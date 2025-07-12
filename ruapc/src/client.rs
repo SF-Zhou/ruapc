@@ -1,0 +1,77 @@
+use serde::{Deserialize, Serialize};
+use serde_inline_default::serde_inline_default;
+use std::time::Duration;
+
+use crate::{
+    context::{Context, SocketEndpoint},
+    error::{Error, ErrorKind},
+    msg::{MsgFlags, MsgMeta},
+};
+
+#[serde_inline_default]
+#[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone)]
+pub struct ClientConfig {
+    #[serde_inline_default(Duration::from_secs(1))]
+    #[serde(with = "humantime_serde")]
+    pub timeout: Duration,
+}
+
+impl Default for ClientConfig {
+    fn default() -> Self {
+        serde_json::from_value(serde_json::Value::Object(serde_json::Map::default())).unwrap()
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct Client {
+    pub config: ClientConfig,
+}
+
+impl Client {
+    /// # Errors
+    pub async fn ruapc_request<Req, Rsp, E>(
+        &self,
+        ctx: &Context,
+        req: &Req,
+        method_name: &str,
+    ) -> std::result::Result<Rsp, E>
+    where
+        Req: Serialize,
+        Rsp: for<'c> Deserialize<'c>,
+        E: std::error::Error + From<crate::Error> + for<'c> Deserialize<'c>,
+    {
+        // 1. get socket.
+        let SocketEndpoint::Address(addr) = ctx.endpoint else {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "client context without address".to_string(),
+            )
+            .into());
+        };
+        let mut socket = ctx.socket_pool.acquire_socket(addr).await?;
+
+        // 2. send request.
+        let meta = MsgMeta {
+            method: method_name.into(),
+            flags: MsgFlags::IsReq,
+        };
+        socket.send(meta, req).await?;
+
+        // 3. recv response with timeout.
+        match tokio::time::timeout(self.config.timeout, socket.recv()).await {
+            Ok(result) => result?.deserialize()?,
+            Err(_) => Err(Error::kind(ErrorKind::Timeout).into()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config() {
+        let config = ClientConfig::default();
+        assert_eq!(config.timeout, Duration::from_secs(1));
+    }
+}

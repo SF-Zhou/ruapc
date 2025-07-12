@@ -1,0 +1,28 @@
+[workspace]
+members = ["ruapc", "ruapc-demo", "ruapc-macro"]
+resolver = "2"
+
+[workspace.package]
+authors = ["SF-Zhou <sfzhou.scut@gmail.com>"]
+edition = "2024"
+homepage = "https://github.com/SF-Zhou/ruapc"
+repository = "https://github.com/SF-Zhou/ruapc"
+description = "A Rust RPC library"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+bitflags = "2.9"
+clap = { version = "4.5", features = ["derive"] }
+foldhash = "0.1"
+humantime-serde = "1.1"
+serde = { version = "1.0", features = ["derive"] }
+serde-inline-default = "0.2"
+serde_json = { version = "1.0" }
+tikv-jemallocator = "0.6"
+tokio = { version = "1.46", features = ["full"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[workspace.lints.clippy]
+pedantic = "warn"
