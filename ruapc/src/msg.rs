@@ -13,6 +13,7 @@ pub struct MsgFlags(u8);
 bitflags! {
     impl MsgFlags: u8 {
         const IsReq = 1;
+        const UseMessagePack = 2;
     }
 }
 
@@ -68,9 +69,15 @@ impl RecvMsg {
             ));
         }
 
-        let meta: MsgMeta = serde_json::from_slice(&bytes[S..offset])?;
-        let payload = serde_json::from_slice(&bytes[offset..])?;
-        Ok(RecvMsg { meta, payload })
+        if bytes[S] == b'{' {
+            let meta: MsgMeta = serde_json::from_slice(&bytes[S..offset])?;
+            let payload = serde_json::from_slice(&bytes[offset..])?;
+            Ok(RecvMsg { meta, payload })
+        } else {
+            let meta: MsgMeta = rmp_serde::from_slice(&bytes[S..offset])?;
+            let payload = rmp_serde::from_slice(&bytes[offset..])?;
+            Ok(RecvMsg { meta, payload })
+        }
     }
 
     /// # Errors
@@ -100,11 +107,19 @@ impl MsgMeta {
         msg.writer()
             .write_all(&0u32.to_be_bytes())
             .map_err(|e| Error::new(ErrorKind::SerializeFailed, e.to_string()))?;
-        serde_json::to_writer(msg.writer(), self)?;
+        if self.flags.contains(MsgFlags::UseMessagePack) {
+            rmp_serde::encode::write_named(&mut msg.writer(), self)?;
+        } else {
+            serde_json::to_writer(msg.writer(), self)?;
+        }
 
         // serialize payload.
         let payload_offset = msg.size();
-        serde_json::to_writer(msg.writer(), payload)?;
+        if self.flags.contains(MsgFlags::UseMessagePack) {
+            rmp_serde::encode::write_named(&mut msg.writer(), payload)?;
+        } else {
+            serde_json::to_writer(msg.writer(), payload)?;
+        }
 
         msg.finish(meta_offset, payload_offset)?;
 

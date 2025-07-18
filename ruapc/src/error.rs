@@ -63,6 +63,24 @@ impl From<serde_json::Error> for Error {
     }
 }
 
+impl From<rmp_serde::encode::Error> for Error {
+    fn from(value: rmp_serde::encode::Error) -> Self {
+        Self {
+            kind: ErrorKind::SerializeFailed,
+            msg: value.to_string(),
+        }
+    }
+}
+
+impl From<rmp_serde::decode::Error> for Error {
+    fn from(value: rmp_serde::decode::Error) -> Self {
+        Self {
+            kind: ErrorKind::DeserializeFailed,
+            msg: value.to_string(),
+        }
+    }
+}
+
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.msg.is_empty() {

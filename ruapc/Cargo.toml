@@ -16,6 +16,7 @@ bytes.workspace = true
 dashmap.workspace = true
 foldhash.workspace = true
 humantime-serde.workspace = true
+rmp-serde.workspace = true
 serde.workspace = true
 serde-inline-default.workspace = true
 serde_json.workspace = true

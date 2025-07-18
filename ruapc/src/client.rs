@@ -14,6 +14,8 @@ pub struct ClientConfig {
     #[serde_inline_default(Duration::from_secs(1))]
     #[serde(with = "humantime_serde")]
     pub timeout: Duration,
+    #[serde_inline_default(true)]
+    pub use_msgpack: bool,
 }
 
 impl Default for ClientConfig {
@@ -51,9 +53,13 @@ impl Client {
         let socket = ctx.state.socket_pool.acquire(&addr, &ctx.state).await?;
 
         // 2. send request.
+        let mut flags = MsgFlags::IsReq;
+        if self.config.use_msgpack {
+            flags |= MsgFlags::UseMessagePack;
+        }
         let meta = MsgMeta {
             method: method_name.into(),
-            flags: MsgFlags::IsReq,
+            flags,
             msgid: 0,
         };
         let receiver = socket.send(meta, req).await?;

@@ -20,6 +20,10 @@ pub struct Args {
     #[arg(short, long, default_value = "alice")]
     pub value: String,
 
+    /// Use MessagePack
+    #[arg(long, default_value_t = false)]
+    pub use_msgpack: bool,
+
     /// Enable stress testing.
     #[arg(long, default_value_t = false)]
     pub stress: bool,
@@ -53,6 +57,7 @@ async fn stress_test(args: Args) {
                 let client = Client {
                     config: ClientConfig {
                         timeout: Duration::from_secs(5),
+                        use_msgpack: args.use_msgpack,
                     },
                 };
                 for _ in 0..256 {
@@ -100,7 +105,12 @@ async fn main() {
         stress_test(args).await;
     } else {
         let ctx = Context::default().with_addr(args.addr);
-        let client = Client::default();
+        let client = Client {
+            config: ClientConfig {
+                use_msgpack: args.use_msgpack,
+                ..Default::default()
+            },
+        };
         let rsp = client.echo(&ctx, &Request(args.value.clone())).await;
         tracing::info!("echo rsp: {:?}", rsp);
 
