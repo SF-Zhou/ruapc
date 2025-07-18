@@ -1,7 +1,10 @@
 use foldhash::fast::RandomState;
 use std::collections::HashMap;
 
-use crate::{Context, RecvMsg, error::{Result, Error, ErrorKind}};
+use crate::{
+    Context, RecvMsg,
+    error::{Error, ErrorKind, Result},
+};
 
 pub type Method = Box<dyn Fn(Context, RecvMsg) -> Result<()> + Send + Sync>;
 

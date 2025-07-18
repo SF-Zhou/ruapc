@@ -50,7 +50,7 @@ async fn main() {
     let server = Server::create(router);
 
     let server = Arc::new(server);
-    let (addr, listen_handle) = server.listen(args.addr).await.unwrap();
+    let addr = server.listen(args.addr).await.unwrap();
     tracing::info!(
         "Serving {:?} on {}...",
         [
@@ -59,5 +59,6 @@ async fn main() {
         ],
         addr.to_string()
     );
-    listen_handle.await.unwrap();
+
+    server.join().await
 }

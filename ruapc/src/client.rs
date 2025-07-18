@@ -48,17 +48,18 @@ impl Client {
             )
             .into());
         };
-        let mut socket = ctx.socket_pool.acquire_socket(addr).await?;
+        let socket = ctx.state.socket_pool.acquire(&addr, &ctx.state).await?;
 
         // 2. send request.
         let meta = MsgMeta {
             method: method_name.into(),
             flags: MsgFlags::IsReq,
+            msgid: 0,
         };
-        socket.send(meta, req).await?;
+        let receiver = socket.send(meta, req).await?;
 
         // 3. recv response with timeout.
-        match tokio::time::timeout(self.config.timeout, socket.recv()).await {
+        match tokio::time::timeout(self.config.timeout, receiver.recv()).await {
             Ok(result) => result?.deserialize()?,
             Err(_) => Err(Error::kind(ErrorKind::Timeout).into()),
         }

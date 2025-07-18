@@ -28,15 +28,15 @@ async fn test_hello() {
 
     let server = ruapc::Server::create(router);
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
-    let (addr, listen_handle) = server.listen(addr).await.unwrap();
+    let addr = server.listen(addr).await.unwrap();
 
     let client = ruapc::Client::default();
-    let ctx = ruapc::Context::create_for_client(addr);
+    let ctx = ruapc::Context::default().with_addr(addr);
     let rsp = client.hello(&ctx, &"ruapc".to_string()).await.unwrap();
     assert_eq!(rsp, "hello ruapc!");
 
     server.stop();
-    let _ = listen_handle.await;
+    server.join().await;
 
     client.hello(&ctx, &"ruapc".to_string()).await.unwrap_err();
 }

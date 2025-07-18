@@ -1,79 +1,53 @@
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use std::{net::SocketAddr, sync::Arc};
 
-use crate::{
-    Router, Socket,
-    context::{Context, SocketEndpoint},
-    error::{Error, ErrorKind, Result},
-};
+use tokio_util::sync::DropGuard;
 
-#[derive(Default)]
-pub struct SocketPool {
-    map: Mutex<HashMap<SocketAddr, Vec<TcpStream>>>,
-    router: Router,
+use crate::{Result, Socket, State, tcp::TcpSocketPool};
+
+#[derive(Clone, Debug)]
+pub enum SocketPool {
+    Tcp(Arc<TcpSocketPool>),
 }
 
 impl SocketPool {
+    /// # Errors
+    pub async fn acquire(&self, addr: &SocketAddr, state: &Arc<State>) -> Result<Socket> {
+        match self {
+            SocketPool::Tcp(tcp_socket_pool) => {
+                tcp_socket_pool.acquire(addr, state).await.map(Socket::Tcp)
+            }
+        }
+    }
+
+    /// # Errors
+    pub async fn start_listen(&self, addr: SocketAddr, state: &Arc<State>) -> Result<SocketAddr> {
+        match self {
+            SocketPool::Tcp(tcp_socket_pool) => tcp_socket_pool.start_listen(addr, state).await,
+        }
+    }
+
+    pub fn stop(&self) {
+        match self {
+            SocketPool::Tcp(tcp_socket_pool) => tcp_socket_pool.stop(),
+        }
+    }
+
     #[must_use]
-    pub fn create_for_server(router: Router) -> Self {
-        Self {
-            map: Mutex::default(),
-            router,
+    pub fn drop_guard(&self) -> DropGuard {
+        match self {
+            SocketPool::Tcp(tcp_socket_pool) => tcp_socket_pool.drop_guard(),
         }
     }
 
-    /// # Errors
-    pub async fn acquire_socket(self: &Arc<Self>, addr: SocketAddr) -> Result<Socket> {
-        let mut map = self.map.lock().await;
-        let stream = if let Some(stream) = map.get_mut(&addr).and_then(std::vec::Vec::pop) {
-            stream
-        } else {
-            drop(map);
-            TcpStream::connect(addr)
-                .await
-                .map_err(|e| Error::new(ErrorKind::TcpConnectFailed, e.to_string()))?
-        };
-
-        Ok(Socket {
-            socket_pool: self.clone(),
-            tcp_stream: Some(stream),
-            for_send: true,
-        })
-    }
-
-    pub fn add_socket_for_send(self: &Arc<Self>, stream: TcpStream) {
-        let this = self.clone();
-        if let Ok(peer_addr) = stream.peer_addr() {
-            tokio::spawn(async move {
-                let mut map = this.map.lock().await;
-                map.entry(peer_addr).or_default().push(stream);
-            });
+    pub async fn join(&self) {
+        match self {
+            SocketPool::Tcp(tcp_socket_pool) => tcp_socket_pool.join().await,
         }
     }
+}
 
-    pub fn add_socket_for_recv(self: &Arc<Self>, stream: TcpStream) {
-        let socket = Socket {
-            socket_pool: self.clone(),
-            tcp_stream: Some(stream),
-            for_send: false,
-        };
-        let this = self.clone();
-        tokio::spawn(async move {
-            let _ = this.handle_request(socket).await;
-        });
-    }
-
-    /// # Errors
-    async fn handle_request(self: &Arc<Self>, mut socket: Socket) -> Result<()> {
-        let msg = socket.recv().await?;
-        let ctx = Context {
-            socket_pool: self.clone(),
-            endpoint: SocketEndpoint::Connected(socket),
-        };
-        self.router.dispatch(ctx, msg);
-        Ok(())
+impl Default for SocketPool {
+    fn default() -> Self {
+        SocketPool::Tcp(TcpSocketPool::new())
     }
 }

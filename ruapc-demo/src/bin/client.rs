@@ -43,10 +43,11 @@ async fn stress_test(args: Args) {
     let state = Arc::new(State::default());
     let start_time = std::time::Instant::now();
     let mut tasks = vec![];
+    let ctx = Context::default().with_addr(args.addr);
     for _ in 0..args.coroutines {
         let value = Request(args.value.clone());
         let state = state.clone();
-        let ctx = Context::create_for_client(args.addr);
+        let ctx = ctx.clone();
         tasks.push(tokio::spawn(async move {
             while start_time.elapsed().as_secs() < args.secs {
                 let client = Client {
@@ -98,7 +99,7 @@ async fn main() {
     if args.stress {
         stress_test(args).await;
     } else {
-        let ctx = Context::create_for_client(args.addr);
+        let ctx = Context::default().with_addr(args.addr);
         let client = Client::default();
         let rsp = client.echo(&ctx, &Request(args.value.clone())).await;
         tracing::info!("echo rsp: {:?}", rsp);

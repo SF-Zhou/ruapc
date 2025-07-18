@@ -8,6 +8,7 @@ pub enum ErrorKind {
     DeserializeFailed,
     SerdeJsonError,
     TcpConnectFailed,
+    TcpBindFailed,
     TcpSendMsgFailed,
     TcpRecvMsgFailed,
     TcpParseMsgFailed,

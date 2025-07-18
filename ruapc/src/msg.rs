@@ -1,3 +1,5 @@
+use std::io::Write;
+
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
 
@@ -18,6 +20,7 @@ bitflags! {
 pub struct MsgMeta {
     pub method: String,
     pub flags: MsgFlags,
+    pub msgid: u64,
 }
 
 #[derive(Debug)]
@@ -50,6 +53,13 @@ impl RecvMsg {
             ));
         };
 
+        if meta_len == 0 {
+            return Err(Error::new(
+                ErrorKind::DeserializeFailed,
+                format!("invalid meta length: {meta_len}"),
+            ));
+        }
+
         let offset = S + meta_len;
         if offset > len {
             return Err(Error::new(
@@ -66,5 +76,79 @@ impl RecvMsg {
     /// # Errors
     pub fn deserialize<P: for<'c> Deserialize<'c>>(self) -> Result<P> {
         Ok(serde_json::from_value(self.payload)?)
+    }
+}
+
+pub trait SendMsg {
+    fn size(&self) -> usize;
+
+    fn prepare(&mut self) -> Result<()>;
+
+    fn finish(&mut self, meta_offset: usize, payload_offset: usize) -> Result<()>;
+
+    fn writer(&mut self) -> impl std::io::Write;
+}
+
+impl MsgMeta {
+    /// # Errors
+    pub fn serialize_to<M: SendMsg, P: Serialize>(&self, payload: &P, msg: &mut M) -> Result<()> {
+        msg.prepare()?;
+
+        // serialize meta.
+        let meta_offset = msg.size();
+        // reserve for meta len.
+        msg.writer()
+            .write_all(&0u32.to_be_bytes())
+            .map_err(|e| Error::new(ErrorKind::SerializeFailed, e.to_string()))?;
+        serde_json::to_writer(msg.writer(), self)?;
+
+        // serialize payload.
+        let payload_offset = msg.size();
+        serde_json::to_writer(msg.writer(), payload)?;
+
+        msg.finish(meta_offset, payload_offset)?;
+
+        Ok(())
+    }
+}
+
+impl SendMsg for bytes::BytesMut {
+    fn size(&self) -> usize {
+        self.len()
+    }
+
+    fn prepare(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn finish(&mut self, meta_offset: usize, payload_offset: usize) -> Result<()> {
+        const S: usize = std::mem::size_of::<u32>();
+        let meta_len = u32::try_from(payload_offset - meta_offset - S)?;
+        self[meta_offset..meta_offset + S].copy_from_slice(&meta_len.to_be_bytes());
+        Ok(())
+    }
+
+    fn writer(&mut self) -> impl std::io::Write {
+        #[repr(transparent)]
+        struct Writer<'a>(&'a mut bytes::BytesMut);
+
+        impl std::io::Write for Writer<'_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.write_all(buf)?;
+                Ok(buf.len())
+            }
+
+            #[inline]
+            fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+                self.0.extend_from_slice(buf);
+                Ok(())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        Writer(self)
     }
 }

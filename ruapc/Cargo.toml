@@ -12,6 +12,8 @@ license.workspace = true
 ruapc-macro = { version = "0.1.0", path = "../ruapc-macro" }
 
 bitflags.workspace = true
+bytes.workspace = true
+dashmap.workspace = true
 foldhash.workspace = true
 humantime-serde.workspace = true
 serde.workspace = true
