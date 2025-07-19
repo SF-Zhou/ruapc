@@ -12,6 +12,10 @@ pub enum ErrorKind {
     TcpSendMsgFailed,
     TcpRecvMsgFailed,
     TcpParseMsgFailed,
+    WebSocketConnectFailed,
+    WebSocketSendFailed,
+    WebSocketRecvFailed,
+    WebSocketClosed,
     #[serde(untagged)]
     Unknown(String),
 }

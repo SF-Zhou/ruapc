@@ -1,5 +1,5 @@
 use clap::Parser;
-use ruapc::{Context, Result, Router, Server};
+use ruapc::{Context, Result, Router, Server, SocketPoolConfig, SocketType};
 use ruapc_demo::{EchoService, GreetService, Request};
 use std::sync::{
     Arc,
@@ -12,6 +12,10 @@ pub struct Args {
     /// Listen address.
     #[arg(default_value = "0.0.0.0:8000")]
     pub addr: std::net::SocketAddr,
+
+    /// Socket type.
+    #[arg(long, default_value = "tcp")]
+    pub socket_type: SocketType,
 }
 
 #[derive(Default)]
@@ -47,7 +51,12 @@ async fn main() {
     let mut router = Router::default();
     router.add_methods(EchoService::ruapc_export(demo.clone()));
     router.add_methods(GreetService::ruapc_export(demo.clone()));
-    let server = Server::create(router);
+    let server = Server::create(
+        router,
+        &SocketPoolConfig {
+            socket_type: args.socket_type,
+        },
+    );
 
     let server = Arc::new(server);
     let addr = server.listen(args.addr).await.unwrap();

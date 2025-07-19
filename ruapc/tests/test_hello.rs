@@ -3,7 +3,7 @@
 
 use std::{str::FromStr, sync::Arc};
 
-use ruapc;
+use ruapc::{self, SocketPoolConfig, SocketType};
 
 #[ruapc::service]
 trait Foo {
@@ -22,21 +22,24 @@ impl Foo for FooImpl {
 async fn test_hello() {
     tracing_subscriber::fmt().init();
 
-    let foo = Arc::new(FooImpl);
-    let mut router = ruapc::Router::default();
-    router.add_methods(foo.ruapc_export());
+    for socket_type in [SocketType::TCP, SocketType::WebSocket] {
+        let foo = Arc::new(FooImpl);
+        let mut router = ruapc::Router::default();
+        router.add_methods(foo.ruapc_export());
 
-    let server = ruapc::Server::create(router);
-    let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
-    let addr = server.listen(addr).await.unwrap();
+        let config = SocketPoolConfig { socket_type };
+        let server = ruapc::Server::create(router, &config);
+        let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
+        let addr = server.listen(addr).await.unwrap();
 
-    let client = ruapc::Client::default();
-    let ctx = ruapc::Context::default().with_addr(addr);
-    let rsp = client.hello(&ctx, &"ruapc".to_string()).await.unwrap();
-    assert_eq!(rsp, "hello ruapc!");
+        let client = ruapc::Client::default();
+        let ctx = ruapc::Context::create(&config).with_addr(addr);
+        let rsp = client.hello(&ctx, &"ruapc".to_string()).await.unwrap();
+        assert_eq!(rsp, "hello ruapc!");
 
-    server.stop();
-    server.join().await;
+        server.stop();
+        server.join().await;
 
-    client.hello(&ctx, &"ruapc".to_string()).await.unwrap_err();
+        client.hello(&ctx, &"ruapc".to_string()).await.unwrap_err();
+    }
 }

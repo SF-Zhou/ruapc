@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use tokio_util::sync::DropGuard;
 
-use crate::{Context, MsgFlags, RecvMsg, Result, Router, Socket, SocketPool, Waiter};
+use crate::{
+    Context, MsgFlags, RecvMsg, Result, Router, Socket, SocketPool, SocketPoolConfig, Waiter,
+};
 
 #[derive(Default)]
 pub struct State {
@@ -12,6 +14,14 @@ pub struct State {
 }
 
 impl State {
+    pub(crate) fn create(router: Router, config: &SocketPoolConfig) -> Self {
+        Self {
+            router,
+            waiter: Arc::default(),
+            socket_pool: SocketPool::create(config),
+        }
+    }
+
     /// # Errors
     pub fn handle_recv(self: &Arc<Self>, socket: &Socket, msg: RecvMsg) -> Result<()> {
         if msg.meta.flags.contains(MsgFlags::IsReq) {

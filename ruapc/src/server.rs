@@ -2,7 +2,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use tokio_util::sync::DropGuard;
 
-use crate::{Result, Router, SocketPool, State};
+use crate::{Result, Router, SocketPoolConfig, State};
 
 pub struct Server {
     state: Arc<State>,
@@ -11,12 +11,8 @@ pub struct Server {
 
 impl Server {
     #[must_use]
-    pub fn create(router: Router) -> Self {
-        let state = State {
-            router,
-            waiter: Arc::default(),
-            socket_pool: SocketPool::default(),
-        };
+    pub fn create(router: Router, config: &SocketPoolConfig) -> Self {
+        let state = State::create(router, config);
         let drop_guard = state.drop_guard();
 
         Self {

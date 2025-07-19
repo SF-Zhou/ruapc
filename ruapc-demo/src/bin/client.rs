@@ -16,6 +16,10 @@ pub struct Args {
     #[arg(default_value = "127.0.0.1:8000")]
     pub addr: std::net::SocketAddr,
 
+    /// Socket type.
+    #[arg(long, default_value = "tcp")]
+    pub socket_type: SocketType,
+
     /// Request value.
     #[arg(short, long, default_value = "alice")]
     pub value: String,
@@ -47,7 +51,10 @@ async fn stress_test(args: Args) {
     let state = Arc::new(State::default());
     let start_time = std::time::Instant::now();
     let mut tasks = vec![];
-    let ctx = Context::default().with_addr(args.addr);
+    let ctx = Context::create(&SocketPoolConfig {
+        socket_type: args.socket_type,
+    })
+    .with_addr(args.addr);
     for _ in 0..args.coroutines {
         let value = Request(args.value.clone());
         let state = state.clone();
@@ -104,7 +111,10 @@ async fn main() {
     if args.stress {
         stress_test(args).await;
     } else {
-        let ctx = Context::default().with_addr(args.addr);
+        let ctx = Context::create(&SocketPoolConfig {
+            socket_type: args.socket_type,
+        })
+        .with_addr(args.addr);
         let client = Client {
             config: ClientConfig {
                 use_msgpack: args.use_msgpack,

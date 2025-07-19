@@ -4,7 +4,7 @@ use serde::Serialize;
 use tokio_util::sync::DropGuard;
 
 use crate::{
-    Error, Socket, State,
+    Error, Router, Socket, SocketPoolConfig, State,
     msg::{MsgFlags, MsgMeta},
 };
 
@@ -35,6 +35,16 @@ impl Default for Context {
 }
 
 impl Context {
+    #[must_use]
+    pub fn create(config: &SocketPoolConfig) -> Self {
+        let state = Arc::new(State::create(Router::default(), config));
+        Self {
+            drop_guard: Some(Arc::new(state.drop_guard())),
+            state,
+            endpoint: SocketEndpoint::Invalid,
+        }
+    }
+
     #[must_use]
     pub fn with_addr(&self, addr: SocketAddr) -> Self {
         Self {

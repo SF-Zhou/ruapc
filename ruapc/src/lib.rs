@@ -22,9 +22,10 @@ mod socket;
 pub use socket::Socket;
 
 mod socket_pool;
-pub use socket_pool::SocketPool;
+pub use socket_pool::{SocketPool, SocketPoolConfig, SocketType};
 
 mod tcp;
+mod ws;
 
 mod state;
 pub use state::State;
