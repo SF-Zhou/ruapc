@@ -21,7 +21,7 @@ impl WebSocket {
         Self { stream, waiter }
     }
 
-    pub async fn send<P: Serialize>(&self, mut meta: MsgMeta, payload: &P) -> Result<Receiver> {
+    pub async fn send<P: Serialize>(&self, meta: &mut MsgMeta, payload: &P) -> Result<Receiver> {
         let receiver = if meta.flags.contains(MsgFlags::IsReq) {
             let (msgid, rx) = self.waiter.alloc();
             meta.msgid = msgid;
