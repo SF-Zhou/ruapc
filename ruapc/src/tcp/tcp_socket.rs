@@ -21,7 +21,7 @@ impl TcpSocket {
         Self { stream, waiter }
     }
 
-    pub async fn send<P: Serialize>(&self, mut meta: MsgMeta, payload: &P) -> Result<Receiver> {
+    pub async fn send<P: Serialize>(&self, meta: &mut MsgMeta, payload: &P) -> Result<Receiver> {
         struct TcpSocketBytes(BytesMut);
 
         impl SendMsg for TcpSocketBytes {

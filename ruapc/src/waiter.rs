@@ -25,7 +25,7 @@ impl Waiter {
         }
     }
 
-    pub fn timeout(&self, msg_id: u64) {
+    pub fn set_timeout(&self, msg_id: u64) {
         self.id_map.remove(&msg_id);
     }
 }

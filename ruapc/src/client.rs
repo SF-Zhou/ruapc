@@ -57,17 +57,19 @@ impl Client {
         if self.config.use_msgpack {
             flags |= MsgFlags::UseMessagePack;
         }
-        let meta = MsgMeta {
+        let mut meta = MsgMeta {
             method: method_name.into(),
             flags,
             msgid: 0,
         };
-        let receiver = socket.send(meta, req).await?;
+        let receiver = socket.send(&mut meta, req).await?;
 
         // 3. recv response with timeout.
-        match tokio::time::timeout(self.config.timeout, receiver.recv()).await {
-            Ok(result) => result?.deserialize()?,
-            Err(_) => Err(Error::kind(ErrorKind::Timeout).into()),
+        if let Ok(result) = tokio::time::timeout(self.config.timeout, receiver.recv()).await {
+            result?.deserialize()?
+        } else {
+            ctx.state.waiter.set_timeout(meta.msgid);
+            Err(Error::kind(ErrorKind::Timeout).into())
         }
     }
 }

@@ -10,7 +10,7 @@ pub enum Socket {
 
 impl Socket {
     /// # Errors
-    pub async fn send<P: Serialize>(&self, meta: MsgMeta, payload: &P) -> Result<Receiver> {
+    pub async fn send<P: Serialize>(&self, meta: &mut MsgMeta, payload: &P) -> Result<Receiver> {
         match self {
             Socket::Tcp(tcp_socket) => tcp_socket.send(meta, payload).await,
             Socket::WS(web_socket) => web_socket.send(meta, payload).await,
