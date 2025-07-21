@@ -43,14 +43,22 @@ impl Client {
         E: std::error::Error + From<crate::Error> + for<'c> Deserialize<'c>,
     {
         // 1. get socket.
-        let SocketEndpoint::Address(addr) = ctx.endpoint else {
-            return Err(Error::new(
-                ErrorKind::InvalidArgument,
-                "client context without address".to_string(),
-            )
-            .into());
+        let socket = match &ctx.endpoint {
+            SocketEndpoint::Invalid => {
+                return Err(Error::new(
+                    ErrorKind::InvalidArgument,
+                    "client context without address".to_string(),
+                )
+                .into());
+            }
+            SocketEndpoint::Connected(socket) => socket.clone(),
+            SocketEndpoint::Address(socket_addr) => {
+                ctx.state
+                    .socket_pool
+                    .acquire(socket_addr, &ctx.state)
+                    .await?
+            }
         };
-        let socket = ctx.state.socket_pool.acquire(&addr, &ctx.state).await?;
 
         // 2. send request.
         let mut flags = MsgFlags::IsReq;
