@@ -46,6 +46,16 @@ impl Context {
     }
 
     #[must_use]
+    pub fn create_with_router(router: Router, config: &SocketPoolConfig) -> Self {
+        let state = Arc::new(State::create(router, config));
+        Self {
+            drop_guard: Some(Arc::new(state.drop_guard())),
+            state,
+            endpoint: SocketEndpoint::Invalid,
+        }
+    }
+
+    #[must_use]
     pub fn with_addr(&self, addr: SocketAddr) -> Self {
         Self {
             state: self.state.clone(),
