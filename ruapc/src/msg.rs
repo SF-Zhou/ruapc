@@ -3,7 +3,10 @@ use std::io::Write;
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Error, ErrorKind, Result};
+use crate::{
+    Bytes,
+    error::{Error, ErrorKind, Result},
+};
 
 #[derive(Deserialize, Serialize, Debug, Default, PartialEq, Eq, Clone, Copy)]
 #[repr(transparent)]
@@ -24,25 +27,17 @@ pub struct MsgMeta {
     pub msgid: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct RecvMsg {
     pub meta: MsgMeta,
-    payload: serde_json::Value,
-}
-
-impl Default for RecvMsg {
-    fn default() -> Self {
-        Self {
-            meta: MsgMeta::default(),
-            payload: serde_json::Value::Null,
-        }
-    }
+    payload: Bytes,
 }
 
 impl RecvMsg {
     /// # Errors
-    pub fn parse(bytes: &[u8]) -> Result<Self> {
+    pub fn parse(bytes: impl Into<Bytes>) -> Result<Self> {
         const S: usize = std::mem::size_of::<u32>();
+        let mut bytes: Bytes = bytes.into();
 
         let len = bytes.len();
         let meta_len = if let Ok(b) = bytes[..S].try_into() {
@@ -69,20 +64,26 @@ impl RecvMsg {
             ));
         }
 
-        if bytes[S] == b'{' {
-            let meta: MsgMeta = serde_json::from_slice(&bytes[S..offset])?;
-            let payload = serde_json::from_slice(&bytes[offset..])?;
-            Ok(RecvMsg { meta, payload })
+        let meta: MsgMeta = if bytes[S] == b'{' {
+            serde_json::from_slice(&bytes[S..offset])?
         } else {
-            let meta: MsgMeta = rmp_serde::from_slice(&bytes[S..offset])?;
-            let payload = rmp_serde::from_slice(&bytes[offset..])?;
-            Ok(RecvMsg { meta, payload })
-        }
+            rmp_serde::from_slice(&bytes[S..offset])?
+        };
+
+        bytes.advance(offset);
+        Ok(RecvMsg {
+            meta,
+            payload: bytes,
+        })
     }
 
     /// # Errors
     pub fn deserialize<P: for<'c> Deserialize<'c>>(self) -> Result<P> {
-        Ok(serde_json::from_value(self.payload)?)
+        if self.meta.flags.contains(MsgFlags::UseMessagePack) {
+            Ok(rmp_serde::from_slice(&self.payload)?)
+        } else {
+            Ok(serde_json::from_slice(&self.payload)?)
+        }
     }
 }
 
