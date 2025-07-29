@@ -205,7 +205,7 @@ impl TcpSocketPool {
         let socket = Socket::Tcp(tcp_socket);
         loop {
             if let Some(bytes) = Self::parse_message(&mut buffer)? {
-                let msg = RecvMsg::parse(&bytes)?;
+                let msg = RecvMsg::parse(bytes)?;
                 state.handle_recv(&socket, msg)?;
             } else {
                 let n = recv_stream

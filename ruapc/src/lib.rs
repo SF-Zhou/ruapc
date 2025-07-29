@@ -6,6 +6,9 @@ pub use ruapc_macro::service;
 mod error;
 pub use error::{Error, ErrorKind, Result};
 
+mod bytes;
+pub use bytes::Bytes;
+
 mod msg;
 pub use msg::{MsgFlags, MsgMeta, RecvMsg};
 

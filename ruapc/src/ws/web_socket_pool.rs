@@ -183,7 +183,7 @@ impl WebSocketPool {
             let msg = msg.map_err(|e| Error::new(ErrorKind::WebSocketRecvFailed, e.to_string()))?;
             match msg {
                 Message::Binary(bytes) => {
-                    let msg = RecvMsg::parse(&bytes)?;
+                    let msg = RecvMsg::parse(bytes)?;
                     state.handle_recv(&socket, msg)?;
                 }
                 Message::Close(_) => {
