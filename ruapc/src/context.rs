@@ -90,7 +90,7 @@ impl Context {
         meta.flags.remove(MsgFlags::IsReq);
         match &mut self.endpoint {
             SocketEndpoint::Connected(socket) => {
-                let _ = socket.send(&mut meta, &rsp).await;
+                let _ = socket.send(&mut meta, &rsp, &self.state.waiter).await;
             }
             _ => {
                 tracing::error!("invalid argument: send rsp without connected socket");

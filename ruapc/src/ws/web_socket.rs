@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use bytes::{Bytes, BytesMut};
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -13,17 +11,21 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct WebSocket {
     stream: mpsc::Sender<Bytes>,
-    waiter: Arc<Waiter>,
 }
 
 impl WebSocket {
-    pub fn new(stream: mpsc::Sender<Bytes>, waiter: Arc<Waiter>) -> Self {
-        Self { stream, waiter }
+    pub fn new(stream: mpsc::Sender<Bytes>) -> Self {
+        Self { stream }
     }
 
-    pub async fn send<P: Serialize>(&self, meta: &mut MsgMeta, payload: &P) -> Result<Receiver> {
+    pub async fn send<P: Serialize>(
+        &self,
+        meta: &mut MsgMeta,
+        payload: &P,
+        waiter: &Waiter,
+    ) -> Result<Receiver> {
         let receiver = if meta.flags.contains(MsgFlags::IsReq) {
-            let (msgid, rx) = self.waiter.alloc();
+            let (msgid, rx) = waiter.alloc();
             meta.msgid = msgid;
             Receiver::OneShotRx(rx)
         } else {

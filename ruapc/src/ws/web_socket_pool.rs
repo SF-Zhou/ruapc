@@ -150,7 +150,7 @@ impl WebSocketPool {
                 this.finish_one_task();
             }
         });
-        let web_socket = WebSocket::new(sender, state.waiter.clone());
+        let web_socket = WebSocket::new(sender);
         self.running.fetch_add(1, Ordering::AcqRel);
         tokio::spawn({
             let this = self.clone();

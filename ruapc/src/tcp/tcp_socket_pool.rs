@@ -144,7 +144,7 @@ impl TcpSocketPool {
                 this.finish_one_task();
             }
         });
-        let tcp_socket = TcpSocket::new(sender, state.waiter.clone());
+        let tcp_socket = TcpSocket::new(sender);
         self.running.fetch_add(1, Ordering::AcqRel);
         tokio::spawn({
             let this = self.clone();
