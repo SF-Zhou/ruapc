@@ -70,7 +70,7 @@ impl Client {
             flags,
             msgid: 0,
         };
-        let receiver = socket.send(&mut meta, req).await?;
+        let receiver = socket.send(&mut meta, req, &ctx.state.waiter).await?;
 
         // 3. recv response with timeout.
         if let Ok(result) = tokio::time::timeout(self.config.timeout, receiver.recv()).await {
