@@ -1,12 +1,4 @@
-use std::{
-    collections::HashMap,
-    io::IoSlice,
-    net::SocketAddr,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-};
+use std::{collections::HashMap, io::IoSlice, net::SocketAddr, sync::Arc};
 
 use bytes::{Buf, Bytes, BytesMut};
 use foldhash::fast::RandomState;
@@ -18,39 +10,25 @@ use tokio::{
     },
     sync::{RwLock, mpsc},
 };
-use tokio_util::sync::{CancellationToken, DropGuard};
+use tokio_util::sync::DropGuard;
 
 use super::TcpSocket;
 use crate::{
-    RecvMsg, Socket, State,
+    RecvMsg, Socket, State, TaskSupervisor,
     error::{Error, ErrorKind, Result},
 };
 
 pub struct TcpSocketPool {
     socket_map: RwLock<HashMap<SocketAddr, TcpSocket, RandomState>>,
-    running: AtomicUsize,
-    stop_token: CancellationToken,
-    stopped_token: CancellationToken,
+    task_supervisor: TaskSupervisor,
 }
 
 impl TcpSocketPool {
     pub fn new() -> Arc<Self> {
-        let this = Arc::new(Self {
+        Arc::new(Self {
             socket_map: RwLock::default(),
-            running: AtomicUsize::new(1),
-            stop_token: CancellationToken::default(),
-            stopped_token: CancellationToken::default(),
-        });
-
-        tokio::spawn({
-            let this = this.clone();
-            async move {
-                this.stop_token.cancelled().await;
-                this.finish_one_task();
-            }
-        });
-
-        this
+            task_supervisor: TaskSupervisor::create(),
+        })
     }
 
     pub async fn start_listen(
@@ -67,10 +45,10 @@ impl TcpSocketPool {
         let this = self.clone();
         let state = state.clone();
 
-        this.running.fetch_add(1, Ordering::AcqRel);
+        let task_supervisor = self.task_supervisor.start_async_task();
         tokio::spawn(async move {
             tokio::select! {
-                () = this.stop_token.cancelled() => {
+                () = task_supervisor.stopped() => {
                     tracing::info!("stop accept loop");
                 }
                 () = async {
@@ -80,22 +58,21 @@ impl TcpSocketPool {
                     }
                 } => {}
             }
-            this.finish_one_task();
         });
 
         Ok(listener_addr)
     }
 
     pub fn stop(&self) {
-        self.stop_token.cancel();
+        self.task_supervisor.stop();
     }
 
     pub fn drop_guard(&self) -> DropGuard {
-        self.stop_token.clone().drop_guard()
+        self.task_supervisor.drop_guard()
     }
 
     pub async fn join(&self) {
-        self.stopped_token.cancelled().await;
+        self.task_supervisor.all_stopped().await;
     }
 
     pub async fn acquire(
@@ -133,26 +110,25 @@ impl TcpSocketPool {
     ) -> TcpSocket {
         let (recv_stream, send_stream) = stream.into_split();
         let (sender, receiver) = mpsc::channel(1024);
-        self.running.fetch_add(1, Ordering::AcqRel);
+        let task_supervisor = self.task_supervisor.start_async_task();
         tokio::spawn({
-            let this = self.clone();
             async move {
                 tokio::select! {
-                    () = this.stop_token.cancelled() => {},
+                    () = task_supervisor.stopped() => {},
                     _ = Self::start_send_loop(send_stream, receiver) => {}
                 }
-                this.finish_one_task();
             }
         });
+
         let tcp_socket = TcpSocket::new(sender);
-        self.running.fetch_add(1, Ordering::AcqRel);
+        let task_supervisor = self.task_supervisor.start_async_task();
         tokio::spawn({
             let this = self.clone();
             let tcp_socket = tcp_socket.clone();
             let state = state.clone();
             async move {
                 tokio::select! {
-                    () = this.stop_token.cancelled() => {},
+                    () = task_supervisor.stopped() => {},
                     r = Self::start_recv_loop(recv_stream, tcp_socket, &state) => {
                         if let Err(e) = r {
                             tracing::error!("recv loop for {addr} failed: {e}");
@@ -161,7 +137,6 @@ impl TcpSocketPool {
                         }
                     }
                 }
-                this.finish_one_task();
             }
         });
         tcp_socket
@@ -252,13 +227,6 @@ impl TcpSocketPool {
                 }
             }
             msgs.clear();
-        }
-    }
-
-    fn finish_one_task(&self) {
-        let running = self.running.fetch_sub(1, Ordering::AcqRel) - 1;
-        if running == 0 {
-            self.stopped_token.cancel();
         }
     }
 }

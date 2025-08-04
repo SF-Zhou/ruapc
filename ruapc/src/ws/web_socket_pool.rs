@@ -1,11 +1,4 @@
-use std::{
-    collections::HashMap,
-    net::SocketAddr,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use bytes::Bytes;
 use foldhash::fast::RandomState;
@@ -20,11 +13,11 @@ use tokio::{
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, accept_async, connect_async, tungstenite::Message,
 };
-use tokio_util::sync::{CancellationToken, DropGuard};
+use tokio_util::sync::DropGuard;
 
 use super::WebSocket;
 use crate::{
-    RecvMsg, Socket, State,
+    RecvMsg, Socket, State, TaskSupervisor,
     error::{Error, ErrorKind, Result},
 };
 
@@ -32,29 +25,15 @@ type Stream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 pub struct WebSocketPool {
     socket_map: RwLock<HashMap<SocketAddr, WebSocket, RandomState>>,
-    running: AtomicUsize,
-    stop_token: CancellationToken,
-    stopped_token: CancellationToken,
+    task_supervisor: TaskSupervisor,
 }
 
 impl WebSocketPool {
     pub fn new() -> Arc<Self> {
-        let this = Arc::new(Self {
+        Arc::new(Self {
             socket_map: RwLock::default(),
-            running: AtomicUsize::new(1),
-            stop_token: CancellationToken::default(),
-            stopped_token: CancellationToken::default(),
-        });
-
-        tokio::spawn({
-            let this = this.clone();
-            async move {
-                this.stop_token.cancelled().await;
-                this.finish_one_task();
-            }
-        });
-
-        this
+            task_supervisor: TaskSupervisor::create(),
+        })
     }
 
     pub async fn start_listen(
@@ -71,10 +50,10 @@ impl WebSocketPool {
         let this = self.clone();
         let state = state.clone();
 
-        this.running.fetch_add(1, Ordering::AcqRel);
+        let task_supervisor = self.task_supervisor.start_async_task();
         tokio::spawn(async move {
             tokio::select! {
-                () = this.stop_token.cancelled() => {
+                () = task_supervisor.stopped() => {
                     tracing::info!("stop accept loop");
                 }
                 () = async {
@@ -86,22 +65,21 @@ impl WebSocketPool {
                     }
                 } => {}
             }
-            this.finish_one_task();
         });
 
         Ok(listener_addr)
     }
 
     pub fn stop(&self) {
-        self.stop_token.cancel();
+        self.task_supervisor.stop();
     }
 
     pub fn drop_guard(&self) -> DropGuard {
-        self.stop_token.clone().drop_guard()
+        self.task_supervisor.drop_guard()
     }
 
     pub async fn join(&self) {
-        self.stopped_token.cancelled().await;
+        self.task_supervisor.all_stopped().await;
     }
 
     pub async fn acquire(
@@ -139,26 +117,25 @@ impl WebSocketPool {
     ) -> WebSocket {
         let (send_stream, recv_stream) = stream.split();
         let (sender, receiver) = mpsc::channel(1024);
-        self.running.fetch_add(1, Ordering::AcqRel);
+        let task_supervisor = self.task_supervisor.start_async_task();
         tokio::spawn({
-            let this = self.clone();
             async move {
                 tokio::select! {
-                    () = this.stop_token.cancelled() => {},
+                    () = task_supervisor.stopped() => {},
                     _ = Self::start_send_loop(send_stream, receiver) => {}
                 }
-                this.finish_one_task();
             }
         });
+
         let web_socket = WebSocket::new(sender);
-        self.running.fetch_add(1, Ordering::AcqRel);
+        let task_supervisor = self.task_supervisor.start_async_task();
         tokio::spawn({
             let this = self.clone();
             let web_socket = web_socket.clone();
             let state = state.clone();
             async move {
                 tokio::select! {
-                    () = this.stop_token.cancelled() => {},
+                    () = task_supervisor.stopped() => {},
                     r = Self::start_recv_loop(recv_stream, web_socket, &state) => {
                         if let Err(e) = r {
                             tracing::error!("recv loop for {addr} failed: {e}");
@@ -167,7 +144,6 @@ impl WebSocketPool {
                         }
                     }
                 }
-                this.finish_one_task();
             }
         });
         web_socket
@@ -206,13 +182,6 @@ impl WebSocketPool {
                 .map_err(|e| Error::new(ErrorKind::WebSocketSendFailed, e.to_string()))?;
         }
         Ok(())
-    }
-
-    fn finish_one_task(&self) {
-        let running = self.running.fetch_sub(1, Ordering::AcqRel) - 1;
-        if running == 0 {
-            self.stopped_token.cancel();
-        }
     }
 }
 
