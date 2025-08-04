@@ -18,6 +18,9 @@ pub use router::{Method, Router};
 mod waiter;
 pub use waiter::Waiter;
 
+mod task_supervisor;
+pub use task_supervisor::TaskSupervisor;
+
 mod receiver;
 use receiver::Receiver;
 
