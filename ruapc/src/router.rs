@@ -1,16 +1,51 @@
+use std::{collections::HashMap, sync::Arc};
+
 use foldhash::fast::RandomState;
-use std::collections::HashMap;
+use schemars::{JsonSchema, Schema};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     Context, RecvMsg,
     error::{Error, ErrorKind, Result},
+    services::MetaService,
 };
 
-pub type Method = Box<dyn Fn(Context, RecvMsg) -> Result<()> + Send + Sync>;
+pub type Func = Box<dyn Fn(Context, RecvMsg) -> Result<()> + Send + Sync>;
 
-#[derive(Default)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
+pub struct MethodInfo {
+    pub req_schema: Schema,
+    pub rsp_schema: Schema,
+}
+
+pub struct Method {
+    pub info: MethodInfo,
+    func: Func,
+}
+
+impl Method {
+    #[must_use]
+    pub fn new(req_schema: Schema, rsp_schema: Schema, func: Func) -> Self {
+        Self {
+            info: MethodInfo {
+                req_schema,
+                rsp_schema,
+            },
+            func,
+        }
+    }
+}
+
 pub struct Router {
-    methods: HashMap<String, Method, RandomState>,
+    pub methods: HashMap<String, Method, RandomState>,
+}
+
+impl Default for Router {
+    fn default() -> Self {
+        Self {
+            methods: Arc::new(()).ruapc_export().into_iter().collect(),
+        }
+    }
 }
 
 impl Router {
@@ -23,8 +58,8 @@ impl Router {
     }
 
     pub fn dispatch(&self, mut ctx: Context, msg: RecvMsg) {
-        if let Some(func) = self.methods.get(&msg.meta.method) {
-            let _ = func(ctx, msg);
+        if let Some(method) = self.methods.get(&msg.meta.method) {
+            let _ = (method.func)(ctx, msg);
         } else {
             tokio::spawn(async move {
                 let m = format!("method not found: {}", msg.meta.method);

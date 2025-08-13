@@ -36,6 +36,8 @@ mod ws;
 mod state;
 pub use state::State;
 
+pub mod services;
+
 mod context;
 pub use context::{Context, SocketEndpoint};
 

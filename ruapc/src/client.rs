@@ -1,3 +1,4 @@
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_inline_default::serde_inline_default;
 use std::time::Duration;
@@ -38,8 +39,8 @@ impl Client {
         method_name: &str,
     ) -> std::result::Result<Rsp, E>
     where
-        Req: Serialize,
-        Rsp: for<'c> Deserialize<'c>,
+        Req: Serialize + JsonSchema,
+        Rsp: for<'c> Deserialize<'c> + JsonSchema,
         E: std::error::Error + From<crate::Error> + for<'c> Deserialize<'c>,
     {
         // 1. get socket.

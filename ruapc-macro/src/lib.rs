@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{FnArg, ItemTrait, TraitItem, parse_macro_input};
+use syn::{FnArg, ItemTrait, ReturnType, TraitItem, parse_macro_input};
 
 #[proc_macro_attribute]
 pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
@@ -23,6 +23,7 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
             && method.sig.asyncness.is_some()
             && let Some(receiver) = method.sig.receiver()
             && let FnArg::Typed(req_type) = &method.sig.inputs[2]
+            && let ReturnType::Type(_, rsp_type) = &method.sig.output
         {
             let method_ident = &method.sig.ident;
             if *method_ident == "ruapc_export" || *method_ident == "ruapc_request" {
@@ -41,11 +42,12 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
             send_bounds.push(quote! { Self::#method_ident(..): Send, });
             invoke_branchs.push(quote! {
                 let this = self.clone();
-                map.insert(
-                    #method_name.into(),
+                let method = #krate::Method::new(
+                    ::schemars::schema_for!(#req_type),
+                    ::schemars::schema_for!(#rsp_type),
                     Box::new(move |mut ctx, msg| {
                         let this = this.clone();
-                        tokio::spawn(async move {
+                        ::tokio::spawn(async move {
                             let meta = msg.meta.clone();
                             match msg.deserialize() {
                                 Ok(req) => {
@@ -60,6 +62,7 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
                         Ok(())
                     }),
                 );
+                map.insert(#method_name.into(), method);
             });
         } else {
             panic!(
@@ -81,7 +84,7 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
                 Self: 'static + Send + Sync,
                 #(#send_bounds)*
             {
-                let mut map = ::std::collections::HashMap::<String, #krate::Method>::default();
+                let mut map = ::std::collections::HashMap::new();
                 #(#invoke_branchs)*
                 map
             }
@@ -100,6 +103,6 @@ pub(crate) fn get_crate_name() -> proc_macro2::TokenStream {
             let ident = syn::Ident::new(&name, proc_macro2::Span::call_site());
             quote! { ::#ident }
         }
-        _ => quote! { ::crate },
+        _ => quote! { crate },
     }
 }
