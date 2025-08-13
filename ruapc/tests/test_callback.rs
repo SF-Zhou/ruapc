@@ -1,12 +1,13 @@
 #![feature(return_type_notation)]
 use ruapc::*;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{str::FromStr, sync::Arc};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct FooReq(u64);
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct FooRsp(u64);
 
 #[service]
@@ -24,10 +25,10 @@ impl FooService for FooServiceImpl {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct BarReq(u64);
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct BarRsp(u64);
 
 #[service]
