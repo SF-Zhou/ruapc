@@ -1,5 +1,6 @@
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
+use tokio::net::TcpStream;
 use tokio_util::sync::DropGuard;
 
 use crate::{
@@ -31,6 +32,16 @@ impl State {
             self.waiter.post(msg.meta.msgid, msg);
         }
         Ok(())
+    }
+
+    pub async fn handle_new_tcp_stream(self: Arc<Self>, tcp_stream: TcpStream, addr: SocketAddr) {
+        if let Err(e) = self
+            .socket_pool
+            .handle_new_tcp_stream(&self, tcp_stream, addr)
+            .await
+        {
+            tracing::error!("handle new tcp stream error: {e}");
+        }
     }
 
     pub(crate) fn drop_guard(&self) -> DropGuard {

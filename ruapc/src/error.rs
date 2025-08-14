@@ -14,6 +14,7 @@ pub enum ErrorKind {
     TcpRecvMsgFailed,
     TcpParseMsgFailed,
     WebSocketConnectFailed,
+    WebSocketAcceptFailed,
     WebSocketSendFailed,
     WebSocketRecvFailed,
     WebSocketClosed,
