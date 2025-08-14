@@ -36,38 +36,17 @@ impl WebSocketPool {
         })
     }
 
-    pub async fn start_listen(
+    pub async fn handle_new_tcp_stream(
         self: &Arc<Self>,
-        addr: SocketAddr,
         state: &Arc<State>,
-    ) -> Result<SocketAddr> {
-        let listener = tokio::net::TcpListener::bind(addr)
+        tcp_stream: TcpStream,
+        addr: SocketAddr,
+    ) -> Result<()> {
+        let stream = accept_async(MaybeTlsStream::Plain(tcp_stream))
             .await
-            .map_err(|e| Error::new(ErrorKind::TcpBindFailed, e.to_string()))?;
-        let listener_addr = listener
-            .local_addr()
-            .map_err(|e| Error::new(ErrorKind::TcpBindFailed, e.to_string()))?;
-        let this = self.clone();
-        let state = state.clone();
-
-        let task_supervisor = self.task_supervisor.start_async_task();
-        tokio::spawn(async move {
-            tokio::select! {
-                () = task_supervisor.stopped() => {
-                    tracing::info!("stop accept loop");
-                }
-                () = async {
-                    tracing::info!("start listening: ws://{listener_addr}");
-                    while let Ok((stream, addr)) = listener.accept().await {
-                        if let Ok(stream) = accept_async(MaybeTlsStream::Plain(stream)).await {
-                            let _ = this.add_socket(addr, stream, &state);
-                        }
-                    }
-                } => {}
-            }
-        });
-
-        Ok(listener_addr)
+            .map_err(|e| Error::new(ErrorKind::WebSocketAcceptFailed, e.to_string()))?;
+        self.add_socket(addr, stream, state);
+        Ok(())
     }
 
     pub fn stop(&self) {

@@ -2,6 +2,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use serde_inline_default::serde_inline_default;
+use tokio::net::TcpStream;
 use tokio_util::sync::DropGuard;
 
 use crate::{Result, Socket, State, tcp::TcpSocketPool, ws::WebSocketPool};
@@ -59,11 +60,21 @@ impl SocketPool {
     }
 
     /// # Errors
-    pub async fn start_listen(&self, addr: SocketAddr, state: &Arc<State>) -> Result<SocketAddr> {
+    pub async fn handle_new_tcp_stream(
+        &self,
+        state: &Arc<State>,
+        tcp_stream: TcpStream,
+        addr: SocketAddr,
+    ) -> Result<()> {
         match self {
-            SocketPool::Tcp(tcp_socket_pool) => tcp_socket_pool.start_listen(addr, state).await,
+            SocketPool::Tcp(tcp_socket_pool) => {
+                tcp_socket_pool.handle_new_tcp_stream(state, tcp_stream, addr);
+                Ok(())
+            }
             SocketPool::WebSocket(web_socket_pool) => {
-                web_socket_pool.start_listen(addr, state).await
+                web_socket_pool
+                    .handle_new_tcp_stream(state, tcp_stream, addr)
+                    .await
             }
         }
     }

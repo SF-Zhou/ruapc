@@ -31,36 +31,13 @@ impl TcpSocketPool {
         })
     }
 
-    pub async fn start_listen(
+    pub fn handle_new_tcp_stream(
         self: &Arc<Self>,
-        addr: SocketAddr,
         state: &Arc<State>,
-    ) -> Result<SocketAddr> {
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .map_err(|e| Error::new(ErrorKind::TcpBindFailed, e.to_string()))?;
-        let listener_addr = listener
-            .local_addr()
-            .map_err(|e| Error::new(ErrorKind::TcpBindFailed, e.to_string()))?;
-        let this = self.clone();
-        let state = state.clone();
-
-        let task_supervisor = self.task_supervisor.start_async_task();
-        tokio::spawn(async move {
-            tokio::select! {
-                () = task_supervisor.stopped() => {
-                    tracing::info!("stop accept loop");
-                }
-                () = async {
-                    tracing::info!("start listening: {listener_addr}");
-                    while let Ok((stream, addr)) = listener.accept().await {
-                        let _ = this.add_socket(addr, stream, &state);
-                    }
-                } => {}
-            }
-        });
-
-        Ok(listener_addr)
+        tcp_stream: TcpStream,
+        addr: SocketAddr,
+    ) {
+        let _ = self.add_socket(addr, tcp_stream, state);
     }
 
     pub fn stop(&self) {

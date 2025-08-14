@@ -41,6 +41,9 @@ pub mod services;
 mod context;
 pub use context::{Context, SocketEndpoint};
 
+mod listener;
+pub use listener::Listener;
+
 mod client;
 pub use client::{Client, ClientConfig};
 
