@@ -8,14 +8,13 @@ use hyper::{
     server::conn::http1::Builder,
 };
 use hyper_util::rt::TokioIo;
-use tokio::{
-    net::TcpStream,
-    sync::{Mutex, RwLock},
-};
+use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::DropGuard;
 
 use super::http_socket::{Connections, HttpSocket};
-use crate::{Error, ErrorKind, Message, MsgFlags, MsgMeta, Result, Socket, State, TaskSupervisor};
+use crate::{
+    Error, ErrorKind, Message, MsgFlags, MsgMeta, RawStream, Result, Socket, State, TaskSupervisor,
+};
 
 pub struct HttpSocketPool {
     socket_map: RwLock<HashMap<SocketAddr, HttpSocket, RandomState>>,
@@ -34,12 +33,19 @@ impl HttpSocketPool {
         })
     }
 
-    pub fn handle_new_tcp_stream(
+    pub fn handle_new_stream(
         self: &Arc<Self>,
         state: &Arc<State>,
-        tcp_stream: TcpStream,
+        stream: RawStream,
         addr: SocketAddr,
-    ) {
+    ) -> Result<()> {
+        let RawStream::TCP(tcp_stream) = stream else {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "invalid socket type".into(),
+            ));
+        };
+
         let this = self.clone();
         let state = state.clone();
         let connection = self
@@ -47,7 +53,7 @@ impl HttpSocketPool {
             .serve_connection(
                 TokioIo::new(tcp_stream),
                 hyper::service::service_fn(move |req: Request<Incoming>| {
-                    this.clone().handle_request(req, state.clone())
+                    this.clone().handle_request(req, state.clone(), addr)
                 }),
             )
             .with_upgrades();
@@ -63,13 +69,37 @@ impl HttpSocketPool {
                 }
             }
         });
+
+        Ok(())
     }
 
     pub async fn handle_request(
         self: Arc<Self>,
-        req: Request<Incoming>,
+        mut req: Request<Incoming>,
         state: Arc<State>,
+        addr: SocketAddr,
     ) -> Result<Response<Full<Bytes>>> {
+        if hyper_tungstenite::is_upgrade_request(&req) {
+            let (response, websocket) = hyper_tungstenite::upgrade(&mut req, None)
+                .map_err(|e| Error::new(ErrorKind::HttpUpgradeFailed, e.to_string()))?;
+
+            let state = state.clone();
+            tokio::spawn(async move {
+                let websocket = match websocket.await {
+                    Ok(socket) => socket,
+                    Err(err) => {
+                        tracing::error!("upgrade HTTP to WebSocket failed: {err}");
+                        return;
+                    }
+                };
+                state
+                    .handle_new_stream(RawStream::WS(Box::new(websocket)), addr)
+                    .await;
+            });
+
+            return Ok(response);
+        }
+
         let (msgid, rx) = state.waiter.alloc();
         let meta = MsgMeta {
             method: req.uri().path().trim_start_matches('/').to_string(),

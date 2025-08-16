@@ -28,10 +28,11 @@ mod socket;
 pub use socket::Socket;
 
 mod socket_pool;
-pub use socket_pool::{SocketPool, SocketPoolConfig, SocketType};
+pub use socket_pool::{RawStream, SocketPool, SocketPoolConfig, SocketType};
 
 mod http;
 mod tcp;
+mod unified;
 mod ws;
 
 mod state;
