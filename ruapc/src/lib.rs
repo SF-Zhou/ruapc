@@ -6,11 +6,11 @@ pub use ruapc_macro::service;
 mod error;
 pub use error::{Error, ErrorKind, Result};
 
-mod bytes;
-pub use bytes::Bytes;
+mod payload;
+pub use payload::Payload;
 
 mod msg;
-pub use msg::{MsgFlags, MsgMeta, RecvMsg};
+pub use msg::{Message, MsgFlags, MsgMeta};
 
 mod router;
 pub use router::{Method, Router};
@@ -30,6 +30,7 @@ pub use socket::Socket;
 mod socket_pool;
 pub use socket_pool::{SocketPool, SocketPoolConfig, SocketType};
 
+mod http;
 mod tcp;
 mod ws;
 

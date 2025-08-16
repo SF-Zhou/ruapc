@@ -3,9 +3,7 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio::net::TcpStream;
 use tokio_util::sync::DropGuard;
 
-use crate::{
-    Context, MsgFlags, RecvMsg, Result, Router, Socket, SocketPool, SocketPoolConfig, Waiter,
-};
+use crate::{Context, Message, Result, Router, Socket, SocketPool, SocketPoolConfig, Waiter};
 
 #[derive(Default)]
 pub struct State {
@@ -24,8 +22,8 @@ impl State {
     }
 
     /// # Errors
-    pub fn handle_recv(self: &Arc<Self>, socket: &Socket, msg: RecvMsg) -> Result<()> {
-        if msg.meta.flags.contains(MsgFlags::IsReq) {
+    pub fn handle_recv(self: &Arc<Self>, socket: &Socket, msg: Message) -> Result<()> {
+        if msg.meta.is_req() {
             let ctx = Context::server_ctx(self, socket.clone());
             self.router.dispatch(ctx, msg);
         } else {

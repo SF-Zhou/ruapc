@@ -5,12 +5,12 @@ use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Context, RecvMsg,
+    Context, Message,
     error::{Error, ErrorKind, Result},
     services::MetaService,
 };
 
-pub type Func = Box<dyn Fn(Context, RecvMsg) -> Result<()> + Send + Sync>;
+pub type Func = Box<dyn Fn(Context, Message) -> Result<()> + Send + Sync>;
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
 pub struct MethodInfo {
@@ -57,13 +57,13 @@ impl Router {
         self.methods.keys()
     }
 
-    pub fn dispatch(&self, mut ctx: Context, msg: RecvMsg) {
+    pub fn dispatch(&self, mut ctx: Context, msg: Message) {
         if let Some(method) = self.methods.get(&msg.meta.method) {
             let _ = (method.func)(ctx, msg);
         } else {
             tokio::spawn(async move {
                 let m = format!("method not found: {}", msg.meta.method);
-                tracing::error!(m);
+                tracing::error!("{}", m);
                 ctx.send_err_rsp(msg.meta, Error::new(ErrorKind::InvalidArgument, m))
                     .await;
             });

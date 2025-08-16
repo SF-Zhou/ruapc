@@ -18,6 +18,9 @@ pub enum ErrorKind {
     WebSocketSendFailed,
     WebSocketRecvFailed,
     WebSocketClosed,
+    HttpWaitRspFailed,
+    HttpBuildReqFailed,
+    HttpSendReqFailed,
     #[serde(untagged)]
     Unknown(String),
 }
