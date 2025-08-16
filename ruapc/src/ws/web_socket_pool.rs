@@ -7,21 +7,17 @@ use futures_util::{
     stream::{SplitSink, SplitStream},
 };
 use tokio::{
-    net::TcpStream,
+    io::{AsyncRead, AsyncWrite},
     sync::{RwLock, mpsc},
 };
-use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, accept_async, connect_async, tungstenite,
-};
+use tokio_tungstenite::{WebSocketStream, accept_async, connect_async, tungstenite};
 use tokio_util::sync::DropGuard;
 
 use super::WebSocket;
 use crate::{
-    Message, Socket, State, TaskSupervisor,
+    Message, RawStream, Socket, State, TaskSupervisor,
     error::{Error, ErrorKind, Result},
 };
-
-type Stream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 pub struct WebSocketPool {
     socket_map: RwLock<HashMap<SocketAddr, WebSocket, RandomState>>,
@@ -36,16 +32,23 @@ impl WebSocketPool {
         })
     }
 
-    pub async fn handle_new_tcp_stream(
+    pub async fn handle_new_stream(
         self: &Arc<Self>,
         state: &Arc<State>,
-        tcp_stream: TcpStream,
+        stream: RawStream,
         addr: SocketAddr,
     ) -> Result<()> {
-        let stream = accept_async(MaybeTlsStream::Plain(tcp_stream))
-            .await
-            .map_err(|e| Error::new(ErrorKind::WebSocketAcceptFailed, e.to_string()))?;
-        self.add_socket(addr, stream, state);
+        match stream {
+            RawStream::TCP(tcp_stream) => {
+                let stream = accept_async(tcp_stream)
+                    .await
+                    .map_err(|e| Error::new(ErrorKind::WebSocketAcceptFailed, e.to_string()))?;
+                self.add_socket(addr, stream, state);
+            }
+            RawStream::WS(web_socket_stream) => {
+                self.add_socket(addr, *web_socket_stream, state);
+            }
+        }
         Ok(())
     }
 
@@ -88,12 +91,15 @@ impl WebSocketPool {
         Ok(send_socket)
     }
 
-    pub fn add_socket(
+    pub fn add_socket<S>(
         self: &Arc<Self>,
         addr: SocketAddr,
-        stream: Stream,
+        stream: WebSocketStream<S>,
         state: &Arc<State>,
-    ) -> WebSocket {
+    ) -> WebSocket
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let (send_stream, recv_stream) = stream.split();
         let (sender, receiver) = mpsc::channel(1024);
         let task_supervisor = self.task_supervisor.start_async_task();
@@ -128,11 +134,14 @@ impl WebSocketPool {
         web_socket
     }
 
-    async fn start_recv_loop(
-        mut recv_stream: SplitStream<Stream>,
+    async fn start_recv_loop<S>(
+        mut recv_stream: SplitStream<WebSocketStream<S>>,
         web_socket: WebSocket,
         state: &Arc<State>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         let socket = Socket::WS(web_socket);
         while let Some(msg) = recv_stream.next().await {
             let msg = msg.map_err(|e| Error::new(ErrorKind::WebSocketRecvFailed, e.to_string()))?;
@@ -150,10 +159,13 @@ impl WebSocketPool {
         Ok(())
     }
 
-    async fn start_send_loop(
-        mut send_stream: SplitSink<Stream, tungstenite::Message>,
+    async fn start_send_loop<S>(
+        mut send_stream: SplitSink<WebSocketStream<S>, tungstenite::Message>,
         mut receiver: mpsc::Receiver<Bytes>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         while let Some(bytes) = receiver.recv().await {
             send_stream
                 .send(tungstenite::Message::Binary(bytes))

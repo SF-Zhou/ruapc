@@ -1,17 +1,24 @@
 use std::{net::SocketAddr, sync::Arc};
 
+use hyper::upgrade::Upgraded;
+use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use serde_inline_default::serde_inline_default;
 use tokio::net::TcpStream;
+use tokio_tungstenite::WebSocketStream;
 use tokio_util::sync::DropGuard;
 
-use crate::{Result, Socket, State, http::HttpSocketPool, tcp::TcpSocketPool, ws::WebSocketPool};
+use crate::{
+    Result, Socket, State, http::HttpSocketPool, tcp::TcpSocketPool, unified::UnifiedSocketPool,
+    ws::WebSocketPool,
+};
 
 #[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone, clap::ValueEnum)]
 pub enum SocketType {
     TCP,
     WS,
     HTTP,
+    UNIFIED,
 }
 
 impl std::fmt::Display for SocketType {
@@ -33,11 +40,17 @@ impl Default for SocketPoolConfig {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum SocketPool {
     TCP(Arc<TcpSocketPool>),
     WS(Arc<WebSocketPool>),
     HTTP(Arc<HttpSocketPool>),
+    UNIFIED(UnifiedSocketPool),
+}
+
+pub enum RawStream {
+    TCP(TcpStream),
+    WS(Box<WebSocketStream<TokioIo<Upgraded>>>),
 }
 
 impl SocketPool {
@@ -47,6 +60,7 @@ impl SocketPool {
             SocketType::TCP => SocketPool::TCP(TcpSocketPool::new()),
             SocketType::WS => SocketPool::WS(WebSocketPool::new()),
             SocketType::HTTP => SocketPool::HTTP(HttpSocketPool::new()),
+            SocketType::UNIFIED => SocketPool::UNIFIED(UnifiedSocketPool::new()),
         }
     }
 
@@ -63,29 +77,35 @@ impl SocketPool {
                 .acquire(addr, state)
                 .await
                 .map(Socket::HTTP),
+            SocketPool::UNIFIED(unified_socket_pool) => unified_socket_pool
+                .tcp_socket_pool
+                .acquire(addr, state)
+                .await
+                .map(Socket::TCP),
         }
     }
 
     /// # Errors
-    pub async fn handle_new_tcp_stream(
+    pub async fn handle_new_stream(
         &self,
         state: &Arc<State>,
-        tcp_stream: TcpStream,
+        stream: RawStream,
         addr: SocketAddr,
     ) -> Result<()> {
         match self {
             SocketPool::TCP(tcp_socket_pool) => {
-                tcp_socket_pool.handle_new_tcp_stream(state, tcp_stream, addr);
-                Ok(())
+                tcp_socket_pool.handle_new_stream(state, stream, addr)
             }
             SocketPool::WS(web_socket_pool) => {
-                web_socket_pool
-                    .handle_new_tcp_stream(state, tcp_stream, addr)
-                    .await
+                web_socket_pool.handle_new_stream(state, stream, addr).await
             }
             SocketPool::HTTP(http_socket_pool) => {
-                http_socket_pool.handle_new_tcp_stream(state, tcp_stream, addr);
-                Ok(())
+                http_socket_pool.handle_new_stream(state, stream, addr)
+            }
+            SocketPool::UNIFIED(unified_socket_pool) => {
+                unified_socket_pool
+                    .handle_new_stream(state, stream, addr)
+                    .await
             }
         }
     }
@@ -95,6 +115,7 @@ impl SocketPool {
             SocketPool::TCP(tcp_socket_pool) => tcp_socket_pool.stop(),
             SocketPool::WS(web_socket_pool) => web_socket_pool.stop(),
             SocketPool::HTTP(http_socket_pool) => http_socket_pool.stop(),
+            SocketPool::UNIFIED(unified_socket_pool) => unified_socket_pool.stop(),
         }
     }
 
@@ -104,6 +125,7 @@ impl SocketPool {
             SocketPool::TCP(tcp_socket_pool) => tcp_socket_pool.drop_guard(),
             SocketPool::WS(web_socket_pool) => web_socket_pool.drop_guard(),
             SocketPool::HTTP(http_socket_pool) => http_socket_pool.drop_guard(),
+            SocketPool::UNIFIED(unified_socket_pool) => unified_socket_pool.drop_guard(),
         }
     }
 
@@ -112,6 +134,7 @@ impl SocketPool {
             SocketPool::TCP(tcp_socket_pool) => tcp_socket_pool.join().await,
             SocketPool::WS(web_socket_pool) => web_socket_pool.join().await,
             SocketPool::HTTP(http_socket_pool) => http_socket_pool.join().await,
+            SocketPool::UNIFIED(unified_socket_pool) => unified_socket_pool.join().await,
         }
     }
 }
