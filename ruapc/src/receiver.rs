@@ -1,16 +1,16 @@
 use tokio::sync::oneshot;
 
-use crate::{Error, ErrorKind, RecvMsg, Result};
+use crate::{Error, ErrorKind, Message, Result};
 
 #[derive(Debug)]
 pub enum Receiver {
     None,
-    OneShotRx(oneshot::Receiver<RecvMsg>),
+    OneShotRx(oneshot::Receiver<Message>),
 }
 
 impl Receiver {
     /// # Errors
-    pub async fn recv(self) -> Result<RecvMsg> {
+    pub async fn recv(self) -> Result<Message> {
         match self {
             Receiver::None => Err(Error::kind(ErrorKind::InvalidArgument)),
             Receiver::OneShotRx(rx) => rx

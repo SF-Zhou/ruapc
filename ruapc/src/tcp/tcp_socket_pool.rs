@@ -14,7 +14,7 @@ use tokio_util::sync::DropGuard;
 
 use super::TcpSocket;
 use crate::{
-    RecvMsg, Socket, State, TaskSupervisor,
+    Message, Socket, State, TaskSupervisor,
     error::{Error, ErrorKind, Result},
 };
 
@@ -153,11 +153,11 @@ impl TcpSocketPool {
         tcp_socket: TcpSocket,
         state: &Arc<State>,
     ) -> Result<()> {
-        let mut buffer = bytes::BytesMut::with_capacity(1 << 20);
-        let socket = Socket::Tcp(tcp_socket);
+        let mut buffer = BytesMut::with_capacity(1 << 20);
+        let socket = Socket::TCP(tcp_socket);
         loop {
             if let Some(bytes) = Self::parse_message(&mut buffer)? {
-                let msg = RecvMsg::parse(bytes)?;
+                let msg = Message::parse(bytes)?;
                 state.handle_recv(&socket, msg)?;
             } else {
                 let n = recv_stream

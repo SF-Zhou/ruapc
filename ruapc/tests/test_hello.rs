@@ -22,7 +22,7 @@ impl Foo for FooImpl {
 async fn test_hello() {
     tracing_subscriber::fmt().init();
 
-    for socket_type in [SocketType::TCP, SocketType::WebSocket] {
+    for socket_type in [SocketType::TCP, SocketType::WS, SocketType::HTTP] {
         let foo = Arc::new(FooImpl);
         let mut router = ruapc::Router::default();
         router.add_methods(foo.ruapc_export());

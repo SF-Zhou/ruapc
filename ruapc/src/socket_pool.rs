@@ -5,12 +5,13 @@ use serde_inline_default::serde_inline_default;
 use tokio::net::TcpStream;
 use tokio_util::sync::DropGuard;
 
-use crate::{Result, Socket, State, tcp::TcpSocketPool, ws::WebSocketPool};
+use crate::{Result, Socket, State, http::HttpSocketPool, tcp::TcpSocketPool, ws::WebSocketPool};
 
 #[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone, clap::ValueEnum)]
 pub enum SocketType {
     TCP,
-    WebSocket,
+    WS,
+    HTTP,
 }
 
 impl std::fmt::Display for SocketType {
@@ -34,28 +35,34 @@ impl Default for SocketPoolConfig {
 
 #[derive(Clone, Debug)]
 pub enum SocketPool {
-    Tcp(Arc<TcpSocketPool>),
-    WebSocket(Arc<WebSocketPool>),
+    TCP(Arc<TcpSocketPool>),
+    WS(Arc<WebSocketPool>),
+    HTTP(Arc<HttpSocketPool>),
 }
 
 impl SocketPool {
     #[must_use]
     pub fn create(config: &SocketPoolConfig) -> Self {
         match config.socket_type {
-            SocketType::TCP => SocketPool::Tcp(TcpSocketPool::new()),
-            SocketType::WebSocket => SocketPool::WebSocket(WebSocketPool::new()),
+            SocketType::TCP => SocketPool::TCP(TcpSocketPool::new()),
+            SocketType::WS => SocketPool::WS(WebSocketPool::new()),
+            SocketType::HTTP => SocketPool::HTTP(HttpSocketPool::new()),
         }
     }
 
     /// # Errors
     pub async fn acquire(&self, addr: &SocketAddr, state: &Arc<State>) -> Result<Socket> {
         match self {
-            SocketPool::Tcp(tcp_socket_pool) => {
-                tcp_socket_pool.acquire(addr, state).await.map(Socket::Tcp)
+            SocketPool::TCP(tcp_socket_pool) => {
+                tcp_socket_pool.acquire(addr, state).await.map(Socket::TCP)
             }
-            SocketPool::WebSocket(web_socket_pool) => {
+            SocketPool::WS(web_socket_pool) => {
                 web_socket_pool.acquire(addr, state).await.map(Socket::WS)
             }
+            SocketPool::HTTP(http_socket_pool) => http_socket_pool
+                .acquire(addr, state)
+                .await
+                .map(Socket::HTTP),
         }
     }
 
@@ -67,43 +74,50 @@ impl SocketPool {
         addr: SocketAddr,
     ) -> Result<()> {
         match self {
-            SocketPool::Tcp(tcp_socket_pool) => {
+            SocketPool::TCP(tcp_socket_pool) => {
                 tcp_socket_pool.handle_new_tcp_stream(state, tcp_stream, addr);
                 Ok(())
             }
-            SocketPool::WebSocket(web_socket_pool) => {
+            SocketPool::WS(web_socket_pool) => {
                 web_socket_pool
                     .handle_new_tcp_stream(state, tcp_stream, addr)
                     .await
+            }
+            SocketPool::HTTP(http_socket_pool) => {
+                http_socket_pool.handle_new_tcp_stream(state, tcp_stream, addr);
+                Ok(())
             }
         }
     }
 
     pub fn stop(&self) {
         match self {
-            SocketPool::Tcp(tcp_socket_pool) => tcp_socket_pool.stop(),
-            SocketPool::WebSocket(web_socket_pool) => web_socket_pool.stop(),
+            SocketPool::TCP(tcp_socket_pool) => tcp_socket_pool.stop(),
+            SocketPool::WS(web_socket_pool) => web_socket_pool.stop(),
+            SocketPool::HTTP(http_socket_pool) => http_socket_pool.stop(),
         }
     }
 
     #[must_use]
     pub fn drop_guard(&self) -> DropGuard {
         match self {
-            SocketPool::Tcp(tcp_socket_pool) => tcp_socket_pool.drop_guard(),
-            SocketPool::WebSocket(web_socket_pool) => web_socket_pool.drop_guard(),
+            SocketPool::TCP(tcp_socket_pool) => tcp_socket_pool.drop_guard(),
+            SocketPool::WS(web_socket_pool) => web_socket_pool.drop_guard(),
+            SocketPool::HTTP(http_socket_pool) => http_socket_pool.drop_guard(),
         }
     }
 
     pub async fn join(&self) {
         match self {
-            SocketPool::Tcp(tcp_socket_pool) => tcp_socket_pool.join().await,
-            SocketPool::WebSocket(web_socket_pool) => web_socket_pool.join().await,
+            SocketPool::TCP(tcp_socket_pool) => tcp_socket_pool.join().await,
+            SocketPool::WS(web_socket_pool) => web_socket_pool.join().await,
+            SocketPool::HTTP(http_socket_pool) => http_socket_pool.join().await,
         }
     }
 }
 
 impl Default for SocketPool {
     fn default() -> Self {
-        SocketPool::Tcp(TcpSocketPool::new())
+        SocketPool::TCP(TcpSocketPool::new())
     }
 }

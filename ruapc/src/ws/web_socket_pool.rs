@@ -11,13 +11,13 @@ use tokio::{
     sync::{RwLock, mpsc},
 };
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, accept_async, connect_async, tungstenite::Message,
+    MaybeTlsStream, WebSocketStream, accept_async, connect_async, tungstenite,
 };
 use tokio_util::sync::DropGuard;
 
 use super::WebSocket;
 use crate::{
-    RecvMsg, Socket, State, TaskSupervisor,
+    Message, Socket, State, TaskSupervisor,
     error::{Error, ErrorKind, Result},
 };
 
@@ -137,11 +137,11 @@ impl WebSocketPool {
         while let Some(msg) = recv_stream.next().await {
             let msg = msg.map_err(|e| Error::new(ErrorKind::WebSocketRecvFailed, e.to_string()))?;
             match msg {
-                Message::Binary(bytes) => {
-                    let msg = RecvMsg::parse(bytes)?;
+                tungstenite::Message::Binary(bytes) => {
+                    let msg = Message::parse(bytes)?;
                     state.handle_recv(&socket, msg)?;
                 }
-                Message::Close(_) => {
+                tungstenite::Message::Close(_) => {
                     return Err(Error::kind(ErrorKind::WebSocketClosed));
                 }
                 _ => {}
@@ -151,12 +151,12 @@ impl WebSocketPool {
     }
 
     async fn start_send_loop(
-        mut send_stream: SplitSink<Stream, Message>,
+        mut send_stream: SplitSink<Stream, tungstenite::Message>,
         mut receiver: mpsc::Receiver<Bytes>,
     ) -> Result<()> {
         while let Some(bytes) = receiver.recv().await {
             send_stream
-                .send(Message::Binary(bytes))
+                .send(tungstenite::Message::Binary(bytes))
                 .await
                 .map_err(|e| Error::new(ErrorKind::WebSocketSendFailed, e.to_string()))?;
         }

@@ -75,3 +75,13 @@ async fn main() {
     println!("echo rsp: {:?}", rsp);
 }
 ```
+
+You could also directly execute the stress program provided in ruapc-demo.
+
+```bash
+# 1. start the server. the socket type can be tcp, ws, and http.
+cargo run --release --bin server -- --socket-type http
+
+# 2. start the client.
+cargo run --release --bin client -- --socket-type http --stress --coroutines 128 --secs 3600
+```

@@ -1,9 +1,11 @@
+use std::sync::Arc;
+
 use bytes::{Bytes, BytesMut};
 use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::{
-    MsgFlags, Receiver, Waiter,
+    Receiver, State,
     error::{Error, ErrorKind, Result},
     msg::{MsgMeta, SendMsg},
 };
@@ -22,7 +24,7 @@ impl TcpSocket {
         &self,
         meta: &mut MsgMeta,
         payload: &P,
-        waiter: &Waiter,
+        state: &Arc<State>,
     ) -> Result<Receiver> {
         struct TcpSocketBytes(BytesMut);
 
@@ -57,8 +59,8 @@ impl TcpSocket {
             }
         }
 
-        let receiver = if meta.flags.contains(MsgFlags::IsReq) {
-            let (msgid, rx) = waiter.alloc();
+        let receiver = if meta.is_req() {
+            let (msgid, rx) = state.waiter.alloc();
             meta.msgid = msgid;
             Receiver::OneShotRx(rx)
         } else {

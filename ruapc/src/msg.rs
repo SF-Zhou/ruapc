@@ -1,10 +1,11 @@
 use std::io::Write;
 
 use bitflags::bitflags;
+use bytes::BytesMut;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Bytes,
+    Payload,
     error::{Error, ErrorKind, Result},
 };
 
@@ -27,20 +28,31 @@ pub struct MsgMeta {
     pub msgid: u64,
 }
 
-#[derive(Debug, Default)]
-pub struct RecvMsg {
-    pub meta: MsgMeta,
-    payload: Bytes,
+impl MsgMeta {
+    #[must_use]
+    pub fn is_req(&self) -> bool {
+        self.flags.contains(MsgFlags::IsReq)
+    }
 }
 
-impl RecvMsg {
-    /// # Errors
-    pub fn parse(bytes: impl Into<Bytes>) -> Result<Self> {
-        const S: usize = std::mem::size_of::<u32>();
-        let mut bytes: Bytes = bytes.into();
+#[derive(Debug, Default)]
+pub struct Message {
+    pub meta: MsgMeta,
+    pub payload: Payload,
+}
 
-        let len = bytes.len();
-        let meta_len = if let Ok(b) = bytes[..S].try_into() {
+impl Message {
+    pub fn new(meta: MsgMeta, payload: Payload) -> Self {
+        Self { meta, payload }
+    }
+
+    /// # Errors
+    pub fn parse(payload: impl Into<Payload>) -> Result<Self> {
+        const S: usize = std::mem::size_of::<u32>();
+        let mut payload: Payload = payload.into();
+
+        let len = payload.len();
+        let meta_len = if let Ok(b) = payload[..S].try_into() {
             u32::from_be_bytes(b) as usize
         } else {
             return Err(Error::new(
@@ -64,17 +76,14 @@ impl RecvMsg {
             ));
         }
 
-        let meta: MsgMeta = if bytes[S] == b'{' {
-            serde_json::from_slice(&bytes[S..offset])?
+        let meta: MsgMeta = if payload[S] == b'{' {
+            serde_json::from_slice(&payload[S..offset])?
         } else {
-            rmp_serde::from_slice(&bytes[S..offset])?
+            rmp_serde::from_slice(&payload[S..offset])?
         };
 
-        bytes.advance(offset);
-        Ok(RecvMsg {
-            meta,
-            payload: bytes,
-        })
+        payload.advance(offset);
+        Ok(Message { meta, payload })
     }
 
     /// # Errors
@@ -128,7 +137,7 @@ impl MsgMeta {
     }
 }
 
-impl SendMsg for bytes::BytesMut {
+impl SendMsg for BytesMut {
     fn size(&self) -> usize {
         self.len()
     }
@@ -146,7 +155,7 @@ impl SendMsg for bytes::BytesMut {
 
     fn writer(&mut self) -> impl std::io::Write {
         #[repr(transparent)]
-        struct Writer<'a>(&'a mut bytes::BytesMut);
+        struct Writer<'a>(&'a mut BytesMut);
 
         impl std::io::Write for Writer<'_> {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
