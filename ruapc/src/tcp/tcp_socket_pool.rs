@@ -14,7 +14,7 @@ use tokio_util::sync::DropGuard;
 
 use super::TcpSocket;
 use crate::{
-    Message, Socket, State, TaskSupervisor,
+    Message, RawStream, Socket, State, TaskSupervisor,
     error::{Error, ErrorKind, Result},
 };
 
@@ -31,13 +31,21 @@ impl TcpSocketPool {
         })
     }
 
-    pub fn handle_new_tcp_stream(
+    pub fn handle_new_stream(
         self: &Arc<Self>,
         state: &Arc<State>,
-        tcp_stream: TcpStream,
+        stream: RawStream,
         addr: SocketAddr,
-    ) {
+    ) -> Result<()> {
+        let RawStream::TCP(tcp_stream) = stream else {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "invalid socket type".into(),
+            ));
+        };
+
         let _ = self.add_socket(addr, tcp_stream, state);
+        Ok(())
     }
 
     pub fn stop(&self) {

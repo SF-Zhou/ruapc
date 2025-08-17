@@ -2,7 +2,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use tokio_util::sync::DropGuard;
 
-use crate::{Error, ErrorKind, Result, State, TaskSupervisor};
+use crate::{Error, ErrorKind, RawStream, Result, State, TaskSupervisor};
 
 pub struct Listener {
     task_supervisor: TaskSupervisor,
@@ -41,7 +41,7 @@ impl Listener {
                 () = async {
                     tracing::info!("start listening: {listener_addr}");
                     while let Ok((stream, addr)) = listener.accept().await {
-                        tokio::spawn(state.clone().handle_new_tcp_stream(stream, addr));
+                        tokio::spawn(state.clone().handle_new_stream(RawStream::TCP(stream), addr));
                     }
                 } => {}
             }

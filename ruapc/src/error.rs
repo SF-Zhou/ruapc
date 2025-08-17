@@ -21,6 +21,7 @@ pub enum ErrorKind {
     HttpWaitRspFailed,
     HttpBuildReqFailed,
     HttpSendReqFailed,
+    HttpUpgradeFailed,
     #[serde(untagged)]
     Unknown(String),
 }
