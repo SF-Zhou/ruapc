@@ -13,6 +13,7 @@ pub struct Metadata {
 #[ruapc_macro::service]
 pub trait MetaService {
     async fn get_metadata(&self, ctx: &Context, req: &()) -> Result<Metadata>;
+    async fn list_methods(&self, ctx: &Context, req: &()) -> Result<Vec<String>>;
 }
 
 impl MetaService for () {
@@ -25,5 +26,9 @@ impl MetaService for () {
             .map(|(name, method)| (name.clone(), method.info.clone()))
             .collect();
         Ok(Metadata { methods })
+    }
+
+    async fn list_methods(&self, ctx: &Context, (): &()) -> Result<Vec<String>> {
+        Ok(ctx.state.router.methods.keys().cloned().collect())
     }
 }

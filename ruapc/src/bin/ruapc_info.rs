@@ -12,9 +12,13 @@ pub struct Args {
     #[arg(long, default_value = "tcp")]
     pub socket_type: SocketType,
 
-    /// Use `MessagePack`
+    /// Use `MessagePack`.
     #[arg(long, default_value_t = false)]
     pub use_msgpack: bool,
+
+    /// Get metadata.
+    #[arg(long, default_value_t = false)]
+    pub get_metadata: bool,
 }
 
 #[tokio::main]
@@ -31,8 +35,16 @@ async fn main() {
             ..Default::default()
         },
     };
-    match client.get_metadata(&ctx, &()).await {
-        Ok(rsp) => println!("{}", serde_json::to_string_pretty(&rsp).unwrap()),
-        Err(err) => eprintln!("request failed: {err}"),
+
+    if args.get_metadata {
+        match client.get_metadata(&ctx, &()).await {
+            Ok(rsp) => println!("{}", serde_json::to_string_pretty(&rsp).unwrap()),
+            Err(err) => eprintln!("request failed: {err}"),
+        }
+    } else {
+        match client.list_methods(&ctx, &()).await {
+            Ok(rsp) => println!("{}", serde_json::to_string_pretty(&rsp).unwrap()),
+            Err(err) => eprintln!("request failed: {err}"),
+        }
     }
 }
