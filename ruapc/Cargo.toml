@@ -19,6 +19,7 @@ foldhash.workspace = true
 http-body-util.workspace = true
 humantime-serde.workspace = true
 hyper.workspace = true
+hyper-tungstenite.workspace = true
 hyper-util.workspace = true
 rmp-serde.workspace = true
 schemars.workspace = true

@@ -79,9 +79,17 @@ async fn main() {
 You could also directly execute the stress program provided in ruapc-demo.
 
 ```bash
-# 1. start the server. the socket type can be tcp, ws, and http.
-cargo run --release --bin server -- --socket-type http
+# 1. start the server. the socket type can be `tcp`, `ws`, `http`, or `unified`, where `unified` supports TCP, WebSocket, and HTTP protocols simultaneously.
+cargo run --release --bin server -- --socket-type unified
 
 # 2. start the client.
-cargo run --release --bin client -- --socket-type http --stress --coroutines 128 --secs 3600
+cargo run --release --bin client -- --stress --coroutines 128 --secs 10 --socket-type tcp
+cargo run --release --bin client -- --stress --coroutines 128 --secs 10 --socket-type ws
+cargo run --release --bin client -- --stress --coroutines 128 --secs 10 --socket-type http
+
+# 3. you can also use curl to send HTTP requests.
+curl -s -X POST -d '"hello HTTP"' http://0.0.0.0:8000/EchoService/echo | json_pp
+#> {
+#>    "Ok" : "hello HTTP"
+#> }
 ```
