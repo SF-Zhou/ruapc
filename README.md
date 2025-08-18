@@ -92,4 +92,13 @@ curl -s -X POST -d '"hello HTTP"' http://0.0.0.0:8000/EchoService/echo | json_pp
 #> {
 #>    "Ok" : "hello HTTP"
 #> }
+curl -s -X POST http://0.0.0.0:8000/MetaService/list_methods | json_pp
+#> {
+#>    "Ok" : [
+#>       "EchoService/echo",
+#>       "MetaService/list_methods",
+#>       "MetaService/get_metadata",
+#>       "GreetService/greet"
+#>    ]
+#> }
 ```
