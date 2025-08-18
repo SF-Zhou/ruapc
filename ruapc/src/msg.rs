@@ -88,7 +88,10 @@ impl Message {
 
     /// # Errors
     pub fn deserialize<P: for<'c> Deserialize<'c>>(self) -> Result<P> {
-        if self.meta.flags.contains(MsgFlags::UseMessagePack) {
+        if self.payload.is_empty() {
+            // for an empty payload, treat it as a null value, which allows using curl to send body-less requests.
+            Ok(serde_json::from_value(serde_json::Value::Null)?)
+        } else if self.meta.flags.contains(MsgFlags::UseMessagePack) {
             Ok(rmp_serde::from_slice(&self.payload)?)
         } else {
             Ok(serde_json::from_slice(&self.payload)?)

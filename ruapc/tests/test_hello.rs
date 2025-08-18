@@ -48,3 +48,37 @@ async fn test_hello() {
         client.hello(&ctx, &"ruapc".to_string()).await.unwrap_err();
     }
 }
+
+#[tokio::test]
+async fn test_http() {
+    let foo = Arc::new(FooImpl);
+    let mut router = ruapc::Router::default();
+    router.add_methods(foo.ruapc_export());
+
+    let config = SocketPoolConfig {
+        socket_type: SocketType::UNIFIED,
+    };
+    let server = ruapc::Server::create(router, &config);
+    let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
+    let addr = server.listen(addr).await.unwrap();
+
+    let client = reqwest::Client::new();
+    let req = client
+        .post(format!("http://{}/MetaService/list_methods", addr))
+        .build()
+        .unwrap();
+    let rsp = client
+        .execute(req)
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<ruapc::Result<Vec<String>>>()
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(rsp.len() > 0);
+
+    server.stop();
+    server.join().await;
+}
