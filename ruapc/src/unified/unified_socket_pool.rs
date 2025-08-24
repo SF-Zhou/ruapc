@@ -3,8 +3,10 @@ use std::{net::SocketAddr, sync::Arc};
 use futures_util::TryFutureExt;
 use tokio_util::sync::DropGuard;
 
+#[cfg(feature = "rdma")]
+use crate::rdma::{Endpoint, RdmaInfo, RdmaSocketPool};
 use crate::{
-    Error, ErrorKind, RawStream, Result, State, TaskSupervisor,
+    Error, ErrorKind, RawStream, Result, Socket, SocketType, State, TaskSupervisor,
     http::HttpSocketPool,
     tcp::{self, TcpSocketPool},
     ws::WebSocketPool,
@@ -14,21 +16,19 @@ pub struct UnifiedSocketPool {
     pub tcp_socket_pool: Arc<TcpSocketPool>,
     pub web_socket_pool: Arc<WebSocketPool>,
     pub http_socket_pool: Arc<HttpSocketPool>,
+    #[cfg(feature = "rdma")]
+    pub rdma_socket_pool: Arc<RdmaSocketPool>,
     task_supervisor: TaskSupervisor,
 }
 
-impl Default for UnifiedSocketPool {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl UnifiedSocketPool {
-    pub fn new() -> Self {
+    pub fn create() -> Result<Self> {
         let this = Self {
             tcp_socket_pool: TcpSocketPool::new(),
             web_socket_pool: WebSocketPool::new(),
             http_socket_pool: HttpSocketPool::new(),
+            #[cfg(feature = "rdma")]
+            rdma_socket_pool: RdmaSocketPool::create()?,
             task_supervisor: TaskSupervisor::create(),
         };
 
@@ -36,14 +36,49 @@ impl UnifiedSocketPool {
         let tcp_guard = this.tcp_socket_pool.drop_guard();
         let web_guard = this.web_socket_pool.drop_guard();
         let http_guard = this.http_socket_pool.drop_guard();
+        #[cfg(feature = "rdma")]
+        let rdma_guard = this.rdma_socket_pool.drop_guard();
         tokio::spawn(async move {
             task_guard.stopped().await;
             drop(http_guard);
             drop(web_guard);
             drop(tcp_guard);
+            #[cfg(feature = "rdma")]
+            drop(rdma_guard);
         });
 
-        this
+        Ok(this)
+    }
+
+    pub async fn acquire(
+        &self,
+        addr: &SocketAddr,
+        socket_type: SocketType,
+        state: &Arc<State>,
+    ) -> Result<Socket> {
+        match socket_type {
+            SocketType::TCP | SocketType::UNIFIED => self
+                .tcp_socket_pool
+                .acquire(addr, SocketType::TCP, state)
+                .await
+                .map(Socket::TCP),
+            SocketType::WS => self
+                .web_socket_pool
+                .acquire(addr, SocketType::WS, state)
+                .await
+                .map(Socket::WS),
+            SocketType::HTTP => self
+                .http_socket_pool
+                .acquire(addr, SocketType::HTTP, state)
+                .await
+                .map(Socket::HTTP),
+            #[cfg(feature = "rdma")]
+            SocketType::RDMA => self
+                .rdma_socket_pool
+                .acquire(addr, SocketType::RDMA, state)
+                .await
+                .map(Socket::RDMA),
+        }
     }
 
     pub async fn handle_new_stream(
@@ -75,6 +110,16 @@ impl UnifiedSocketPool {
         }
     }
 
+    #[cfg(feature = "rdma")]
+    pub fn rdma_info(&self) -> RdmaInfo {
+        self.rdma_socket_pool.rdma_info()
+    }
+
+    #[cfg(feature = "rdma")]
+    pub fn rdma_connect(&self, endpoint: &Endpoint, state: &Arc<State>) -> Result<Endpoint> {
+        self.rdma_socket_pool.rdma_connect(endpoint, state)
+    }
+
     pub fn stop(&self) {
         self.task_supervisor.stop();
     }
@@ -87,6 +132,8 @@ impl UnifiedSocketPool {
         self.http_socket_pool.join().await;
         self.web_socket_pool.join().await;
         self.tcp_socket_pool.join().await;
+        #[cfg(feature = "rdma")]
+        self.rdma_socket_pool.join().await;
         self.task_supervisor.all_stopped().await;
     }
 }

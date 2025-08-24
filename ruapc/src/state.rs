@@ -14,12 +14,19 @@ pub struct State {
 }
 
 impl State {
-    pub(crate) fn create(router: Router, config: &SocketPoolConfig) -> Self {
-        Self {
+    /// # Errors
+    pub(crate) fn create(
+        router: Router,
+        config: &SocketPoolConfig,
+    ) -> Result<(Arc<Self>, DropGuard)> {
+        let state = Self {
             router,
             waiter: Arc::default(),
-            socket_pool: SocketPool::create(config),
-        }
+            socket_pool: SocketPool::create(config)?,
+        };
+        let state = Arc::new(state);
+        let drop_guard = state.drop_guard();
+        Ok((state, drop_guard))
     }
 
     /// # Errors
@@ -45,5 +52,11 @@ impl State {
 
     pub(crate) fn drop_guard(&self) -> DropGuard {
         self.socket_pool.drop_guard()
+    }
+}
+
+impl std::fmt::Debug for State {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("State").finish()
     }
 }

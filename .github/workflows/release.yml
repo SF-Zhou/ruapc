@@ -18,6 +18,9 @@ jobs:
       id: auth
 
     - run: |
+        sudo prlimit --pid $$ -l=unlimited && ulimit -a
+        sudo apt install -y pkg-config libibverbs-dev ibverbs-utils
+        ibv_devinfo -d rxe_0 -v
         cargo publish -p ruapc-macro || echo skip publishing ruapc-macro
         cargo publish -p ruapc
       env:

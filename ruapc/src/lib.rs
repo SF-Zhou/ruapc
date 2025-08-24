@@ -31,6 +31,8 @@ mod socket_pool;
 pub use socket_pool::{RawStream, SocketPool, SocketPoolConfig, SocketType};
 
 mod http;
+#[cfg(feature = "rdma")]
+mod rdma;
 mod tcp;
 mod unified;
 mod ws;
@@ -47,7 +49,7 @@ mod listener;
 pub use listener::Listener;
 
 mod client;
-pub use client::{Client, ClientConfig};
+pub use client::Client;
 
 mod server;
 pub use server::Server;

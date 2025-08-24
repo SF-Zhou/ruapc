@@ -15,7 +15,7 @@ use tokio_util::sync::DropGuard;
 
 use super::WebSocket;
 use crate::{
-    Message, RawStream, Socket, State, TaskSupervisor,
+    Message, RawStream, Socket, SocketType, State, TaskSupervisor,
     error::{Error, ErrorKind, Result},
 };
 
@@ -67,8 +67,16 @@ impl WebSocketPool {
     pub async fn acquire(
         self: &Arc<Self>,
         addr: &SocketAddr,
+        socket_type: SocketType,
         state: &Arc<State>,
     ) -> Result<WebSocket> {
+        if socket_type != SocketType::WS {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                format!("invalid socket type {socket_type} for WebSocketPool"),
+            ));
+        }
+
         // Check if the socket is already in the socket map.
         if let Ok(socket_map) = self.socket_map.try_read()
             && let Some(socket) = socket_map.get(addr)
