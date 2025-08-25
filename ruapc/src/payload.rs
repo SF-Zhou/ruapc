@@ -1,10 +1,12 @@
 use bytes::{Buf, Bytes, BytesMut};
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub enum Payload {
     #[default]
     Empty,
     Normal(Bytes),
+    #[cfg(feature = "rdma")]
+    RDMA(ruapc_rdma::Buffer, usize),
 }
 
 impl Payload {
@@ -12,6 +14,8 @@ impl Payload {
         match self {
             Payload::Empty => 0,
             Payload::Normal(bytes) => bytes.len(),
+            #[cfg(feature = "rdma")]
+            Payload::RDMA(buffer, off) => buffer.len() - off,
         }
     }
 
@@ -19,6 +23,8 @@ impl Payload {
         match self {
             Payload::Empty => true,
             Payload::Normal(bytes) => bytes.is_empty(),
+            #[cfg(feature = "rdma")]
+            Payload::RDMA(buffer, off) => buffer.len() == *off,
         }
     }
 
@@ -26,6 +32,8 @@ impl Payload {
         match self {
             Payload::Empty => &[],
             Payload::Normal(bytes) => bytes,
+            #[cfg(feature = "rdma")]
+            Payload::RDMA(buffer, off) => &buffer[*off..],
         }
     }
 
@@ -33,6 +41,8 @@ impl Payload {
         match self {
             Payload::Empty => {}
             Payload::Normal(bytes) => bytes.advance(offset),
+            #[cfg(feature = "rdma")]
+            Payload::RDMA(_, off) => *off += offset,
         }
     }
 }
@@ -62,6 +72,15 @@ impl From<Payload> for Bytes {
         match value {
             Payload::Empty => Bytes::new(),
             Payload::Normal(bytes) => bytes,
+            #[cfg(feature = "rdma")]
+            Payload::RDMA(buffer, off) => Bytes::copy_from_slice(&buffer[off..]),
         }
+    }
+}
+
+#[cfg(feature = "rdma")]
+impl From<ruapc_rdma::Buffer> for Payload {
+    fn from(value: ruapc_rdma::Buffer) -> Self {
+        Payload::RDMA(value, 0)
     }
 }

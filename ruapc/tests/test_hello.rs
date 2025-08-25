@@ -3,7 +3,7 @@
 
 use std::{str::FromStr, sync::Arc};
 
-use ruapc::{self, SocketPoolConfig, SocketType};
+use ruapc::{SocketPoolConfig, SocketType};
 
 #[ruapc::service]
 trait Foo {
@@ -27,23 +27,32 @@ async fn test_hello() {
         SocketType::WS,
         SocketType::HTTP,
         SocketType::UNIFIED,
+        #[cfg(feature = "rdma")]
+        SocketType::RDMA,
     ] {
         let foo = Arc::new(FooImpl);
         let mut router = ruapc::Router::default();
         router.add_methods(foo.ruapc_export());
 
-        let config = SocketPoolConfig { socket_type };
-        let server = ruapc::Server::create(router, &config);
+        let config = SocketPoolConfig {
+            socket_type: SocketType::UNIFIED,
+        };
+        let server = ruapc::Server::create(router, &config).unwrap();
         let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
         let addr = server.listen(addr).await.unwrap();
 
-        let client = ruapc::Client::default();
-        let ctx = ruapc::Context::create(&config).with_addr(addr);
+        let client = ruapc::Client {
+            socket_type: Some(socket_type),
+            ..Default::default()
+        };
+        let ctx = ruapc::Context::create(&config).unwrap().with_addr(addr);
         let rsp = client.hello(&ctx, &"ruapc".to_string()).await.unwrap();
         assert_eq!(rsp, "hello ruapc!");
 
         server.stop();
-        server.join().await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), server.join())
+            .await
+            .unwrap();
 
         client.hello(&ctx, &"ruapc".to_string()).await.unwrap_err();
     }
@@ -58,7 +67,7 @@ async fn test_http() {
     let config = SocketPoolConfig {
         socket_type: SocketType::UNIFIED,
     };
-    let server = ruapc::Server::create(router, &config);
+    let server = ruapc::Server::create(router, &config).unwrap();
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
     let addr = server.listen(addr).await.unwrap();
 

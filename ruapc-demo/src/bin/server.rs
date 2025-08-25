@@ -56,7 +56,8 @@ async fn main() {
         &SocketPoolConfig {
             socket_type: args.socket_type,
         },
-    );
+    )
+    .unwrap();
 
     let server = Arc::new(server);
     let addr = server.listen(args.addr).await.unwrap();

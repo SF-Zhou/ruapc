@@ -1,0 +1,28 @@
+[package]
+name = "ruapc-rdma"
+version = "0.1.0"
+description = "RDMA support for ruapc"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes.workspace = true
+dashmap.workspace = true
+libc.workspace = true
+schemars.workspace = true
+serde.workspace = true
+
+[build-dependencies]
+bindgen.workspace = true
+pkg-config.workspace = true
+syn = { version = "2", features = ["full", "parsing"] }
+prettyplease = "0.2"
+
+[dev-dependencies]
+clap.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

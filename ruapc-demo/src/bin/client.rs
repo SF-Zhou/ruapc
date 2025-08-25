@@ -52,8 +52,9 @@ async fn stress_test(args: Args) {
     let start_time = std::time::Instant::now();
     let mut tasks = vec![];
     let ctx = Context::create(&SocketPoolConfig {
-        socket_type: args.socket_type,
+        socket_type: SocketType::UNIFIED,
     })
+    .unwrap()
     .with_addr(args.addr);
     for _ in 0..args.coroutines {
         let value = Request(args.value.clone());
@@ -62,10 +63,9 @@ async fn stress_test(args: Args) {
         tasks.push(tokio::spawn(async move {
             while start_time.elapsed().as_secs() < args.secs {
                 let client = Client {
-                    config: ClientConfig {
-                        timeout: Duration::from_secs(5),
-                        use_msgpack: args.use_msgpack,
-                    },
+                    timeout: Duration::from_secs(5),
+                    use_msgpack: args.use_msgpack,
+                    socket_type: Some(args.socket_type),
                 };
                 for _ in 0..256 {
                     let result = client.echo(&ctx, &value).await;
@@ -112,14 +112,14 @@ async fn main() {
         stress_test(args).await;
     } else {
         let ctx = Context::create(&SocketPoolConfig {
-            socket_type: args.socket_type,
+            socket_type: SocketType::UNIFIED,
         })
+        .unwrap()
         .with_addr(args.addr);
         let client = Client {
-            config: ClientConfig {
-                use_msgpack: args.use_msgpack,
-                ..Default::default()
-            },
+            use_msgpack: args.use_msgpack,
+            socket_type: Some(args.socket_type),
+            ..Default::default()
         };
         let rsp = client.echo(&ctx, &Request(args.value.clone())).await;
         tracing::info!("echo rsp: {:?}", rsp);

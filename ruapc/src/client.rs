@@ -4,6 +4,7 @@ use serde_inline_default::serde_inline_default;
 use std::time::Duration;
 
 use crate::{
+    SocketType,
     context::{Context, SocketEndpoint},
     error::{Error, ErrorKind},
     msg::{MsgFlags, MsgMeta},
@@ -11,23 +12,20 @@ use crate::{
 
 #[serde_inline_default]
 #[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone)]
-pub struct ClientConfig {
+pub struct Client {
     #[serde_inline_default(Duration::from_secs(1))]
     #[serde(with = "humantime_serde")]
     pub timeout: Duration,
     #[serde_inline_default(true)]
     pub use_msgpack: bool,
+    #[serde_inline_default(None)]
+    pub socket_type: Option<SocketType>,
 }
 
-impl Default for ClientConfig {
+impl Default for Client {
     fn default() -> Self {
         serde_json::from_value(serde_json::Value::Object(serde_json::Map::default())).unwrap()
     }
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct Client {
-    pub config: ClientConfig,
 }
 
 impl Client {
@@ -54,16 +52,19 @@ impl Client {
             }
             SocketEndpoint::Connected(socket) => socket.clone(),
             SocketEndpoint::Address(socket_addr) => {
+                let socket_type = self
+                    .socket_type
+                    .unwrap_or(ctx.state.socket_pool.socket_type());
                 ctx.state
                     .socket_pool
-                    .acquire(socket_addr, &ctx.state)
+                    .acquire(socket_addr, socket_type, &ctx.state)
                     .await?
             }
         };
 
         // 2. send request.
         let mut flags = MsgFlags::IsReq;
-        if self.config.use_msgpack {
+        if self.use_msgpack {
             flags |= MsgFlags::UseMessagePack;
         }
         let mut meta = MsgMeta {
@@ -74,7 +75,7 @@ impl Client {
         let receiver = socket.send(&mut meta, req, &ctx.state).await?;
 
         // 3. recv response with timeout.
-        if let Ok(result) = tokio::time::timeout(self.config.timeout, receiver.recv()).await {
+        if let Ok(result) = tokio::time::timeout(self.timeout, receiver.recv()).await {
             result?.deserialize()?
         } else {
             ctx.state.waiter.set_timeout(meta.msgid);
@@ -89,7 +90,7 @@ mod tests {
 
     #[test]
     fn test_default_config() {
-        let config = ClientConfig::default();
-        assert_eq!(config.timeout, Duration::from_secs(1));
+        let client = Client::default();
+        assert_eq!(client.timeout, Duration::from_secs(1));
     }
 }

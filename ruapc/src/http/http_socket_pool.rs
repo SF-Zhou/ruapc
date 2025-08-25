@@ -13,7 +13,8 @@ use tokio_util::sync::DropGuard;
 
 use super::http_socket::{Connections, HttpSocket};
 use crate::{
-    Error, ErrorKind, Message, MsgFlags, MsgMeta, RawStream, Result, Socket, State, TaskSupervisor,
+    Error, ErrorKind, Message, MsgFlags, MsgMeta, RawStream, Result, Socket, SocketType, State,
+    TaskSupervisor,
 };
 
 pub struct HttpSocketPool {
@@ -142,8 +143,16 @@ impl HttpSocketPool {
     pub async fn acquire(
         self: &Arc<Self>,
         addr: &SocketAddr,
+        socket_type: SocketType,
         _state: &Arc<State>,
     ) -> Result<HttpSocket> {
+        if socket_type != SocketType::HTTP {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                format!("invalid socket type {socket_type} for HttpSocketPool"),
+            ));
+        }
+
         // Check if the socket is already in the socket map.
         if let Ok(socket_map) = self.socket_map.try_read()
             && let Some(socket) = socket_map.get(addr)

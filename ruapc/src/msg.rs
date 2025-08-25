@@ -166,7 +166,6 @@ impl SendMsg for BytesMut {
                 Ok(buf.len())
             }
 
-            #[inline]
             fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
                 self.0.extend_from_slice(buf);
                 Ok(())

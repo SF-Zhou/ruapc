@@ -1,5 +1,5 @@
 use clap::Parser;
-use ruapc::{Client, ClientConfig, Context, SocketPoolConfig, SocketType, services::MetaService};
+use ruapc::{Client, Context, SocketPoolConfig, SocketType, services::MetaService};
 
 #[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
@@ -28,12 +28,11 @@ async fn main() {
     let ctx = Context::create(&SocketPoolConfig {
         socket_type: args.socket_type,
     })
+    .unwrap()
     .with_addr(args.addr);
     let client = Client {
-        config: ClientConfig {
-            use_msgpack: args.use_msgpack,
-            ..Default::default()
-        },
+        use_msgpack: args.use_msgpack,
+        ..Default::default()
     };
 
     if args.get_metadata {

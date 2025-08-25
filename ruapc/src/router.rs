@@ -4,6 +4,8 @@ use foldhash::fast::RandomState;
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "rdma")]
+use crate::rdma::RdmaService;
 use crate::{
     Context, Message,
     error::{Error, ErrorKind, Result},
@@ -42,9 +44,13 @@ pub struct Router {
 
 impl Default for Router {
     fn default() -> Self {
-        Self {
-            methods: Arc::new(()).ruapc_export().into_iter().collect(),
-        }
+        let mut this = Self {
+            methods: HashMap::default(),
+        };
+        this.add_methods(MetaService::ruapc_export(Arc::new(())));
+        #[cfg(feature = "rdma")]
+        this.add_methods(RdmaService::ruapc_export(Arc::new(())));
+        this
     }
 }
 

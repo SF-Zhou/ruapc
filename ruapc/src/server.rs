@@ -11,16 +11,15 @@ pub struct Server {
 }
 
 impl Server {
-    #[must_use]
-    pub fn create(router: Router, config: &SocketPoolConfig) -> Self {
-        let state = State::create(router, config);
-        let drop_guard = state.drop_guard();
+    /// # Errors
+    pub fn create(router: Router, config: &SocketPoolConfig) -> Result<Self> {
+        let (state, drop_guard) = State::create(router, config)?;
 
-        Self {
-            state: Arc::new(state),
+        Ok(Self {
+            state,
             listener: Listener::new(),
             _drop_guard: drop_guard,
-        }
+        })
     }
 
     pub fn stop(&self) {

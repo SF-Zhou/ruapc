@@ -8,17 +8,24 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::WebSocketStream;
 use tokio_util::sync::DropGuard;
 
+#[cfg(feature = "rdma")]
+use crate::{
+    Error, ErrorKind,
+    rdma::{Endpoint, RdmaSocketPool},
+};
 use crate::{
     Result, Socket, State, http::HttpSocketPool, tcp::TcpSocketPool, unified::UnifiedSocketPool,
     ws::WebSocketPool,
 };
 
-#[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone, clap::ValueEnum)]
+#[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone, Copy, clap::ValueEnum)]
 pub enum SocketType {
     TCP,
     WS,
     HTTP,
     UNIFIED,
+    #[cfg(feature = "rdma")]
+    RDMA,
 }
 
 impl std::fmt::Display for SocketType {
@@ -46,6 +53,8 @@ pub enum SocketPool {
     WS(Arc<WebSocketPool>),
     HTTP(Arc<HttpSocketPool>),
     UNIFIED(UnifiedSocketPool),
+    #[cfg(feature = "rdma")]
+    RDMA(Arc<RdmaSocketPool>),
 }
 
 pub enum RawStream {
@@ -54,34 +63,58 @@ pub enum RawStream {
 }
 
 impl SocketPool {
-    #[must_use]
-    pub fn create(config: &SocketPoolConfig) -> Self {
+    /// # Errors
+    pub fn create(config: &SocketPoolConfig) -> Result<Self> {
         match config.socket_type {
-            SocketType::TCP => SocketPool::TCP(TcpSocketPool::new()),
-            SocketType::WS => SocketPool::WS(WebSocketPool::new()),
-            SocketType::HTTP => SocketPool::HTTP(HttpSocketPool::new()),
-            SocketType::UNIFIED => SocketPool::UNIFIED(UnifiedSocketPool::new()),
+            SocketType::TCP => Ok(SocketPool::TCP(TcpSocketPool::new())),
+            SocketType::WS => Ok(SocketPool::WS(WebSocketPool::new())),
+            SocketType::HTTP => Ok(SocketPool::HTTP(HttpSocketPool::new())),
+            SocketType::UNIFIED => Ok(SocketPool::UNIFIED(UnifiedSocketPool::create()?)),
+            #[cfg(feature = "rdma")]
+            SocketType::RDMA => Ok(SocketPool::RDMA(RdmaSocketPool::create()?)),
+        }
+    }
+
+    #[must_use]
+    pub fn socket_type(&self) -> SocketType {
+        match self {
+            SocketPool::TCP(_) => SocketType::TCP,
+            SocketPool::WS(_) => SocketType::WS,
+            SocketPool::HTTP(_) => SocketType::HTTP,
+            SocketPool::UNIFIED(_) => SocketType::UNIFIED,
+            #[cfg(feature = "rdma")]
+            SocketPool::RDMA(_) => SocketType::RDMA,
         }
     }
 
     /// # Errors
-    pub async fn acquire(&self, addr: &SocketAddr, state: &Arc<State>) -> Result<Socket> {
+    pub async fn acquire(
+        &self,
+        addr: &SocketAddr,
+        socket_type: SocketType,
+        state: &Arc<State>,
+    ) -> Result<Socket> {
         match self {
-            SocketPool::TCP(tcp_socket_pool) => {
-                tcp_socket_pool.acquire(addr, state).await.map(Socket::TCP)
-            }
-            SocketPool::WS(web_socket_pool) => {
-                web_socket_pool.acquire(addr, state).await.map(Socket::WS)
-            }
-            SocketPool::HTTP(http_socket_pool) => http_socket_pool
-                .acquire(addr, state)
-                .await
-                .map(Socket::HTTP),
-            SocketPool::UNIFIED(unified_socket_pool) => unified_socket_pool
-                .tcp_socket_pool
-                .acquire(addr, state)
+            SocketPool::TCP(tcp_socket_pool) => tcp_socket_pool
+                .acquire(addr, socket_type, state)
                 .await
                 .map(Socket::TCP),
+            SocketPool::WS(web_socket_pool) => web_socket_pool
+                .acquire(addr, socket_type, state)
+                .await
+                .map(Socket::WS),
+            SocketPool::HTTP(http_socket_pool) => http_socket_pool
+                .acquire(addr, socket_type, state)
+                .await
+                .map(Socket::HTTP),
+            SocketPool::UNIFIED(unified_socket_pool) => {
+                unified_socket_pool.acquire(addr, socket_type, state).await
+            }
+            #[cfg(feature = "rdma")]
+            SocketPool::RDMA(rdma_socket_pool) => rdma_socket_pool
+                .acquire(addr, socket_type, state)
+                .await
+                .map(Socket::RDMA),
         }
     }
 
@@ -107,6 +140,41 @@ impl SocketPool {
                     .handle_new_stream(state, stream, addr)
                     .await
             }
+            #[cfg(feature = "rdma")]
+            SocketPool::RDMA(_) => Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "invalid socket type".into(),
+            )),
+        }
+    }
+
+    #[cfg(feature = "rdma")]
+    /// # Errors
+    pub fn rdma_info(&self) -> Result<crate::rdma::RdmaInfo> {
+        match self {
+            SocketPool::RDMA(rdma_socket_pool) => Ok(rdma_socket_pool.rdma_info()),
+            SocketPool::UNIFIED(unified_socket_pool) => Ok(unified_socket_pool.rdma_info()),
+            _ => Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "RDMA is not supported: invalid socket type".into(),
+            )),
+        }
+    }
+
+    #[cfg(feature = "rdma")]
+    /// # Errors
+    pub fn rdma_connect(&self, endpoint: &Endpoint, state: &Arc<State>) -> Result<Endpoint> {
+        use crate::{Error, ErrorKind};
+
+        match self {
+            SocketPool::RDMA(rdma_socket_pool) => rdma_socket_pool.rdma_connect(endpoint, state),
+            SocketPool::UNIFIED(unified_socket_pool) => {
+                unified_socket_pool.rdma_connect(endpoint, state)
+            }
+            _ => Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "RDMA is not supported: invalid socket type".into(),
+            )),
         }
     }
 
@@ -116,6 +184,8 @@ impl SocketPool {
             SocketPool::WS(web_socket_pool) => web_socket_pool.stop(),
             SocketPool::HTTP(http_socket_pool) => http_socket_pool.stop(),
             SocketPool::UNIFIED(unified_socket_pool) => unified_socket_pool.stop(),
+            #[cfg(feature = "rdma")]
+            SocketPool::RDMA(rdma_socket_pool) => rdma_socket_pool.stop(),
         }
     }
 
@@ -126,6 +196,8 @@ impl SocketPool {
             SocketPool::WS(web_socket_pool) => web_socket_pool.drop_guard(),
             SocketPool::HTTP(http_socket_pool) => http_socket_pool.drop_guard(),
             SocketPool::UNIFIED(unified_socket_pool) => unified_socket_pool.drop_guard(),
+            #[cfg(feature = "rdma")]
+            SocketPool::RDMA(rdma_socket_pool) => rdma_socket_pool.drop_guard(),
         }
     }
 
@@ -135,6 +207,8 @@ impl SocketPool {
             SocketPool::WS(web_socket_pool) => web_socket_pool.join().await,
             SocketPool::HTTP(http_socket_pool) => http_socket_pool.join().await,
             SocketPool::UNIFIED(unified_socket_pool) => unified_socket_pool.join().await,
+            #[cfg(feature = "rdma")]
+            SocketPool::RDMA(rdma_socket_pool) => rdma_socket_pool.join().await,
         }
     }
 }

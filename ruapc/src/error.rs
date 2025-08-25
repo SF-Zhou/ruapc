@@ -22,6 +22,10 @@ pub enum ErrorKind {
     HttpBuildReqFailed,
     HttpSendReqFailed,
     HttpUpgradeFailed,
+    RdmaSendFailed,
+    RdmaRecvFailed,
+    #[cfg(feature = "rdma")]
+    RdmaError(ruapc_rdma::ErrorKind),
     #[serde(untagged)]
     Unknown(String),
 }
@@ -52,6 +56,13 @@ impl std::error::Error for Error {}
 impl From<ErrorKind> for Error {
     fn from(kind: ErrorKind) -> Self {
         Self::kind(kind)
+    }
+}
+
+#[cfg(feature = "rdma")]
+impl From<ruapc_rdma::Error> for Error {
+    fn from(value: ruapc_rdma::Error) -> Self {
+        Self::new(ErrorKind::RdmaError(value.kind), value.msg)
     }
 }
 

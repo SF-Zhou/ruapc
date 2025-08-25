@@ -4,7 +4,7 @@ use serde::Serialize;
 use tokio_util::sync::DropGuard;
 
 use crate::{
-    Error, Router, Socket, SocketPoolConfig, State,
+    Error, Result, Router, Socket, SocketPoolConfig, State,
     msg::{MsgFlags, MsgMeta},
 };
 
@@ -18,40 +18,33 @@ pub enum SocketEndpoint {
 
 #[derive(Clone)]
 pub struct Context {
+    pub(crate) drop_guard: Option<Arc<DropGuard>>,
     pub state: Arc<State>,
     pub(crate) endpoint: SocketEndpoint,
-    pub(crate) drop_guard: Option<Arc<DropGuard>>,
-}
-
-impl Default for Context {
-    fn default() -> Self {
-        let state = Arc::new(State::default());
-        Self {
-            drop_guard: Some(Arc::new(state.drop_guard())),
-            state,
-            endpoint: SocketEndpoint::Invalid,
-        }
-    }
 }
 
 impl Context {
-    #[must_use]
-    pub fn create(config: &SocketPoolConfig) -> Self {
-        let state = Arc::new(State::create(Router::default(), config));
-        Self {
-            drop_guard: Some(Arc::new(state.drop_guard())),
-            state,
-            endpoint: SocketEndpoint::Invalid,
-        }
+    /// # Errors
+    pub fn create(config: &SocketPoolConfig) -> Result<Self> {
+        Self::create_with_router(Router::default(), config)
     }
 
-    #[must_use]
-    pub fn create_with_router(router: Router, config: &SocketPoolConfig) -> Self {
-        let state = Arc::new(State::create(router, config));
-        Self {
-            drop_guard: Some(Arc::new(state.drop_guard())),
+    /// # Errors
+    pub fn create_with_router(router: Router, config: &SocketPoolConfig) -> Result<Self> {
+        let (state, drop_guard) = State::create(router, config)?;
+        Ok(Self {
             state,
             endpoint: SocketEndpoint::Invalid,
+            drop_guard: Some(Arc::new(drop_guard)),
+        })
+    }
+
+    #[cfg(feature = "rdma")]
+    pub(crate) fn create_with_state_and_addr(state: &Arc<State>, addr: &SocketAddr) -> Self {
+        Self {
+            state: state.clone(),
+            endpoint: SocketEndpoint::Address(*addr),
+            drop_guard: None,
         }
     }
 
