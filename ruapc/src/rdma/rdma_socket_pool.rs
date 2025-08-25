@@ -129,18 +129,22 @@ impl RdmaSocketPool {
         state: Arc<State>,
         pending_receiver: tokio::sync::mpsc::Receiver<u64>,
     ) -> Result<()> {
+        let socket_clone = socket.clone();
         let mut event_loop = EventLoop::new(socket, state, pending_receiver);
         event_loop.submit_recv_tasks(64)?;
 
         let task_supervisor = self.task_supervisor.start_async_task();
         tokio::spawn(async move {
-            tokio::select! {
-                () = task_supervisor.stopped() => {},
-                r = event_loop.run() => {
-                    tracing::info!("result is {:?}", r);
-                }
+            task_supervisor.stopped().await;
+            socket_clone.set_error();
+        });
+
+        let task_supervisor = self.task_supervisor.start_async_task();
+        tokio::spawn(async move {
+            if let Err(e) = event_loop.run().await {
+                tracing::info!("result is {}", e);
             }
-            let _ = event_loop.clean_up().await;
+            drop(task_supervisor);
         });
 
         Ok(())

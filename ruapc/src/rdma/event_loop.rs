@@ -297,7 +297,7 @@ impl EventLoop {
 
         let mut wcs_buf = [verbs::ibv_wc::default(); 16];
 
-        while !self.ready_to_remove() {
+        loop {
             self.socket.queue_pair.req_notify()?;
 
             loop {
@@ -322,6 +322,10 @@ impl EventLoop {
 
             if let Err(e) = self.update_flow_control() {
                 tracing::error!("Flow control update error: {e}");
+            }
+
+            if self.ready_to_remove() {
+                break;
             }
 
             tokio::select! {
@@ -386,13 +390,6 @@ impl EventLoop {
             self.recv.imm_acked = self.recv.imm_received;
         }
 
-        Ok(())
-    }
-
-    /// Performs cleanup operations before shutting down the event loop.
-    pub async fn clean_up(&mut self) -> Result<()> {
-        self.socket.set_error();
-        self.run().await?;
         Ok(())
     }
 }
