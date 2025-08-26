@@ -1,7 +1,8 @@
-use crate::Message;
 use foldhash::fast::RandomState;
 use std::sync::atomic::AtomicU64;
 use tokio::sync::oneshot;
+
+use crate::{Message, Receiver};
 
 #[derive(Default)]
 pub struct Waiter {
@@ -9,12 +10,32 @@ pub struct Waiter {
     id_map: dashmap::DashMap<u64, oneshot::Sender<Message>, RandomState>,
 }
 
+pub struct WaiterCleaner<'a> {
+    waiter: &'a Waiter,
+    msg_id: u64,
+}
+
+impl Drop for WaiterCleaner<'_> {
+    fn drop(&mut self) {
+        self.waiter.remove(self.msg_id);
+    }
+}
+
 impl Waiter {
-    pub fn alloc(&self) -> (u64, oneshot::Receiver<Message>) {
+    pub fn alloc(&self) -> (u64, Receiver<'_>) {
         let msg_id = self.index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.id_map.insert(msg_id, tx);
-        (msg_id, rx)
+        (
+            msg_id,
+            Receiver::OneShotRx(
+                rx,
+                WaiterCleaner {
+                    waiter: self,
+                    msg_id,
+                },
+            ),
+        )
     }
 
     pub fn post(&self, msg_id: u64, result: Message) {
@@ -25,7 +46,7 @@ impl Waiter {
         }
     }
 
-    pub fn set_timeout(&self, msg_id: u64) {
+    fn remove(&self, msg_id: u64) {
         self.id_map.remove(&msg_id);
     }
 }
@@ -43,8 +64,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_waiter() {
-        let msg_waiter = Waiter::default();
-        let msg_waiter = Arc::new(msg_waiter);
+        let msg_waiter = Arc::new(Waiter::default());
 
         let (msg_id, rx) = msg_waiter.alloc();
         assert_eq!(msg_id, 0);
@@ -59,8 +79,12 @@ mod tests {
             })
         };
 
-        let msg = rx.await.unwrap();
+        let msg = rx.recv().await.unwrap();
         assert_eq!(msg.meta.method, "dummy");
         handle.await.unwrap();
+
+        let (msg_id, rx) = msg_waiter.alloc();
+        drop(rx); // drop the receiver to trigger the cleaner's Drop
+        assert!(msg_waiter.id_map.get(&msg_id).is_none());
     }
 }

@@ -16,7 +16,7 @@ mod router;
 pub use router::{Method, Router};
 
 mod waiter;
-pub use waiter::Waiter;
+pub use waiter::{Waiter, WaiterCleaner};
 
 mod task_supervisor;
 pub use task_supervisor::TaskSupervisor;

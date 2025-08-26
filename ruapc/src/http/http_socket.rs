@@ -16,12 +16,12 @@ pub enum HttpSocket {
 }
 
 impl HttpSocket {
-    pub fn send<P: Serialize>(
+    pub fn send<'a, P: Serialize>(
         &self,
         meta: &mut MsgMeta,
         payload: &P,
-        state: &Arc<State>,
-    ) -> Result<Receiver> {
+        state: &'a Arc<State>,
+    ) -> Result<Receiver<'a>> {
         let mut bytes = BytesMut::new();
         let writer = SendMsg::writer(&mut bytes);
         let _ = serde_json::to_writer(writer, payload);
@@ -48,7 +48,7 @@ impl HttpSocket {
                         waiter.post(msgid, msg);
                     });
 
-                    Ok(Receiver::OneShotRx(rx))
+                    Ok(rx)
                 } else {
                     Err(Error::new(
                         ErrorKind::InvalidArgument,

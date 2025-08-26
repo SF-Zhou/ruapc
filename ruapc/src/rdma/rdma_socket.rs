@@ -35,17 +35,17 @@ impl RdmaSocket {
         }
     }
 
-    pub async fn send<P: Serialize>(
+    pub async fn send<'a, P: Serialize>(
         &self,
         meta: &mut MsgMeta,
         payload: &P,
-        state: &State,
-    ) -> Result<Receiver> {
+        state: &'a State,
+    ) -> Result<Receiver<'a>> {
         // receiver recall.
         let receiver = if meta.flags.contains(MsgFlags::IsReq) {
             let (msgid, rx) = state.waiter.alloc();
             meta.msgid = msgid;
-            Receiver::OneShotRx(rx)
+            rx
         } else {
             Receiver::None
         };
