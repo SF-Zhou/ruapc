@@ -2,12 +2,12 @@ use tokio::sync::oneshot;
 
 use crate::{Error, ErrorKind, Message, Result, WaiterCleaner};
 
-pub enum Receiver {
+pub enum Receiver<'a> {
     None,
-    OneShotRx(oneshot::Receiver<Message>, WaiterCleaner),
+    OneShotRx(oneshot::Receiver<Message>, WaiterCleaner<'a>),
 }
 
-impl Receiver {
+impl Receiver<'_> {
     /// # Errors
     pub async fn recv(self) -> Result<Message> {
         match self {

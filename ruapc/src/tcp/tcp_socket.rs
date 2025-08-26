@@ -20,12 +20,12 @@ impl TcpSocket {
         Self { stream }
     }
 
-    pub async fn send<P: Serialize>(
+    pub async fn send<'a, P: Serialize>(
         &self,
         meta: &mut MsgMeta,
         payload: &P,
-        state: &Arc<State>,
-    ) -> Result<Receiver> {
+        state: &'a Arc<State>,
+    ) -> Result<Receiver<'a>> {
         struct TcpSocketBytes(BytesMut);
 
         impl SendMsg for TcpSocketBytes {

@@ -15,12 +15,12 @@ pub enum Socket {
 
 impl Socket {
     /// # Errors
-    pub async fn send<P: Serialize>(
+    pub async fn send<'a, P: Serialize>(
         &self,
         meta: &mut MsgMeta,
         payload: &P,
-        state: &Arc<State>,
-    ) -> Result<Receiver> {
+        state: &'a Arc<State>,
+    ) -> Result<Receiver<'a>> {
         match self {
             Socket::TCP(tcp_socket) => tcp_socket.send(meta, payload, state).await,
             Socket::WS(web_socket) => web_socket.send(meta, payload, state).await,

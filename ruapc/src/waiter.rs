@@ -1,5 +1,5 @@
 use foldhash::fast::RandomState;
-use std::sync::{Arc, atomic::AtomicU64};
+use std::sync::atomic::AtomicU64;
 use tokio::sync::oneshot;
 
 use crate::{Message, Receiver};
@@ -10,19 +10,19 @@ pub struct Waiter {
     id_map: dashmap::DashMap<u64, oneshot::Sender<Message>, RandomState>,
 }
 
-pub struct WaiterCleaner {
-    waiter: Arc<Waiter>,
+pub struct WaiterCleaner<'a> {
+    waiter: &'a Waiter,
     msg_id: u64,
 }
 
-impl Drop for WaiterCleaner {
+impl Drop for WaiterCleaner<'_> {
     fn drop(&mut self) {
         self.waiter.remove(self.msg_id);
     }
 }
 
 impl Waiter {
-    pub fn alloc(self: &Arc<Self>) -> (u64, Receiver) {
+    pub fn alloc(&self) -> (u64, Receiver<'_>) {
         let msg_id = self.index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.id_map.insert(msg_id, tx);
@@ -31,7 +31,7 @@ impl Waiter {
             Receiver::OneShotRx(
                 rx,
                 WaiterCleaner {
-                    waiter: self.clone(),
+                    waiter: self,
                     msg_id,
                 },
             ),
@@ -64,8 +64,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_waiter() {
-        let msg_waiter = Waiter::default();
-        let msg_waiter = Arc::new(msg_waiter);
+        let msg_waiter = Arc::new(Waiter::default());
 
         let (msg_id, rx) = msg_waiter.alloc();
         assert_eq!(msg_id, 0);
