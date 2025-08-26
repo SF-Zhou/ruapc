@@ -45,7 +45,7 @@ impl RdmaSocket {
         let receiver = if meta.flags.contains(MsgFlags::IsReq) {
             let (msgid, rx) = state.waiter.alloc();
             meta.msgid = msgid;
-            Receiver::OneShotRx(rx)
+            rx
         } else {
             Receiver::None
         };

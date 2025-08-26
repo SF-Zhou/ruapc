@@ -122,6 +122,7 @@ impl HttpSocketPool {
         state.handle_recv(&socket, msg)?;
 
         let msg = rx
+            .recv()
             .await
             .map_err(|e| Error::new(ErrorKind::HttpWaitRspFailed, e.to_string()))?;
 

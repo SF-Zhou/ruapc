@@ -29,7 +29,7 @@ impl WebSocket {
         let receiver = if meta.is_req() {
             let (msgid, rx) = state.waiter.alloc();
             meta.msgid = msgid;
-            Receiver::OneShotRx(rx)
+            rx
         } else {
             Receiver::None
         };

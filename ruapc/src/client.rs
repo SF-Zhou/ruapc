@@ -78,7 +78,6 @@ impl Client {
         if let Ok(result) = tokio::time::timeout(self.timeout, receiver.recv()).await {
             result?.deserialize()?
         } else {
-            ctx.state.waiter.set_timeout(meta.msgid);
             Err(Error::kind(ErrorKind::Timeout).into())
         }
     }

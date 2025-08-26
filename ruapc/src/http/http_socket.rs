@@ -48,7 +48,7 @@ impl HttpSocket {
                         waiter.post(msgid, msg);
                     });
 
-                    Ok(Receiver::OneShotRx(rx))
+                    Ok(rx)
                 } else {
                     Err(Error::new(
                         ErrorKind::InvalidArgument,
