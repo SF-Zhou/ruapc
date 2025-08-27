@@ -91,3 +91,36 @@ async fn test_http() {
     server.stop();
     server.join().await;
 }
+
+#[cfg(feature = "rdma")]
+#[tokio::test]
+async fn test_rdma() {
+    let foo = Arc::new(FooImpl);
+    let mut router = ruapc::Router::default();
+    router.add_methods(foo.ruapc_export());
+
+    let config = SocketPoolConfig {
+        socket_type: SocketType::UNIFIED,
+    };
+    let server = ruapc::Server::create(router, &config).unwrap();
+    let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
+    let addr = server.listen(addr).await.unwrap();
+
+    let client = ruapc::Client {
+        socket_type: Some(SocketType::RDMA),
+        ..Default::default()
+    };
+    let ctx = ruapc::Context::create(&config).unwrap().with_addr(addr);
+
+    for _ in 0..256 {
+        let rsp = client.hello(&ctx, &"ruapc".to_string()).await.unwrap();
+        assert_eq!(rsp, "hello ruapc!");
+    }
+
+    server.stop();
+    tokio::time::timeout(std::time::Duration::from_secs(30), server.join())
+        .await
+        .unwrap();
+
+    client.hello(&ctx, &"ruapc".to_string()).await.unwrap_err();
+}

@@ -78,13 +78,10 @@ impl RdmaState {
 
     /// only update by event loop.
     pub fn update_send_finished(&self, index: u64) -> u64 {
-        let old = self.send_finished.load(Ordering::Acquire);
-        if old == index {
-            old + self.max_send_limit
-        } else {
+        if self.send_finished.load(Ordering::Acquire) != index {
             self.send_finished.store(index, Ordering::Release);
-            index + self.max_send_limit
         }
+        index + self.max_send_limit
     }
 
     pub fn set_error(&self) -> bool {
