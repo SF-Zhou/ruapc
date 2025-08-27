@@ -141,8 +141,9 @@ impl RdmaSocketPool {
 
         let task_supervisor = self.task_supervisor.start_async_task();
         tokio::spawn(async move {
-            if let Err(e) = event_loop.run().await {
-                tracing::info!("result is {}", e);
+            match event_loop.run().await {
+                Ok(()) => tracing::info!("rdma socket event loop stopped"),
+                Err(e) => tracing::error!("rdma socket event loop error: {}", e),
             }
             drop(task_supervisor);
         });

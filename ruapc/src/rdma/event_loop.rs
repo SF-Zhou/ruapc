@@ -295,7 +295,8 @@ impl EventLoop {
         let async_fd = AsyncFd::with_interest(socket.queue_pair.notify_fd(), Interest::READABLE)
             .map_err(|e| Error::new(ErrorKind::InvalidArgument, e.to_string()))?;
 
-        let mut wcs_buf = [verbs::ibv_wc::default(); 16];
+        let mut wcs_buf = [verbs::ibv_wc::default(); 32];
+        let mut pending_sends = Vec::with_capacity(256);
 
         loop {
             self.socket.queue_pair.req_notify()?;
@@ -333,13 +334,9 @@ impl EventLoop {
                     self.unack_cq_events += self.socket.queue_pair.get_cq_events()?;
                     guard.unwrap().clear_ready();
                 },
-                item = self.pending_receiver.recv() => {
-                    if let Some(msgid) = item {
-                        self.pending_sends.insert(msgid);
-                        while let Ok(item) = self.pending_receiver.try_recv() {
-                            self.pending_sends.insert(item);
-                        }
-                    }
+                _ = self.pending_receiver.recv_many(&mut pending_sends, 256) => {
+                    self.pending_sends.extend(pending_sends.iter());
+                    pending_sends.clear();
                 }
             }
         }
