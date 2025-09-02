@@ -9,6 +9,9 @@ repository.workspace = true
 description.workspace = true
 license.workspace = true
 
+[features]
+rdma = ["ruapc/rdma"]
+
 [dependencies]
 ruapc = { path = "../ruapc" }
 

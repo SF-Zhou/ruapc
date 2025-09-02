@@ -204,12 +204,12 @@ pub enum WCType {
 }
 
 impl WRID {
-    pub const TYPE_MASK: u64 = 0xC000_0000_0000_0000;
-    pub const ID_MASK: u64 = !Self::TYPE_MASK;
+    pub const TYPE_BITS: u32 = 62;
+    pub const TYPE_MASK: u64 = ((1 << (u64::BITS - Self::TYPE_BITS)) - 1) << Self::TYPE_BITS;
 
     pub fn new(wc_type: WCType, id: u64) -> Self {
         assert!(id & Self::TYPE_MASK == 0, "ID too large");
-        Self(((wc_type as u64) << 62) | id)
+        Self(((wc_type as u64) << Self::TYPE_BITS) | id)
     }
 
     pub fn recv(id: u64) -> Self {
@@ -234,7 +234,7 @@ impl WRID {
     }
 
     pub fn get_id(&self) -> u64 {
-        self.0 & Self::ID_MASK
+        self.0 & !Self::TYPE_MASK
     }
 }
 

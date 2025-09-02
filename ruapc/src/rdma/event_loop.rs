@@ -1,13 +1,14 @@
 //! RDMA event loop implementation for handling completion queue events and flow control
 //!
 //! This module provides:
-//! - RDMA completion queue event processing
-//! - Flow control management with configurable thresholds
-//! - Separate handling of send/receive operations
-//! - Performance statistics tracking
-//! - Acknowledgment mechanism for reliable delivery
+//! - RDMA completion queue event processing and event management
+//! - Flow control management with configurable thresholds and limits
+//! - Separate handling of send/receive operations with dedicated handlers
+//! - Performance statistics tracking for sends, receives and acknowledgments
+//! - Reliable delivery through an acknowledgment mechanism with configurable thresholds
+//! - Buffer management and work request (WR) processing for RDMA operations
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::{collections::BTreeSet, sync::Arc, time::Instant};
 
 use ruapc_rdma::{Buffer, verbs};
 use tokio::io::{Interest, unix::AsyncFd};
@@ -18,11 +19,12 @@ use super::RdmaSocket;
 
 /// Handler for RDMA receive operations
 ///
-/// Responsibilities:
-/// - Managing receive buffers
-/// - Processing receive completions
-/// - Tracking operation statistics
-/// - Handling data messages
+/// Responsible for managing RDMA receive operations including:
+/// - Allocating and managing receive buffers
+/// - Processing receive completions and work requests (WRs)
+/// - Tracking detailed operation statistics (submitted, completed, messages)
+/// - Handling both immediate and data messages
+/// - Managing acknowledgments for received messages
 #[derive(Debug, Default)]
 struct RecvHandler {
     /// Number of recv WRs submitted
@@ -129,28 +131,22 @@ struct SendHandler {
 
 impl SendHandler {
     fn handle_completion(&mut self, wc: &verbs::ibv_wc, socket: &RdmaSocket) -> Result<()> {
-        if !wc.succ() {
-            tracing::error!(
-                "{} send completion error: {:?}, {:?}",
-                socket.queue_pair.qp_num,
-                wc.status,
-                wc.vendor_err,
-            );
-            socket.queue_pair.set_error();
-            return Err(Error::new(
-                ErrorKind::RdmaRecvFailed,
-                format!(
-                    "send completion error: {:?}, {:?}",
-                    wc.status, wc.vendor_err
-                ),
-            ));
-        } else if wc.is_send_imm() {
+        if wc.is_send_imm() {
             self.ack_completed += 1;
         } else {
             self.data_completed += 1;
             socket.send_buffers.remove(&wc.wr_id.get_id());
         }
-        Ok(())
+
+        if wc.succ() {
+            Ok(())
+        } else {
+            tracing::error!("send completion error: {wc:?}",);
+            Err(Error::new(
+                ErrorKind::RdmaSendFailed,
+                format!("send completion error: {wc:?}",),
+            ))
+        }
     }
 
     fn update_confirmed(&mut self, ack: u32) {
@@ -237,6 +233,7 @@ pub struct EventLoop {
 
     recv: RecvHandler,
     send: SendHandler,
+    last_ack_timestamp: Instant,
     flow_config: FlowConfig,
 }
 
@@ -262,6 +259,7 @@ impl EventLoop {
             unack_cq_events: 0,
             recv: RecvHandler::default(),
             send: SendHandler::default(),
+            last_ack_timestamp: Instant::now(),
             flow_config: FlowConfig::default(),
         }
     }
@@ -295,7 +293,8 @@ impl EventLoop {
         let async_fd = AsyncFd::with_interest(socket.queue_pair.notify_fd(), Interest::READABLE)
             .map_err(|e| Error::new(ErrorKind::InvalidArgument, e.to_string()))?;
 
-        let mut wcs_buf = [verbs::ibv_wc::default(); 16];
+        let mut wcs_buf = [verbs::ibv_wc::default(); 32];
+        let mut pending_sends = Vec::with_capacity(256);
 
         loop {
             self.socket.queue_pair.req_notify()?;
@@ -333,14 +332,11 @@ impl EventLoop {
                     self.unack_cq_events += self.socket.queue_pair.get_cq_events()?;
                     guard.unwrap().clear_ready();
                 },
-                item = self.pending_receiver.recv() => {
-                    if let Some(msgid) = item {
-                        self.pending_sends.insert(msgid);
-                        while let Ok(item) = self.pending_receiver.try_recv() {
-                            self.pending_sends.insert(item);
-                        }
-                    }
-                }
+                _ = self.pending_receiver.recv_many(&mut pending_sends, 256) => {
+                    self.pending_sends.extend(pending_sends.iter());
+                    pending_sends.clear();
+                },
+                () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
             }
         }
 
@@ -348,7 +344,6 @@ impl EventLoop {
     }
 
     /// Checks if the event loop is ready to be removed/cleaned up.
-    #[allow(unused)]
     fn ready_to_remove(&self) -> bool {
         self.socket.state.ready_to_remove(self.send.data_completed)
             && self.send.ack_submitted == self.send.ack_completed
@@ -357,6 +352,14 @@ impl EventLoop {
 
     /// Updates flow control state and sends acknowledgments when necessary.
     fn update_flow_control(&mut self) -> Result<()> {
+        if !self.socket.state.is_ok() {
+            while let Some(msgid) = self.pending_sends.pop_first() {
+                self.socket.send_buffers.remove(&msgid);
+                self.send.data_completed += 1;
+            }
+            return Ok(());
+        }
+
         let completed_sends = std::cmp::min(self.send.data_completed, self.send.data_confirmed);
         let sendable_bound = self.socket.state.update_send_finished(completed_sends);
         while let Some(&msgid) = self.pending_sends.first()
@@ -369,10 +372,6 @@ impl EventLoop {
             self.pending_sends.pop_first();
         }
 
-        if !self.socket.state.is_ok() {
-            return Ok(());
-        }
-
         let ack_done = std::cmp::min(self.send.ack_completed, self.send.ack_confirmed);
         if self.send.ack_submitted >= ack_done + u64::from(self.flow_config.ack_max_limit) {
             return Ok(());
@@ -383,11 +382,13 @@ impl EventLoop {
 
         if pending_data >= self.flow_config.ack_threshold
             || pending_imm >= self.flow_config.ack_max_limit / 2
+            || self.last_ack_timestamp.elapsed().as_secs() >= 5
         {
             self.send
                 .submit_ack(&self.socket, pending_imm, pending_data)?;
             self.recv.data_acked = self.recv.data_received;
             self.recv.imm_acked = self.recv.imm_received;
+            self.last_ack_timestamp = Instant::now();
         }
 
         Ok(())
