@@ -14,7 +14,7 @@ pub struct Args {
     pub addr: std::net::SocketAddr,
 
     /// Socket type.
-    #[arg(long, default_value = "tcp")]
+    #[arg(long, default_value = "unified")]
     pub socket_type: SocketType,
 }
 
