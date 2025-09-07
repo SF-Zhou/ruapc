@@ -114,7 +114,7 @@ impl Router {
             };
 
             let operation = Operation {
-                operation_id: Some("createUser".to_string()),
+                operation_id: Some(name.clone()),
                 request_body: Some(ReferenceOr::Item(request_body)),
                 responses: Responses {
                     responses: IndexMap::from([(
