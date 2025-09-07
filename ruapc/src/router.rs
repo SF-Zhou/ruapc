@@ -138,8 +138,8 @@ impl Router {
         let definitions = generator.take_definitions(true);
         let schemas = definitions
             .into_iter()
-            .map(|(name, schema)| (name, serde_json::from_value(schema).unwrap()))
-            .collect::<IndexMap<_, _>>();
+            .map(|(name, schema)| Ok((name, serde_json::from_value(schema)?)))
+            .collect::<Result<IndexMap<_, _>>>()?;
 
         // Create base OpenAPI specification with natural builder pattern
         self.openapi = OpenAPI {
