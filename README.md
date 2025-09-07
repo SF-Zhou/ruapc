@@ -47,7 +47,7 @@ impl EchoService for DemoImpl {
 async fn main() {
     let demo = Arc::new(DemoImpl);
     let mut router = Router::default();
-    router.add_methods(EchoService::ruapc_export(demo.clone()));
+    EchoService::ruapc_export(demo.clone(), &mut router);
     let server = Server::create(router, &SocketPoolConfig::default());
 
     let server = Arc::new(server);
@@ -97,7 +97,7 @@ curl -s -X POST http://0.0.0.0:8000/MetaService/list_methods | json_pp
 #>    "Ok" : [
 #>       "EchoService/echo",
 #>       "MetaService/list_methods",
-#>       "MetaService/get_metadata",
+#>       "MetaService/openapi",
 #>       "GreetService/greet"
 #>    ]
 #> }

@@ -16,9 +16,10 @@ pub struct State {
 impl State {
     /// # Errors
     pub(crate) fn create(
-        router: Router,
+        mut router: Router,
         config: &SocketPoolConfig,
     ) -> Result<(Arc<Self>, DropGuard)> {
+        router.build_open_api()?;
         let state = Self {
             router,
             waiter: Arc::default(),

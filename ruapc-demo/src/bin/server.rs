@@ -49,8 +49,8 @@ async fn main() {
 
     let demo = Arc::new(DemoImpl::default());
     let mut router = Router::default();
-    router.add_methods(EchoService::ruapc_export(demo.clone()));
-    router.add_methods(GreetService::ruapc_export(demo.clone()));
+    EchoService::ruapc_export(demo.clone(), &mut router);
+    GreetService::ruapc_export(demo.clone(), &mut router);
     let server = Server::create(
         router,
         &SocketPoolConfig {

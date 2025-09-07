@@ -48,7 +48,7 @@ impl BarService for BarServiceImpl {
 async fn test_callback() {
     let foo = Arc::new(FooServiceImpl);
     let mut router = Router::default();
-    router.add_methods(foo.clone().ruapc_export());
+    foo.clone().ruapc_export(&mut router);
     let server = Server::create(router, &SocketPoolConfig::default()).unwrap();
     let server = Arc::new(server);
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
@@ -56,7 +56,7 @@ async fn test_callback() {
 
     let bar = Arc::new(BarServiceImpl);
     let mut router = Router::default();
-    router.add_methods(bar.clone().ruapc_export());
+    bar.clone().ruapc_export(&mut router);
     let ctx = Context::create_with_router(router, &SocketPoolConfig::default()).unwrap();
     let ctx = ctx.with_addr(addr);
 

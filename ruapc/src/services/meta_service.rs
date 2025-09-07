@@ -12,20 +12,13 @@ pub struct Metadata {
 
 #[ruapc_macro::service]
 pub trait MetaService {
-    async fn get_metadata(&self, ctx: &Context, req: &()) -> Result<Metadata>;
+    async fn openapi(&self, ctx: &Context, req: &()) -> Result<serde_json::Value>;
     async fn list_methods(&self, ctx: &Context, req: &()) -> Result<Vec<String>>;
 }
 
 impl MetaService for () {
-    async fn get_metadata(&self, ctx: &Context, (): &()) -> Result<Metadata> {
-        let methods = ctx
-            .state
-            .router
-            .methods
-            .iter()
-            .map(|(name, method)| (name.clone(), method.info.clone()))
-            .collect();
-        Ok(Metadata { methods })
+    async fn openapi(&self, ctx: &Context, (): &()) -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(&ctx.state.router.openapi).unwrap())
     }
 
     async fn list_methods(&self, ctx: &Context, (): &()) -> Result<Vec<String>> {

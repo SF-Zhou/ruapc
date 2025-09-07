@@ -13,7 +13,7 @@ mod msg;
 pub use msg::{Message, MsgFlags, MsgMeta};
 
 mod router;
-pub use router::{Method, Router};
+pub use router::Router;
 
 mod waiter;
 pub use waiter::{Waiter, WaiterCleaner};

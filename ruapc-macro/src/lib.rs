@@ -42,27 +42,22 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
             send_bounds.push(quote! { Self::#method_ident(..): Send, });
             invoke_branchs.push(quote! {
                 let this = self.clone();
-                let method = #krate::Method::new(
-                    ::schemars::schema_for!(#req_type),
-                    ::schemars::schema_for!(#rsp_type),
-                    Box::new(move |mut ctx, msg| {
-                        let this = this.clone();
-                        ::tokio::spawn(async move {
-                            let meta = msg.meta.clone();
-                            match msg.deserialize() {
-                                Ok(req) => {
-                                    let result = this.#method_ident(&ctx, &req).await;
-                                    ctx.send_rsp(meta, result).await;
-                                }
-                                Err(err) => {
-                                    ctx.send_err_rsp(meta, err).await;
-                                }
+                router.add_method::<#req_type, #rsp_type>(#method_name, Box::new(move |mut ctx, msg| {
+                    let this = this.clone();
+                    ::tokio::spawn(async move {
+                        let meta = msg.meta.clone();
+                        match msg.deserialize() {
+                            Ok(req) => {
+                                let result = this.#method_ident(&ctx, &req).await;
+                                ctx.send_rsp(meta, result).await;
                             }
-                        });
-                        Ok(())
-                    }),
-                );
-                map.insert(#method_name.into(), method);
+                            Err(err) => {
+                                ctx.send_err_rsp(meta, err).await;
+                            }
+                        }
+                    });
+                    Ok(())
+                }));
             });
         } else {
             panic!(
@@ -79,14 +74,13 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
 
             fn ruapc_export(
                 self: ::std::sync::Arc<Self>,
-            ) -> ::std::collections::HashMap<String, #krate::Method>
+                router: &mut #krate::Router,
+            )
             where
                 Self: 'static + Send + Sync,
                 #(#send_bounds)*
             {
-                let mut map = ::std::collections::HashMap::new();
                 #(#invoke_branchs)*
-                map
             }
         }
 
