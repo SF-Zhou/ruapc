@@ -1,7 +1,15 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use foldhash::fast::RandomState;
-use schemars::{JsonSchema, Schema};
+use indexmap::IndexMap;
+use openapiv3::{
+    Components, MediaType, OpenAPI, Operation, PathItem, Paths, ReferenceOr, RequestBody, Response,
+    Responses, StatusCode,
+};
+use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "rdma")]
@@ -12,7 +20,7 @@ use crate::{
     services::MetaService,
 };
 
-pub type Func = Box<dyn Fn(Context, Message) -> Result<()> + Send + Sync>;
+type Func = Box<dyn Fn(Context, Message) -> Result<()> + Send + Sync>;
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
 pub struct MethodInfo {
@@ -25,38 +33,129 @@ pub struct Method {
     func: Func,
 }
 
-impl Method {
-    #[must_use]
-    pub fn new(req_schema: Schema, rsp_schema: Schema, func: Func) -> Self {
-        Self {
-            info: MethodInfo {
-                req_schema,
-                rsp_schema,
-            },
-            func,
-        }
-    }
-}
-
 pub struct Router {
+    pub generator: Mutex<SchemaGenerator>,
     pub methods: HashMap<String, Method, RandomState>,
+    pub openapi: OpenAPI,
 }
 
 impl Default for Router {
     fn default() -> Self {
+        let settings = schemars::generate::SchemaSettings::openapi3();
         let mut this = Self {
+            generator: Mutex::new(SchemaGenerator::new(settings)),
             methods: HashMap::default(),
+            openapi: OpenAPI::default(),
         };
-        this.add_methods(MetaService::ruapc_export(Arc::new(())));
+        MetaService::ruapc_export(Arc::new(()), &mut this);
         #[cfg(feature = "rdma")]
-        this.add_methods(RdmaService::ruapc_export(Arc::new(())));
+        RdmaService::ruapc_export(Arc::new(()), &mut this);
         this
     }
 }
 
 impl Router {
-    pub fn add_methods(&mut self, methods: HashMap<String, Method>) {
-        self.methods.extend(methods);
+    pub fn add_method<Req, Rsp>(&mut self, name: &str, func: Func)
+    where
+        Req: JsonSchema,
+        Rsp: JsonSchema,
+    {
+        let (req_schema, rsp_schema) = {
+            let mut generator = self.generator.lock().unwrap();
+            (
+                generator.subschema_for::<Req>(),
+                generator.subschema_for::<Rsp>(),
+            )
+        };
+
+        self.methods.insert(
+            name.to_string(),
+            Method {
+                info: MethodInfo {
+                    req_schema,
+                    rsp_schema,
+                },
+                func,
+            },
+        );
+    }
+
+    pub fn build_open_api(&mut self) -> Result<()> {
+        let mut paths = IndexMap::<String, ReferenceOr<PathItem>>::new();
+        for (name, method) in &self.methods {
+            let request_schema = serde_json::to_value(&method.info.req_schema)?;
+            let response_schema = serde_json::to_value(&method.info.rsp_schema)?;
+
+            let request_body = RequestBody {
+                content: {
+                    IndexMap::from([(
+                        "application/json".to_string(),
+                        MediaType {
+                            schema: Some(serde_json::from_value(request_schema)?),
+                            ..Default::default()
+                        },
+                    )])
+                },
+                required: true,
+                ..Default::default()
+            };
+
+            let response = Response {
+                content: {
+                    IndexMap::from([(
+                        "application/json".to_string(),
+                        MediaType {
+                            schema: Some(serde_json::from_value(response_schema)?),
+                            ..Default::default()
+                        },
+                    )])
+                },
+                ..Default::default()
+            };
+
+            let operation = Operation {
+                operation_id: Some(name.clone()),
+                request_body: Some(ReferenceOr::Item(request_body)),
+                responses: Responses {
+                    responses: IndexMap::from([(
+                        StatusCode::Code(200),
+                        ReferenceOr::Item(response),
+                    )]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            let path_item = openapiv3::PathItem {
+                post: Some(operation),
+                ..Default::default()
+            };
+
+            paths.insert(name.clone(), ReferenceOr::Item(path_item));
+        }
+
+        let mut generator = self.generator.lock().unwrap();
+        let definitions = generator.take_definitions(true);
+        let schemas = definitions
+            .into_iter()
+            .map(|(name, schema)| Ok((name, serde_json::from_value(schema)?)))
+            .collect::<Result<IndexMap<_, _>>>()?;
+
+        // Create base OpenAPI specification with natural builder pattern
+        self.openapi = OpenAPI {
+            openapi: "3.0.0".to_string(),
+            components: Some(Components {
+                schemas,
+                ..Default::default()
+            }),
+            paths: Paths {
+                paths,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        Ok(())
     }
 
     pub fn method_names(&self) -> impl Iterator<Item = &String> {
@@ -81,6 +180,7 @@ impl std::fmt::Debug for Router {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Router")
             .field("methods", &self.methods.keys())
+            .field("generator", &())
             .finish()
     }
 }

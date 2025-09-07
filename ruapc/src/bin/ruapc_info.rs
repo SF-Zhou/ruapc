@@ -18,7 +18,7 @@ pub struct Args {
 
     /// Get metadata.
     #[arg(long, default_value_t = false)]
-    pub get_metadata: bool,
+    pub openapi: bool,
 }
 
 #[tokio::main]
@@ -35,8 +35,8 @@ async fn main() {
         ..Default::default()
     };
 
-    if args.get_metadata {
-        match client.get_metadata(&ctx, &()).await {
+    if args.openapi {
+        match client.openapi(&ctx, &()).await {
             Ok(rsp) => println!("{}", serde_json::to_string_pretty(&rsp).unwrap()),
             Err(err) => eprintln!("request failed: {err}"),
         }

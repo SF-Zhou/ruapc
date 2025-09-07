@@ -101,6 +101,14 @@ impl HttpSocketPool {
             return Ok(response);
         }
 
+        if req.uri().path() == "/openapi.json" && req.method() == hyper::Method::GET {
+            let openapi_json = serde_json::to_string_pretty(&state.router.openapi)?;
+            return Ok(Response::builder()
+                .header("Content-Type", "application/json")
+                .body(Full::new(Bytes::from(openapi_json)))
+                .unwrap());
+        }
+
         let (msgid, rx) = state.waiter.alloc();
         let meta = MsgMeta {
             method: req.uri().path().trim_start_matches('/').to_string(),

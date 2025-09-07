@@ -32,7 +32,7 @@ async fn test_hello() {
     ] {
         let foo = Arc::new(FooImpl);
         let mut router = ruapc::Router::default();
-        router.add_methods(foo.ruapc_export());
+        foo.ruapc_export(&mut router);
 
         let config = SocketPoolConfig {
             socket_type: SocketType::UNIFIED,
@@ -62,7 +62,7 @@ async fn test_hello() {
 async fn test_http() {
     let foo = Arc::new(FooImpl);
     let mut router = ruapc::Router::default();
-    router.add_methods(foo.ruapc_export());
+    foo.ruapc_export(&mut router);
 
     let config = SocketPoolConfig {
         socket_type: SocketType::UNIFIED,
@@ -97,7 +97,7 @@ async fn test_http() {
 async fn test_rdma() {
     let foo = Arc::new(FooImpl);
     let mut router = ruapc::Router::default();
-    router.add_methods(foo.ruapc_export());
+    foo.ruapc_export(&mut router);
 
     let config = SocketPoolConfig {
         socket_type: SocketType::UNIFIED,
