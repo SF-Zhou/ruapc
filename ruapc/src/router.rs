@@ -1,12 +1,12 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
 };
 
 use foldhash::fast::RandomState;
 use indexmap::IndexMap;
 use openapiv3::{
-    Components, MediaType, OpenAPI, Operation, PathItem, Paths, ReferenceOr, RequestBody, Response,
+    Components, MediaType, OpenAPI, Operation, Paths, ReferenceOr, RequestBody, Response,
     Responses, StatusCode,
 };
 use schemars::{JsonSchema, Schema, SchemaGenerator};
@@ -81,7 +81,7 @@ impl Router {
     }
 
     pub fn build_open_api(&mut self) -> Result<()> {
-        let mut paths = IndexMap::<String, ReferenceOr<PathItem>>::new();
+        let mut paths = BTreeMap::new();
         for (name, method) in &self.methods {
             let request_schema = serde_json::to_value(&method.info.req_schema)?;
             let response_schema = serde_json::to_value(&method.info.rsp_schema)?;
@@ -114,7 +114,7 @@ impl Router {
             };
 
             let operation = Operation {
-                operation_id: Some(name.clone()),
+                operation_id: Some(format!("/{name}")),
                 request_body: Some(ReferenceOr::Item(request_body)),
                 responses: Responses {
                     responses: IndexMap::from([(
@@ -131,7 +131,7 @@ impl Router {
                 ..Default::default()
             };
 
-            paths.insert(name.clone(), ReferenceOr::Item(path_item));
+            paths.insert(format!("/{name}"), ReferenceOr::Item(path_item));
         }
 
         let mut generator = self.generator.lock().unwrap();
@@ -149,7 +149,7 @@ impl Router {
                 ..Default::default()
             }),
             paths: Paths {
-                paths,
+                paths: paths.into_iter().collect(),
                 ..Default::default()
             },
             ..Default::default()
