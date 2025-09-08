@@ -101,12 +101,37 @@ impl HttpSocketPool {
             return Ok(response);
         }
 
-        if req.uri().path() == "/openapi.json" && req.method() == hyper::Method::GET {
-            let openapi_json = serde_json::to_string_pretty(&state.router.openapi)?;
-            return Ok(Response::builder()
-                .header("Content-Type", "application/json")
-                .body(Full::new(Bytes::from(openapi_json)))
-                .unwrap());
+        if req.method() == hyper::Method::GET {
+            match req.uri().path() {
+                "/openapi.json" => {
+                    let openapi_json = serde_json::to_string_pretty(&state.router.openapi)?;
+                    return Ok(Response::builder()
+                        .header("Content-Type", "application/json")
+                        .body(Full::new(Bytes::from(openapi_json)))
+                        .unwrap());
+                }
+                "/rapidoc/rapidoc-min.js" => {
+                    return Ok(Response::builder()
+                        .header("Content-Type", "application/javascript")
+                        .body(Full::new(Bytes::from(include_str!(
+                            "rapidoc/rapidoc-min.js"
+                        ))))
+                        .unwrap());
+                }
+                "/rapidoc" | "/rapidoc/" | "/rapidoc/index.html" => {
+                    let html = include_str!("rapidoc/index.html");
+                    return Ok(Response::builder()
+                        .header("Content-Type", "text/html; charset=utf-8")
+                        .body(Full::new(Bytes::from(html)))
+                        .unwrap());
+                }
+                _ => {
+                    return Ok(Response::builder()
+                        .status(404)
+                        .body(Full::new(Bytes::from("Not Found")))
+                        .unwrap());
+                }
+            }
         }
 
         let (msgid, rx) = state.waiter.alloc();
