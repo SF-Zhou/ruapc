@@ -1,6 +1,6 @@
+name: Rust
 permissions:
   contents: read
-name: Rust
 
 on:
   push:
