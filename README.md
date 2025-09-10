@@ -5,9 +5,16 @@
 [![crates.io](https://img.shields.io/crates/v/ruapc.svg)](https://crates.io/crates/ruapc)
 [![stability-wip](https://img.shields.io/badge/stability-wip-lightgrey.svg)](https://github.com/mkenney/software-guides/blob/master/STABILITY-BADGES.md#work-in-progress)
 
-A Rust RPC library.
+A high-performance Rust RPC library that supports multiple transport protocols (TCP, WebSocket, HTTP, RDMA) with unified API, and OpenAPI integration.
 
 <img src="docs/logo.png" alt="RuaPC" width="256" height="256">
+
+## Features
+
+- **Multiple Transport Protocols**: TCP, WebSocket, HTTP, RDMA (optional), and a unified protocol that supports all simultaneously
+- **Multiple Serialization Formats**: JSON (default) and MessagePack support
+- **OpenAPI Integration**: Automatic OpenAPI 3.0 specification generation with JSON Schema support
+- **Built-in Documentation**: RapiDoc integration for interactive API documentation
 
 ## Example
 
@@ -17,9 +24,10 @@ Define service:
 #![feature(return_type_notation)]
 
 use ruapc::{Context, Result};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, JsonSchema)]
 pub struct Request(pub String);
 
 #[ruapc::service]
@@ -76,18 +84,31 @@ async fn main() {
 }
 ```
 
-You could also directly execute the stress program provided in ruapc-demo.
+## Quick Start
+
+You can directly execute the demo programs provided in ruapc-demo:
+
+### Server
 
 ```bash
-# 1. start the server. the socket type can be `tcp`, `ws`, `http`, or `unified`, where `unified` supports TCP, WebSocket, and HTTP protocols simultaneously.
+# Start the server with unified protocol (supports TCP, WebSocket, and HTTP simultaneously)
 cargo run --release --bin server -- --socket-type unified
 
-# 2. start the client.
+# Or start with specific protocol
+cargo run --release --bin server -- --socket-type tcp
+cargo run --release --bin server -- --socket-type ws
+cargo run --release --bin server -- --socket-type http
+```
+
+### Client
+
+```bash
+# Stress testing with different protocols
 cargo run --release --bin client -- --stress --coroutines 128 --secs 10 --socket-type tcp
 cargo run --release --bin client -- --stress --coroutines 128 --secs 10 --socket-type ws
 cargo run --release --bin client -- --stress --coroutines 128 --secs 10 --socket-type http
 
-# 3. you can also use curl to send HTTP requests.
+# Or use curl to send HTTP requests.
 curl -s -X POST -d '"hello HTTP"' http://0.0.0.0:8000/EchoService/echo | json_pp
 #> {
 #>    "Ok" : "hello HTTP"
@@ -101,4 +122,11 @@ curl -s -X POST http://0.0.0.0:8000/MetaService/list_methods | json_pp
 #>       "GreetService/greet"
 #>    ]
 #> }
+
+# Access interactive API documentation
+open http://0.0.0.0:8000/rapidoc
 ```
+
+## License
+
+This project is dual-licensed under the [MIT License](LICENSE-MIT) and [Apache License 2.0](LICENSE-APACHE).
