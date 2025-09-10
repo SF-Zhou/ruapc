@@ -101,6 +101,7 @@ impl HttpSocket {
         // 2. build request.
         let req = hyper::Request::builder()
             .uri(format!("http://{}/{}", connections.addr, method))
+            .header("Content-Type", "application/json")
             .method(hyper::Method::POST)
             .body(Full::new(bytes))
             .map_err(|e| Error::new(ErrorKind::HttpBuildReqFailed, e.to_string()))?;
