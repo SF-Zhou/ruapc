@@ -159,7 +159,10 @@ impl HttpSocketPool {
             .await
             .map_err(|e| Error::new(ErrorKind::HttpWaitRspFailed, e.to_string()))?;
 
-        Ok(Response::new(Full::new(msg.payload.into())))
+        Ok(Response::builder()
+            .header("Content-Type", "application/json")
+            .body(Full::new(msg.payload.into()))
+            .unwrap())
     }
 
     pub fn stop(&self) {
