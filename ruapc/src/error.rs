@@ -132,4 +132,68 @@ mod tests {
             .into();
         assert_eq!(error.kind, ErrorKind::SerdeJsonError);
     }
+
+    #[test]
+    fn test_error_new() {
+        let error = Error::new(ErrorKind::Timeout, "operation timeout".to_string());
+        assert_eq!(error.kind, ErrorKind::Timeout);
+        assert_eq!(error.msg, "operation timeout");
+    }
+
+    #[test]
+    fn test_error_kind_constructor() {
+        let error = Error::kind(ErrorKind::InvalidArgument);
+        assert_eq!(error.kind, ErrorKind::InvalidArgument);
+        assert_eq!(error.msg, String::default());
+    }
+
+    #[test]
+    fn test_error_display() {
+        // Test display with empty message
+        let error = Error::kind(ErrorKind::Timeout);
+        assert_eq!(format!("{}", error), "Timeout");
+
+        // Test display with message
+        let error = Error::new(
+            ErrorKind::TcpConnectFailed,
+            "connection refused".to_string(),
+        );
+        assert_eq!(format!("{}", error), "TcpConnectFailed: connection refused");
+    }
+
+    #[test]
+    fn test_from_try_from_int_error() {
+        let value: std::result::Result<u8, _> = (-1i32).try_into();
+        let int_error = value.unwrap_err();
+        let error: Error = int_error.into();
+
+        assert_eq!(error.kind, ErrorKind::InvalidArgument);
+        assert!(!error.msg.is_empty());
+    }
+
+    #[test]
+    fn test_from_serde_json_error() {
+        let json_error = serde_json::from_str::<serde_json::Value>("invalid json").unwrap_err();
+        let error: Error = json_error.into();
+
+        assert_eq!(error.kind, ErrorKind::SerdeJsonError);
+        assert!(!error.msg.is_empty());
+    }
+
+    #[test]
+    fn test_from_rmp_serde_encode_error() {
+        let e: Error = rmp_serde::encode::Error::UnknownLength.into();
+        assert_eq!(e.kind, ErrorKind::SerializeFailed);
+    }
+
+    #[test]
+    fn test_from_rmp_serde_decode_error() {
+        // Try to decode invalid MessagePack data
+        let invalid_data = vec![0xFF, 0xFF, 0xFF];
+        let decode_error = rmp_serde::from_slice::<String>(&invalid_data).unwrap_err();
+        let error: Error = decode_error.into();
+
+        assert_eq!(error.kind, ErrorKind::DeserializeFailed);
+        assert!(!error.msg.is_empty());
+    }
 }

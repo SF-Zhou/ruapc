@@ -1,7 +1,5 @@
 use std::{net::SocketAddr, sync::Arc};
 
-use tokio_util::sync::DropGuard;
-
 use crate::{Error, ErrorKind, RawStream, Result, State, TaskSupervisor};
 
 pub struct Listener {
@@ -52,11 +50,6 @@ impl Listener {
 
     pub fn stop(&self) {
         self.task_supervisor.stop();
-    }
-
-    #[must_use]
-    pub fn drop_guard(&self) -> DropGuard {
-        self.task_supervisor.drop_guard()
     }
 
     pub async fn join(&self) {
