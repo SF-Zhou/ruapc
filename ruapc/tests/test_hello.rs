@@ -3,7 +3,7 @@
 
 use std::{str::FromStr, sync::Arc};
 
-use ruapc::{SocketPoolConfig, SocketType};
+use ruapc::{MsgMeta, Result, SocketPoolConfig, SocketType};
 
 #[ruapc::service]
 trait Foo {
@@ -110,8 +110,12 @@ async fn test_rdma() {
         socket_type: Some(SocketType::RDMA),
         ..Default::default()
     };
-    let ctx = ruapc::Context::create(&config).unwrap().with_addr(addr);
 
+    let mut ctx = ruapc::Context::create(&config).unwrap();
+    client.hello(&ctx, &"ruapc".to_string()).await.unwrap_err();
+    ctx.send_rsp(MsgMeta::default(), Result::Ok(())).await;
+
+    let ctx = ctx.with_addr(addr);
     for _ in 0..256 {
         let rsp = client.hello(&ctx, &"ruapc".to_string()).await.unwrap();
         assert_eq!(rsp, "hello ruapc!");

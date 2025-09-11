@@ -58,15 +58,6 @@ impl Context {
     }
 
     #[must_use]
-    pub fn with_socket(&self, socket: Socket) -> Self {
-        Self {
-            state: self.state.clone(),
-            endpoint: SocketEndpoint::Connected(socket),
-            drop_guard: self.drop_guard.clone(),
-        }
-    }
-
-    #[must_use]
     pub(crate) fn server_ctx(state: &Arc<State>, socket: Socket) -> Self {
         Self {
             state: state.clone(),

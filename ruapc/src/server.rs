@@ -17,7 +17,7 @@ impl Server {
 
         Ok(Self {
             state,
-            listener: Listener::new(),
+            listener: Listener::default(),
             _drop_guard: drop_guard,
         })
     }
