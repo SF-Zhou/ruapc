@@ -44,12 +44,21 @@ jobs:
         sudo rdma link add rxe_0 type rxe netdev $ETHERNET_CARD
         rdma link
 
+    - name: Install llvm-tools
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: llvm-tools-preview
+
+    - name: Install cargo-llvm-cov
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-llvm-cov,cargo-nextest
+
     - name: Run tests
       run: |
         sudo prlimit --pid $$ -l=unlimited && ulimit -a
         sudo apt install -y pkg-config libibverbs-dev ibverbs-utils
         ibv_devinfo -d rxe_0 -v
-        cargo install cargo-llvm-cov cargo-nextest
         cargo llvm-cov nextest --all-features --ignore-filename-regex "ruapc-demo/*|ruapc-macro/*|ruapc/src/bin/*"
         cargo llvm-cov report --cobertura --ignore-filename-regex "ruapc-demo/*|ruapc-macro/*|ruapc/src/bin/*" --output-path target/llvm-cov-target/cobertura.xml
 
