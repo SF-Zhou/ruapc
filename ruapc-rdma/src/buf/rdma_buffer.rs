@@ -36,6 +36,9 @@ impl RegisteredBuffer {
                     verbs::ACCESS_FLAGS as _,
                 )
             };
+            if mr.is_null() {
+                return Err(ErrorKind::IBRegMemoryRegionFail.into());
+            }
             memory_regions.push(RawMemoryRegion(mr));
         }
         Ok(Self {
