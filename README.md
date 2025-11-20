@@ -127,6 +127,19 @@ curl -s -X POST http://0.0.0.0:8000/MetaService/list_methods | json_pp
 open http://0.0.0.0:8000/rapidoc
 ```
 
+### RDMA Support
+
+```bash
+# Make sure the process has unlimited memory lock limit.
+sudo prlimit --pid $$ -l=unlimited
+
+# Start the server with RDMA
+cargo run --release --bin server --features rdma -- --socket-type unified
+
+# Stress testing with RDMA
+cargo run --release --bin client --features rdma -- --stress --coroutines 128
+```
+
 ## License
 
 This project is dual-licensed under the [MIT License](LICENSE-MIT) and [Apache License 2.0](LICENSE-APACHE).
