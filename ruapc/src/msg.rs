@@ -238,7 +238,7 @@ impl MsgMeta {
     ///
     /// # Type Parameters
     ///
-    /// * `M` - The message buffer type implementing [`SendMsg`]
+    /// * `M` - The message buffer type implementing `SendMsg`
     /// * `P` - The payload type to serialize
     ///
     /// # Arguments

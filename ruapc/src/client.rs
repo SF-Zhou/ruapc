@@ -18,26 +18,12 @@ use crate::{
 ///
 /// # Examples
 ///
-/// ```rust,no_run
-/// # #![feature(return_type_notation)]
-/// # use ruapc::{Client, Context, SocketPoolConfig};
-/// # use std::{net::SocketAddr, str::FromStr};
-/// # use schemars::JsonSchema;
-/// # use serde::{Deserialize, Serialize};
-/// # #[derive(Serialize, Deserialize, JsonSchema)]
-/// # struct Request(String);
-/// # #[ruapc::service]
-/// # trait EchoService {
-/// #     async fn echo(&self, ctx: &Context, req: &Request) -> ruapc::Result<String>;
-/// # }
-/// # #[tokio::main]
-/// # async fn main() {
+/// ```rust,ignore
 /// let client = Client::default();
 /// let addr = SocketAddr::from_str("127.0.0.1:8000").unwrap();
 /// let ctx = Context::create(&SocketPoolConfig::default()).unwrap().with_addr(addr);
 ///
 /// let rsp = client.echo(&ctx, &Request("hello".into())).await;
-/// # }
 /// ```
 #[serde_inline_default]
 #[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone)]

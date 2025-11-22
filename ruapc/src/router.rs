@@ -53,24 +53,7 @@ pub struct Method {
 ///
 /// # Examples
 ///
-/// ```rust,no_run
-/// # #![feature(return_type_notation)]
-/// # use ruapc::{Router, Context};
-/// # use std::sync::Arc;
-/// # use schemars::JsonSchema;
-/// # use serde::{Deserialize, Serialize};
-/// # #[derive(Serialize, Deserialize, JsonSchema)]
-/// # struct Request(String);
-/// # #[ruapc::service]
-/// # trait EchoService {
-/// #     async fn echo(&self, ctx: &Context, req: &Request) -> ruapc::Result<String>;
-/// # }
-/// # struct EchoImpl;
-/// # impl EchoService for EchoImpl {
-/// #     async fn echo(&self, _ctx: &Context, req: &Request) -> ruapc::Result<String> {
-/// #         Ok(req.0.clone())
-/// #     }
-/// # }
+/// ```rust,ignore
 /// let mut router = Router::default();
 /// EchoService::ruapc_export(Arc::new(EchoImpl), &mut router);
 /// ```

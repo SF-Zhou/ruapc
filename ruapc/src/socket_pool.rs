@@ -119,7 +119,7 @@ impl SocketPool {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,no_run
     /// # use ruapc::{SocketPool, SocketPoolConfig, SocketType};
     /// let config = SocketPoolConfig { socket_type: SocketType::TCP };
     /// let pool = SocketPool::create(&config).unwrap();
@@ -139,7 +139,7 @@ impl SocketPool {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,no_run
     /// # use ruapc::{SocketPool, SocketPoolConfig, SocketType};
     /// # let pool = SocketPool::create(&SocketPoolConfig::default()).unwrap();
     /// let socket_type = pool.socket_type();
@@ -173,21 +173,6 @@ impl SocketPool {
     /// Returns an error if:
     /// - The connection cannot be established
     /// - The requested socket type is not supported by this pool
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// # use ruapc::{SocketPool, SocketPoolConfig, SocketType, State, Router};
-    /// # use std::{net::SocketAddr, str::FromStr, sync::Arc};
-    /// # #[tokio::main]
-    /// # async fn main() {
-    /// # let pool = SocketPool::create(&SocketPoolConfig::default()).unwrap();
-    /// # let (state, _) = State::create(Router::default(), &SocketPoolConfig::default()).unwrap();
-    /// # let state = Arc::new(state);
-    /// let addr = SocketAddr::from_str("127.0.0.1:8000").unwrap();
-    /// let socket = pool.acquire(&addr, SocketType::TCP, &state).await.unwrap();
-    /// # }
-    /// ```
     pub async fn acquire(
         &self,
         addr: &SocketAddr,

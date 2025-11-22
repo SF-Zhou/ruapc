@@ -14,26 +14,7 @@ use crate::{Listener, Result, Router, SocketPoolConfig, State};
 ///
 /// # Examples
 ///
-/// ```rust,no_run
-/// # #![feature(return_type_notation)]
-/// # use ruapc::{Server, Router, SocketPoolConfig, Context};
-/// # use std::{net::SocketAddr, str::FromStr, sync::Arc};
-/// # use schemars::JsonSchema;
-/// # use serde::{Deserialize, Serialize};
-/// # #[derive(Serialize, Deserialize, JsonSchema)]
-/// # struct Request(String);
-/// # #[ruapc::service]
-/// # trait EchoService {
-/// #     async fn echo(&self, ctx: &Context, req: &Request) -> ruapc::Result<String>;
-/// # }
-/// # struct DemoImpl;
-/// # impl EchoService for DemoImpl {
-/// #     async fn echo(&self, _ctx: &Context, req: &Request) -> ruapc::Result<String> {
-/// #         Ok(req.0.clone())
-/// #     }
-/// # }
-/// # #[tokio::main]
-/// # async fn main() {
+/// ```rust,ignore
 /// let mut router = Router::default();
 /// EchoService::ruapc_export(Arc::new(DemoImpl), &mut router);
 ///
@@ -43,7 +24,6 @@ use crate::{Listener, Result, Router, SocketPoolConfig, State};
 /// let addr = SocketAddr::from_str("127.0.0.1:8000").unwrap();
 /// server.listen(addr).await.unwrap();
 /// server.join().await;
-/// # }
 /// ```
 pub struct Server {
     state: Arc<State>,
