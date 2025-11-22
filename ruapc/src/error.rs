@@ -1,47 +1,109 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Error kinds representing different failure scenarios in RPC operations.
+///
+/// This enum categorizes errors that can occur during RPC communication,
+/// serialization/deserialization, and protocol-specific operations.
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
 pub enum ErrorKind {
+    /// Request or response timeout.
     Timeout,
+    /// Invalid argument or parameter provided.
     InvalidArgument,
+    /// Failed to serialize data.
     SerializeFailed,
+    /// Failed to deserialize data.
     DeserializeFailed,
+    /// JSON serialization/deserialization error.
     SerdeJsonError,
+    /// Failed to establish TCP connection.
     TcpConnectFailed,
+    /// Failed to bind TCP socket.
     TcpBindFailed,
+    /// Failed to send message over TCP.
     TcpSendMsgFailed,
+    /// Failed to receive message over TCP.
     TcpRecvMsgFailed,
+    /// Failed to parse TCP message.
     TcpParseMsgFailed,
+    /// Failed to establish WebSocket connection.
     WebSocketConnectFailed,
+    /// Failed to accept WebSocket connection.
     WebSocketAcceptFailed,
+    /// Failed to send message over WebSocket.
     WebSocketSendFailed,
+    /// Failed to receive message over WebSocket.
     WebSocketRecvFailed,
+    /// WebSocket connection closed.
     WebSocketClosed,
+    /// Failed to wait for HTTP response.
     HttpWaitRspFailed,
+    /// Failed to build HTTP request.
     HttpBuildReqFailed,
+    /// Failed to send HTTP request.
     HttpSendReqFailed,
+    /// Failed to upgrade HTTP connection.
     HttpUpgradeFailed,
+    /// Failed to send message over RDMA.
     RdmaSendFailed,
+    /// Failed to receive message over RDMA.
     RdmaRecvFailed,
+    /// RDMA-specific error (only available with "rdma" feature).
     #[cfg(feature = "rdma")]
     RdmaError(ruapc_rdma::ErrorKind),
+    /// Unknown or unclassified error with a custom message.
     #[serde(untagged)]
     Unknown(String),
 }
 
+/// RPC error type containing error kind and optional message.
+///
+/// This is the primary error type used throughout the RuaPC library.
+/// It combines an error kind for categorization with an optional message
+/// for additional context.
+///
+/// # Examples
+///
+/// ```
+/// use ruapc::{Error, ErrorKind};
+///
+/// let error = Error::new(ErrorKind::Timeout, "request timed out after 5s".to_string());
+/// assert_eq!(error.kind, ErrorKind::Timeout);
+/// ```
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
 pub struct Error {
+    /// The category of error that occurred.
     pub kind: ErrorKind,
+    /// Additional error message providing context.
     pub msg: String,
 }
 
 impl Error {
+    /// Creates a new error with the specified kind and message.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ruapc::{Error, ErrorKind};
+    ///
+    /// let error = Error::new(ErrorKind::Timeout, "operation timed out".to_string());
+    /// ```
     #[must_use]
     pub fn new(kind: ErrorKind, msg: String) -> Self {
         Self { kind, msg }
     }
 
+    /// Creates a new error with the specified kind and an empty message.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ruapc::{Error, ErrorKind};
+    ///
+    /// let error = Error::kind(ErrorKind::Timeout);
+    /// assert_eq!(error.msg, "");
+    /// ```
     #[must_use]
     pub fn kind(kind: ErrorKind) -> Self {
         Self {
@@ -112,6 +174,19 @@ impl std::fmt::Display for Error {
     }
 }
 
+/// Result type alias using [`Error`] as the error type.
+///
+/// This is a convenience type alias used throughout the RuaPC library.
+///
+/// # Examples
+///
+/// ```
+/// use ruapc::{Result, Error, ErrorKind};
+///
+/// fn example_function() -> Result<String> {
+///     Ok("success".to_string())
+/// }
+/// ```
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
