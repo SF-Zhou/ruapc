@@ -3,7 +3,7 @@
 
 use std::{str::FromStr, sync::Arc};
 
-use ruapc::{MsgMeta, Result, SocketPoolConfig, SocketType};
+use ruapc::{SocketPoolConfig, SocketType};
 
 #[ruapc::service]
 trait Foo {
@@ -95,6 +95,8 @@ async fn test_http() {
 #[cfg(feature = "rdma")]
 #[tokio::test]
 async fn test_rdma() {
+    use ruapc::{MsgMeta, Result};
+
     let foo = Arc::new(FooImpl);
     let mut router = ruapc::Router::default();
     foo.ruapc_export(&mut router);
