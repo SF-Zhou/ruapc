@@ -18,12 +18,25 @@ use crate::{
     ws::WebSocketPool,
 };
 
+/// Transport protocol types supported by RuaPC.
+///
+/// Each socket type represents a different transport protocol with its own characteristics:
+/// - **TCP**: Raw TCP sockets with custom protocol
+/// - **WS**: WebSocket over HTTP
+/// - **HTTP**: HTTP/1.1 with request/response semantics
+/// - **UNIFIED**: Accepts all protocol types on the same port
+/// - **RDMA**: High-performance RDMA (requires "rdma" feature)
 #[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone, Copy, clap::ValueEnum)]
 pub enum SocketType {
+    /// Raw TCP transport.
     TCP,
+    /// WebSocket transport.
     WS,
+    /// HTTP transport.
     HTTP,
+    /// Unified transport supporting multiple protocols.
     UNIFIED,
+    /// RDMA transport (requires "rdma" feature).
     #[cfg(feature = "rdma")]
     RDMA,
 }
@@ -34,9 +47,23 @@ impl std::fmt::Display for SocketType {
     }
 }
 
+/// Socket pool configuration.
+///
+/// Specifies which transport protocol to use for the socket pool.
+///
+/// # Examples
+///
+/// ```rust
+/// use ruapc::{SocketPoolConfig, SocketType};
+///
+/// let config = SocketPoolConfig {
+///     socket_type: SocketType::TCP,
+/// };
+/// ```
 #[serde_inline_default]
 #[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone)]
 pub struct SocketPoolConfig {
+    /// The transport protocol type to use. Default is TCP.
     #[serde_inline_default(SocketType::TCP)]
     pub socket_type: SocketType,
 }
@@ -47,23 +74,56 @@ impl Default for SocketPoolConfig {
     }
 }
 
+/// Socket pool managing connections for different transport protocols.
+///
+/// The socket pool is responsible for:
+/// - Managing connection pooling and reuse
+/// - Acquiring new connections when needed
+/// - Handling protocol-specific connection logic
+/// - Lifecycle management (stop/join)
 #[derive(Debug)]
 pub enum SocketPool {
+    /// TCP socket pool.
     TCP(Arc<TcpSocketPool>),
+    /// WebSocket pool.
     WS(Arc<WebSocketPool>),
+    /// HTTP socket pool.
     HTTP(Arc<HttpSocketPool>),
+    /// Unified socket pool supporting multiple protocols.
     UNIFIED(UnifiedSocketPool),
+    /// RDMA socket pool (requires "rdma" feature).
     #[cfg(feature = "rdma")]
     RDMA(Arc<RdmaSocketPool>),
 }
 
+/// Raw network stream types.
+///
+/// Represents the underlying transport stream for different protocols.
 pub enum RawStream {
+    /// Raw TCP stream.
     TCP(TcpStream),
+    /// WebSocket stream over upgraded HTTP connection.
     WS(Box<WebSocketStream<TokioIo<Upgraded>>>),
 }
 
 impl SocketPool {
+    /// Creates a new socket pool with the given configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Socket pool configuration specifying the protocol type
+    ///
     /// # Errors
+    ///
+    /// Returns an error if the socket pool for the specified type cannot be created.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use ruapc::{SocketPool, SocketPoolConfig, SocketType};
+    /// let config = SocketPoolConfig { socket_type: SocketType::TCP };
+    /// let pool = SocketPool::create(&config).unwrap();
+    /// ```
     pub fn create(config: &SocketPoolConfig) -> Result<Self> {
         match config.socket_type {
             SocketType::TCP => Ok(SocketPool::TCP(TcpSocketPool::new())),
@@ -75,6 +135,16 @@ impl SocketPool {
         }
     }
 
+    /// Returns the socket type of this pool.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use ruapc::{SocketPool, SocketPoolConfig, SocketType};
+    /// # let pool = SocketPool::create(&SocketPoolConfig::default()).unwrap();
+    /// let socket_type = pool.socket_type();
+    /// assert_eq!(socket_type, SocketType::TCP);
+    /// ```
     #[must_use]
     pub fn socket_type(&self) -> SocketType {
         match self {
@@ -87,7 +157,22 @@ impl SocketPool {
         }
     }
 
+    /// Acquires a socket connection to the specified address.
+    ///
+    /// This method attempts to reuse an existing connection from the pool,
+    /// or creates a new connection if needed.
+    ///
+    /// # Arguments
+    ///
+    /// * `addr` - The target socket address
+    /// * `socket_type` - The protocol type to use for the connection
+    /// * `state` - Shared state for connection management
+    ///
     /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The connection cannot be established
+    /// - The requested socket type is not supported by this pool
     pub async fn acquire(
         &self,
         addr: &SocketAddr,

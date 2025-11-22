@@ -1,7 +1,60 @@
+//! # RuaPC Procedural Macros
+//!
+//! This crate provides procedural macros for the RuaPC RPC library.
+//!
+//! ## `#[service]` Macro
+//!
+//! The `#[service]` macro is used to define RPC service traits. It generates:
+//! - Server-side dispatch code for handling requests
+//! - Client-side implementation for making requests
+//! - Method registration with the router
+//!
+//! ### Example
+//!
+//! ```rust,ignore
+//! #[ruapc::service]
+//! pub trait MyService {
+//!     async fn my_method(&self, ctx: &Context, req: &Request) -> Result<Response>;
+//! }
+//! ```
+//!
+//! ### Requirements
+//!
+//! Service methods must follow this signature:
+//! - `async fn method_name(&self, ctx: &Context, req: &RequestType) -> Result<ResponseType>`
+//! - Three parameters: `&self`, `&Context`, and a request reference
+//! - Return type must be `Result<T>` where T is the response type
+//!
+//! ### Generated Code
+//!
+//! The macro generates:
+//! 1. A `ruapc_export` method for registering the service with a router
+//! 2. Client trait implementation on `Client` for making requests
+//! 3. Proper error handling and message serialization
+
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{FnArg, ItemTrait, ReturnType, TraitItem, parse_macro_input};
 
+/// Procedural macro for defining RPC services.
+///
+/// This macro transforms a trait definition into a complete RPC service
+/// with both client and server implementations.
+///
+/// # Panics
+///
+/// Panics at compile time if:
+/// - Methods don't match the required signature
+/// - Methods are named `ruapc_export` or `ruapc_request` (reserved names)
+///
+/// # Example
+///
+/// ```rust,ignore
+/// #[service]
+/// pub trait EchoService {
+///     async fn echo(&self, ctx: &Context, req: &String) -> Result<String>;
+/// }
+/// ```
 #[proc_macro_attribute]
 pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as ItemTrait);
@@ -91,6 +144,11 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
     .into()
 }
 
+/// Gets the correct crate name for importing ruapc.
+///
+/// This function handles both cases:
+/// - When ruapc-macro is used as a dependency (uses `::ruapc`)
+/// - When ruapc-macro is in the same workspace (uses `crate`)
 pub(crate) fn get_crate_name() -> proc_macro2::TokenStream {
     match proc_macro_crate::crate_name("ruapc") {
         Ok(proc_macro_crate::FoundCrate::Name(name)) => {

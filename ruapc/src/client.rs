@@ -10,14 +10,34 @@ use crate::{
     msg::{MsgFlags, MsgMeta},
 };
 
+/// RPC client configuration and request handler.
+///
+/// The `Client` struct is used to make RPC requests to remote services.
+/// It handles connection management, request serialization, and response
+/// deserialization with configurable timeout and serialization format.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// let client = Client::default();
+/// let addr = SocketAddr::from_str("127.0.0.1:8000").unwrap();
+/// let ctx = Context::create(&SocketPoolConfig::default()).unwrap().with_addr(addr);
+///
+/// let rsp = client.echo(&ctx, &Request("hello".into())).await;
+/// ```
 #[serde_inline_default]
 #[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone)]
 pub struct Client {
+    /// Timeout duration for RPC requests. Default is 1 second.
     #[serde_inline_default(Duration::from_secs(1))]
     #[serde(with = "humantime_serde")]
     pub timeout: Duration,
+    /// Whether to use MessagePack serialization. Default is true.
+    /// When false, JSON serialization is used.
     #[serde_inline_default(true)]
     pub use_msgpack: bool,
+    /// Optional socket type to override the default from context.
+    /// If None, uses the socket type from the context's socket pool.
     #[serde_inline_default(None)]
     pub socket_type: Option<SocketType>,
 }
@@ -29,7 +49,40 @@ impl Default for Client {
 }
 
 impl Client {
+    /// Makes an RPC request to a remote service.
+    ///
+    /// This is the internal method used by service trait implementations to
+    /// send requests and receive responses. It handles:
+    /// - Socket acquisition from the context
+    /// - Request serialization
+    /// - Response waiting with timeout
+    /// - Response deserialization
+    ///
+    /// # Type Parameters
+    ///
+    /// * `Req` - The request type, must be serializable and have a JSON schema
+    /// * `Rsp` - The response type, must be deserializable and have a JSON schema
+    /// * `E` - The error type that can be returned
+    ///
+    /// # Arguments
+    ///
+    /// * `ctx` - The RPC context containing connection information
+    /// * `req` - The request to send
+    /// * `method_name` - The name of the RPC method to invoke
+    ///
     /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The context doesn't have a valid endpoint
+    /// - Socket acquisition fails
+    /// - Request sending fails
+    /// - Response timeout occurs
+    /// - Response deserialization fails
+    ///
+    /// # Examples
+    ///
+    /// This method is typically called by generated service trait implementations,
+    /// not directly by user code.
     pub async fn ruapc_request<Req, Rsp, E>(
         &self,
         ctx: &Context,
