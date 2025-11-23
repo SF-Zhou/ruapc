@@ -5,7 +5,7 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::{
-    Receiver, State,
+    State,
     error::{Error, ErrorKind, Result},
     msg::MsgMeta,
 };
@@ -20,20 +20,12 @@ impl WebSocket {
         Self { stream }
     }
 
-    pub async fn send<'a, P: Serialize>(
+    pub async fn send<P: Serialize>(
         &self,
         meta: &mut MsgMeta,
         payload: &P,
-        state: &'a Arc<State>,
-    ) -> Result<Receiver<'a>> {
-        let receiver = if meta.is_req() {
-            let (msgid, rx) = state.waiter.alloc();
-            meta.msgid = msgid;
-            rx
-        } else {
-            Receiver::None
-        };
-
+        _: &Arc<State>,
+    ) -> Result<()> {
         let mut bytes = BytesMut::with_capacity(512);
         meta.serialize_to(payload, &mut bytes)?;
 
@@ -42,6 +34,6 @@ impl WebSocket {
             .await
             .map_err(|e| Error::new(ErrorKind::WebSocketSendFailed, e.to_string()))?;
 
-        Ok(receiver)
+        Ok(())
     }
 }

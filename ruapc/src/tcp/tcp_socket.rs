@@ -5,7 +5,7 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::{
-    Receiver, State,
+    State,
     error::{Error, ErrorKind, Result},
     msg::{MsgMeta, SendMsg},
 };
@@ -20,12 +20,12 @@ impl TcpSocket {
         Self { stream }
     }
 
-    pub async fn send<'a, P: Serialize>(
+    pub async fn send<P: Serialize>(
         &self,
         meta: &mut MsgMeta,
         payload: &P,
-        state: &'a Arc<State>,
-    ) -> Result<Receiver<'a>> {
+        _: &Arc<State>,
+    ) -> Result<()> {
         struct TcpSocketBytes(BytesMut);
 
         impl SendMsg for TcpSocketBytes {
@@ -59,14 +59,6 @@ impl TcpSocket {
             }
         }
 
-        let receiver = if meta.is_req() {
-            let (msgid, rx) = state.waiter.alloc();
-            meta.msgid = msgid;
-            rx
-        } else {
-            Receiver::None
-        };
-
         let mut bytes = TcpSocketBytes(BytesMut::with_capacity(512));
         meta.serialize_to(payload, &mut bytes)?;
         if bytes.0.len() >= super::MAX_MSG_SIZE {
@@ -81,6 +73,6 @@ impl TcpSocket {
             .await
             .map_err(|e| Error::new(ErrorKind::TcpSendMsgFailed, e.to_string()))?;
 
-        Ok(receiver)
+        Ok(())
     }
 }

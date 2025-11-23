@@ -7,7 +7,7 @@ use hyper_util::rt::TokioIo;
 use serde::Serialize;
 use tokio::{net::TcpStream, sync::Mutex};
 
-use crate::{Error, ErrorKind, Message, MsgMeta, Receiver, Result, State, msg::SendMsg};
+use crate::{Error, ErrorKind, Message, MsgMeta, Result, State, msg::SendMsg};
 
 #[derive(Clone, Debug)]
 pub enum HttpSocket {
@@ -16,12 +16,12 @@ pub enum HttpSocket {
 }
 
 impl HttpSocket {
-    pub fn send<'a, P: Serialize>(
+    pub fn send<P: Serialize>(
         &self,
         meta: &mut MsgMeta,
         payload: &P,
-        state: &'a Arc<State>,
-    ) -> Result<Receiver<'a>> {
+        state: &Arc<State>,
+    ) -> Result<()> {
         let mut bytes = BytesMut::new();
         let writer = SendMsg::writer(&mut bytes);
         let _ = serde_json::to_writer(writer, payload);
@@ -29,9 +29,7 @@ impl HttpSocket {
         match self {
             HttpSocket::ForRequest(connections) => {
                 if meta.is_req() {
-                    let (msgid, rx) = state.waiter.alloc();
-                    meta.msgid = msgid;
-
+                    let msgid = meta.msgid;
                     let method = meta.method.clone();
                     let bytes = bytes.freeze();
                     let waiter = state.waiter.clone();
@@ -48,7 +46,7 @@ impl HttpSocket {
                         waiter.post(msgid, msg);
                     });
 
-                    Ok(rx)
+                    Ok(())
                 } else {
                     Err(Error::new(
                         ErrorKind::InvalidArgument,
@@ -68,7 +66,7 @@ impl HttpSocket {
                         payload: bytes.into(),
                     };
                     state.waiter.post(*msgid, msg);
-                    Ok(Receiver::None)
+                    Ok(())
                 }
             }
         }

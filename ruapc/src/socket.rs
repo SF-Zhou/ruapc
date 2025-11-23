@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-use crate::{MsgMeta, Receiver, Result, State, http::HttpSocket, tcp::TcpSocket, ws::WebSocket};
+use crate::{MsgMeta, Result, State, http::HttpSocket, tcp::TcpSocket, ws::WebSocket};
 
 /// Socket abstraction supporting multiple transport protocols.
 ///
@@ -42,19 +42,15 @@ impl Socket {
     /// * `payload` - The data to send
     /// * `state` - Shared state for request/response correlation
     ///
-    /// # Returns
-    ///
-    /// Returns a `Receiver` that can be used to wait for the response (if this is a request).
-    ///
     /// # Errors
     ///
     /// Returns an error if sending fails.
-    pub async fn send<'a, P: Serialize>(
+    pub async fn send<P: Serialize>(
         &self,
         meta: &mut MsgMeta,
         payload: &P,
-        state: &'a Arc<State>,
-    ) -> Result<Receiver<'a>> {
+        state: &Arc<State>,
+    ) -> Result<()> {
         match self {
             Socket::TCP(tcp_socket) => tcp_socket.send(meta, payload, state).await,
             Socket::WS(web_socket) => web_socket.send(meta, payload, state).await,
