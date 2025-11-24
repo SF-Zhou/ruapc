@@ -78,6 +78,19 @@ impl Waiter {
         }
     }
 
+    /// Checks if a message ID is currently being waited on.
+    ///
+    /// # Arguments
+    ///
+    /// * `msg_id` - The message ID to check
+    ///
+    /// # Returns
+    ///
+    /// Returns true if the message ID exists in the waiter's map.
+    pub fn contains_uuid(&self, msg_id: u64) -> bool {
+        self.id_map.contains_key(&msg_id)
+    }
+
     fn remove(&self, msg_id: u64) {
         self.id_map.remove(&msg_id);
     }
