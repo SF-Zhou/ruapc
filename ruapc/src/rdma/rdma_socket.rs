@@ -6,7 +6,7 @@ use tokio::sync::mpsc::Sender;
 
 use super::RdmaState;
 use crate::{
-    Error, MsgFlags, Receiver, State,
+    Error, State,
     error::{ErrorKind, Result},
     msg::{MsgMeta, SendMsg},
 };
@@ -35,21 +35,12 @@ impl RdmaSocket {
         }
     }
 
-    pub async fn send<'a, P: Serialize>(
+    pub async fn send<P: Serialize>(
         &self,
         meta: &mut MsgMeta,
         payload: &P,
-        state: &'a State,
-    ) -> Result<Receiver<'a>> {
-        // receiver recall.
-        let receiver = if meta.flags.contains(MsgFlags::IsReq) {
-            let (msgid, rx) = state.waiter.alloc();
-            meta.msgid = msgid;
-            rx
-        } else {
-            Receiver::None
-        };
-
+        _: &State,
+    ) -> Result<()> {
         let mut buf = self.rdmabuf_pool.allocate()?;
         meta.serialize_to(payload, &mut buf)?;
 
@@ -66,11 +57,10 @@ impl RdmaSocket {
                     .await
                     .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
             }
+            Ok(())
         } else {
-            return Err(ErrorKind::RdmaSendFailed.into());
+            Err(ErrorKind::RdmaSendFailed.into())
         }
-
-        Ok(receiver)
     }
 
     pub fn set_error(&self) {

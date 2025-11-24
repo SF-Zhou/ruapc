@@ -120,12 +120,14 @@ impl Client {
         if self.use_msgpack {
             flags |= MsgFlags::UseMessagePack;
         }
+
+        let (msgid, receiver) = ctx.state.waiter.alloc();
         let mut meta = MsgMeta {
             method: method_name.into(),
             flags,
-            msgid: 0,
+            msgid,
         };
-        let receiver = socket.send(&mut meta, req, &ctx.state).await?;
+        socket.send(&mut meta, req, &ctx.state).await?;
 
         // 3. recv response with timeout.
         if let Ok(result) = tokio::time::timeout(self.timeout, receiver.recv()).await {
