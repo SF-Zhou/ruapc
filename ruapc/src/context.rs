@@ -173,6 +173,7 @@ impl Context {
         E: std::error::Error + From<Error> + Serialize,
     {
         meta.flags.remove(MsgFlags::IsReq);
+        meta.flags.insert(MsgFlags::IsRsp);
         match &mut self.endpoint {
             SocketEndpoint::Connected(socket) => {
                 let _ = socket.send(&mut meta, &rsp, &self.state).await;

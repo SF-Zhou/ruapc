@@ -21,10 +21,12 @@ pub struct MsgFlags(u8);
 
 bitflags! {
     impl MsgFlags: u8 {
-        /// Message is a request (not a response).
+        /// Message is a request.
         const IsReq = 1;
+        /// Message is a response.
+        const IsRsp = 2;
         /// Use MessagePack serialization format.
-        const UseMessagePack = 2;
+        const UseMessagePack = 4;
     }
 }
 
@@ -58,6 +60,11 @@ impl MsgMeta {
     #[must_use]
     pub fn is_req(&self) -> bool {
         self.flags.contains(MsgFlags::IsReq)
+    }
+
+    #[must_use]
+    pub fn is_rsp(&self) -> bool {
+        self.flags.contains(MsgFlags::IsRsp)
     }
 }
 

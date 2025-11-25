@@ -50,23 +50,23 @@ impl HttpSocket {
                 } else {
                     Err(Error::new(
                         ErrorKind::InvalidArgument,
-                        "invalid send response".to_string(),
+                        format!("invalid msg type {:?}", meta),
                     ))
                 }
             }
             HttpSocket::ForResponse(msgid) => {
-                if meta.is_req() {
-                    Err(Error::new(
-                        ErrorKind::InvalidArgument,
-                        "invalid send request".to_string(),
-                    ))
-                } else {
+                if meta.is_rsp() {
                     let msg = Message {
                         meta: meta.clone(),
                         payload: bytes.into(),
                     };
                     state.waiter.post(*msgid, msg);
                     Ok(())
+                } else {
+                    Err(Error::new(
+                        ErrorKind::InvalidArgument,
+                        format!("invalid msg type {:?}", meta),
+                    ))
                 }
             }
         }

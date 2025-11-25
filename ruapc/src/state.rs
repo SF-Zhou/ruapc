@@ -77,8 +77,10 @@ impl State {
         if msg.meta.is_req() {
             let ctx = Context::server_ctx(self, socket.clone());
             self.router.dispatch(ctx, msg);
-        } else {
+        } else if msg.meta.is_rsp() {
             self.waiter.post(msg.meta.msgid, msg);
+        } else {
+            tracing::warn!("invalid msg type {:?}", msg.meta);
         }
         Ok(())
     }
