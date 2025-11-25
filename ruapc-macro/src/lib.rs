@@ -95,17 +95,16 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
             send_bounds.push(quote! { Self::#method_ident(..): Send, });
             invoke_branchs.push(quote! {
                 let this = self.clone();
-                router.add_method::<#req_type, #rsp_type>(#method_name, Box::new(move |mut ctx, msg| {
+                router.add_method::<#req_type, #rsp_type>(#method_name, Box::new(move |mut ctx, payload| {
                     let this = this.clone();
                     ::tokio::spawn(async move {
-                        let meta = msg.meta.clone();
-                        match msg.deserialize() {
+                        match payload.deserialize(&ctx.msg_meta) {
                             Ok(req) => {
                                 let result = this.#method_ident(&ctx, &req).await;
-                                ctx.send_rsp(meta, result).await;
+                                ctx.send_rsp(result).await;
                             }
                             Err(err) => {
-                                ctx.send_err_rsp(meta, err).await;
+                                ctx.send_err_rsp(err).await;
                             }
                         }
                     });

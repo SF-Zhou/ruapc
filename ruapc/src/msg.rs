@@ -166,40 +166,6 @@ impl Message {
         payload.advance(offset);
         Ok(Message { meta, payload })
     }
-
-    /// Deserializes the message payload into a typed value.
-    ///
-    /// The deserialization format is determined by the `UseMessagePack` flag
-    /// in the message metadata. If the payload is empty, it's treated as null.
-    ///
-    /// # Type Parameters
-    ///
-    /// * `P` - The type to deserialize into
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if deserialization fails.
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// # use ruapc::Message;
-    /// # use serde::Deserialize;
-    /// # #[derive(Deserialize)]
-    /// # struct MyResponse { value: String }
-    /// # let msg = Message::default();
-    /// let response: MyResponse = msg.deserialize().unwrap();
-    /// ```
-    pub fn deserialize<P: for<'c> Deserialize<'c>>(self) -> Result<P> {
-        if self.payload.is_empty() {
-            // for an empty payload, treat it as a null value, which allows using curl to send body-less requests.
-            Ok(serde_json::from_value(serde_json::Value::Null)?)
-        } else if self.meta.flags.contains(MsgFlags::UseMessagePack) {
-            Ok(rmp_serde::from_slice(&self.payload)?)
-        } else {
-            Ok(serde_json::from_slice(&self.payload)?)
-        }
-    }
 }
 
 /// Trait for types that can send serialized messages.

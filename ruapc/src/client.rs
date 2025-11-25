@@ -131,7 +131,8 @@ impl Client {
 
         // 3. recv response with timeout.
         if let Ok(result) = tokio::time::timeout(self.timeout, receiver.recv()).await {
-            result?.deserialize()?
+            let response = result?;
+            response.payload.deserialize(&response.meta)?
         } else {
             Err(Error::kind(ErrorKind::Timeout).into())
         }

@@ -1,4 +1,7 @@
 use bytes::{Buf, Bytes, BytesMut};
+use serde::Deserialize;
+
+use crate::{MsgFlags, MsgMeta, Result};
 
 /// Message payload supporting different memory backends.
 ///
@@ -91,6 +94,33 @@ impl Payload {
             Payload::Normal(bytes) => bytes.advance(offset),
             #[cfg(feature = "rdma")]
             Payload::RDMA(_, off) => *off += offset,
+        }
+    }
+
+    /// Deserializes the payload into a specific type.
+    ///
+    /// This method handles different serialization formats based on message flags.
+    /// It supports JSON (default) and MessagePack.
+    ///
+    /// # Type Parameters
+    ///
+    /// * `P` - The type to deserialize into
+    ///
+    /// # Arguments
+    ///
+    /// * `meta` - Message metadata containing flags indicating the serialization format
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if deserialization fails.
+    pub fn deserialize<P: for<'c> Deserialize<'c>>(&self, meta: &MsgMeta) -> Result<P> {
+        if self.is_empty() {
+            // for an empty payload, treat it as a null value, which allows using curl to send body-less requests.
+            Ok(serde_json::from_value(serde_json::Value::Null)?)
+        } else if meta.flags.contains(MsgFlags::UseMessagePack) {
+            Ok(rmp_serde::from_slice(self)?)
+        } else {
+            Ok(serde_json::from_slice(self)?)
         }
     }
 }

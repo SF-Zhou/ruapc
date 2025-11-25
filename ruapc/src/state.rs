@@ -75,8 +75,8 @@ impl State {
     /// Currently always returns Ok, but has Result type for future extensibility.
     pub fn handle_recv(self: &Arc<Self>, socket: &Socket, msg: Message) -> Result<()> {
         if msg.meta.is_req() {
-            let ctx = Context::server_ctx(self, socket.clone());
-            self.router.dispatch(ctx, msg);
+            let ctx = Context::server_ctx(self, socket.clone(), msg.meta);
+            self.router.dispatch(ctx, msg.payload);
         } else if msg.meta.is_rsp() {
             self.waiter.post(msg.meta.msgid, msg);
         } else {
