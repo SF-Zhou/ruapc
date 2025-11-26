@@ -19,7 +19,7 @@ impl Foo for FooImpl {
         tokio::time::sleep(*req).await;
 
         let client = Client::default();
-        let in_waiting = client.verify_uuid(ctx, &ctx.msg_meta.msgid).await?;
+        let in_waiting = client.is_message_waiting(ctx, &ctx.msg_meta.msgid).await?;
         if *req < CLIENT_TIMEOUT {
             assert!(in_waiting);
         } else {

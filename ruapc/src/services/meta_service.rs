@@ -15,17 +15,8 @@ pub trait MetaService {
     async fn openapi(&self, ctx: &Context, req: &()) -> Result<serde_json::Value>;
     async fn list_methods(&self, ctx: &Context, req: &()) -> Result<Vec<String>>;
 
-    /// Verifies if a given UUID is currently being waited on.
-    ///
-    /// # Arguments
-    ///
-    /// * `ctx` - The RPC context
-    /// * `uuid` - The UUID to verify
-    ///
-    /// # Returns
-    ///
-    /// Returns true if the UUID is being waited on, false otherwise
-    async fn verify_uuid(&self, ctx: &Context, uuid: &u64) -> Result<bool>;
+    /// Verifies if a given msgid is currently being waited on.
+    async fn is_message_waiting(&self, ctx: &Context, msgid: &u64) -> Result<bool>;
 }
 
 impl MetaService for () {
@@ -37,7 +28,7 @@ impl MetaService for () {
         Ok(ctx.state.router.methods.keys().cloned().collect())
     }
 
-    async fn verify_uuid(&self, ctx: &Context, uuid: &u64) -> Result<bool> {
-        Ok(ctx.state.waiter.contains_uuid(*uuid))
+    async fn is_message_waiting(&self, ctx: &Context, msgid: &u64) -> Result<bool> {
+        Ok(ctx.state.waiter.contains_message_id(*msgid))
     }
 }
