@@ -15,13 +15,13 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "rdma")]
 use crate::rdma::RdmaService;
 use crate::{
-    Context, Message,
+    Context, Payload,
     error::{Error, ErrorKind, Result},
     services::MetaService,
 };
 
 /// Type alias for service method handler functions.
-type Func = Box<dyn Fn(Context, Message) -> Result<()> + Send + Sync>;
+type Func = Box<dyn Fn(Context, Payload) -> Result<()> + Send + Sync>;
 
 /// JSON schema information for a service method.
 ///
@@ -243,15 +243,15 @@ impl Router {
     /// # Arguments
     ///
     /// * `ctx` - The RPC context for this request
-    /// * `msg` - The incoming message to dispatch
-    pub fn dispatch(&self, mut ctx: Context, msg: Message) {
-        if let Some(method) = self.methods.get(&msg.meta.method) {
-            let _ = (method.func)(ctx, msg);
+    /// * `payload` - The incoming message payload to dispatch
+    pub fn dispatch(&self, mut ctx: Context, payload: Payload) {
+        if let Some(method) = self.methods.get(&ctx.msg_meta.method) {
+            let _ = (method.func)(ctx, payload);
         } else {
             tokio::spawn(async move {
-                let m = format!("method not found: {}", msg.meta.method);
+                let m = format!("method not found: {}", ctx.msg_meta.method);
                 tracing::error!("{}", m);
-                ctx.send_err_rsp(msg.meta, Error::new(ErrorKind::InvalidArgument, m))
+                ctx.send_err_rsp(Error::new(ErrorKind::InvalidArgument, m))
                     .await;
             });
         }

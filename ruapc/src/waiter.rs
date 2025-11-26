@@ -22,12 +22,12 @@ pub struct Waiter {
 /// receive responses.
 pub struct WaiterCleaner<'a> {
     waiter: &'a Waiter,
-    msg_id: u64,
+    msgid: u64,
 }
 
 impl Drop for WaiterCleaner<'_> {
     fn drop(&mut self) {
-        self.waiter.remove(self.msg_id);
+        self.waiter.remove(self.msgid);
     }
 }
 
@@ -45,16 +45,16 @@ impl Waiter {
     /// Returns a tuple of (message_id, receiver). The receiver will automatically
     /// clean up the waiter entry when dropped.
     pub fn alloc(&self) -> (u64, Receiver<'_>) {
-        let msg_id = self.index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let msgid = self.index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
-        self.id_map.insert(msg_id, tx);
+        self.id_map.insert(msgid, tx);
         (
-            msg_id,
+            msgid,
             Receiver::OneShotRx(
                 rx,
                 WaiterCleaner {
                     waiter: self,
-                    msg_id,
+                    msgid,
                 },
             ),
         )
@@ -68,18 +68,31 @@ impl Waiter {
     ///
     /// # Arguments
     ///
-    /// * `msg_id` - The message ID to match
+    /// * `msgid` - The message ID to match
     /// * `result` - The response message to send
-    pub fn post(&self, msg_id: u64, result: Message) {
-        if let Some((_, tx)) = self.id_map.remove(&msg_id) {
+    pub fn post(&self, msgid: u64, result: Message) {
+        if let Some((_, tx)) = self.id_map.remove(&msgid) {
             let _ = tx.send(result);
         } else {
-            tracing::warn!("Waiter post failed for msg_id: {}", msg_id);
+            tracing::warn!("Waiter post failed for msgid: {}", msgid);
         }
     }
 
-    fn remove(&self, msg_id: u64) {
-        self.id_map.remove(&msg_id);
+    /// Checks if a message ID is currently being waited on.
+    ///
+    /// # Arguments
+    ///
+    /// * `msgid` - The message ID to check
+    ///
+    /// # Returns
+    ///
+    /// Returns true if the message ID exists in the waiter's map.
+    pub fn contains_message_id(&self, msgid: u64) -> bool {
+        self.id_map.contains_key(&msgid)
+    }
+
+    fn remove(&self, msgid: u64) {
+        self.id_map.remove(&msgid);
     }
 }
 
@@ -98,8 +111,8 @@ mod tests {
     async fn test_waiter() {
         let msg_waiter = Arc::new(Waiter::default());
 
-        let (msg_id, rx) = msg_waiter.alloc();
-        assert_eq!(msg_id, 0);
+        let (msgid, rx) = msg_waiter.alloc();
+        assert_eq!(msgid, 0);
 
         let handle = {
             let msg_waiter = Arc::clone(&msg_waiter);
@@ -107,7 +120,7 @@ mod tests {
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 let mut msg = Message::default();
                 msg.meta.method = "dummy".into();
-                msg_waiter.post(msg_id, msg);
+                msg_waiter.post(msgid, msg);
             })
         };
 
@@ -115,8 +128,8 @@ mod tests {
         assert_eq!(msg.meta.method, "dummy");
         handle.await.unwrap();
 
-        let (msg_id, rx) = msg_waiter.alloc();
+        let (msgid, rx) = msg_waiter.alloc();
         drop(rx); // drop the receiver to trigger the cleaner's Drop
-        assert!(msg_waiter.id_map.get(&msg_id).is_none());
+        assert!(msg_waiter.id_map.get(&msgid).is_none());
     }
 }

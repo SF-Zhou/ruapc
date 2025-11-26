@@ -95,7 +95,7 @@ async fn test_http() {
 #[cfg(feature = "rdma")]
 #[tokio::test]
 async fn test_rdma() {
-    use ruapc::{MsgMeta, Result};
+    use ruapc::Result;
 
     let foo = Arc::new(FooImpl);
     let mut router = ruapc::Router::default();
@@ -115,7 +115,7 @@ async fn test_rdma() {
 
     let mut ctx = ruapc::Context::create(&config).unwrap();
     client.hello(&ctx, &"ruapc".to_string()).await.unwrap_err();
-    ctx.send_rsp(MsgMeta::default(), Result::Ok(())).await;
+    ctx.send_rsp(Result::Ok(())).await;
 
     let ctx = ctx.with_addr(addr);
     for _ in 0..256 {

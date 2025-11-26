@@ -49,6 +49,8 @@ pub struct Context {
     /// Shared state containing router and socket pool.
     pub state: Arc<State>,
     pub(crate) endpoint: SocketEndpoint,
+    /// Message metadata for the current RPC operation.
+    pub msg_meta: MsgMeta,
 }
 
 impl Context {
@@ -100,6 +102,7 @@ impl Context {
             state,
             endpoint: SocketEndpoint::Invalid,
             drop_guard: Some(Arc::new(drop_guard)),
+            msg_meta: MsgMeta::default(),
         })
     }
 
@@ -112,6 +115,7 @@ impl Context {
             state: state.clone(),
             endpoint: SocketEndpoint::Address(*addr),
             drop_guard: None,
+            msg_meta: MsgMeta::default(),
         }
     }
 
@@ -139,18 +143,26 @@ impl Context {
             state: self.state.clone(),
             endpoint: SocketEndpoint::Address(addr),
             drop_guard: self.drop_guard.clone(),
+            msg_meta: MsgMeta::default(),
         }
     }
 
     /// Creates a server-side context with an established socket connection.
     ///
     /// Internal method used by the server to create contexts for incoming requests.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - Shared state
+    /// * `socket` - Connected socket
+    /// * `msg_meta` - Message metadata from the incoming request
     #[must_use]
-    pub(crate) fn server_ctx(state: &Arc<State>, socket: Socket) -> Self {
+    pub(crate) fn server_ctx(state: &Arc<State>, socket: Socket, msg_meta: MsgMeta) -> Self {
         Self {
             state: state.clone(),
             endpoint: SocketEndpoint::Connected(socket),
             drop_guard: None,
+            msg_meta,
         }
     }
 
@@ -165,14 +177,15 @@ impl Context {
     ///
     /// # Arguments
     ///
-    /// * `meta` - Message metadata from the original request
     /// * `rsp` - The result to send back (Ok or Err)
-    pub async fn send_rsp<Rsp, E>(&mut self, mut meta: MsgMeta, rsp: std::result::Result<Rsp, E>)
+    pub async fn send_rsp<Rsp, E>(&mut self, rsp: std::result::Result<Rsp, E>)
     where
         Rsp: Serialize,
         E: std::error::Error + From<Error> + Serialize,
     {
+        let mut meta = self.msg_meta.clone();
         meta.flags.remove(MsgFlags::IsReq);
+        meta.flags.insert(MsgFlags::IsRsp);
         match &mut self.endpoint {
             SocketEndpoint::Connected(socket) => {
                 let _ = socket.send(&mut meta, &rsp, &self.state).await;
@@ -189,9 +202,8 @@ impl Context {
     ///
     /// # Arguments
     ///
-    /// * `meta` - Message metadata from the original request
     /// * `err` - The error to send back
-    pub async fn send_err_rsp(&mut self, meta: MsgMeta, err: Error) {
-        self.send_rsp::<(), Error>(meta, Err(err)).await;
+    pub async fn send_err_rsp(&mut self, err: Error) {
+        self.send_rsp::<(), Error>(Err(err)).await;
     }
 }
