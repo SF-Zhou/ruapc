@@ -31,7 +31,7 @@ impl Foo for FooImpl {
 }
 
 #[tokio::test]
-async fn test_verify_uuid() {
+async fn test_verify_message_id() {
     tracing_subscriber::fmt().init();
 
     for socket_type in [
@@ -67,6 +67,7 @@ async fn test_verify_uuid() {
             .await
             .unwrap_err();
 
+        drop(server);
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }

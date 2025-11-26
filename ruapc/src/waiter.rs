@@ -87,7 +87,7 @@ impl Waiter {
     /// # Returns
     ///
     /// Returns true if the message ID exists in the waiter's map.
-    pub fn contains_uuid(&self, msg_id: u64) -> bool {
+    pub fn contains_message_id(&self, msg_id: u64) -> bool {
         self.id_map.contains_key(&msg_id)
     }
 
