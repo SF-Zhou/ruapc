@@ -234,7 +234,7 @@ impl WRID {
     }
 
     pub fn get_type(&self) -> WCType {
-        match (self.0 & Self::TYPE_MASK) >> 62 {
+        match (self.0 & Self::TYPE_MASK) >> Self::TYPE_BITS {
             0 => WCType::Recv,
             1 => WCType::SendData,
             2 => WCType::SendImm,

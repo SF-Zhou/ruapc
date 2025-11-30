@@ -109,6 +109,10 @@ impl RdmaSocket {
         // Set the expected length so the completion handler knows the size
         local_buf.set_len(remote_buffer.len as usize);
 
+        // Extract buffer pointer and lkey before moving the buffer
+        let buf_ptr = local_buf.as_ptr() as u64;
+        let buf_lkey = local_buf.lkey(&self.queue_pair.device);
+
         let (tx, rx) = oneshot::channel();
 
         // Store the request for completion handling
@@ -116,11 +120,6 @@ impl RdmaSocket {
             local_buffer: local_buf,
             completion_tx: tx,
         };
-
-        // Post the RDMA Read work request
-        // We need to get a reference to the buffer before storing the request
-        let buf_ptr = request.local_buffer.as_ptr() as u64;
-        let buf_lkey = request.local_buffer.lkey(&self.queue_pair.device);
 
         self.rdma_read_requests.insert(request_id, request);
 

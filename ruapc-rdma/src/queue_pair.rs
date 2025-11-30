@@ -460,7 +460,6 @@ mod tests {
         assert_eq!(comps[0].status, verbs::ibv_wc_status::IBV_WC_SUCCESS);
 
         // 7. Verify the data was read correctly.
-        let local_slice: &[u8] = unsafe { std::mem::transmute(&*local_buf) };
-        assert_eq!(&local_slice[..LEN], &test_data[..]);
+        assert_eq!(local_buf.as_slice(), &test_data[..]);
     }
 }
