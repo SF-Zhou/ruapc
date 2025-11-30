@@ -5,4 +5,4 @@ mod rdma_buffer;
 pub use rdma_buffer::RegisteredBuffer;
 
 mod buffer_pool;
-pub use buffer_pool::{Buffer, BufferPool};
+pub use buffer_pool::{Buffer, BufferPool, RemoteBuffer};

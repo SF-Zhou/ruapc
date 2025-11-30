@@ -1,8 +1,26 @@
 use crate::*;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use std::{
     ops::{Deref, DerefMut},
     sync::{Arc, Mutex},
 };
+
+/// Represents a remote RDMA buffer that can be read via RDMA Read operations.
+///
+/// This struct contains the necessary information for a server to perform
+/// an RDMA Read operation to fetch data from a client's memory. The client
+/// prepares a buffer and sends its address, rkey, and length to the server,
+/// which can then use this information to read the data directly.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RemoteBuffer {
+    /// The remote memory address of the buffer
+    pub addr: u64,
+    /// The remote key for accessing the memory region
+    pub rkey: u32,
+    /// The length of the data in the buffer
+    pub len: u32,
+}
 
 /// A pool of buffers that can be allocated and deallocated.
 /// This pool is designed to manage a fixed-size buffer that can be divided into smaller blocks.
@@ -48,6 +66,12 @@ impl Buffer {
         self.pool.buffer.rkey(device.index())
     }
 
+    /// Returns the memory address of the buffer's data start position.
+    pub fn addr(&self) -> u64 {
+        let offset = self.idx * self.capacity();
+        (self.pool.buffer.as_ptr() as u64) + offset as u64
+    }
+
     pub fn capacity(&self) -> usize {
         self.pool.block_size
     }
@@ -86,6 +110,25 @@ impl Buffer {
                     cap
                 ),
             ))
+        }
+    }
+
+    /// Creates a RemoteBuffer descriptor for this buffer that can be sent
+    /// to a remote peer for RDMA Read operations.
+    ///
+    /// # Arguments
+    ///
+    /// * `device` - The RDMA device used to get the rkey for remote access
+    ///
+    /// # Returns
+    ///
+    /// A RemoteBuffer containing the address, rkey, and length needed for
+    /// the remote peer to perform an RDMA Read.
+    pub fn as_remote(&self, device: &Device) -> RemoteBuffer {
+        RemoteBuffer {
+            addr: self.addr(),
+            rkey: self.rkey(device),
+            len: self.length as u32,
         }
     }
 }
@@ -163,5 +206,47 @@ mod tests {
         assert_eq!(buf.len(), 233);
         assert_eq!(buf.capacity(), LEN);
         assert_eq!(buf.deref(), SLICE.map(|v| v * 2));
+    }
+
+    #[test]
+    fn test_remote_buffer_serialization() {
+        // Test that RemoteBuffer can be serialized and deserialized correctly
+        let remote_buf = RemoteBuffer {
+            addr: 0x12345678_9ABCDEF0,
+            rkey: 0xDEADBEEF,
+            len: 4096,
+        };
+
+        // Serialize to JSON
+        let json = serde_json::to_string(&remote_buf).unwrap();
+        let deserialized: RemoteBuffer = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(remote_buf.addr, deserialized.addr);
+        assert_eq!(remote_buf.rkey, deserialized.rkey);
+        assert_eq!(remote_buf.len, deserialized.len);
+
+        // Serialize to MessagePack
+        let msgpack = rmp_serde::to_vec(&remote_buf).unwrap();
+        let deserialized: RemoteBuffer = rmp_serde::from_slice(&msgpack).unwrap();
+
+        assert_eq!(remote_buf.addr, deserialized.addr);
+        assert_eq!(remote_buf.rkey, deserialized.rkey);
+        assert_eq!(remote_buf.len, deserialized.len);
+    }
+
+    #[test]
+    fn test_buffer_as_remote() {
+        const LEN: usize = 4096;
+        let devices = Devices::availables().unwrap();
+        let buffer_pool = BufferPool::create(LEN, 32, &devices).unwrap();
+
+        let mut buf = buffer_pool.allocate().unwrap();
+        buf.extend_from_slice(&vec![1u8; 100]).unwrap();
+
+        let remote = buf.as_remote(&devices[0]);
+
+        assert_ne!(remote.addr, 0, "Remote address should not be zero");
+        assert_ne!(remote.rkey, 0, "Remote key should not be zero");
+        assert_eq!(remote.len, 100, "Length should match buffer length");
     }
 }
