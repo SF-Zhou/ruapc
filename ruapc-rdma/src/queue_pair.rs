@@ -125,6 +125,54 @@ impl QueuePair {
         }
     }
 
+    /// Performs an RDMA Read operation to read data from a remote buffer into a local buffer.
+    ///
+    /// # Arguments
+    ///
+    /// * `wr_id` - Work request ID for tracking the completion
+    /// * `local_buf` - The local buffer to read data into
+    /// * `remote_addr` - The remote memory address to read from
+    /// * `rkey` - The remote key for accessing the remote memory region
+    /// * `length` - The number of bytes to read
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - If the RDMA Read work request was successfully posted
+    /// * `Err` - If the post operation failed
+    pub fn rdma_read(
+        &self,
+        wr_id: verbs::WRID,
+        local_buf: &Buffer,
+        remote_addr: u64,
+        rkey: u32,
+        length: u32,
+    ) -> Result<()> {
+        let mut sge = verbs::ibv_sge {
+            addr: local_buf.as_ptr() as _,
+            length,
+            lkey: local_buf.lkey(&self.device),
+        };
+        let mut wr = verbs::ibv_send_wr {
+            wr_id,
+            sg_list: &mut sge as *mut _,
+            num_sge: 1,
+            opcode: verbs::ibv_wr_opcode::IBV_WR_RDMA_READ,
+            send_flags: verbs::ibv_send_flags::IBV_SEND_SIGNALED.0,
+            wr: verbs::ibv_send_wr__bindgen_ty_2 {
+                rdma: verbs::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 {
+                    remote_addr,
+                    rkey,
+                },
+            },
+            ..Default::default()
+        };
+
+        match self.post_send(&mut wr) {
+            0 => Ok(()),
+            _ => Err(ErrorKind::IBPostSendFailed.with_errno()),
+        }
+    }
+
     pub fn ready_to_recv(&self, remote: &Endpoint) -> Result<()> {
         let mut attr = verbs::ibv_qp_attr {
             qp_state: verbs::ibv_qp_state::IBV_QPS_RTR,
@@ -347,5 +395,72 @@ mod tests {
         assert_eq!(comp_b[0].status, verbs::ibv_wc_status::IBV_WC_SUCCESS);
         assert_eq!(comp_b[0].byte_len, send_len as u32);
         assert!(&recv_slice[..send_len] == send_slice);
+    }
+
+    #[test]
+    fn test_queue_pair_rdma_read() {
+        // Test RDMA Read operation: QP A reads data from QP B's memory
+        // 1. list all available devices.
+        let devices = Devices::availables().unwrap();
+
+        // 2. create two queue pairs.
+        let cap = verbs::ibv_qp_cap {
+            max_send_wr: 64,
+            max_recv_wr: 64,
+            max_send_sge: 1,
+            max_recv_sge: 1,
+            max_inline_data: 0,
+        };
+
+        let queue_pair_a = QueuePair::create(&devices[0], cap).unwrap();
+        let queue_pair_b = QueuePair::create(&devices[0], cap).unwrap();
+
+        // 3. init all queue pairs and connect them.
+        queue_pair_a.connect(&queue_pair_b.endpoint()).unwrap();
+        queue_pair_b.connect(&queue_pair_a.endpoint()).unwrap();
+
+        // 4. create buffers.
+        const LEN: usize = 4096;
+        let buffer_pool = BufferPool::create(LEN, 32, &devices).unwrap();
+
+        // Setup remote buffer on QP B with test data.
+        let mut remote_buf = buffer_pool.allocate().unwrap();
+        let test_data: Vec<u8> = (0..LEN).map(|i| (i % 256) as u8).collect();
+        remote_buf.extend_from_slice(&test_data).unwrap();
+
+        // Get the remote buffer info that would be sent to QP A.
+        let remote_buffer_info = remote_buf.as_remote(&devices[0]);
+        assert_eq!(remote_buffer_info.len, LEN as u32);
+        assert_ne!(remote_buffer_info.addr, 0);
+        assert_ne!(remote_buffer_info.rkey, 0);
+
+        // Setup local buffer on QP A to receive the data.
+        let mut local_buf = buffer_pool.allocate().unwrap();
+        local_buf.extend_from_slice(&vec![0; LEN]).unwrap();
+
+        // 5. QP A initiates RDMA Read from QP B's buffer.
+        queue_pair_a
+            .rdma_read(
+                WRID::rdma_read(1),
+                &local_buf,
+                remote_buffer_info.addr,
+                remote_buffer_info.rkey,
+                remote_buffer_info.len,
+            )
+            .unwrap();
+
+        // 6. Poll for completion on QP A.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let mut wcs = vec![verbs::ibv_wc::default(); 128];
+        let comps = queue_pair_a.poll_cq(&mut wcs).unwrap();
+
+        assert_eq!(comps.len(), 1);
+        assert_eq!(comps[0].wr_id, WRID::rdma_read(1));
+        assert!(comps[0].is_rdma_read());
+        assert_eq!(comps[0].status, verbs::ibv_wc_status::IBV_WC_SUCCESS);
+
+        // 7. Verify the data was read correctly.
+        let local_slice: &[u8] = unsafe { std::mem::transmute(&*local_buf) };
+        assert_eq!(&local_slice[..LEN], &test_data[..]);
     }
 }

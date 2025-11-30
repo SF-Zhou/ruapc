@@ -164,6 +164,10 @@ impl ibv_wc {
         self.wr_id.get_type() == WCType::SendImm
     }
 
+    pub fn is_rdma_read(&self) -> bool {
+        self.wr_id.get_type() == WCType::RdmaRead
+    }
+
     pub fn succ(&self) -> bool {
         self.status == ibv_wc_status::IBV_WC_SUCCESS
     }
@@ -201,6 +205,7 @@ pub enum WCType {
     Recv = 0,
     SendData = 1,
     SendImm = 2,
+    RdmaRead = 3,
 }
 
 impl WRID {
@@ -224,11 +229,16 @@ impl WRID {
         Self::new(WCType::SendImm, id)
     }
 
+    pub fn rdma_read(id: u64) -> Self {
+        Self::new(WCType::RdmaRead, id)
+    }
+
     pub fn get_type(&self) -> WCType {
         match (self.0 & Self::TYPE_MASK) >> 62 {
             0 => WCType::Recv,
             1 => WCType::SendData,
             2 => WCType::SendImm,
+            3 => WCType::RdmaRead,
             _ => unreachable!(),
         }
     }
@@ -244,6 +254,7 @@ impl std::fmt::Debug for WRID {
             WCType::Recv => write!(f, "Recv({})", self.get_id()),
             WCType::SendData => write!(f, "SendData({})", self.get_id()),
             WCType::SendImm => write!(f, "SendImm({})", self.get_id()),
+            WCType::RdmaRead => write!(f, "RdmaRead({})", self.get_id()),
         }
     }
 }

@@ -133,6 +133,9 @@ impl SendHandler {
     fn handle_completion(&mut self, wc: &verbs::ibv_wc, socket: &RdmaSocket) -> Result<()> {
         if wc.is_send_imm() {
             self.ack_completed += 1;
+        } else if wc.is_rdma_read() {
+            // Handle RDMA Read completion
+            socket.complete_rdma_read(wc.wr_id.get_id(), wc.succ());
         } else {
             self.data_completed += 1;
             socket.send_buffers.remove(&wc.wr_id.get_id());
