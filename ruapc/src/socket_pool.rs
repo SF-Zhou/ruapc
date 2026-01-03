@@ -203,7 +203,22 @@ impl SocketPool {
         }
     }
 
+    /// Handles a new incoming connection stream.
+    ///
+    /// This method is called by the listener when a new connection is accepted.
+    /// It processes the stream according to the pool's protocol type.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - Shared state for handling the connection
+    /// * `stream` - The raw network stream to handle
+    /// * `addr` - The remote address of the connection
+    ///
     /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Stream handling fails
+    /// - The protocol doesn't support incoming connections (e.g., RDMA)
     pub async fn handle_new_stream(
         &self,
         state: &Arc<State>,
@@ -234,7 +249,13 @@ impl SocketPool {
     }
 
     #[cfg(feature = "rdma")]
+    /// Returns RDMA connection information.
+    ///
+    /// This method is only available when the RDMA feature is enabled.
+    ///
     /// # Errors
+    ///
+    /// Returns an error if the socket pool doesn't support RDMA.
     pub fn rdma_info(&self) -> Result<crate::rdma::RdmaInfo> {
         match self {
             SocketPool::RDMA(rdma_socket_pool) => Ok(rdma_socket_pool.rdma_info()),
@@ -247,7 +268,24 @@ impl SocketPool {
     }
 
     #[cfg(feature = "rdma")]
+    /// Establishes an RDMA connection to the specified endpoint.
+    ///
+    /// This method is only available when the RDMA feature is enabled.
+    ///
+    /// # Arguments
+    ///
+    /// * `endpoint` - The remote RDMA endpoint to connect to
+    /// * `state` - Shared state for connection management
+    ///
+    /// # Returns
+    ///
+    /// Returns the local endpoint information for the established connection.
+    ///
     /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The socket pool doesn't support RDMA
+    /// - The RDMA connection fails
     pub fn rdma_connect(&self, endpoint: &Endpoint, state: &Arc<State>) -> Result<Endpoint> {
         use crate::{Error, ErrorKind};
 
@@ -263,6 +301,9 @@ impl SocketPool {
         }
     }
 
+    /// Stops the socket pool and initiates connection cleanup.
+    ///
+    /// This signals all connections to gracefully close.
     pub fn stop(&self) {
         match self {
             SocketPool::TCP(tcp_socket_pool) => tcp_socket_pool.stop(),
@@ -274,6 +315,14 @@ impl SocketPool {
         }
     }
 
+    /// Creates a drop guard for this socket pool.
+    ///
+    /// The returned guard will call `stop()` when dropped, ensuring
+    /// graceful shutdown.
+    ///
+    /// # Returns
+    ///
+    /// Returns a `DropGuard` that calls `stop()` on drop.
     #[must_use]
     pub fn drop_guard(&self) -> DropGuard {
         match self {
@@ -286,6 +335,10 @@ impl SocketPool {
         }
     }
 
+    /// Waits for all connections in the pool to close.
+    ///
+    /// This method blocks until the socket pool has fully shut down
+    /// and all connections are closed.
     pub async fn join(&self) {
         match self {
             SocketPool::TCP(tcp_socket_pool) => tcp_socket_pool.join().await,

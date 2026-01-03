@@ -57,11 +57,31 @@ impl MsgMeta {
     /// meta.flags = MsgFlags::IsReq;
     /// assert!(meta.is_req());
     /// ```
+    /// Checks if this message is a request.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use ruapc::{MsgMeta, MsgFlags};
+    /// let mut meta = MsgMeta::default();
+    /// meta.flags = MsgFlags::IsReq;
+    /// assert!(meta.is_req());
+    /// ```
     #[must_use]
     pub fn is_req(&self) -> bool {
         self.flags.contains(MsgFlags::IsReq)
     }
 
+    /// Checks if this message is a response.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use ruapc::{MsgMeta, MsgFlags};
+    /// let mut meta = MsgMeta::default();
+    /// meta.flags = MsgFlags::IsRsp;
+    /// assert!(meta.is_rsp());
+    /// ```
     #[must_use]
     pub fn is_rsp(&self) -> bool {
         self.flags.contains(MsgFlags::IsRsp)
