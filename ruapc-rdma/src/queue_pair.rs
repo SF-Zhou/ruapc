@@ -3,13 +3,24 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{ffi::c_int, ops::Deref, os::fd::BorrowedFd, sync::Arc};
 
+/// RDMA connection endpoint information.
+///
+/// Contains the necessary information to establish an RDMA connection
+/// between two queue pairs, including queue pair number, local ID, and GID.
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy)]
 pub struct Endpoint {
+    /// Queue pair number.
     pub qp_num: u32,
+    /// Local Identifier for InfiniBand routing.
     pub lid: u16,
+    /// Global Identifier for RoCE routing.
     pub gid: verbs::ibv_gid,
 }
 
+/// Raw queue pair wrapper with automatic cleanup.
+///
+/// This type wraps a raw InfiniBand queue pair pointer
+/// and ensures proper cleanup on drop.
 struct RawQueuePair(*mut verbs::ibv_qp);
 impl Drop for RawQueuePair {
     fn drop(&mut self) {
@@ -19,11 +30,34 @@ impl Drop for RawQueuePair {
 unsafe impl Send for RawQueuePair {}
 unsafe impl Sync for RawQueuePair {}
 
-/// Represents a queue pair in RDMA communication.
-/// A queue pair consists of a send queue and a receive queue, which are used to send and receive messages.
+/// RDMA queue pair for reliable connected communication.
+///
+/// A queue pair consists of a send queue and a receive queue, which are
+/// used to send and receive messages. This implementation provides a
+/// reliable connection (RC) queue pair type with associated completion
+/// queue for operation status.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// # use ruapc_rdma::{QueuePair, Device, verbs};
+/// # use std::sync::Arc;
+/// # fn example(device: &Arc<Device>) -> Result<(), Box<dyn std::error::Error>> {
+/// let cap = verbs::ibv_qp_cap {
+///     max_send_wr: 128,
+///     max_recv_wr: 128,
+///     max_send_sge: 1,
+///     max_recv_sge: 1,
+///     max_inline_data: 0,
+/// };
+/// let qp = QueuePair::create(device, cap)?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct QueuePair {
     queue_pair: RawQueuePair,
     comp_queue: CompQueue,
+    /// The RDMA device this queue pair belongs to.
     pub device: Arc<Device>,
 }
 
