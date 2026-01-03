@@ -1,5 +1,9 @@
 use crate::*;
 
+/// Raw memory region wrapper with automatic deregistration.
+///
+/// Wraps an InfiniBand memory region pointer and ensures
+/// proper cleanup on drop.
 struct RawMemoryRegion(*mut verbs::ibv_mr);
 impl std::ops::Deref for RawMemoryRegion {
     type Target = verbs::ibv_mr;
@@ -16,7 +20,23 @@ impl Drop for RawMemoryRegion {
 unsafe impl Send for RawMemoryRegion {}
 unsafe impl Sync for RawMemoryRegion {}
 
-/// A registered buffer that can be used for RDMA operations.
+/// RDMA-registered memory buffer.
+///
+/// A buffer that has been registered with RDMA devices for
+/// zero-copy data transfer. The buffer is automatically
+/// deregistered when dropped.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// # use ruapc_rdma::{RegisteredBuffer, Devices};
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let devices = Devices::availables()?;
+/// let buffer = RegisteredBuffer::create(&devices, 4096)?;
+/// println!("Buffer address: {:p}", buffer.as_ptr());
+/// # Ok(())
+/// # }
+/// ```
 pub struct RegisteredBuffer {
     memory_regions: Vec<RawMemoryRegion>,
     aligned_buffer: AlignedBuffer,
@@ -24,6 +44,21 @@ pub struct RegisteredBuffer {
 }
 
 impl RegisteredBuffer {
+    /// Creates a new RDMA-registered buffer.
+    ///
+    /// The buffer is registered with all devices in the provided collection,
+    /// allowing it to be used for RDMA operations with any of those devices.
+    ///
+    /// # Arguments
+    ///
+    /// * `devices` - Collection of RDMA devices to register with
+    /// * `size` - Size of the buffer in bytes
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Memory allocation fails
+    /// - Memory registration fails
     pub fn create(devices: &Devices, size: usize) -> Result<Self> {
         let mut buf = AlignedBuffer::new(size)?;
         let mut memory_regions = Vec::with_capacity(devices.len());
@@ -48,10 +83,32 @@ impl RegisteredBuffer {
         })
     }
 
+    /// Returns the local key for the specified device.
+    ///
+    /// The lkey is used for local RDMA operations.
+    ///
+    /// # Arguments
+    ///
+    /// * `index` - Device index
+    ///
+    /// # Returns
+    ///
+    /// The local key for this buffer on the specified device.
     pub fn lkey(&self, index: usize) -> u32 {
         self.memory_regions[index].lkey
     }
 
+    /// Returns the remote key for the specified device.
+    ///
+    /// The rkey is used for remote RDMA operations.
+    ///
+    /// # Arguments
+    ///
+    /// * `index` - Device index
+    ///
+    /// # Returns
+    ///
+    /// The remote key for this buffer on the specified device.
     pub fn rkey(&self, index: usize) -> u32 {
         self.memory_regions[index].lkey
     }

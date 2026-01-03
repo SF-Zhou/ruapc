@@ -115,6 +115,10 @@ impl RawContext {
 unsafe impl Send for RawContext {}
 unsafe impl Sync for RawContext {}
 
+/// Raw protection domain wrapper with automatic cleanup.
+///
+/// A protection domain (PD) is a security mechanism that isolates
+/// memory regions and queue pairs from each other.
 pub struct RawProtectionDomain(*mut verbs::ibv_pd);
 impl Drop for RawProtectionDomain {
     fn drop(&mut self) {
@@ -124,18 +128,44 @@ impl Drop for RawProtectionDomain {
 unsafe impl Send for RawProtectionDomain {}
 unsafe impl Sync for RawProtectionDomain {}
 
+/// Information about an RDMA device.
+///
+/// Contains device metadata including name, GUID, attributes,
+/// and available ports with their GIDs.
 #[derive(Debug, Default, Serialize, Deserialize, JsonSchema, Clone)]
 #[allow(unused)]
 pub struct DeviceInfo {
+    /// Device index in the system.
     pub index: usize,
+    /// Device name (e.g., "mlx5_0").
     pub name: String,
+    /// Globally unique identifier for the device.
     pub guid: u64,
+    /// Path to the device in sysfs.
     pub ibdev_path: PathBuf,
+    /// Device attributes including capabilities.
     pub device_attr: verbs::ibv_device_attr,
+    /// Available ports on this device.
     pub ports: Vec<Port>,
 }
 
-/// Represents an RDMA device.
+/// RDMA device handle.
+///
+/// Represents an opened RDMA device with an allocated protection domain.
+/// The device is used to create queue pairs, register memory, and perform
+/// RDMA operations.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// # use ruapc_rdma::Devices;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let devices = Devices::availables()?;
+/// let device = devices.first().unwrap();
+/// println!("Device name: {}", device.info().name);
+/// # Ok(())
+/// # }
+/// ```
 #[allow(unused)]
 pub struct Device {
     protection_domain: RawProtectionDomain,
@@ -147,15 +177,27 @@ pub struct Device {
 unsafe impl Send for Device {}
 unsafe impl Sync for Device {}
 
+/// Global Identifier (GID) information for a port.
+///
+/// A GID uniquely identifies a port on an RDMA network and
+/// includes the GID type (IB, RoCEv1, RoCEv2).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Gid {
+    /// GID index on the port.
     pub index: u16,
+    /// The GID value.
     pub gid: verbs::ibv_gid,
+    /// The type of this GID.
     pub gid_type: GidType,
 }
 
+/// RDMA device port information.
+///
+/// Contains port attributes and the list of available GIDs
+/// for that port.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Port {
+    /// Port number (1-based).
     pub port_num: u8,
     /// The attributes of the port.
     pub port_attr: verbs::ibv_port_attr,
@@ -262,22 +304,47 @@ impl Device {
         Ok(())
     }
 
+    /// Returns the raw device pointer.
+    ///
+    /// # Safety
+    ///
+    /// The returned pointer is only valid as long as this `Device` exists.
     pub(crate) fn device_ptr(&self) -> *mut verbs::ibv_device {
         self.device
     }
 
+    /// Returns the raw context pointer.
+    ///
+    /// # Safety
+    ///
+    /// The returned pointer is only valid as long as this `Device` exists.
     pub(crate) fn context_ptr(&self) -> *mut verbs::ibv_context {
         self.context.0
     }
 
+    /// Returns the raw protection domain pointer.
+    ///
+    /// # Safety
+    ///
+    /// The returned pointer is only valid as long as this `Device` exists.
     pub(crate) fn pd_ptr(&self) -> *mut verbs::ibv_pd {
         self.protection_domain.0
     }
 
+    /// Returns the device index.
+    ///
+    /// # Returns
+    ///
+    /// The zero-based index of this device in the system.
     pub fn index(&self) -> usize {
         self.info.index
     }
 
+    /// Returns device information.
+    ///
+    /// # Returns
+    ///
+    /// A reference to the device's metadata and capabilities.
     pub fn info(&self) -> &DeviceInfo {
         &self.info
     }
@@ -290,16 +357,43 @@ impl std::fmt::Debug for Device {
 }
 
 /// A collection of RDMA devices available on the system.
+///
+/// Provides access to all available RDMA devices after filtering
+/// based on configuration.
 #[derive(Clone)]
 pub struct Devices(Vec<Arc<Device>>);
 
 impl Devices {
-    /// Returns a list of available RDMA devices.
+    /// Returns a list of available RDMA devices with default configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - No RDMA devices are found
+    /// - Device opening fails
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use ruapc_rdma::Devices;
+    /// let devices = Devices::availables().unwrap();
+    /// println!("Found {} RDMA device(s)", devices.len());
+    /// ```
     pub fn availables() -> Result<Devices> {
         Self::open(&Default::default())
     }
 
     /// Opens RDMA devices based on the provided configuration.
+    ///
+    /// Allows filtering devices by name, GID type, and other criteria.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Configuration for device filtering
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if device enumeration or opening fails.
     pub fn open(config: &DeviceConfig) -> Result<Devices> {
         let list = RawDeviceList::available()?;
         let mut devices = Vec::with_capacity(list.len());
