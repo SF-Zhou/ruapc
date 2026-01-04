@@ -1,12 +1,44 @@
 use crate::{ErrorKind, Result};
 use std::alloc::Layout;
 
+/// Page alignment size for RDMA buffers (4 KB).
 pub const ALIGN_SIZE: usize = 4096;
 
-/// A buffer that is aligned to a specific size, typically used for RDMA operations.
+/// Page-aligned memory buffer for RDMA operations.
+///
+/// Allocates memory aligned to 4KB boundaries as required by RDMA hardware.
+/// The buffer size is automatically rounded up to the nearest multiple of
+/// [`ALIGN_SIZE`].
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// # use ruapc_rdma::AlignedBuffer;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let buffer = AlignedBuffer::new(8192)?;
+/// assert_eq!(buffer.len(), 8192);
+/// # Ok(())
+/// # }
+/// ```
 pub struct AlignedBuffer(&'static mut [u8]);
 
 impl AlignedBuffer {
+    /// Creates a new page-aligned buffer.
+    ///
+    /// The actual buffer size will be rounded up to the nearest multiple
+    /// of [`ALIGN_SIZE`] (4096 bytes).
+    ///
+    /// # Arguments
+    ///
+    /// * `size` - Desired buffer size in bytes (must be non-zero)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if memory allocation fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `size` is zero.
     pub fn new(size: usize) -> Result<Self> {
         assert_ne!(size, 0, "the buffer length cannot be zero!");
         let size = size.next_multiple_of(ALIGN_SIZE);

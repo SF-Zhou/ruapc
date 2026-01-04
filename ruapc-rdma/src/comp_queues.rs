@@ -1,6 +1,10 @@
 use crate::{CompChannel, Device, ErrorKind, Result, verbs};
 use std::sync::Arc;
 
+/// Raw completion queue wrapper with automatic cleanup.
+///
+/// This type wraps a raw InfiniBand completion queue pointer
+/// and ensures proper cleanup on drop.
 struct RawCompQueue(*mut verbs::ibv_cq);
 impl std::ops::Deref for RawCompQueue {
     type Target = verbs::ibv_cq;
@@ -17,14 +21,32 @@ impl Drop for RawCompQueue {
 unsafe impl Send for RawCompQueue {}
 unsafe impl Sync for RawCompQueue {}
 
+/// Completion queue for RDMA work request completions.
+///
+/// A completion queue (CQ) is used to report the completion status
+/// of work requests posted to send and receive queues. Applications
+/// poll the CQ or use event notification to determine when operations
+/// have completed.
 pub struct CompQueue {
     comp_queue: RawCompQueue,
+    /// Maximum number of completion queue entries.
     pub cqe: usize,
+    /// Associated completion channel for event notification.
     pub(crate) comp_channel: CompChannel,
     _device: Arc<Device>,
 }
 
 impl CompQueue {
+    /// Creates a new completion queue for the given device.
+    ///
+    /// # Arguments
+    ///
+    /// * `device` - The RDMA device to create the completion queue for
+    /// * `max_cqe` - Maximum number of completion queue entries
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if completion queue creation fails.
     pub fn create(device: &Arc<Device>, max_cqe: u32) -> Result<Self> {
         let comp_channel = CompChannel::create(device.clone())?;
 
@@ -51,10 +73,23 @@ impl CompQueue {
         })
     }
 
+    /// Returns the raw completion queue pointer.
+    ///
+    /// # Safety
+    ///
+    /// The returned pointer is only valid as long as this `CompQueue` exists.
     pub(crate) fn comp_queue_ptr(&self) -> *mut verbs::ibv_cq {
         self.comp_queue.0
     }
 
+    /// Requests event notification for the next completion.
+    ///
+    /// After calling this, an event will be generated on the associated
+    /// completion channel when the next completion is added to the queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the notification request fails.
     pub fn req_notify(&self) -> Result<()> {
         let ret = unsafe { verbs::ibv_req_notify_cq(self.comp_queue_ptr(), 0) };
         if ret == 0 {
@@ -64,6 +99,21 @@ impl CompQueue {
         }
     }
 
+    /// Polls the completion queue for work completions.
+    ///
+    /// Retrieves completed work requests from the completion queue without blocking.
+    ///
+    /// # Arguments
+    ///
+    /// * `wcs` - Buffer to store work completion entries
+    ///
+    /// # Returns
+    ///
+    /// Returns a slice of the input buffer containing the completed entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if polling fails.
     pub fn poll_cq<'a>(&self, wcs: &'a mut [verbs::ibv_wc]) -> Result<&'a mut [verbs::ibv_wc]> {
         let num = unsafe {
             verbs::ibv_poll_cq(
@@ -79,6 +129,18 @@ impl CompQueue {
         }
     }
 
+    /// Gets completion queue events from the completion channel.
+    ///
+    /// This is a non-blocking operation that returns 0 if no events
+    /// are available.
+    ///
+    /// # Returns
+    ///
+    /// Returns the number of events retrieved (0 or 1).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if getting events fails (other than would-block).
     pub fn get_cq_events(&self) -> Result<usize> {
         let mut cq = std::ptr::null_mut();
         let mut cq_ctx = std::ptr::null_mut();
@@ -94,6 +156,13 @@ impl CompQueue {
         }
     }
 
+    /// Acknowledges completion queue events.
+    ///
+    /// Must be called after `get_cq_events` to properly manage event counts.
+    ///
+    /// # Arguments
+    ///
+    /// * `nevents` - Number of events to acknowledge
     pub fn ack_cq_events(&self, nevents: usize) {
         unsafe { verbs::ibv_ack_cq_events(self.comp_queue_ptr(), nevents as u32) };
     }

@@ -1,6 +1,10 @@
 use crate::{Device, ErrorKind, Result, verbs};
 use std::{os::fd::BorrowedFd, sync::Arc};
 
+/// Raw completion channel wrapper with automatic cleanup.
+///
+/// This type wraps a raw InfiniBand completion channel pointer
+/// and ensures proper cleanup on drop.
 struct RawCompChannel(*mut verbs::ibv_comp_channel);
 impl std::ops::Deref for RawCompChannel {
     type Target = verbs::ibv_comp_channel;
@@ -17,12 +21,33 @@ impl Drop for RawCompChannel {
 unsafe impl Send for RawCompChannel {}
 unsafe impl Sync for RawCompChannel {}
 
+/// Completion channel for asynchronous RDMA event notification.
+///
+/// A completion channel allows applications to receive notifications
+/// when completion queue events occur, enabling efficient event-driven
+/// RDMA programming without polling.
+///
+/// The channel is automatically configured in non-blocking mode.
 pub struct CompChannel {
     channel: RawCompChannel,
     _device: Arc<Device>,
 }
 
 impl CompChannel {
+    /// Creates a new completion channel for the given device.
+    ///
+    /// The channel is automatically configured in non-blocking mode
+    /// to allow for efficient asynchronous operations.
+    ///
+    /// # Arguments
+    ///
+    /// * `device` - The RDMA device to create the channel for
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Channel creation fails
+    /// - Setting non-blocking mode fails
     pub fn create(device: Arc<Device>) -> Result<Self> {
         let ptr = unsafe { verbs::ibv_create_comp_channel(device.context_ptr()) };
         if ptr.is_null() {
@@ -47,10 +72,23 @@ impl CompChannel {
         Ok(this)
     }
 
+    /// Returns the raw completion channel pointer.
+    ///
+    /// # Safety
+    ///
+    /// The returned pointer is only valid as long as this `CompChannel` exists.
     pub fn comp_channel_ptr(&self) -> *mut verbs::ibv_comp_channel {
         self.channel.0
     }
 
+    /// Returns a borrowed file descriptor for event notification.
+    ///
+    /// This file descriptor can be used with async runtimes like tokio
+    /// to efficiently wait for completion events.
+    ///
+    /// # Returns
+    ///
+    /// Returns a borrowed file descriptor.
     pub fn notify_fd<'a>(&'a self) -> BorrowedFd<'a> {
         unsafe { BorrowedFd::borrow_raw(self.channel.fd) }
     }
