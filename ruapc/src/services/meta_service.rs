@@ -56,7 +56,7 @@ pub trait MetaService {
     ///
     /// Returns a JSON value containing the complete OpenAPI specification.
     async fn openapi(&self, ctx: &Context, req: &()) -> Result<serde_json::Value>;
-    
+
     /// Lists all registered RPC method names.
     ///
     /// # Arguments
