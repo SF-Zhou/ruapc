@@ -6,7 +6,7 @@ use crate::{Error, ErrorKind, Message, Result, WaiterCleaner};
 ///
 /// The receiver is used internally to wait for responses from remote services.
 /// It wraps a oneshot channel and handles automatic cleanup of waiter entries.
-pub(crate) enum Receiver<'a> {
+pub enum Receiver<'a> {
     /// No receiver (placeholder state).
     None,
     /// Active oneshot receiver with cleanup guard.
