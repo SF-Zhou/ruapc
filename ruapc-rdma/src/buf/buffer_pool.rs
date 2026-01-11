@@ -104,11 +104,22 @@ enum AllocationType {
 /// A buffer allocated from the pool.
 ///
 /// When dropped, the buffer is automatically returned to the pool for reuse.
+///
+/// # Safety Invariants
+///
+/// - `base_ptr` is derived from the `RegisteredBuffer` at index `buffer_idx` in the pool
+/// - The underlying `RegisteredBuffer` remains valid as long as the pool exists
+/// - The `Buffer` holds an `Arc<BufferPool>` ensuring the pool outlives this buffer
+/// - Concurrent access is safe because:
+///   - Read/write operations use raw pointer arithmetic without locking (safe due to unique ownership)
+///   - Metadata access (lkey/rkey) acquires the pool lock
+///   - The buffer is exclusively owned after allocation until dropped
 pub struct Buffer {
     pool: Arc<BufferPool>,
     /// Index of the RDMA buffer in the pool.
     buffer_idx: usize,
     /// Base pointer to the RDMA buffer data (cached for performance).
+    /// This pointer remains valid as long as the BufferPool exists.
     base_ptr: *mut u8,
     /// Offset within the RDMA buffer.
     offset: usize,
@@ -592,13 +603,14 @@ impl BufferPool {
         while current_level > 0 {
             let block_size = BUDDY_LEVELS[current_level];
             let parent_size = BUDDY_LEVELS[current_level - 1];
-            let parent_offset = (current_offset / parent_size) * parent_size;
+            // Use bitwise AND for faster alignment calculation (parent_size is always power of 2).
+            let parent_offset = current_offset & !(parent_size - 1);
             let buddy_offset_in_parent = current_offset - parent_offset;
             let buddy_index = buddy_offset_in_parent / block_size;
 
-            // Check if all siblings are free.
+            // Check if all siblings are free and collect their indices.
             let mut all_siblings_free = true;
-            let mut sibling_indices = Vec::new();
+            let mut sibling_indices = Vec::with_capacity(BUDDY_CHILDREN - 1);
 
             for i in 0..BUDDY_CHILDREN {
                 if i == buddy_index {
@@ -617,8 +629,8 @@ impl BufferPool {
             }
 
             if all_siblings_free && sibling_indices.len() == BUDDY_CHILDREN - 1 {
-                // Remove siblings from free list (in reverse order to preserve indices).
-                sibling_indices.sort_by(|a, b| b.cmp(a));
+                // Remove siblings from free list in reverse index order to avoid invalidation.
+                sibling_indices.sort_unstable_by(|a, b| b.cmp(a));
                 for idx in sibling_indices {
                     state.buddy_free_lists[current_level].swap_remove(idx);
                 }
