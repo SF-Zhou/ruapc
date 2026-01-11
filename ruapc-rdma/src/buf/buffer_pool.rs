@@ -9,9 +9,11 @@
 
 use crate::*;
 use std::{
+    collections::HashSet,
     ops::{Deref, DerefMut},
-    sync::{Arc, Condvar, Mutex},
+    sync::Arc,
 };
+use tokio::sync::{Mutex, Notify};
 
 /// Size of a single RDMA-registered memory block (64 MiB).
 pub const RDMA_BLOCK_SIZE: usize = 64 * 1024 * 1024;
@@ -68,6 +70,9 @@ struct BufferPoolState {
     /// Free lists for each buddy level (0=64MiB, 1=16MiB, 2=4MiB, 3=1MiB).
     /// Each entry is (buffer_index, offset within buffer).
     buddy_free_lists: [Vec<(usize, usize)>; 4],
+    /// HashSet for O(1) lookup during buddy merging.
+    /// Key is (buffer_index, offset, level).
+    buddy_free_set: HashSet<(usize, usize, usize)>,
     /// Free list for small buffers (offset, buffer_index).
     small_free_list: Vec<(usize, usize)>,
     /// Current total allocated memory.
@@ -89,7 +94,8 @@ struct BufferPoolState {
 pub struct BufferPool {
     devices: Devices,
     state: Mutex<BufferPoolState>,
-    available: Condvar,
+    /// Notification for async waiting when buffers become available.
+    available: Notify,
 }
 
 /// Represents the allocation type for a buffer.
@@ -159,13 +165,14 @@ impl DerefMut for Buffer {
 impl Buffer {
     /// Returns the local key for RDMA operations on the specified device.
     pub fn lkey(&self, device: &Device) -> u32 {
-        let state = self.pool.state.lock().unwrap();
+        // Use blocking lock since this is a quick operation.
+        let state = self.pool.state.blocking_lock();
         state.rdma_buffers[self.buffer_idx].buffer.lkey(device.index())
     }
 
     /// Returns the remote key for RDMA operations on the specified device.
     pub fn rkey(&self, device: &Device) -> u32 {
-        let state = self.pool.state.lock().unwrap();
+        let state = self.pool.state.blocking_lock();
         state.rdma_buffers[self.buffer_idx].buffer.rkey(device.index())
     }
 
@@ -256,6 +263,7 @@ impl BufferPool {
         let state = BufferPoolState {
             rdma_buffers: Vec::new(),
             buddy_free_lists: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+            buddy_free_set: HashSet::new(),
             small_free_list: Vec::new(),
             total_memory: 0,
             max_memory: config.max_memory,
@@ -265,7 +273,7 @@ impl BufferPool {
         Ok(Arc::new(Self {
             devices: devices.clone(),
             state: Mutex::new(state),
-            available: Condvar::new(),
+            available: Notify::new(),
         }))
     }
 
@@ -284,7 +292,7 @@ impl BufferPool {
     /// # Returns
     /// A buffer with at least the requested capacity, or an error if allocation fails.
     pub fn allocate_with_size(self: &Arc<Self>, size: usize) -> Result<Buffer> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.blocking_lock();
         let small_buffer_size = state.small_buffer_size;
         drop(state);
 
@@ -295,11 +303,44 @@ impl BufferPool {
         }
     }
 
+    /// Asynchronously allocates a buffer of at least the specified size.
+    ///
+    /// This method will wait asynchronously if no buffer is available and the memory
+    /// limit has been reached. It will be notified when buffers are freed.
+    ///
+    /// # Arguments
+    /// * `size` - Minimum size of the buffer
+    ///
+    /// # Returns
+    /// A buffer with at least the requested capacity.
+    pub async fn async_allocate(self: &Arc<Self>, size: usize) -> Result<Buffer> {
+        loop {
+            let state = self.state.lock().await;
+            let small_buffer_size = state.small_buffer_size;
+            drop(state);
+
+            let result = if size <= small_buffer_size {
+                self.allocate_small_async().await
+            } else {
+                self.allocate_buddy_async(size).await
+            };
+
+            match result {
+                Ok(buffer) => return Ok(buffer),
+                Err(e) if e.kind == ErrorKind::AllocMemoryFailed => {
+                    // Memory limit reached, wait for a buffer to be freed.
+                    self.available.notified().await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Allocates a buffer using the default size (small buffer).
     ///
     /// This is a compatibility wrapper for the old API.
     pub fn allocate(self: &Arc<Self>) -> Result<Buffer> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.blocking_lock();
         let small_buffer_size = state.small_buffer_size;
         drop(state);
         self.allocate_small_with_capacity(small_buffer_size)
@@ -307,15 +348,62 @@ impl BufferPool {
 
     /// Allocates a small buffer from the dedicated small buffer pool.
     fn allocate_small(self: &Arc<Self>) -> Result<Buffer> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.blocking_lock();
         let small_buffer_size = state.small_buffer_size;
         drop(state);
         self.allocate_small_with_capacity(small_buffer_size)
     }
 
+    /// Async version of allocate_small.
+    async fn allocate_small_async(self: &Arc<Self>) -> Result<Buffer> {
+        let state = self.state.lock().await;
+        let small_buffer_size = state.small_buffer_size;
+        drop(state);
+        self.allocate_small_with_capacity_async(small_buffer_size).await
+    }
+
     /// Allocates a small buffer with the specified capacity.
     fn allocate_small_with_capacity(self: &Arc<Self>, capacity: usize) -> Result<Buffer> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.blocking_lock();
+
+        // Try to get from small buffer free list.
+        if let Some((offset, buffer_idx)) = state.small_free_list.pop() {
+            let base_ptr = state.rdma_buffers[buffer_idx].base_ptr;
+            return Ok(Buffer {
+                pool: self.clone(),
+                buffer_idx,
+                base_ptr,
+                offset,
+                capacity,
+                length: 0,
+                allocation_type: AllocationType::Small,
+            });
+        }
+
+        // Need to allocate a new 64MiB block and split it into small buffers.
+        let buffer_idx = self.allocate_new_rdma_buffer(&mut state)?;
+        let base_ptr = state.rdma_buffers[buffer_idx].base_ptr;
+        let num_small_buffers = RDMA_BLOCK_SIZE / capacity;
+
+        // Add all small buffers to free list (except the first one we'll return).
+        for i in 1..num_small_buffers {
+            state.small_free_list.push((i * capacity, buffer_idx));
+        }
+
+        Ok(Buffer {
+            pool: self.clone(),
+            buffer_idx,
+            base_ptr,
+            offset: 0,
+            capacity,
+            length: 0,
+            allocation_type: AllocationType::Small,
+        })
+    }
+
+    /// Async version of allocate_small_with_capacity.
+    async fn allocate_small_with_capacity_async(self: &Arc<Self>, capacity: usize) -> Result<Buffer> {
+        let mut state = self.state.lock().await;
 
         // Try to get from small buffer free list.
         if let Some((offset, buffer_idx)) = state.small_free_list.pop() {
@@ -358,7 +446,7 @@ impl BufferPool {
         let level = Self::size_to_level(size)?;
         let capacity = BUDDY_LEVELS[level];
 
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.blocking_lock();
 
         // Try to allocate from this level or higher.
         if let Some((buffer_idx, offset)) = self.try_allocate_buddy_at_level(&mut state, level) {
@@ -421,7 +509,7 @@ impl BufferPool {
                             level,
                         );
                     } else {
-                        state.buddy_free_lists[parent_level + 1].push((buffer_idx, child_offset));
+                        self.add_to_free_list(&mut state, buffer_idx, child_offset, parent_level + 1);
                     }
                 }
 
@@ -452,7 +540,7 @@ impl BufferPool {
             if level > 1 {
                 self.add_split_children_to_free_list(&mut state, buffer_idx, child_offset, 1, level);
             } else {
-                state.buddy_free_lists[1].push((buffer_idx, child_offset));
+                self.add_to_free_list(&mut state, buffer_idx, child_offset, 1);
             }
         }
 
@@ -466,6 +554,140 @@ impl BufferPool {
             length: 0,
             allocation_type: AllocationType::Buddy(level),
         })
+    }
+
+    /// Async version of allocate_buddy.
+    async fn allocate_buddy_async(self: &Arc<Self>, size: usize) -> Result<Buffer> {
+        // Determine the appropriate level.
+        let level = Self::size_to_level(size)?;
+        let capacity = BUDDY_LEVELS[level];
+
+        let mut state = self.state.lock().await;
+
+        // Try to allocate from this level or higher.
+        if let Some((buffer_idx, offset)) = self.try_allocate_buddy_at_level(&mut state, level) {
+            let base_ptr = state.rdma_buffers[buffer_idx].base_ptr;
+            return Ok(Buffer {
+                pool: self.clone(),
+                buffer_idx,
+                base_ptr,
+                offset,
+                capacity,
+                length: 0,
+                allocation_type: AllocationType::Buddy(level),
+            });
+        }
+
+        // If level 0 (64 MiB), we need a new RDMA buffer.
+        if level == 0 {
+            let buffer_idx = self.allocate_new_rdma_buffer(&mut state)?;
+            let base_ptr = state.rdma_buffers[buffer_idx].base_ptr;
+            return Ok(Buffer {
+                pool: self.clone(),
+                buffer_idx,
+                base_ptr,
+                offset: 0,
+                capacity: RDMA_BLOCK_SIZE,
+                length: 0,
+                allocation_type: AllocationType::Buddy(0),
+            });
+        }
+
+        // Try to split from a higher level.
+        for parent_level in (0..level).rev() {
+            if let Some((buffer_idx, parent_offset)) =
+                self.try_allocate_buddy_at_level(&mut state, parent_level)
+            {
+                // Split the parent block into children.
+                let parent_size = BUDDY_LEVELS[parent_level];
+                let child_size = BUDDY_LEVELS[parent_level + 1];
+                let num_children = parent_size / child_size;
+
+                // Recursively split down to the target level.
+                let (final_buffer_idx, final_offset) = self.split_to_level(
+                    &mut state,
+                    buffer_idx,
+                    parent_offset,
+                    parent_level,
+                    level,
+                );
+
+                // Add remaining children to free list.
+                for i in 1..num_children {
+                    let child_offset = parent_offset + i * child_size;
+                    // Need to recursively split these as well if they're not at the target level.
+                    if parent_level + 1 < level {
+                        self.add_split_children_to_free_list(
+                            &mut state,
+                            buffer_idx,
+                            child_offset,
+                            parent_level + 1,
+                            level,
+                        );
+                    } else {
+                        self.add_to_free_list(&mut state, buffer_idx, child_offset, parent_level + 1);
+                    }
+                }
+
+                let base_ptr = state.rdma_buffers[final_buffer_idx].base_ptr;
+                return Ok(Buffer {
+                    pool: self.clone(),
+                    buffer_idx: final_buffer_idx,
+                    base_ptr,
+                    offset: final_offset,
+                    capacity,
+                    length: 0,
+                    allocation_type: AllocationType::Buddy(level),
+                });
+            }
+        }
+
+        // Need to allocate a new 64 MiB block.
+        let buffer_idx = self.allocate_new_rdma_buffer(&mut state)?;
+
+        // Split down to the requested level.
+        let (final_buffer_idx, final_offset) =
+            self.split_to_level(&mut state, buffer_idx, 0, 0, level);
+
+        // Add the remaining 64 MiB block's children to free lists.
+        let child_size = BUDDY_LEVELS[1]; // 16 MiB
+        for i in 1..BUDDY_CHILDREN {
+            let child_offset = i * child_size;
+            if level > 1 {
+                self.add_split_children_to_free_list(&mut state, buffer_idx, child_offset, 1, level);
+            } else {
+                self.add_to_free_list(&mut state, buffer_idx, child_offset, 1);
+            }
+        }
+
+        let base_ptr = state.rdma_buffers[final_buffer_idx].base_ptr;
+        Ok(Buffer {
+            pool: self.clone(),
+            buffer_idx: final_buffer_idx,
+            base_ptr,
+            offset: final_offset,
+            capacity,
+            length: 0,
+            allocation_type: AllocationType::Buddy(level),
+        })
+    }
+
+    /// Adds an entry to the free list and the free set.
+    fn add_to_free_list(&self, state: &mut BufferPoolState, buffer_idx: usize, offset: usize, level: usize) {
+        state.buddy_free_lists[level].push((buffer_idx, offset));
+        state.buddy_free_set.insert((buffer_idx, offset, level));
+    }
+
+    /// Removes an entry from the free list and the free set.
+    fn remove_from_free_list(&self, state: &mut BufferPoolState, buffer_idx: usize, offset: usize, level: usize) {
+        state.buddy_free_set.remove(&(buffer_idx, offset, level));
+        // Find and remove from the Vec (less efficient but maintains list)
+        if let Some(idx) = state.buddy_free_lists[level]
+            .iter()
+            .position(|&(bi, off)| bi == buffer_idx && off == offset)
+        {
+            state.buddy_free_lists[level].swap_remove(idx);
+        }
     }
 
     /// Splits a block from `from_level` down to `to_level`, adding siblings to free lists.
@@ -482,7 +704,7 @@ impl BufferPool {
             let child_size = BUDDY_LEVELS[level + 1];
             // Add siblings (all except the first) to the free list at level+1.
             for i in 1..BUDDY_CHILDREN {
-                state.buddy_free_lists[level + 1].push((buffer_idx, current_offset + i * child_size));
+                self.add_to_free_list(state, buffer_idx, current_offset + i * child_size, level + 1);
             }
             // Continue with the first child.
         }
@@ -499,7 +721,7 @@ impl BufferPool {
         target_level: usize,
     ) {
         if current_level >= target_level {
-            state.buddy_free_lists[current_level].push((buffer_idx, offset));
+            self.add_to_free_list(state, buffer_idx, offset, current_level);
             return;
         }
 
@@ -521,7 +743,12 @@ impl BufferPool {
         state: &mut BufferPoolState,
         level: usize,
     ) -> Option<(usize, usize)> {
-        state.buddy_free_lists[level].pop()
+        if let Some((buffer_idx, offset)) = state.buddy_free_lists[level].pop() {
+            state.buddy_free_set.remove(&(buffer_idx, offset, level));
+            Some((buffer_idx, offset))
+        } else {
+            None
+        }
     }
 
     /// Converts a size to the appropriate buddy level.
@@ -571,7 +798,7 @@ impl BufferPool {
 
     /// Deallocates a buffer, returning it to the appropriate free list.
     fn deallocate(&self, buffer_idx: usize, offset: usize, allocation_type: AllocationType) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.blocking_lock();
 
         match allocation_type {
             AllocationType::Small => {
@@ -586,10 +813,11 @@ impl BufferPool {
 
         // Notify any waiting allocators.
         drop(state);
-        self.available.notify_all();
+        self.available.notify_waiters();
     }
 
     /// Deallocates a buddy buffer, attempting to merge with adjacent buddies.
+    /// Uses HashSet for O(1) sibling lookup.
     fn deallocate_buddy(
         &self,
         state: &mut BufferPoolState,
@@ -608,31 +836,27 @@ impl BufferPool {
             let buddy_offset_in_parent = current_offset - parent_offset;
             let buddy_index = buddy_offset_in_parent / block_size;
 
-            // Check if all siblings are free and collect their indices.
+            // Check if all siblings are free using O(1) HashSet lookup.
             let mut all_siblings_free = true;
-            let mut sibling_indices = Vec::with_capacity(BUDDY_CHILDREN - 1);
-
             for i in 0..BUDDY_CHILDREN {
                 if i == buddy_index {
                     continue; // Skip the current block.
                 }
                 let sibling_offset = parent_offset + i * block_size;
-                if let Some(idx) = state.buddy_free_lists[current_level]
-                    .iter()
-                    .position(|&(bi, off)| bi == buffer_idx && off == sibling_offset)
-                {
-                    sibling_indices.push(idx);
-                } else {
+                if !state.buddy_free_set.contains(&(buffer_idx, sibling_offset, current_level)) {
                     all_siblings_free = false;
                     break;
                 }
             }
 
-            if all_siblings_free && sibling_indices.len() == BUDDY_CHILDREN - 1 {
-                // Remove siblings from free list in reverse index order to avoid invalidation.
-                sibling_indices.sort_unstable_by(|a, b| b.cmp(a));
-                for idx in sibling_indices {
-                    state.buddy_free_lists[current_level].swap_remove(idx);
+            if all_siblings_free {
+                // Remove all siblings from free list.
+                for i in 0..BUDDY_CHILDREN {
+                    if i == buddy_index {
+                        continue;
+                    }
+                    let sibling_offset = parent_offset + i * block_size;
+                    self.remove_from_free_list(state, buffer_idx, sibling_offset, current_level);
                 }
 
                 // Move up to parent level.
@@ -640,51 +864,67 @@ impl BufferPool {
                 current_offset = parent_offset;
             } else {
                 // Can't merge, add to current level's free list.
-                state.buddy_free_lists[current_level].push((buffer_idx, current_offset));
+                self.add_to_free_list(state, buffer_idx, current_offset, current_level);
                 return;
             }
         }
 
         // Reached level 0 (64 MiB), add to level 0 free list.
-        state.buddy_free_lists[0].push((buffer_idx, current_offset));
+        self.add_to_free_list(state, buffer_idx, current_offset, 0);
     }
 
-    /// Waits for a buffer to become available (for async contexts).
+    /// Waits for a buffer to become available (blocking version).
     ///
     /// This method blocks until a buffer becomes available or the timeout expires.
     pub fn wait_for_buffer(&self, timeout: std::time::Duration) -> Result<()> {
-        let state = self.state.lock().unwrap();
-        let result = self
-            .available
-            .wait_timeout(state, timeout)
-            .map_err(|_| Error::new(ErrorKind::AllocMemoryFailed, "lock poisoned".to_string()))?;
-
-        if result.1.timed_out() {
-            Err(Error::new(
-                ErrorKind::AllocMemoryFailed,
-                "timeout waiting for buffer".to_string(),
-            ))
-        } else {
-            Ok(())
+        // Use tokio's blocking runtime to wait.
+        let rt = tokio::runtime::Handle::try_current();
+        match rt {
+            Ok(handle) => {
+                // We're in a tokio context, use block_on.
+                handle.block_on(async {
+                    tokio::select! {
+                        _ = self.available.notified() => Ok(()),
+                        _ = tokio::time::sleep(timeout) => Err(Error::new(
+                            ErrorKind::AllocMemoryFailed,
+                            "timeout waiting for buffer".to_string(),
+                        )),
+                    }
+                })
+            }
+            Err(_) => {
+                // Not in a tokio context, just return an error.
+                Err(Error::new(
+                    ErrorKind::AllocMemoryFailed,
+                    "not in tokio runtime".to_string(),
+                ))
+            }
         }
+    }
+
+    /// Asynchronously waits for a buffer to become available.
+    ///
+    /// This method will wait until a buffer is freed and becomes available.
+    pub async fn async_wait_for_buffer(&self) {
+        self.available.notified().await;
     }
 
     /// Returns the current memory usage of the pool.
     pub fn memory_usage(&self) -> usize {
-        let state = self.state.lock().unwrap();
+        let state = self.state.blocking_lock();
         state.total_memory
     }
 
     /// Returns the maximum memory limit of the pool.
     pub fn max_memory(&self) -> usize {
-        let state = self.state.lock().unwrap();
+        let state = self.state.blocking_lock();
         state.max_memory
     }
 }
 
 impl std::fmt::Debug for BufferPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let state = self.state.lock().unwrap();
+        let state = self.state.blocking_lock();
         f.debug_struct("BufferPool")
             .field("total_memory", &state.total_memory)
             .field("max_memory", &state.max_memory)
@@ -796,5 +1036,38 @@ mod tests {
 
         // Now we should be able to allocate again.
         let _buf2 = buffer_pool.allocate_with_size(32 * 1024 * 1024).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_async_allocate() {
+        let devices = Devices::availables().unwrap();
+        let config = BufferPoolConfig {
+            max_memory: RDMA_BLOCK_SIZE,
+            small_buffer_size: DEFAULT_SMALL_BUFFER_SIZE,
+        };
+        let buffer_pool = BufferPool::with_config(&devices, config).unwrap();
+
+        // First async allocation should succeed.
+        let buf1 = buffer_pool.async_allocate(32 * 1024 * 1024).await.unwrap();
+        assert_eq!(buf1.capacity(), 64 * 1024 * 1024);
+
+        // Clone pool for spawned task.
+        let pool_clone = buffer_pool.clone();
+
+        // Spawn a task that will try to allocate when memory is full.
+        let handle = tokio::spawn(async move {
+            // This should wait until buf1 is dropped.
+            pool_clone.async_allocate(32 * 1024 * 1024).await.unwrap()
+        });
+
+        // Give the spawned task time to start waiting.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Drop buf1, which should wake up the waiting task.
+        drop(buf1);
+
+        // The spawned task should complete successfully.
+        let buf2 = handle.await.unwrap();
+        assert_eq!(buf2.capacity(), 64 * 1024 * 1024);
     }
 }
