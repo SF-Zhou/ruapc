@@ -1,7 +1,7 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use foldhash::fast::RandomState;
-use ruapc_rdma::{BufferPool, Devices, QueuePair, verbs};
+use ruapc_rdma::{BufferPool, BufferPoolConfig, Devices, QueuePair, verbs};
 use tokio::sync::RwLock;
 use tokio_util::sync::DropGuard;
 
@@ -39,7 +39,12 @@ impl RdmaSocketPool {
     /// * `Err(Error)` - If RDMA devices cannot be initialized or buffer pool creation fails
     pub fn create() -> Result<Arc<Self>> {
         let devices = Devices::availables()?;
-        let rdmabuf_pool = BufferPool::create(4096, 4096, &devices)?;
+        // Use small buffer size of 4096 bytes for RDMA socket recv buffers.
+        let config = BufferPoolConfig {
+            max_memory: 0,
+            small_buffer_size: 4096,
+        };
+        let rdmabuf_pool = BufferPool::with_config(&devices, config);
         let this = Arc::new(Self {
             acquire_client: Client {
                 timeout: std::time::Duration::from_secs(5),

@@ -15,7 +15,7 @@ use tokio::io::{Interest, unix::AsyncFd};
 
 use crate::{Error, ErrorKind, Message, Result, Socket, State};
 
-use super::RdmaSocket;
+use super::{RdmaSocket, rdma_socket::DEFAULT_RDMA_BUFFER_SIZE};
 
 /// Handler for RDMA receive operations
 ///
@@ -49,7 +49,7 @@ impl RecvHandler {
         self.buffers.reserve(count);
 
         for wrid in 0..count as u64 {
-            let buf = socket.rdmabuf_pool.allocate()?;
+            let buf = socket.rdmabuf_pool.allocate(DEFAULT_RDMA_BUFFER_SIZE)?;
             self.buffers.push(buf);
             self.post_recv(wrid, socket)?;
         }
@@ -89,7 +89,7 @@ impl RecvHandler {
             self.data_received += 1;
 
             // Handle regular data message
-            let mut new_buf = socket.rdmabuf_pool.allocate()?;
+            let mut new_buf = socket.rdmabuf_pool.allocate(DEFAULT_RDMA_BUFFER_SIZE)?;
             std::mem::swap(
                 &mut self.buffers[usize::try_from(wc.wr_id.get_id()).unwrap()],
                 &mut new_buf,

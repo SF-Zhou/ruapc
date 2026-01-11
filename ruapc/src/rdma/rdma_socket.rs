@@ -11,6 +11,9 @@ use crate::{
     msg::{MsgMeta, SendMsg},
 };
 
+/// Default buffer size for RDMA send/recv operations (4 KiB).
+pub const DEFAULT_RDMA_BUFFER_SIZE: usize = 4096;
+
 #[derive(Debug)]
 pub struct RdmaSocket {
     pub(crate) queue_pair: QueuePair,
@@ -41,7 +44,7 @@ impl RdmaSocket {
         payload: &P,
         _: &State,
     ) -> Result<()> {
-        let mut buf = self.rdmabuf_pool.allocate()?;
+        let mut buf = self.rdmabuf_pool.allocate(DEFAULT_RDMA_BUFFER_SIZE)?;
         meta.serialize_to(payload, &mut buf)?;
 
         let buf = Arc::new(buf);

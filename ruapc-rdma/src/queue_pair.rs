@@ -344,9 +344,9 @@ mod tests {
 
         // 4. post recv wr.
         const LEN: usize = 1 << 20;
-        let buffer_pool = BufferPool::create(LEN, 32, &devices).unwrap();
+        let buffer_pool = BufferPool::new(&devices);
 
-        let mut recv_buf = buffer_pool.allocate().unwrap();
+        let mut recv_buf = buffer_pool.allocate(LEN).unwrap();
         recv_buf.extend_from_slice(&vec![0; LEN]).unwrap();
         let recv_slice: &[u8] = unsafe { std::mem::transmute(&*recv_buf) };
         queue_pair_b.recv(verbs::WRID::recv(1), &recv_buf).unwrap();
@@ -356,7 +356,7 @@ mod tests {
         assert!(queue_pair_b.poll_cq(&mut wcs_b).unwrap().is_empty());
 
         // 6. post send wr.
-        let mut send_buf = buffer_pool.allocate().unwrap();
+        let mut send_buf = buffer_pool.allocate(LEN).unwrap();
         assert_ne!(recv_buf.as_slice().as_ptr(), send_buf.as_slice().as_ptr());
         send_buf.extend_from_slice(&vec![1; LEN]).unwrap();
         let send_slice: &[u8] = unsafe { std::mem::transmute(&*send_buf) };
