@@ -1,3 +1,8 @@
+//! Message payload representation supporting different backends.
+//!
+//! This module provides the `Payload` type which abstracts over different memory
+//! backends for RPC message data.
+
 use bytes::{Buf, Bytes, BytesMut};
 use serde::Deserialize;
 
@@ -30,7 +35,7 @@ impl Payload {
     /// # Examples
     ///
     /// ```rust
-    /// # use ruapc::Payload;
+    /// # use ruapc_core::Payload;
     /// # use bytes::Bytes;
     /// let payload = Payload::from(Bytes::from("hello"));
     /// assert_eq!(payload.len(), 5);
@@ -49,7 +54,7 @@ impl Payload {
     /// # Examples
     ///
     /// ```rust
-    /// # use ruapc::Payload;
+    /// # use ruapc_core::Payload;
     /// let payload = Payload::default();
     /// assert!(payload.is_empty());
     /// ```
@@ -67,7 +72,7 @@ impl Payload {
     /// # Examples
     ///
     /// ```rust
-    /// # use ruapc::Payload;
+    /// # use ruapc_core::Payload;
     /// # use bytes::Bytes;
     /// let payload = Payload::from(Bytes::from("hello"));
     /// assert_eq!(payload.as_slice(), b"hello");

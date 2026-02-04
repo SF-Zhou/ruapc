@@ -15,8 +15,7 @@ use tokio_util::sync::DropGuard;
 
 use super::WebSocket;
 use crate::{
-    Message, RawStream, Socket, SocketType, State, TaskSupervisor,
-    error::{Error, ErrorKind, Result},
+    Error, ErrorKind, Message, RawStream, Result, Socket, SocketType, State, TaskSupervisor,
 };
 
 pub struct WebSocketPool {

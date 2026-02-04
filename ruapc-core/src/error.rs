@@ -1,3 +1,7 @@
+//! Error types and error handling utilities.
+//!
+//! This module provides the core error types used throughout the RuaPC library.
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -66,7 +70,7 @@ pub enum ErrorKind {
 /// # Examples
 ///
 /// ```
-/// use ruapc::{Error, ErrorKind};
+/// use ruapc_core::{Error, ErrorKind};
 ///
 /// let error = Error::new(ErrorKind::Timeout, "request timed out after 5s".to_string());
 /// assert_eq!(error.kind, ErrorKind::Timeout);
@@ -85,7 +89,7 @@ impl Error {
     /// # Examples
     ///
     /// ```
-    /// use ruapc::{Error, ErrorKind};
+    /// use ruapc_core::{Error, ErrorKind};
     ///
     /// let error = Error::new(ErrorKind::Timeout, "operation timed out".to_string());
     /// ```
@@ -99,7 +103,7 @@ impl Error {
     /// # Examples
     ///
     /// ```
-    /// use ruapc::{Error, ErrorKind};
+    /// use ruapc_core::{Error, ErrorKind};
     ///
     /// let error = Error::kind(ErrorKind::Timeout);
     /// assert_eq!(error.msg, "");
@@ -181,7 +185,7 @@ impl std::fmt::Display for Error {
 /// # Examples
 ///
 /// ```
-/// use ruapc::{Result, Error, ErrorKind};
+/// use ruapc_core::{Result, Error, ErrorKind};
 ///
 /// fn example_function() -> Result<String> {
 ///     Ok("success".to_string())

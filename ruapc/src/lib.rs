@@ -96,17 +96,8 @@
 /// ```
 pub use ruapc_macro::service;
 
-/// Error types and error handling utilities.
-mod error;
-pub use error::{Error, ErrorKind, Result};
-
-/// Message payload representation supporting different backends.
-mod payload;
-pub use payload::Payload;
-
-/// Message types and serialization/deserialization.
-mod msg;
-pub use msg::{Message, MsgFlags, MsgMeta};
+// Re-export core types from ruapc-core.
+pub use ruapc_core::{Error, ErrorKind, Message, MsgFlags, MsgMeta, Payload, Result, SendMsg};
 
 /// Request routing and method dispatch.
 mod router;

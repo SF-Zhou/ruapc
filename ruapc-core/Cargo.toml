@@ -1,0 +1,26 @@
+[package]
+name = "ruapc-core"
+version = "0.1.0"
+description = "Core types and traits for the RuaPC RPC library"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[features]
+rdma = ["ruapc-rdma"]
+default = []
+
+[dependencies]
+ruapc-rdma = { version = "0.1.0", path = "../ruapc-rdma", optional = true }
+
+bitflags.workspace = true
+bytes.workspace = true
+rmp-serde.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

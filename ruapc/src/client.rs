@@ -4,10 +4,8 @@ use serde_inline_default::serde_inline_default;
 use std::time::Duration;
 
 use crate::{
-    SocketType,
+    Error, ErrorKind, MsgFlags, MsgMeta, SocketType,
     context::{Context, SocketEndpoint},
-    error::{Error, ErrorKind},
-    msg::{MsgFlags, MsgMeta},
 };
 
 /// RPC client configuration and request handler.

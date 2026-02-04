@@ -7,7 +7,7 @@ use hyper_util::rt::TokioIo;
 use serde::Serialize;
 use tokio::{net::TcpStream, sync::Mutex};
 
-use crate::{Error, ErrorKind, Message, MsgMeta, Result, State, msg::SendMsg};
+use crate::{Error, ErrorKind, Message, MsgMeta, Result, SendMsg, State};
 
 #[derive(Clone, Debug)]
 pub enum HttpSocket {

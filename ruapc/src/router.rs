@@ -14,11 +14,7 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "rdma")]
 use crate::rdma::RdmaService;
-use crate::{
-    Context, Payload,
-    error::{Error, ErrorKind, Result},
-    services::MetaService,
-};
+use crate::{Context, Error, ErrorKind, Payload, Result, services::MetaService};
 
 /// Type alias for service method handler functions.
 type Func = Box<dyn Fn(Context, Payload) -> Result<()> + Send + Sync>;

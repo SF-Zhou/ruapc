@@ -9,14 +9,14 @@ description.workspace = true
 license.workspace = true
 
 [features]
-rdma = ["ruapc-rdma"]
+rdma = ["ruapc-rdma", "ruapc-core/rdma"]
 default = []
 
 [dependencies]
+ruapc-core = { version = "0.1.0", path = "../ruapc-core" }
 ruapc-macro ={ version = "0.1.1", path = "../ruapc-macro" }
 ruapc-rdma = { version = "0.1.0", path = "../ruapc-rdma", optional = true }
 
-bitflags.workspace = true
 bytes.workspace = true
 clap.workspace = true
 dashmap.workspace = true
@@ -28,7 +28,6 @@ hyper-tungstenite.workspace = true
 hyper-util.workspace = true
 indexmap.workspace = true
 openapiv3.workspace = true
-rmp-serde.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde-inline-default.workspace = true
