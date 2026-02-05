@@ -99,6 +99,9 @@ pub use ruapc_macro::service;
 // Re-export core types from ruapc-core.
 pub use ruapc_core::{Error, ErrorKind, Message, MsgFlags, MsgMeta, Payload, Result, SendMsg};
 
+// Re-export async utilities from ruapc-async.
+pub use ruapc_async::{TaskSupervisor, TaskSupervisorGuard};
+
 /// Request routing and method dispatch.
 mod router;
 pub use router::Router;
@@ -106,10 +109,6 @@ pub use router::Router;
 /// Response waiting mechanism for asynchronous RPC calls.
 mod waiter;
 pub use waiter::{Waiter, WaiterCleaner};
-
-/// Task lifecycle management.
-mod task_supervisor;
-pub use task_supervisor::TaskSupervisor;
 
 /// Internal message receiver.
 mod receiver;

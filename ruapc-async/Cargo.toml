@@ -1,0 +1,16 @@
+[package]
+name = "ruapc-async"
+version = "0.1.0"
+description = "Async utilities for the RuaPC RPC library"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+tokio-util.workspace = true
+
+[lints]
+workspace = true

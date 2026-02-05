@@ -28,7 +28,7 @@ struct TaskSupervisorState {
 /// # Examples
 ///
 /// ```rust,no_run
-/// # use ruapc::TaskSupervisor;
+/// # use ruapc_async::TaskSupervisor;
 /// # #[tokio::main]
 /// # async fn main() {
 /// let supervisor = TaskSupervisor::create();

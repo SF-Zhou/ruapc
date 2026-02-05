@@ -13,6 +13,7 @@ rdma = ["ruapc-rdma", "ruapc-core/rdma"]
 default = []
 
 [dependencies]
+ruapc-async = { version = "0.1.0", path = "../ruapc-async" }
 ruapc-core = { version = "0.1.0", path = "../ruapc-core" }
 ruapc-macro ={ version = "0.1.1", path = "../ruapc-macro" }
 ruapc-rdma = { version = "0.1.0", path = "../ruapc-rdma", optional = true }
