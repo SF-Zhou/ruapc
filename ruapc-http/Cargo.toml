@@ -1,0 +1,28 @@
+[package]
+name = "ruapc-http"
+version = "0.1.0"
+description = "HTTP transport implementation for the RuaPC RPC library"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+ruapc-transport = { version = "0.1.0", path = "../ruapc-transport" }
+ruapc-ws = { version = "0.1.0", path = "../ruapc-ws" }
+
+bytes.workspace = true
+foldhash.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-tungstenite.workspace = true
+hyper-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
