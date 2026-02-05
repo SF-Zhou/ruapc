@@ -1,0 +1,23 @@
+[package]
+name = "ruapc-ws"
+version = "0.1.0"
+description = "WebSocket transport implementation for the RuaPC RPC library"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+ruapc-transport = { version = "0.1.0", path = "../ruapc-transport" }
+
+bytes.workspace = true
+foldhash.workspace = true
+futures-util.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

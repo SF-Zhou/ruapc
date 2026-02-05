@@ -1,0 +1,21 @@
+[package]
+name = "ruapc-tcp"
+version = "0.1.0"
+description = "TCP transport implementation for the RuaPC RPC library"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+ruapc-transport = { version = "0.1.0", path = "../ruapc-transport" }
+
+bytes.workspace = true
+foldhash.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

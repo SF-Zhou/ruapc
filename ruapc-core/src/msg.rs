@@ -267,6 +267,52 @@ impl MsgMeta {
 
         Ok(())
     }
+
+    /// Serializes the metadata and raw bytes payload into a message buffer.
+    ///
+    /// Similar to `serialize_to`, but takes pre-serialized payload bytes.
+    ///
+    /// # Type Parameters
+    ///
+    /// * `M` - The message buffer type implementing `SendMsg`
+    ///
+    /// # Arguments
+    ///
+    /// * `payload` - The pre-serialized payload bytes
+    /// * `msg` - The message buffer to write to
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if buffer preparation or finalization fails.
+    pub fn serialize_to_bytes<M: SendMsg>(
+        &self,
+        payload: bytes::Bytes,
+        msg: &mut M,
+    ) -> Result<()> {
+        msg.prepare()?;
+
+        // serialize meta.
+        let meta_offset = msg.size();
+        // reserve for meta len.
+        msg.writer()
+            .write_all(&0u32.to_be_bytes())
+            .map_err(|e| Error::new(ErrorKind::SerializeFailed, e.to_string()))?;
+        if self.flags.contains(MsgFlags::UseMessagePack) {
+            rmp_serde::encode::write_named(&mut msg.writer(), self)?;
+        } else {
+            serde_json::to_writer(msg.writer(), self)?;
+        }
+
+        // write payload bytes directly.
+        let payload_offset = msg.size();
+        msg.writer()
+            .write_all(&payload)
+            .map_err(|e| Error::new(ErrorKind::SerializeFailed, e.to_string()))?;
+
+        msg.finish(meta_offset, payload_offset)?;
+
+        Ok(())
+    }
 }
 
 impl SendMsg for BytesMut {
