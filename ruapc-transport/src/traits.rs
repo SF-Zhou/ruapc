@@ -149,6 +149,7 @@ pub trait RuapcSocketPool: Send + Sync + std::fmt::Debug + 'static {
 }
 
 // Helper function for serializing payloads
+#[allow(dead_code)]
 pub fn serialize_payload<P: Serialize>(meta: &mut MsgMeta, payload: &P) -> Result<bytes::Bytes> {
     let mut bytes = bytes::BytesMut::with_capacity(512);
     meta.serialize_to(payload, &mut bytes)?;

@@ -15,8 +15,12 @@ default = []
 [dependencies]
 ruapc-async = { version = "0.1.0", path = "../ruapc-async" }
 ruapc-core = { version = "0.1.0", path = "../ruapc-core" }
+ruapc-http = { version = "0.1.0", path = "../ruapc-http" }
 ruapc-macro ={ version = "0.1.1", path = "../ruapc-macro" }
 ruapc-rdma = { version = "0.1.0", path = "../ruapc-rdma", optional = true }
+ruapc-tcp = { version = "0.1.0", path = "../ruapc-tcp" }
+ruapc-transport = { version = "0.1.0", path = "../ruapc-transport" }
+ruapc-ws = { version = "0.1.0", path = "../ruapc-ws" }
 
 bytes.workspace = true
 clap.workspace = true

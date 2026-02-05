@@ -284,11 +284,7 @@ impl MsgMeta {
     /// # Errors
     ///
     /// Returns an error if buffer preparation or finalization fails.
-    pub fn serialize_to_bytes<M: SendMsg>(
-        &self,
-        payload: bytes::Bytes,
-        msg: &mut M,
-    ) -> Result<()> {
+    pub fn serialize_to_bytes<M: SendMsg>(&self, payload: bytes::Bytes, msg: &mut M) -> Result<()> {
         msg.prepare()?;
 
         // serialize meta.

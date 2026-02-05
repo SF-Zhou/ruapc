@@ -12,8 +12,8 @@ use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::DropGuard;
 
 use crate::{
-    BoxFuture, Error, ErrorKind, Message, MessageHandler, MsgFlags, MsgMeta, RawStream,
-    Result, RuapcSocket, RuapcSocketPool, SocketType, TaskSupervisor,
+    BoxFuture, Error, ErrorKind, Message, MessageHandler, MsgFlags, MsgMeta, RawStream, Result,
+    RuapcSocket, RuapcSocketPool, SocketType, TaskSupervisor,
     http_socket::{Connections, HttpSocket},
 };
 
@@ -93,7 +93,8 @@ impl HttpSocketPool {
             .serve_connection(
                 TokioIo::new(tcp_stream),
                 hyper::service::service_fn(move |req: Request<Incoming>| {
-                    this.clone().handle_request(req, handler.clone(), request_handler.clone(), addr)
+                    this.clone()
+                        .handle_request(req, handler.clone(), request_handler.clone(), addr)
                 }),
             )
             .with_upgrades();

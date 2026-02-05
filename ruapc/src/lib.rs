@@ -102,6 +102,9 @@ pub use ruapc_core::{Error, ErrorKind, Message, MsgFlags, MsgMeta, Payload, Resu
 // Re-export async utilities from ruapc-async.
 pub use ruapc_async::{TaskSupervisor, TaskSupervisorGuard};
 
+// Re-export transport traits and types.
+pub use ruapc_transport::{BoxFuture, MessageHandler, RuapcSocket, RuapcSocketPool};
+
 /// Request routing and method dispatch.
 mod router;
 pub use router::Router;
@@ -122,17 +125,33 @@ pub use socket::Socket;
 mod socket_pool;
 pub use socket_pool::{RawStream, SocketPool, SocketPoolConfig, SocketType};
 
-/// HTTP transport implementation.
-mod http;
+/// HTTP transport implementation (internal).
+pub(crate) mod http;
 /// RDMA (Remote Direct Memory Access) transport implementation.
 #[cfg(feature = "rdma")]
 mod rdma;
-/// TCP transport implementation.
-mod tcp;
+/// TCP transport implementation (internal).
+pub(crate) mod tcp;
 /// Unified transport that supports multiple protocols simultaneously.
 mod unified;
-/// WebSocket transport implementation.
-mod ws;
+/// WebSocket transport implementation (internal).
+pub(crate) mod ws;
+
+// Re-export standalone transport crates for users who want to use them directly.
+/// Standalone TCP transport crate.
+pub mod transport_tcp {
+    pub use ruapc_tcp::*;
+}
+
+/// Standalone WebSocket transport crate.
+pub mod transport_ws {
+    pub use ruapc_ws::*;
+}
+
+/// Standalone HTTP transport crate.
+pub mod transport_http {
+    pub use ruapc_http::*;
+}
 
 /// Shared state management.
 mod state;
