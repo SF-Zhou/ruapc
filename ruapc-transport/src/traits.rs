@@ -148,8 +148,8 @@ pub trait RuapcSocketPool: Send + Sync + std::fmt::Debug + 'static {
     fn join(&self) -> BoxFuture<'_, ()>;
 }
 
-// Helper function for serializing payloads
-#[allow(dead_code)]
+// Helper function for serializing payloads.
+// This is a utility function that may be used by custom transport implementations.
 pub fn serialize_payload<P: Serialize>(meta: &mut MsgMeta, payload: &P) -> Result<bytes::Bytes> {
     let mut bytes = bytes::BytesMut::with_capacity(512);
     meta.serialize_to(payload, &mut bytes)?;

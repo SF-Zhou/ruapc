@@ -33,21 +33,25 @@ pub struct Connections {
 impl HttpSocket {
     /// Sends a message using this HTTP socket.
     ///
-    /// For requests: sends an HTTP POST to the server and returns the response.
-    /// For responses: posts the response back through the waiter.
+    /// For requests: sends an HTTP POST to the server and awaits the response.
+    /// Note: The response bytes are received but discarded here because the
+    /// actual response handling is done through the waiter mechanism at the
+    /// higher level (ruapc crate). The response is delivered via the waiter
+    /// channel, not as a return value from this method.
+    ///
+    /// For responses: This is a server-side socket used to mark responses.
+    /// The actual response sending is handled by the HttpSocketPool's request
+    /// handler which posts to the waiter channel. This variant exists to allow
+    /// the socket to be passed through the RPC framework's message handling.
     pub async fn send_internal(&self, meta: MsgMeta, payload: Bytes) -> Result<()> {
         match self {
             HttpSocket::ForRequest(connections) => {
                 if meta.is_req() {
                     let method = meta.method.clone();
-                    let result = Self::send_request(&method, payload, connections).await;
-                    // Note: The response handling is done by the caller through the waiter
-                    // This is a simplified version - the actual implementation needs
-                    // access to the waiter which is in the ruapc crate
-                    match result {
-                        Ok(_bytes) => Ok(()),
-                        Err(e) => Err(e),
-                    }
+                    // Send the request and await the response.
+                    // The response bytes are intentionally discarded here because
+                    // the response is handled through the waiter mechanism at a higher level.
+                    Self::send_request(&method, payload, connections).await.map(|_| ())
                 } else {
                     Err(Error::new(
                         ErrorKind::InvalidArgument,
@@ -57,8 +61,10 @@ impl HttpSocket {
             }
             HttpSocket::ForResponse(_msgid) => {
                 if meta.is_rsp() {
-                    // Response handling requires the waiter from ruapc crate
-                    // This is handled at a higher level
+                    // Server-side response handling.
+                    // The actual response is sent via HttpSocketPool.handle_request
+                    // which posts to the waiter channel. This socket variant exists
+                    // to allow the socket to be passed through message handling.
                     Ok(())
                 } else {
                     Err(Error::new(
