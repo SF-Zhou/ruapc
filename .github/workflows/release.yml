@@ -20,6 +20,7 @@ jobs:
     - run: |
         sudo apt install -y pkg-config libibverbs-dev ibverbs-utils
         cargo publish -p ruapc-macro || echo skip publishing ruapc-macro
+        cargo publish -p ruapc-core || echo skip publishing ruapc-core
         cargo publish -p ruapc-rdma || echo skip publishing ruapc-rdma
         cargo publish -p ruapc
       env:

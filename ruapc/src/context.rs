@@ -3,10 +3,7 @@ use std::{net::SocketAddr, sync::Arc};
 use serde::Serialize;
 use tokio_util::sync::DropGuard;
 
-use crate::{
-    Error, Result, Router, Socket, SocketPoolConfig, State,
-    msg::{MsgFlags, MsgMeta},
-};
+use crate::{Error, MsgFlags, MsgMeta, Result, Router, Socket, SocketPoolConfig, State};
 
 /// Socket endpoint information for RPC contexts.
 ///

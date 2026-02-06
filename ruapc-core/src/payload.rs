@@ -8,7 +8,6 @@ use crate::{MsgFlags, MsgMeta, Result};
 /// The payload can be:
 /// - **Empty**: No data
 /// - **Normal**: Standard heap-allocated bytes
-/// - **RDMA**: Zero-copy RDMA buffer (requires "rdma" feature)
 ///
 /// This abstraction allows efficient handling of different memory types
 /// while providing a uniform interface.
@@ -19,9 +18,6 @@ pub enum Payload {
     Empty,
     /// Normal heap-allocated payload.
     Normal(Bytes),
-    /// RDMA buffer payload with offset (requires "rdma" feature).
-    #[cfg(feature = "rdma")]
-    RDMA(ruapc_rdma::Buffer, usize),
 }
 
 impl Payload {
@@ -30,7 +26,7 @@ impl Payload {
     /// # Examples
     ///
     /// ```rust
-    /// # use ruapc::Payload;
+    /// # use ruapc_core::Payload;
     /// # use bytes::Bytes;
     /// let payload = Payload::from(Bytes::from("hello"));
     /// assert_eq!(payload.len(), 5);
@@ -39,8 +35,6 @@ impl Payload {
         match self {
             Payload::Empty => 0,
             Payload::Normal(bytes) => bytes.len(),
-            #[cfg(feature = "rdma")]
-            Payload::RDMA(buffer, off) => buffer.len() - off,
         }
     }
 
@@ -49,7 +43,7 @@ impl Payload {
     /// # Examples
     ///
     /// ```rust
-    /// # use ruapc::Payload;
+    /// # use ruapc_core::Payload;
     /// let payload = Payload::default();
     /// assert!(payload.is_empty());
     /// ```
@@ -57,8 +51,6 @@ impl Payload {
         match self {
             Payload::Empty => true,
             Payload::Normal(bytes) => bytes.is_empty(),
-            #[cfg(feature = "rdma")]
-            Payload::RDMA(buffer, off) => buffer.len() == *off,
         }
     }
 
@@ -67,7 +59,7 @@ impl Payload {
     /// # Examples
     ///
     /// ```rust
-    /// # use ruapc::Payload;
+    /// # use ruapc_core::Payload;
     /// # use bytes::Bytes;
     /// let payload = Payload::from(Bytes::from("hello"));
     /// assert_eq!(payload.as_slice(), b"hello");
@@ -76,8 +68,6 @@ impl Payload {
         match self {
             Payload::Empty => &[],
             Payload::Normal(bytes) => bytes,
-            #[cfg(feature = "rdma")]
-            Payload::RDMA(buffer, off) => &buffer[*off..],
         }
     }
 
@@ -92,8 +82,6 @@ impl Payload {
         match self {
             Payload::Empty => {}
             Payload::Normal(bytes) => bytes.advance(offset),
-            #[cfg(feature = "rdma")]
-            Payload::RDMA(_, off) => *off += offset,
         }
     }
 
@@ -150,15 +138,6 @@ impl From<Payload> for Bytes {
         match value {
             Payload::Empty => Bytes::new(),
             Payload::Normal(bytes) => bytes,
-            #[cfg(feature = "rdma")]
-            Payload::RDMA(buffer, off) => Bytes::copy_from_slice(&buffer[off..]),
         }
-    }
-}
-
-#[cfg(feature = "rdma")]
-impl From<ruapc_rdma::Buffer> for Payload {
-    fn from(value: ruapc_rdma::Buffer) -> Self {
-        Payload::RDMA(value, 0)
     }
 }

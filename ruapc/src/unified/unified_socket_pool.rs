@@ -78,6 +78,11 @@ impl UnifiedSocketPool {
                 .acquire(addr, SocketType::RDMA, state)
                 .await
                 .map(Socket::RDMA),
+            #[cfg(not(feature = "rdma"))]
+            SocketType::RDMA => Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "RDMA feature is not enabled".into(),
+            )),
         }
     }
 

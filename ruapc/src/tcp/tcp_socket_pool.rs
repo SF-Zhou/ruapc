@@ -14,8 +14,7 @@ use tokio_util::sync::DropGuard;
 
 use super::TcpSocket;
 use crate::{
-    Message, RawStream, Socket, SocketType, State, TaskSupervisor,
-    error::{Error, ErrorKind, Result},
+    Error, ErrorKind, Message, RawStream, Result, Socket, SocketType, State, TaskSupervisor,
 };
 
 pub struct TcpSocketPool {

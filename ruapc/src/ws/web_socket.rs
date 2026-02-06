@@ -4,11 +4,7 @@ use bytes::{Bytes, BytesMut};
 use serde::Serialize;
 use tokio::sync::mpsc;
 
-use crate::{
-    State,
-    error::{Error, ErrorKind, Result},
-    msg::MsgMeta,
-};
+use crate::{Error, ErrorKind, MsgMeta, Result, State};
 
 #[derive(Debug, Clone)]
 pub struct WebSocket {

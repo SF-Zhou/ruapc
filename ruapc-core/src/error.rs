@@ -49,9 +49,6 @@ pub enum ErrorKind {
     RdmaSendFailed,
     /// Failed to receive message over RDMA.
     RdmaRecvFailed,
-    /// RDMA-specific error (only available with "rdma" feature).
-    #[cfg(feature = "rdma")]
-    RdmaError(ruapc_rdma::ErrorKind),
     /// Unknown or unclassified error with a custom message.
     #[serde(untagged)]
     Unknown(String),
@@ -66,7 +63,7 @@ pub enum ErrorKind {
 /// # Examples
 ///
 /// ```
-/// use ruapc::{Error, ErrorKind};
+/// use ruapc_core::{Error, ErrorKind};
 ///
 /// let error = Error::new(ErrorKind::Timeout, "request timed out after 5s".to_string());
 /// assert_eq!(error.kind, ErrorKind::Timeout);
@@ -85,7 +82,7 @@ impl Error {
     /// # Examples
     ///
     /// ```
-    /// use ruapc::{Error, ErrorKind};
+    /// use ruapc_core::{Error, ErrorKind};
     ///
     /// let error = Error::new(ErrorKind::Timeout, "operation timed out".to_string());
     /// ```
@@ -99,7 +96,7 @@ impl Error {
     /// # Examples
     ///
     /// ```
-    /// use ruapc::{Error, ErrorKind};
+    /// use ruapc_core::{Error, ErrorKind};
     ///
     /// let error = Error::kind(ErrorKind::Timeout);
     /// assert_eq!(error.msg, "");
@@ -118,13 +115,6 @@ impl std::error::Error for Error {}
 impl From<ErrorKind> for Error {
     fn from(kind: ErrorKind) -> Self {
         Self::kind(kind)
-    }
-}
-
-#[cfg(feature = "rdma")]
-impl From<ruapc_rdma::Error> for Error {
-    fn from(value: ruapc_rdma::Error) -> Self {
-        Self::new(ErrorKind::RdmaError(value.kind), value.msg)
     }
 }
 
@@ -181,7 +171,7 @@ impl std::fmt::Display for Error {
 /// # Examples
 ///
 /// ```
-/// use ruapc::{Result, Error, ErrorKind};
+/// use ruapc_core::{Result, Error, ErrorKind};
 ///
 /// fn example_function() -> Result<String> {
 ///     Ok("success".to_string())

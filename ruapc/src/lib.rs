@@ -96,33 +96,19 @@
 /// ```
 pub use ruapc_macro::service;
 
-/// Error types and error handling utilities.
-mod error;
-pub use error::{Error, ErrorKind, Result};
-
-/// Message payload representation supporting different backends.
-mod payload;
-pub use payload::Payload;
-
-/// Message types and serialization/deserialization.
-mod msg;
-pub use msg::{Message, MsgFlags, MsgMeta};
+// Re-export core types from ruapc-core.
+pub use ruapc_core::{
+    Error, ErrorKind, MsgFlags, MsgMeta, Payload, Receiver, Result, SendMsg, SocketPoolConfig,
+    SocketType, TaskSupervisor, TaskSupervisorGuard, Waiter, WaiterCleaner,
+};
+// Re-export MethodInfo through the router module.
+pub use ruapc_core::MethodInfo;
+// Re-export Message separately since it's used frequently.
+pub use ruapc_core::Message;
 
 /// Request routing and method dispatch.
 mod router;
 pub use router::Router;
-
-/// Response waiting mechanism for asynchronous RPC calls.
-mod waiter;
-pub use waiter::{Waiter, WaiterCleaner};
-
-/// Task lifecycle management.
-mod task_supervisor;
-pub use task_supervisor::TaskSupervisor;
-
-/// Internal message receiver.
-mod receiver;
-use receiver::Receiver;
 
 /// Socket abstraction layer.
 mod socket;
@@ -130,7 +116,7 @@ pub use socket::Socket;
 
 /// Socket pool management and configuration.
 mod socket_pool;
-pub use socket_pool::{RawStream, SocketPool, SocketPoolConfig, SocketType};
+pub use socket_pool::{RawStream, SocketPool};
 
 /// HTTP transport implementation.
 mod http;

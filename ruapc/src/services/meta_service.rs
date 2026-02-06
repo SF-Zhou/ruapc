@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{Context, Result, router::MethodInfo};
+use crate::{Context, MethodInfo, Result};
 
 /// Service metadata information.
 ///

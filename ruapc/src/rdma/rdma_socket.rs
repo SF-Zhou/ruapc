@@ -5,11 +5,7 @@ use serde::Serialize;
 use tokio::sync::mpsc::Sender;
 
 use super::RdmaState;
-use crate::{
-    Error, State,
-    error::{ErrorKind, Result},
-    msg::{MsgMeta, SendMsg},
-};
+use crate::{Error, ErrorKind, MsgMeta, Result, SendMsg, State};
 
 #[derive(Debug)]
 pub struct RdmaSocket {

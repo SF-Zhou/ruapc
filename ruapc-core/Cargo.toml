@@ -1,0 +1,27 @@
+[package]
+name = "ruapc-core"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Core types for the ruapc RPC library"
+license.workspace = true
+
+[dependencies]
+bitflags.workspace = true
+bytes.workspace = true
+clap.workspace = true
+dashmap.workspace = true
+foldhash.workspace = true
+rmp-serde.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde-inline-default.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

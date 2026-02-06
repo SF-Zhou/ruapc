@@ -52,7 +52,7 @@ impl MsgMeta {
     /// # Examples
     ///
     /// ```rust
-    /// # use ruapc::{MsgMeta, MsgFlags};
+    /// # use ruapc_core::{MsgMeta, MsgFlags};
     /// let mut meta = MsgMeta::default();
     /// meta.flags = MsgFlags::IsReq;
     /// assert!(meta.is_req());
@@ -67,7 +67,7 @@ impl MsgMeta {
     /// # Examples
     ///
     /// ```rust
-    /// # use ruapc::{MsgMeta, MsgFlags};
+    /// # use ruapc_core::{MsgMeta, MsgFlags};
     /// let mut meta = MsgMeta::default();
     /// meta.flags = MsgFlags::IsRsp;
     /// assert!(meta.is_rsp());
@@ -102,7 +102,7 @@ impl Message {
     /// # Examples
     ///
     /// ```rust
-    /// # use ruapc::{Message, MsgMeta, Payload};
+    /// # use ruapc_core::{Message, MsgMeta, Payload};
     /// let meta = MsgMeta::default();
     /// let payload = Payload::default();
     /// let msg = Message::new(meta, payload);
@@ -133,7 +133,7 @@ impl Message {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// # use ruapc::{Message, Payload};
+    /// # use ruapc_core::{Message, Payload};
     /// # use bytes::Bytes;
     /// # let raw_bytes = Bytes::new();
     /// let msg = Message::parse(raw_bytes).unwrap();

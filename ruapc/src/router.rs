@@ -9,31 +9,14 @@ use openapiv3::{
     Components, MediaType, OpenAPI, Operation, Paths, ReferenceOr, RequestBody, Response,
     Responses, StatusCode,
 };
-use schemars::{JsonSchema, Schema, SchemaGenerator};
-use serde::{Deserialize, Serialize};
+use schemars::{JsonSchema, SchemaGenerator};
 
 #[cfg(feature = "rdma")]
 use crate::rdma::RdmaService;
-use crate::{
-    Context, Payload,
-    error::{Error, ErrorKind, Result},
-    services::MetaService,
-};
+use crate::{Context, Error, ErrorKind, MethodInfo, Payload, Result, services::MetaService};
 
 /// Type alias for service method handler functions.
 type Func = Box<dyn Fn(Context, Payload) -> Result<()> + Send + Sync>;
-
-/// JSON schema information for a service method.
-///
-/// Contains the request and response schemas used for OpenAPI generation
-/// and runtime validation.
-#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
-pub struct MethodInfo {
-    /// JSON schema for the request type.
-    pub req_schema: Schema,
-    /// JSON schema for the response type.
-    pub rsp_schema: Schema,
-}
 
 /// Internal method representation containing metadata and handler.
 pub struct Method {

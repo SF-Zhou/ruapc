@@ -143,17 +143,25 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
     .into()
 }
 
-/// Gets the correct crate name for importing ruapc.
+/// Gets the correct crate name for importing ruapc types.
 ///
-/// This function handles both cases:
-/// - When ruapc-macro is used as a dependency (uses `::ruapc`)
-/// - When ruapc-macro is in the same workspace (uses `crate`)
+/// This function handles multiple cases:
+/// - When `ruapc` is a dependency (uses `::ruapc`)
+/// - When `ruapc-core` is a direct dependency without `ruapc` (uses `::ruapc_core`)
+/// - When ruapc-macro is in the same workspace as `ruapc` (uses `crate`)
 pub(crate) fn get_crate_name() -> proc_macro2::TokenStream {
     match proc_macro_crate::crate_name("ruapc") {
         Ok(proc_macro_crate::FoundCrate::Name(name)) => {
             let ident = syn::Ident::new(&name, proc_macro2::Span::call_site());
             quote! { ::#ident }
         }
-        _ => quote! { crate },
+        Ok(proc_macro_crate::FoundCrate::Itself) => quote! { crate },
+        Err(_) => match proc_macro_crate::crate_name("ruapc-core") {
+            Ok(proc_macro_crate::FoundCrate::Name(name)) => {
+                let ident = syn::Ident::new(&name, proc_macro2::Span::call_site());
+                quote! { ::#ident }
+            }
+            _ => quote! { crate },
+        },
     }
 }
