@@ -77,7 +77,7 @@ impl SocketPool {
             #[cfg(not(feature = "rdma"))]
             SocketType::RDMA => Err(crate::Error::new(
                 crate::ErrorKind::InvalidArgument,
-                "RDMA feature is not enabled".into(),
+                "RDMA transport requires the \"rdma\" feature to be enabled".into(),
             )),
         }
     }

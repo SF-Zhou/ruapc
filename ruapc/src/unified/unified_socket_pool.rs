@@ -81,7 +81,7 @@ impl UnifiedSocketPool {
             #[cfg(not(feature = "rdma"))]
             SocketType::RDMA => Err(Error::new(
                 ErrorKind::InvalidArgument,
-                "RDMA feature is not enabled".into(),
+                "RDMA transport requires the \"rdma\" feature to be enabled".into(),
             )),
         }
     }

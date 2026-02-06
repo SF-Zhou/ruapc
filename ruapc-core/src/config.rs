@@ -52,6 +52,7 @@ pub struct SocketPoolConfig {
 
 impl Default for SocketPoolConfig {
     fn default() -> Self {
-        serde_json::from_value(serde_json::Value::Object(serde_json::Map::default())).unwrap()
+        serde_json::from_value(serde_json::Value::Object(serde_json::Map::default()))
+            .expect("default SocketPoolConfig should deserialize successfully")
     }
 }
