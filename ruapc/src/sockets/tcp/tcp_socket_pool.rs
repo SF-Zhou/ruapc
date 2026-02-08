@@ -14,25 +14,23 @@ use tokio_util::sync::DropGuard;
 
 use super::TcpSocket;
 use crate::{
-    Message, RawStream, Socket, SocketType, State, TaskSupervisor,
+    Message, RawStream, Socket, SocketPoolConfig, SocketPoolTrait, SocketType, State,
+    TaskSupervisor,
     error::{Error, ErrorKind, Result},
 };
 
 pub struct TcpSocketPool {
-    socket_map: RwLock<HashMap<SocketAddr, TcpSocket, RandomState>>,
+    socket_map: Arc<RwLock<HashMap<SocketAddr, TcpSocket, RandomState>>>,
     task_supervisor: TaskSupervisor,
 }
 
-impl TcpSocketPool {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            socket_map: RwLock::default(),
-            task_supervisor: TaskSupervisor::create(),
-        })
+impl SocketPoolTrait for TcpSocketPool {
+    fn create(_: &SocketPoolConfig) -> Result<Self> {
+        Ok(Self::new())
     }
 
-    pub fn handle_new_stream(
-        self: &Arc<Self>,
+    async fn handle_new_stream(
+        &self,
         state: &Arc<State>,
         stream: RawStream,
         addr: SocketAddr,
@@ -48,24 +46,24 @@ impl TcpSocketPool {
         Ok(())
     }
 
-    pub fn stop(&self) {
+    fn stop(&self) {
         self.task_supervisor.stop();
     }
 
-    pub fn drop_guard(&self) -> DropGuard {
+    fn drop_guard(&self) -> DropGuard {
         self.task_supervisor.drop_guard()
     }
 
-    pub async fn join(&self) {
+    async fn join(&self) {
         self.task_supervisor.all_stopped().await;
     }
 
-    pub async fn acquire(
-        self: &Arc<Self>,
+    async fn acquire(
+        &self,
         addr: &SocketAddr,
         socket_type: SocketType,
         state: &Arc<State>,
-    ) -> Result<TcpSocket> {
+    ) -> Result<Socket> {
         if socket_type != SocketType::TCP {
             return Err(Error::new(
                 ErrorKind::InvalidArgument,
@@ -77,13 +75,13 @@ impl TcpSocketPool {
         if let Ok(socket_map) = self.socket_map.try_read()
             && let Some(socket) = socket_map.get(addr)
         {
-            return Ok(socket.clone());
+            return Ok(socket.into());
         }
 
         // If not, create a new socket and insert it into the socket map.
         let mut socket_map = self.socket_map.write().await;
         if let Some(socket) = socket_map.get(addr) {
-            return Ok(socket.clone());
+            return Ok(socket.into());
         }
 
         let stream = TcpStream::connect(addr)
@@ -92,11 +90,20 @@ impl TcpSocketPool {
 
         let send_socket = self.add_socket(*addr, stream, state);
         socket_map.insert(*addr, send_socket.clone());
-        Ok(send_socket)
+        Ok(send_socket.into())
+    }
+}
+
+impl TcpSocketPool {
+    pub fn new() -> Self {
+        Self {
+            socket_map: Arc::default(),
+            task_supervisor: TaskSupervisor::create(),
+        }
     }
 
     pub fn add_socket(
-        self: &Arc<Self>,
+        &self,
         addr: SocketAddr,
         stream: tokio::net::TcpStream,
         state: &Arc<State>,
@@ -116,7 +123,7 @@ impl TcpSocketPool {
         let tcp_socket = TcpSocket::new(sender);
         let task_supervisor = self.task_supervisor.start_async_task();
         tokio::spawn({
-            let this = self.clone();
+            let socket_map = self.socket_map.clone();
             let tcp_socket = tcp_socket.clone();
             let state = state.clone();
             async move {
@@ -125,7 +132,7 @@ impl TcpSocketPool {
                     r = Self::start_recv_loop(recv_stream, tcp_socket, &state) => {
                         if let Err(e) = r {
                             tracing::error!("recv loop for {addr} failed: {e}");
-                            let mut socket_map = this.socket_map.write().await;
+                            let mut socket_map = socket_map.write().await;
                             socket_map.remove(&addr);
                         }
                     }

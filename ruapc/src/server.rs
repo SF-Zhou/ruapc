@@ -2,7 +2,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use tokio_util::sync::DropGuard;
 
-use crate::{Listener, Result, Router, SocketPoolConfig, State};
+use crate::{Listener, Result, Router, SocketPoolConfig, SocketPoolTrait, State};
 
 /// RPC server that listens for and handles incoming requests.
 ///

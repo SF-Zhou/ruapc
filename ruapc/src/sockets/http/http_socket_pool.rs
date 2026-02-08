@@ -13,8 +13,8 @@ use tokio_util::sync::DropGuard;
 
 use super::http_socket::{Connections, HttpSocket};
 use crate::{
-    Error, ErrorKind, Message, MsgFlags, MsgMeta, RawStream, Result, Socket, SocketType, State,
-    TaskSupervisor,
+    Error, ErrorKind, Message, MsgFlags, MsgMeta, RawStream, Result, Socket, SocketPoolConfig,
+    SocketPoolTrait, SocketType, State, TaskSupervisor,
 };
 
 pub struct HttpSocketPool {
@@ -23,19 +23,77 @@ pub struct HttpSocketPool {
     task_supervisor: TaskSupervisor,
 }
 
-impl HttpSocketPool {
-    pub fn new() -> Arc<Self> {
+impl SocketPoolTrait for HttpSocketPool {
+    fn create(_config: &SocketPoolConfig) -> Result<Self> {
         let mut http = Builder::new();
         http.keep_alive(true);
-        Arc::new(Self {
+        Ok(Self {
             socket_map: RwLock::default(),
             http,
             task_supervisor: TaskSupervisor::create(),
         })
     }
 
-    pub fn handle_new_stream(
-        self: &Arc<Self>,
+    async fn handle_new_stream(
+        &self,
+        state: &Arc<State>,
+        stream: RawStream,
+        addr: SocketAddr,
+    ) -> Result<()> {
+        self.handle_new_stream(state, stream, addr)
+    }
+
+    fn stop(&self) {
+        self.task_supervisor.stop();
+    }
+
+    fn drop_guard(&self) -> DropGuard {
+        self.task_supervisor.drop_guard()
+    }
+
+    async fn join(&self) {
+        self.task_supervisor.all_stopped().await;
+    }
+
+    async fn acquire(
+        &self,
+        addr: &SocketAddr,
+        socket_type: SocketType,
+        _state: &Arc<State>,
+    ) -> Result<Socket> {
+        if socket_type != SocketType::HTTP {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                format!("invalid socket type {socket_type} for HttpSocketPool"),
+            ));
+        }
+
+        // Check if the socket is already in the socket map.
+        if let Ok(socket_map) = self.socket_map.try_read()
+            && let Some(socket) = socket_map.get(addr)
+        {
+            return Ok(socket.into());
+        }
+
+        // If not, create a new socket and insert it into the socket map.
+        let mut socket_map = self.socket_map.write().await;
+        if let Some(socket) = socket_map.get(addr) {
+            return Ok(socket.into());
+        }
+
+        let connections = Arc::new(Connections {
+            addr: *addr,
+            vec: Mutex::default(),
+        });
+        let socket = HttpSocket::ForRequest(connections);
+        socket_map.insert(*addr, socket.clone());
+        Ok(socket.into())
+    }
+}
+
+impl HttpSocketPool {
+    fn handle_new_stream(
+        &self,
         state: &Arc<State>,
         stream: RawStream,
         addr: SocketAddr,
@@ -47,14 +105,13 @@ impl HttpSocketPool {
             ));
         };
 
-        let this = self.clone();
         let state = state.clone();
         let connection = self
             .http
             .serve_connection(
                 TokioIo::new(tcp_stream),
                 hyper::service::service_fn(move |req: Request<Incoming>| {
-                    this.clone().handle_request(req, state.clone(), addr)
+                    Self::handle_request(req, state.clone(), addr)
                 }),
             )
             .with_upgrades();
@@ -75,7 +132,6 @@ impl HttpSocketPool {
     }
 
     pub async fn handle_request(
-        self: Arc<Self>,
         mut req: Request<Incoming>,
         state: Arc<State>,
         addr: SocketAddr,
@@ -163,53 +219,6 @@ impl HttpSocketPool {
             .header("Content-Type", "application/json")
             .body(Full::new(msg.payload.into()))
             .unwrap())
-    }
-
-    pub fn stop(&self) {
-        self.task_supervisor.stop();
-    }
-
-    pub fn drop_guard(&self) -> DropGuard {
-        self.task_supervisor.drop_guard()
-    }
-
-    pub async fn join(&self) {
-        self.task_supervisor.all_stopped().await;
-    }
-
-    pub async fn acquire(
-        self: &Arc<Self>,
-        addr: &SocketAddr,
-        socket_type: SocketType,
-        _state: &Arc<State>,
-    ) -> Result<HttpSocket> {
-        if socket_type != SocketType::HTTP {
-            return Err(Error::new(
-                ErrorKind::InvalidArgument,
-                format!("invalid socket type {socket_type} for HttpSocketPool"),
-            ));
-        }
-
-        // Check if the socket is already in the socket map.
-        if let Ok(socket_map) = self.socket_map.try_read()
-            && let Some(socket) = socket_map.get(addr)
-        {
-            return Ok(socket.clone());
-        }
-
-        // If not, create a new socket and insert it into the socket map.
-        let mut socket_map = self.socket_map.write().await;
-        if let Some(socket) = socket_map.get(addr) {
-            return Ok(socket.clone());
-        }
-
-        let connections = Arc::new(Connections {
-            addr: *addr,
-            vec: Mutex::default(),
-        });
-        let socket = HttpSocket::ForRequest(connections);
-        socket_map.insert(*addr, socket.clone());
-        Ok(socket)
     }
 }
 

@@ -84,16 +84,16 @@ impl Default for SocketPoolConfig {
 #[derive(Debug)]
 pub enum SocketPool {
     /// TCP socket pool.
-    TCP(Arc<TcpSocketPool>),
+    TCP(TcpSocketPool),
     /// WebSocket pool.
-    WS(Arc<WebSocketPool>),
+    WS(WebSocketPool),
     /// HTTP socket pool.
-    HTTP(Arc<HttpSocketPool>),
+    HTTP(HttpSocketPool),
     /// Unified socket pool supporting multiple protocols.
     UNIFIED(UnifiedSocketPool),
     /// RDMA socket pool (requires "rdma" feature).
     #[cfg(feature = "rdma")]
-    RDMA(Arc<RdmaSocketPool>),
+    RDMA(RdmaSocketPool),
 }
 
 /// Raw network stream types.
@@ -106,41 +106,93 @@ pub enum RawStream {
     WS(Box<WebSocketStream<TokioIo<Upgraded>>>),
 }
 
-impl SocketPool {
-    /// Creates a new socket pool with the given configuration.
+/// Trait defining the interface for socket pool management.
+///
+/// `SocketPoolTrait` provides a unified interface for managing connection pools
+/// across different transport protocols. Implementations handle:
+/// - Creating pools with specific configurations
+/// - Acquiring new or reusing existing connections
+/// - Handling incoming connection streams (server-side)
+/// - Lifecycle management (stop, join, cleanup)
+/// - Optional RDMA support when the feature is enabled
+///
+/// # Implementors
+///
+/// - [`SocketPool`] - The main enum implementing this trait for all pool types
+/// - Individual pool types (TcpSocketPool, WebSocketPool, HttpSocketPool, etc.) also implement this
+pub trait SocketPoolTrait: Sized {
+    fn create(config: &SocketPoolConfig) -> Result<Self>;
+
+    async fn acquire(
+        &self,
+        addr: &SocketAddr,
+        socket_type: SocketType,
+        state: &Arc<State>,
+    ) -> Result<Socket>;
+
+    async fn handle_new_stream(
+        &self,
+        state: &Arc<State>,
+        stream: RawStream,
+        addr: SocketAddr,
+    ) -> Result<()>;
+
+    fn stop(&self);
+
+    fn drop_guard(&self) -> DropGuard;
+
+    async fn join(&self);
+
+    #[cfg(feature = "rdma")]
+    /// Returns RDMA connection information.
     ///
-    /// # Arguments
-    ///
-    /// * `config` - Socket pool configuration specifying the protocol type
+    /// This method is only available when the RDMA feature is enabled.
     ///
     /// # Errors
     ///
-    /// Returns an error if the socket pool for the specified type cannot be created.
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// # use ruapc::{SocketPool, SocketPoolConfig, SocketType};
-    /// let config = SocketPoolConfig { socket_type: SocketType::TCP };
-    /// let pool = SocketPool::create(&config).unwrap();
-    /// ```
-    pub fn create(config: &SocketPoolConfig) -> Result<Self> {
-        match config.socket_type {
-            SocketType::TCP => Ok(SocketPool::TCP(TcpSocketPool::new())),
-            SocketType::WS => Ok(SocketPool::WS(WebSocketPool::new())),
-            SocketType::HTTP => Ok(SocketPool::HTTP(HttpSocketPool::new())),
-            SocketType::UNIFIED => Ok(SocketPool::UNIFIED(UnifiedSocketPool::create()?)),
-            #[cfg(feature = "rdma")]
-            SocketType::RDMA => Ok(SocketPool::RDMA(RdmaSocketPool::create()?)),
-        }
+    /// Returns an error if the socket pool doesn't support RDMA.
+    fn rdma_info(&self) -> Result<crate::rdma::RdmaInfo> {
+        Err(Error::new(
+            ErrorKind::InvalidArgument,
+            "RDMA is not supported: invalid socket type".into(),
+        ))
     }
 
+    #[cfg(feature = "rdma")]
+    /// Establishes an RDMA connection to the specified endpoint.
+    ///
+    /// This method is only available when the RDMA feature is enabled.
+    ///
+    /// # Arguments
+    ///
+    /// * `endpoint` - The remote RDMA endpoint to connect to
+    /// * `state` - Shared state for connection management
+    ///
+    /// # Returns
+    ///
+    /// Returns the local endpoint information for the established connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The socket pool doesn't support RDMA
+    /// - The RDMA connection fails
+    #[allow(unused_variables)]
+    fn rdma_connect(&self, endpoint: &Endpoint, state: &Arc<State>) -> Result<Endpoint> {
+        Err(Error::new(
+            ErrorKind::InvalidArgument,
+            "RDMA is not supported: invalid socket type".into(),
+        ))
+    }
+}
+
+impl SocketPool {
     /// Returns the socket type of this pool.
     ///
     /// # Examples
     ///
     /// ```rust,no_run
-    /// # use ruapc::{SocketPool, SocketPoolConfig, SocketType};
+    /// # use ruapc::{SocketPool, SocketPoolConfig, SocketType, SocketPoolTrait};
     /// # let pool = SocketPool::create(&SocketPoolConfig::default()).unwrap();
     /// let socket_type = pool.socket_type();
     /// assert_eq!(socket_type, SocketType::TCP);
@@ -154,6 +206,36 @@ impl SocketPool {
             SocketPool::UNIFIED(_) => SocketType::UNIFIED,
             #[cfg(feature = "rdma")]
             SocketPool::RDMA(_) => SocketType::RDMA,
+        }
+    }
+}
+
+impl SocketPoolTrait for SocketPool {
+    /// Creates a new socket pool with the given configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Socket pool configuration specifying the protocol type
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the socket pool for the specified type cannot be created.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use ruapc::{SocketPool, SocketPoolConfig, SocketType, SocketPoolTrait};
+    /// let config = SocketPoolConfig { socket_type: SocketType::TCP };
+    /// let pool = SocketPool::create(&config).unwrap();
+    /// ```
+    fn create(config: &SocketPoolConfig) -> Result<Self> {
+        match config.socket_type {
+            SocketType::TCP => Ok(SocketPool::TCP(TcpSocketPool::create(config)?)),
+            SocketType::WS => Ok(SocketPool::WS(WebSocketPool::create(config)?)),
+            SocketType::HTTP => Ok(SocketPool::HTTP(HttpSocketPool::create(config)?)),
+            SocketType::UNIFIED => Ok(SocketPool::UNIFIED(UnifiedSocketPool::create(config)?)),
+            #[cfg(feature = "rdma")]
+            SocketType::RDMA => Ok(SocketPool::RDMA(RdmaSocketPool::create(config)?)),
         }
     }
 
@@ -173,33 +255,29 @@ impl SocketPool {
     /// Returns an error if:
     /// - The connection cannot be established
     /// - The requested socket type is not supported by this pool
-    pub async fn acquire(
+    async fn acquire(
         &self,
         addr: &SocketAddr,
         socket_type: SocketType,
         state: &Arc<State>,
     ) -> Result<Socket> {
         match self {
-            SocketPool::TCP(tcp_socket_pool) => tcp_socket_pool
-                .acquire(addr, socket_type, state)
-                .await
-                .map(Socket::TCP),
-            SocketPool::WS(web_socket_pool) => web_socket_pool
-                .acquire(addr, socket_type, state)
-                .await
-                .map(Socket::WS),
-            SocketPool::HTTP(http_socket_pool) => http_socket_pool
-                .acquire(addr, socket_type, state)
-                .await
-                .map(Socket::HTTP),
+            SocketPool::TCP(tcp_socket_pool) => {
+                tcp_socket_pool.acquire(addr, socket_type, state).await
+            }
+            SocketPool::WS(web_socket_pool) => {
+                web_socket_pool.acquire(addr, socket_type, state).await
+            }
+            SocketPool::HTTP(http_socket_pool) => {
+                http_socket_pool.acquire(addr, socket_type, state).await
+            }
             SocketPool::UNIFIED(unified_socket_pool) => {
                 unified_socket_pool.acquire(addr, socket_type, state).await
             }
             #[cfg(feature = "rdma")]
-            SocketPool::RDMA(rdma_socket_pool) => rdma_socket_pool
-                .acquire(addr, socket_type, state)
-                .await
-                .map(Socket::RDMA),
+            SocketPool::RDMA(rdma_socket_pool) => {
+                rdma_socket_pool.acquire(addr, socket_type, state).await
+            }
         }
     }
 
@@ -219,7 +297,7 @@ impl SocketPool {
     /// Returns an error if:
     /// - Stream handling fails
     /// - The protocol doesn't support incoming connections (e.g., RDMA)
-    pub async fn handle_new_stream(
+    async fn handle_new_stream(
         &self,
         state: &Arc<State>,
         stream: RawStream,
@@ -227,13 +305,15 @@ impl SocketPool {
     ) -> Result<()> {
         match self {
             SocketPool::TCP(tcp_socket_pool) => {
-                tcp_socket_pool.handle_new_stream(state, stream, addr)
+                tcp_socket_pool.handle_new_stream(state, stream, addr).await
             }
             SocketPool::WS(web_socket_pool) => {
                 web_socket_pool.handle_new_stream(state, stream, addr).await
             }
             SocketPool::HTTP(http_socket_pool) => {
-                http_socket_pool.handle_new_stream(state, stream, addr)
+                http_socket_pool
+                    .handle_new_stream(state, stream, addr)
+                    .await
             }
             SocketPool::UNIFIED(unified_socket_pool) => {
                 unified_socket_pool
@@ -256,10 +336,10 @@ impl SocketPool {
     /// # Errors
     ///
     /// Returns an error if the socket pool doesn't support RDMA.
-    pub fn rdma_info(&self) -> Result<crate::rdma::RdmaInfo> {
+    fn rdma_info(&self) -> Result<crate::rdma::RdmaInfo> {
         match self {
-            SocketPool::RDMA(rdma_socket_pool) => Ok(rdma_socket_pool.rdma_info()),
-            SocketPool::UNIFIED(unified_socket_pool) => Ok(unified_socket_pool.rdma_info()),
+            SocketPool::RDMA(rdma_socket_pool) => rdma_socket_pool.rdma_info(),
+            SocketPool::UNIFIED(unified_socket_pool) => unified_socket_pool.rdma_info(),
             _ => Err(Error::new(
                 ErrorKind::InvalidArgument,
                 "RDMA is not supported: invalid socket type".into(),
@@ -286,7 +366,7 @@ impl SocketPool {
     /// Returns an error if:
     /// - The socket pool doesn't support RDMA
     /// - The RDMA connection fails
-    pub fn rdma_connect(&self, endpoint: &Endpoint, state: &Arc<State>) -> Result<Endpoint> {
+    fn rdma_connect(&self, endpoint: &Endpoint, state: &Arc<State>) -> Result<Endpoint> {
         use crate::{Error, ErrorKind};
 
         match self {
@@ -304,7 +384,7 @@ impl SocketPool {
     /// Stops the socket pool and initiates connection cleanup.
     ///
     /// This signals all connections to gracefully close.
-    pub fn stop(&self) {
+    fn stop(&self) {
         match self {
             SocketPool::TCP(tcp_socket_pool) => tcp_socket_pool.stop(),
             SocketPool::WS(web_socket_pool) => web_socket_pool.stop(),
@@ -323,8 +403,7 @@ impl SocketPool {
     /// # Returns
     ///
     /// Returns a `DropGuard` that calls `stop()` on drop.
-    #[must_use]
-    pub fn drop_guard(&self) -> DropGuard {
+    fn drop_guard(&self) -> DropGuard {
         match self {
             SocketPool::TCP(tcp_socket_pool) => tcp_socket_pool.drop_guard(),
             SocketPool::WS(web_socket_pool) => web_socket_pool.drop_guard(),
@@ -339,7 +418,7 @@ impl SocketPool {
     ///
     /// This method blocks until the socket pool has fully shut down
     /// and all connections are closed.
-    pub async fn join(&self) {
+    async fn join(&self) {
         match self {
             SocketPool::TCP(tcp_socket_pool) => tcp_socket_pool.join().await,
             SocketPool::WS(web_socket_pool) => web_socket_pool.join().await,
