@@ -6,7 +6,7 @@ use tokio::sync::mpsc::Sender;
 
 use super::RdmaState;
 use crate::{
-    Error, State,
+    Error, SocketTrait, State,
     error::{ErrorKind, Result},
     msg::{MsgMeta, SendMsg},
 };
@@ -35,11 +35,18 @@ impl RdmaSocket {
         }
     }
 
-    pub async fn send<P: Serialize>(
+    pub fn set_error(&self) {
+        self.state.set_error();
+        self.queue_pair.set_error();
+    }
+}
+
+impl SocketTrait for RdmaSocket {
+    async fn send<P: Serialize>(
         &self,
         meta: &mut MsgMeta,
         payload: &P,
-        _: &State,
+        _: &Arc<State>,
     ) -> Result<()> {
         let mut buf = self.rdmabuf_pool.allocate()?;
         meta.serialize_to(payload, &mut buf)?;
@@ -61,11 +68,6 @@ impl RdmaSocket {
         } else {
             Err(ErrorKind::RdmaSendFailed.into())
         }
-    }
-
-    pub fn set_error(&self) {
-        self.state.set_error();
-        self.queue_pair.set_error();
     }
 }
 

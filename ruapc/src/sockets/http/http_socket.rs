@@ -7,7 +7,7 @@ use hyper_util::rt::TokioIo;
 use serde::Serialize;
 use tokio::{net::TcpStream, sync::Mutex};
 
-use crate::{Error, ErrorKind, Message, MsgMeta, Result, State, msg::SendMsg};
+use crate::{Error, ErrorKind, Message, MsgMeta, Result, SocketTrait, State, msg::SendMsg};
 
 #[derive(Clone, Debug)]
 pub enum HttpSocket {
@@ -16,7 +16,61 @@ pub enum HttpSocket {
 }
 
 impl HttpSocket {
-    pub fn send<P: Serialize>(
+    async fn send_request(
+        method: &str,
+        bytes: Bytes,
+        connections: &Arc<Connections>,
+    ) -> Result<Bytes> {
+        // 1. acquire connection.
+        let mut sender = if let Some(sender) = connections.vec.lock().await.pop() {
+            sender
+        } else {
+            // estabilish new connection.
+            let stream = TcpStream::connect(connections.addr)
+                .await
+                .map_err(|e| Error::new(ErrorKind::TcpConnectFailed, e.to_string()))?;
+
+            let (sender, conn) = hyper::client::conn::http1::handshake::<TokioIo<_>, Full<Bytes>>(
+                TokioIo::new(stream),
+            )
+            .await
+            .map_err(|e| Error::new(ErrorKind::HttpWaitRspFailed, e.to_string()))?;
+            tokio::spawn(conn);
+
+            sender
+        };
+
+        // 2. build request.
+        let req = hyper::Request::builder()
+            .uri(format!("http://{}/{}", connections.addr, method))
+            .header("Content-Type", "application/json")
+            .method(hyper::Method::POST)
+            .body(Full::new(bytes))
+            .map_err(|e| Error::new(ErrorKind::HttpBuildReqFailed, e.to_string()))?;
+
+        // 3. send request.
+        let rsp = sender
+            .send_request(req)
+            .await
+            .map_err(|e| Error::new(ErrorKind::HttpSendReqFailed, e.to_string()))?;
+
+        // 4. collect body bytes.
+        let body_bytes = rsp
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| Error::new(ErrorKind::HttpWaitRspFailed, e.to_string()))?
+            .to_bytes();
+
+        // 5. restore connection.
+        connections.vec.lock().await.push(sender);
+
+        Ok(body_bytes)
+    }
+}
+
+impl SocketTrait for HttpSocket {
+    async fn send<P: Serialize>(
         &self,
         meta: &mut MsgMeta,
         payload: &P,
@@ -70,58 +124,6 @@ impl HttpSocket {
                 }
             }
         }
-    }
-
-    async fn send_request(
-        method: &str,
-        bytes: Bytes,
-        connections: &Arc<Connections>,
-    ) -> Result<Bytes> {
-        // 1. acquire connection.
-        let mut sender = if let Some(sender) = connections.vec.lock().await.pop() {
-            sender
-        } else {
-            // estabilish new connection.
-            let stream = TcpStream::connect(connections.addr)
-                .await
-                .map_err(|e| Error::new(ErrorKind::TcpConnectFailed, e.to_string()))?;
-
-            let (sender, conn) = hyper::client::conn::http1::handshake::<TokioIo<_>, Full<Bytes>>(
-                TokioIo::new(stream),
-            )
-            .await
-            .map_err(|e| Error::new(ErrorKind::HttpWaitRspFailed, e.to_string()))?;
-            tokio::spawn(conn);
-
-            sender
-        };
-
-        // 2. build request.
-        let req = hyper::Request::builder()
-            .uri(format!("http://{}/{}", connections.addr, method))
-            .header("Content-Type", "application/json")
-            .method(hyper::Method::POST)
-            .body(Full::new(bytes))
-            .map_err(|e| Error::new(ErrorKind::HttpBuildReqFailed, e.to_string()))?;
-
-        // 3. send request.
-        let rsp = sender
-            .send_request(req)
-            .await
-            .map_err(|e| Error::new(ErrorKind::HttpSendReqFailed, e.to_string()))?;
-
-        // 4. collect body bytes.
-        let body_bytes = rsp
-            .into_body()
-            .collect()
-            .await
-            .map_err(|e| Error::new(ErrorKind::HttpWaitRspFailed, e.to_string()))?
-            .to_bytes();
-
-        // 5. restore connection.
-        connections.vec.lock().await.push(sender);
-
-        Ok(body_bytes)
     }
 }
 

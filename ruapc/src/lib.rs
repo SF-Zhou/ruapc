@@ -125,24 +125,8 @@ mod receiver;
 use receiver::Receiver;
 
 /// Socket abstraction layer.
-mod socket;
-pub use socket::Socket;
-
-/// Socket pool management and configuration.
-mod socket_pool;
-pub use socket_pool::{RawStream, SocketPool, SocketPoolConfig, SocketType};
-
-/// HTTP transport implementation.
-mod http;
-/// RDMA (Remote Direct Memory Access) transport implementation.
-#[cfg(feature = "rdma")]
-mod rdma;
-/// TCP transport implementation.
-mod tcp;
-/// Unified transport that supports multiple protocols simultaneously.
-mod unified;
-/// WebSocket transport implementation.
-mod ws;
+mod sockets;
+pub use sockets::*;
 
 /// Shared state management.
 mod state;

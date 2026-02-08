@@ -6,7 +6,10 @@ use tokio::sync::RwLock;
 use tokio_util::sync::DropGuard;
 
 use super::{Endpoint, EventLoop, RdmaInfo, RdmaService, RdmaSocket};
-use crate::{Client, Context, Error, ErrorKind, Result, SocketType, State, TaskSupervisor};
+use crate::{
+    Client, Context, Error, ErrorKind, Result, Socket, SocketPoolConfig, SocketPoolTrait,
+    SocketType, State, TaskSupervisor,
+};
 
 /// A pool managing RDMA sockets and their associated resources.
 ///
@@ -25,7 +28,7 @@ pub struct RdmaSocketPool {
     pub task_supervisor: TaskSupervisor,
 }
 
-impl RdmaSocketPool {
+impl SocketPoolTrait for RdmaSocketPool {
     /// Creates a new RDMA socket pool with default configuration.
     ///
     /// This function:
@@ -37,10 +40,10 @@ impl RdmaSocketPool {
     /// # Returns
     /// * `Ok(Arc<Self>)` - A new thread-safe RDMA socket pool instance
     /// * `Err(Error)` - If RDMA devices cannot be initialized or buffer pool creation fails
-    pub fn create() -> Result<Arc<Self>> {
+    fn create(_: &SocketPoolConfig) -> Result<Self> {
         let devices = Devices::availables()?;
         let rdmabuf_pool = BufferPool::create(4096, 4096, &devices)?;
-        let this = Arc::new(Self {
+        let this = Self {
             acquire_client: Client {
                 timeout: std::time::Duration::from_secs(5),
                 use_msgpack: true,
@@ -50,25 +53,25 @@ impl RdmaSocketPool {
             devices,
             socket_map: RwLock::default(),
             task_supervisor: TaskSupervisor::create(),
-        });
+        };
         Ok(this)
     }
 
     /// Stops all tasks managed by the socket pool.
     /// This initiates the shutdown process for all active RDMA connections.
-    pub fn stop(&self) {
+    fn stop(&self) {
         self.task_supervisor.stop();
     }
 
     /// Returns a guard that will stop all tasks when dropped.
     /// This is useful for implementing RAII-style cleanup of RDMA resources.
-    pub fn drop_guard(&self) -> DropGuard {
+    fn drop_guard(&self) -> DropGuard {
         self.task_supervisor.drop_guard()
     }
 
     /// Waits for all tasks to complete.
     /// This should be called after `stop()` to ensure clean shutdown.
-    pub async fn join(&self) {
+    async fn join(&self) {
         self.task_supervisor.all_stopped().await;
     }
 
@@ -76,10 +79,10 @@ impl RdmaSocketPool {
     ///
     /// # Returns
     /// `RdmaInfo` containing details of all available RDMA devices
-    pub fn rdma_info(&self) -> RdmaInfo {
-        RdmaInfo {
+    fn rdma_info(&self) -> Result<RdmaInfo> {
+        Ok(RdmaInfo {
             devices: self.devices.iter().map(|d| d.info()).cloned().collect(),
-        }
+        })
     }
 
     /// Establishes a new RDMA connection with the specified endpoint.
@@ -96,11 +99,7 @@ impl RdmaSocketPool {
     /// # Returns
     /// * `Ok(Endpoint)` - The local endpoint information if connection succeeds
     /// * `Err(Error)` - If connection setup fails
-    pub fn rdma_connect(
-        self: &Arc<Self>,
-        endpoint: &Endpoint,
-        state: &Arc<State>,
-    ) -> Result<Endpoint> {
+    fn rdma_connect(&self, endpoint: &Endpoint, state: &Arc<State>) -> Result<Endpoint> {
         let cap = verbs::ibv_qp_cap {
             max_send_wr: 64,
             max_recv_wr: 64,
@@ -134,12 +133,12 @@ impl RdmaSocketPool {
     /// # Returns
     /// * `Ok(Arc<RdmaSocket>)` - A thread-safe reference to the RDMA socket
     /// * `Err(Error)` - If socket creation fails or if socket type is invalid
-    pub async fn acquire(
-        self: &Arc<Self>,
+    async fn acquire(
+        &self,
         addr: &SocketAddr,
         socket_type: SocketType,
         state: &Arc<State>,
-    ) -> Result<Arc<RdmaSocket>> {
+    ) -> Result<Socket> {
         if socket_type != SocketType::RDMA {
             return Err(Error::new(
                 ErrorKind::InvalidArgument,
@@ -151,13 +150,13 @@ impl RdmaSocketPool {
         if let Ok(socket_map) = self.socket_map.try_read()
             && let Some(socket) = socket_map.get(addr)
         {
-            return Ok(socket.clone());
+            return Ok(socket.into());
         }
 
         // If not, create a new socket and insert it into the socket map.
         let mut socket_map = self.socket_map.write().await;
         if let Some(socket) = socket_map.get(addr) {
-            return Ok(socket.clone());
+            return Ok(socket.into());
         }
 
         let cap = verbs::ibv_qp_cap {
@@ -181,9 +180,23 @@ impl RdmaSocketPool {
         let socket = Arc::new(socket);
         socket_map.insert(*addr, socket.clone());
         self.start_event_loop(socket.clone(), state.clone(), rx)?;
-        Ok(socket)
+        Ok(socket.into())
     }
 
+    async fn handle_new_stream(
+        &self,
+        _state: &Arc<State>,
+        _stream: crate::RawStream,
+        _addr: SocketAddr,
+    ) -> Result<()> {
+        Err(Error::new(
+            ErrorKind::InvalidArgument,
+            "invalid socket type".into(),
+        ))
+    }
+}
+
+impl RdmaSocketPool {
     /// Starts the event loop for handling RDMA events on a socket.
     ///
     /// This method:
@@ -200,7 +213,7 @@ impl RdmaSocketPool {
     /// * `Ok(())` - If event loop setup succeeds
     /// * `Err(Error)` - If setup fails
     pub fn start_event_loop(
-        self: &Arc<Self>,
+        &self,
         socket: Arc<RdmaSocket>,
         state: Arc<State>,
         pending_receiver: tokio::sync::mpsc::Receiver<u64>,

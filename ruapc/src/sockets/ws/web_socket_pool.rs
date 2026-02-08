@@ -15,25 +15,26 @@ use tokio_util::sync::DropGuard;
 
 use super::WebSocket;
 use crate::{
-    Message, RawStream, Socket, SocketType, State, TaskSupervisor,
+    Message, RawStream, Socket, SocketPoolConfig, SocketPoolTrait, SocketType, State,
+    TaskSupervisor,
     error::{Error, ErrorKind, Result},
 };
 
 pub struct WebSocketPool {
-    socket_map: RwLock<HashMap<SocketAddr, WebSocket, RandomState>>,
+    socket_map: Arc<RwLock<HashMap<SocketAddr, WebSocket, RandomState>>>,
     task_supervisor: TaskSupervisor,
 }
 
-impl WebSocketPool {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            socket_map: RwLock::default(),
+impl SocketPoolTrait for WebSocketPool {
+    fn create(_: &SocketPoolConfig) -> Result<Self> {
+        Ok(Self {
+            socket_map: Arc::default(),
             task_supervisor: TaskSupervisor::create(),
         })
     }
 
-    pub async fn handle_new_stream(
-        self: &Arc<Self>,
+    async fn handle_new_stream(
+        &self,
         state: &Arc<State>,
         stream: RawStream,
         addr: SocketAddr,
@@ -52,24 +53,24 @@ impl WebSocketPool {
         Ok(())
     }
 
-    pub fn stop(&self) {
+    fn stop(&self) {
         self.task_supervisor.stop();
     }
 
-    pub fn drop_guard(&self) -> DropGuard {
+    fn drop_guard(&self) -> DropGuard {
         self.task_supervisor.drop_guard()
     }
 
-    pub async fn join(&self) {
+    async fn join(&self) {
         self.task_supervisor.all_stopped().await;
     }
 
-    pub async fn acquire(
-        self: &Arc<Self>,
+    async fn acquire(
+        &self,
         addr: &SocketAddr,
         socket_type: SocketType,
         state: &Arc<State>,
-    ) -> Result<WebSocket> {
+    ) -> Result<Socket> {
         if socket_type != SocketType::WS {
             return Err(Error::new(
                 ErrorKind::InvalidArgument,
@@ -81,13 +82,13 @@ impl WebSocketPool {
         if let Ok(socket_map) = self.socket_map.try_read()
             && let Some(socket) = socket_map.get(addr)
         {
-            return Ok(socket.clone());
+            return Ok(socket.into());
         }
 
         // If not, create a new socket and insert it into the socket map.
         let mut socket_map = self.socket_map.write().await;
         if let Some(socket) = socket_map.get(addr) {
-            return Ok(socket.clone());
+            return Ok(socket.into());
         }
 
         let (stream, _) = connect_async(format!("ws://{addr}"))
@@ -96,11 +97,13 @@ impl WebSocketPool {
 
         let send_socket = self.add_socket(*addr, stream, state);
         socket_map.insert(*addr, send_socket.clone());
-        Ok(send_socket)
+        Ok(send_socket.into())
     }
+}
 
+impl WebSocketPool {
     pub fn add_socket<S>(
-        self: &Arc<Self>,
+        &self,
         addr: SocketAddr,
         stream: WebSocketStream<S>,
         state: &Arc<State>,
@@ -123,7 +126,7 @@ impl WebSocketPool {
         let web_socket = WebSocket::new(sender);
         let task_supervisor = self.task_supervisor.start_async_task();
         tokio::spawn({
-            let this = self.clone();
+            let socket_map = self.socket_map.clone();
             let web_socket = web_socket.clone();
             let state = state.clone();
             async move {
@@ -132,7 +135,7 @@ impl WebSocketPool {
                     r = Self::start_recv_loop(recv_stream, web_socket, &state) => {
                         if let Err(e) = r {
                             tracing::error!("recv loop for {addr} failed: {e}");
-                            let mut socket_map = this.socket_map.write().await;
+                            let mut socket_map = socket_map.write().await;
                             socket_map.remove(&addr);
                         }
                     }

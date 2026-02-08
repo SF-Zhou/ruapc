@@ -26,7 +26,18 @@ pub enum Socket {
     RDMA(std::sync::Arc<crate::rdma::RdmaSocket>),
 }
 
-impl Socket {
+/// Trait defining the interface for sending messages through different socket types.
+///
+/// `SocketTrait` provides a unified interface for message transmission across
+/// different transport protocols (TCP, WebSocket, HTTP, RDMA). Each socket type
+/// implements this trait to provide its own send mechanism while maintaining
+/// a consistent API.
+///
+/// # Implementors
+///
+/// - [`Socket`] - The main enum implementing this trait for all transport types
+/// - Individual socket types (TcpSocket, WebSocket, HttpSocket, etc.) also implement this
+pub trait SocketTrait {
     /// Sends a message through this socket.
     ///
     /// This method serializes and sends a message with the given metadata and payload.
@@ -45,7 +56,16 @@ impl Socket {
     /// # Errors
     ///
     /// Returns an error if sending fails.
-    pub async fn send<P: Serialize>(
+    async fn send<P: Serialize>(
+        &self,
+        meta: &mut MsgMeta,
+        payload: &P,
+        state: &Arc<State>,
+    ) -> Result<()>;
+}
+
+impl SocketTrait for Socket {
+    async fn send<P: Serialize>(
         &self,
         meta: &mut MsgMeta,
         payload: &P,
@@ -54,7 +74,7 @@ impl Socket {
         match self {
             Socket::TCP(tcp_socket) => tcp_socket.send(meta, payload, state).await,
             Socket::WS(web_socket) => web_socket.send(meta, payload, state).await,
-            Socket::HTTP(http_socket) => http_socket.send(meta, payload, state),
+            Socket::HTTP(http_socket) => http_socket.send(meta, payload, state).await,
             #[cfg(feature = "rdma")]
             Socket::RDMA(rdma_socket) => rdma_socket.send(meta, payload, state).await,
         }
@@ -82,6 +102,18 @@ impl From<WebSocket> for Socket {
 impl From<&WebSocket> for Socket {
     fn from(value: &WebSocket) -> Self {
         Socket::WS(value.clone())
+    }
+}
+
+impl From<HttpSocket> for Socket {
+    fn from(value: HttpSocket) -> Self {
+        Socket::HTTP(value)
+    }
+}
+
+impl From<&HttpSocket> for Socket {
+    fn from(value: &HttpSocket) -> Self {
+        Socket::HTTP(value.clone())
     }
 }
 

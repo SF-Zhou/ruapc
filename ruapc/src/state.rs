@@ -3,7 +3,8 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio_util::sync::DropGuard;
 
 use crate::{
-    Context, Message, RawStream, Result, Router, Socket, SocketPool, SocketPoolConfig, Waiter,
+    Context, Message, RawStream, Result, Router, Socket, SocketPool, SocketPoolConfig,
+    SocketPoolTrait, Waiter,
 };
 
 /// Shared state for the RPC system.

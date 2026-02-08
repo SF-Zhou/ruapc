@@ -1,7 +1,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{Context, Result, rdma, service};
+use crate::{Context, Result, SocketPoolTrait, rdma, service};
 
 /// Information about available RDMA devices in the system.
 ///
