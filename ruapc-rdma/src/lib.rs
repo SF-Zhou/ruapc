@@ -21,7 +21,7 @@
 //! # use ruapc_rdma::Devices;
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! // Discover available RDMA devices
-//! let devices = Devices::availables()?;
+//! let devices = Devices::available()?;
 //! let device = devices.first().unwrap();
 //!
 //! println!("Device: {:?}", device.info());
@@ -36,16 +36,13 @@
 //! - RDMA-capable hardware or software emulation
 
 /// InfiniBand Verbs API bindings and types.
-pub mod verbs;
+pub use ruapc_rdma_sys::*;
 
-mod error;
-pub use error::*;
-
-mod config;
-pub use config::{Config, DeviceConfig, GidType};
-
-mod devices;
-pub use devices::{Device, DeviceInfo, Devices};
+// Constants
+pub const ACCESS_FLAGS: u32 = ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0
+    | ibv_access_flags::IBV_ACCESS_REMOTE_WRITE.0
+    | ibv_access_flags::IBV_ACCESS_REMOTE_READ.0
+    | ibv_access_flags::IBV_ACCESS_RELAXED_ORDERING.0;
 
 mod comp_channel;
 pub use comp_channel::CompChannel;

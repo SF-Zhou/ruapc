@@ -1,13 +1,13 @@
-use crate::{Device, ErrorKind, Result, verbs};
+use crate::{Device, ErrorKind, Result};
 use std::{os::fd::BorrowedFd, sync::Arc};
 
 /// Raw completion channel wrapper with automatic cleanup.
 ///
 /// This type wraps a raw InfiniBand completion channel pointer
 /// and ensures proper cleanup on drop.
-struct RawCompChannel(*mut verbs::ibv_comp_channel);
+struct RawCompChannel(*mut crate::ibv_comp_channel);
 impl std::ops::Deref for RawCompChannel {
-    type Target = verbs::ibv_comp_channel;
+    type Target = crate::ibv_comp_channel;
 
     fn deref(&self) -> &Self::Target {
         unsafe { &*self.0 }
@@ -15,7 +15,7 @@ impl std::ops::Deref for RawCompChannel {
 }
 impl Drop for RawCompChannel {
     fn drop(&mut self) {
-        let _ = unsafe { verbs::ibv_destroy_comp_channel(self.0) };
+        let _ = unsafe { crate::ibv_destroy_comp_channel(self.0) };
     }
 }
 unsafe impl Send for RawCompChannel {}
@@ -49,7 +49,7 @@ impl CompChannel {
     /// - Channel creation fails
     /// - Setting non-blocking mode fails
     pub fn create(device: Arc<Device>) -> Result<Self> {
-        let ptr = unsafe { verbs::ibv_create_comp_channel(device.context_ptr()) };
+        let ptr = unsafe { crate::ibv_create_comp_channel(device.context_ptr()) };
         if ptr.is_null() {
             return Err(ErrorKind::IBCreateCompChannelFail.with_errno());
         }
@@ -77,7 +77,7 @@ impl CompChannel {
     /// # Safety
     ///
     /// The returned pointer is only valid as long as this `CompChannel` exists.
-    pub fn comp_channel_ptr(&self) -> *mut verbs::ibv_comp_channel {
+    pub fn comp_channel_ptr(&self) -> *mut crate::ibv_comp_channel {
         self.channel.0
     }
 
@@ -107,7 +107,7 @@ mod tests {
 
     #[test]
     fn test_create_comp_channel() {
-        let devices = Devices::availables().unwrap();
+        let devices = Devices::available().unwrap();
         assert!(!devices.is_empty());
         for device in &devices {
             let comp_channel = CompChannel::create(device.clone()).unwrap();

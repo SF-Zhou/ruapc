@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use ruapc_rdma::{Buffer, BufferPool, QueuePair, verbs::WRID};
+use ruapc_rdma::{Buffer, BufferPool, QueuePair, WRID};
 use serde::Serialize;
 use tokio::sync::mpsc::Sender;
 

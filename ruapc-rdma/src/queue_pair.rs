@@ -1,4 +1,4 @@
-use crate::{Buffer, CompQueue, Device, ErrorKind, Result, verbs};
+use crate::{Buffer, CompQueue, Device, ErrorKind, Result};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{ffi::c_int, ops::Deref, os::fd::BorrowedFd, sync::Arc};
@@ -14,17 +14,17 @@ pub struct Endpoint {
     /// Local Identifier for InfiniBand routing.
     pub lid: u16,
     /// Global Identifier for RoCE routing.
-    pub gid: verbs::ibv_gid,
+    pub gid: crate::ibv_gid,
 }
 
 /// Raw queue pair wrapper with automatic cleanup.
 ///
 /// This type wraps a raw InfiniBand queue pair pointer
 /// and ensures proper cleanup on drop.
-struct RawQueuePair(*mut verbs::ibv_qp);
+struct RawQueuePair(*mut crate::ibv_qp);
 impl Drop for RawQueuePair {
     fn drop(&mut self) {
-        let _ = unsafe { verbs::ibv_destroy_qp(self.0) };
+        let _ = unsafe { crate::ibv_destroy_qp(self.0) };
     }
 }
 unsafe impl Send for RawQueuePair {}
@@ -40,10 +40,10 @@ unsafe impl Sync for RawQueuePair {}
 /// # Examples
 ///
 /// ```rust,no_run
-/// # use ruapc_rdma::{QueuePair, Device, verbs};
+/// # use ruapc_rdma::{QueuePair, Device, ibv_qp_cap};
 /// # use std::sync::Arc;
 /// # fn example(device: &Arc<Device>) -> Result<(), Box<dyn std::error::Error>> {
-/// let cap = verbs::ibv_qp_cap {
+/// let cap = ibv_qp_cap {
 ///     max_send_wr: 128,
 ///     max_recv_wr: 128,
 ///     max_send_sge: 1,
@@ -62,19 +62,19 @@ pub struct QueuePair {
 }
 
 impl QueuePair {
-    pub fn create(device: &Arc<Device>, cap: verbs::ibv_qp_cap) -> Result<Self> {
+    pub fn create(device: &Arc<Device>, cap: crate::ibv_qp_cap) -> Result<Self> {
         let max_cqe = cap.max_send_wr + cap.max_recv_wr;
         let comp_queue = CompQueue::create(device, max_cqe)?;
-        let mut attr = verbs::ibv_qp_init_attr {
+        let mut attr = crate::ibv_qp_init_attr {
             qp_context: std::ptr::null_mut(),
             send_cq: comp_queue.comp_queue_ptr(),
             recv_cq: comp_queue.comp_queue_ptr(),
             srq: std::ptr::null_mut(),
             cap,
-            qp_type: verbs::ibv_qp_type::IBV_QPT_RC,
+            qp_type: crate::ibv_qp_type::IBV_QPT_RC,
             sq_sig_all: 0,
         };
-        let ptr = unsafe { verbs::ibv_create_qp(device.pd_ptr(), &mut attr) };
+        let ptr = unsafe { crate::ibv_create_qp(device.pd_ptr(), &mut attr) };
         if ptr.is_null() {
             return Err(ErrorKind::IBCreateQueuePairFail.with_errno());
         }
@@ -86,19 +86,19 @@ impl QueuePair {
     }
 
     pub fn init(&self, port_num: u8, pkey_index: u16) -> Result<()> {
-        let mut attr = verbs::ibv_qp_attr {
-            qp_state: verbs::ibv_qp_state::IBV_QPS_INIT,
+        let mut attr = crate::ibv_qp_attr {
+            qp_state: crate::ibv_qp_state::IBV_QPS_INIT,
             pkey_index,
             port_num,
-            qp_access_flags: verbs::ACCESS_FLAGS,
+            qp_access_flags: crate::ACCESS_FLAGS,
             ..Default::default()
         };
 
-        const MASK: verbs::ibv_qp_attr_mask = verbs::ibv_qp_attr_mask(
-            verbs::ibv_qp_attr_mask::IBV_QP_PKEY_INDEX.0
-                | verbs::ibv_qp_attr_mask::IBV_QP_STATE.0
-                | verbs::ibv_qp_attr_mask::IBV_QP_PORT.0
-                | verbs::ibv_qp_attr_mask::IBV_QP_ACCESS_FLAGS.0,
+        const MASK: crate::ibv_qp_attr_mask = crate::ibv_qp_attr_mask(
+            crate::ibv_qp_attr_mask::IBV_QP_PKEY_INDEX.0
+                | crate::ibv_qp_attr_mask::IBV_QP_STATE.0
+                | crate::ibv_qp_attr_mask::IBV_QP_PORT.0
+                | crate::ibv_qp_attr_mask::IBV_QP_ACCESS_FLAGS.0,
         );
 
         self.modify_qp(&mut attr, MASK)
@@ -119,13 +119,13 @@ impl QueuePair {
         Ok(())
     }
 
-    pub fn recv(&self, wr_id: verbs::WRID, buf: &Buffer) -> Result<()> {
-        let mut recv_sge = verbs::ibv_sge {
+    pub fn recv(&self, wr_id: crate::WRID, buf: &Buffer) -> Result<()> {
+        let mut recv_sge = crate::ibv_sge {
             addr: buf.as_ptr() as _,
             length: buf.capacity() as _,
             lkey: buf.lkey(&self.device),
         };
-        let mut recv_wr = verbs::ibv_recv_wr {
+        let mut recv_wr = crate::ibv_recv_wr {
             wr_id,
             sg_list: &mut recv_sge as *mut _,
             num_sge: 1,
@@ -138,18 +138,18 @@ impl QueuePair {
         }
     }
 
-    pub fn send(&self, wr_id: verbs::WRID, buf: &Buffer) -> Result<()> {
-        let mut send_sge = verbs::ibv_sge {
+    pub fn send(&self, wr_id: crate::WRID, buf: &Buffer) -> Result<()> {
+        let mut send_sge = crate::ibv_sge {
             addr: buf.as_ptr() as _,
             length: buf.len() as _,
             lkey: buf.lkey(&self.device),
         };
-        let mut send_wr = verbs::ibv_send_wr {
+        let mut send_wr = crate::ibv_send_wr {
             wr_id,
             sg_list: &mut send_sge as *mut _,
             num_sge: 1,
-            opcode: verbs::ibv_wr_opcode::IBV_WR_SEND,
-            send_flags: verbs::ibv_send_flags::IBV_SEND_SIGNALED.0,
+            opcode: crate::ibv_wr_opcode::IBV_WR_SEND,
+            send_flags: crate::ibv_send_flags::IBV_SEND_SIGNALED.0,
             ..Default::default()
         };
 
@@ -160,15 +160,15 @@ impl QueuePair {
     }
 
     pub fn ready_to_recv(&self, remote: &Endpoint) -> Result<()> {
-        let mut attr = verbs::ibv_qp_attr {
-            qp_state: verbs::ibv_qp_state::IBV_QPS_RTR,
-            path_mtu: verbs::ibv_mtu::IBV_MTU_512,
+        let mut attr = crate::ibv_qp_attr {
+            qp_state: crate::ibv_qp_state::IBV_QPS_RTR,
+            path_mtu: crate::ibv_mtu::IBV_MTU_512,
             dest_qp_num: remote.qp_num,
             rq_psn: 0,
             max_dest_rd_atomic: 1,
             min_rnr_timer: 0x12,
-            ah_attr: verbs::ibv_ah_attr {
-                grh: verbs::ibv_global_route {
+            ah_attr: crate::ibv_ah_attr {
+                grh: crate::ibv_global_route {
                     dgid: remote.gid,
                     flow_label: 0,
                     sgid_index: 1,
@@ -185,22 +185,22 @@ impl QueuePair {
             ..Default::default()
         };
 
-        const MASK: verbs::ibv_qp_attr_mask = verbs::ibv_qp_attr_mask(
-            verbs::ibv_qp_attr_mask::IBV_QP_STATE.0
-                | verbs::ibv_qp_attr_mask::IBV_QP_AV.0
-                | verbs::ibv_qp_attr_mask::IBV_QP_PATH_MTU.0
-                | verbs::ibv_qp_attr_mask::IBV_QP_DEST_QPN.0
-                | verbs::ibv_qp_attr_mask::IBV_QP_RQ_PSN.0
-                | verbs::ibv_qp_attr_mask::IBV_QP_MAX_DEST_RD_ATOMIC.0
-                | verbs::ibv_qp_attr_mask::IBV_QP_MIN_RNR_TIMER.0,
+        const MASK: crate::ibv_qp_attr_mask = crate::ibv_qp_attr_mask(
+            crate::ibv_qp_attr_mask::IBV_QP_STATE.0
+                | crate::ibv_qp_attr_mask::IBV_QP_AV.0
+                | crate::ibv_qp_attr_mask::IBV_QP_PATH_MTU.0
+                | crate::ibv_qp_attr_mask::IBV_QP_DEST_QPN.0
+                | crate::ibv_qp_attr_mask::IBV_QP_RQ_PSN.0
+                | crate::ibv_qp_attr_mask::IBV_QP_MAX_DEST_RD_ATOMIC.0
+                | crate::ibv_qp_attr_mask::IBV_QP_MIN_RNR_TIMER.0,
         );
 
         self.modify_qp(&mut attr, MASK)
     }
 
     pub fn ready_to_send(&self) -> Result<()> {
-        let mut attr = verbs::ibv_qp_attr {
-            qp_state: verbs::ibv_qp_state::IBV_QPS_RTS,
+        let mut attr = crate::ibv_qp_attr {
+            qp_state: crate::ibv_qp_state::IBV_QPS_RTS,
             timeout: 0x12,
             retry_cnt: 6,
             rnr_retry: 6,
@@ -209,38 +209,38 @@ impl QueuePair {
             ..Default::default()
         };
 
-        const MASK: verbs::ibv_qp_attr_mask = verbs::ibv_qp_attr_mask(
-            verbs::ibv_qp_attr_mask::IBV_QP_STATE.0
-                | verbs::ibv_qp_attr_mask::IBV_QP_TIMEOUT.0
-                | verbs::ibv_qp_attr_mask::IBV_QP_RETRY_CNT.0
-                | verbs::ibv_qp_attr_mask::IBV_QP_RNR_RETRY.0
-                | verbs::ibv_qp_attr_mask::IBV_QP_SQ_PSN.0
-                | verbs::ibv_qp_attr_mask::IBV_QP_MAX_QP_RD_ATOMIC.0,
+        const MASK: crate::ibv_qp_attr_mask = crate::ibv_qp_attr_mask(
+            crate::ibv_qp_attr_mask::IBV_QP_STATE.0
+                | crate::ibv_qp_attr_mask::IBV_QP_TIMEOUT.0
+                | crate::ibv_qp_attr_mask::IBV_QP_RETRY_CNT.0
+                | crate::ibv_qp_attr_mask::IBV_QP_RNR_RETRY.0
+                | crate::ibv_qp_attr_mask::IBV_QP_SQ_PSN.0
+                | crate::ibv_qp_attr_mask::IBV_QP_MAX_QP_RD_ATOMIC.0,
         );
 
         self.modify_qp(&mut attr, MASK)
     }
 
     pub fn set_error(&self) {
-        let mut attr = verbs::ibv_qp_attr {
-            qp_state: verbs::ibv_qp_state::IBV_QPS_ERR,
+        let mut attr = crate::ibv_qp_attr {
+            qp_state: crate::ibv_qp_state::IBV_QPS_ERR,
             ..Default::default()
         };
 
-        const MASK: verbs::ibv_qp_attr_mask = verbs::ibv_qp_attr_mask::IBV_QP_STATE;
+        const MASK: crate::ibv_qp_attr_mask = crate::ibv_qp_attr_mask::IBV_QP_STATE;
 
         // assuming this operation succeeds.
         self.modify_qp(&mut attr, MASK).unwrap()
     }
 
-    pub fn post_send(&self, wr: &mut verbs::ibv_send_wr) -> c_int {
+    pub fn post_send(&self, wr: &mut crate::ibv_send_wr) -> c_int {
         let mut bad_wr = std::ptr::null_mut();
-        unsafe { verbs::ibv_post_send(self.queue_pair.0, wr, &mut bad_wr) }
+        unsafe { crate::ibv_post_send(self.queue_pair.0, wr, &mut bad_wr) }
     }
 
-    pub fn post_recv(&self, wr: &mut verbs::ibv_recv_wr) -> c_int {
+    pub fn post_recv(&self, wr: &mut crate::ibv_recv_wr) -> c_int {
         let mut bad_wr = std::ptr::null_mut();
-        unsafe { verbs::ibv_post_recv(self.queue_pair.0, wr, &mut bad_wr) }
+        unsafe { crate::ibv_post_recv(self.queue_pair.0, wr, &mut bad_wr) }
     }
 
     pub fn notify_fd<'a>(&'a self) -> BorrowedFd<'a> {
@@ -251,7 +251,7 @@ impl QueuePair {
         self.comp_queue.req_notify()
     }
 
-    pub fn poll_cq<'a>(&self, wcs: &'a mut [verbs::ibv_wc]) -> Result<&'a mut [verbs::ibv_wc]> {
+    pub fn poll_cq<'a>(&self, wcs: &'a mut [crate::ibv_wc]) -> Result<&'a mut [crate::ibv_wc]> {
         self.comp_queue.poll_cq(wcs)
     }
 
@@ -265,10 +265,10 @@ impl QueuePair {
 
     fn modify_qp(
         &self,
-        attr: &mut verbs::ibv_qp_attr,
-        mask: verbs::ibv_qp_attr_mask,
+        attr: &mut crate::ibv_qp_attr,
+        mask: crate::ibv_qp_attr_mask,
     ) -> Result<()> {
-        let ret = unsafe { verbs::ibv_modify_qp(self.queue_pair.0, attr, mask.0 as _) };
+        let ret = unsafe { crate::ibv_modify_qp(self.queue_pair.0, attr, mask.0 as _) };
         if ret == 0_i32 {
             Ok(())
         } else {
@@ -278,7 +278,7 @@ impl QueuePair {
 }
 
 impl Deref for QueuePair {
-    type Target = verbs::ibv_qp;
+    type Target = crate::ibv_qp;
 
     fn deref(&self) -> &Self::Target {
         unsafe { &*self.queue_pair.0 }
@@ -299,15 +299,15 @@ impl std::fmt::Debug for QueuePair {
 
 #[cfg(test)]
 mod tests {
-    use crate::{BufferPool, verbs::WRID};
+    use crate::{BufferPool, WRID};
 
     use super::*;
     use crate::Devices;
 
     #[test]
     fn test_queue_pair_create() {
-        let devices = Devices::availables().unwrap();
-        let cap = verbs::ibv_qp_cap {
+        let devices = Devices::available().unwrap();
+        let cap = crate::ibv_qp_cap {
             max_send_wr: 64,
             max_recv_wr: 64,
             max_send_sge: 1,
@@ -324,10 +324,10 @@ mod tests {
     #[test]
     fn test_queue_pair_send_recv() {
         // 1. list all available devices.
-        let devices = Devices::availables().unwrap();
+        let devices = Devices::available().unwrap();
 
         // 2. create two queue pairs.
-        let cap = verbs::ibv_qp_cap {
+        let cap = crate::ibv_qp_cap {
             max_send_wr: 64,
             max_recv_wr: 64,
             max_send_sge: 1,
@@ -349,10 +349,10 @@ mod tests {
         let mut recv_buf = buffer_pool.allocate().unwrap();
         recv_buf.extend_from_slice(&vec![0; LEN]).unwrap();
         let recv_slice: &[u8] = unsafe { std::mem::transmute(&*recv_buf) };
-        queue_pair_b.recv(verbs::WRID::recv(1), &recv_buf).unwrap();
+        queue_pair_b.recv(crate::WRID::recv(1), &recv_buf).unwrap();
 
         // 5. try to poll cq.
-        let mut wcs_b = vec![verbs::ibv_wc::default(); 128];
+        let mut wcs_b = vec![crate::ibv_wc::default(); 128];
         assert!(queue_pair_b.poll_cq(&mut wcs_b).unwrap().is_empty());
 
         // 6. post send wr.
@@ -362,23 +362,23 @@ mod tests {
         let send_slice: &[u8] = unsafe { std::mem::transmute(&*send_buf) };
         let send_len = send_buf.len();
         queue_pair_a
-            .send(verbs::WRID::send_data(2), &send_buf)
+            .send(crate::WRID::send_data(2), &send_buf)
             .unwrap();
 
         // 7. poll cq.
         std::thread::sleep(std::time::Duration::from_millis(100));
-        let mut wcs_a = vec![verbs::ibv_wc::default(); 128];
+        let mut wcs_a = vec![crate::ibv_wc::default(); 128];
         let comp_a = queue_pair_a.poll_cq(&mut wcs_a).unwrap();
         assert_eq!(comp_a.len(), 1);
         assert_eq!(comp_a[0].wr_id, WRID::send_data(2));
         assert_eq!(comp_a[0].qp_num, queue_pair_a.qp_num);
-        assert_eq!(comp_a[0].status, verbs::ibv_wc_status::IBV_WC_SUCCESS);
+        assert_eq!(comp_a[0].status, crate::ibv_wc_status::IBV_WC_SUCCESS);
 
         let comp_b = queue_pair_b.poll_cq(&mut wcs_b).unwrap();
         assert_eq!(comp_b.len(), 1);
         assert_eq!(comp_b[0].wr_id, WRID::recv(1));
         assert_eq!(comp_b[0].qp_num, queue_pair_b.qp_num);
-        assert_eq!(comp_b[0].status, verbs::ibv_wc_status::IBV_WC_SUCCESS);
+        assert_eq!(comp_b[0].status, crate::ibv_wc_status::IBV_WC_SUCCESS);
         assert_eq!(comp_b[0].byte_len, send_len as u32);
         assert!(&recv_slice[..send_len] == send_slice);
     }

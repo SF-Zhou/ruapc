@@ -1,7 +1,7 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use foldhash::fast::RandomState;
-use ruapc_rdma::{BufferPool, Devices, QueuePair, verbs};
+use ruapc_rdma::{BufferPool, Devices, QueuePair, ibv_qp_cap};
 use tokio::sync::RwLock;
 use tokio_util::sync::DropGuard;
 
@@ -41,7 +41,7 @@ impl SocketPoolTrait for RdmaSocketPool {
     /// * `Ok(Arc<Self>)` - A new thread-safe RDMA socket pool instance
     /// * `Err(Error)` - If RDMA devices cannot be initialized or buffer pool creation fails
     fn create(_: &SocketPoolConfig) -> Result<Self> {
-        let devices = Devices::availables()?;
+        let devices = Devices::available()?;
         let rdmabuf_pool = BufferPool::create(4096, 4096, &devices)?;
         let this = Self {
             acquire_client: Client {
@@ -100,7 +100,7 @@ impl SocketPoolTrait for RdmaSocketPool {
     /// * `Ok(Endpoint)` - The local endpoint information if connection succeeds
     /// * `Err(Error)` - If connection setup fails
     fn rdma_connect(&self, endpoint: &Endpoint, state: &Arc<State>) -> Result<Endpoint> {
-        let cap = verbs::ibv_qp_cap {
+        let cap = ibv_qp_cap {
             max_send_wr: 64,
             max_recv_wr: 64,
             max_send_sge: 1,
@@ -159,7 +159,7 @@ impl SocketPoolTrait for RdmaSocketPool {
             return Ok(socket.into());
         }
 
-        let cap = verbs::ibv_qp_cap {
+        let cap = ibv_qp_cap {
             max_send_wr: 64,
             max_recv_wr: 64,
             max_send_sge: 1,

@@ -1,13 +1,13 @@
-use crate::{CompChannel, Device, ErrorKind, Result, verbs};
+use crate::{CompChannel, Device, ErrorKind, Result};
 use std::sync::Arc;
 
 /// Raw completion queue wrapper with automatic cleanup.
 ///
 /// This type wraps a raw InfiniBand completion queue pointer
 /// and ensures proper cleanup on drop.
-struct RawCompQueue(*mut verbs::ibv_cq);
+struct RawCompQueue(*mut crate::ibv_cq);
 impl std::ops::Deref for RawCompQueue {
-    type Target = verbs::ibv_cq;
+    type Target = crate::ibv_cq;
 
     fn deref(&self) -> &Self::Target {
         unsafe { &*self.0 }
@@ -15,7 +15,7 @@ impl std::ops::Deref for RawCompQueue {
 }
 impl Drop for RawCompQueue {
     fn drop(&mut self) {
-        let _ = unsafe { verbs::ibv_destroy_cq(self.0) };
+        let _ = unsafe { crate::ibv_destroy_cq(self.0) };
     }
 }
 unsafe impl Send for RawCompQueue {}
@@ -51,7 +51,7 @@ impl CompQueue {
         let comp_channel = CompChannel::create(device.clone())?;
 
         let ptr = unsafe {
-            verbs::ibv_create_cq(
+            crate::ibv_create_cq(
                 device.context_ptr(),
                 max_cqe as _,
                 std::ptr::null_mut(),
@@ -78,7 +78,7 @@ impl CompQueue {
     /// # Safety
     ///
     /// The returned pointer is only valid as long as this `CompQueue` exists.
-    pub(crate) fn comp_queue_ptr(&self) -> *mut verbs::ibv_cq {
+    pub(crate) fn comp_queue_ptr(&self) -> *mut crate::ibv_cq {
         self.comp_queue.0
     }
 
@@ -91,7 +91,7 @@ impl CompQueue {
     ///
     /// Returns an error if the notification request fails.
     pub fn req_notify(&self) -> Result<()> {
-        let ret = unsafe { verbs::ibv_req_notify_cq(self.comp_queue_ptr(), 0) };
+        let ret = unsafe { crate::ibv_req_notify_cq(self.comp_queue_ptr(), 0) };
         if ret == 0 {
             Ok(())
         } else {
@@ -114,9 +114,9 @@ impl CompQueue {
     /// # Errors
     ///
     /// Returns an error if polling fails.
-    pub fn poll_cq<'a>(&self, wcs: &'a mut [verbs::ibv_wc]) -> Result<&'a mut [verbs::ibv_wc]> {
+    pub fn poll_cq<'a>(&self, wcs: &'a mut [crate::ibv_wc]) -> Result<&'a mut [crate::ibv_wc]> {
         let num = unsafe {
-            verbs::ibv_poll_cq(
+            crate::ibv_poll_cq(
                 self.comp_queue_ptr(),
                 std::cmp::min(self.cqe, wcs.len()) as _,
                 wcs.as_mut_ptr() as _,
@@ -145,7 +145,7 @@ impl CompQueue {
         let mut cq = std::ptr::null_mut();
         let mut cq_ctx = std::ptr::null_mut();
         let ret = unsafe {
-            verbs::ibv_get_cq_event(self.comp_channel.comp_channel_ptr(), &mut cq, &mut cq_ctx)
+            crate::ibv_get_cq_event(self.comp_channel.comp_channel_ptr(), &mut cq, &mut cq_ctx)
         };
         if ret == 0 {
             Ok(1)
@@ -164,7 +164,7 @@ impl CompQueue {
     ///
     /// * `nevents` - Number of events to acknowledge
     pub fn ack_cq_events(&self, nevents: usize) {
-        unsafe { verbs::ibv_ack_cq_events(self.comp_queue_ptr(), nevents as u32) };
+        unsafe { crate::ibv_ack_cq_events(self.comp_queue_ptr(), nevents as u32) };
     }
 }
 
@@ -182,9 +182,9 @@ mod tests {
     #[test]
     fn test_comp_queue() {
         let max_cqe = 1024;
-        let device = Devices::availables().unwrap().first().unwrap().clone();
+        let device = Devices::available().unwrap().first().unwrap().clone();
         let comp_queue = CompQueue::create(&device, max_cqe).unwrap();
-        let mut wcs = [verbs::ibv_wc::default(); 16];
+        let mut wcs = [crate::ibv_wc::default(); 16];
         let result = comp_queue.poll_cq(&mut wcs).unwrap();
         assert_eq!(result.len(), 0);
         println!("{comp_queue:?}");

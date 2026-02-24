@@ -10,7 +10,9 @@
 
 use std::{collections::BTreeSet, sync::Arc, time::Instant};
 
-use ruapc_rdma::{Buffer, verbs};
+use ruapc_rdma::{
+    Buffer, WRID, ibv_send_flags, ibv_send_wr, ibv_send_wr__bindgen_ty_1, ibv_wc, ibv_wr_opcode,
+};
 use tokio::io::{Interest, unix::AsyncFd};
 
 use crate::{Error, ErrorKind, Message, Result, Socket, State};
@@ -58,14 +60,14 @@ impl RecvHandler {
 
     fn post_recv(&mut self, wrid: u64, socket: &RdmaSocket) -> Result<()> {
         let buf = &self.buffers[usize::try_from(wrid).unwrap()];
-        socket.queue_pair.recv(verbs::WRID::recv(wrid), buf)?;
+        socket.queue_pair.recv(WRID::recv(wrid), buf)?;
         self.submitted += 1;
         Ok(())
     }
 
     fn handle_completion(
         &mut self,
-        wc: &verbs::ibv_wc,
+        wc: &ibv_wc,
         socket: &Arc<RdmaSocket>,
         send: &mut SendHandler,
         state: &Arc<State>,
@@ -130,7 +132,7 @@ struct SendHandler {
 }
 
 impl SendHandler {
-    fn handle_completion(&mut self, wc: &verbs::ibv_wc, socket: &RdmaSocket) -> Result<()> {
+    fn handle_completion(&mut self, wc: &ibv_wc, socket: &RdmaSocket) -> Result<()> {
         if wc.is_send_imm() {
             self.ack_completed += 1;
         } else {
@@ -160,11 +162,11 @@ impl SendHandler {
         pending_imm: u32,
         pending_data: u32,
     ) -> Result<()> {
-        let mut wr = verbs::ibv_send_wr {
-            wr_id: verbs::WRID::send_imm(self.ack_submitted),
-            opcode: verbs::ibv_wr_opcode::IBV_WR_SEND_WITH_IMM,
-            send_flags: verbs::ibv_send_flags::IBV_SEND_SIGNALED.0,
-            __bindgen_anon_1: verbs::ibv_send_wr__bindgen_ty_1 {
+        let mut wr = ibv_send_wr {
+            wr_id: WRID::send_imm(self.ack_submitted),
+            opcode: ibv_wr_opcode::IBV_WR_SEND_WITH_IMM,
+            send_flags: ibv_send_flags::IBV_SEND_SIGNALED.0,
+            __bindgen_anon_1: ibv_send_wr__bindgen_ty_1 {
                 imm_data: ((pending_imm << 16) + pending_data).to_be(),
             },
             ..Default::default()
@@ -293,7 +295,7 @@ impl EventLoop {
         let async_fd = AsyncFd::with_interest(socket.queue_pair.notify_fd(), Interest::READABLE)
             .map_err(|e| Error::new(ErrorKind::InvalidArgument, e.to_string()))?;
 
-        let mut wcs_buf = [verbs::ibv_wc::default(); 32];
+        let mut wcs_buf = [ibv_wc::default(); 32];
         let mut pending_sends = Vec::with_capacity(256);
 
         loop {
@@ -366,7 +368,7 @@ impl EventLoop {
             && msgid < sendable_bound
         {
             self.socket.queue_pair.send(
-                verbs::WRID::send_data(msgid),
+                WRID::send_data(msgid),
                 &self.socket.send_buffers.get(&msgid).unwrap(),
             )?;
             self.pending_sends.pop_first();

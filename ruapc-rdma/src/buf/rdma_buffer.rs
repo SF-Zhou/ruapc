@@ -4,9 +4,9 @@ use crate::*;
 ///
 /// Wraps an InfiniBand memory region pointer and ensures
 /// proper cleanup on drop.
-struct RawMemoryRegion(*mut verbs::ibv_mr);
+struct RawMemoryRegion(*mut crate::ibv_mr);
 impl std::ops::Deref for RawMemoryRegion {
-    type Target = verbs::ibv_mr;
+    type Target = crate::ibv_mr;
 
     fn deref(&self) -> &Self::Target {
         unsafe { &*self.0 }
@@ -14,7 +14,7 @@ impl std::ops::Deref for RawMemoryRegion {
 }
 impl Drop for RawMemoryRegion {
     fn drop(&mut self) {
-        let _ = unsafe { verbs::ibv_dereg_mr(self.0) };
+        let _ = unsafe { crate::ibv_dereg_mr(self.0) };
     }
 }
 unsafe impl Send for RawMemoryRegion {}
@@ -31,7 +31,7 @@ unsafe impl Sync for RawMemoryRegion {}
 /// ```rust,no_run
 /// # use ruapc_rdma::{RegisteredBuffer, Devices};
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// let devices = Devices::availables()?;
+/// let devices = Devices::available()?;
 /// let buffer = RegisteredBuffer::create(&devices, 4096)?;
 /// println!("Buffer address: {:p}", buffer.as_ptr());
 /// # Ok(())
@@ -64,11 +64,11 @@ impl RegisteredBuffer {
         let mut memory_regions = Vec::with_capacity(devices.len());
         for device in devices {
             let mr = unsafe {
-                verbs::ibv_reg_mr(
+                crate::ibv_reg_mr(
                     device.pd_ptr(),
                     buf.as_mut_ptr() as _,
                     buf.len(),
-                    verbs::ACCESS_FLAGS as _,
+                    crate::ACCESS_FLAGS as _,
                 )
             };
             if mr.is_null() {
@@ -140,7 +140,7 @@ mod tests {
     #[test]
     fn test_memory_region() {
         let size = 4096usize;
-        let devices = Devices::availables().unwrap();
+        let devices = Devices::available().unwrap();
         let registered_buffer = RegisteredBuffer::create(&devices, size).unwrap();
         assert_eq!(registered_buffer.len(), size);
         println!("{:#?}", registered_buffer);
