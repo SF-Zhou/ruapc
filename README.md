@@ -11,7 +11,8 @@ A high-performance Rust RPC library that supports multiple transport protocols (
 
 ## Features
 
-- **Multiple Transport Protocols**: TCP, WebSocket, HTTP, RDMA (optional), and a unified protocol that supports all simultaneously
+- **Multiple Transport Protocols**: TCP, WebSocket, HTTP/1.1 and HTTP/2 (h2c), RDMA (optional), and a unified protocol that supports all simultaneously
+- **Reverse RPC**: Server can call back into client services over established HTTP/2 or WebSocket connections
 - **Multiple Serialization Formats**: JSON (default) and MessagePack support
 - **OpenAPI Integration**: Automatic OpenAPI 3.0 specification generation with JSON Schema support
 - **Built-in Documentation**: RapiDoc integration for interactive API documentation
@@ -56,7 +57,7 @@ async fn main() {
     let demo = Arc::new(DemoImpl);
     let mut router = Router::default();
     EchoService::ruapc_export(demo.clone(), &mut router);
-    let server = Server::create(router, &SocketPoolConfig::default());
+    let server = Server::create(router, &SocketPoolConfig::default()).unwrap();
 
     let server = Arc::new(server);
     let addr = SocketAddr::from_str("127.0.0.1:8000").unwrap();
@@ -76,7 +77,7 @@ use std::{net::SocketAddr, str::FromStr};
 #[tokio::main]
 async fn main() {
     let addr = SocketAddr::from_str("127.0.0.1:8000").unwrap();
-    let ctx = Context::create(&SocketPoolConfig::default()).with_addr(addr);
+    let ctx = Context::create(&SocketPoolConfig::default()).unwrap().with_addr(addr);
     let client = Client::default();
 
     let rsp = client.echo(&ctx, &Request("Rua!".into())).await;

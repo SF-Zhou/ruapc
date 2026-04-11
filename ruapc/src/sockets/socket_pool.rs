@@ -23,7 +23,7 @@ use crate::{
 /// Each socket type represents a different transport protocol with its own characteristics:
 /// - **TCP**: Raw TCP sockets with custom protocol
 /// - **WS**: WebSocket over HTTP
-/// - **HTTP**: HTTP/1.1 with request/response semantics
+/// - **HTTP**: HTTP/1.1 and HTTP/2 (h2c), supports bidirectional streaming for reverse RPC
 /// - **UNIFIED**: Accepts all protocol types on the same port
 /// - **RDMA**: High-performance RDMA (requires "rdma" feature)
 #[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone, Copy, clap::ValueEnum)]
