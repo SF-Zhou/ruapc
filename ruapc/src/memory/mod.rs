@@ -10,3 +10,13 @@ pub use memory_registration::MemoryRegistration;
 
 mod registered;
 pub use registered::Memory;
+
+mod remote_buffer_info;
+pub use remote_buffer_info::RemoteBufferInfo;
+
+#[allow(unsafe_code)]
+mod buffer;
+pub use buffer::Buffer;
+
+mod buffer_pool;
+pub use buffer_pool::BufferPool;
