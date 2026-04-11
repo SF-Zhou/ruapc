@@ -63,7 +63,7 @@ jobs:
         ibv_devinfo -d rxe_0 -v
         cargo fmt -- --check
         cargo clippy --release -- -D warnings
-        cargo llvm-cov nextest --all-features --ignore-filename-regex "ruapc-demo/*|ruapc-macro/*|ruapc/src/bin/*"
+        cargo llvm-cov nextest --all-features --ignore-filename-regex "ruapc-demo/*|ruapc-macro/*|ruapc/src/bin/*" -j 1
         cargo llvm-cov report --cobertura --ignore-filename-regex "ruapc-demo/*|ruapc-macro/*|ruapc/src/bin/*" --output-path target/llvm-cov-target/cobertura.xml
 
     - name: Upload coverage reports to Codecov
