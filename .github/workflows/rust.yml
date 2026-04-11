@@ -10,6 +10,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUAPC_PREFER_RXE: "1"
 
 jobs:
   build:
