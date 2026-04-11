@@ -131,6 +131,12 @@ struct SendHandler {
 
 impl SendHandler {
     fn handle_completion(&mut self, wc: &verbs::ibv_wc, socket: &RdmaSocket) -> Result<()> {
+        // Check if this is an RDMA one-sided operation completion.
+        if let Some((_, sender)) = socket.rdma_completions.remove(&wc.wr_id) {
+            let _ = sender.send(wc.status);
+            return Ok(());
+        }
+
         if wc.is_send_imm() {
             self.ack_completed += 1;
         } else {

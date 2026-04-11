@@ -208,6 +208,151 @@ async fn test_tcp_remote_write() {
     server.join().await;
 }
 
+#[cfg(feature = "rdma")]
+#[tokio::test]
+async fn test_rdma_remote_read() {
+    // Get RDMA devices.
+    let rdma_devices = ruapc_rdma::Devices::availables().unwrap();
+
+    // Set up server with RDMA device.
+    let mut server_devs = Devices::new();
+    let _server_rdma = server_devs.add_rdma_device(rdma_devices[0].clone());
+    let server_devs = Arc::new(server_devs);
+
+    let read_svc = Arc::new(ReadTestImpl);
+    let mut router = Router::default();
+    read_svc.ruapc_export(&mut router);
+    let config = SocketPoolConfig {
+        socket_type: SocketType::UNIFIED,
+    };
+    let server = Server::create_with_devices(router, &config, Some(server_devs.clone())).unwrap();
+    let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
+    let addr = server.listen(addr).await.unwrap();
+
+    // Set up client with RDMA device.
+    let mut client_devs = Devices::new();
+    let client_rdma = client_devs.add_rdma_device(rdma_devices[0].clone());
+    let client_devs = Arc::new(client_devs);
+
+    let client_pool = BufferPool::new(client_devs.clone(), 2 * 1024 * 1024, 2 * 1024 * 1024, 0);
+
+    // Allocate client buffer and fill with test data.
+    let mut client_buf = client_pool.allocate().unwrap();
+    let test_data = b"Hello, RDMA Remote Read!";
+    client_buf[..test_data.len()].copy_from_slice(test_data);
+
+    // Get RemoteBufferInfo with RDMA key.
+    let rbi = client_buf.remote_buffer_info(&client_rdma).unwrap();
+    assert!(matches!(rbi.key, MemoryKey::Rdma { .. }));
+    let rbi_for_req = RemoteBufferInfo {
+        key: rbi.key,
+        addr: rbi.addr,
+        len: test_data.len() as u64,
+    };
+
+    // Create client context with RDMA device (for lkey lookup on server side).
+    let ctx = Context::create_with_router_and_devices(
+        Router::default(),
+        &config,
+        Some(client_devs.clone()),
+    )
+    .unwrap();
+    let ctx = ctx.with_addr(addr);
+
+    // Use RDMA socket type for the RPC call.
+    let client = Client {
+        socket_type: Some(SocketType::RDMA),
+        ..Default::default()
+    };
+    let rsp: RemoteReadRsp = client
+        .read_remote(&ctx, &RemoteReadReq { info: rbi_for_req })
+        .await
+        .unwrap();
+
+    assert_eq!(rsp.data, test_data);
+
+    server.stop();
+    tokio::time::timeout(std::time::Duration::from_secs(30), server.join())
+        .await
+        .unwrap();
+}
+
+#[cfg(feature = "rdma")]
+#[tokio::test]
+async fn test_rdma_remote_write() {
+    // Get RDMA devices.
+    let rdma_devices = ruapc_rdma::Devices::availables().unwrap();
+
+    // Set up server with RDMA device.
+    let mut server_devs = Devices::new();
+    let _server_rdma = server_devs.add_rdma_device(rdma_devices[0].clone());
+    let server_devs = Arc::new(server_devs);
+
+    let write_svc = Arc::new(WriteTestImpl);
+    let mut router = Router::default();
+    write_svc.ruapc_export(&mut router);
+    let config = SocketPoolConfig {
+        socket_type: SocketType::UNIFIED,
+    };
+    let server = Server::create_with_devices(router, &config, Some(server_devs.clone())).unwrap();
+    let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
+    let addr = server.listen(addr).await.unwrap();
+
+    // Set up client with RDMA device.
+    let mut client_devs = Devices::new();
+    let client_rdma = client_devs.add_rdma_device(rdma_devices[0].clone());
+    let client_devs = Arc::new(client_devs);
+
+    let client_pool = BufferPool::new(client_devs.clone(), 2 * 1024 * 1024, 2 * 1024 * 1024, 0);
+
+    // Allocate client buffer (initially zeroed).
+    let client_buf = client_pool.allocate().unwrap();
+    assert!(client_buf[..10].iter().all(|&b| b == 0));
+
+    // Get RemoteBufferInfo with RDMA key.
+    let rbi = client_buf.remote_buffer_info(&client_rdma).unwrap();
+    assert!(matches!(rbi.key, MemoryKey::Rdma { .. }));
+    let write_data = b"Hello, RDMA Remote Write!";
+    let rbi_for_req = RemoteBufferInfo {
+        key: rbi.key,
+        addr: rbi.addr,
+        len: write_data.len() as u64,
+    };
+
+    // Create client context with RDMA device.
+    let ctx = Context::create_with_router_and_devices(
+        Router::default(),
+        &config,
+        Some(client_devs.clone()),
+    )
+    .unwrap();
+    let ctx = ctx.with_addr(addr);
+
+    // Use RDMA socket type for the RPC call.
+    let client = Client {
+        socket_type: Some(SocketType::RDMA),
+        ..Default::default()
+    };
+    client
+        .write_remote(
+            &ctx,
+            &RemoteWriteReq {
+                info: rbi_for_req,
+                data: write_data.to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+
+    // Verify the data was written to our buffer via RDMA Write.
+    assert_eq!(&client_buf[..write_data.len()], write_data);
+
+    server.stop();
+    tokio::time::timeout(std::time::Duration::from_secs(30), server.join())
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn test_tcp_remote_read_bounds_check() {
     // Set up server devices.
