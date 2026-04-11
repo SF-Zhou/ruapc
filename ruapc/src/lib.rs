@@ -130,7 +130,9 @@ pub use device::{Device, Devices};
 
 /// Memory management (aligned allocation, registration, keys).
 pub mod memory;
-pub use memory::{AlignedMemory, Memory, MemoryKey, MemoryRegistration};
+pub use memory::{
+    AlignedMemory, Buffer, BufferPool, Memory, MemoryKey, MemoryRegistration, RemoteBufferInfo,
+};
 
 /// Socket abstraction layer.
 mod sockets;
