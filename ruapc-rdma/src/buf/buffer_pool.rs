@@ -145,7 +145,7 @@ mod tests {
     #[test]
     fn test_buffer() {
         const LEN: usize = 1 << 20;
-        let devices = Devices::availables().unwrap();
+        let devices = Devices::availables().unwrap().prefer_rxe();
         let buffer_pool = BufferPool::create(LEN, 32, &devices).unwrap();
 
         let mut buf = buffer_pool.allocate().unwrap();

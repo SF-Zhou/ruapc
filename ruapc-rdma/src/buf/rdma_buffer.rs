@@ -140,7 +140,7 @@ mod tests {
     #[test]
     fn test_memory_region() {
         let size = 4096usize;
-        let devices = Devices::availables().unwrap();
+        let devices = Devices::availables().unwrap().prefer_rxe();
         let registered_buffer = RegisteredBuffer::create(&devices, size).unwrap();
         assert_eq!(registered_buffer.len(), size);
         println!("{:#?}", registered_buffer);

@@ -413,6 +413,16 @@ impl Devices {
             Ok(Devices(devices))
         }
     }
+
+    /// Reorders devices so that RXE (Soft-RoCE) devices come first.
+    ///
+    /// This is useful in test environments where RXE devices should be
+    /// preferred over hardware RDMA devices when both are available.
+    /// If no RXE device is found, the order remains unchanged.
+    pub fn prefer_rxe(mut self) -> Self {
+        self.0.sort_by_key(|d| if d.info.name.contains("rxe") { 0 } else { 1 });
+        self
+    }
 }
 
 impl Deref for Devices {
@@ -438,7 +448,7 @@ mod tests {
 
     #[test]
     fn list_devices() {
-        let devices = Devices::availables().unwrap();
+        let devices = Devices::availables().unwrap().prefer_rxe();
         assert!(!devices.is_empty());
         for device in &devices {
             println!("{:#?}", device);

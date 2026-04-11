@@ -107,7 +107,7 @@ mod tests {
 
     #[test]
     fn test_create_comp_channel() {
-        let devices = Devices::availables().unwrap();
+        let devices = Devices::availables().unwrap().prefer_rxe();
         assert!(!devices.is_empty());
         for device in &devices {
             let comp_channel = CompChannel::create(device.clone()).unwrap();
