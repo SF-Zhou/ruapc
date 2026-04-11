@@ -1,6 +1,6 @@
 use std::{collections::HashMap, io::IoSlice, net::SocketAddr, sync::Arc};
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use foldhash::fast::RandomState;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -143,32 +143,7 @@ impl TcpSocketPool {
     }
 
     fn parse_message(buffer: &mut BytesMut) -> Result<Option<Bytes>> {
-        const S: usize = std::mem::size_of::<u64>();
-        if buffer.len() < S {
-            return Ok(None);
-        }
-        let header = u64::from_be_bytes(buffer[..S].try_into().unwrap());
-        if (header >> 32) as u32 != super::MAGIC_NUM {
-            return Err(Error::new(
-                ErrorKind::TcpParseMsgFailed,
-                format!("invalid header: {header:08X}"),
-            ));
-        }
-
-        let len = usize::try_from(header & u64::from(u32::MAX))?;
-        if S + len >= super::MAX_MSG_SIZE {
-            return Err(Error::new(
-                ErrorKind::TcpParseMsgFailed,
-                format!("msg is too long: {len}"),
-            ));
-        }
-
-        if buffer.len() < S + len {
-            Ok(None)
-        } else {
-            buffer.advance(S);
-            Ok(Some(buffer.split_to(len).into()))
-        }
+        super::parse_message(buffer)
     }
 
     async fn start_recv_loop(

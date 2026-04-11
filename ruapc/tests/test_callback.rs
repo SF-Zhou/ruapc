@@ -69,3 +69,34 @@ async fn test_callback() {
     server.stop();
     server.join().await;
 }
+
+#[tokio::test]
+async fn test_callback_http() {
+    let foo = Arc::new(FooServiceImpl);
+    let mut router = Router::default();
+    foo.clone().ruapc_export(&mut router);
+    let config = SocketPoolConfig {
+        socket_type: SocketType::HTTP,
+        ..Default::default()
+    };
+    let server = Server::create(router, &config).unwrap();
+    let server = Arc::new(server);
+    let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
+    let addr = server.clone().listen(addr).await.unwrap();
+
+    let bar = Arc::new(BarServiceImpl);
+    let mut router = Router::default();
+    bar.clone().ruapc_export(&mut router);
+    let ctx = Context::create_with_router(router, &config).unwrap();
+    let ctx = ctx.with_addr(addr);
+
+    let client = Client {
+        socket_type: Some(SocketType::HTTP),
+        ..Default::default()
+    };
+    assert_eq!(client.foo(&ctx, &FooReq(0)).await, Ok(FooRsp(1)));
+    assert_eq!(client.foo(&ctx, &FooReq(1)).await, Ok(FooRsp(3)));
+
+    server.stop();
+    server.join().await;
+}
