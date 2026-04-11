@@ -83,7 +83,7 @@ impl SocketPoolTrait for HttpSocketPool {
 
         let connections = Arc::new(Connections {
             addr: *addr,
-            vec: Mutex::default(),
+            sender: Mutex::default(),
         });
         let socket = HttpSocket::ForRequest(connections);
         socket_map.insert(*addr, socket.clone());

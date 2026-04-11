@@ -2,8 +2,8 @@ use std::{net::SocketAddr, sync::Arc};
 
 use bytes::{Bytes, BytesMut};
 use http_body_util::{BodyExt, Full};
-use hyper::client::conn::http1::SendRequest;
-use hyper_util::rt::TokioIo;
+use hyper::client::conn::http2::SendRequest;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use serde::Serialize;
 use tokio::{net::TcpStream, sync::Mutex};
 
@@ -21,23 +21,27 @@ impl HttpSocket {
         bytes: Bytes,
         connections: &Arc<Connections>,
     ) -> Result<Bytes> {
-        // 1. acquire connection.
-        let mut sender = if let Some(sender) = connections.vec.lock().await.pop() {
-            sender
-        } else {
-            // estabilish new connection.
-            let stream = TcpStream::connect(connections.addr)
+        // 1. acquire or establish HTTP/2 connection.
+        let mut sender = {
+            let mut guard = connections.sender.lock().await;
+            if let Some(sender) = guard.as_ref() {
+                sender.clone()
+            } else {
+                let stream = TcpStream::connect(connections.addr)
+                    .await
+                    .map_err(|e| Error::new(ErrorKind::TcpConnectFailed, e.to_string()))?;
+
+                let (sender, conn) = hyper::client::conn::http2::handshake(
+                    TokioExecutor::new(),
+                    TokioIo::new(stream),
+                )
                 .await
-                .map_err(|e| Error::new(ErrorKind::TcpConnectFailed, e.to_string()))?;
+                .map_err(|e| Error::new(ErrorKind::HttpWaitRspFailed, e.to_string()))?;
+                tokio::spawn(conn);
 
-            let (sender, conn) = hyper::client::conn::http1::handshake::<TokioIo<_>, Full<Bytes>>(
-                TokioIo::new(stream),
-            )
-            .await
-            .map_err(|e| Error::new(ErrorKind::HttpWaitRspFailed, e.to_string()))?;
-            tokio::spawn(conn);
-
-            sender
+                *guard = Some(sender.clone());
+                sender
+            }
         };
 
         // 2. build request.
@@ -61,9 +65,6 @@ impl HttpSocket {
             .await
             .map_err(|e| Error::new(ErrorKind::HttpWaitRspFailed, e.to_string()))?
             .to_bytes();
-
-        // 5. restore connection.
-        connections.vec.lock().await.push(sender);
 
         Ok(body_bytes)
     }
@@ -130,5 +131,5 @@ impl SocketTrait for HttpSocket {
 #[derive(Debug)]
 pub struct Connections {
     pub addr: SocketAddr,
-    pub vec: Mutex<Vec<SendRequest<Full<Bytes>>>>,
+    pub sender: Mutex<Option<SendRequest<Full<Bytes>>>>,
 }
