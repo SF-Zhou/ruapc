@@ -1,20 +1,18 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
+use bytes::{Bytes, BytesMut};
 use foldhash::fast::RandomState;
-use http_body_util::{BodyExt, Full};
-use hyper::{
-    Request, Response,
-    body::{Bytes, Incoming},
-};
+use http_body_util::{BodyExt, Either, Full};
+use hyper::{Request, Response, body::Incoming};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::DropGuard;
 
-use super::http_socket::{Connections, HttpSocket};
+use super::http_socket::{ChannelBody, HttpSocket};
 use crate::{
     Error, ErrorKind, Message, MsgFlags, MsgMeta, RawStream, Result, Socket, SocketPoolConfig,
-    SocketPoolTrait, SocketType, State, TaskSupervisor,
+    SocketPoolTrait, SocketType, State, TaskSupervisor, sockets::tcp,
 };
 
 pub struct HttpSocketPool {
@@ -59,7 +57,7 @@ impl SocketPoolTrait for HttpSocketPool {
         &self,
         addr: &SocketAddr,
         socket_type: SocketType,
-        _state: &Arc<State>,
+        state: &Arc<State>,
     ) -> Result<Socket> {
         if socket_type != SocketType::HTTP {
             return Err(Error::new(
@@ -75,17 +73,13 @@ impl SocketPoolTrait for HttpSocketPool {
             return Ok(socket.into());
         }
 
-        // If not, create a new socket and insert it into the socket map.
+        // If not, establish an HTTP/2 streaming connection.
         let mut socket_map = self.socket_map.write().await;
         if let Some(socket) = socket_map.get(addr) {
             return Ok(socket.into());
         }
 
-        let connections = Arc::new(Connections {
-            addr: *addr,
-            sender: Mutex::default(),
-        });
-        let socket = HttpSocket::ForRequest(connections);
+        let socket = Self::connect_stream(addr, state).await?;
         socket_map.insert(*addr, socket.clone());
         Ok(socket.into())
     }
@@ -133,7 +127,7 @@ impl HttpSocketPool {
         mut req: Request<Incoming>,
         state: Arc<State>,
         addr: SocketAddr,
-    ) -> Result<Response<Full<Bytes>>> {
+    ) -> Result<Response<Either<Full<Bytes>, ChannelBody>>> {
         if hyper_tungstenite::is_upgrade_request(&req) {
             let (response, websocket) = hyper_tungstenite::upgrade(&mut req, None)
                 .map_err(|e| Error::new(ErrorKind::HttpUpgradeFailed, e.to_string()))?;
@@ -152,7 +146,12 @@ impl HttpSocketPool {
                     .await;
             });
 
-            return Ok(response);
+            return Ok(response.map(Either::Left));
+        }
+
+        // Handle /_rpc: bidirectional streaming for reverse RPC.
+        if req.method() == hyper::Method::POST && req.uri().path() == "/_rpc" {
+            return Self::handle_rpc_stream(req, state, addr).await;
         }
 
         if req.method() == hyper::Method::GET {
@@ -161,28 +160,28 @@ impl HttpSocketPool {
                     let openapi_json = serde_json::to_string_pretty(&state.router.openapi)?;
                     return Ok(Response::builder()
                         .header("Content-Type", "application/json")
-                        .body(Full::new(Bytes::from(openapi_json)))
+                        .body(Either::Left(Full::new(Bytes::from(openapi_json))))
                         .unwrap());
                 }
                 "/rapidoc/rapidoc-min.js" => {
                     return Ok(Response::builder()
                         .header("Content-Type", "application/javascript")
-                        .body(Full::new(Bytes::from(include_str!(
+                        .body(Either::Left(Full::new(Bytes::from(include_str!(
                             "rapidoc/rapidoc-min.js"
-                        ))))
+                        )))))
                         .unwrap());
                 }
                 "/rapidoc" | "/rapidoc/" | "/rapidoc/index.html" => {
                     let html = include_str!("rapidoc/index.html");
                     return Ok(Response::builder()
                         .header("Content-Type", "text/html; charset=utf-8")
-                        .body(Full::new(Bytes::from(html)))
+                        .body(Either::Left(Full::new(Bytes::from(html))))
                         .unwrap());
                 }
                 _ => {
                     return Ok(Response::builder()
                         .status(404)
-                        .body(Full::new(Bytes::from("Not Found")))
+                        .body(Either::Left(Full::new(Bytes::from("Not Found"))))
                         .unwrap());
                 }
             }
@@ -199,7 +198,9 @@ impl HttpSocketPool {
             Err(_) => {
                 return Ok(Response::builder()
                     .status(500)
-                    .body(Full::new(Bytes::from("Internal Server Error")))
+                    .body(Either::Left(Full::new(Bytes::from(
+                        "Internal Server Error",
+                    ))))
                     .unwrap());
             }
         };
@@ -215,8 +216,114 @@ impl HttpSocketPool {
 
         Ok(Response::builder()
             .header("Content-Type", "application/json")
-            .body(Full::new(msg.payload.into()))
+            .body(Either::Left(Full::new(msg.payload.into())))
             .unwrap())
+    }
+
+    /// Handle a `POST /_rpc` request for bidirectional streaming.
+    ///
+    /// Creates a pair of channels:
+    /// - Request body recv loop: reads framed messages from client → `state.handle_recv()`
+    /// - Response body send channel: server sends framed messages back to client via `ChannelBody`
+    async fn handle_rpc_stream(
+        req: Request<Incoming>,
+        state: Arc<State>,
+        addr: SocketAddr,
+    ) -> Result<Response<Either<Full<Bytes>, ChannelBody>>> {
+        // Create the send channel for server → client messages.
+        let (tx, rx) = mpsc::channel::<Bytes>(1024);
+        let socket = HttpSocket::Stream(tx);
+        let socket_for_recv = Socket::HTTP(socket);
+
+        // Spawn recv loop: read framed messages from the request body.
+        tokio::spawn({
+            let state = state.clone();
+            let socket_for_recv = socket_for_recv.clone();
+            async move {
+                if let Err(e) = Self::recv_loop(req.into_body(), &socket_for_recv, &state).await {
+                    tracing::error!("http rpc recv loop for {addr} failed: {e}");
+                }
+            }
+        });
+
+        // Return streaming response.
+        Ok(Response::builder()
+            .header("Content-Type", "application/octet-stream")
+            .body(Either::Right(ChannelBody::new(rx)))
+            .unwrap())
+    }
+
+    /// Read framed messages from an HTTP body stream.
+    ///
+    /// Uses the same wire format as TCP: `[magic][len][body]`.
+    async fn recv_loop(mut body: Incoming, socket: &Socket, state: &Arc<State>) -> Result<()> {
+        let mut buffer = BytesMut::with_capacity(1 << 20);
+        loop {
+            // Try to parse complete messages from the buffer.
+            while let Some(bytes) = tcp::parse_message(&mut buffer)? {
+                let msg = Message::parse(bytes)?;
+                state.handle_recv(socket, msg)?;
+            }
+
+            // Read more data from the body.
+            match body.frame().await {
+                Some(Ok(frame)) => {
+                    if let Some(data) = frame.data_ref() {
+                        buffer.extend_from_slice(data);
+                    }
+                }
+                Some(Err(e)) => {
+                    return Err(Error::new(ErrorKind::HttpWaitRspFailed, e.to_string()));
+                }
+                None => return Ok(()), // Body stream ended.
+            }
+        }
+    }
+
+    /// Client-side: establish an HTTP/2 streaming connection to `/_rpc`.
+    ///
+    /// Sends a POST request with a streaming body and starts a recv loop
+    /// on the response body. Returns an `HttpSocket::Stream` for sending.
+    async fn connect_stream(addr: &SocketAddr, state: &Arc<State>) -> Result<HttpSocket> {
+        use hyper::client::conn::http2;
+
+        let stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .map_err(|e| Error::new(ErrorKind::TcpConnectFailed, e.to_string()))?;
+
+        let (mut sender, conn) = http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+            .await
+            .map_err(|e| Error::new(ErrorKind::HttpWaitRspFailed, e.to_string()))?;
+        tokio::spawn(conn);
+
+        // Create send channel for client → server messages (request body).
+        let (req_tx, req_rx) = mpsc::channel::<Bytes>(1024);
+
+        let req = Request::builder()
+            .uri(format!("http://{addr}/_rpc"))
+            .method(hyper::Method::POST)
+            .body(ChannelBody::new(req_rx))
+            .map_err(|e| Error::new(ErrorKind::HttpBuildReqFailed, e.to_string()))?;
+
+        let rsp = sender
+            .send_request(req)
+            .await
+            .map_err(|e| Error::new(ErrorKind::HttpSendReqFailed, e.to_string()))?;
+
+        // Create the socket for sending messages.
+        let socket = HttpSocket::Stream(req_tx);
+
+        // Spawn recv loop on the response body.
+        let socket_for_recv = Socket::HTTP(socket.clone());
+        let state = state.clone();
+        let addr = *addr;
+        tokio::spawn(async move {
+            if let Err(e) = Self::recv_loop(rsp.into_body(), &socket_for_recv, &state).await {
+                tracing::error!("http rpc client recv loop for {addr} failed: {e}");
+            }
+        });
+
+        Ok(socket)
     }
 }
 
