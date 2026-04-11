@@ -26,6 +26,10 @@ RuaPC ("Rua! Procedure Call") is a high-performance Rust RPC library supporting 
 - `Waiter` — Request/response correlation via unique message IDs and oneshot channels
 - `State` — Shared state holding Router, Waiter, and SocketPool
 
+### Design Principles
+
+- **Enum dispatch over `dyn Trait`**: All runtime polymorphism uses enum variants (e.g. `Socket`, `SocketPool`, `HttpSocket`) instead of trait objects. Two reasons: (1) we don't need open-ended extensibility and won't sacrifice performance for it; (2) `async`-compatible `dyn Trait` has high runtime cost and is not mature enough. When adding new transport types or socket variants, add enum variants rather than trait objects.
+
 ### Wire Format (TCP/HTTP/2 Stream)
 `[4B magic "RUA!"][4B total_len][4B meta_len][meta bytes][payload bytes]`
 
