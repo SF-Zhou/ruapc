@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{DeviceConfig, Error, ErrorKind, GidType, Result, verbs};
 use std::{
+    collections::HashSet,
     ffi::{CStr, OsStr, c_int},
     ops::Deref,
     os::unix::ffi::OsStrExt,
@@ -380,11 +381,14 @@ impl Devices {
     /// println!("Found {} RDMA device(s)", devices.len());
     /// ```
     pub fn availables() -> Result<Devices> {
-        let devices = Self::open(&Default::default())?;
         if std::env::var("RUAPC_PREFER_RXE").is_ok() {
-            return devices.only_rxe();
+            let device_filter = HashSet::from(["rxe_0".to_string()]);
+            return Self::open(&DeviceConfig {
+                device_filter,
+                ..Default::default()
+            });
         }
-        Ok(devices)
+        Self::open(&Default::default())
     }
 
     /// Opens RDMA devices based on the provided configuration.
@@ -402,37 +406,22 @@ impl Devices {
         let list = RawDeviceList::available()?;
         let mut devices = Vec::with_capacity(list.len());
         for &device in list.iter() {
+            if !config.device_filter.is_empty() {
+                let name = unsafe { CStr::from_ptr((*device).name.as_ptr()) }
+                    .to_string_lossy()
+                    .to_string();
+                if !config.device_filter.contains(&name) {
+                    continue;
+                }
+            }
             let index = devices.len();
             let device = Device::open(device, index, config)?;
-            if !config.device_filter.is_empty() && !config.device_filter.contains(&device.info.name)
-            {
-                continue;
-            }
-
             devices.push(Arc::new(device));
         }
         if devices.is_empty() {
             Err(ErrorKind::IBDeviceNotFound.into())
         } else {
             Ok(Devices(devices))
-        }
-    }
-
-    /// Filters devices to only keep RXE (Soft-RoCE) devices.
-    ///
-    /// This is useful in test environments where only RXE devices should
-    /// be used, filtering out hardware RDMA devices that may be present
-    /// but not functional.
-    fn only_rxe(self) -> Result<Devices> {
-        let filtered: Vec<_> = self
-            .0
-            .into_iter()
-            .filter(|d| d.info.name.to_ascii_lowercase().contains("rxe"))
-            .collect();
-        if filtered.is_empty() {
-            Err(ErrorKind::IBDeviceNotFound.into())
-        } else {
-            Ok(Devices(filtered))
         }
     }
 }
