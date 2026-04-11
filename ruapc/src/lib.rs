@@ -142,7 +142,7 @@ pub use sockets::*;
 mod state;
 pub use state::State;
 
-/// Built-in services (MetaService, RdmaService).
+/// Built-in services (MetaService, MemoryService, RdmaService).
 pub mod services;
 
 /// RPC context carrying request metadata and connection information.

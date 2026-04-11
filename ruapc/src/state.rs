@@ -3,8 +3,9 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio_util::sync::DropGuard;
 
 use crate::{
-    Context, Message, RawStream, Result, Router, Socket, SocketPool, SocketPoolConfig,
+    Context, Devices, Message, RawStream, Result, Router, Socket, SocketPool, SocketPoolConfig,
     SocketPoolTrait, Waiter,
+    services::{MemoryService, MemoryServiceImpl},
 };
 
 /// Shared state for the RPC system.
@@ -23,6 +24,8 @@ pub struct State {
     pub(crate) waiter: Arc<Waiter>,
     /// Socket pool for managing connections.
     pub(crate) socket_pool: SocketPool,
+    /// Device collection for memory registration and Remote Read/Write.
+    pub devices: Option<Arc<Devices>>,
 }
 
 impl State {
@@ -39,6 +42,12 @@ impl State {
     /// * `config` - Socket pool configuration
     ///
     /// # Returns
+    /// Creates a new state with the given router and configuration.
+    ///
+    /// When `devices` is provided, a `MemoryService` is automatically
+    /// registered in the router to handle Remote Read/Write requests.
+    ///
+    /// # Returns
     ///
     /// Returns an Arc-wrapped state and a drop guard for lifecycle management.
     ///
@@ -48,12 +57,20 @@ impl State {
     pub(crate) fn create(
         mut router: Router,
         config: &SocketPoolConfig,
+        devices: Option<Arc<Devices>>,
     ) -> Result<(Arc<Self>, DropGuard)> {
+        if let Some(ref devs) = devices {
+            let mem_svc = Arc::new(MemoryServiceImpl {
+                devices: devs.clone(),
+            });
+            mem_svc.ruapc_export(&mut router);
+        }
         router.build_open_api()?;
         let state = Self {
             router,
             waiter: Arc::default(),
             socket_pool: SocketPool::create(config)?,
+            devices,
         };
         let state = Arc::new(state);
         let drop_guard = state.drop_guard();

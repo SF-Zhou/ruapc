@@ -8,6 +8,8 @@ pub use rdma_device::RdmaDevice;
 
 use std::sync::Arc;
 
+use crate::Result;
+
 /// A network device abstraction using enum dispatch.
 ///
 /// Can be a real RDMA NIC or a virtual TCP device. Memory must be
@@ -27,6 +29,30 @@ impl Device {
             Device::Tcp(d) => d.index(),
             #[cfg(feature = "rdma")]
             Device::Rdma(d) => d.index(),
+        }
+    }
+
+    /// Reads data from a registered memory region using absolute address.
+    pub fn read_memory(&self, id: u32, addr: u64, len: u64) -> Result<Vec<u8>> {
+        match self {
+            Device::Tcp(d) => d.read_memory(id, addr, len),
+            #[cfg(feature = "rdma")]
+            Device::Rdma(_) => Err(crate::Error::new(
+                crate::ErrorKind::InvalidArgument,
+                "read_memory not supported on RDMA device".into(),
+            )),
+        }
+    }
+
+    /// Writes data into a registered memory region using absolute address.
+    pub fn write_memory(&self, id: u32, addr: u64, data: &[u8]) -> Result<()> {
+        match self {
+            Device::Tcp(d) => d.write_memory(id, addr, data),
+            #[cfg(feature = "rdma")]
+            Device::Rdma(_) => Err(crate::Error::new(
+                crate::ErrorKind::InvalidArgument,
+                "write_memory not supported on RDMA device".into(),
+            )),
         }
     }
 }
