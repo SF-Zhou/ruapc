@@ -5,9 +5,9 @@ use http_body_util::{BodyExt, Full};
 use hyper::{
     Request, Response,
     body::{Bytes, Incoming},
-    server::conn::http1::Builder,
 };
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::DropGuard;
 
@@ -19,14 +19,14 @@ use crate::{
 
 pub struct HttpSocketPool {
     socket_map: RwLock<HashMap<SocketAddr, HttpSocket, RandomState>>,
-    http: Builder,
+    http: Builder<TokioExecutor>,
     task_supervisor: TaskSupervisor,
 }
 
 impl SocketPoolTrait for HttpSocketPool {
     fn create(_config: &SocketPoolConfig) -> Result<Self> {
-        let mut http = Builder::new();
-        http.keep_alive(true);
+        let mut http = Builder::new(TokioExecutor::new());
+        http.http1().keep_alive(true);
         Ok(Self {
             socket_map: RwLock::default(),
             http,
@@ -106,18 +106,16 @@ impl HttpSocketPool {
         };
 
         let state = state.clone();
-        let connection = self
-            .http
-            .serve_connection(
+        let http = self.http.clone();
+
+        let task_supervisor = self.task_supervisor.start_async_task();
+        tokio::spawn(async move {
+            let connection = http.serve_connection_with_upgrades(
                 TokioIo::new(tcp_stream),
                 hyper::service::service_fn(move |req: Request<Incoming>| {
                     Self::handle_request(req, state.clone(), addr)
                 }),
-            )
-            .with_upgrades();
-
-        let task_supervisor = self.task_supervisor.start_async_task();
-        tokio::spawn(async move {
+            );
             tokio::select! {
                 () = task_supervisor.stopped() => {},
                 r = connection => {
