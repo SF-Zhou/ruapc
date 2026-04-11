@@ -306,7 +306,7 @@ mod tests {
 
     #[test]
     fn test_queue_pair_create() {
-        let devices = Devices::availables().unwrap().prefer_rxe();
+        let devices = Devices::availables().unwrap();
         let cap = verbs::ibv_qp_cap {
             max_send_wr: 64,
             max_recv_wr: 64,
@@ -324,7 +324,7 @@ mod tests {
     #[test]
     fn test_queue_pair_send_recv() {
         // 1. list all available devices.
-        let devices = Devices::availables().unwrap().prefer_rxe();
+        let devices = Devices::availables().unwrap();
 
         // 2. create two queue pairs.
         let cap = verbs::ibv_qp_cap {

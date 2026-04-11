@@ -182,7 +182,7 @@ mod tests {
     #[test]
     fn test_comp_queue() {
         let max_cqe = 1024;
-        let device = Devices::availables().unwrap().prefer_rxe().first().unwrap().clone();
+        let device = Devices::availables().unwrap().first().unwrap().clone();
         let comp_queue = CompQueue::create(&device, max_cqe).unwrap();
         let mut wcs = [verbs::ibv_wc::default(); 16];
         let result = comp_queue.poll_cq(&mut wcs).unwrap();

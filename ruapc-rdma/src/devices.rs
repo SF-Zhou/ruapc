@@ -380,7 +380,10 @@ impl Devices {
     /// println!("Found {} RDMA device(s)", devices.len());
     /// ```
     pub fn availables() -> Result<Devices> {
-        Self::open(&Default::default())
+        let devices = Self::open(&Default::default())?;
+        #[cfg(test)]
+        let devices = devices.prefer_rxe();
+        Ok(devices)
     }
 
     /// Opens RDMA devices based on the provided configuration.
@@ -420,7 +423,7 @@ impl Devices {
     /// preferred over hardware RDMA devices when both are available.
     /// If no RXE device is found, the order remains unchanged.
     #[cfg(test)]
-    pub fn prefer_rxe(mut self) -> Self {
+    fn prefer_rxe(mut self) -> Self {
         self.0.sort_by_key(|d| {
             if d.info.name.to_ascii_lowercase().contains("rxe") { 0 } else { 1 }
         });
@@ -451,7 +454,7 @@ mod tests {
 
     #[test]
     fn list_devices() {
-        let devices = Devices::availables().unwrap().prefer_rxe();
+        let devices = Devices::availables().unwrap();
         assert!(!devices.is_empty());
         for device in &devices {
             println!("{:#?}", device);
