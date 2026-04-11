@@ -73,7 +73,7 @@
 //! }
 //! ```
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![feature(return_type_notation)]
 
 /// Procedural macro for defining RPC services.
@@ -123,6 +123,14 @@ pub use task_supervisor::TaskSupervisor;
 /// Internal message receiver.
 mod receiver;
 use receiver::Receiver;
+
+/// Device abstraction layer (TCP, RDMA).
+pub mod device;
+pub use device::{Device, Devices};
+
+/// Memory management (aligned allocation, registration, keys).
+pub mod memory;
+pub use memory::{AlignedMemory, Memory, MemoryKey, MemoryRegistration};
 
 /// Socket abstraction layer.
 mod sockets;
