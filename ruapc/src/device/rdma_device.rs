@@ -24,6 +24,11 @@ impl RdmaDevice {
     pub fn inner(&self) -> &Arc<ruapc_rdma::Device> {
         &self.inner
     }
+
+    /// Returns the raw protection domain pointer for memory registration.
+    pub fn pd_ptr(&self) -> *mut ruapc_rdma::verbs::ibv_pd {
+        self.inner.pd_ptr()
+    }
 }
 
 impl std::fmt::Debug for RdmaDevice {
