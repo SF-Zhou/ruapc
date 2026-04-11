@@ -406,16 +406,13 @@ impl Devices {
         let list = RawDeviceList::available()?;
         let mut devices = Vec::with_capacity(list.len());
         for &device in list.iter() {
-            if !config.device_filter.is_empty() {
-                let name = unsafe { CStr::from_ptr((*device).name.as_ptr()) }
-                    .to_string_lossy()
-                    .to_string();
-                if !config.device_filter.contains(&name) {
-                    continue;
-                }
-            }
             let index = devices.len();
             let device = Device::open(device, index, config)?;
+            if !config.device_filter.is_empty() && !config.device_filter.contains(&device.info.name)
+            {
+                continue;
+            }
+
             devices.push(Arc::new(device));
         }
         if devices.is_empty() {
