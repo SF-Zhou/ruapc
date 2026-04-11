@@ -2,7 +2,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use tokio_util::sync::DropGuard;
 
-use crate::{Listener, Result, Router, SocketPoolConfig, SocketPoolTrait, State};
+use crate::{Devices, Listener, Result, Router, SocketPoolConfig, SocketPoolTrait, State};
 
 /// RPC server that listens for and handles incoming requests.
 ///
@@ -53,7 +53,19 @@ impl Server {
     /// let server = Server::create(router, &SocketPoolConfig::default()).unwrap();
     /// ```
     pub fn create(router: Router, config: &SocketPoolConfig) -> Result<Self> {
-        let (state, drop_guard) = State::create(router, config)?;
+        Self::create_with_devices(router, config, None)
+    }
+
+    /// Creates a new RPC server with device support for Remote Read/Write.
+    ///
+    /// When `devices` is provided, a `MemoryService` is automatically
+    /// registered to handle incoming Remote Read/Write requests.
+    pub fn create_with_devices(
+        router: Router,
+        config: &SocketPoolConfig,
+        devices: Option<Arc<Devices>>,
+    ) -> Result<Self> {
+        let (state, drop_guard) = State::create(router, config, devices)?;
 
         Ok(Self {
             state,

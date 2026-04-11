@@ -4,7 +4,7 @@ use serde::Serialize;
 use tokio_util::sync::DropGuard;
 
 use crate::{
-    Error, Result, Router, Socket, SocketPoolConfig, SocketTrait, State,
+    Devices, Error, Result, Router, Socket, SocketPoolConfig, SocketTrait, State,
     msg::{MsgFlags, MsgMeta},
 };
 
@@ -97,7 +97,19 @@ impl Context {
     /// let ctx = Context::create_with_router(router, &SocketPoolConfig::default()).unwrap();
     /// ```
     pub fn create_with_router(router: Router, config: &SocketPoolConfig) -> Result<Self> {
-        let (state, drop_guard) = State::create(router, config)?;
+        Self::create_with_router_and_devices(router, config, None)
+    }
+
+    /// Creates a new context with a custom router, configuration, and devices.
+    ///
+    /// When `devices` is provided, a `MemoryService` is automatically
+    /// registered to handle incoming Remote Read/Write requests from peers.
+    pub fn create_with_router_and_devices(
+        router: Router,
+        config: &SocketPoolConfig,
+        devices: Option<Arc<Devices>>,
+    ) -> Result<Self> {
+        let (state, drop_guard) = State::create(router, config, devices)?;
         Ok(Self {
             state,
             endpoint: SocketEndpoint::Invalid,
@@ -205,5 +217,72 @@ impl Context {
     /// * `err` - The error to send back
     pub async fn send_err_rsp(&mut self, err: Error) {
         self.send_rsp::<(), Error>(Err(err)).await;
+    }
+
+    /// Reads data from a remote peer's registered memory via reverse RPC.
+    ///
+    /// Sends a `MemoryService/read` request to the peer, which validates
+    /// the access and returns the data. The returned data is copied into
+    /// `local_buf` starting at offset 0.
+    ///
+    /// # Arguments
+    ///
+    /// * `remote` - Remote buffer info (key, addr, len) obtained from the peer
+    /// * `local_buf` - Local buffer to write the received data into
+    pub async fn remote_read(
+        &self,
+        remote: &crate::RemoteBufferInfo,
+        local_buf: &mut crate::Buffer,
+    ) -> Result<()> {
+        use crate::services::{MemoryReadReq, MemoryService};
+
+        let req = MemoryReadReq {
+            key: remote.key,
+            addr: remote.addr,
+            len: remote.len,
+        };
+        let client = crate::Client::default();
+        let data: Vec<u8> = client.read(self, &req).await?;
+        if data.len() > local_buf.len() {
+            return Err(Error::new(
+                crate::ErrorKind::InvalidArgument,
+                format!(
+                    "remote read returned {} bytes but local buffer is {} bytes",
+                    data.len(),
+                    local_buf.len()
+                ),
+            ));
+        }
+        local_buf[..data.len()].copy_from_slice(&data);
+        Ok(())
+    }
+
+    /// Writes data from a local buffer to a remote peer's registered memory
+    /// via reverse RPC.
+    ///
+    /// Sends a `MemoryService/write` request to the peer with the data,
+    /// which validates the access and writes the data.
+    ///
+    /// # Arguments
+    ///
+    /// * `remote` - Remote buffer info (key, addr, len) obtained from the peer
+    /// * `local_buf` - Local buffer containing the data to write
+    /// * `len` - Number of bytes to write from `local_buf`
+    pub async fn remote_write(
+        &self,
+        remote: &crate::RemoteBufferInfo,
+        local_buf: &crate::Buffer,
+        len: usize,
+    ) -> Result<()> {
+        use crate::services::{MemoryService, MemoryWriteReq};
+
+        let req = MemoryWriteReq {
+            key: remote.key,
+            addr: remote.addr,
+            data: local_buf[..len].to_vec(),
+        };
+        let client = crate::Client::default();
+        client.write(self, &req).await?;
+        Ok(())
     }
 }

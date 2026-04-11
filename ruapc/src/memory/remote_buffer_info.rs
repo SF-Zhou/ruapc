@@ -1,3 +1,4 @@
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::MemoryKey;
@@ -6,7 +7,7 @@ use super::MemoryKey;
 ///
 /// Transmitted via normal RPC messages so the remote side can issue
 /// Remote Read/Write operations against the described buffer.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
 pub struct RemoteBufferInfo {
     pub key: MemoryKey,
     pub addr: u64,
