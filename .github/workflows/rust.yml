@@ -10,6 +10,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUAPC_PREFER_RXE: "1"
 
 jobs:
   build:
@@ -53,7 +54,7 @@ jobs:
     - name: Install cargo-llvm-cov
       uses: taiki-e/install-action@v2
       with:
-        tool: cargo-llvm-cov,cargo-nextest
+        tool: cargo-llvm-cov
 
     - name: Run tests
       run: |
@@ -62,19 +63,11 @@ jobs:
         ibv_devinfo -d rxe_0 -v
         cargo fmt -- --check
         cargo clippy --release -- -D warnings
-        cargo llvm-cov nextest --all-features --ignore-filename-regex "ruapc-demo/*|ruapc-macro/*|ruapc/src/bin/*"
-        cargo llvm-cov report --cobertura --ignore-filename-regex "ruapc-demo/*|ruapc-macro/*|ruapc/src/bin/*" --output-path target/llvm-cov-target/cobertura.xml
+        cargo llvm-cov --all-features --ignore-filename-regex "ruapc-demo/*|ruapc-macro/*|ruapc/src/bin/*" --cobertura --output-path cobertura.xml
 
     - name: Upload coverage reports to Codecov
-      uses: codecov/codecov-action@v4
+      uses: codecov/codecov-action@v5
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
         slug: SF-Zhou/ruapc
-        files: target/llvm-cov-target/cobertura.xml
-
-    - name: Upload test results to Codecov
-      uses: codecov/test-results-action@v1
-      with:
-        token: ${{ secrets.CODECOV_TOKEN }}
-        slug: SF-Zhou/ruapc
-        files: target/nextest/default/junit.xml
+        files: cobertura.xml

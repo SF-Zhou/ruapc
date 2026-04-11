@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{DeviceConfig, Error, ErrorKind, GidType, Result, verbs};
 use std::{
+    collections::HashSet,
     ffi::{CStr, OsStr, c_int},
     ops::Deref,
     os::unix::ffi::OsStrExt,
@@ -380,6 +381,13 @@ impl Devices {
     /// println!("Found {} RDMA device(s)", devices.len());
     /// ```
     pub fn availables() -> Result<Devices> {
+        if std::env::var("RUAPC_PREFER_RXE").is_ok() {
+            let device_filter = HashSet::from(["rxe_0".to_string()]);
+            return Self::open(&DeviceConfig {
+                device_filter,
+                ..Default::default()
+            });
+        }
         Self::open(&Default::default())
     }
 
