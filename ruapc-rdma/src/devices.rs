@@ -381,8 +381,9 @@ impl Devices {
     /// ```
     pub fn availables() -> Result<Devices> {
         let devices = Self::open(&Default::default())?;
-        #[cfg(test)]
-        let devices = devices.prefer_rxe();
+        if std::env::var("RUAPC_PREFER_RXE").is_ok() {
+            return Ok(devices.prefer_rxe());
+        }
         Ok(devices)
     }
 
@@ -422,7 +423,6 @@ impl Devices {
     /// This is useful in test environments where RXE devices should be
     /// preferred over hardware RDMA devices when both are available.
     /// If no RXE device is found, the order remains unchanged.
-    #[cfg(test)]
     fn prefer_rxe(mut self) -> Self {
         self.0.sort_by_key(|d| {
             if d.info.name.to_ascii_lowercase().contains("rxe") {
