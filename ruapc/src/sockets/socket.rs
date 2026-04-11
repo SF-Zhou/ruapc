@@ -9,7 +9,7 @@ use crate::{MsgMeta, Result, State, http::HttpSocket, tcp::TcpSocket, ws::WebSoc
 /// The `Socket` enum provides a unified interface for different transport types:
 /// - TCP: Raw TCP socket
 /// - WS: WebSocket connection
-/// - HTTP: HTTP/1.1 connection
+/// - HTTP: HTTP/1.1 and HTTP/2 (h2c) connection
 /// - RDMA: RDMA connection (requires "rdma" feature)
 ///
 /// All socket types support the same `send` operation for transmitting messages.
