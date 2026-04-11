@@ -16,10 +16,7 @@ pub enum MemoryRegistration {
     #[cfg(feature = "rdma")]
     Rdma {
         device: Arc<Device>,
-        // Will hold RawMemoryRegion (*mut ibv_mr) in the future.
-        // For now, store lkey/rkey obtained during registration.
-        lkey: u32,
-        rkey: u32,
+        mr: ruapc_rdma::RawMemoryRegion,
     },
 }
 
@@ -29,14 +26,18 @@ impl MemoryRegistration {
         match self {
             MemoryRegistration::Tcp { id, .. } => MemoryKey::Tcp { id: *id },
             #[cfg(feature = "rdma")]
-            MemoryRegistration::Rdma { lkey, rkey, .. } => MemoryKey::Rdma {
-                lkey: *lkey,
-                rkey: *rkey,
+            MemoryRegistration::Rdma { mr, .. } => MemoryKey::Rdma {
+                lkey: mr.lkey,
+                rkey: mr.rkey,
             },
         }
     }
 
     /// Unregisters the memory from the associated device.
+    ///
+    /// For TCP, removes the ID from the registry.
+    /// For RDMA, the `RawMemoryRegion` is dropped (handled by the enum
+    /// variant being dropped), which calls `ibv_dereg_mr` automatically.
     pub fn unregister(&self, _mem: &AlignedMemory) {
         match self {
             MemoryRegistration::Tcp { device, id } => {
@@ -46,7 +47,9 @@ impl MemoryRegistration {
             }
             #[cfg(feature = "rdma")]
             MemoryRegistration::Rdma { .. } => {
-                // TODO: call ibv_dereg_mr when RawMemoryRegion is integrated
+                // RawMemoryRegion's Drop calls ibv_dereg_mr.
+                // Nothing extra to do here — the variant will be dropped
+                // when the MemoryRegistration is dropped.
             }
         }
     }
@@ -69,10 +72,10 @@ impl std::fmt::Debug for MemoryRegistration {
                 .field("id", id)
                 .finish(),
             #[cfg(feature = "rdma")]
-            MemoryRegistration::Rdma { lkey, rkey, .. } => f
+            MemoryRegistration::Rdma { mr, .. } => f
                 .debug_struct("MemoryRegistration::Rdma")
-                .field("lkey", lkey)
-                .field("rkey", rkey)
+                .field("lkey", &mr.lkey)
+                .field("rkey", &mr.rkey)
                 .finish(),
         }
     }

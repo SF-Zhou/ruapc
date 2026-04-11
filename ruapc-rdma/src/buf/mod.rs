@@ -10,7 +10,7 @@ mod aligned_buffer;
 pub use aligned_buffer::AlignedBuffer;
 
 mod rdma_buffer;
-pub use rdma_buffer::RegisteredBuffer;
+pub use rdma_buffer::{RawMemoryRegion, RegisteredBuffer};
 
 mod buffer_pool;
 pub use buffer_pool::{Buffer, BufferPool};

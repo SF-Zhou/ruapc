@@ -328,7 +328,7 @@ impl Device {
     /// # Safety
     ///
     /// The returned pointer is only valid as long as this `Device` exists.
-    pub(crate) fn pd_ptr(&self) -> *mut verbs::ibv_pd {
+    pub fn pd_ptr(&self) -> *mut verbs::ibv_pd {
         self.protection_domain.0
     }
 

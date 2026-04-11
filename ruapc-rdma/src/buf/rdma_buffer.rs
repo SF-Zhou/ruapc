@@ -4,7 +4,21 @@ use crate::*;
 ///
 /// Wraps an InfiniBand memory region pointer and ensures
 /// proper cleanup on drop.
-struct RawMemoryRegion(*mut verbs::ibv_mr);
+pub struct RawMemoryRegion(*mut verbs::ibv_mr);
+
+impl RawMemoryRegion {
+    /// Creates a new `RawMemoryRegion` from a raw `ibv_mr` pointer.
+    ///
+    /// # Safety
+    ///
+    /// The pointer must be a valid, non-null `ibv_mr` pointer returned
+    /// by `ibv_reg_mr`. The caller transfers ownership to `RawMemoryRegion`,
+    /// which will call `ibv_dereg_mr` on drop.
+    pub unsafe fn from_raw(ptr: *mut verbs::ibv_mr) -> Self {
+        Self(ptr)
+    }
+}
+
 impl std::ops::Deref for RawMemoryRegion {
     type Target = verbs::ibv_mr;
 
@@ -74,7 +88,7 @@ impl RegisteredBuffer {
             if mr.is_null() {
                 return Err(ErrorKind::IBRegMemoryRegionFail.with_errno());
             }
-            memory_regions.push(RawMemoryRegion(mr));
+            memory_regions.push(unsafe { RawMemoryRegion::from_raw(mr) });
         }
         Ok(Self {
             memory_regions,
@@ -110,7 +124,7 @@ impl RegisteredBuffer {
     ///
     /// The remote key for this buffer on the specified device.
     pub fn rkey(&self, index: usize) -> u32 {
-        self.memory_regions[index].lkey
+        self.memory_regions[index].rkey
     }
 }
 

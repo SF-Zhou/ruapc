@@ -37,6 +37,7 @@ impl Memory {
     }
 
     /// Registers the aligned memory on a single device.
+    #[allow(unsafe_code)]
     fn register_on_device(mem: &AlignedMemory, device: &Arc<Device>) -> Result<MemoryRegistration> {
         match device.as_ref() {
             Device::Tcp(tcp) => {
@@ -47,13 +48,25 @@ impl Memory {
                 })
             }
             #[cfg(feature = "rdma")]
-            Device::Rdma(_rdma) => {
-                // TODO: call ibv_reg_mr via RdmaDevice and store RawMemoryRegion.
-                // For now, return placeholder keys.
+            Device::Rdma(rdma) => {
+                let mr = unsafe {
+                    ruapc_rdma::verbs::ibv_reg_mr(
+                        rdma.pd_ptr(),
+                        mem.as_ptr() as *mut _,
+                        mem.size(),
+                        ruapc_rdma::verbs::ACCESS_FLAGS as _,
+                    )
+                };
+                if mr.is_null() {
+                    return Err(Error::new(
+                        ErrorKind::InvalidArgument,
+                        "ibv_reg_mr failed".into(),
+                    ));
+                }
+                let raw_mr = unsafe { ruapc_rdma::RawMemoryRegion::from_raw(mr) };
                 Ok(MemoryRegistration::Rdma {
                     device: device.clone(),
-                    lkey: 0,
-                    rkey: 0,
+                    mr: raw_mr,
                 })
             }
         }
