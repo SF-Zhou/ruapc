@@ -100,9 +100,9 @@ impl TcpDevice {
 
         let region_start = region.addr as u64;
         let region_end = region_start + region.len as u64;
-        let access_end = addr.checked_add(len).ok_or_else(|| {
-            Error::new(ErrorKind::InvalidArgument, "addr + len overflow".into())
-        })?;
+        let access_end = addr
+            .checked_add(len)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidArgument, "addr + len overflow".into()))?;
 
         if addr < region_start || access_end > region_end {
             return Err(Error::new(

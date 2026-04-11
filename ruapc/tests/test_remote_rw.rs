@@ -100,8 +100,7 @@ async fn test_tcp_remote_read() {
     let client_device = client_devices.add_tcp_device();
     let client_devices = Arc::new(client_devices);
 
-    let client_pool =
-        BufferPool::new(client_devices.clone(), 2 * 1024 * 1024, 2 * 1024 * 1024, 0);
+    let client_pool = BufferPool::new(client_devices.clone(), 2 * 1024 * 1024, 2 * 1024 * 1024, 0);
 
     // Allocate client buffer and fill with test data.
     let mut client_buf = client_pool.allocate().unwrap();
@@ -164,8 +163,7 @@ async fn test_tcp_remote_write() {
     let client_device = client_devices.add_tcp_device();
     let client_devices = Arc::new(client_devices);
 
-    let client_pool =
-        BufferPool::new(client_devices.clone(), 2 * 1024 * 1024, 2 * 1024 * 1024, 0);
+    let client_pool = BufferPool::new(client_devices.clone(), 2 * 1024 * 1024, 2 * 1024 * 1024, 0);
 
     // Allocate client buffer (initially zeroed by the allocator).
     let client_buf = client_pool.allocate().unwrap();
@@ -236,8 +234,7 @@ async fn test_tcp_remote_read_bounds_check() {
     let client_device = client_devices.add_tcp_device();
     let client_devices = Arc::new(client_devices);
 
-    let client_pool =
-        BufferPool::new(client_devices.clone(), 2 * 1024 * 1024, 2 * 1024 * 1024, 0);
+    let client_pool = BufferPool::new(client_devices.clone(), 2 * 1024 * 1024, 2 * 1024 * 1024, 0);
     let client_buf = client_pool.allocate().unwrap();
     let rbi = client_buf.remote_buffer_info(&client_device).unwrap();
 
