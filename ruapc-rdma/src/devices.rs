@@ -382,7 +382,7 @@ impl Devices {
     pub fn availables() -> Result<Devices> {
         let devices = Self::open(&Default::default())?;
         if std::env::var("RUAPC_PREFER_RXE").is_ok() {
-            return Ok(devices.prefer_rxe());
+            return devices.only_rxe();
         }
         Ok(devices)
     }
@@ -418,20 +418,22 @@ impl Devices {
         }
     }
 
-    /// Reorders devices so that RXE (Soft-RoCE) devices come first.
+    /// Filters devices to only keep RXE (Soft-RoCE) devices.
     ///
-    /// This is useful in test environments where RXE devices should be
-    /// preferred over hardware RDMA devices when both are available.
-    /// If no RXE device is found, the order remains unchanged.
-    fn prefer_rxe(mut self) -> Self {
-        self.0.sort_by_key(|d| {
-            if d.info.name.to_ascii_lowercase().contains("rxe") {
-                0
-            } else {
-                1
-            }
-        });
-        self
+    /// This is useful in test environments where only RXE devices should
+    /// be used, filtering out hardware RDMA devices that may be present
+    /// but not functional.
+    fn only_rxe(self) -> Result<Devices> {
+        let filtered: Vec<_> = self
+            .0
+            .into_iter()
+            .filter(|d| d.info.name.to_ascii_lowercase().contains("rxe"))
+            .collect();
+        if filtered.is_empty() {
+            Err(ErrorKind::IBDeviceNotFound.into())
+        } else {
+            Ok(Devices(filtered))
+        }
     }
 }
 
