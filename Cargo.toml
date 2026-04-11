@@ -7,7 +7,9 @@ authors = ["SF-Zhou <sfzhou.scut@gmail.com>"]
 edition = "2024"
 homepage = "https://github.com/SF-Zhou/ruapc"
 repository = "https://github.com/SF-Zhou/ruapc"
-description = "A Rust RPC library"
+description = "A high-performance Rust RPC library supporting TCP, WebSocket, HTTP/2, and RDMA transports"
+keywords = ["rpc", "http2", "rdma", "async"]
+categories = ["network-programming", "asynchronous"]
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
