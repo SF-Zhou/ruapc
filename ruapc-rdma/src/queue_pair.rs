@@ -159,6 +159,64 @@ impl QueuePair {
         }
     }
 
+    pub fn rdma_read(
+        &self,
+        wr_id: verbs::WRID,
+        local_buf: &Buffer,
+        remote_addr: u64,
+        rkey: u32,
+    ) -> Result<()> {
+        let mut send_sge = verbs::ibv_sge {
+            addr: local_buf.as_ptr() as _,
+            length: local_buf.capacity() as _,
+            lkey: local_buf.lkey(&self.device),
+        };
+        let mut send_wr = verbs::ibv_send_wr {
+            wr_id,
+            sg_list: &mut send_sge as *mut _,
+            num_sge: 1,
+            opcode: verbs::ibv_wr_opcode::IBV_WR_RDMA_READ,
+            send_flags: verbs::ibv_send_flags::IBV_SEND_SIGNALED.0,
+            ..Default::default()
+        };
+        send_wr.wr.rdma.remote_addr = remote_addr;
+        send_wr.wr.rdma.rkey = rkey;
+
+        match self.post_send(&mut send_wr) {
+            0 => Ok(()),
+            _ => Err(ErrorKind::IBPostSendFailed.with_errno()),
+        }
+    }
+
+    pub fn rdma_write(
+        &self,
+        wr_id: verbs::WRID,
+        local_buf: &Buffer,
+        remote_addr: u64,
+        rkey: u32,
+    ) -> Result<()> {
+        let mut send_sge = verbs::ibv_sge {
+            addr: local_buf.as_ptr() as _,
+            length: local_buf.len() as _,
+            lkey: local_buf.lkey(&self.device),
+        };
+        let mut send_wr = verbs::ibv_send_wr {
+            wr_id,
+            sg_list: &mut send_sge as *mut _,
+            num_sge: 1,
+            opcode: verbs::ibv_wr_opcode::IBV_WR_RDMA_WRITE,
+            send_flags: verbs::ibv_send_flags::IBV_SEND_SIGNALED.0,
+            ..Default::default()
+        };
+        send_wr.wr.rdma.remote_addr = remote_addr;
+        send_wr.wr.rdma.rkey = rkey;
+
+        match self.post_send(&mut send_wr) {
+            0 => Ok(()),
+            _ => Err(ErrorKind::IBPostSendFailed.with_errno()),
+        }
+    }
+
     pub fn ready_to_recv(&self, remote: &Endpoint) -> Result<()> {
         let mut attr = verbs::ibv_qp_attr {
             qp_state: verbs::ibv_qp_state::IBV_QPS_RTR,
@@ -381,5 +439,95 @@ mod tests {
         assert_eq!(comp_b[0].status, verbs::ibv_wc_status::IBV_WC_SUCCESS);
         assert_eq!(comp_b[0].byte_len, send_len as u32);
         assert!(&recv_slice[..send_len] == send_slice);
+    }
+
+    #[test]
+    fn test_rdma_read() {
+        let devices = Devices::availables().unwrap();
+
+        let cap = verbs::ibv_qp_cap {
+            max_send_wr: 64,
+            max_recv_wr: 64,
+            max_send_sge: 1,
+            max_recv_sge: 1,
+            max_inline_data: 0,
+        };
+
+        let qp_a = QueuePair::create(&devices[0], cap).unwrap();
+        let qp_b = QueuePair::create(&devices[0], cap).unwrap();
+        qp_a.connect(&qp_b.endpoint()).unwrap();
+        qp_b.connect(&qp_a.endpoint()).unwrap();
+
+        const LEN: usize = 4096;
+        let buffer_pool = BufferPool::create(LEN, 32, &devices).unwrap();
+
+        // A side: register memory and fill with test data.
+        let mut buf_a = buffer_pool.allocate().unwrap();
+        let test_data: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+        buf_a.extend_from_slice(&test_data).unwrap();
+        let remote_addr = buf_a.as_ptr() as u64;
+        let rkey = buf_a.rkey(&devices[0]);
+
+        // B side: allocate empty buffer, issue RDMA Read from A.
+        let buf_b = buffer_pool.allocate().unwrap();
+        qp_b.rdma_read(WRID::send_data(1), &buf_b, remote_addr, rkey)
+            .unwrap();
+
+        // Wait and poll completion on B side.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let mut wcs = vec![verbs::ibv_wc::default(); 128];
+        let comp = qp_b.poll_cq(&mut wcs).unwrap();
+        assert_eq!(comp.len(), 1);
+        assert_eq!(comp[0].status, verbs::ibv_wc_status::IBV_WC_SUCCESS);
+
+        // Verify the data was read correctly.
+        // buf_b has length 0 (never extended), but RDMA wrote into raw memory.
+        let read_data = unsafe { std::slice::from_raw_parts(buf_b.as_ptr() as *const u8, LEN) };
+        assert_eq!(read_data, &test_data[..]);
+    }
+
+    #[test]
+    fn test_rdma_write() {
+        let devices = Devices::availables().unwrap();
+
+        let cap = verbs::ibv_qp_cap {
+            max_send_wr: 64,
+            max_recv_wr: 64,
+            max_send_sge: 1,
+            max_recv_sge: 1,
+            max_inline_data: 0,
+        };
+
+        let qp_a = QueuePair::create(&devices[0], cap).unwrap();
+        let qp_b = QueuePair::create(&devices[0], cap).unwrap();
+        qp_a.connect(&qp_b.endpoint()).unwrap();
+        qp_b.connect(&qp_a.endpoint()).unwrap();
+
+        const LEN: usize = 4096;
+        let buffer_pool = BufferPool::create(LEN, 32, &devices).unwrap();
+
+        // A side: register empty buffer (target for write).
+        let mut buf_a = buffer_pool.allocate().unwrap();
+        buf_a.extend_from_slice(&vec![0u8; LEN]).unwrap();
+        let remote_addr = buf_a.as_ptr() as u64;
+        let rkey = buf_a.rkey(&devices[0]);
+
+        // B side: fill buffer with test data, issue RDMA Write to A.
+        let mut buf_b = buffer_pool.allocate().unwrap();
+        let test_data: Vec<u8> = (0..LEN).map(|i| (i % 199) as u8).collect();
+        buf_b.extend_from_slice(&test_data).unwrap();
+        qp_b.rdma_write(WRID::send_data(1), &buf_b, remote_addr, rkey)
+            .unwrap();
+
+        // Wait and poll completion on B side.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let mut wcs = vec![verbs::ibv_wc::default(); 128];
+        let comp = qp_b.poll_cq(&mut wcs).unwrap();
+        assert_eq!(comp.len(), 1);
+        assert_eq!(comp[0].status, verbs::ibv_wc_status::IBV_WC_SUCCESS);
+
+        // Verify A side memory was modified.
+        let a_data: &[u8] = unsafe { std::mem::transmute(&*buf_a) };
+        assert_eq!(&a_data[..LEN], &test_data[..]);
     }
 }
