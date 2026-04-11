@@ -425,7 +425,11 @@ impl Devices {
     #[cfg(test)]
     fn prefer_rxe(mut self) -> Self {
         self.0.sort_by_key(|d| {
-            if d.info.name.to_ascii_lowercase().contains("rxe") { 0 } else { 1 }
+            if d.info.name.to_ascii_lowercase().contains("rxe") {
+                0
+            } else {
+                1
+            }
         });
         self
     }
