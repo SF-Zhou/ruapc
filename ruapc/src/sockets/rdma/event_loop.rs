@@ -118,7 +118,7 @@ impl RecvHandler {
 
             // Wrap completed buffer in Payload::Buffer (zero-copy); pool returns it on drop.
             let data_len = wc.byte_len as usize;
-            let payload = Payload::Buffer(Arc::new(new_buf), 0, data_len);
+            let payload = Payload::Buffer(new_buf, 0, data_len);
 
             if let Ok(msg) = Message::parse(payload)
                 && let Err(e) = state.handle_recv(&Socket::from(socket), msg)

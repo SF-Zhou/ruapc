@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use bytes::{Buf, Bytes, BytesMut};
 use serde::Deserialize;
 
@@ -19,7 +17,7 @@ pub enum Payload {
     /// Normal heap-allocated payload.
     Normal(Bytes),
     /// Zero-copy receive buffer: (buffer, start_offset, valid_end).
-    Buffer(Arc<Buffer>, usize, usize),
+    Buffer(Buffer, usize, usize),
 }
 
 impl Payload {
@@ -149,8 +147,8 @@ impl From<Payload> for Bytes {
     }
 }
 
-impl From<(Arc<Buffer>, usize)> for Payload {
-    fn from((buf, len): (Arc<Buffer>, usize)) -> Self {
+impl From<(Buffer, usize)> for Payload {
+    fn from((buf, len): (Buffer, usize)) -> Self {
         Payload::Buffer(buf, 0, len)
     }
 }
