@@ -10,12 +10,12 @@
 
 use std::{collections::BTreeSet, sync::Arc, time::Instant};
 
-use ruapc_rdma::{Buffer, verbs};
+use ruapc_rdma::verbs;
 use tokio::io::{Interest, unix::AsyncFd};
 
-use crate::{Error, ErrorKind, Message, Result, Socket, State};
+use crate::{Error, ErrorKind, Message, Result, Socket, State, memory::Buffer};
 
-use super::RdmaSocket;
+use super::{QueuePairExt, RdmaSocket};
 
 /// Handler for RDMA receive operations
 ///
@@ -229,18 +229,30 @@ impl Default for FlowConfig {
 /// - Implementing flow control logic
 /// - Handling acknowledgments
 /// - Maintaining operation statistics
+///
+/// # Drop order
+///
+/// RDMA resources must be destroyed in the correct order:
+///   1. Ack CQ events (in the custom `Drop` impl)
+///   2. Drop `recv` / `send` handlers — releases Buffers back to the pool
+///   3. Drop `socket` — may be the last `Arc<RdmaSocket>`, destroying the QP
+///
+/// Rust drops fields in **declaration order**, so `recv` and `send` are
+/// intentionally placed before `socket`.
 #[derive(Debug)]
 pub struct EventLoop {
-    socket: Arc<RdmaSocket>,
-    state: Arc<State>,
-    pending_receiver: tokio::sync::mpsc::Receiver<u64>,
-    pending_sends: BTreeSet<u64>,
-    unack_cq_events: usize,
-
+    // --- handlers first: release Buffers before the QP is destroyed ---
     recv: RecvHandler,
     send: SendHandler,
     last_ack_timestamp: Instant,
     flow_config: FlowConfig,
+    unack_cq_events: usize,
+
+    // --- then the socket (QP) ---
+    socket: Arc<RdmaSocket>,
+    state: Arc<State>,
+    pending_receiver: tokio::sync::mpsc::Receiver<u64>,
+    pending_sends: BTreeSet<u64>,
 }
 
 impl EventLoop {
@@ -258,15 +270,15 @@ impl EventLoop {
         pending_receiver: tokio::sync::mpsc::Receiver<u64>,
     ) -> Self {
         Self {
-            socket,
-            state,
-            pending_receiver,
-            pending_sends: BTreeSet::new(),
-            unack_cq_events: 0,
             recv: RecvHandler::default(),
             send: SendHandler::default(),
             last_ack_timestamp: Instant::now(),
             flow_config: FlowConfig::default(),
+            unack_cq_events: 0,
+            socket,
+            state,
+            pending_receiver,
+            pending_sends: BTreeSet::new(),
         }
     }
 

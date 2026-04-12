@@ -8,7 +8,7 @@ use crate::{MsgFlags, MsgMeta, Result};
 /// The payload can be:
 /// - **Empty**: No data
 /// - **Normal**: Standard heap-allocated bytes
-/// - **RDMA**: Zero-copy RDMA buffer (requires "rdma" feature)
+/// - **RDMA**: Zero-copy registered buffer (requires "rdma" feature)
 ///
 /// This abstraction allows efficient handling of different memory types
 /// while providing a uniform interface.
@@ -19,9 +19,9 @@ pub enum Payload {
     Empty,
     /// Normal heap-allocated payload.
     Normal(Bytes),
-    /// RDMA buffer payload with offset (requires "rdma" feature).
+    /// Registered buffer payload with offset (requires "rdma" feature).
     #[cfg(feature = "rdma")]
-    RDMA(ruapc_rdma::Buffer, usize),
+    RDMA(crate::memory::Buffer, usize),
 }
 
 impl Payload {
@@ -157,8 +157,8 @@ impl From<Payload> for Bytes {
 }
 
 #[cfg(feature = "rdma")]
-impl From<ruapc_rdma::Buffer> for Payload {
-    fn from(value: ruapc_rdma::Buffer) -> Self {
+impl From<crate::memory::Buffer> for Payload {
+    fn from(value: crate::memory::Buffer) -> Self {
         Payload::RDMA(value, 0)
     }
 }

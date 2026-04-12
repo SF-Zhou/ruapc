@@ -1,26 +1,32 @@
 use std::sync::Arc;
 
-use ruapc_rdma::{Buffer, BufferPool, QueuePair, verbs::WRID};
+use ruapc_rdma::{QueuePair, verbs::WRID};
 use serde::Serialize;
 use tokio::sync::mpsc::Sender;
 
-use super::RdmaState;
+use super::{QueuePairExt, RdmaState};
 use crate::{
     Error, SocketTrait, State,
     error::{ErrorKind, Result},
+    memory::{Buffer, BufferPool},
     msg::{MsgMeta, SendMsg},
 };
 
 #[derive(Debug)]
 pub struct RdmaSocket {
-    pub(crate) queue_pair: QueuePair,
-    pub(crate) rdmabuf_pool: Arc<BufferPool>,
-    pub(crate) send_buffers: dashmap::DashMap<u64, Arc<Buffer>>,
-    pub(crate) state: RdmaState,
-    pub(crate) pending_sender: Sender<u64>,
     /// Pending RDMA one-sided operation completions (wr_id -> status sender).
     pub(crate) rdma_completions:
         dashmap::DashMap<WRID, tokio::sync::oneshot::Sender<ruapc_rdma::verbs::ibv_wc_status>>,
+    /// Buffers for in-flight sends — dropped before QP so that any Arc<Buffer>
+    /// references are released before we destroy the queue pair.
+    pub(crate) send_buffers: dashmap::DashMap<u64, Arc<Buffer>>,
+    /// Shared buffer pool — its Arc is decremented before QP destruction,
+    /// but actual pool cleanup waits until *all* Arcs (from Buffers) are gone.
+    pub(crate) rdmabuf_pool: Arc<BufferPool>,
+    /// The RDMA queue pair — destroyed after send_buffers and rdmabuf_pool Arcs.
+    pub(crate) queue_pair: QueuePair,
+    pub(crate) state: RdmaState,
+    pub(crate) pending_sender: Sender<u64>,
 }
 
 impl RdmaSocket {
@@ -30,12 +36,12 @@ impl RdmaSocket {
         pending_sender: Sender<u64>,
     ) -> Self {
         Self {
-            queue_pair,
-            rdmabuf_pool,
+            rdma_completions: dashmap::DashMap::default(),
             send_buffers: dashmap::DashMap::default(),
+            rdmabuf_pool,
+            queue_pair,
             state: RdmaState::new(32),
             pending_sender,
-            rdma_completions: dashmap::DashMap::default(),
         }
     }
 
@@ -81,6 +87,7 @@ impl SendMsg for Buffer {
     }
 
     fn prepare(&mut self) -> Result<()> {
+        self.set_len(0);
         Ok(())
     }
 

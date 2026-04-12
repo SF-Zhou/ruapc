@@ -110,6 +110,17 @@ impl Devices {
         self.devices.get(index)
     }
 
+    /// Finds the `Device` that wraps the given `ruapc_rdma::Device`.
+    ///
+    /// Returns `None` if no device in the collection wraps the same Arc.
+    #[cfg(feature = "rdma")]
+    pub fn find_by_rdma_device(&self, inner: &Arc<ruapc_rdma::Device>) -> Option<&Arc<Device>> {
+        self.devices.iter().find(|d| match d.as_ref() {
+            Device::Rdma(r) => Arc::ptr_eq(r.inner(), inner),
+            _ => false,
+        })
+    }
+
     /// Collects the inner `ruapc_rdma::Device` arcs from all RDMA devices.
     ///
     /// Returns a `ruapc_rdma::Devices` built from the same `Arc`s that back
