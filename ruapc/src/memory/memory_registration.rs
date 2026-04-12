@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use crate::device::{Device, TcpDevice};
-use crate::memory::AlignedMemory;
 use crate::memory::MemoryKey;
 
 /// Represents the registration state of an `AlignedMemory` on a specific device.
@@ -33,12 +32,23 @@ impl MemoryRegistration {
         }
     }
 
+    /// Returns a reference to the device this registration belongs to.
+    pub fn device(&self) -> &Arc<Device> {
+        match self {
+            MemoryRegistration::Tcp { device, .. } => device,
+            #[cfg(feature = "rdma")]
+            MemoryRegistration::Rdma { device, .. } => device,
+        }
+    }
+}
+
+impl ruapc_bufpool::Registration for MemoryRegistration {
     /// Unregisters the memory from the associated device.
     ///
     /// For TCP, removes the ID from the registry.
     /// For RDMA, the `RawMemoryRegion` is dropped (handled by the enum
     /// variant being dropped), which calls `ibv_dereg_mr` automatically.
-    pub fn unregister(&self, _mem: &AlignedMemory) {
+    fn unregister(&self, _buf: &[u8]) {
         match self {
             MemoryRegistration::Tcp { device, id } => {
                 if let Some(tcp) = as_tcp_device(device) {
@@ -51,15 +61,6 @@ impl MemoryRegistration {
                 // Nothing extra to do here — the variant will be dropped
                 // when the MemoryRegistration is dropped.
             }
-        }
-    }
-
-    /// Returns a reference to the device this registration belongs to.
-    pub fn device(&self) -> &Arc<Device> {
-        match self {
-            MemoryRegistration::Tcp { device, .. } => device,
-            #[cfg(feature = "rdma")]
-            MemoryRegistration::Rdma { device, .. } => device,
         }
     }
 }

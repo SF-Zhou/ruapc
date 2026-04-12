@@ -1,4 +1,5 @@
 use std::alloc::{Layout, alloc, dealloc};
+use std::io::{Error, ErrorKind, Result};
 use std::ptr::NonNull;
 
 /// Alignment size: 2 MiB for huge page compatibility on 64-bit platforms.
@@ -29,31 +30,25 @@ impl AlignedMemory {
     ///
     /// The size is rounded up to a multiple of the alignment.
     /// Returns an error if size is zero or allocation fails.
-    pub fn new(size: usize) -> crate::Result<Self> {
+    pub fn new(size: usize) -> Result<Self> {
         if size == 0 {
-            return Err(crate::Error::new(
-                crate::ErrorKind::InvalidArgument,
-                "cannot allocate zero-sized memory".into(),
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "cannot allocate zero-sized memory",
             ));
         }
 
         // Round up to alignment boundary.
         let size = (size + ALIGN - 1) & !(ALIGN - 1);
-        let layout = Layout::from_size_align(size, ALIGN).map_err(|e| {
-            crate::Error::new(
-                crate::ErrorKind::InvalidArgument,
-                format!("bad layout: {e}"),
-            )
-        })?;
+        let layout = Layout::from_size_align(size, ALIGN)
+            .map_err(|e| Error::new(ErrorKind::InvalidInput, format!("bad layout: {e}")))?;
 
         // SAFETY: layout has non-zero size (checked above).
         let ptr = unsafe { alloc(layout) };
         let ptr = NonNull::new(ptr).ok_or_else(|| {
-            crate::Error::new(
-                crate::ErrorKind::Unknown(format!(
-                    "failed to allocate {size} bytes with {ALIGN} alignment"
-                )),
-                String::new(),
+            Error::new(
+                ErrorKind::OutOfMemory,
+                format!("failed to allocate {size} bytes with {ALIGN} alignment"),
             )
         })?;
 

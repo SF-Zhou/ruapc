@@ -6,6 +6,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::DropGuard;
 
 use super::{Endpoint, EventLoop, RdmaInfo, RdmaService, RdmaSocket};
+use crate::device::DevicesExt;
 use crate::{
     Client, Context, Error, ErrorKind, Result, Socket, SocketPoolConfig, SocketPoolTrait,
     SocketType, State, TaskSupervisor, memory::BufferPool,
