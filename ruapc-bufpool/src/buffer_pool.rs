@@ -1,8 +1,9 @@
 use std::collections::VecDeque;
-use std::io::{Error, ErrorKind, Result};
+use std::io::{Error, Result};
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 
+use aliasable::boxed::AliasableBox;
 use tokio::sync::oneshot;
 
 use crate::buffer::Buffer;
@@ -28,7 +29,7 @@ pub struct BufferPool<D: Device> {
 }
 
 struct PoolInner<D: Device> {
-    memories: Vec<Memory<D::Registration>>,
+    memories: Vec<AliasableBox<Memory<D::Registration>>>,
     free_list: VecDeque<FreeSlot>,
     allocated_memory: usize,
     waiters: VecDeque<oneshot::Sender<()>>,
@@ -95,25 +96,21 @@ impl<D: Device> BufferPool<D> {
                 match self.allocate_inner(&mut inner) {
                     Ok(buf) => return Ok(buf),
                     Err(_) => {
-                        // Memory limit reached and free list empty — wait.
                         let (tx, rx) = oneshot::channel();
                         inner.waiters.push_back(tx);
                         rx
                     }
                 }
             };
-            // Wait outside the lock for a buffer to be returned.
             let _ = rx.await;
         }
     }
 
     fn allocate_inner(self: &Arc<Self>, inner: &mut PoolInner<D>) -> Result<Buffer<D>> {
-        // Try to pop from the free list.
         if let Some(slot) = inner.free_list.pop_front() {
             return self.make_buffer(inner, slot);
         }
 
-        // Free list empty — try to allocate a new chunk.
         if self.max_memory == 0 || inner.allocated_memory + self.chunk_size <= self.max_memory {
             self.allocate_chunk(inner)?;
             if let Some(slot) = inner.free_list.pop_front() {
@@ -129,8 +126,6 @@ impl<D: Device> BufferPool<D> {
         let memory_index = inner.memories.len();
         let blocks_per_chunk = self.chunk_size / self.block_size;
 
-        // Note: Memory::new rounds up to alignment boundary, so actual
-        // size may be larger. We use chunk_size for block counting.
         for block_index in 0..blocks_per_chunk {
             inner.free_list.push_back(FreeSlot {
                 memory_index,
@@ -139,21 +134,30 @@ impl<D: Device> BufferPool<D> {
         }
 
         inner.allocated_memory += mem.aligned_memory().size();
-        inner.memories.push(mem);
+        inner
+            .memories
+            .push(AliasableBox::from_unique(Box::new(mem)));
         Ok(())
     }
 
     #[allow(unsafe_code)]
     fn make_buffer(self: &Arc<Self>, inner: &PoolInner<D>, slot: FreeSlot) -> Result<Buffer<D>> {
-        let mem = &inner.memories[slot.memory_index];
+        let mem: &Memory<D::Registration> = &inner.memories[slot.memory_index];
         let base = mem.aligned_memory().as_ptr();
         let offset = slot.block_index * self.block_size;
         // SAFETY: offset is within the allocated memory region.
         let ptr = unsafe { NonNull::new_unchecked(base.add(offset) as *mut u8) };
+        // SAFETY: The Memory lives inside an AliasableBox in the append-only
+        // Vec. The AliasableBox heap-allocates Memory so its address is stable
+        // even when the Vec grows. The Buffer holds Arc<BufferPool> which keeps
+        // the pool (and thus the PoolInner with all memories) alive for the
+        // Buffer's lifetime.
+        let memory = NonNull::from(mem);
         Ok(Buffer::new(
             Arc::clone(self),
             ptr,
             self.block_size,
+            memory,
             slot.memory_index,
             slot.block_index,
         ))
@@ -166,38 +170,9 @@ impl<D: Device> BufferPool<D> {
             memory_index,
             block_index,
         });
-        // Wake one waiter, if any.
         if let Some(tx) = inner.waiters.pop_front() {
             let _ = tx.send(());
         }
-    }
-
-    /// Returns a reference to the registration for the given memory chunk
-    /// and device index.
-    ///
-    /// This is used by consumer crates (e.g. `ruapc`) to look up
-    /// device-specific keys from registrations.
-    pub fn registration(
-        &self,
-        memory_index: usize,
-        device_index: usize,
-    ) -> Result<&D::Registration> {
-        let inner = self.inner.lock().unwrap();
-        let mem = inner.memories.get(memory_index).ok_or_else(|| {
-            Error::new(
-                ErrorKind::InvalidInput,
-                format!("invalid memory index {memory_index}"),
-            )
-        })?;
-        // SAFETY: We return a reference to a Registration that lives inside
-        // a Memory which is owned by PoolInner. The PoolInner is behind a
-        // Mutex inside Arc<BufferPool>, so the Memory won't be dropped while
-        // the BufferPool is alive. We need to extend the lifetime past the
-        // MutexGuard since the underlying data is stable (memories Vec is
-        // append-only, Memory contents don't move).
-        let reg = mem.registration(device_index)?;
-        let reg: &D::Registration = unsafe { &*(reg as *const D::Registration) };
-        Ok(reg)
     }
 
     /// Returns the total memory allocated from the OS.

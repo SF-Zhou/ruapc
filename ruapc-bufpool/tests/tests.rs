@@ -290,7 +290,8 @@ fn pool_allocate_and_return() {
     assert_eq!(buf.capacity(), BLOCK);
     assert_eq!(buf.len(), BLOCK); // len == capacity by default
     assert!(!buf.is_empty());
-    assert_eq!(buf.memory_index(), 0);
+    // Verify the buffer has a valid memory reference.
+    assert!(!buf.memory().registrations().is_empty());
 
     // After allocating one block from a 1-block chunk, free count is 0.
     assert_eq!(pool.free_count(), 0);
@@ -342,8 +343,10 @@ fn pool_multiple_chunks() {
     let buf1 = pool.allocate().unwrap();
     let buf2 = pool.allocate().unwrap();
 
-    assert_eq!(buf1.memory_index(), 0);
-    assert_eq!(buf2.memory_index(), 1);
+    // Two buffers from different chunks should point to different Memory objects.
+    let mem1_ptr = buf1.memory() as *const _;
+    let mem2_ptr = buf2.memory() as *const _;
+    assert_ne!(mem1_ptr, mem2_ptr);
 
     drop(buf1);
     drop(buf2);
@@ -351,22 +354,21 @@ fn pool_multiple_chunks() {
 }
 
 #[test]
-fn pool_registration_lookup() {
+fn buffer_memory_registration_lookup() {
     let devices = mock_devices(2);
     let pool = mock_pool(devices, 0);
 
     let buf = pool.allocate().unwrap();
 
-    let reg0 = pool.registration(buf.memory_index(), 0).unwrap();
+    // Access registrations directly through buf.memory().
+    let reg0 = buf.memory().registration(0).unwrap();
     assert_eq!(reg0.device_index, 0);
 
-    let reg1 = pool.registration(buf.memory_index(), 1).unwrap();
+    let reg1 = buf.memory().registration(1).unwrap();
     assert_eq!(reg1.device_index, 1);
 
     // Invalid device index.
-    assert!(pool.registration(buf.memory_index(), 99).is_err());
-    // Invalid memory index.
-    assert!(pool.registration(99, 0).is_err());
+    assert!(buf.memory().registration(99).is_err());
 }
 
 #[test]
@@ -487,7 +489,6 @@ fn buffer_debug_format() {
     let debug = format!("{buf:?}");
     assert!(debug.contains("Buffer"));
     assert!(debug.contains("capacity"));
-    assert!(debug.contains("memory_index"));
 }
 
 // ---------------------------------------------------------------------------

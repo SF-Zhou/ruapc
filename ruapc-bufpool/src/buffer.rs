@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::buffer_pool::BufferPool;
 use crate::device::Device;
+use crate::memory::Memory;
 
 /// A memory buffer allocated from a [`BufferPool`].
 ///
@@ -25,6 +26,10 @@ pub struct Buffer<D: Device> {
     ptr: NonNull<u8>,
     capacity: usize,
     len: usize,
+    /// Pointer to the Memory this buffer's block belongs to.
+    /// Valid for the lifetime of the Buffer because the pool (held
+    /// via `Arc<BufferPool>`) keeps all memories alive.
+    memory: NonNull<Memory<D::Registration>>,
     memory_index: usize,
     block_index: usize,
 }
@@ -44,6 +49,7 @@ impl<D: Device> Buffer<D> {
         pool: Arc<BufferPool<D>>,
         ptr: NonNull<u8>,
         capacity: usize,
+        memory: NonNull<Memory<D::Registration>>,
         memory_index: usize,
         block_index: usize,
     ) -> Self {
@@ -52,6 +58,7 @@ impl<D: Device> Buffer<D> {
             ptr,
             capacity,
             len: capacity,
+            memory,
             memory_index,
             block_index,
         }
@@ -77,9 +84,15 @@ impl<D: Device> Buffer<D> {
         self.len == 0
     }
 
-    /// Returns the memory index within the pool.
-    pub fn memory_index(&self) -> usize {
-        self.memory_index
+    /// Returns a reference to the [`Memory`] this buffer belongs to.
+    ///
+    /// This allows direct access to registrations without going through
+    /// the pool's lock.
+    pub fn memory(&self) -> &Memory<D::Registration> {
+        // SAFETY: The Memory is heap-allocated inside an AliasableBox in the
+        // pool's append-only Vec. The Arc<BufferPool> keeps the pool alive,
+        // so the Memory outlives the Buffer.
+        unsafe { self.memory.as_ref() }
     }
 
     /// Sets the length of the used region.
@@ -177,7 +190,6 @@ impl<D: Device> std::fmt::Debug for Buffer<D> {
             .field("ptr", &self.ptr)
             .field("capacity", &self.capacity)
             .field("len", &self.len)
-            .field("memory_index", &self.memory_index)
             .field("block_index", &self.block_index)
             .finish()
     }

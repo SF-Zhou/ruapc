@@ -36,8 +36,8 @@ pub trait BufferExt {
 impl BufferExt for Buffer {
     fn memory_key(&self, device: &crate::device::Device) -> crate::Result<MemoryKey> {
         let reg = self
-            .pool()
-            .registration(self.memory_index(), device.index())
+            .memory()
+            .registration(device.index())
             .map_err(|e| crate::Error::new(crate::ErrorKind::InvalidArgument, e.to_string()))?;
         Ok(reg.memory_key())
     }
