@@ -10,11 +10,10 @@
 
 use std::{collections::BTreeSet, sync::Arc, time::Instant};
 
-use bytes::Bytes;
 use ruapc_rdma::verbs;
 use tokio::io::{Interest, unix::AsyncFd};
 
-use crate::{Buffer, Error, ErrorKind, MemoryKey, Message, Result, Socket, State};
+use crate::{Buffer, Error, ErrorKind, MemoryKey, Message, Payload, Result, Socket, State};
 
 use super::RdmaSocket;
 
@@ -117,11 +116,11 @@ impl RecvHandler {
                 &mut new_buf,
             );
 
-            // Wrap the completed buffer in Bytes zero-copy; buffer returns to pool on drop.
+            // Wrap completed buffer in Payload::Buffer (zero-copy); pool returns it on drop.
             let data_len = wc.byte_len as usize;
-            let bytes = Bytes::from_owner(new_buf).slice(..data_len);
+            let payload = Payload::Buffer(Arc::new(new_buf), 0, data_len);
 
-            if let Ok(msg) = Message::parse(bytes)
+            if let Ok(msg) = Message::parse(payload)
                 && let Err(e) = state.handle_recv(&Socket::from(socket), msg)
             {
                 tracing::error!("Failed to handle message: {}", e);

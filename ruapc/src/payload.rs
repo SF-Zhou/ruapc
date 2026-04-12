@@ -1,13 +1,16 @@
+use std::sync::Arc;
+
 use bytes::{Buf, Bytes, BytesMut};
 use serde::Deserialize;
 
-use crate::{MsgFlags, MsgMeta, Result};
+use crate::{Buffer, MsgFlags, MsgMeta, Result};
 
 /// Message payload supporting different memory backends.
 ///
 /// The payload can be:
 /// - **Empty**: No data
 /// - **Normal**: Standard heap-allocated bytes
+/// - **Buffer**: Zero-copy pool buffer for RDMA recv; buffer returns to pool on drop
 #[derive(Debug, Default)]
 pub enum Payload {
     /// Empty payload (no data).
@@ -15,6 +18,8 @@ pub enum Payload {
     Empty,
     /// Normal heap-allocated payload.
     Normal(Bytes),
+    /// Zero-copy receive buffer: (buffer, start_offset, valid_end).
+    Buffer(Arc<Buffer>, usize, usize),
 }
 
 impl Payload {
@@ -32,6 +37,7 @@ impl Payload {
         match self {
             Payload::Empty => 0,
             Payload::Normal(bytes) => bytes.len(),
+            Payload::Buffer(_, start, end) => end - start,
         }
     }
 
@@ -48,6 +54,7 @@ impl Payload {
         match self {
             Payload::Empty => true,
             Payload::Normal(bytes) => bytes.is_empty(),
+            Payload::Buffer(_, start, end) => start >= end,
         }
     }
 
@@ -65,6 +72,7 @@ impl Payload {
         match self {
             Payload::Empty => &[],
             Payload::Normal(bytes) => bytes,
+            Payload::Buffer(buf, start, end) => &buf[*start..*end],
         }
     }
 
@@ -79,6 +87,7 @@ impl Payload {
         match self {
             Payload::Empty => {}
             Payload::Normal(bytes) => bytes.advance(offset),
+            Payload::Buffer(_, start, _) => *start += offset,
         }
     }
 
@@ -135,6 +144,13 @@ impl From<Payload> for Bytes {
         match value {
             Payload::Empty => Bytes::new(),
             Payload::Normal(bytes) => bytes,
+            Payload::Buffer(buf, start, end) => Bytes::copy_from_slice(&buf[start..end]),
         }
+    }
+}
+
+impl From<(Arc<Buffer>, usize)> for Payload {
+    fn from((buf, len): (Arc<Buffer>, usize)) -> Self {
+        Payload::Buffer(buf, 0, len)
     }
 }

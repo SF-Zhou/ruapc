@@ -79,8 +79,10 @@ impl State {
         let socket_pool = {
             #[cfg(feature = "rdma")]
             {
-                let uses_rdma =
-                    matches!(config.socket_type, crate::SocketType::RDMA | crate::SocketType::UNIFIED);
+                let uses_rdma = matches!(
+                    config.socket_type,
+                    crate::SocketType::RDMA | crate::SocketType::UNIFIED
+                );
                 let rdma_inner = devices.rdma_inner_devices();
                 if uses_rdma && !rdma_inner.is_empty() {
                     SocketPool::create_with_rdma_devices(config, rdma_inner, buffer_pool.clone())?
