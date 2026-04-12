@@ -9,10 +9,21 @@ A high-performance Rust RPC library that supports multiple transport protocols (
 
 <img src="docs/logo.png" alt="RuaPC" width="256" height="256">
 
+## Workspace
+
+| Crate | Description |
+|---|---|
+| `ruapc` | Core library: server, client, router, socket abstractions, message format |
+| `ruapc-bufpool` | Generic buffer pool with device registration (transport-independent) |
+| `ruapc-macro` | Proc macro `#[service]` for service definition and code generation |
+| `ruapc-rdma` | RDMA transport (optional, behind `rdma` feature flag) |
+| `ruapc-demo` | Example server/client applications |
+
 ## Features
 
 - **Multiple Transport Protocols**: TCP, WebSocket, HTTP/1.1 and HTTP/2 (h2c), RDMA (optional), and a unified protocol that supports all simultaneously
 - **Reverse RPC**: Server can call back into client services over established HTTP/2 or WebSocket connections
+- **Remote Read/Write**: Zero-copy remote memory access over TCP (reverse RPC) and RDMA, backed by a generic registered buffer pool ([ruapc-bufpool](ruapc-bufpool/))
 - **Multiple Serialization Formats**: JSON (default) and MessagePack support
 - **OpenAPI Integration**: Automatic OpenAPI 3.0 specification generation with JSON Schema support
 - **Built-in Documentation**: RapiDoc integration for interactive API documentation
