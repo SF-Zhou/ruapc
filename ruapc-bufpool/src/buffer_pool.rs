@@ -140,7 +140,6 @@ impl<D: Device> BufferPool<D> {
         Ok(())
     }
 
-    #[allow(unsafe_code)]
     fn make_buffer(self: &Arc<Self>, inner: &PoolInner<D>, slot: FreeSlot) -> Result<Buffer<D>> {
         let mem: &RegisteredMemory<D::Registration> = &inner.memories[slot.memory_index];
         let base = mem.aligned_memory().as_ptr();

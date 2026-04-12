@@ -37,12 +37,11 @@ pub struct Buffer<D: Device> {
 // SAFETY: The pointer is valid for the buffer's lifetime (guaranteed
 // by the Arc<BufferPool> preventing RegisteredMemory from being freed), and
 // each Buffer is the sole owner of its block until returned.
-#[allow(unsafe_code)]
+
 unsafe impl<D: Device> Send for Buffer<D> {}
-#[allow(unsafe_code)]
+
 unsafe impl<D: Device> Sync for Buffer<D> {}
 
-#[allow(unsafe_code)]
 impl<D: Device> Buffer<D> {
     /// Creates a new buffer. Called internally by `BufferPool::allocate`.
     pub(crate) fn new(
@@ -148,7 +147,6 @@ impl<D: Device> Buffer<D> {
     }
 }
 
-#[allow(unsafe_code)]
 impl<D: Device> Deref for Buffer<D> {
     type Target = [u8];
 
@@ -158,7 +156,6 @@ impl<D: Device> Deref for Buffer<D> {
     }
 }
 
-#[allow(unsafe_code)]
 impl<D: Device> DerefMut for Buffer<D> {
     fn deref_mut(&mut self) -> &mut [u8] {
         // SAFETY: ptr is valid for `len` bytes and we have exclusive access.
