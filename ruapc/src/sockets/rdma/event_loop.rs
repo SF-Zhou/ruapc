@@ -117,9 +117,9 @@ impl RecvHandler {
                 &mut new_buf,
             );
 
-            // Copy the received bytes out of the completed buffer (now in new_buf).
+            // Wrap the completed buffer in Bytes zero-copy; buffer returns to pool on drop.
             let data_len = wc.byte_len as usize;
-            let bytes = Bytes::copy_from_slice(&new_buf[..data_len]);
+            let bytes = Bytes::from_owner(new_buf).slice(..data_len);
 
             if let Ok(msg) = Message::parse(bytes)
                 && let Err(e) = state.handle_recv(&Socket::from(socket), msg)
