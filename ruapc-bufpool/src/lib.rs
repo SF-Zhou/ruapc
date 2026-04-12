@@ -1,14 +1,28 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! `ruapc-bufpool` — A generic, high-performance buffer pool with device registration.
+//!
+//! This crate provides the core memory management primitives for RPC systems
+//! that need registered memory (e.g. for RDMA or TCP remote read/write):
+//!
+//! - [`AlignedMemory`] — 2 MiB-aligned memory allocation
+//! - [`Device`] / [`Registration`] traits — generic device registration interface
+//! - [`Devices`] — a collection of devices
+//! - [`Memory`] — aligned memory registered on a set of devices
+//! - [`Buffer`] — a fixed-size buffer from a pool, returned on drop
+//! - [`BufferPool`] — manages large registered chunks, hands out `Buffer`s
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[allow(unsafe_code)]
+mod aligned_memory;
+pub use aligned_memory::AlignedMemory;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+mod device;
+pub use device::{Device, Devices, Registration};
+
+mod memory;
+pub use memory::Memory;
+
+#[allow(unsafe_code)]
+mod buffer;
+pub use buffer::Buffer;
+
+mod buffer_pool;
+pub use buffer_pool::BufferPool;

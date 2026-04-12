@@ -11,6 +11,10 @@ categories.workspace = true
 license.workspace = true
 
 [dependencies]
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
 
 [lints]
 workspace = true
