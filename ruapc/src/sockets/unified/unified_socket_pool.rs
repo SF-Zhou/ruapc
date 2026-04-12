@@ -24,31 +24,13 @@ pub struct UnifiedSocketPool {
 
 impl SocketPoolTrait for UnifiedSocketPool {
     fn create(config: &SocketPoolConfig) -> Result<Self> {
-        let this = Self {
-            tcp_socket_pool: TcpSocketPool::create(config)?,
-            web_socket_pool: WebSocketPool::create(config)?,
-            http_socket_pool: HttpSocketPool::create(config)?,
-            #[cfg(feature = "rdma")]
-            rdma_socket_pool: RdmaSocketPool::create(config)?,
-            task_supervisor: TaskSupervisor::create(),
-        };
-
-        let task_guard = this.task_supervisor.start_async_task();
-        let tcp_guard = this.tcp_socket_pool.drop_guard();
-        let web_guard = this.web_socket_pool.drop_guard();
-        let http_guard = this.http_socket_pool.drop_guard();
         #[cfg(feature = "rdma")]
-        let rdma_guard = this.rdma_socket_pool.drop_guard();
-        tokio::spawn(async move {
-            task_guard.stopped().await;
-            drop(http_guard);
-            drop(web_guard);
-            drop(tcp_guard);
+        let rdma_socket_pool = RdmaSocketPool::create(config)?;
+        Self::create_inner(
+            config,
             #[cfg(feature = "rdma")]
-            drop(rdma_guard);
-        });
-
-        Ok(this)
+            rdma_socket_pool,
+        )
     }
 
     async fn acquire(
@@ -146,5 +128,53 @@ impl SocketPoolTrait for UnifiedSocketPool {
 impl std::fmt::Debug for UnifiedSocketPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UnifiedSocketPool").finish()
+    }
+}
+
+impl UnifiedSocketPool {
+    /// Creates a pool using the provided RDMA devices so QPs and user buffer
+    /// registrations share the same protection domain.
+    #[cfg(feature = "rdma")]
+    pub fn create_with_rdma_devices(
+        config: &SocketPoolConfig,
+        rdma_devices: ruapc_rdma::Devices,
+    ) -> Result<Self> {
+        let rdma_socket_pool = if rdma_devices.is_empty() {
+            RdmaSocketPool::create(config)?
+        } else {
+            RdmaSocketPool::create_from_devices(rdma_devices)?
+        };
+        Self::create_inner(config, rdma_socket_pool)
+    }
+
+    fn create_inner(
+        config: &SocketPoolConfig,
+        #[cfg(feature = "rdma")] rdma_socket_pool: RdmaSocketPool,
+    ) -> Result<Self> {
+        let this = Self {
+            tcp_socket_pool: TcpSocketPool::create(config)?,
+            web_socket_pool: WebSocketPool::create(config)?,
+            http_socket_pool: HttpSocketPool::create(config)?,
+            #[cfg(feature = "rdma")]
+            rdma_socket_pool,
+            task_supervisor: TaskSupervisor::create(),
+        };
+
+        let task_guard = this.task_supervisor.start_async_task();
+        let tcp_guard = this.tcp_socket_pool.drop_guard();
+        let web_guard = this.web_socket_pool.drop_guard();
+        let http_guard = this.http_socket_pool.drop_guard();
+        #[cfg(feature = "rdma")]
+        let rdma_guard = this.rdma_socket_pool.drop_guard();
+        tokio::spawn(async move {
+            task_guard.stopped().await;
+            drop(http_guard);
+            drop(web_guard);
+            drop(tcp_guard);
+            #[cfg(feature = "rdma")]
+            drop(rdma_guard);
+        });
+
+        Ok(this)
     }
 }

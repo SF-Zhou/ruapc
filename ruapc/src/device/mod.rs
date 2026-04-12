@@ -109,6 +109,28 @@ impl Devices {
     pub fn get(&self, index: usize) -> Option<&Arc<Device>> {
         self.devices.get(index)
     }
+
+    /// Collects the inner `ruapc_rdma::Device` arcs from all RDMA devices.
+    ///
+    /// Returns a `ruapc_rdma::Devices` built from the same `Arc`s that back
+    /// the RDMA entries in this collection, so any QPs or buffer pools created
+    /// from the returned value share the same protection domain as memory
+    /// registered through these devices.
+    #[cfg(feature = "rdma")]
+    pub fn rdma_inner_devices(&self) -> ruapc_rdma::Devices {
+        let arcs = self
+            .devices
+            .iter()
+            .filter_map(|d| {
+                if let Device::Rdma(r) = d.as_ref() {
+                    Some(r.inner().clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        ruapc_rdma::Devices::from_arcs(arcs)
+    }
 }
 
 impl Default for Devices {

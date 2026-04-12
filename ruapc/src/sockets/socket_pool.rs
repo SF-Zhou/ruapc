@@ -208,6 +208,30 @@ impl SocketPool {
             SocketPool::RDMA(_) => SocketType::RDMA,
         }
     }
+
+    /// Creates a pool, using the given RDMA devices for any RDMA sub-pool so
+    /// that QPs and user buffer registrations share the same protection domain.
+    ///
+    /// For non-RDMA pool types the `rdma_devices` argument is unused.
+    #[cfg(feature = "rdma")]
+    pub fn create_with_rdma_devices(
+        config: &SocketPoolConfig,
+        rdma_devices: ruapc_rdma::Devices,
+    ) -> Result<Self> {
+        match config.socket_type {
+            SocketType::TCP => Ok(SocketPool::TCP(TcpSocketPool::create(config)?)),
+            SocketType::WS => Ok(SocketPool::WS(WebSocketPool::create(config)?)),
+            SocketType::HTTP => Ok(SocketPool::HTTP(HttpSocketPool::create(config)?)),
+            SocketType::UNIFIED => Ok(SocketPool::UNIFIED(
+                UnifiedSocketPool::create_with_rdma_devices(config, rdma_devices)?,
+            )),
+            SocketType::RDMA => Ok(SocketPool::RDMA(if rdma_devices.is_empty() {
+                RdmaSocketPool::create(config)?
+            } else {
+                RdmaSocketPool::create_from_devices(rdma_devices)?
+            })),
+        }
+    }
 }
 
 impl SocketPoolTrait for SocketPool {

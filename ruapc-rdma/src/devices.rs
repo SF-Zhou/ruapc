@@ -421,6 +421,15 @@ impl Devices {
             Ok(Devices(devices))
         }
     }
+
+    /// Creates a `Devices` collection from an existing set of device `Arc`s.
+    ///
+    /// Use this when you already have opened devices and want to share them
+    /// with a component that expects a `Devices` collection (e.g. to reuse
+    /// the same protection domain across buffer registration and QP creation).
+    pub fn from_arcs(arcs: Vec<Arc<Device>>) -> Self {
+        Devices(arcs)
+    }
 }
 
 impl Deref for Devices {

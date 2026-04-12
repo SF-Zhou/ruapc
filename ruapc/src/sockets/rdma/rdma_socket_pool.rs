@@ -42,19 +42,7 @@ impl SocketPoolTrait for RdmaSocketPool {
     /// * `Err(Error)` - If RDMA devices cannot be initialized or buffer pool creation fails
     fn create(_: &SocketPoolConfig) -> Result<Self> {
         let devices = Devices::availables()?;
-        let rdmabuf_pool = BufferPool::create(4096, 4096, &devices)?;
-        let this = Self {
-            acquire_client: Client {
-                timeout: std::time::Duration::from_secs(5),
-                use_msgpack: true,
-                socket_type: Some(SocketType::TCP),
-            },
-            rdmabuf_pool,
-            devices,
-            socket_map: RwLock::default(),
-            task_supervisor: TaskSupervisor::create(),
-        };
-        Ok(this)
+        Self::create_from_devices(devices)
     }
 
     /// Stops all tasks managed by the socket pool.
@@ -197,6 +185,27 @@ impl SocketPoolTrait for RdmaSocketPool {
 }
 
 impl RdmaSocketPool {
+    /// Creates a pool using the provided RDMA devices.
+    ///
+    /// Call this instead of [`SocketPoolTrait::create`] when you have
+    /// already-opened RDMA devices whose protection domain should be
+    /// shared with user buffer registrations. If `rdma_devices` is
+    /// empty, falls back to `Devices::availables()`.
+    pub fn create_from_devices(devices: Devices) -> Result<Self> {
+        let rdmabuf_pool = BufferPool::create(4096, 4096, &devices)?;
+        Ok(Self {
+            acquire_client: Client {
+                timeout: std::time::Duration::from_secs(5),
+                use_msgpack: true,
+                socket_type: Some(SocketType::TCP),
+            },
+            rdmabuf_pool,
+            devices,
+            socket_map: RwLock::default(),
+            task_supervisor: TaskSupervisor::create(),
+        })
+    }
+
     /// Starts the event loop for handling RDMA events on a socket.
     ///
     /// This method:
