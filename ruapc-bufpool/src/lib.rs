@@ -10,7 +10,6 @@
 //! - [`Buffer`] — a fixed-size buffer from a pool, returned on drop
 //! - [`BufferPool`] — manages large registered chunks, hands out `Buffer`s
 
-#[allow(unsafe_code)]
 mod aligned_memory;
 pub use aligned_memory::AlignedMemory;
 
@@ -20,7 +19,6 @@ pub use device::{Device, Devices, Registration};
 mod memory;
 pub use memory::RegisteredMemory;
 
-#[allow(unsafe_code)]
 mod buffer;
 pub use buffer::Buffer;
 

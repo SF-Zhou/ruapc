@@ -24,7 +24,6 @@ unsafe impl Send for AlignedMemory {}
 // SAFETY: Shared access (&self) only provides immutable views.
 unsafe impl Sync for AlignedMemory {}
 
-#[allow(unsafe_code)]
 impl AlignedMemory {
     /// Allocates a new aligned memory block of the given size.
     ///
@@ -83,7 +82,6 @@ impl AlignedMemory {
     }
 }
 
-#[allow(unsafe_code)]
 impl Drop for AlignedMemory {
     fn drop(&mut self) {
         // SAFETY: ptr was allocated with the same layout.
