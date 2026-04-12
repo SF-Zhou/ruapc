@@ -219,19 +219,19 @@ impl SocketPool {
     pub fn create_with_rdma_devices(
         config: &SocketPoolConfig,
         rdma_devices: ruapc_rdma::Devices,
-        rdma_buf_pool: std::sync::Arc<ruapc_rdma::BufferPool>,
+        buffer_pool: std::sync::Arc<crate::BufferPool>,
     ) -> Result<Self> {
         match config.socket_type {
             SocketType::TCP => Ok(SocketPool::TCP(TcpSocketPool::create(config)?)),
             SocketType::WS => Ok(SocketPool::WS(WebSocketPool::create(config)?)),
             SocketType::HTTP => Ok(SocketPool::HTTP(HttpSocketPool::create(config)?)),
             SocketType::UNIFIED => Ok(SocketPool::UNIFIED(
-                UnifiedSocketPool::create_with_rdma_devices(config, rdma_devices, rdma_buf_pool)?,
+                UnifiedSocketPool::create_with_rdma_devices(config, rdma_devices, buffer_pool)?,
             )),
             SocketType::RDMA => Ok(SocketPool::RDMA(if rdma_devices.is_empty() {
                 RdmaSocketPool::create(config)?
             } else {
-                RdmaSocketPool::create_from_devices(rdma_devices, rdma_buf_pool)?
+                RdmaSocketPool::create_from_devices(rdma_devices, buffer_pool)?
             })),
         }
     }

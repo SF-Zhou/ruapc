@@ -4,7 +4,7 @@ use tokio_util::sync::DropGuard;
 
 use crate::{
     BufferPool, Context, Devices, Message, RawStream, Result, Router, Socket, SocketPool,
-    SocketPoolConfig, SocketPoolTrait, Waiter,
+    SocketPoolConfig, SocketPoolTrait, SocketType, Waiter,
     services::{MemoryService, MemoryServiceImpl},
 };
 
@@ -68,7 +68,7 @@ impl State {
             }
         }
         let devices = Arc::new(devs);
-        let buffer_pool = BufferPool::new(devices.clone(), 4 * 1024 * 1024, 256 * 1024 * 1024, 0);
+        let buffer_pool = BufferPool::new(devices.clone(), 4 * 1024 * 1024, 8 * 1024 * 1024, 0);
 
         let mem_svc = Arc::new(MemoryServiceImpl {
             devices: devices.clone(),
@@ -79,12 +79,13 @@ impl State {
         let socket_pool = {
             #[cfg(feature = "rdma")]
             {
+                let uses_rdma =
+                    matches!(config.socket_type, SocketType::RDMA | SocketType::UNIFIED);
                 let rdma_inner = devices.rdma_inner_devices();
-                if rdma_inner.is_empty() {
-                    SocketPool::create(config)?
+                if uses_rdma && !rdma_inner.is_empty() {
+                    SocketPool::create_with_rdma_devices(config, rdma_inner, buffer_pool.clone())?
                 } else {
-                    let rdma_buf_pool = ruapc_rdma::BufferPool::create(4096, 4096, &rdma_inner)?;
-                    SocketPool::create_with_rdma_devices(config, rdma_inner, rdma_buf_pool)?
+                    SocketPool::create(config)?
                 }
             }
             #[cfg(not(feature = "rdma"))]

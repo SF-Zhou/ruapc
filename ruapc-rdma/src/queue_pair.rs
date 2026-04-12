@@ -159,6 +159,44 @@ impl QueuePair {
         }
     }
 
+    pub fn send_raw(&self, wr_id: verbs::WRID, addr: u64, len: u32, lkey: u32) -> Result<()> {
+        let mut send_sge = verbs::ibv_sge {
+            addr,
+            length: len,
+            lkey,
+        };
+        let mut send_wr = verbs::ibv_send_wr {
+            wr_id,
+            sg_list: &mut send_sge as *mut _,
+            num_sge: 1,
+            opcode: verbs::ibv_wr_opcode::IBV_WR_SEND,
+            send_flags: verbs::ibv_send_flags::IBV_SEND_SIGNALED.0,
+            ..Default::default()
+        };
+        match self.post_send(&mut send_wr) {
+            0 => Ok(()),
+            _ => Err(ErrorKind::IBPostSendFailed.with_errno()),
+        }
+    }
+
+    pub fn recv_raw(&self, wr_id: verbs::WRID, addr: u64, capacity: u32, lkey: u32) -> Result<()> {
+        let mut recv_sge = verbs::ibv_sge {
+            addr,
+            length: capacity,
+            lkey,
+        };
+        let mut recv_wr = verbs::ibv_recv_wr {
+            wr_id,
+            sg_list: &mut recv_sge as *mut _,
+            num_sge: 1,
+            next: std::ptr::null_mut(),
+        };
+        match self.post_recv(&mut recv_wr) {
+            0 => Ok(()),
+            _ => Err(ErrorKind::IBPostRecvFailed.with_errno()),
+        }
+    }
+
     pub fn rdma_read(
         &self,
         wr_id: verbs::WRID,

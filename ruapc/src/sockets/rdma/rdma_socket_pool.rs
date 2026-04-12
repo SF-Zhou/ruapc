@@ -1,14 +1,14 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use foldhash::fast::RandomState;
-use ruapc_rdma::{BufferPool, Devices, QueuePair, verbs};
+use ruapc_rdma::{Devices, QueuePair, verbs};
 use tokio::sync::RwLock;
 use tokio_util::sync::DropGuard;
 
 use super::{Endpoint, EventLoop, RdmaInfo, RdmaService, RdmaSocket};
 use crate::{
-    Client, Context, Error, ErrorKind, Result, Socket, SocketPoolConfig, SocketPoolTrait,
-    SocketType, State, TaskSupervisor,
+    BufferPool, Client, Context, Error, ErrorKind, Result, Socket, SocketPoolConfig,
+    SocketPoolTrait, SocketType, State, TaskSupervisor,
 };
 
 /// A pool managing RDMA sockets and their associated resources.
@@ -18,7 +18,7 @@ use crate::{
 pub struct RdmaSocketPool {
     /// Client used for acquiring RDMA connections
     pub acquire_client: Client,
-    /// Shared buffer pool for RDMA operations
+    /// Shared buffer pool for RDMA send/recv buffers (from State).
     pub rdmabuf_pool: Arc<BufferPool>,
     /// Available RDMA devices in the system
     pub devices: Devices,
@@ -31,63 +31,40 @@ pub struct RdmaSocketPool {
 impl SocketPoolTrait for RdmaSocketPool {
     /// Creates a new RDMA socket pool with default configuration.
     ///
-    /// This function:
-    /// 1. Initializes available RDMA devices
-    /// 2. Creates a shared buffer pool
-    /// 3. Sets up a default client configuration
-    /// 4. Initializes the socket map and task supervisor
-    ///
-    /// # Returns
-    /// * `Ok(Arc<Self>)` - A new thread-safe RDMA socket pool instance
-    /// * `Err(Error)` - If RDMA devices cannot be initialized or buffer pool creation fails
+    /// Uses a minimal dummy buffer pool (no RDMA devices registered).
+    /// This path is only hit when no RDMA devices are present, so the
+    /// pool is never exercised for actual RDMA operations.
     fn create(_: &SocketPoolConfig) -> Result<Self> {
-        let devices = Devices::availables()?;
-        let rdmabuf_pool = BufferPool::create(4096, 4096, &devices)?;
-        Self::create_from_devices(devices, rdmabuf_pool)
+        let devices = Devices::availables().unwrap_or_else(|_| Devices::from_arcs(vec![]));
+        // No shared state pool available here; create a placeholder with no
+        // RDMA registrations. Actual RDMA connections use create_from_devices().
+        let dummy_pool = BufferPool::new(
+            Arc::new(crate::Devices::new()),
+            4 * 1024 * 1024,
+            8 * 1024 * 1024,
+            0,
+        );
+        Self::create_from_devices(devices, dummy_pool)
     }
 
-    /// Stops all tasks managed by the socket pool.
-    /// This initiates the shutdown process for all active RDMA connections.
     fn stop(&self) {
         self.task_supervisor.stop();
     }
 
-    /// Returns a guard that will stop all tasks when dropped.
-    /// This is useful for implementing RAII-style cleanup of RDMA resources.
     fn drop_guard(&self) -> DropGuard {
         self.task_supervisor.drop_guard()
     }
 
-    /// Waits for all tasks to complete.
-    /// This should be called after `stop()` to ensure clean shutdown.
     async fn join(&self) {
         self.task_supervisor.all_stopped().await;
     }
 
-    /// Returns information about the available RDMA devices.
-    ///
-    /// # Returns
-    /// `RdmaInfo` containing details of all available RDMA devices
     fn rdma_info(&self) -> Result<RdmaInfo> {
         Ok(RdmaInfo {
             devices: self.devices.iter().map(|d| d.info()).cloned().collect(),
         })
     }
 
-    /// Establishes a new RDMA connection with the specified endpoint.
-    ///
-    /// This method:
-    /// 1. Creates a new queue pair with default capabilities
-    /// 2. Connects to the remote endpoint
-    /// 3. Sets up the event loop for handling RDMA events
-    ///
-    /// # Arguments
-    /// * `endpoint` - The remote endpoint to connect to
-    /// * `state` - The shared state for the connection
-    ///
-    /// # Returns
-    /// * `Ok(Endpoint)` - The local endpoint information if connection succeeds
-    /// * `Err(Error)` - If connection setup fails
     fn rdma_connect(&self, endpoint: &Endpoint, state: &Arc<State>) -> Result<Endpoint> {
         let cap = verbs::ibv_qp_cap {
             max_send_wr: 64,
@@ -100,28 +77,12 @@ impl SocketPoolTrait for RdmaSocketPool {
         queue_pair.connect(endpoint)?;
         let local_endpoint = queue_pair.endpoint();
         let (tx, rx) = tokio::sync::mpsc::channel::<u64>(1024);
-        let rdma_socket = RdmaSocket::new(queue_pair, self.rdmabuf_pool.clone(), tx);
+        let rdma_device = state.devices().rdma_device(0)?;
+        let rdma_socket = RdmaSocket::new(queue_pair, self.rdmabuf_pool.clone(), rdma_device, tx);
         self.start_event_loop(Arc::new(rdma_socket), state.clone(), rx)?;
         Ok(local_endpoint)
     }
 
-    /// Acquires or creates an RDMA socket for the specified address.
-    ///
-    /// This method first checks if a socket already exists for the given address.
-    /// If not, it creates a new RDMA connection by:
-    /// 1. Creating a new queue pair
-    /// 2. Exchanging endpoint information with the remote peer
-    /// 3. Establishing the RDMA connection
-    /// 4. Setting up the event loop
-    ///
-    /// # Arguments
-    /// * `addr` - The socket address to connect to
-    /// * `socket_type` - Must be `SocketType::RDMA`
-    /// * `state` - The shared state for the connection
-    ///
-    /// # Returns
-    /// * `Ok(Arc<RdmaSocket>)` - A thread-safe reference to the RDMA socket
-    /// * `Err(Error)` - If socket creation fails or if socket type is invalid
     async fn acquire(
         &self,
         addr: &SocketAddr,
@@ -165,7 +126,8 @@ impl SocketPoolTrait for RdmaSocketPool {
         tracing::info!("acquired socket: {:?}", queue_pair);
 
         let (tx, rx) = tokio::sync::mpsc::channel::<u64>(1024);
-        let socket = RdmaSocket::new(queue_pair, self.rdmabuf_pool.clone(), tx);
+        let rdma_device = state.devices().rdma_device(0)?;
+        let socket = RdmaSocket::new(queue_pair, self.rdmabuf_pool.clone(), rdma_device, tx);
         let socket = Arc::new(socket);
         socket_map.insert(*addr, socket.clone());
         self.start_event_loop(socket.clone(), state.clone(), rx)?;
@@ -186,13 +148,10 @@ impl SocketPoolTrait for RdmaSocketPool {
 }
 
 impl RdmaSocketPool {
-    /// Creates a pool using the provided RDMA devices and transport buffer pool.
+    /// Creates a pool using the provided RDMA devices and shared buffer pool.
     ///
-    /// Call this instead of [`SocketPoolTrait::create`] when you have
-    /// already-opened RDMA devices whose protection domain should be
-    /// shared with user buffer registrations. The `rdmabuf_pool` must
-    /// have been created from the same devices so that QP send/recv
-    /// buffers share the same protection domain.
+    /// The `rdmabuf_pool` must be registered on the same RDMA devices so that
+    /// QP send/recv buffers share the same protection domain.
     pub fn create_from_devices(devices: Devices, rdmabuf_pool: Arc<BufferPool>) -> Result<Self> {
         Ok(Self {
             acquire_client: Client {
@@ -207,21 +166,6 @@ impl RdmaSocketPool {
         })
     }
 
-    /// Starts the event loop for handling RDMA events on a socket.
-    ///
-    /// This method:
-    /// 1. Initializes receive tasks for the socket
-    /// 2. Sets up error handling for task supervisor shutdown
-    /// 3. Spawns the main event loop task
-    ///
-    /// # Arguments
-    /// * `socket` - The RDMA socket to manage
-    /// * `state` - Shared state for the connection
-    /// * `pending_receiver` - Channel for receiving pending operation notifications
-    ///
-    /// # Returns
-    /// * `Ok(())` - If event loop setup succeeds
-    /// * `Err(Error)` - If setup fails
     pub fn start_event_loop(
         &self,
         socket: Arc<RdmaSocket>,

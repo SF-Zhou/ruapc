@@ -138,12 +138,12 @@ impl UnifiedSocketPool {
     pub fn create_with_rdma_devices(
         config: &SocketPoolConfig,
         rdma_devices: ruapc_rdma::Devices,
-        rdma_buf_pool: std::sync::Arc<ruapc_rdma::BufferPool>,
+        buffer_pool: std::sync::Arc<crate::BufferPool>,
     ) -> Result<Self> {
         let rdma_socket_pool = if rdma_devices.is_empty() {
             RdmaSocketPool::create(config)?
         } else {
-            RdmaSocketPool::create_from_devices(rdma_devices, rdma_buf_pool)?
+            RdmaSocketPool::create_from_devices(rdma_devices, buffer_pool)?
         };
         Self::create_inner(config, rdma_socket_pool)
     }

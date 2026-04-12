@@ -10,10 +10,11 @@
 
 use std::{collections::BTreeSet, sync::Arc, time::Instant};
 
-use ruapc_rdma::{Buffer, verbs};
+use bytes::Bytes;
+use ruapc_rdma::verbs;
 use tokio::io::{Interest, unix::AsyncFd};
 
-use crate::{Error, ErrorKind, Message, Result, Socket, State};
+use crate::{Buffer, Error, ErrorKind, MemoryKey, Message, Result, Socket, State};
 
 use super::RdmaSocket;
 
@@ -50,15 +51,36 @@ impl RecvHandler {
 
         for wrid in 0..count as u64 {
             let buf = socket.rdmabuf_pool.allocate()?;
+            Self::post_recv_buf(wrid, &buf, socket)?;
             self.buffers.push(buf);
-            self.post_recv(wrid, socket)?;
+            self.submitted += 1;
         }
+        Ok(())
+    }
+
+    fn post_recv_buf(wrid: u64, buf: &Buffer, socket: &RdmaSocket) -> Result<()> {
+        let rbi = buf.remote_buffer_info(&socket.rdma_device)?;
+        let lkey = match rbi.key {
+            MemoryKey::Rdma { lkey, .. } => lkey,
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidArgument,
+                    "recv buffer not registered on RDMA device".into(),
+                ));
+            }
+        };
+        socket.queue_pair.recv_raw(
+            verbs::WRID::recv(wrid),
+            buf.as_ptr() as u64,
+            buf.len() as u32,
+            lkey,
+        )?;
         Ok(())
     }
 
     fn post_recv(&mut self, wrid: u64, socket: &RdmaSocket) -> Result<()> {
         let buf = &self.buffers[usize::try_from(wrid).unwrap()];
-        socket.queue_pair.recv(verbs::WRID::recv(wrid), buf)?;
+        Self::post_recv_buf(wrid, buf, socket)?;
         self.submitted += 1;
         Ok(())
     }
@@ -88,15 +110,18 @@ impl RecvHandler {
         } else {
             self.data_received += 1;
 
-            // Handle regular data message
+            // Allocate a fresh buffer to replace the just-completed one.
             let mut new_buf = socket.rdmabuf_pool.allocate()?;
             std::mem::swap(
                 &mut self.buffers[usize::try_from(wc.wr_id.get_id()).unwrap()],
                 &mut new_buf,
             );
-            new_buf.set_len(wc.byte_len as usize);
 
-            if let Ok(msg) = Message::parse(new_buf)
+            // Copy the received bytes out of the completed buffer (now in new_buf).
+            let data_len = wc.byte_len as usize;
+            let bytes = Bytes::copy_from_slice(&new_buf[..data_len]);
+
+            if let Ok(msg) = Message::parse(bytes)
                 && let Err(e) = state.handle_recv(&Socket::from(socket), msg)
             {
                 tracing::error!("Failed to handle message: {}", e);
@@ -371,10 +396,25 @@ impl EventLoop {
         while let Some(&msgid) = self.pending_sends.first()
             && msgid < sendable_bound
         {
-            self.socket.queue_pair.send(
+            let entry = self.socket.send_buffers.get(&msgid).unwrap();
+            let (buf, written) = &*entry;
+            let rbi = buf.remote_buffer_info(&self.socket.rdma_device)?;
+            let lkey = match rbi.key {
+                MemoryKey::Rdma { lkey, .. } => lkey,
+                _ => {
+                    return Err(Error::new(
+                        ErrorKind::RdmaSendFailed,
+                        "send buffer not registered on RDMA device".into(),
+                    ));
+                }
+            };
+            self.socket.queue_pair.send_raw(
                 verbs::WRID::send_data(msgid),
-                &self.socket.send_buffers.get(&msgid).unwrap(),
+                buf.as_ptr() as u64,
+                *written,
+                lkey,
             )?;
+            drop(entry);
             self.pending_sends.pop_first();
         }
 
