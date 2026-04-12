@@ -62,7 +62,11 @@ impl State {
         let mut devs = Devices::new();
         devs.add_tcp_device();
         #[cfg(feature = "rdma")]
-        if let Ok(rdma_devs) = ruapc_rdma::Devices::availables() {
+        if matches!(
+            config.socket_type,
+            crate::SocketType::RDMA | crate::SocketType::UNIFIED
+        ) && let Ok(rdma_devs) = ruapc_rdma::Devices::availables()
+        {
             for rdma_dev in rdma_devs.iter() {
                 devs.add_rdma_device(rdma_dev.clone());
             }
