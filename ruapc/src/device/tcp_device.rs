@@ -23,7 +23,9 @@ struct MemoryRegion {
 }
 
 impl TcpDevice {
-    pub(crate) fn new(index: usize) -> Self {
+    /// Creates a new TCP device. The `index` is typically overwritten
+    /// by [`Devices::add`](ruapc_bufpool::Devices::add) via `set_index`.
+    pub fn new(index: usize) -> Self {
         Self {
             index,
             registry: Mutex::new(HashMap::new()),
@@ -31,9 +33,14 @@ impl TcpDevice {
         }
     }
 
-    /// Returns the device index assigned by `Devices::add_device`.
+    /// Returns the device index assigned by `Devices::add`.
     pub fn index(&self) -> usize {
         self.index
+    }
+
+    /// Sets the device index. Called by `Devices::add`.
+    pub fn set_index(&mut self, idx: usize) {
+        self.index = idx;
     }
 
     /// Registers a memory region and returns its assigned ID.

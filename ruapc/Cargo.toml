@@ -14,6 +14,7 @@ default = []
 
 [dependencies]
 ruapc-macro ={ version = "0.1.3", path = "../ruapc-macro" }
+ruapc-bufpool = { version = "0.1.0", path = "../ruapc-bufpool" }
 ruapc-rdma = { version = "0.1.3", path = "../ruapc-rdma", optional = true }
 
 bitflags.workspace = true

@@ -2,6 +2,8 @@ use std::{net::SocketAddr, sync::Arc};
 
 use tokio_util::sync::DropGuard;
 
+#[cfg(feature = "rdma")]
+use crate::device::DevicesExt;
 use crate::{
     Context, Devices, Message, RawStream, Result, Router, Socket, SocketPool, SocketPoolConfig,
     SocketPoolTrait, Waiter,

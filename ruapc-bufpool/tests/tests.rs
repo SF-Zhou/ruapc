@@ -58,7 +58,7 @@ impl Device for MockDevice {
         self.index = idx;
     }
 
-    fn register(&self, mem: &mut Memory<Self::Registration>) -> Result<()> {
+    fn register(self: &Arc<Self>, mem: &mut Memory<Self::Registration>) -> Result<()> {
         mem.add_registration(MockRegistration::new(self.index));
         Ok(())
     }
@@ -93,7 +93,7 @@ impl Device for PartialDevice {
         self.index = idx;
     }
 
-    fn register(&self, mem: &mut Memory<Self::Registration>) -> Result<()> {
+    fn register(self: &Arc<Self>, mem: &mut Memory<Self::Registration>) -> Result<()> {
         let n = self.call_count.fetch_add(1, Ordering::SeqCst);
         if n < self.succeed_count {
             mem.add_registration(MockRegistration::new(self.index));
@@ -243,7 +243,7 @@ fn memory_aligned_memory_accessors() {
 fn partial_registration_failure_leaves_successful_intact() {
     let mut mem = Memory::<MockRegistration>::new_unregistered(BLOCK).unwrap();
 
-    let dev = PartialDevice::new(1); // succeeds once, then fails
+    let dev = Arc::new(PartialDevice::new(1)); // succeeds once, then fails
 
     // First call succeeds.
     assert!(dev.register(&mut mem).is_ok());

@@ -9,6 +9,7 @@ pub use rdma_device::RdmaDevice;
 use std::sync::Arc;
 
 use crate::Result;
+use crate::memory::MemoryRegistration;
 
 /// A network device abstraction using enum dispatch.
 ///
@@ -23,7 +24,10 @@ pub enum Device {
 }
 
 impl Device {
-    /// Returns the unique index assigned by [`Devices::add_device`].
+    /// Returns the unique index assigned by [`Devices::add`].
+    ///
+    /// This is a convenience wrapper so callers don't need to import
+    /// `ruapc_bufpool::Device`.
     pub fn index(&self) -> usize {
         match self {
             Device::Tcp(d) => d.index(),
@@ -57,80 +61,113 @@ impl Device {
     }
 }
 
-/// A fixed collection of devices. Devices are assigned monotonically
-/// increasing indices when added. The set must be finalized before
-/// creating a `BufferPool`.
-#[derive(Debug)]
-pub struct Devices {
-    devices: Vec<Arc<Device>>,
-}
+/// Implementation of the `ruapc_bufpool::Device` trait for the `Device` enum.
+///
+/// This connects the generic buffer pool machinery to ruapc's concrete
+/// TCP and RDMA device types.
+impl ruapc_bufpool::Device for Device {
+    type Registration = MemoryRegistration;
 
-impl Devices {
-    /// Creates an empty device collection.
-    pub fn new() -> Self {
-        Self {
-            devices: Vec::new(),
+    fn index(&self) -> usize {
+        match self {
+            Device::Tcp(d) => d.index(),
+            #[cfg(feature = "rdma")]
+            Device::Rdma(d) => d.index(),
         }
     }
 
-    /// Adds a TCP device and returns a shared reference to it.
-    pub fn add_tcp_device(&mut self) -> Arc<Device> {
-        let index = self.devices.len();
-        let device = Arc::new(Device::Tcp(TcpDevice::new(index)));
-        self.devices.push(device.clone());
-        device
+    fn set_index(&mut self, idx: usize) {
+        match self {
+            Device::Tcp(d) => d.set_index(idx),
+            #[cfg(feature = "rdma")]
+            Device::Rdma(d) => d.set_index(idx),
+        }
     }
+
+    #[allow(unsafe_code)]
+    fn register(
+        self: &Arc<Self>,
+        mem: &mut ruapc_bufpool::Memory<Self::Registration>,
+    ) -> std::io::Result<()> {
+        let aligned = mem.aligned_memory();
+        let ptr = aligned.as_ptr();
+        let size = aligned.size();
+
+        match self.as_ref() {
+            Device::Tcp(tcp) => {
+                let id = tcp.register(ptr as usize, size);
+                mem.add_registration(MemoryRegistration::Tcp {
+                    device: self.clone(),
+                    id,
+                });
+                Ok(())
+            }
+            #[cfg(feature = "rdma")]
+            Device::Rdma(rdma) => {
+                let mr = unsafe {
+                    ruapc_rdma::verbs::ibv_reg_mr(
+                        rdma.pd_ptr(),
+                        ptr as *mut _,
+                        size,
+                        ruapc_rdma::verbs::ACCESS_FLAGS as _,
+                    )
+                };
+                if mr.is_null() {
+                    return Err(std::io::Error::other("ibv_reg_mr failed"));
+                }
+                let raw_mr = unsafe { ruapc_rdma::RawMemoryRegion::from_raw(mr) };
+                mem.add_registration(MemoryRegistration::Rdma {
+                    device: self.clone(),
+                    mr: raw_mr,
+                });
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Type alias for the device collection backed by `ruapc_bufpool`.
+pub type Devices = ruapc_bufpool::Devices<Device>;
+
+/// Extension methods for `Devices` providing convenient device-addition helpers.
+pub trait DevicesExt {
+    /// Adds a TCP device and returns a shared reference to it.
+    fn add_tcp_device(&mut self) -> Arc<Device>;
 
     /// Adds an RDMA device and returns a shared reference to it.
     #[cfg(feature = "rdma")]
-    pub fn add_rdma_device(&mut self, inner: Arc<ruapc_rdma::Device>) -> Arc<Device> {
-        let index = self.devices.len();
-        let device = Arc::new(Device::Rdma(RdmaDevice::new(index, inner)));
-        self.devices.push(device.clone());
-        device
-    }
-
-    /// Returns the number of devices.
-    pub fn len(&self) -> usize {
-        self.devices.len()
-    }
-
-    /// Returns true if no devices have been added.
-    pub fn is_empty(&self) -> bool {
-        self.devices.is_empty()
-    }
-
-    /// Returns an iterator over the devices.
-    pub fn iter(&self) -> impl Iterator<Item = &Arc<Device>> {
-        self.devices.iter()
-    }
-
-    /// Returns the device at the given index.
-    pub fn get(&self, index: usize) -> Option<&Arc<Device>> {
-        self.devices.get(index)
-    }
+    fn add_rdma_device(&mut self, inner: Arc<ruapc_rdma::Device>) -> Arc<Device>;
 
     /// Finds the `Device` that wraps the given `ruapc_rdma::Device`.
-    ///
-    /// Returns `None` if no device in the collection wraps the same Arc.
     #[cfg(feature = "rdma")]
-    pub fn find_by_rdma_device(&self, inner: &Arc<ruapc_rdma::Device>) -> Option<&Arc<Device>> {
-        self.devices.iter().find(|d| match d.as_ref() {
+    fn find_by_rdma_device(&self, inner: &Arc<ruapc_rdma::Device>) -> Option<&Arc<Device>>;
+
+    /// Collects the inner `ruapc_rdma::Device` arcs from all RDMA devices.
+    #[cfg(feature = "rdma")]
+    fn rdma_inner_devices(&self) -> ruapc_rdma::Devices;
+}
+
+impl DevicesExt for Devices {
+    fn add_tcp_device(&mut self) -> Arc<Device> {
+        self.add(Device::Tcp(TcpDevice::new(0)))
+    }
+
+    #[cfg(feature = "rdma")]
+    fn add_rdma_device(&mut self, inner: Arc<ruapc_rdma::Device>) -> Arc<Device> {
+        self.add(Device::Rdma(RdmaDevice::new(0, inner)))
+    }
+
+    #[cfg(feature = "rdma")]
+    fn find_by_rdma_device(&self, inner: &Arc<ruapc_rdma::Device>) -> Option<&Arc<Device>> {
+        self.iter().find(|d| match d.as_ref() {
             Device::Rdma(r) => Arc::ptr_eq(r.inner(), inner),
             _ => false,
         })
     }
 
-    /// Collects the inner `ruapc_rdma::Device` arcs from all RDMA devices.
-    ///
-    /// Returns a `ruapc_rdma::Devices` built from the same `Arc`s that back
-    /// the RDMA entries in this collection, so any QPs or buffer pools created
-    /// from the returned value share the same protection domain as memory
-    /// registered through these devices.
     #[cfg(feature = "rdma")]
-    pub fn rdma_inner_devices(&self) -> ruapc_rdma::Devices {
+    fn rdma_inner_devices(&self) -> ruapc_rdma::Devices {
         let arcs = self
-            .devices
             .iter()
             .filter_map(|d| {
                 if let Device::Rdma(r) = d.as_ref() {
@@ -141,12 +178,6 @@ impl Devices {
             })
             .collect();
         ruapc_rdma::Devices::from_arcs(arcs)
-    }
-}
-
-impl Default for Devices {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

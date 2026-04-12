@@ -11,13 +11,20 @@ pub struct RdmaDevice {
 }
 
 impl RdmaDevice {
-    pub(crate) fn new(index: usize, inner: Arc<ruapc_rdma::Device>) -> Self {
+    /// Creates a new RDMA device. The `index` is typically overwritten
+    /// by [`Devices::add`](ruapc_bufpool::Devices::add) via `set_index`.
+    pub fn new(index: usize, inner: Arc<ruapc_rdma::Device>) -> Self {
         Self { index, inner }
     }
 
-    /// Returns the device index assigned by `Devices::add_device`.
+    /// Returns the device index assigned by `Devices::add`.
     pub fn index(&self) -> usize {
         self.index
+    }
+
+    /// Sets the device index. Called by `Devices::add`.
+    pub fn set_index(&mut self, idx: usize) {
+        self.index = idx;
     }
 
     /// Returns a reference to the underlying `ruapc_rdma::Device`.

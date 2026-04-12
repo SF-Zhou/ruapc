@@ -5,7 +5,8 @@
 
 use ruapc_rdma::{QueuePair, verbs};
 
-use crate::memory::{Buffer, MemoryKey};
+use crate::device::DevicesExt;
+use crate::memory::{Buffer, BufferExt, MemoryKey};
 use crate::{Error, ErrorKind, Result};
 
 /// Extracts the RDMA lkey from a [`Buffer`] for the given QueuePair's device.

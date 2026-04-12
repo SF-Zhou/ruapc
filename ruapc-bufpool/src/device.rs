@@ -36,7 +36,7 @@ pub trait Device: Send + Sync + std::fmt::Debug {
     /// Registers this device's memory region and pushes the registration
     /// into `mem` on success. If registration fails, `mem` is left
     /// unchanged — already-registered devices remain valid for cleanup.
-    fn register(&self, mem: &mut Memory<Self::Registration>) -> Result<()>;
+    fn register(self: &Arc<Self>, mem: &mut Memory<Self::Registration>) -> Result<()>;
 }
 
 /// A fixed collection of devices.
