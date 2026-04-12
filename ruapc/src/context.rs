@@ -219,17 +219,53 @@ impl Context {
         self.send_rsp::<(), Error>(Err(err)).await;
     }
 
-    /// Reads data from a remote peer's registered memory via reverse RPC.
+    /// Reads data from a remote peer's registered memory.
     ///
-    /// Sends a `MemoryService/read` request to the peer, which validates
-    /// the access and returns the data. The returned data is copied into
-    /// `local_buf` starting at offset 0.
+    /// For TCP: sends a `MemoryService/read` reverse RPC request.
+    /// For RDMA: issues a one-sided RDMA Read via QP verbs.
     ///
     /// # Arguments
     ///
     /// * `remote` - Remote buffer info (key, addr, len) obtained from the peer
     /// * `local_buf` - Local buffer to write the received data into
     pub async fn remote_read(
+        &self,
+        remote: &crate::RemoteBufferInfo,
+        local_buf: &mut crate::Buffer,
+    ) -> Result<()> {
+        #[cfg(feature = "rdma")]
+        if let crate::MemoryKey::Rdma { lkey: _, rkey } = remote.key {
+            return self.rdma_remote_read(remote, local_buf, rkey).await;
+        }
+
+        self.tcp_remote_read(remote, local_buf).await
+    }
+
+    /// Writes data from a local buffer to a remote peer's registered memory.
+    ///
+    /// For TCP: sends a `MemoryService/write` reverse RPC request.
+    /// For RDMA: issues a one-sided RDMA Write via QP verbs.
+    ///
+    /// # Arguments
+    ///
+    /// * `remote` - Remote buffer info (key, addr, len) obtained from the peer
+    /// * `local_buf` - Local buffer containing the data to write
+    /// * `len` - Number of bytes to write from `local_buf`
+    pub async fn remote_write(
+        &self,
+        remote: &crate::RemoteBufferInfo,
+        local_buf: &crate::Buffer,
+        len: usize,
+    ) -> Result<()> {
+        #[cfg(feature = "rdma")]
+        if let crate::MemoryKey::Rdma { lkey: _, rkey } = remote.key {
+            return self.rdma_remote_write(remote, local_buf, len, rkey).await;
+        }
+
+        self.tcp_remote_write(remote, local_buf, len).await
+    }
+
+    async fn tcp_remote_read(
         &self,
         remote: &crate::RemoteBufferInfo,
         local_buf: &mut crate::Buffer,
@@ -257,18 +293,7 @@ impl Context {
         Ok(())
     }
 
-    /// Writes data from a local buffer to a remote peer's registered memory
-    /// via reverse RPC.
-    ///
-    /// Sends a `MemoryService/write` request to the peer with the data,
-    /// which validates the access and writes the data.
-    ///
-    /// # Arguments
-    ///
-    /// * `remote` - Remote buffer info (key, addr, len) obtained from the peer
-    /// * `local_buf` - Local buffer containing the data to write
-    /// * `len` - Number of bytes to write from `local_buf`
-    pub async fn remote_write(
+    async fn tcp_remote_write(
         &self,
         remote: &crate::RemoteBufferInfo,
         local_buf: &crate::Buffer,
@@ -283,6 +308,127 @@ impl Context {
         };
         let client = crate::Client::default();
         client.write(self, &req).await?;
+        Ok(())
+    }
+
+    #[cfg(feature = "rdma")]
+    async fn rdma_remote_read(
+        &self,
+        remote: &crate::RemoteBufferInfo,
+        local_buf: &mut crate::Buffer,
+        rkey: u32,
+    ) -> Result<()> {
+        let rdma_socket = self.get_rdma_socket()?;
+
+        // Register local buffer on the QP's device to get a valid lkey.
+        let mr = Self::register_on_qp_device(&rdma_socket.queue_pair, local_buf)?;
+        let local_lkey = mr.lkey;
+
+        let wr_id = ruapc_rdma::verbs::WRID::send_data(0);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        rdma_socket.rdma_completions.insert(wr_id, tx);
+
+        rdma_socket.queue_pair.rdma_read_raw(
+            wr_id,
+            local_buf.as_ptr() as u64,
+            remote.len as u32,
+            local_lkey,
+            remote.addr,
+            rkey,
+        )?;
+
+        let result = Self::await_rdma_completion(rx).await;
+        drop(mr);
+        result
+    }
+
+    #[cfg(feature = "rdma")]
+    async fn rdma_remote_write(
+        &self,
+        remote: &crate::RemoteBufferInfo,
+        local_buf: &crate::Buffer,
+        len: usize,
+        rkey: u32,
+    ) -> Result<()> {
+        let rdma_socket = self.get_rdma_socket()?;
+
+        // Register local buffer on the QP's device to get a valid lkey.
+        let mr = Self::register_on_qp_device(&rdma_socket.queue_pair, local_buf)?;
+        let local_lkey = mr.lkey;
+
+        let wr_id = ruapc_rdma::verbs::WRID::send_data(0);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        rdma_socket.rdma_completions.insert(wr_id, tx);
+
+        rdma_socket.queue_pair.rdma_write_raw(
+            wr_id,
+            local_buf.as_ptr() as u64,
+            len as u32,
+            local_lkey,
+            remote.addr,
+            rkey,
+        )?;
+
+        let result = Self::await_rdma_completion(rx).await;
+        drop(mr);
+        result
+    }
+
+    #[cfg(feature = "rdma")]
+    fn get_rdma_socket(&self) -> Result<std::sync::Arc<crate::rdma::RdmaSocket>> {
+        match &self.endpoint {
+            SocketEndpoint::Connected(Socket::RDMA(s)) => Ok(s.clone()),
+            _ => Err(Error::new(
+                crate::ErrorKind::InvalidArgument,
+                "RDMA remote read/write requires a connected RDMA socket".into(),
+            )),
+        }
+    }
+
+    /// Registers a buffer's memory on the QP's protection domain.
+    ///
+    /// The QP and the buffer may be on different protection domains
+    /// (RdmaSocketPool creates its own devices internally). This method
+    /// registers the buffer on the QP's pd to get a valid lkey.
+    #[cfg(feature = "rdma")]
+    #[allow(unsafe_code)]
+    fn register_on_qp_device(
+        qp: &ruapc_rdma::QueuePair,
+        buf: &crate::Buffer,
+    ) -> Result<ruapc_rdma::RawMemoryRegion> {
+        let mr = unsafe {
+            ruapc_rdma::verbs::ibv_reg_mr(
+                qp.device.pd_ptr(),
+                buf.as_ptr() as *mut _,
+                buf.len(),
+                ruapc_rdma::verbs::ACCESS_FLAGS as _,
+            )
+        };
+        if mr.is_null() {
+            return Err(Error::new(
+                crate::ErrorKind::RdmaSendFailed,
+                "failed to register local buffer on QP device".into(),
+            ));
+        }
+        Ok(unsafe { ruapc_rdma::RawMemoryRegion::from_raw(mr) })
+    }
+
+    #[cfg(feature = "rdma")]
+    async fn await_rdma_completion(
+        rx: tokio::sync::oneshot::Receiver<ruapc_rdma::verbs::ibv_wc_status>,
+    ) -> Result<()> {
+        let status = rx.await.map_err(|_| {
+            Error::new(
+                crate::ErrorKind::RdmaSendFailed,
+                "RDMA completion channel closed".into(),
+            )
+        })?;
+        if status != ruapc_rdma::verbs::ibv_wc_status::IBV_WC_SUCCESS {
+            return Err(Error::new(
+                crate::ErrorKind::RdmaSendFailed,
+                format!("RDMA operation failed with status {:?}", status),
+            ));
+        }
         Ok(())
     }
 }

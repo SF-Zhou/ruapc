@@ -66,10 +66,21 @@ impl State {
             mem_svc.ruapc_export(&mut router);
         }
         router.build_open_api()?;
+        let socket_pool = {
+            #[cfg(feature = "rdma")]
+            if let Some(ref devs) = devices {
+                let rdma_devices = devs.rdma_inner_devices();
+                SocketPool::create_with_rdma_devices(config, rdma_devices)?
+            } else {
+                SocketPool::create(config)?
+            }
+            #[cfg(not(feature = "rdma"))]
+            SocketPool::create(config)?
+        };
         let state = Self {
             router,
             waiter: Arc::default(),
-            socket_pool: SocketPool::create(config)?,
+            socket_pool,
             devices,
         };
         let state = Arc::new(state);

@@ -166,10 +166,46 @@ impl QueuePair {
         remote_addr: u64,
         rkey: u32,
     ) -> Result<()> {
+        self.rdma_read_raw(
+            wr_id,
+            local_buf.as_ptr() as u64,
+            local_buf.capacity() as u32,
+            local_buf.lkey(&self.device),
+            remote_addr,
+            rkey,
+        )
+    }
+
+    pub fn rdma_write(
+        &self,
+        wr_id: verbs::WRID,
+        local_buf: &Buffer,
+        remote_addr: u64,
+        rkey: u32,
+    ) -> Result<()> {
+        self.rdma_write_raw(
+            wr_id,
+            local_buf.as_ptr() as u64,
+            local_buf.len() as u32,
+            local_buf.lkey(&self.device),
+            remote_addr,
+            rkey,
+        )
+    }
+
+    pub fn rdma_read_raw(
+        &self,
+        wr_id: verbs::WRID,
+        local_addr: u64,
+        local_len: u32,
+        local_lkey: u32,
+        remote_addr: u64,
+        remote_rkey: u32,
+    ) -> Result<()> {
         let mut send_sge = verbs::ibv_sge {
-            addr: local_buf.as_ptr() as _,
-            length: local_buf.capacity() as _,
-            lkey: local_buf.lkey(&self.device),
+            addr: local_addr,
+            length: local_len,
+            lkey: local_lkey,
         };
         let mut send_wr = verbs::ibv_send_wr {
             wr_id,
@@ -180,7 +216,7 @@ impl QueuePair {
             ..Default::default()
         };
         send_wr.wr.rdma.remote_addr = remote_addr;
-        send_wr.wr.rdma.rkey = rkey;
+        send_wr.wr.rdma.rkey = remote_rkey;
 
         match self.post_send(&mut send_wr) {
             0 => Ok(()),
@@ -188,17 +224,19 @@ impl QueuePair {
         }
     }
 
-    pub fn rdma_write(
+    pub fn rdma_write_raw(
         &self,
         wr_id: verbs::WRID,
-        local_buf: &Buffer,
+        local_addr: u64,
+        local_len: u32,
+        local_lkey: u32,
         remote_addr: u64,
-        rkey: u32,
+        remote_rkey: u32,
     ) -> Result<()> {
         let mut send_sge = verbs::ibv_sge {
-            addr: local_buf.as_ptr() as _,
-            length: local_buf.len() as _,
-            lkey: local_buf.lkey(&self.device),
+            addr: local_addr,
+            length: local_len,
+            lkey: local_lkey,
         };
         let mut send_wr = verbs::ibv_send_wr {
             wr_id,
@@ -209,7 +247,7 @@ impl QueuePair {
             ..Default::default()
         };
         send_wr.wr.rdma.remote_addr = remote_addr;
-        send_wr.wr.rdma.rkey = rkey;
+        send_wr.wr.rdma.rkey = remote_rkey;
 
         match self.post_send(&mut send_wr) {
             0 => Ok(()),

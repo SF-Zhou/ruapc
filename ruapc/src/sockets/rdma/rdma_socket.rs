@@ -18,6 +18,9 @@ pub struct RdmaSocket {
     pub(crate) send_buffers: dashmap::DashMap<u64, Arc<Buffer>>,
     pub(crate) state: RdmaState,
     pub(crate) pending_sender: Sender<u64>,
+    /// Pending RDMA one-sided operation completions (wr_id -> status sender).
+    pub(crate) rdma_completions:
+        dashmap::DashMap<WRID, tokio::sync::oneshot::Sender<ruapc_rdma::verbs::ibv_wc_status>>,
 }
 
 impl RdmaSocket {
@@ -32,6 +35,7 @@ impl RdmaSocket {
             send_buffers: dashmap::DashMap::default(),
             state: RdmaState::new(32),
             pending_sender,
+            rdma_completions: dashmap::DashMap::default(),
         }
     }
 
