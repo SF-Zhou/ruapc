@@ -12,7 +12,7 @@ pub use ruapc_bufpool::AlignedMemory;
 
 /// Type alias for a registered memory block parameterized with ruapc's
 /// `MemoryRegistration`.
-pub type Memory = ruapc_bufpool::Memory<MemoryRegistration>;
+pub type Memory = ruapc_bufpool::RegisteredMemory<MemoryRegistration>;
 
 /// Type alias for a buffer from the pool, parameterized with ruapc's `Device`.
 pub type Buffer = ruapc_bufpool::Buffer<crate::device::Device>;

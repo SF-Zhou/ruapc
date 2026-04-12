@@ -6,7 +6,7 @@
 //! - [`AlignedMemory`] — 2 MiB-aligned memory allocation
 //! - [`Device`] / [`Registration`] traits — generic device registration interface
 //! - [`Devices`] — a collection of devices
-//! - [`Memory`] — aligned memory registered on a set of devices
+//! - [`RegisteredMemory`] — aligned memory registered on a set of devices
 //! - [`Buffer`] — a fixed-size buffer from a pool, returned on drop
 //! - [`BufferPool`] — manages large registered chunks, hands out `Buffer`s
 
@@ -18,7 +18,7 @@ mod device;
 pub use device::{Device, Devices, Registration};
 
 mod memory;
-pub use memory::Memory;
+pub use memory::RegisteredMemory;
 
 #[allow(unsafe_code)]
 mod buffer;

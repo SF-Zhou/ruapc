@@ -87,7 +87,7 @@ impl ruapc_bufpool::Device for Device {
     #[allow(unsafe_code)]
     fn register(
         self: &Arc<Self>,
-        mem: &mut ruapc_bufpool::Memory<Self::Registration>,
+        mem: &mut ruapc_bufpool::RegisteredMemory<Self::Registration>,
     ) -> std::io::Result<()> {
         let aligned = mem.aligned_memory();
         let ptr = aligned.as_ptr();

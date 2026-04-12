@@ -5,12 +5,12 @@ use std::sync::Arc;
 
 use crate::buffer_pool::BufferPool;
 use crate::device::Device;
-use crate::memory::Memory;
+use crate::memory::RegisteredMemory;
 
 /// A memory buffer allocated from a [`BufferPool`].
 ///
 /// Holds an `Arc<BufferPool>` to keep the pool (and the underlying
-/// registered `Memory`) alive. On drop, the buffer is returned to
+/// registered `RegisteredMemory`) alive. On drop, the buffer is returned to
 /// the pool's free list for reuse.
 ///
 /// The buffer has a fixed `capacity` (the block size) and a variable
@@ -26,16 +26,16 @@ pub struct Buffer<D: Device> {
     ptr: NonNull<u8>,
     capacity: usize,
     len: usize,
-    /// Pointer to the Memory this buffer's block belongs to.
+    /// Pointer to the `RegisteredMemory` this buffer's block belongs to.
     /// Valid for the lifetime of the Buffer because the pool (held
     /// via `Arc<BufferPool>`) keeps all memories alive.
-    memory: NonNull<Memory<D::Registration>>,
+    memory: NonNull<RegisteredMemory<D::Registration>>,
     memory_index: usize,
     block_index: usize,
 }
 
 // SAFETY: The pointer is valid for the buffer's lifetime (guaranteed
-// by the Arc<BufferPool> preventing Memory from being freed), and
+// by the Arc<BufferPool> preventing RegisteredMemory from being freed), and
 // each Buffer is the sole owner of its block until returned.
 #[allow(unsafe_code)]
 unsafe impl<D: Device> Send for Buffer<D> {}
@@ -49,7 +49,7 @@ impl<D: Device> Buffer<D> {
         pool: Arc<BufferPool<D>>,
         ptr: NonNull<u8>,
         capacity: usize,
-        memory: NonNull<Memory<D::Registration>>,
+        memory: NonNull<RegisteredMemory<D::Registration>>,
         memory_index: usize,
         block_index: usize,
     ) -> Self {
@@ -84,14 +84,14 @@ impl<D: Device> Buffer<D> {
         self.len == 0
     }
 
-    /// Returns a reference to the [`Memory`] this buffer belongs to.
+    /// Returns a reference to the [`RegisteredMemory`] this buffer belongs to.
     ///
     /// This allows direct access to registrations without going through
     /// the pool's lock.
-    pub fn memory(&self) -> &Memory<D::Registration> {
-        // SAFETY: The Memory is heap-allocated inside an AliasableBox in the
-        // pool's append-only Vec. The Arc<BufferPool> keeps the pool alive,
-        // so the Memory outlives the Buffer.
+    pub fn memory(&self) -> &RegisteredMemory<D::Registration> {
+        // SAFETY: The RegisteredMemory is heap-allocated inside an
+        // AliasableBox in the pool's append-only Vec. The Arc<BufferPool>
+        // keeps the pool alive, so the RegisteredMemory outlives the Buffer.
         unsafe { self.memory.as_ref() }
     }
 

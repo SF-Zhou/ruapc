@@ -8,7 +8,7 @@ use tokio::sync::oneshot;
 
 use crate::buffer::Buffer;
 use crate::device::{Device, Devices};
-use crate::memory::Memory;
+use crate::memory::RegisteredMemory;
 
 /// A memory pool that manages large registered memory chunks and
 /// hands out fixed-size [`Buffer`]s from them.
@@ -29,7 +29,7 @@ pub struct BufferPool<D: Device> {
 }
 
 struct PoolInner<D: Device> {
-    memories: Vec<AliasableBox<Memory<D::Registration>>>,
+    memories: Vec<AliasableBox<RegisteredMemory<D::Registration>>>,
     free_list: VecDeque<FreeSlot>,
     allocated_memory: usize,
     waiters: VecDeque<oneshot::Sender<()>>,
@@ -122,7 +122,7 @@ impl<D: Device> BufferPool<D> {
     }
 
     fn allocate_chunk(&self, inner: &mut PoolInner<D>) -> Result<()> {
-        let mem = Memory::new(self.chunk_size, &self.devices)?;
+        let mem = RegisteredMemory::new(self.chunk_size, &self.devices)?;
         let memory_index = inner.memories.len();
         let blocks_per_chunk = self.chunk_size / self.block_size;
 
@@ -142,16 +142,16 @@ impl<D: Device> BufferPool<D> {
 
     #[allow(unsafe_code)]
     fn make_buffer(self: &Arc<Self>, inner: &PoolInner<D>, slot: FreeSlot) -> Result<Buffer<D>> {
-        let mem: &Memory<D::Registration> = &inner.memories[slot.memory_index];
+        let mem: &RegisteredMemory<D::Registration> = &inner.memories[slot.memory_index];
         let base = mem.aligned_memory().as_ptr();
         let offset = slot.block_index * self.block_size;
         // SAFETY: offset is within the allocated memory region.
         let ptr = unsafe { NonNull::new_unchecked(base.add(offset) as *mut u8) };
-        // SAFETY: The Memory lives inside an AliasableBox in the append-only
-        // Vec. The AliasableBox heap-allocates Memory so its address is stable
-        // even when the Vec grows. The Buffer holds Arc<BufferPool> which keeps
-        // the pool (and thus the PoolInner with all memories) alive for the
-        // Buffer's lifetime.
+        // SAFETY: The RegisteredMemory lives inside an AliasableBox in the
+        // append-only Vec. The AliasableBox heap-allocates it so its address
+        // is stable even when the Vec grows. The Buffer holds Arc<BufferPool>
+        // which keeps the pool (and thus the PoolInner with all memories)
+        // alive for the Buffer's lifetime.
         let memory = NonNull::from(mem);
         Ok(Buffer::new(
             Arc::clone(self),

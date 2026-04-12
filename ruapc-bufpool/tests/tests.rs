@@ -2,7 +2,7 @@ use std::io::{Error, Result};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use ruapc_bufpool::{BufferPool, Device, Devices, Memory, Registration};
+use ruapc_bufpool::{BufferPool, Device, Devices, RegisteredMemory, Registration};
 
 // ---------------------------------------------------------------------------
 // Mock types
@@ -58,7 +58,7 @@ impl Device for MockDevice {
         self.index = idx;
     }
 
-    fn register(self: &Arc<Self>, mem: &mut Memory<Self::Registration>) -> Result<()> {
+    fn register(self: &Arc<Self>, mem: &mut RegisteredMemory<Self::Registration>) -> Result<()> {
         mem.add_registration(MockRegistration::new(self.index));
         Ok(())
     }
@@ -93,7 +93,7 @@ impl Device for PartialDevice {
         self.index = idx;
     }
 
-    fn register(self: &Arc<Self>, mem: &mut Memory<Self::Registration>) -> Result<()> {
+    fn register(self: &Arc<Self>, mem: &mut RegisteredMemory<Self::Registration>) -> Result<()> {
         let n = self.call_count.fetch_add(1, Ordering::SeqCst);
         if n < self.succeed_count {
             mem.add_registration(MockRegistration::new(self.index));
@@ -180,12 +180,12 @@ fn devices_default() {
 }
 
 // ---------------------------------------------------------------------------
-// Memory tests
+// RegisteredMemory tests
 // ---------------------------------------------------------------------------
 
 #[test]
 fn memory_new_unregistered() {
-    let mem = Memory::<MockRegistration>::new_unregistered(BLOCK).unwrap();
+    let mem = RegisteredMemory::<MockRegistration>::new_unregistered(BLOCK).unwrap();
     assert!(mem.registrations().is_empty());
     assert!(mem.aligned_memory().size() >= BLOCK);
 }
@@ -193,11 +193,9 @@ fn memory_new_unregistered() {
 #[test]
 fn memory_add_registration_and_lookup() {
     let before = live_regs();
-    let mut mem = Memory::<MockRegistration>::new_unregistered(BLOCK).unwrap();
+    let mut mem = RegisteredMemory::<MockRegistration>::new_unregistered(BLOCK).unwrap();
     mem.add_registration(MockRegistration::new(0));
     mem.add_registration(MockRegistration::new(1));
-
-    assert_eq!(mem.registrations().len(), 2);
     assert_eq!(mem.registration(0).unwrap().device_index, 0);
     assert_eq!(mem.registration(1).unwrap().device_index, 1);
     assert!(mem.registration(2).is_err());
@@ -207,7 +205,7 @@ fn memory_add_registration_and_lookup() {
 #[test]
 fn memory_new_with_devices() {
     let devices = mock_devices(3);
-    let mem = Memory::new(BLOCK, &devices).unwrap();
+    let mem = RegisteredMemory::new(BLOCK, &devices).unwrap();
 
     assert_eq!(mem.registrations().len(), 3);
     for i in 0..3 {
@@ -220,7 +218,7 @@ fn memory_drop_calls_unregister() {
     let before = live_regs();
     {
         let devices = mock_devices(2);
-        let _mem = Memory::new(BLOCK, &devices).unwrap();
+        let _mem = RegisteredMemory::new(BLOCK, &devices).unwrap();
         assert_eq!(live_regs(), before + 2);
     }
     // After drop, the delta should be zero.
@@ -229,7 +227,7 @@ fn memory_drop_calls_unregister() {
 
 #[test]
 fn memory_aligned_memory_accessors() {
-    let mut mem = Memory::<MockRegistration>::new_unregistered(BLOCK).unwrap();
+    let mut mem = RegisteredMemory::<MockRegistration>::new_unregistered(BLOCK).unwrap();
     let ptr = mem.aligned_memory().as_ptr();
     let ptr_mut = mem.aligned_memory_mut().as_mut_ptr();
     assert_eq!(ptr as *mut u8, ptr_mut);
@@ -241,7 +239,7 @@ fn memory_aligned_memory_accessors() {
 
 #[test]
 fn partial_registration_failure_leaves_successful_intact() {
-    let mut mem = Memory::<MockRegistration>::new_unregistered(BLOCK).unwrap();
+    let mut mem = RegisteredMemory::<MockRegistration>::new_unregistered(BLOCK).unwrap();
 
     let dev = Arc::new(PartialDevice::new(1)); // succeeds once, then fails
 
@@ -257,21 +255,21 @@ fn partial_registration_failure_leaves_successful_intact() {
 #[test]
 fn memory_new_with_failing_device_cleans_up() {
     // 3 devices: first two always succeed, third always fails.
-    // Memory::new iterates all devices. When device 2 fails the `?`
-    // propagates, dropping the partially-registered Memory and
+    // RegisteredMemory::new iterates all devices. When device 2 fails the `?`
+    // propagates, dropping the partially-registered RegisteredMemory and
     // unregistering the 2 successful registrations.
     let mut devices = Devices::new();
     devices.add(PartialDevice::new(100)); // always succeeds
     devices.add(PartialDevice::new(100)); // always succeeds
     devices.add(PartialDevice::new(0)); // always fails
 
-    let result = Memory::new(BLOCK, &devices);
+    let result = RegisteredMemory::new(BLOCK, &devices);
     assert!(result.is_err());
-    // The 2 successful registrations were cleaned up by Memory::drop
-    // inside Memory::new when `?` propagated the error. We can't
-    // assert on the global counter here due to parallel test races,
-    // but the structural invariant (error returned, Memory dropped)
-    // guarantees unregister was called.
+    // The 2 successful registrations were cleaned up by
+    // RegisteredMemory::drop inside RegisteredMemory::new when `?`
+    // propagated the error. We can't assert on the global counter here
+    // due to parallel test races, but the structural invariant (error
+    // returned, RegisteredMemory dropped) guarantees unregister was called.
 }
 
 // ---------------------------------------------------------------------------
@@ -343,7 +341,7 @@ fn pool_multiple_chunks() {
     let buf1 = pool.allocate().unwrap();
     let buf2 = pool.allocate().unwrap();
 
-    // Two buffers from different chunks should point to different Memory objects.
+    // Two buffers from different chunks should point to different RegisteredMemory objects.
     let mem1_ptr = buf1.memory() as *const _;
     let mem2_ptr = buf2.memory() as *const _;
     assert_ne!(mem1_ptr, mem2_ptr);

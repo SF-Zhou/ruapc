@@ -1,11 +1,11 @@
 use std::io::Result;
 use std::sync::Arc;
 
-use crate::Memory;
+use crate::RegisteredMemory;
 
 /// A device registration handle for a memory region.
 ///
-/// When a `Memory` is dropped, `unregister` is called on each
+/// When a `RegisteredMemory` is dropped, `unregister` is called on each
 /// registration to clean up device-side state.
 pub trait Registration: Send + Sync + std::fmt::Debug {
     /// Unregisters the memory from the device.
@@ -36,7 +36,7 @@ pub trait Device: Send + Sync + std::fmt::Debug {
     /// Registers this device's memory region and pushes the registration
     /// into `mem` on success. If registration fails, `mem` is left
     /// unchanged — already-registered devices remain valid for cleanup.
-    fn register(self: &Arc<Self>, mem: &mut Memory<Self::Registration>) -> Result<()>;
+    fn register(self: &Arc<Self>, mem: &mut RegisteredMemory<Self::Registration>) -> Result<()>;
 }
 
 /// A fixed collection of devices.
