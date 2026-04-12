@@ -45,7 +45,18 @@ async fn test_hello() {
             socket_type: Some(socket_type),
             ..Default::default()
         };
-        let ctx = ruapc::Context::create(&config).unwrap().with_addr(addr);
+        // RDMA acquisition internally uses a TCP handshake through the same State,
+        // so the RDMA iteration's client needs UNIFIED (TCP + RDMA) rather than RDMA-only.
+        #[cfg(feature = "rdma")]
+        let client_config_type = if socket_type == SocketType::RDMA {
+            SocketType::UNIFIED
+        } else {
+            socket_type
+        };
+        #[cfg(not(feature = "rdma"))]
+        let client_config_type = socket_type;
+        let client_config = SocketPoolConfig { socket_type: client_config_type };
+        let ctx = ruapc::Context::create(&client_config).unwrap().with_addr(addr);
         let rsp = client.hello(&ctx, &"ruapc".to_string()).await.unwrap();
         assert_eq!(rsp, "hello ruapc!");
 
