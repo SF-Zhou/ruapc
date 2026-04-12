@@ -28,10 +28,8 @@ struct ReadTestImpl;
 
 impl ReadTestService for ReadTestImpl {
     async fn read_remote(&self, ctx: &Context, req: &RemoteReadReq) -> Result<RemoteReadRsp> {
-        // Allocate a local buffer on the server side to receive data.
-        let devices = ctx.state.devices.as_ref().unwrap();
-        let pool = BufferPool::new(devices.clone(), 2 * 1024 * 1024, 2 * 1024 * 1024, 0);
-        let mut local_buf = pool.allocate().unwrap();
+        // Allocate a local buffer from the shared pool on the server side.
+        let mut local_buf = ctx.state.buffer_pool().allocate().unwrap();
 
         // Remote read: pull data from the client's registered memory.
         ctx.remote_read(&req.info, &mut local_buf).await?;
@@ -60,10 +58,8 @@ struct WriteTestImpl;
 
 impl WriteTestService for WriteTestImpl {
     async fn write_remote(&self, ctx: &Context, req: &RemoteWriteReq) -> Result<()> {
-        // Allocate a local buffer on the server side, fill with data.
-        let devices = ctx.state.devices.as_ref().unwrap();
-        let pool = BufferPool::new(devices.clone(), 2 * 1024 * 1024, 2 * 1024 * 1024, 0);
-        let mut local_buf = pool.allocate().unwrap();
+        // Allocate a local buffer from the shared pool, fill with data.
+        let mut local_buf = ctx.state.buffer_pool().allocate().unwrap();
         local_buf[..req.data.len()].copy_from_slice(&req.data);
 
         // Remote write: push data to the client's registered memory.
@@ -76,34 +72,20 @@ impl WriteTestService for WriteTestImpl {
 
 #[tokio::test]
 async fn test_tcp_remote_read() {
-    // Set up devices shared by server.
-    let mut server_devices = Devices::new();
-    let _server_device = server_devices.add_tcp_device();
-    let server_devices = Arc::new(server_devices);
-
     // Set up server with ReadTestService.
     let read_svc = Arc::new(ReadTestImpl);
     let mut router = Router::default();
     read_svc.ruapc_export(&mut router);
-    let server = Server::create_with_devices(
-        router,
-        &SocketPoolConfig::default(),
-        Some(server_devices.clone()),
-    )
-    .unwrap();
-    let server = Arc::new(server);
+    let server = Server::create(router, &SocketPoolConfig::default()).unwrap();
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
-    let addr = server.clone().listen(addr).await.unwrap();
+    let addr = server.listen(addr).await.unwrap();
 
-    // Set up client with devices and MemoryService.
-    let mut client_devices = Devices::new();
-    let client_device = client_devices.add_tcp_device();
-    let client_devices = Arc::new(client_devices);
-
-    let client_pool = BufferPool::new(client_devices.clone(), 2 * 1024 * 1024, 2 * 1024 * 1024, 0);
+    // Set up client context (devices and MemoryService registered internally).
+    let ctx = Context::create_with_router(Router::default(), &SocketPoolConfig::default()).unwrap();
+    let client_device = ctx.state.devices().tcp_device().unwrap();
 
     // Allocate client buffer and fill with test data.
-    let mut client_buf = client_pool.allocate().unwrap();
+    let mut client_buf = ctx.state.buffer_pool().allocate().unwrap();
     let test_data = b"Hello, Remote Read!";
     client_buf[..test_data.len()].copy_from_slice(test_data);
 
@@ -115,13 +97,6 @@ async fn test_tcp_remote_read() {
         len: test_data.len() as u64,
     };
 
-    // Create client context with MemoryService registered (so server can call back).
-    let ctx = Context::create_with_router_and_devices(
-        Router::default(),
-        &SocketPoolConfig::default(),
-        Some(client_devices.clone()),
-    )
-    .unwrap();
     let ctx = ctx.with_addr(addr);
 
     // Call the server's ReadTestService — it will reverse-RPC to read our buffer.
@@ -139,35 +114,20 @@ async fn test_tcp_remote_read() {
 
 #[tokio::test]
 async fn test_tcp_remote_write() {
-    // Set up server devices.
-    let mut server_devices = Devices::new();
-    let _server_device = server_devices.add_tcp_device();
-    let server_devices = Arc::new(server_devices);
-
     // Set up server with WriteTestService.
     let write_svc = Arc::new(WriteTestImpl);
     let mut router = Router::default();
     write_svc.ruapc_export(&mut router);
-    let server = Server::create_with_devices(
-        router,
-        &SocketPoolConfig::default(),
-        Some(server_devices.clone()),
-    )
-    .unwrap();
-    let server = Arc::new(server);
+    let server = Server::create(router, &SocketPoolConfig::default()).unwrap();
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
-    let addr = server.clone().listen(addr).await.unwrap();
+    let addr = server.listen(addr).await.unwrap();
 
-    // Set up client with devices and MemoryService.
-    let mut client_devices = Devices::new();
-    let client_device = client_devices.add_tcp_device();
-    let client_devices = Arc::new(client_devices);
-
-    let client_pool = BufferPool::new(client_devices.clone(), 2 * 1024 * 1024, 2 * 1024 * 1024, 0);
+    // Set up client context (devices and MemoryService registered internally).
+    let ctx = Context::create_with_router(Router::default(), &SocketPoolConfig::default()).unwrap();
+    let client_device = ctx.state.devices().tcp_device().unwrap();
 
     // Allocate client buffer (initially zeroed by the allocator).
-    let client_buf = client_pool.allocate().unwrap();
-    // Verify it starts as zeros.
+    let client_buf = ctx.state.buffer_pool().allocate().unwrap();
     assert!(client_buf[..10].iter().all(|&b| b == 0));
 
     // Get RemoteBufferInfo for the client's buffer.
@@ -179,13 +139,6 @@ async fn test_tcp_remote_write() {
         len: write_data.len() as u64,
     };
 
-    // Create client context with MemoryService registered.
-    let ctx = Context::create_with_router_and_devices(
-        Router::default(),
-        &SocketPoolConfig::default(),
-        Some(client_devices.clone()),
-    )
-    .unwrap();
     let ctx = ctx.with_addr(addr);
 
     // Call the server's WriteTestService — it will reverse-RPC to write to our buffer.
@@ -211,33 +164,24 @@ async fn test_tcp_remote_write() {
 #[cfg(feature = "rdma")]
 #[tokio::test]
 async fn test_rdma_remote_read() {
-    // Get RDMA devices.
-    let rdma_devices = ruapc_rdma::Devices::availables().unwrap();
-
-    // Set up server with RDMA device.
-    let mut server_devs = Devices::new();
-    let _server_rdma = server_devs.add_rdma_device(rdma_devices[0].clone());
-    let server_devs = Arc::new(server_devs);
-
-    let read_svc = Arc::new(ReadTestImpl);
-    let mut router = Router::default();
-    read_svc.ruapc_export(&mut router);
     let config = SocketPoolConfig {
         socket_type: SocketType::UNIFIED,
     };
-    let server = Server::create_with_devices(router, &config, Some(server_devs.clone())).unwrap();
+
+    // Set up server with ReadTestService (devices constructed internally).
+    let read_svc = Arc::new(ReadTestImpl);
+    let mut router = Router::default();
+    read_svc.ruapc_export(&mut router);
+    let server = Server::create(router, &config).unwrap();
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
     let addr = server.listen(addr).await.unwrap();
 
-    // Set up client with RDMA device.
-    let mut client_devs = Devices::new();
-    let client_rdma = client_devs.add_rdma_device(rdma_devices[0].clone());
-    let client_devs = Arc::new(client_devs);
-
-    let client_pool = BufferPool::new(client_devs.clone(), 2 * 1024 * 1024, 2 * 1024 * 1024, 0);
+    // Set up client context (RDMA device constructed internally).
+    let ctx = Context::create_with_router(Router::default(), &config).unwrap();
+    let client_rdma = ctx.state.devices().rdma_device(0).unwrap();
 
     // Allocate client buffer and fill with test data.
-    let mut client_buf = client_pool.allocate().unwrap();
+    let mut client_buf = ctx.state.buffer_pool().allocate().unwrap();
     let test_data = b"Hello, RDMA Remote Read!";
     client_buf[..test_data.len()].copy_from_slice(test_data);
 
@@ -250,16 +194,8 @@ async fn test_rdma_remote_read() {
         len: test_data.len() as u64,
     };
 
-    // Create client context with RDMA device (for lkey lookup on server side).
-    let ctx = Context::create_with_router_and_devices(
-        Router::default(),
-        &config,
-        Some(client_devs.clone()),
-    )
-    .unwrap();
-    let ctx = ctx.with_addr(addr);
-
     // Use RDMA socket type for the RPC call.
+    let ctx = ctx.with_addr(addr);
     let client = Client {
         socket_type: Some(SocketType::RDMA),
         ..Default::default()
@@ -280,33 +216,24 @@ async fn test_rdma_remote_read() {
 #[cfg(feature = "rdma")]
 #[tokio::test]
 async fn test_rdma_remote_write() {
-    // Get RDMA devices.
-    let rdma_devices = ruapc_rdma::Devices::availables().unwrap();
-
-    // Set up server with RDMA device.
-    let mut server_devs = Devices::new();
-    let _server_rdma = server_devs.add_rdma_device(rdma_devices[0].clone());
-    let server_devs = Arc::new(server_devs);
-
-    let write_svc = Arc::new(WriteTestImpl);
-    let mut router = Router::default();
-    write_svc.ruapc_export(&mut router);
     let config = SocketPoolConfig {
         socket_type: SocketType::UNIFIED,
     };
-    let server = Server::create_with_devices(router, &config, Some(server_devs.clone())).unwrap();
+
+    // Set up server with WriteTestService (devices constructed internally).
+    let write_svc = Arc::new(WriteTestImpl);
+    let mut router = Router::default();
+    write_svc.ruapc_export(&mut router);
+    let server = Server::create(router, &config).unwrap();
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
     let addr = server.listen(addr).await.unwrap();
 
-    // Set up client with RDMA device.
-    let mut client_devs = Devices::new();
-    let client_rdma = client_devs.add_rdma_device(rdma_devices[0].clone());
-    let client_devs = Arc::new(client_devs);
-
-    let client_pool = BufferPool::new(client_devs.clone(), 2 * 1024 * 1024, 2 * 1024 * 1024, 0);
+    // Set up client context (RDMA device constructed internally).
+    let ctx = Context::create_with_router(Router::default(), &config).unwrap();
+    let client_rdma = ctx.state.devices().rdma_device(0).unwrap();
 
     // Allocate client buffer (initially zeroed).
-    let client_buf = client_pool.allocate().unwrap();
+    let client_buf = ctx.state.buffer_pool().allocate().unwrap();
     assert!(client_buf[..10].iter().all(|&b| b == 0));
 
     // Get RemoteBufferInfo with RDMA key.
@@ -319,16 +246,8 @@ async fn test_rdma_remote_write() {
         len: write_data.len() as u64,
     };
 
-    // Create client context with RDMA device.
-    let ctx = Context::create_with_router_and_devices(
-        Router::default(),
-        &config,
-        Some(client_devs.clone()),
-    )
-    .unwrap();
-    let ctx = ctx.with_addr(addr);
-
     // Use RDMA socket type for the RPC call.
+    let ctx = ctx.with_addr(addr);
     let client = Client {
         socket_type: Some(SocketType::RDMA),
         ..Default::default()
@@ -355,49 +274,28 @@ async fn test_rdma_remote_write() {
 
 #[tokio::test]
 async fn test_tcp_remote_read_bounds_check() {
-    // Set up server devices.
-    let mut server_devices = Devices::new();
-    server_devices.add_tcp_device();
-    let server_devices = Arc::new(server_devices);
-
     // Set up server with ReadTestService.
     let read_svc = Arc::new(ReadTestImpl);
     let mut router = Router::default();
     read_svc.ruapc_export(&mut router);
-    let server = Server::create_with_devices(
-        router,
-        &SocketPoolConfig::default(),
-        Some(server_devices.clone()),
-    )
-    .unwrap();
-    let server = Arc::new(server);
+    let server = Server::create(router, &SocketPoolConfig::default()).unwrap();
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
-    let addr = server.clone().listen(addr).await.unwrap();
+    let addr = server.listen(addr).await.unwrap();
 
-    // Set up client with devices and MemoryService.
-    let mut client_devices = Devices::new();
-    let client_device = client_devices.add_tcp_device();
-    let client_devices = Arc::new(client_devices);
-
-    let client_pool = BufferPool::new(client_devices.clone(), 2 * 1024 * 1024, 2 * 1024 * 1024, 0);
-    let client_buf = client_pool.allocate().unwrap();
+    // Set up client context.
+    let ctx = Context::create_with_router(Router::default(), &SocketPoolConfig::default()).unwrap();
+    let client_device = ctx.state.devices().tcp_device().unwrap();
+    let client_buf = ctx.state.buffer_pool().allocate().unwrap();
     let rbi = client_buf.remote_buffer_info(&client_device).unwrap();
 
     // Try to read beyond the buffer bounds.
     let bad_rbi = RemoteBufferInfo {
         key: rbi.key,
         addr: rbi.addr,
-        len: (3 * 1024 * 1024) as u64, // Exceeds 2 MiB buffer
+        len: (5 * 1024 * 1024) as u64, // Exceeds 4 MiB buffer
     };
 
-    let ctx = Context::create_with_router_and_devices(
-        Router::default(),
-        &SocketPoolConfig::default(),
-        Some(client_devices.clone()),
-    )
-    .unwrap();
     let ctx = ctx.with_addr(addr);
-
     let client = Client::default();
     let result: Result<RemoteReadRsp> = client
         .read_remote(&ctx, &RemoteReadReq { info: bad_rbi })

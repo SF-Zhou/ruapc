@@ -42,7 +42,8 @@ impl SocketPoolTrait for RdmaSocketPool {
     /// * `Err(Error)` - If RDMA devices cannot be initialized or buffer pool creation fails
     fn create(_: &SocketPoolConfig) -> Result<Self> {
         let devices = Devices::availables()?;
-        Self::create_from_devices(devices)
+        let rdmabuf_pool = BufferPool::create(4096, 4096, &devices)?;
+        Self::create_from_devices(devices, rdmabuf_pool)
     }
 
     /// Stops all tasks managed by the socket pool.
@@ -185,14 +186,14 @@ impl SocketPoolTrait for RdmaSocketPool {
 }
 
 impl RdmaSocketPool {
-    /// Creates a pool using the provided RDMA devices.
+    /// Creates a pool using the provided RDMA devices and transport buffer pool.
     ///
     /// Call this instead of [`SocketPoolTrait::create`] when you have
     /// already-opened RDMA devices whose protection domain should be
-    /// shared with user buffer registrations. If `rdma_devices` is
-    /// empty, falls back to `Devices::availables()`.
-    pub fn create_from_devices(devices: Devices) -> Result<Self> {
-        let rdmabuf_pool = BufferPool::create(4096, 4096, &devices)?;
+    /// shared with user buffer registrations. The `rdmabuf_pool` must
+    /// have been created from the same devices so that QP send/recv
+    /// buffers share the same protection domain.
+    pub fn create_from_devices(devices: Devices, rdmabuf_pool: Arc<BufferPool>) -> Result<Self> {
         Ok(Self {
             acquire_client: Client {
                 timeout: std::time::Duration::from_secs(5),

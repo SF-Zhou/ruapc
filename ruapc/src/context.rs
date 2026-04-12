@@ -4,7 +4,7 @@ use serde::Serialize;
 use tokio_util::sync::DropGuard;
 
 use crate::{
-    Devices, Error, Result, Router, Socket, SocketPoolConfig, SocketTrait, State,
+    Error, Result, Router, Socket, SocketPoolConfig, SocketTrait, State,
     msg::{MsgFlags, MsgMeta},
 };
 
@@ -28,7 +28,7 @@ pub enum SocketEndpoint {
 /// RPC context carrying request metadata and connection information.
 ///
 /// The `Context` is passed to all RPC service methods and contains:
-/// - Shared state (router, socket pool, etc.)
+/// - Shared state (router, socket pool, devices, buffer pool, etc.)
 /// - Connection endpoint information
 /// - Lifecycle management through drop guards
 ///
@@ -57,6 +57,7 @@ impl Context {
     /// Creates a new context with the given socket pool configuration.
     ///
     /// This creates a context with a default router (containing only MetaService).
+    /// Devices and the shared buffer pool are constructed internally.
     ///
     /// # Arguments
     ///
@@ -79,6 +80,8 @@ impl Context {
     /// Creates a new context with a custom router and configuration.
     ///
     /// Use this when you need to create a client context with custom services registered.
+    /// Devices (TCP and any available RDMA NICs) and the shared buffer pool are
+    /// constructed internally. A `MemoryService` is automatically registered.
     ///
     /// # Arguments
     ///
@@ -97,19 +100,7 @@ impl Context {
     /// let ctx = Context::create_with_router(router, &SocketPoolConfig::default()).unwrap();
     /// ```
     pub fn create_with_router(router: Router, config: &SocketPoolConfig) -> Result<Self> {
-        Self::create_with_router_and_devices(router, config, None)
-    }
-
-    /// Creates a new context with a custom router, configuration, and devices.
-    ///
-    /// When `devices` is provided, a `MemoryService` is automatically
-    /// registered to handle incoming Remote Read/Write requests from peers.
-    pub fn create_with_router_and_devices(
-        router: Router,
-        config: &SocketPoolConfig,
-        devices: Option<Arc<Devices>>,
-    ) -> Result<Self> {
-        let (state, drop_guard) = State::create(router, config, devices)?;
+        let (state, drop_guard) = State::create(router, config)?;
         Ok(Self {
             state,
             endpoint: SocketEndpoint::Invalid,
@@ -320,9 +311,19 @@ impl Context {
     ) -> Result<()> {
         let rdma_socket = self.get_rdma_socket()?;
 
-        // Register local buffer on the QP's device to get a valid lkey.
-        let mr = Self::register_on_qp_device(&rdma_socket.queue_pair, local_buf)?;
-        let local_lkey = mr.lkey;
+        // The state's RDMA device shares the same protection domain as the QP,
+        // so we can obtain the lkey directly from the buffer's existing registration.
+        let rdma_device = self.state.devices().rdma_device(0)?;
+        let local_rbi = local_buf.remote_buffer_info(&rdma_device)?;
+        let local_lkey = match local_rbi.key {
+            crate::MemoryKey::Rdma { lkey, .. } => lkey,
+            _ => {
+                return Err(Error::new(
+                    crate::ErrorKind::InvalidArgument,
+                    "expected RDMA key for local buffer".into(),
+                ));
+            }
+        };
 
         let wr_id = ruapc_rdma::verbs::WRID::send_data(0);
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -337,9 +338,7 @@ impl Context {
             rkey,
         )?;
 
-        let result = Self::await_rdma_completion(rx).await;
-        drop(mr);
-        result
+        Self::await_rdma_completion(rx).await
     }
 
     #[cfg(feature = "rdma")]
@@ -352,9 +351,19 @@ impl Context {
     ) -> Result<()> {
         let rdma_socket = self.get_rdma_socket()?;
 
-        // Register local buffer on the QP's device to get a valid lkey.
-        let mr = Self::register_on_qp_device(&rdma_socket.queue_pair, local_buf)?;
-        let local_lkey = mr.lkey;
+        // The state's RDMA device shares the same protection domain as the QP,
+        // so we can obtain the lkey directly from the buffer's existing registration.
+        let rdma_device = self.state.devices().rdma_device(0)?;
+        let local_rbi = local_buf.remote_buffer_info(&rdma_device)?;
+        let local_lkey = match local_rbi.key {
+            crate::MemoryKey::Rdma { lkey, .. } => lkey,
+            _ => {
+                return Err(Error::new(
+                    crate::ErrorKind::InvalidArgument,
+                    "expected RDMA key for local buffer".into(),
+                ));
+            }
+        };
 
         let wr_id = ruapc_rdma::verbs::WRID::send_data(0);
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -369,9 +378,7 @@ impl Context {
             rkey,
         )?;
 
-        let result = Self::await_rdma_completion(rx).await;
-        drop(mr);
-        result
+        Self::await_rdma_completion(rx).await
     }
 
     #[cfg(feature = "rdma")]
@@ -383,34 +390,6 @@ impl Context {
                 "RDMA remote read/write requires a connected RDMA socket".into(),
             )),
         }
-    }
-
-    /// Registers a buffer's memory on the QP's protection domain.
-    ///
-    /// The QP and the buffer may be on different protection domains
-    /// (RdmaSocketPool creates its own devices internally). This method
-    /// registers the buffer on the QP's pd to get a valid lkey.
-    #[cfg(feature = "rdma")]
-    #[allow(unsafe_code)]
-    fn register_on_qp_device(
-        qp: &ruapc_rdma::QueuePair,
-        buf: &crate::Buffer,
-    ) -> Result<ruapc_rdma::RawMemoryRegion> {
-        let mr = unsafe {
-            ruapc_rdma::verbs::ibv_reg_mr(
-                qp.device.pd_ptr(),
-                buf.as_ptr() as *mut _,
-                buf.len(),
-                ruapc_rdma::verbs::ACCESS_FLAGS as _,
-            )
-        };
-        if mr.is_null() {
-            return Err(Error::new(
-                crate::ErrorKind::RdmaSendFailed,
-                "failed to register local buffer on QP device".into(),
-            ));
-        }
-        Ok(unsafe { ruapc_rdma::RawMemoryRegion::from_raw(mr) })
     }
 
     #[cfg(feature = "rdma")]

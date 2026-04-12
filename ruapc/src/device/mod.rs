@@ -8,7 +8,7 @@ pub use rdma_device::RdmaDevice;
 
 use std::sync::Arc;
 
-use crate::Result;
+use crate::{Error, ErrorKind, Result};
 
 /// A network device abstraction using enum dispatch.
 ///
@@ -108,6 +108,39 @@ impl Devices {
     /// Returns the device at the given index.
     pub fn get(&self, index: usize) -> Option<&Arc<Device>> {
         self.devices.get(index)
+    }
+
+    /// Returns the nth RDMA device (0-based among RDMA devices only).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no RDMA device exists at the given index.
+    #[cfg(feature = "rdma")]
+    pub fn rdma_device(&self, idx: usize) -> Result<Arc<Device>> {
+        self.devices
+            .iter()
+            .filter(|d| matches!(d.as_ref(), Device::Rdma(_)))
+            .nth(idx)
+            .cloned()
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidArgument,
+                    format!("no RDMA device at index {idx}"),
+                )
+            })
+    }
+
+    /// Returns the first TCP device.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no TCP device has been added.
+    pub fn tcp_device(&self) -> Result<Arc<Device>> {
+        self.devices
+            .iter()
+            .find(|d| matches!(d.as_ref(), Device::Tcp(_)))
+            .cloned()
+            .ok_or_else(|| Error::new(ErrorKind::InvalidArgument, "no TCP device".into()))
     }
 
     /// Collects the inner `ruapc_rdma::Device` arcs from all RDMA devices.

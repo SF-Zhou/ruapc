@@ -3,8 +3,8 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio_util::sync::DropGuard;
 
 use crate::{
-    Context, Devices, Message, RawStream, Result, Router, Socket, SocketPool, SocketPoolConfig,
-    SocketPoolTrait, Waiter,
+    BufferPool, Context, Devices, Message, RawStream, Result, Router, Socket, SocketPool,
+    SocketPoolConfig, SocketPoolTrait, Waiter,
     services::{MemoryService, MemoryServiceImpl},
 };
 
@@ -14,9 +14,11 @@ use crate::{
 /// - Router for method dispatch
 /// - Waiter for request/response correlation
 /// - Socket pool for connection management
+/// - Device collection and buffer pool for Remote Read/Write
 ///
 /// This state is shared between the server and all active connections.
-#[derive(Default)]
+/// Devices and the buffer pool are constructed internally; callers access
+/// them via [`State::devices`] and [`State::buffer_pool`].
 pub struct State {
     /// Router containing registered service methods.
     pub router: Router,
@@ -25,27 +27,26 @@ pub struct State {
     /// Socket pool for managing connections.
     pub(crate) socket_pool: SocketPool,
     /// Device collection for memory registration and Remote Read/Write.
-    pub devices: Option<Arc<Devices>>,
+    pub(crate) devices: Arc<Devices>,
+    /// Shared user-level buffer pool registered on all devices.
+    pub(crate) buffer_pool: Arc<BufferPool>,
 }
 
 impl State {
     /// Creates a new state with the given router and configuration.
     ///
     /// This method:
-    /// 1. Builds the OpenAPI specification from the router
-    /// 2. Creates the socket pool with the specified configuration
-    /// 3. Initializes the waiter for request/response correlation
+    /// 1. Constructs the device collection (TCP + available RDMA devices)
+    /// 2. Creates the shared user-level buffer pool registered on all devices
+    /// 3. Registers a `MemoryService` in the router for Remote Read/Write
+    /// 4. Builds the OpenAPI specification from the router
+    /// 5. Creates the socket pool with the specified configuration
+    /// 6. Initializes the waiter for request/response correlation
     ///
     /// # Arguments
     ///
     /// * `router` - Router containing registered service methods
     /// * `config` - Socket pool configuration
-    ///
-    /// # Returns
-    /// Creates a new state with the given router and configuration.
-    ///
-    /// When `devices` is provided, a `MemoryService` is automatically
-    /// registered in the router to handle Remote Read/Write requests.
     ///
     /// # Returns
     ///
@@ -57,35 +58,59 @@ impl State {
     pub(crate) fn create(
         mut router: Router,
         config: &SocketPoolConfig,
-        devices: Option<Arc<Devices>>,
     ) -> Result<(Arc<Self>, DropGuard)> {
-        if let Some(ref devs) = devices {
-            let mem_svc = Arc::new(MemoryServiceImpl {
-                devices: devs.clone(),
-            });
-            mem_svc.ruapc_export(&mut router);
+        let mut devs = Devices::new();
+        devs.add_tcp_device();
+        #[cfg(feature = "rdma")]
+        if let Ok(rdma_devs) = ruapc_rdma::Devices::availables() {
+            for rdma_dev in rdma_devs.iter() {
+                devs.add_rdma_device(rdma_dev.clone());
+            }
         }
+        let devices = Arc::new(devs);
+        let buffer_pool = BufferPool::new(devices.clone(), 4 * 1024 * 1024, 256 * 1024 * 1024, 0);
+
+        let mem_svc = Arc::new(MemoryServiceImpl {
+            devices: devices.clone(),
+        });
+        mem_svc.ruapc_export(&mut router);
         router.build_open_api()?;
+
         let socket_pool = {
             #[cfg(feature = "rdma")]
-            if let Some(ref devs) = devices {
-                let rdma_devices = devs.rdma_inner_devices();
-                SocketPool::create_with_rdma_devices(config, rdma_devices)?
-            } else {
-                SocketPool::create(config)?
+            {
+                let rdma_inner = devices.rdma_inner_devices();
+                if rdma_inner.is_empty() {
+                    SocketPool::create(config)?
+                } else {
+                    let rdma_buf_pool = ruapc_rdma::BufferPool::create(4096, 4096, &rdma_inner)?;
+                    SocketPool::create_with_rdma_devices(config, rdma_inner, rdma_buf_pool)?
+                }
             }
             #[cfg(not(feature = "rdma"))]
             SocketPool::create(config)?
         };
+
         let state = Self {
             router,
             waiter: Arc::default(),
             socket_pool,
             devices,
+            buffer_pool,
         };
         let state = Arc::new(state);
         let drop_guard = state.drop_guard();
         Ok((state, drop_guard))
+    }
+
+    /// Returns the shared device collection.
+    pub fn devices(&self) -> &Arc<Devices> {
+        &self.devices
+    }
+
+    /// Returns the shared user-level buffer pool.
+    pub fn buffer_pool(&self) -> &Arc<BufferPool> {
+        &self.buffer_pool
     }
 
     /// Handles a received message from a socket.

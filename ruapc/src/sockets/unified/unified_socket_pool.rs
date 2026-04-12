@@ -132,17 +132,18 @@ impl std::fmt::Debug for UnifiedSocketPool {
 }
 
 impl UnifiedSocketPool {
-    /// Creates a pool using the provided RDMA devices so QPs and user buffer
-    /// registrations share the same protection domain.
+    /// Creates a pool using the provided RDMA devices and transport buffer pool so
+    /// QPs and user buffer registrations share the same protection domain.
     #[cfg(feature = "rdma")]
     pub fn create_with_rdma_devices(
         config: &SocketPoolConfig,
         rdma_devices: ruapc_rdma::Devices,
+        rdma_buf_pool: std::sync::Arc<ruapc_rdma::BufferPool>,
     ) -> Result<Self> {
         let rdma_socket_pool = if rdma_devices.is_empty() {
             RdmaSocketPool::create(config)?
         } else {
-            RdmaSocketPool::create_from_devices(rdma_devices)?
+            RdmaSocketPool::create_from_devices(rdma_devices, rdma_buf_pool)?
         };
         Self::create_inner(config, rdma_socket_pool)
     }
