@@ -146,9 +146,3 @@ impl From<Payload> for Bytes {
         }
     }
 }
-
-impl From<(Buffer, usize)> for Payload {
-    fn from((buf, len): (Buffer, usize)) -> Self {
-        Payload::Buffer(buf, 0, len)
-    }
-}
