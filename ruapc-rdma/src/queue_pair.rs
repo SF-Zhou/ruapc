@@ -1,4 +1,4 @@
-use crate::{Buffer, CompQueue, Device, ErrorKind, Result, verbs};
+use crate::{CompQueue, Device, ErrorKind, Result, verbs};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{ffi::c_int, ops::Deref, os::fd::BorrowedFd, sync::Arc};
@@ -119,12 +119,8 @@ impl QueuePair {
         Ok(())
     }
 
-    pub fn recv(&self, wr_id: verbs::WRID, buf: &Buffer) -> Result<()> {
-        let mut recv_sge = verbs::ibv_sge {
-            addr: buf.as_ptr() as _,
-            length: buf.capacity() as _,
-            lkey: buf.lkey(&self.device),
-        };
+    pub fn recv_raw(&self, wr_id: verbs::WRID, addr: u64, length: u32, lkey: u32) -> Result<()> {
+        let mut recv_sge = verbs::ibv_sge { addr, length, lkey };
         let mut recv_wr = verbs::ibv_recv_wr {
             wr_id,
             sg_list: &mut recv_sge as *mut _,
@@ -138,12 +134,8 @@ impl QueuePair {
         }
     }
 
-    pub fn send(&self, wr_id: verbs::WRID, buf: &Buffer) -> Result<()> {
-        let mut send_sge = verbs::ibv_sge {
-            addr: buf.as_ptr() as _,
-            length: buf.len() as _,
-            lkey: buf.lkey(&self.device),
-        };
+    pub fn send_raw(&self, wr_id: verbs::WRID, addr: u64, length: u32, lkey: u32) -> Result<()> {
+        let mut send_sge = verbs::ibv_sge { addr, length, lkey };
         let mut send_wr = verbs::ibv_send_wr {
             wr_id,
             sg_list: &mut send_sge as *mut _,
@@ -157,40 +149,6 @@ impl QueuePair {
             0 => Ok(()),
             _ => Err(ErrorKind::IBPostSendFailed.with_errno()),
         }
-    }
-
-    pub fn rdma_read(
-        &self,
-        wr_id: verbs::WRID,
-        local_buf: &Buffer,
-        remote_addr: u64,
-        rkey: u32,
-    ) -> Result<()> {
-        self.rdma_read_raw(
-            wr_id,
-            local_buf.as_ptr() as u64,
-            local_buf.capacity() as u32,
-            local_buf.lkey(&self.device),
-            remote_addr,
-            rkey,
-        )
-    }
-
-    pub fn rdma_write(
-        &self,
-        wr_id: verbs::WRID,
-        local_buf: &Buffer,
-        remote_addr: u64,
-        rkey: u32,
-    ) -> Result<()> {
-        self.rdma_write_raw(
-            wr_id,
-            local_buf.as_ptr() as u64,
-            local_buf.len() as u32,
-            local_buf.lkey(&self.device),
-            remote_addr,
-            rkey,
-        )
     }
 
     pub fn rdma_read_raw(
@@ -395,7 +353,7 @@ impl std::fmt::Debug for QueuePair {
 
 #[cfg(test)]
 mod tests {
-    use crate::{BufferPool, verbs::WRID};
+    use crate::{RegisteredBuffer, verbs::WRID};
 
     use super::*;
     use crate::Devices;
@@ -440,25 +398,36 @@ mod tests {
 
         // 4. post recv wr.
         const LEN: usize = 1 << 20;
-        let buffer_pool = BufferPool::create(LEN, 32, &devices).unwrap();
-
-        let mut recv_buf = buffer_pool.allocate().unwrap();
-        recv_buf.extend_from_slice(&vec![0; LEN]).unwrap();
-        let recv_slice: &[u8] = unsafe { std::mem::transmute(&*recv_buf) };
-        queue_pair_b.recv(verbs::WRID::recv(1), &recv_buf).unwrap();
+        let recv_buffer = RegisteredBuffer::create(&devices, LEN).unwrap();
+        let recv_lkey = recv_buffer.lkey(0);
+        let recv_ptr = recv_buffer.as_ptr();
+        let recv_slice = &*recv_buffer;
+        queue_pair_b
+            .recv_raw(WRID::recv(1), recv_ptr as u64, LEN as u32, recv_lkey)
+            .unwrap();
 
         // 5. try to poll cq.
         let mut wcs_b = vec![verbs::ibv_wc::default(); 128];
         assert!(queue_pair_b.poll_cq(&mut wcs_b).unwrap().is_empty());
 
         // 6. post send wr.
-        let mut send_buf = buffer_pool.allocate().unwrap();
-        assert_ne!(recv_buf.as_slice().as_ptr(), send_buf.as_slice().as_ptr());
-        send_buf.extend_from_slice(&vec![1; LEN]).unwrap();
-        let send_slice: &[u8] = unsafe { std::mem::transmute(&*send_buf) };
-        let send_len = send_buf.len();
+        let send_buffer = RegisteredBuffer::create(&devices, LEN).unwrap();
+        let send_lkey = send_buffer.lkey(0);
+        let send_ptr = send_buffer.as_ptr();
+        assert_ne!(recv_ptr, send_ptr);
+        // Fill send buffer with test data.
+        unsafe {
+            std::ptr::write_bytes(send_ptr as *mut u8, 1u8, LEN);
+        }
+        let send_slice = &*send_buffer;
+        let send_len = LEN;
         queue_pair_a
-            .send(verbs::WRID::send_data(2), &send_buf)
+            .send_raw(
+                WRID::send_data(2),
+                send_ptr as u64,
+                send_len as u32,
+                send_lkey,
+            )
             .unwrap();
 
         // 7. poll cq.
@@ -497,19 +466,28 @@ mod tests {
         qp_b.connect(&qp_a.endpoint()).unwrap();
 
         const LEN: usize = 4096;
-        let buffer_pool = BufferPool::create(LEN, 32, &devices).unwrap();
 
         // A side: register memory and fill with test data.
-        let mut buf_a = buffer_pool.allocate().unwrap();
+        let buf_a = RegisteredBuffer::create(&devices, LEN).unwrap();
         let test_data: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
-        buf_a.extend_from_slice(&test_data).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(test_data.as_ptr(), buf_a.as_ptr() as *mut u8, LEN);
+        }
         let remote_addr = buf_a.as_ptr() as u64;
-        let rkey = buf_a.rkey(&devices[0]);
+        let rkey_a = buf_a.rkey(0);
 
         // B side: allocate empty buffer, issue RDMA Read from A.
-        let buf_b = buffer_pool.allocate().unwrap();
-        qp_b.rdma_read(WRID::send_data(1), &buf_b, remote_addr, rkey)
-            .unwrap();
+        let buf_b = RegisteredBuffer::create(&devices, LEN).unwrap();
+        let lkey_b = buf_b.lkey(0);
+        qp_b.rdma_read_raw(
+            WRID::send_data(1),
+            buf_b.as_ptr() as u64,
+            LEN as u32,
+            lkey_b,
+            remote_addr,
+            rkey_a,
+        )
+        .unwrap();
 
         // Wait and poll completion on B side.
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -519,9 +497,7 @@ mod tests {
         assert_eq!(comp[0].status, verbs::ibv_wc_status::IBV_WC_SUCCESS);
 
         // Verify the data was read correctly.
-        // buf_b has length 0 (never extended), but RDMA wrote into raw memory.
-        let read_data = unsafe { std::slice::from_raw_parts(buf_b.as_ptr() as *const u8, LEN) };
-        assert_eq!(read_data, &test_data[..]);
+        assert_eq!(&buf_b[..LEN], &test_data[..]);
     }
 
     #[test]
@@ -542,20 +518,28 @@ mod tests {
         qp_b.connect(&qp_a.endpoint()).unwrap();
 
         const LEN: usize = 4096;
-        let buffer_pool = BufferPool::create(LEN, 32, &devices).unwrap();
 
         // A side: register empty buffer (target for write).
-        let mut buf_a = buffer_pool.allocate().unwrap();
-        buf_a.extend_from_slice(&vec![0u8; LEN]).unwrap();
+        let buf_a = RegisteredBuffer::create(&devices, LEN).unwrap();
         let remote_addr = buf_a.as_ptr() as u64;
-        let rkey = buf_a.rkey(&devices[0]);
+        let rkey_a = buf_a.rkey(0);
 
         // B side: fill buffer with test data, issue RDMA Write to A.
-        let mut buf_b = buffer_pool.allocate().unwrap();
+        let buf_b = RegisteredBuffer::create(&devices, LEN).unwrap();
         let test_data: Vec<u8> = (0..LEN).map(|i| (i % 199) as u8).collect();
-        buf_b.extend_from_slice(&test_data).unwrap();
-        qp_b.rdma_write(WRID::send_data(1), &buf_b, remote_addr, rkey)
-            .unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(test_data.as_ptr(), buf_b.as_ptr() as *mut u8, LEN);
+        }
+        let lkey_b = buf_b.lkey(0);
+        qp_b.rdma_write_raw(
+            WRID::send_data(1),
+            buf_b.as_ptr() as u64,
+            LEN as u32,
+            lkey_b,
+            remote_addr,
+            rkey_a,
+        )
+        .unwrap();
 
         // Wait and poll completion on B side.
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -565,7 +549,6 @@ mod tests {
         assert_eq!(comp[0].status, verbs::ibv_wc_status::IBV_WC_SUCCESS);
 
         // Verify A side memory was modified.
-        let a_data: &[u8] = unsafe { std::mem::transmute(&*buf_a) };
-        assert_eq!(&a_data[..LEN], &test_data[..]);
+        assert_eq!(&buf_a[..LEN], &test_data[..]);
     }
 }

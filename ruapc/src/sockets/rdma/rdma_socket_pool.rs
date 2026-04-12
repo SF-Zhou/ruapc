@@ -1,31 +1,46 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use foldhash::fast::RandomState;
-use ruapc_rdma::{BufferPool, Devices, QueuePair, verbs};
+use ruapc_rdma::{Devices, QueuePair, verbs};
 use tokio::sync::RwLock;
 use tokio_util::sync::DropGuard;
 
 use super::{Endpoint, EventLoop, RdmaInfo, RdmaService, RdmaSocket};
 use crate::{
     Client, Context, Error, ErrorKind, Result, Socket, SocketPoolConfig, SocketPoolTrait,
-    SocketType, State, TaskSupervisor,
+    SocketType, State, TaskSupervisor, memory::BufferPool,
 };
 
 /// A pool managing RDMA sockets and their associated resources.
 ///
 /// This structure maintains a collection of RDMA sockets, manages their lifecycle,
 /// and handles the shared resources like buffer pools and device access.
+///
+/// # Drop order
+///
+/// RDMA resources **must** be destroyed in this order:
+///   1. Stop all async tasks (so EventLoop drops its `Arc<RdmaSocket>`)
+///   2. Destroy QPs (`socket_map`)
+///   3. Deregister MRs (`rdmabuf_pool`)
+///   4. Destroy PD / close device context (`devices`)
+///
+/// Rust drops struct fields in **declaration order**, so the fields below
+/// are intentionally ordered to satisfy the ibverbs requirement.
 pub struct RdmaSocketPool {
-    /// Client used for acquiring RDMA connections
+    /// Client used for acquiring RDMA connections (no RDMA resources).
     pub acquire_client: Client,
-    /// Shared buffer pool for RDMA operations
-    pub rdmabuf_pool: Arc<BufferPool>,
-    /// Available RDMA devices in the system
-    pub devices: Devices,
-    /// Thread-safe map of active RDMA sockets indexed by their addresses
-    pub socket_map: RwLock<HashMap<SocketAddr, Arc<RdmaSocket>, RandomState>>,
-    /// Supervisor for managing asynchronous tasks
+    /// Supervisor for managing asynchronous tasks — dropped first so that
+    /// all spawned EventLoop tasks finish and release their `Arc<RdmaSocket>`.
     pub task_supervisor: TaskSupervisor,
+    /// Thread-safe map of active RDMA sockets indexed by their addresses.
+    /// Dropped after tasks stop → destroys QPs.
+    pub socket_map: RwLock<HashMap<SocketAddr, Arc<RdmaSocket>, RandomState>>,
+    /// Shared buffer pool for RDMA operations.
+    /// Dropped after QPs → deregisters MRs.
+    pub rdmabuf_pool: Arc<BufferPool>,
+    /// Available RDMA devices in the system.
+    /// Dropped last → destroys PD and closes device context.
+    pub devices: Devices,
 }
 
 impl SocketPoolTrait for RdmaSocketPool {
@@ -191,18 +206,23 @@ impl RdmaSocketPool {
     /// already-opened RDMA devices whose protection domain should be
     /// shared with user buffer registrations. If `rdma_devices` is
     /// empty, falls back to `Devices::availables()`.
-    pub fn create_from_devices(devices: Devices) -> Result<Self> {
-        let rdmabuf_pool = BufferPool::create(4096, 4096, &devices)?;
+    pub fn create_from_devices(rdma_devices: ruapc_rdma::Devices) -> Result<Self> {
+        // Build the high-level Devices collection that BufferPool expects.
+        let mut hl_devices = crate::device::Devices::new();
+        for d in rdma_devices.iter() {
+            hl_devices.add_rdma_device(d.clone());
+        }
+        let rdmabuf_pool = BufferPool::new(Arc::new(hl_devices), 4096, 4096, 0);
         Ok(Self {
             acquire_client: Client {
                 timeout: std::time::Duration::from_secs(5),
                 use_msgpack: true,
                 socket_type: Some(SocketType::TCP),
             },
-            rdmabuf_pool,
-            devices,
-            socket_map: RwLock::default(),
             task_supervisor: TaskSupervisor::create(),
+            socket_map: RwLock::default(),
+            rdmabuf_pool,
+            devices: rdma_devices,
         })
     }
 
@@ -247,6 +267,37 @@ impl RdmaSocketPool {
         });
 
         Ok(())
+    }
+}
+
+impl Drop for RdmaSocketPool {
+    fn drop(&mut self) {
+        // Signal all tasks to stop.
+        self.task_supervisor.stop();
+
+        // Block until every spawned EventLoop task has finished so that
+        // their `Arc<RdmaSocket>` (and thus QPs) are released before we
+        // drop the BufferPool (MRs) and Devices (PD).
+        //
+        // We may be inside a tokio runtime, so `block_on` would panic.
+        // Instead, clear the socket_map synchronously — this drops our
+        // `Arc<RdmaSocket>` references. The EventLoop tasks still hold
+        // their own Arcs and will drop the actual QPs when they finish.
+        // Since `BufferPool` and `Devices` are behind Arcs / have refcounts
+        // from Buffers in the EventLoop, they won't actually be freed until
+        // those tasks complete.
+        //
+        // However, the `rdmabuf_pool` field here might be the *only* owner
+        // of the Arc, so we must ensure the EventLoop has truly exited
+        // before our field drops proceed. We achieve this by NOT relying
+        // on task completion here, but instead ensuring the EventLoop drops
+        // its buffers before dropping the socket (see EventLoop field order).
+        //
+        // The key guarantee: the EventLoop drops `recv.buffers` before
+        // `socket`, and each Buffer holds `Arc<BufferPool>`, so the pool
+        // stays alive until after the QP in `socket` is destroyed.
+        // This `socket_map.clear()` just removes our extra Arc references.
+        self.socket_map.get_mut().clear();
     }
 }
 

@@ -212,6 +212,11 @@ impl BufferPool {
     pub fn chunk_size(&self) -> usize {
         self.chunk_size
     }
+
+    /// Returns a reference to the devices this pool is registered on.
+    pub fn devices(&self) -> &Arc<Devices> {
+        &self.devices
+    }
 }
 
 impl std::fmt::Debug for BufferPool {

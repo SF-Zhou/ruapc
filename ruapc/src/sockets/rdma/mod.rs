@@ -1,5 +1,8 @@
 pub(crate) use ruapc_rdma::Endpoint;
 
+mod queue_pair_ext;
+pub(crate) use queue_pair_ext::QueuePairExt;
+
 mod rdma_service;
 pub(crate) use rdma_service::{RdmaInfo, RdmaService};
 

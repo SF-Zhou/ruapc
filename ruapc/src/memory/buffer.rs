@@ -2,23 +2,31 @@ use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use crate::Result;
 use crate::device::Device;
+use crate::memory::MemoryKey;
+use crate::{Error, ErrorKind, Result};
 
 use super::buffer_pool::BufferPool;
 use super::remote_buffer_info::RemoteBufferInfo;
 
-/// A fixed-size memory buffer allocated from a [`BufferPool`].
+/// A memory buffer allocated from a [`BufferPool`].
 ///
 /// Holds an `Arc<BufferPool>` to keep the pool (and the underlying
 /// registered `Memory`) alive. On drop, the buffer is returned to
 /// the pool's free list for reuse.
 ///
+/// The buffer has a fixed `capacity` (the block size) and a variable
+/// `len` that tracks how much of the capacity is in use. By default
+/// `len == capacity` after allocation, but callers can use
+/// [`set_len`](Self::set_len) and [`extend_from_slice`](Self::extend_from_slice)
+/// for incremental filling (e.g. in RDMA send paths).
+///
 /// Implements `Deref<Target=[u8]>` and `DerefMut` for convenient
-/// byte-slice access.
+/// byte-slice access to the `[0..len]` region.
 pub struct Buffer {
     pool: Arc<BufferPool>,
     ptr: NonNull<u8>,
+    capacity: usize,
     len: usize,
     memory_index: usize,
     block_index: usize,
@@ -38,27 +46,80 @@ impl Buffer {
     pub(crate) fn new(
         pool: Arc<BufferPool>,
         ptr: NonNull<u8>,
-        len: usize,
+        capacity: usize,
         memory_index: usize,
         block_index: usize,
     ) -> Self {
         Self {
             pool,
             ptr,
-            len,
+            capacity,
+            len: capacity,
             memory_index,
             block_index,
         }
     }
 
-    /// Returns the size of this buffer in bytes.
+    /// Returns the number of bytes currently in use.
     pub fn len(&self) -> usize {
         self.len
     }
 
-    /// Buffers always have non-zero size.
+    /// Returns the total capacity of this buffer (block size).
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Returns a reference to the owning buffer pool.
+    pub fn pool(&self) -> &Arc<BufferPool> {
+        &self.pool
+    }
+
+    /// Returns `true` if `len` is zero.
     pub fn is_empty(&self) -> bool {
-        false
+        self.len == 0
+    }
+
+    /// Sets the length of the used region.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len > capacity`.
+    pub fn set_len(&mut self, len: usize) {
+        assert!(
+            len <= self.capacity,
+            "len {len} > capacity {}",
+            self.capacity
+        );
+        self.len = len;
+    }
+
+    /// Appends `data` to the used region, growing `len` accordingly.
+    ///
+    /// Returns an error if appending would exceed capacity.
+    pub fn extend_from_slice(&mut self, data: &[u8]) -> Result<()> {
+        let new_len = self.len + data.len();
+        if new_len > self.capacity {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                format!(
+                    "extend_from_slice: offset {} + length {} > capacity {}",
+                    self.len,
+                    data.len(),
+                    self.capacity
+                ),
+            ));
+        }
+        // SAFETY: ptr + self.len is within the allocated block.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                self.ptr.as_ptr().add(self.len),
+                data.len(),
+            );
+        }
+        self.len = new_len;
+        Ok(())
     }
 
     /// Returns a raw pointer to the buffer's memory.
@@ -71,6 +132,11 @@ impl Buffer {
         self.ptr.as_ptr()
     }
 
+    /// Returns the [`MemoryKey`] for this buffer on the given device.
+    pub fn memory_key(&self, device: &Device) -> Result<MemoryKey> {
+        self.pool.get_memory_key(self.memory_index, device)
+    }
+
     /// Builds the [`RemoteBufferInfo`] for this buffer on the given device.
     ///
     /// This information can be sent to a remote peer via RPC so it can
@@ -80,7 +146,7 @@ impl Buffer {
         Ok(RemoteBufferInfo {
             key,
             addr: self.ptr.as_ptr() as u64,
-            len: self.len as u64,
+            len: self.capacity as u64,
         })
     }
 }
@@ -125,6 +191,7 @@ impl std::fmt::Debug for Buffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Buffer")
             .field("ptr", &self.ptr)
+            .field("capacity", &self.capacity)
             .field("len", &self.len)
             .field("memory_index", &self.memory_index)
             .field("block_index", &self.block_index)
