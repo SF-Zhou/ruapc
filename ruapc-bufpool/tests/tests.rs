@@ -521,3 +521,83 @@ async fn pool_async_allocate_waits_for_return() {
     let buf2 = handle.await.unwrap();
     assert_eq!(buf2.capacity(), BLOCK);
 }
+
+// ---------------------------------------------------------------------------
+// Coverage gap tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn aligned_memory_debug_format() {
+    let mem = ruapc_bufpool::AlignedMemory::new(4096).unwrap();
+    let debug = format!("{mem:?}");
+    assert!(debug.contains("AlignedMemory"));
+    assert!(debug.contains("size"));
+}
+
+#[test]
+fn registered_memory_debug_format() {
+    let mem = RegisteredMemory::<MockRegistration>::new_unregistered(BLOCK).unwrap();
+    let debug = format!("{mem:?}");
+    assert!(debug.contains("RegisteredMemory"));
+    assert!(debug.contains("registrations"));
+}
+
+#[test]
+fn buffer_pool_accessor() {
+    let devices = mock_devices(1);
+    let pool = mock_pool(devices, 0);
+    let buf = pool.allocate().unwrap();
+
+    // buf.pool() should return a reference to the same pool.
+    assert_eq!(buf.pool().block_size(), BLOCK);
+}
+
+#[test]
+fn pool_allocate_chunk_failure() {
+    // All devices fail immediately, so the first allocate() triggers
+    // allocate_chunk -> RegisteredMemory::new -> device.register -> Err.
+    let mut devices = Devices::new();
+    devices.add(PartialDevice::new(0)); // always fails
+    let devices = Arc::new(devices);
+    let pool = BufferPool::new(devices, BLOCK, BLOCK, 0);
+
+    assert!(pool.allocate().is_err());
+}
+
+#[test]
+fn registered_memory_new_unregistered_zero_size() {
+    // Triggers AlignedMemory::new(0) -> Err inside new_unregistered.
+    let result = RegisteredMemory::<MockRegistration>::new_unregistered(0);
+    assert!(result.is_err());
+}
+
+#[test]
+fn registered_memory_new_first_device_fails() {
+    // Triggers the `?` error return at the top of the device iteration loop
+    // inside RegisteredMemory::new (memory.rs:30).
+    let mut devices = Devices::new();
+    devices.add(PartialDevice::new(0)); // first device always fails
+    let result = RegisteredMemory::new(BLOCK, &devices);
+    assert!(result.is_err());
+}
+
+#[test]
+fn pool_multi_block_chunk() {
+    // Use a chunk size that is a multiple of the block size to get
+    // multiple blocks per chunk.
+    let devices = mock_devices(1);
+    let pool = BufferPool::new(devices, BLOCK, BLOCK * 2, 0);
+
+    let buf1 = pool.allocate().unwrap();
+    let buf2 = pool.allocate().unwrap();
+
+    // Both should come from the same chunk (single allocation).
+    assert_eq!(pool.allocated_memory(), BLOCK * 2);
+
+    // They must have different addresses.
+    assert_ne!(buf1.as_ptr(), buf2.as_ptr());
+
+    drop(buf1);
+    drop(buf2);
+    assert_eq!(pool.free_count(), 2);
+}

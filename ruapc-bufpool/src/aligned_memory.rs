@@ -139,4 +139,34 @@ mod tests {
         assert_eq!(mem.as_slice()[0], 0x42);
         assert_eq!(mem.as_slice()[1], 0x43);
     }
+
+    #[test]
+    fn test_aligned_memory_debug() {
+        let mem = AlignedMemory::new(ALIGN).unwrap();
+        let debug = format!("{mem:?}");
+        assert!(debug.contains("AlignedMemory"));
+        assert!(debug.contains("size"));
+    }
+
+    #[test]
+    fn test_aligned_memory_mut_ptr() {
+        let mem = AlignedMemory::new(ALIGN).unwrap();
+        let ptr = mem.as_ptr();
+        let mut_ptr = mem.as_mut_ptr();
+        assert_eq!(ptr, mut_ptr as *const u8);
+    }
+
+    #[test]
+    fn test_aligned_memory_layout_too_large() {
+        // Size just above isize::MAX triggers Layout::from_size_align error.
+        let result = AlignedMemory::new(isize::MAX as usize + 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_aligned_memory_alloc_failure() {
+        // Request a valid-layout but impossibly large allocation (1 EiB).
+        let result = AlignedMemory::new(1_usize << 60);
+        assert!(result.is_err());
+    }
 }
