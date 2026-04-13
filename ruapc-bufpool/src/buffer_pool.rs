@@ -113,9 +113,12 @@ impl<D: Device> BufferPool<D> {
 
         if self.max_memory == 0 || inner.allocated_memory + self.chunk_size <= self.max_memory {
             self.allocate_chunk(inner)?;
-            if let Some(slot) = inner.free_list.pop_front() {
-                return self.make_buffer(inner, slot);
-            }
+            // allocate_chunk always pushes at least one slot.
+            let slot = inner
+                .free_list
+                .pop_front()
+                .expect("allocate_chunk pushed no slots");
+            return self.make_buffer(inner, slot);
         }
 
         Err(Error::other("buffer pool exhausted"))
