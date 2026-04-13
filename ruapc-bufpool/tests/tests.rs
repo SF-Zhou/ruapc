@@ -227,9 +227,9 @@ fn memory_drop_calls_unregister() {
 
 #[test]
 fn memory_aligned_memory_accessors() {
-    let mut mem = RegisteredMemory::<MockRegistration>::new_unregistered(BLOCK).unwrap();
+    let mem = RegisteredMemory::<MockRegistration>::new_unregistered(BLOCK).unwrap();
     let ptr = mem.aligned_memory().as_ptr();
-    let ptr_mut = mem.aligned_memory_mut().as_mut_ptr();
+    let ptr_mut = mem.aligned_memory().as_mut_ptr();
     assert_eq!(ptr as *mut u8, ptr_mut);
 }
 

@@ -65,7 +65,7 @@ impl AlignedMemory {
     }
 
     /// Returns a mutable raw pointer to the memory.
-    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+    pub fn as_mut_ptr(&self) -> *mut u8 {
         self.ptr.as_ptr()
     }
 
@@ -76,8 +76,15 @@ impl AlignedMemory {
     }
 
     /// Returns the memory as a mutable byte slice.
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        // SAFETY: ptr is valid for `size` bytes and we have exclusive access.
+    ///
+    /// This is safe because `AlignedMemory` owns its allocation exclusively
+    /// and the raw pointer is valid for `size` bytes. Concurrent access
+    /// is governed by the higher-level types that hold the `AlignedMemory`
+    /// (e.g. `RegisteredMemory`, `BufferPool`).
+    #[allow(clippy::mut_from_ref)]
+    pub fn as_mut_slice(&self) -> &mut [u8] {
+        // SAFETY: ptr is valid for `size` bytes and properly aligned.
+        // AlignedMemory is the sole owner of this allocation.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.size) }
     }
 }
@@ -125,7 +132,7 @@ mod tests {
 
     #[test]
     fn test_aligned_memory_read_write() {
-        let mut mem = AlignedMemory::new(ALIGN).unwrap();
+        let mem = AlignedMemory::new(ALIGN).unwrap();
         let slice = mem.as_mut_slice();
         slice[0] = 0x42;
         slice[1] = 0x43;

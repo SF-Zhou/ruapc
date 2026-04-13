@@ -89,13 +89,11 @@ impl ruapc_bufpool::Device for Device {
         self: &Arc<Self>,
         mem: &mut ruapc_bufpool::RegisteredMemory<Self::Registration>,
     ) -> std::io::Result<()> {
-        let aligned = mem.aligned_memory();
-        let ptr = aligned.as_ptr();
-        let size = aligned.size();
+        let aligned = mem.aligned_memory().clone();
 
         match self.as_ref() {
             Device::Tcp(tcp) => {
-                let id = tcp.register(ptr as usize, size);
+                let id = tcp.register(aligned);
                 mem.add_registration(MemoryRegistration::Tcp {
                     device: self.clone(),
                     id,
@@ -104,6 +102,8 @@ impl ruapc_bufpool::Device for Device {
             }
             #[cfg(feature = "rdma")]
             Device::Rdma(rdma) => {
+                let ptr = aligned.as_ptr();
+                let size = aligned.size();
                 let mr = unsafe {
                     ruapc_rdma::verbs::ibv_reg_mr(
                         rdma.pd_ptr(),
@@ -197,15 +197,19 @@ mod tests {
 
     #[test]
     fn test_tcp_device_register_validate() {
+        use ruapc_bufpool::AlignedMemory;
+
         let dev = TcpDevice::new(0);
-        let id = dev.register(0x1000, 4096);
+        let mem = Arc::new(AlignedMemory::new(4096).unwrap());
+        let size = mem.size();
+        let id = dev.register(mem);
 
         // Valid access.
         assert!(dev.validate_access(id, 0, 100).is_ok());
-        assert!(dev.validate_access(id, 4000, 96).is_ok());
+        assert!(dev.validate_access(id, size as u64 - 96, 96).is_ok());
 
         // Out of bounds.
-        assert!(dev.validate_access(id, 4000, 97).is_err());
+        assert!(dev.validate_access(id, size as u64 - 96, 97).is_err());
 
         // Unknown ID.
         assert!(dev.validate_access(id + 1, 0, 1).is_err());

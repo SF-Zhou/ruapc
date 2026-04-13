@@ -1,4 +1,5 @@
 use std::io::{Error, ErrorKind, Result};
+use std::sync::Arc;
 
 use crate::AlignedMemory;
 use crate::device::{Device, Devices, Registration};
@@ -15,7 +16,7 @@ use crate::device::{Device, Devices, Registration};
 /// registration fails, the `RegisteredMemory` still holds registrations
 /// from previously successful devices, ensuring correct cleanup on drop.
 pub struct RegisteredMemory<R: Registration> {
-    aligned_memory: AlignedMemory,
+    aligned_memory: Arc<AlignedMemory>,
     registrations: Vec<R>,
 }
 
@@ -41,7 +42,7 @@ impl<R: Registration> RegisteredMemory<R> {
     /// Use [`Device::register`] to register on individual devices
     /// afterwards.
     pub fn new_unregistered(size: usize) -> Result<Self> {
-        let aligned_memory = AlignedMemory::new(size)?;
+        let aligned_memory = Arc::new(AlignedMemory::new(size)?);
         Ok(Self {
             aligned_memory,
             registrations: Vec::new(),
@@ -56,14 +57,9 @@ impl<R: Registration> RegisteredMemory<R> {
         self.registrations.push(reg);
     }
 
-    /// Returns a reference to the underlying `AlignedMemory`.
-    pub fn aligned_memory(&self) -> &AlignedMemory {
+    /// Returns a reference to the underlying `Arc<AlignedMemory>`.
+    pub fn aligned_memory(&self) -> &Arc<AlignedMemory> {
         &self.aligned_memory
-    }
-
-    /// Returns a mutable reference to the underlying `AlignedMemory`.
-    pub fn aligned_memory_mut(&mut self) -> &mut AlignedMemory {
-        &mut self.aligned_memory
     }
 
     /// Returns a reference to the registration for the given device index.
