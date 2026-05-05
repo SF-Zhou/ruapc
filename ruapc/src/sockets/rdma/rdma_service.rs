@@ -1,7 +1,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{Context, Result, SocketPoolTrait, rdma, service};
+use crate::{Context, Result, rdma, service};
 
 /// Information about available RDMA devices in the system.
 ///
@@ -10,7 +10,7 @@ use crate::{Context, Result, SocketPoolTrait, rdma, service};
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct RdmaInfo {
     /// List of available RDMA devices and their capabilities
-    pub devices: Vec<ruapc_rdma::DeviceInfo>,
+    pub devices: Vec<ruapc_rdma_sys::DeviceInfo>,
 }
 
 /// Service interface for RDMA operations.
@@ -21,25 +21,9 @@ pub struct RdmaInfo {
 #[service]
 pub trait RdmaService {
     /// Retrieves information about available RDMA devices.
-    ///
-    /// # Arguments
-    /// * `ctx` - The context containing state and configuration
-    /// * `_` - Unused parameter required by the service framework
-    ///
-    /// # Returns
-    /// * `Ok(RdmaInfo)` - Information about available RDMA devices
-    /// * `Err(Error)` - If device information cannot be retrieved
     async fn info(&self, ctx: &Context, _: &()) -> Result<rdma::RdmaInfo>;
 
     /// Establishes an RDMA connection with the specified endpoint.
-    ///
-    /// # Arguments
-    /// * `ctx` - The context containing state and configuration
-    /// * `endpoint` - The remote endpoint to connect to
-    ///
-    /// # Returns
-    /// * `Ok(Endpoint)` - The local endpoint information if connection succeeds
-    /// * `Err(Error)` - If connection establishment fails
     async fn connect(&self, ctx: &Context, endpoint: &rdma::Endpoint) -> Result<rdma::Endpoint>;
 }
 

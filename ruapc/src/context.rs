@@ -4,7 +4,7 @@ use serde::Serialize;
 use tokio_util::sync::DropGuard;
 
 use crate::{
-    Devices, Error, Result, Router, Socket, SocketPoolConfig, SocketTrait, State,
+    Error, Result, Router, Socket, SocketPoolConfig, SocketTrait, State,
     msg::{MsgFlags, MsgMeta},
 };
 
@@ -55,61 +55,13 @@ pub struct Context {
 
 impl Context {
     /// Creates a new context with the given socket pool configuration.
-    ///
-    /// This creates a context with a default router (containing only MetaService).
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - Socket pool configuration
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if state creation fails.
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// # use ruapc::{Context, SocketPoolConfig};
-    /// let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
-    /// ```
     pub fn create(config: &SocketPoolConfig) -> Result<Self> {
         Self::create_with_router(Router::default(), config)
     }
 
     /// Creates a new context with a custom router and configuration.
-    ///
-    /// Use this when you need to create a client context with custom services registered.
-    ///
-    /// # Arguments
-    ///
-    /// * `router` - Custom router with registered services
-    /// * `config` - Socket pool configuration
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if state creation fails.
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// # use ruapc::{Context, Router, SocketPoolConfig};
-    /// let router = Router::default();
-    /// let ctx = Context::create_with_router(router, &SocketPoolConfig::default()).unwrap();
-    /// ```
     pub fn create_with_router(router: Router, config: &SocketPoolConfig) -> Result<Self> {
-        Self::create_with_router_and_devices(router, config, None)
-    }
-
-    /// Creates a new context with a custom router, configuration, and devices.
-    ///
-    /// When `devices` is provided, a `MemoryService` is automatically
-    /// registered to handle incoming Remote Read/Write requests from peers.
-    pub fn create_with_router_and_devices(
-        router: Router,
-        config: &SocketPoolConfig,
-        devices: Option<Arc<Devices>>,
-    ) -> Result<Self> {
-        let (state, drop_guard) = State::create(router, config, devices)?;
+        let (state, drop_guard) = State::create(router, config)?;
         Ok(Self {
             state,
             endpoint: SocketEndpoint::Invalid,
@@ -132,23 +84,6 @@ impl Context {
     }
 
     /// Creates a new context with the specified target address.
-    ///
-    /// This method clones the current context and sets a new target address,
-    /// useful for making requests to a specific server.
-    ///
-    /// # Arguments
-    ///
-    /// * `addr` - The target socket address
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// # use ruapc::{Context, SocketPoolConfig};
-    /// # use std::{net::SocketAddr, str::FromStr};
-    /// # let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
-    /// let addr = SocketAddr::from_str("127.0.0.1:8000").unwrap();
-    /// let client_ctx = ctx.with_addr(addr);
-    /// ```
     #[must_use]
     pub fn with_addr(&self, addr: SocketAddr) -> Self {
         Self {
@@ -160,14 +95,6 @@ impl Context {
     }
 
     /// Creates a server-side context with an established socket connection.
-    ///
-    /// Internal method used by the server to create contexts for incoming requests.
-    ///
-    /// # Arguments
-    ///
-    /// * `state` - Shared state
-    /// * `socket` - Connected socket
-    /// * `msg_meta` - Message metadata from the incoming request
     #[must_use]
     pub(crate) fn server_ctx(state: &Arc<State>, socket: Socket, msg_meta: MsgMeta) -> Self {
         Self {
@@ -179,17 +106,6 @@ impl Context {
     }
 
     /// Sends an RPC response back to the client.
-    ///
-    /// This method is called by service implementations to return results.
-    ///
-    /// # Type Parameters
-    ///
-    /// * `Rsp` - The response type
-    /// * `E` - The error type
-    ///
-    /// # Arguments
-    ///
-    /// * `rsp` - The result to send back (Ok or Err)
     pub async fn send_rsp<Rsp, E>(&mut self, rsp: std::result::Result<Rsp, E>)
     where
         Rsp: Serialize,
@@ -209,12 +125,6 @@ impl Context {
     }
 
     /// Sends an error response back to the client.
-    ///
-    /// Convenience method for sending error responses.
-    ///
-    /// # Arguments
-    ///
-    /// * `err` - The error to send back
     pub async fn send_err_rsp(&mut self, err: Error) {
         self.send_rsp::<(), Error>(Err(err)).await;
     }
@@ -223,11 +133,6 @@ impl Context {
     ///
     /// For TCP: sends a `MemoryService/read` reverse RPC request.
     /// For RDMA: issues a one-sided RDMA Read via QP verbs.
-    ///
-    /// # Arguments
-    ///
-    /// * `remote` - Remote buffer info (key, addr, len) obtained from the peer
-    /// * `local_buf` - Local buffer to write the received data into
     pub async fn remote_read(
         &self,
         remote: &crate::RemoteBufferInfo,
@@ -245,12 +150,6 @@ impl Context {
     ///
     /// For TCP: sends a `MemoryService/write` reverse RPC request.
     /// For RDMA: issues a one-sided RDMA Write via QP verbs.
-    ///
-    /// # Arguments
-    ///
-    /// * `remote` - Remote buffer info (key, addr, len) obtained from the peer
-    /// * `local_buf` - Local buffer containing the data to write
-    /// * `len` - Number of bytes to write from `local_buf`
     pub async fn remote_write(
         &self,
         remote: &crate::RemoteBufferInfo,
@@ -319,22 +218,15 @@ impl Context {
         rkey: u32,
     ) -> Result<()> {
         let rdma_socket = self.get_rdma_socket()?;
+        let mr = Self::register_on_qp_device(&rdma_socket, local_buf)?;
 
-        // Register local buffer on the QP's device to get a valid lkey.
-        let mr = Self::register_on_qp_device(&rdma_socket.queue_pair, local_buf)?;
-        let local_lkey = mr.lkey;
-
-        let wr_id = ruapc_rdma::verbs::WRID::send_data(0);
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        rdma_socket.rdma_completions.insert(wr_id, tx);
-
-        rdma_socket.queue_pair.rdma_read_raw(
-            wr_id,
-            local_buf.as_ptr() as u64,
-            remote.len as u32,
-            local_lkey,
+        let rx = Self::post_rdma_verb(
+            &rdma_socket,
+            &mr,
+            remote.len as usize,
             remote.addr,
             rkey,
+            true,
         )?;
 
         let result = Self::await_rdma_completion(rx).await;
@@ -351,31 +243,48 @@ impl Context {
         rkey: u32,
     ) -> Result<()> {
         let rdma_socket = self.get_rdma_socket()?;
+        let mr = Self::register_on_qp_device(&rdma_socket, local_buf)?;
 
-        // Register local buffer on the QP's device to get a valid lkey.
-        let mr = Self::register_on_qp_device(&rdma_socket.queue_pair, local_buf)?;
-        let local_lkey = mr.lkey;
-
-        let wr_id = ruapc_rdma::verbs::WRID::send_data(0);
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        rdma_socket.rdma_completions.insert(wr_id, tx);
-
-        rdma_socket.queue_pair.rdma_write_raw(
-            wr_id,
-            local_buf.as_ptr() as u64,
-            len as u32,
-            local_lkey,
-            remote.addr,
-            rkey,
-        )?;
+        let rx = Self::post_rdma_verb(&rdma_socket, &mr, len, remote.addr, rkey, false)?;
 
         let result = Self::await_rdma_completion(rx).await;
         drop(mr);
         result
     }
 
+    /// Posts an RDMA Read or Write verb via the safe QueuePair API.
+    ///
+    /// Separated from the async methods so that the `!Send` types inside
+    /// `QueuePair` do not live across an await point.
     #[cfg(feature = "rdma")]
-    fn get_rdma_socket(&self) -> Result<std::sync::Arc<crate::rdma::RdmaSocket>> {
+    fn post_rdma_verb(
+        rdma_socket: &crate::rdma::RdmaSocket,
+        mr: &ruapc_rdma_sys::MemoryRegion,
+        length: usize,
+        remote_addr: u64,
+        rkey: u32,
+        is_read: bool,
+    ) -> Result<tokio::sync::oneshot::Receiver<ruapc_rdma_sys::ibv_wc_status>> {
+        let buf_ref = crate::rdma::MrBufferRef::new(mr, length);
+
+        let wr_id = if is_read {
+            rdma_socket
+                .queue_pair
+                .read_untracked(&buf_ref, remote_addr, rkey)
+        } else {
+            rdma_socket
+                .queue_pair
+                .write_untracked(&buf_ref, remote_addr, rkey)
+        }
+        .map_err(|e| Error::new(crate::ErrorKind::RdmaSendFailed, e.to_string()))?;
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        rdma_socket.rdma_completions.insert(wr_id, tx);
+        Ok(rx)
+    }
+
+    #[cfg(feature = "rdma")]
+    fn get_rdma_socket(&self) -> Result<Arc<crate::rdma::RdmaSocket>> {
         match &self.endpoint {
             SocketEndpoint::Connected(Socket::RDMA(s)) => Ok(s.clone()),
             _ => Err(Error::new(
@@ -386,36 +295,40 @@ impl Context {
     }
 
     /// Registers a buffer's memory on the QP's protection domain.
-    ///
-    /// The QP and the buffer may be on different protection domains
-    /// (RdmaSocketPool creates its own devices internally). This method
-    /// registers the buffer on the QP's pd to get a valid lkey.
     #[cfg(feature = "rdma")]
     #[allow(unsafe_code)]
     fn register_on_qp_device(
-        qp: &ruapc_rdma::QueuePair,
+        rdma_socket: &crate::rdma::RdmaSocket,
         buf: &crate::Buffer,
-    ) -> Result<ruapc_rdma::RawMemoryRegion> {
+    ) -> Result<ruapc_rdma_sys::MemoryRegion> {
+        let pd = match rdma_socket.device.as_ref() {
+            crate::Device::Rdma(r) => r.pd(),
+            _ => unreachable!("RdmaSocket should always have an RDMA device"),
+        };
+        let access = ruapc_rdma_sys::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0
+            | ruapc_rdma_sys::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE.0
+            | ruapc_rdma_sys::ibv_access_flags::IBV_ACCESS_REMOTE_READ.0
+            | ruapc_rdma_sys::ibv_access_flags::IBV_ACCESS_RELAXED_ORDERING.0;
         let mr = unsafe {
-            ruapc_rdma::verbs::ibv_reg_mr(
-                qp.device.pd_ptr(),
+            ruapc_rdma_sys::MemoryRegion::register(
+                pd,
                 buf.as_ptr() as *mut _,
                 buf.len(),
-                ruapc_rdma::verbs::ACCESS_FLAGS as _,
+                access as _,
             )
-        };
-        if mr.is_null() {
-            return Err(Error::new(
-                crate::ErrorKind::RdmaSendFailed,
-                "failed to register local buffer on QP device".into(),
-            ));
         }
-        Ok(unsafe { ruapc_rdma::RawMemoryRegion::from_raw(mr) })
+        .map_err(|e| {
+            Error::new(
+                crate::ErrorKind::RdmaSendFailed,
+                format!("failed to register local buffer on QP device: {e}"),
+            )
+        })?;
+        Ok(mr)
     }
 
     #[cfg(feature = "rdma")]
     async fn await_rdma_completion(
-        rx: tokio::sync::oneshot::Receiver<ruapc_rdma::verbs::ibv_wc_status>,
+        rx: tokio::sync::oneshot::Receiver<ruapc_rdma_sys::ibv_wc_status>,
     ) -> Result<()> {
         let status = rx.await.map_err(|_| {
             Error::new(
@@ -423,7 +336,7 @@ impl Context {
                 "RDMA completion channel closed".into(),
             )
         })?;
-        if status != ruapc_rdma::verbs::ibv_wc_status::IBV_WC_SUCCESS {
+        if status != ruapc_rdma_sys::ibv_wc_status::IBV_WC_SUCCESS {
             return Err(Error::new(
                 crate::ErrorKind::RdmaSendFailed,
                 format!("RDMA operation failed with status {:?}", status),

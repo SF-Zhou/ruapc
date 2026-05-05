@@ -26,7 +26,11 @@ pub struct WebSocketPool {
 }
 
 impl SocketPoolTrait for WebSocketPool {
-    fn create(_: &SocketPoolConfig) -> Result<Self> {
+    fn create(
+        _config: &SocketPoolConfig,
+        _devices: &Arc<crate::Devices>,
+        _buffer_pool: &Arc<crate::memory::BufferPool>,
+    ) -> Result<Self> {
         Ok(Self {
             socket_map: Arc::default(),
             task_supervisor: TaskSupervisor::create(),

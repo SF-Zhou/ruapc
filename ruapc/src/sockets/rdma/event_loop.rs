@@ -10,12 +10,12 @@
 
 use std::{collections::BTreeSet, sync::Arc, time::Instant};
 
-use ruapc_rdma::verbs;
+use ruapc_rdma_sys::{CompChannel, CompletionQueue, WRType, ibv_send_flags, ibv_wc};
 use tokio::io::{Interest, unix::AsyncFd};
 
 use crate::{Error, ErrorKind, Message, Result, Socket, State, memory::Buffer};
 
-use super::{QueuePairExt, RdmaSocket};
+use super::{RdmaBufferRef, RdmaSocket};
 
 /// Handler for RDMA receive operations
 ///
@@ -39,33 +39,36 @@ struct RecvHandler {
     data_received: u64,
     /// Number of acknowledged data messages
     data_acked: u64,
-    /// Receive buffers for incoming messages
-    buffers: Vec<Buffer>,
 }
 
 impl RecvHandler {
     fn init_buffers(&mut self, count: usize, socket: &RdmaSocket) -> Result<()> {
-        assert!(self.buffers.is_empty());
-        self.buffers.reserve(count);
-
-        for wrid in 0..count as u64 {
+        for _ in 0..count {
             let buf = socket.rdmabuf_pool.allocate()?;
-            self.buffers.push(buf);
-            self.post_recv(wrid, socket)?;
+            self.post_recv(buf, socket)?;
         }
         Ok(())
     }
 
-    fn post_recv(&mut self, wrid: u64, socket: &RdmaSocket) -> Result<()> {
-        let buf = &self.buffers[usize::try_from(wrid).unwrap()];
-        socket.queue_pair.recv(verbs::WRID::recv(wrid), buf)?;
+    fn post_recv(&mut self, buf: Buffer, socket: &RdmaSocket) -> Result<()> {
+        let buf_ref = socket.make_buffer_ref(Arc::new(buf)).ok_or_else(|| {
+            Error::new(
+                ErrorKind::RdmaRecvFailed,
+                "buffer not registered on QP device".into(),
+            )
+        })?;
+        socket
+            .queue_pair
+            .recv(buf_ref)
+            .map_err(|e| Error::new(ErrorKind::RdmaRecvFailed, e.to_string()))?;
         self.submitted += 1;
         Ok(())
     }
 
     fn handle_completion(
         &mut self,
-        wc: &verbs::ibv_wc,
+        wc: &ibv_wc,
+        buffer: Option<RdmaBufferRef>,
         socket: &Arc<RdmaSocket>,
         send: &mut SendHandler,
         state: &Arc<State>,
@@ -73,7 +76,7 @@ impl RecvHandler {
         self.completed += 1;
 
         if !wc.succ() {
-            socket.queue_pair.set_error();
+            self.set_error(socket);
             return Err(Error::new(
                 ErrorKind::RdmaRecvFailed,
                 format!(
@@ -83,28 +86,34 @@ impl RecvHandler {
             ));
         } else if let Some(ack) = wc.imm() {
             self.imm_received += 1;
-
             send.update_confirmed(ack);
         } else {
             self.data_received += 1;
 
             // Handle regular data message
-            let mut new_buf = socket.rdmabuf_pool.allocate()?;
-            std::mem::swap(
-                &mut self.buffers[usize::try_from(wc.wr_id.get_id()).unwrap()],
-                &mut new_buf,
-            );
-            new_buf.set_len(wc.byte_len as usize);
+            if let Some(buf_ref) = buffer {
+                let arc_buf = buf_ref.into_buffer();
+                // We should be the only holder of this Arc at this point.
+                if let Ok(mut buf) = Arc::try_unwrap(arc_buf) {
+                    buf.set_len(wc.byte_len as usize);
 
-            if let Ok(msg) = Message::parse(new_buf)
-                && let Err(e) = state.handle_recv(&Socket::from(socket), msg)
-            {
-                tracing::error!("Failed to handle message: {}", e);
+                    if let Ok(msg) = Message::parse(buf)
+                        && let Err(e) = state.handle_recv(&Socket::from(socket), msg)
+                    {
+                        tracing::error!("Failed to handle message: {}", e);
+                    }
+                }
             }
         }
 
-        self.post_recv(wc.wr_id.get_id(), socket)?;
+        // Post a new recv buffer
+        let new_buf = socket.rdmabuf_pool.allocate()?;
+        self.post_recv(new_buf, socket)?;
         Ok(())
+    }
+
+    fn set_error(&self, socket: &Arc<RdmaSocket>) {
+        socket.set_error();
     }
 }
 
@@ -130,18 +139,25 @@ struct SendHandler {
 }
 
 impl SendHandler {
-    fn handle_completion(&mut self, wc: &verbs::ibv_wc, socket: &RdmaSocket) -> Result<()> {
+    fn handle_completion(
+        &mut self,
+        wc: &ibv_wc,
+        _buffer: Option<RdmaBufferRef>,
+        socket: &RdmaSocket,
+    ) -> Result<()> {
         // Check if this is an RDMA one-sided operation completion.
         if let Some((_, sender)) = socket.rdma_completions.remove(&wc.wr_id) {
             let _ = sender.send(wc.status);
             return Ok(());
         }
 
-        if wc.is_send_imm() {
-            self.ack_completed += 1;
-        } else {
-            self.data_completed += 1;
-            socket.send_buffers.remove(&wc.wr_id.get_id());
+        match wc.wr_id.get_type() {
+            WRType::SendImm => {
+                self.ack_completed += 1;
+            }
+            _ => {
+                self.data_completed += 1;
+            }
         }
 
         if wc.succ() {
@@ -166,34 +182,24 @@ impl SendHandler {
         pending_imm: u32,
         pending_data: u32,
     ) -> Result<()> {
-        let mut wr = verbs::ibv_send_wr {
-            wr_id: verbs::WRID::send_imm(self.ack_submitted),
-            opcode: verbs::ibv_wr_opcode::IBV_WR_SEND_WITH_IMM,
-            send_flags: verbs::ibv_send_flags::IBV_SEND_SIGNALED.0,
-            __bindgen_anon_1: verbs::ibv_send_wr__bindgen_ty_1 {
-                imm_data: ((pending_imm << 16) + pending_data).to_be(),
-            },
-            ..Default::default()
-        };
+        let imm_data = (pending_imm << 16) + pending_data;
 
-        let ret = socket.queue_pair.post_send(&mut wr);
+        let ret = socket
+            .queue_pair
+            .send_imm_only(imm_data, ibv_send_flags::IBV_SEND_SIGNALED);
         self.ack_submitted += 1;
-        if ret == 0 {
-            Ok(())
-        } else {
-            self.ack_completed += 1;
-            self.ack_confirmed += 1;
-            tracing::error!(
-                "{} submit ack error: {}, {:?}",
-                socket.queue_pair.qp_num,
-                ret,
-                std::io::Error::last_os_error()
-            );
-            socket.queue_pair.set_error();
-            Err(Error::new(
-                ErrorKind::RdmaSendFailed,
-                format!("failed to post ack: {ret}"),
-            ))
+        match ret {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.ack_completed += 1;
+                self.ack_confirmed += 1;
+                tracing::error!("submit ack error: {err}",);
+                socket.set_error();
+                Err(Error::new(
+                    ErrorKind::RdmaSendFailed,
+                    format!("failed to post ack: {err}"),
+                ))
+            }
         }
     }
 }
@@ -246,7 +252,11 @@ pub struct EventLoop {
     send: SendHandler,
     last_ack_timestamp: Instant,
     flow_config: FlowConfig,
-    unack_cq_events: usize,
+    unack_cq_events: u32,
+
+    // --- completion infrastructure ---
+    comp_channel: Arc<CompChannel>,
+    cq: Arc<CompletionQueue>,
 
     // --- then the socket (QP) ---
     socket: Arc<RdmaSocket>,
@@ -261,12 +271,16 @@ impl EventLoop {
     /// # Arguments
     /// * `socket` - RDMA socket with initialized queue pair
     /// * `state` - Shared state for coordination
+    /// * `comp_channel` - Completion channel for event notifications
+    /// * `cq` - Completion queue shared between send and recv
     ///
     /// # Returns
     /// New `EventLoop` instance configured for the given socket
     pub fn new(
         socket: Arc<RdmaSocket>,
         state: Arc<State>,
+        comp_channel: Arc<CompChannel>,
+        cq: Arc<CompletionQueue>,
         pending_receiver: tokio::sync::mpsc::Receiver<u64>,
     ) -> Self {
         Self {
@@ -275,6 +289,8 @@ impl EventLoop {
             last_ack_timestamp: Instant::now(),
             flow_config: FlowConfig::default(),
             unack_cq_events: 0,
+            comp_channel,
+            cq,
             socket,
             state,
             pending_receiver,
@@ -306,33 +322,59 @@ impl EventLoop {
     ///
     /// # Returns
     /// * `Result<()>` - Success or error with cause
+    #[allow(unsafe_code)]
     pub async fn run(&mut self) -> Result<()> {
-        let socket = self.socket.clone();
-        let async_fd = AsyncFd::with_interest(socket.queue_pair.notify_fd(), Interest::READABLE)
+        // Extract the raw fd to avoid borrowing `self` through BorrowedFd.
+        let raw_fd = {
+            use std::os::unix::io::AsRawFd;
+            self.comp_channel.fd().as_raw_fd()
+        };
+        let borrowed_fd = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(raw_fd) };
+        let async_fd = AsyncFd::with_interest(borrowed_fd, Interest::READABLE)
             .map_err(|e| Error::new(ErrorKind::InvalidArgument, e.to_string()))?;
 
-        let mut wcs_buf = [verbs::ibv_wc::default(); 32];
+        let mut wcs_buf = [ibv_wc::default(); 32];
         let mut pending_sends = Vec::with_capacity(256);
 
         loop {
-            self.socket.queue_pair.req_notify()?;
+            self.cq
+                .req_notify(false)
+                .map_err(|e| Error::new(ErrorKind::RdmaRecvFailed, e.to_string()))?;
 
             loop {
-                let wcs = self.socket.queue_pair.poll_cq(&mut wcs_buf)?;
+                let n = self
+                    .cq
+                    .poll(&mut wcs_buf)
+                    .map_err(|e| Error::new(ErrorKind::RdmaRecvFailed, e.to_string()))?;
+                let wcs = &wcs_buf[..n];
+
                 for wc in wcs.iter() {
+                    // Retrieve the buffer from the QP's internal wrs map.
+                    let buffer = self.socket.queue_pair.take_buffer(&wc.wr_id);
+
                     if wc.is_recv() {
                         if self
                             .recv
-                            .handle_completion(wc, &self.socket, &mut self.send, &self.state)
+                            .handle_completion(
+                                wc,
+                                buffer,
+                                &self.socket,
+                                &mut self.send,
+                                &self.state,
+                            )
                             .is_err()
                         {
                             self.socket.set_error();
                         }
-                    } else if self.send.handle_completion(wc, &self.socket).is_err() {
+                    } else if self
+                        .send
+                        .handle_completion(wc, buffer, &self.socket)
+                        .is_err()
+                    {
                         self.socket.set_error();
                     }
                 }
-                if wcs.len() < wcs_buf.len() {
+                if n < wcs_buf.len() {
                     break;
                 }
             }
@@ -347,7 +389,15 @@ impl EventLoop {
 
             tokio::select! {
                 guard = async_fd.readable() => {
-                    self.unack_cq_events += self.socket.queue_pair.get_cq_events()?;
+                    match self.comp_channel.get_event() {
+                        Ok(_) => self.unack_cq_events += 1,
+                        Err(e) => {
+                            // EAGAIN means no event ready yet, that's fine
+                            if e.kind != ruapc_rdma_sys::ErrorKind::IBGetCompQueueEventFail {
+                                tracing::error!("get_cq_event error: {e}");
+                            }
+                        }
+                    }
                     guard.unwrap().clear_ready();
                 },
                 _ = self.pending_receiver.recv_many(&mut pending_sends, 256) => {
@@ -372,7 +422,7 @@ impl EventLoop {
     fn update_flow_control(&mut self) -> Result<()> {
         if !self.socket.state.is_ok() {
             while let Some(msgid) = self.pending_sends.pop_first() {
-                self.socket.send_buffers.remove(&msgid);
+                self.socket.pending_buffers.remove(&msgid);
                 self.send.data_completed += 1;
             }
             return Ok(());
@@ -383,11 +433,21 @@ impl EventLoop {
         while let Some(&msgid) = self.pending_sends.first()
             && msgid < sendable_bound
         {
-            self.socket.queue_pair.send(
-                verbs::WRID::send_data(msgid),
-                &self.socket.send_buffers.get(&msgid).unwrap(),
-            )?;
             self.pending_sends.pop_first();
+            // Retrieve the stored buffer and post it to the QP.
+            if let Some((_, buf_ref)) = self.socket.pending_buffers.remove(&msgid)
+                && let Err(e) = self
+                    .socket
+                    .queue_pair
+                    .send(buf_ref, ibv_send_flags::IBV_SEND_SIGNALED)
+            {
+                tracing::error!("failed to send pending buffer: {e}");
+                self.socket.set_error();
+                return Err(Error::new(
+                    ErrorKind::RdmaSendFailed,
+                    format!("failed to send pending buffer: {e}"),
+                ));
+            }
         }
 
         let ack_done = std::cmp::min(self.send.ack_completed, self.send.ack_confirmed);
@@ -415,6 +475,8 @@ impl EventLoop {
 
 impl Drop for EventLoop {
     fn drop(&mut self) {
-        self.socket.queue_pair.ack_cq_events(self.unack_cq_events);
+        if self.unack_cq_events > 0 {
+            self.cq.ack_events(self.unack_cq_events);
+        }
     }
 }

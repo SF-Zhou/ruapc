@@ -16,7 +16,7 @@ A high-performance Rust RPC library that supports multiple transport protocols (
 | `ruapc` | Core library: server, client, router, socket abstractions, message format |
 | `ruapc-bufpool` | Generic buffer pool with device registration (transport-independent) |
 | `ruapc-macro` | Proc macro `#[service]` for service definition and code generation |
-| `ruapc-rdma` | RDMA transport (optional, behind `rdma` feature flag) |
+| `ruapc-rdma-sys` | Low-level FFI bindings to libibverbs with type-safe RDMA device management |
 | `ruapc-demo` | Example server/client applications |
 
 ## Features

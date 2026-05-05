@@ -19,11 +19,13 @@ pub struct TcpDevice {
 }
 
 impl TcpDevice {
-    /// Creates a new TCP device. The `index` is typically overwritten
+    /// Creates a new TCP device.
+    ///
+    /// The `index` field is set to `0` initially and will be assigned
     /// by [`Devices::add`](ruapc_bufpool::Devices::add) via `set_index`.
-    pub fn new(index: usize) -> Self {
+    pub fn new() -> Self {
         Self {
-            index,
+            index: 0,
             registry: Mutex::new(HashMap::new()),
             next_id: AtomicU32::new(1),
         }
@@ -135,6 +137,12 @@ impl TcpDevice {
         }
 
         Ok(mem.as_ptr() as usize + offset as usize)
+    }
+}
+
+impl Default for TcpDevice {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

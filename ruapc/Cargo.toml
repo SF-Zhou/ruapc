@@ -9,13 +9,13 @@ description.workspace = true
 license.workspace = true
 
 [features]
-rdma = ["ruapc-rdma"]
+rdma = ["ruapc-rdma-sys"]
 default = []
 
 [dependencies]
 ruapc-macro ={ version = "0.1.3", path = "../ruapc-macro" }
 ruapc-bufpool = { version = "0.1.0", path = "../ruapc-bufpool" }
-ruapc-rdma = { version = "0.1.3", path = "../ruapc-rdma", optional = true }
+ruapc-rdma-sys = { version = "0.1.2", path = "../ruapc-rdma-sys", optional = true }
 
 bitflags.workspace = true
 bytes.workspace = true
