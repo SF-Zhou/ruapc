@@ -27,8 +27,8 @@ pub enum ErrorKind {
     IBAllocPDFail,
     /// Failed to create completion channel.
     IBCreateCompChannelFail,
-    /// Failed to set completion channel to non-blocking mode.
-    IBSetCompChannelNonBlockFail,
+    /// Failed to set non-blocking mode.
+    IBSetNonBlockFail,
     /// Failed to get completion queue event.
     IBGetCompQueueEventFail,
     /// Failed to create completion queue.
@@ -44,11 +44,9 @@ pub enum ErrorKind {
     /// Failed to modify queue pair state.
     IBModifyQueuePairFail,
     /// Failed to post receive work request.
-    IBPostRecvFailed,
+    IBPostRecvFail,
     /// Failed to post send work request.
-    IBPostSendFailed,
-    /// Failed to set non-blocking mode.
-    IBSetNonBlockFailed,
+    IBPostSendFail,
     /// Buffer size insufficient for operation.
     InsufficientBuffer,
     /// Unknown or unclassified error with a custom message.
@@ -61,7 +59,7 @@ pub enum ErrorKind {
 /// This is the primary error type used throughout the ruapc-rdma library.
 /// It combines an error kind for categorization with an optional message
 /// for additional context.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct Error {
     /// The category of error that occurred.
     pub kind: ErrorKind,
@@ -115,6 +113,12 @@ impl std::fmt::Display for Error {
     }
 }
 
+impl std::fmt::Debug for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
 impl std::error::Error for Error {}
 
 /// Result type alias using [`Error`] as the error type.
@@ -156,5 +160,21 @@ mod tests {
 
         let err: Error = ErrorKind::IBGetDeviceListFail.into();
         assert_eq!(err.to_string(), "IBGetDeviceListFail");
+    }
+
+    #[test]
+    fn test_error_display() {
+        let err = Error::new(ErrorKind::IBOpenDeviceFail, "Device not found".to_string());
+        assert_eq!(err.to_string(), "IBOpenDeviceFail: Device not found");
+
+        let err: Error = ErrorKind::IBAllocPDFail.into();
+        assert_eq!(err.to_string(), "IBAllocPDFail");
+    }
+
+    #[test]
+    fn test_error_from_kind() {
+        let err: Error = ErrorKind::IBQueryDeviceFail.into();
+        assert_eq!(err.kind, ErrorKind::IBQueryDeviceFail);
+        assert!(err.msg.is_empty());
     }
 }

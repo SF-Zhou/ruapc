@@ -25,7 +25,11 @@ pub struct TcpSocketPool {
 }
 
 impl SocketPoolTrait for TcpSocketPool {
-    fn create(_: &SocketPoolConfig) -> Result<Self> {
+    fn create(
+        _config: &SocketPoolConfig,
+        _devices: &Arc<crate::Devices>,
+        _buffer_pool: &Arc<crate::memory::BufferPool>,
+    ) -> Result<Self> {
         Ok(Self::new())
     }
 

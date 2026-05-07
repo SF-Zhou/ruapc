@@ -8,31 +8,35 @@ use ruapc_bufpool::{BufferPool, Device, Devices, RegisteredMemory, Registration}
 // Mock types
 // ---------------------------------------------------------------------------
 
-/// Global counter tracking net registrations (created minus unregistered).
-/// Used by tests that need to verify cleanup behavior. Because tests run
-/// in parallel, assertions should always use *relative* deltas (snapshot
-/// before and after) rather than checking for an absolute value.
-static LIVE_REGISTRATIONS: AtomicUsize = AtomicUsize::new(0);
-
-fn live_regs() -> usize {
-    LIVE_REGISTRATIONS.load(Ordering::SeqCst)
-}
-
 #[derive(Debug)]
 struct MockRegistration {
     device_index: usize,
+    /// Optional shared counter decremented on unregister, for drop verification.
+    drop_counter: Option<Arc<AtomicUsize>>,
 }
 
 impl MockRegistration {
     fn new(device_index: usize) -> Self {
-        LIVE_REGISTRATIONS.fetch_add(1, Ordering::SeqCst);
-        Self { device_index }
+        Self {
+            device_index,
+            drop_counter: None,
+        }
+    }
+
+    fn with_counter(device_index: usize, counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self {
+            device_index,
+            drop_counter: Some(counter.clone()),
+        }
     }
 }
 
 impl Registration for MockRegistration {
     fn unregister(&self, _buf: &[u8]) {
-        LIVE_REGISTRATIONS.fetch_sub(1, Ordering::SeqCst);
+        if let Some(counter) = &self.drop_counter {
+            counter.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 }
 
@@ -60,6 +64,36 @@ impl Device for MockDevice {
 
     fn register(self: &Arc<Self>, mem: &mut RegisteredMemory<Self::Registration>) -> Result<()> {
         mem.add_registration(MockRegistration::new(self.index));
+        Ok(())
+    }
+}
+
+/// A device that tracks registrations via a shared counter.
+#[derive(Debug)]
+struct CountingDevice {
+    index: usize,
+    counter: Arc<AtomicUsize>,
+}
+
+impl CountingDevice {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        Self { index: 0, counter }
+    }
+}
+
+impl Device for CountingDevice {
+    type Registration = MockRegistration;
+
+    fn index(&self) -> usize {
+        self.index
+    }
+
+    fn set_index(&mut self, idx: usize) {
+        self.index = idx;
+    }
+
+    fn register(self: &Arc<Self>, mem: &mut RegisteredMemory<Self::Registration>) -> Result<()> {
+        mem.add_registration(MockRegistration::with_counter(self.index, &self.counter));
         Ok(())
     }
 }
@@ -192,14 +226,13 @@ fn memory_new_unregistered() {
 
 #[test]
 fn memory_add_registration_and_lookup() {
-    let before = live_regs();
     let mut mem = RegisteredMemory::<MockRegistration>::new_unregistered(BLOCK).unwrap();
     mem.add_registration(MockRegistration::new(0));
     mem.add_registration(MockRegistration::new(1));
     assert_eq!(mem.registration(0).unwrap().device_index, 0);
     assert_eq!(mem.registration(1).unwrap().device_index, 1);
     assert!(mem.registration(2).is_err());
-    assert_eq!(live_regs(), before + 2);
+    assert_eq!(mem.registrations().len(), 2);
 }
 
 #[test]
@@ -215,14 +248,16 @@ fn memory_new_with_devices() {
 
 #[test]
 fn memory_drop_calls_unregister() {
-    let before = live_regs();
+    let counter = Arc::new(AtomicUsize::new(0));
     {
-        let devices = mock_devices(2);
+        let mut devices = Devices::new();
+        devices.add(CountingDevice::new(counter.clone()));
+        devices.add(CountingDevice::new(counter.clone()));
         let _mem = RegisteredMemory::new(BLOCK, &devices).unwrap();
-        assert_eq!(live_regs(), before + 2);
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
     }
-    // After drop, the delta should be zero.
-    assert_eq!(live_regs(), before);
+    // After drop, unregister should have been called on each registration.
+    assert_eq!(counter.load(Ordering::SeqCst), 0);
 }
 
 #[test]

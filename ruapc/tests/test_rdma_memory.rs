@@ -1,20 +1,33 @@
 #![cfg(feature = "rdma")]
-#![feature(return_type_notation)]
 
 use std::sync::Arc;
 
 use ruapc::*;
 
-fn make_rdma_devices() -> (Devices, Arc<Device>) {
-    let rdma_devices = ruapc_rdma::Devices::availables().unwrap();
+fn make_devices() -> (Arc<Devices>, Arc<Device>) {
+    // Manually build devices: TCP + RDMA (same logic as State::discover_devices).
     let mut devices = Devices::new();
-    let device = devices.add_rdma_device(rdma_devices[0].clone());
-    (devices, device)
+    devices.add_tcp_device();
+    let active_devices = ruapc_rdma_sys::ActiveDevice::available().unwrap();
+    let prefer_rxe = std::env::var("RUAPC_PREFER_RXE").is_ok();
+    for dev in active_devices {
+        if prefer_rxe && !dev.info().name.starts_with("rxe") {
+            continue;
+        }
+        devices.add_rdma_device(dev);
+    }
+    let devices = Arc::new(devices);
+    let rdma_device = devices
+        .iter()
+        .find(|d| matches!(d.as_ref(), Device::Rdma(_)))
+        .expect("no RDMA device discovered")
+        .clone();
+    (devices, rdma_device)
 }
 
 #[test]
 fn test_rdma_memory_registration() {
-    let (devices, device) = make_rdma_devices();
+    let (devices, device) = make_devices();
 
     let mem = Memory::new(4096, &devices).unwrap();
     let key = mem.get_memory_key(&device).unwrap();
@@ -31,7 +44,7 @@ fn test_rdma_memory_registration() {
 
 #[test]
 fn test_rdma_memory_drop_cleanup() {
-    let (devices, device) = make_rdma_devices();
+    let (devices, device) = make_devices();
 
     // Create and drop memory — should not panic.
     let mem = Memory::new(4096, &devices).unwrap();
@@ -46,20 +59,26 @@ fn test_rdma_memory_drop_cleanup() {
 
 #[test]
 fn test_rdma_memory_mixed_devices() {
-    // Create both TCP and RDMA devices.
-    let rdma_devices = ruapc_rdma::Devices::availables().unwrap();
-    let mut devices = Devices::new();
-    let tcp_device = devices.add_tcp_device();
-    let rdma_device = devices.add_rdma_device(rdma_devices[0].clone());
+    let (devices, _) = make_devices();
+
+    // The devices collection should have both TCP and RDMA.
+    let tcp_device = devices
+        .iter()
+        .find(|d| matches!(d.as_ref(), Device::Tcp(_)))
+        .expect("no TCP device");
+    let rdma_device = devices
+        .iter()
+        .find(|d| matches!(d.as_ref(), Device::Rdma(_)))
+        .expect("no RDMA device");
 
     let mem = Memory::new(4096, &devices).unwrap();
 
     // TCP key should be Tcp variant.
-    let tcp_key = mem.get_memory_key(&tcp_device).unwrap();
+    let tcp_key = mem.get_memory_key(tcp_device).unwrap();
     assert!(matches!(tcp_key, MemoryKey::Tcp { .. }));
 
     // RDMA key should be Rdma variant.
-    let rdma_key = mem.get_memory_key(&rdma_device).unwrap();
+    let rdma_key = mem.get_memory_key(rdma_device).unwrap();
     match rdma_key {
         MemoryKey::Rdma { lkey, rkey } => {
             assert_ne!(lkey, 0);
@@ -71,8 +90,7 @@ fn test_rdma_memory_mixed_devices() {
 
 #[test]
 fn test_rdma_buffer_pool_allocate() {
-    let (devices, device) = make_rdma_devices();
-    let devices = Arc::new(devices);
+    let (devices, device) = make_devices();
 
     let pool = BufferPool::new(devices, 2 * 1024 * 1024, 2 * 1024 * 1024, 0);
     let buf = pool.allocate().unwrap();
@@ -94,8 +112,7 @@ fn test_rdma_buffer_pool_allocate() {
 
 #[test]
 fn test_rdma_buffer_pool_multiple_buffers() {
-    let (devices, device) = make_rdma_devices();
-    let devices = Arc::new(devices);
+    let (devices, device) = make_devices();
 
     let pool = BufferPool::new(devices, 2 * 1024 * 1024, 4 * 1024 * 1024, 0);
 

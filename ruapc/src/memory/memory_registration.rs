@@ -15,7 +15,7 @@ pub enum MemoryRegistration {
     #[cfg(feature = "rdma")]
     Rdma {
         device: Arc<Device>,
-        mr: ruapc_rdma::RawMemoryRegion,
+        mr: ruapc_rdma_sys::MemoryRegion,
     },
 }
 
@@ -26,8 +26,8 @@ impl MemoryRegistration {
             MemoryRegistration::Tcp { id, .. } => MemoryKey::Tcp { id: *id },
             #[cfg(feature = "rdma")]
             MemoryRegistration::Rdma { mr, .. } => MemoryKey::Rdma {
-                lkey: mr.lkey,
-                rkey: mr.rkey,
+                lkey: mr.lkey(),
+                rkey: mr.rkey(),
             },
         }
     }
@@ -46,7 +46,7 @@ impl ruapc_bufpool::Registration for MemoryRegistration {
     /// Unregisters the memory from the associated device.
     ///
     /// For TCP, removes the ID from the registry.
-    /// For RDMA, the `RawMemoryRegion` is dropped (handled by the enum
+    /// For RDMA, the `MemoryRegion` is dropped (handled by the enum
     /// variant being dropped), which calls `ibv_dereg_mr` automatically.
     fn unregister(&self, _buf: &[u8]) {
         match self {
@@ -57,7 +57,7 @@ impl ruapc_bufpool::Registration for MemoryRegistration {
             }
             #[cfg(feature = "rdma")]
             MemoryRegistration::Rdma { .. } => {
-                // RawMemoryRegion's Drop calls ibv_dereg_mr.
+                // MemoryRegion's Drop calls ibv_dereg_mr.
                 // Nothing extra to do here — the variant will be dropped
                 // when the MemoryRegistration is dropped.
             }
@@ -75,8 +75,8 @@ impl std::fmt::Debug for MemoryRegistration {
             #[cfg(feature = "rdma")]
             MemoryRegistration::Rdma { mr, .. } => f
                 .debug_struct("MemoryRegistration::Rdma")
-                .field("lkey", &mr.lkey)
-                .field("rkey", &mr.rkey)
+                .field("lkey", &mr.lkey())
+                .field("rkey", &mr.rkey())
                 .finish(),
         }
     }

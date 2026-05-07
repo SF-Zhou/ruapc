@@ -17,6 +17,7 @@ use crate::memory::MemoryRegistration;
 /// registered on a device before it can participate in Remote Read/Write
 /// operations through that device's transport.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // Always behind Arc<Device>, heap-allocated.
 pub enum Device {
     Tcp(TcpDevice),
     #[cfg(feature = "rdma")]
@@ -104,21 +105,22 @@ impl ruapc_bufpool::Device for Device {
             Device::Rdma(rdma) => {
                 let ptr = aligned.as_ptr();
                 let size = aligned.size();
+                let access = ruapc_rdma_sys::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0
+                    | ruapc_rdma_sys::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE.0
+                    | ruapc_rdma_sys::ibv_access_flags::IBV_ACCESS_REMOTE_READ.0
+                    | ruapc_rdma_sys::ibv_access_flags::IBV_ACCESS_RELAXED_ORDERING.0;
                 let mr = unsafe {
-                    ruapc_rdma::verbs::ibv_reg_mr(
-                        rdma.pd_ptr(),
+                    ruapc_rdma_sys::MemoryRegion::register(
+                        rdma.pd(),
                         ptr as *mut _,
                         size,
-                        ruapc_rdma::verbs::ACCESS_FLAGS as _,
+                        access as _,
                     )
-                };
-                if mr.is_null() {
-                    return Err(std::io::Error::other("ibv_reg_mr failed"));
                 }
-                let raw_mr = unsafe { ruapc_rdma::RawMemoryRegion::from_raw(mr) };
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
                 mem.add_registration(MemoryRegistration::Rdma {
                     device: self.clone(),
-                    mr: raw_mr,
+                    mr,
                 });
                 Ok(())
             }
@@ -136,48 +138,46 @@ pub trait DevicesExt {
 
     /// Adds an RDMA device and returns a shared reference to it.
     #[cfg(feature = "rdma")]
-    fn add_rdma_device(&mut self, inner: Arc<ruapc_rdma::Device>) -> Arc<Device>;
+    fn add_rdma_device(&mut self, inner: ruapc_rdma_sys::ActiveDevice) -> Arc<Device>;
 
-    /// Finds the `Device` that wraps the given `ruapc_rdma::Device`.
+    /// Finds the `Device` wrapping the given `ActiveDevice` (by pointer identity).
     #[cfg(feature = "rdma")]
-    fn find_by_rdma_device(&self, inner: &Arc<ruapc_rdma::Device>) -> Option<&Arc<Device>>;
+    fn find_by_rdma_device(&self, inner: &ruapc_rdma_sys::ActiveDevice) -> Option<&Arc<Device>>;
 
-    /// Collects the inner `ruapc_rdma::Device` arcs from all RDMA devices.
+    /// Collects references to the inner `ActiveDevice` from all RDMA devices.
     #[cfg(feature = "rdma")]
-    fn rdma_inner_devices(&self) -> ruapc_rdma::Devices;
+    fn rdma_inner_devices(&self) -> Vec<&ruapc_rdma_sys::ActiveDevice>;
 }
 
 impl DevicesExt for Devices {
     fn add_tcp_device(&mut self) -> Arc<Device> {
-        self.add(Device::Tcp(TcpDevice::new(0)))
+        self.add(Device::Tcp(TcpDevice::new()))
     }
 
     #[cfg(feature = "rdma")]
-    fn add_rdma_device(&mut self, inner: Arc<ruapc_rdma::Device>) -> Arc<Device> {
-        self.add(Device::Rdma(RdmaDevice::new(0, inner)))
+    fn add_rdma_device(&mut self, inner: ruapc_rdma_sys::ActiveDevice) -> Arc<Device> {
+        self.add(Device::Rdma(RdmaDevice::new(inner)))
     }
 
     #[cfg(feature = "rdma")]
-    fn find_by_rdma_device(&self, inner: &Arc<ruapc_rdma::Device>) -> Option<&Arc<Device>> {
+    fn find_by_rdma_device(&self, inner: &ruapc_rdma_sys::ActiveDevice) -> Option<&Arc<Device>> {
         self.iter().find(|d| match d.as_ref() {
-            Device::Rdma(r) => Arc::ptr_eq(r.inner(), inner),
+            Device::Rdma(r) => std::ptr::eq(r.inner(), inner),
             _ => false,
         })
     }
 
     #[cfg(feature = "rdma")]
-    fn rdma_inner_devices(&self) -> ruapc_rdma::Devices {
-        let arcs = self
-            .iter()
+    fn rdma_inner_devices(&self) -> Vec<&ruapc_rdma_sys::ActiveDevice> {
+        self.iter()
             .filter_map(|d| {
                 if let Device::Rdma(r) = d.as_ref() {
-                    Some(r.inner().clone())
+                    Some(r.inner())
                 } else {
                     None
                 }
             })
-            .collect();
-        ruapc_rdma::Devices::from_arcs(arcs)
+            .collect()
     }
 }
 
@@ -199,7 +199,7 @@ mod tests {
     fn test_tcp_device_register_validate() {
         use ruapc_bufpool::AlignedMemory;
 
-        let dev = TcpDevice::new(0);
+        let dev = TcpDevice::new();
         let mem = Arc::new(AlignedMemory::new(4096).unwrap());
         let size = mem.size();
         let id = dev.register(mem);

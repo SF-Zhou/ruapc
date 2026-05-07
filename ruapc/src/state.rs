@@ -2,11 +2,11 @@ use std::{net::SocketAddr, sync::Arc};
 
 use tokio_util::sync::DropGuard;
 
-#[cfg(feature = "rdma")]
 use crate::device::DevicesExt;
 use crate::{
     Context, Devices, Message, RawStream, Result, Router, Socket, SocketPool, SocketPoolConfig,
-    SocketPoolTrait, Waiter,
+    Waiter,
+    memory::BufferPool,
     services::{MemoryService, MemoryServiceImpl},
 };
 
@@ -16,9 +16,9 @@ use crate::{
 /// - Router for method dispatch
 /// - Waiter for request/response correlation
 /// - Socket pool for connection management
+/// - Device collection and buffer pool for memory operations
 ///
 /// This state is shared between the server and all active connections.
-#[derive(Default)]
 pub struct State {
     /// Router containing registered service methods.
     pub router: Router,
@@ -27,27 +27,16 @@ pub struct State {
     /// Socket pool for managing connections.
     pub(crate) socket_pool: SocketPool,
     /// Device collection for memory registration and Remote Read/Write.
-    pub devices: Option<Arc<Devices>>,
+    pub devices: Arc<Devices>,
+    /// Shared buffer pool for RDMA and memory operations.
+    pub buffer_pool: Arc<BufferPool>,
 }
 
 impl State {
     /// Creates a new state with the given router and configuration.
     ///
-    /// This method:
-    /// 1. Builds the OpenAPI specification from the router
-    /// 2. Creates the socket pool with the specified configuration
-    /// 3. Initializes the waiter for request/response correlation
-    ///
-    /// # Arguments
-    ///
-    /// * `router` - Router containing registered service methods
-    /// * `config` - Socket pool configuration
-    ///
-    /// # Returns
-    /// Creates a new state with the given router and configuration.
-    ///
-    /// When `devices` is provided, a `MemoryService` is automatically
-    /// registered in the router to handle Remote Read/Write requests.
+    /// Internally discovers devices, creates a shared buffer pool, registers
+    /// `MemoryService`, and creates the socket pool.
     ///
     /// # Returns
     ///
@@ -59,51 +48,64 @@ impl State {
     pub(crate) fn create(
         mut router: Router,
         config: &SocketPoolConfig,
-        devices: Option<Arc<Devices>>,
     ) -> Result<(Arc<Self>, DropGuard)> {
-        if let Some(ref devs) = devices {
-            let mem_svc = Arc::new(MemoryServiceImpl {
-                devices: devs.clone(),
-            });
-            mem_svc.ruapc_export(&mut router);
-        }
+        // Build the Devices collection based on configuration.
+        let devices = Arc::new(Self::discover_devices(config));
+
+        // Create a shared buffer pool backed by all discovered devices.
+        let buffer_pool = BufferPool::new(devices.clone(), 4096, 4096, 0);
+
+        // Always register MemoryService for Remote Read/Write support.
+        let mem_svc = Arc::new(MemoryServiceImpl {
+            devices: devices.clone(),
+        });
+        mem_svc.ruapc_export(&mut router);
+
         router.build_open_api()?;
-        let socket_pool = {
-            #[cfg(feature = "rdma")]
-            if let Some(ref devs) = devices {
-                let rdma_devices = devs.rdma_inner_devices();
-                SocketPool::create_with_rdma_devices(config, rdma_devices)?
-            } else {
-                SocketPool::create(config)?
-            }
-            #[cfg(not(feature = "rdma"))]
-            SocketPool::create(config)?
-        };
+        let socket_pool = SocketPool::create(config, &devices, &buffer_pool)?;
+
         let state = Self {
             router,
             waiter: Arc::default(),
             socket_pool,
             devices,
+            buffer_pool,
         };
         let state = Arc::new(state);
         let drop_guard = state.drop_guard();
         Ok((state, drop_guard))
     }
 
+    /// Discovers and creates devices based on the socket pool configuration.
+    ///
+    /// Always adds a TCP device. When the `rdma` feature is enabled and the
+    /// socket type is RDMA or UNIFIED, automatically discovers available
+    /// RDMA devices.
+    fn discover_devices(config: &SocketPoolConfig) -> Devices {
+        let mut devices = Devices::new();
+        devices.add_tcp_device();
+
+        #[cfg(feature = "rdma")]
+        {
+            use crate::SocketType;
+            if matches!(config.socket_type, SocketType::RDMA | SocketType::UNIFIED)
+                && let Ok(active_devices) = ruapc_rdma_sys::ActiveDevice::available()
+            {
+                let prefer_rxe = std::env::var("RUAPC_PREFER_RXE").is_ok();
+                for dev in active_devices {
+                    if prefer_rxe && !dev.info().name.starts_with("rxe") {
+                        continue;
+                    }
+                    devices.add_rdma_device(dev);
+                }
+            }
+        }
+
+        let _ = config; // suppress unused warning when rdma feature is off
+        devices
+    }
+
     /// Handles a received message from a socket.
-    ///
-    /// This method routes the message based on whether it's a request or response:
-    /// - Requests are dispatched to the router
-    /// - Responses are posted to the waiter
-    ///
-    /// # Arguments
-    ///
-    /// * `socket` - The socket that received the message
-    /// * `msg` - The received message
-    ///
-    /// # Errors
-    ///
-    /// Currently always returns Ok, but has Result type for future extensibility.
     pub fn handle_recv(self: &Arc<Self>, socket: &Socket, msg: Message) -> Result<()> {
         if msg.meta.is_req() {
             let ctx = Context::server_ctx(self, socket.clone(), msg.meta);
@@ -117,14 +119,6 @@ impl State {
     }
 
     /// Handles a new incoming stream connection.
-    ///
-    /// This method delegates stream handling to the socket pool, which will
-    /// perform any necessary protocol negotiation and start message processing.
-    ///
-    /// # Arguments
-    ///
-    /// * `stream` - The raw network stream
-    /// * `addr` - The remote address
     pub async fn handle_new_stream(self: Arc<Self>, stream: RawStream, addr: SocketAddr) {
         if let Err(e) = self
             .socket_pool
@@ -136,8 +130,6 @@ impl State {
     }
 
     /// Creates a drop guard for state lifecycle management.
-    ///
-    /// The drop guard ensures proper cleanup when the state is no longer needed.
     pub(crate) fn drop_guard(&self) -> DropGuard {
         self.socket_pool.drop_guard()
     }

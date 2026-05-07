@@ -4,7 +4,7 @@ use serde_inline_default::serde_inline_default;
 use std::time::Duration;
 
 use crate::{
-    SocketPoolTrait, SocketTrait, SocketType,
+    SocketTrait, SocketType,
     context::{Context, SocketEndpoint},
     error::{Error, ErrorKind},
     msg::{MsgFlags, MsgMeta},
