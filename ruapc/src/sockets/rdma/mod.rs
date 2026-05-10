@@ -2,7 +2,7 @@ mod endpoint;
 pub(crate) use endpoint::Endpoint;
 
 mod rdma_buffer_ref;
-pub(crate) use rdma_buffer_ref::{MrBufferRef, RdmaBufferRef};
+pub(crate) use rdma_buffer_ref::RdmaBufferRef;
 
 mod rdma_service;
 pub(crate) use rdma_service::{RdmaInfo, RdmaService};

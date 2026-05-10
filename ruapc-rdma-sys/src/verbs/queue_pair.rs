@@ -607,7 +607,7 @@ unsafe impl<B: RdmaBuffer> Sync for QueuePair<B> {}
 mod tests {
     use std::sync::Arc;
 
-    use crate::test_utils::{TestBuffer, open_device, test_buffer};
+    use crate::test_utils::{TestBuffer, open_device, test_buffer, test_buffer_with};
     use crate::*;
 
     #[test]
@@ -743,6 +743,151 @@ mod tests {
         assert_eq!(comps.len(), 1);
         let buf = comps.into_iter().next().unwrap().buffer.unwrap();
         assert_eq!(buf.as_slice(), &[0xABu8; 64]);
+    }
+
+    /// Validates buffer ownership transfer for tracked RDMA Read.
+    ///
+    /// The tracked `read()` API takes ownership of the buffer.
+    /// After completion, the buffer is returned via `poll_send()` /
+    /// `take_buffer()`. This is the pattern used by `RdmaSocket::remote_read`
+    /// to guarantee the local buffer stays alive during the RDMA operation.
+    #[test]
+    fn test_read_ownership_transfer() {
+        let dev = open_device();
+        let ctx = Arc::clone(dev.context());
+        let pd = Arc::clone(dev.pd());
+
+        let port = &dev.info().ports[0];
+        let port_attr = &port.port_attr;
+        let gid = port.gids[1].gid;
+
+        let send_cq = CompletionQueue::create(&ctx, 128, None).unwrap();
+        let recv_cq = CompletionQueue::create(&ctx, 128, None).unwrap();
+
+        let mut init_attr = ibv_qp_init_attr {
+            qp_type: ibv_qp_type::IBV_QPT_RC,
+            cap: ibv_qp_cap {
+                max_send_wr: 64,
+                max_recv_wr: 64,
+                max_send_sge: 1,
+                max_recv_sge: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let qp_a: QueuePair<TestBuffer> =
+            QueuePair::create(&pd, &send_cq, &send_cq, &mut init_attr).unwrap();
+        let qp_b: QueuePair<TestBuffer> =
+            QueuePair::create(&pd, &recv_cq, &recv_cq, &mut init_attr).unwrap();
+
+        qp_a.connect(qp_b.qp_num(), gid, port_attr.lid).unwrap();
+        qp_b.connect(qp_a.qp_num(), gid, port_attr.lid).unwrap();
+
+        // Remote buffer with known data pattern
+        let mut remote_buf = test_buffer(&pd);
+        remote_buf.as_mut_slice().fill(0xCD);
+
+        // Local buffer — transferred into the QP via tracked `read()`
+        let local_buf = test_buffer(&pd);
+        let local_addr = local_buf.addr() as usize; // remember address for verification
+
+        let wr_id = qp_a
+            .read(
+                local_buf, // ownership transferred here
+                remote_buf.addr() as u64,
+                remote_buf.rkey(),
+                ibv_send_flags::IBV_SEND_SIGNALED,
+            )
+            .unwrap();
+
+        // At this point, `local_buf` is consumed — the QP holds it.
+        // Verify we can retrieve it via take_buffer after completion.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let mut wc = [ibv_wc::default(); 1];
+        let comps = qp_a.poll_send(&mut wc).unwrap();
+        assert_eq!(comps.len(), 1);
+        assert_eq!(comps[0].wc.status, ibv_wc_status::IBV_WC_SUCCESS);
+
+        // Buffer is returned with the completion — ownership recovered.
+        let returned_buf = comps.into_iter().next().unwrap().buffer.unwrap();
+        assert_eq!(returned_buf.addr() as usize, local_addr);
+        assert_eq!(returned_buf.as_slice(), &[0xCDu8; 64]);
+
+        // Verify take_buffer returns None (buffer was already taken via poll_send)
+        assert!(qp_a.take_buffer(&wr_id).is_none());
+    }
+
+    /// Validates buffer ownership transfer for tracked RDMA Write.
+    #[test]
+    fn test_write_ownership_transfer() {
+        let dev = open_device();
+        let ctx = Arc::clone(dev.context());
+        let pd = Arc::clone(dev.pd());
+
+        let port = &dev.info().ports[0];
+        let port_attr = &port.port_attr;
+        let gid = port.gids[1].gid;
+
+        let send_cq = CompletionQueue::create(&ctx, 128, None).unwrap();
+        let recv_cq = CompletionQueue::create(&ctx, 128, None).unwrap();
+
+        let mut init_attr = ibv_qp_init_attr {
+            qp_type: ibv_qp_type::IBV_QPT_RC,
+            cap: ibv_qp_cap {
+                max_send_wr: 64,
+                max_recv_wr: 64,
+                max_send_sge: 1,
+                max_recv_sge: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let qp_a: QueuePair<TestBuffer> =
+            QueuePair::create(&pd, &send_cq, &send_cq, &mut init_attr).unwrap();
+        let qp_b: QueuePair<TestBuffer> =
+            QueuePair::create(&pd, &recv_cq, &recv_cq, &mut init_attr).unwrap();
+
+        qp_a.connect(qp_b.qp_num(), gid, port_attr.lid).unwrap();
+        qp_b.connect(qp_a.qp_num(), gid, port_attr.lid).unwrap();
+
+        // Remote buffer — will be written into (needs REMOTE_WRITE access)
+        let remote_buf = test_buffer_with(
+            &pd,
+            vec![0u8; 64],
+            ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
+                | ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
+                | ibv_access_flags::IBV_ACCESS_REMOTE_READ,
+        );
+        assert_eq!(remote_buf.as_slice(), &[0u8; 64]);
+
+        // Local buffer with data to write — ownership transferred to QP
+        let mut local_buf = test_buffer(&pd);
+        local_buf.as_mut_slice().fill(0xEF);
+        let local_addr = local_buf.addr() as usize;
+
+        let _wr_id = qp_a
+            .write(
+                local_buf, // ownership transferred here
+                remote_buf.addr() as u64,
+                remote_buf.rkey(),
+                ibv_send_flags::IBV_SEND_SIGNALED,
+            )
+            .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let mut wc = [ibv_wc::default(); 1];
+        let comps = qp_a.poll_send(&mut wc).unwrap();
+        assert_eq!(comps.len(), 1);
+        assert_eq!(comps[0].wc.status, ibv_wc_status::IBV_WC_SUCCESS);
+
+        // Buffer ownership recovered after completion
+        let returned_buf = comps.into_iter().next().unwrap().buffer.unwrap();
+        assert_eq!(returned_buf.addr() as usize, local_addr);
+
+        // Verify the remote buffer received the data
+        assert_eq!(remote_buf.as_slice(), &[0xEFu8; 64]);
     }
 
     /// Simple send / recv test using high-level typed API.

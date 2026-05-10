@@ -2,7 +2,14 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-use crate::{MsgMeta, Result, State, http::HttpSocket, tcp::TcpSocket, ws::WebSocket};
+use crate::{
+    Context, MsgMeta, RemoteBufferInfo, Result, State,
+    http::HttpSocket,
+    memory::Buffer,
+    services::{MemoryReadReq, MemoryService, MemoryWriteReq},
+    tcp::TcpSocket,
+    ws::WebSocket,
+};
 
 /// Socket abstraction supporting multiple transport protocols.
 ///
@@ -62,6 +69,49 @@ pub trait SocketTrait {
         payload: &P,
         state: &Arc<State>,
     ) -> Result<()>;
+
+    async fn remote_read(
+        &self,
+        ctx: &Context,
+        mut local: Buffer,
+        remote: &RemoteBufferInfo,
+    ) -> Result<Buffer> {
+        let req = MemoryReadReq {
+            key: remote.key,
+            addr: remote.addr,
+            len: remote.len,
+        };
+        let client = crate::Client::default();
+        let data: Vec<u8> = client.tcp_read(ctx, &req).await?;
+        if data.len() > local.len() {
+            return Err(crate::Error::new(
+                crate::ErrorKind::InvalidArgument,
+                format!(
+                    "remote read returned {} bytes but local buffer is {} bytes",
+                    data.len(),
+                    local.len()
+                ),
+            ));
+        }
+        local[..data.len()].copy_from_slice(&data);
+        Ok(local)
+    }
+
+    async fn remote_write(
+        &self,
+        ctx: &Context,
+        local: Buffer,
+        remote: &RemoteBufferInfo,
+    ) -> Result<Buffer> {
+        let req = MemoryWriteReq {
+            key: remote.key,
+            addr: remote.addr,
+            data: local[..remote.len as usize].to_vec(),
+        };
+        let client = crate::Client::default();
+        client.tcp_write(ctx, &req).await?;
+        Ok(local)
+    }
 }
 
 impl SocketTrait for Socket {
@@ -77,6 +127,36 @@ impl SocketTrait for Socket {
             Socket::HTTP(http_socket) => http_socket.send(meta, payload, state).await,
             #[cfg(feature = "rdma")]
             Socket::RDMA(rdma_socket) => rdma_socket.send(meta, payload, state).await,
+        }
+    }
+
+    async fn remote_read(
+        &self,
+        ctx: &Context,
+        local: Buffer,
+        remote: &RemoteBufferInfo,
+    ) -> Result<Buffer> {
+        match self {
+            Socket::TCP(tcp_socket) => tcp_socket.remote_read(ctx, local, remote).await,
+            Socket::WS(web_socket) => web_socket.remote_read(ctx, local, remote).await,
+            Socket::HTTP(http_socket) => http_socket.remote_read(ctx, local, remote).await,
+            #[cfg(feature = "rdma")]
+            Socket::RDMA(rdma_socket) => rdma_socket.remote_read(ctx, local, remote).await,
+        }
+    }
+
+    async fn remote_write(
+        &self,
+        ctx: &Context,
+        local: Buffer,
+        remote: &RemoteBufferInfo,
+    ) -> Result<Buffer> {
+        match self {
+            Socket::TCP(tcp_socket) => tcp_socket.remote_write(ctx, local, remote).await,
+            Socket::WS(web_socket) => web_socket.remote_write(ctx, local, remote).await,
+            Socket::HTTP(http_socket) => http_socket.remote_write(ctx, local, remote).await,
+            #[cfg(feature = "rdma")]
+            Socket::RDMA(rdma_socket) => rdma_socket.remote_write(ctx, local, remote).await,
         }
     }
 }

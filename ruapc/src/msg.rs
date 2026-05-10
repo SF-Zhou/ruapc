@@ -264,6 +264,46 @@ impl MsgMeta {
     }
 }
 
+impl SendMsg for crate::memory::Buffer {
+    fn size(&self) -> usize {
+        self.len()
+    }
+
+    fn prepare(&mut self) -> Result<()> {
+        self.set_len(0);
+        Ok(())
+    }
+
+    fn finish(&mut self, meta_offset: usize, payload_offset: usize) -> Result<()> {
+        const S: usize = std::mem::size_of::<u32>();
+        let meta_len = u32::try_from(payload_offset - meta_offset - S)?;
+        self[meta_offset..meta_offset + S].copy_from_slice(&meta_len.to_be_bytes());
+        Ok(())
+    }
+
+    fn writer(&mut self) -> impl std::io::Write {
+        #[repr(transparent)]
+        struct Writer<'a>(&'a mut crate::memory::Buffer);
+
+        impl std::io::Write for Writer<'_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.write_all(buf)?;
+                Ok(buf.len())
+            }
+
+            fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+                self.0.extend_from_slice(buf).map_err(std::io::Error::other)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        Writer(self)
+    }
+}
+
 impl SendMsg for BytesMut {
     fn size(&self) -> usize {
         self.len()

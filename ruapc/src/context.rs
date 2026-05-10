@@ -4,7 +4,7 @@ use serde::Serialize;
 use tokio_util::sync::DropGuard;
 
 use crate::{
-    Error, Result, Router, Socket, SocketPoolConfig, SocketTrait, State,
+    Buffer, Error, RemoteBufferInfo, Result, Router, Socket, SocketPoolConfig, SocketTrait, State,
     msg::{MsgFlags, MsgMeta},
 };
 
@@ -133,215 +133,30 @@ impl Context {
     ///
     /// For TCP: sends a `MemoryService/read` reverse RPC request.
     /// For RDMA: issues a one-sided RDMA Read via QP verbs.
-    pub async fn remote_read(
-        &self,
-        remote: &crate::RemoteBufferInfo,
-        local_buf: &mut crate::Buffer,
-    ) -> Result<()> {
-        #[cfg(feature = "rdma")]
-        if let crate::MemoryKey::Rdma { lkey: _, rkey } = remote.key {
-            return self.rdma_remote_read(remote, local_buf, rkey).await;
-        }
-
-        self.tcp_remote_read(remote, local_buf).await
+    pub async fn remote_read(&self, remote: &RemoteBufferInfo, local: Buffer) -> Result<Buffer> {
+        let socket = match &self.endpoint {
+            SocketEndpoint::Connected(s) => s,
+            _ => {
+                return Err(Error::new(
+                    crate::ErrorKind::InvalidArgument,
+                    "remote read requires a connected socket".into(),
+                ));
+            }
+        };
+        socket.remote_read(self, local, remote).await
     }
 
     /// Writes data from a local buffer to a remote peer's registered memory.
-    ///
-    /// For TCP: sends a `MemoryService/write` reverse RPC request.
-    /// For RDMA: issues a one-sided RDMA Write via QP verbs.
-    pub async fn remote_write(
-        &self,
-        remote: &crate::RemoteBufferInfo,
-        local_buf: &crate::Buffer,
-        len: usize,
-    ) -> Result<()> {
-        #[cfg(feature = "rdma")]
-        if let crate::MemoryKey::Rdma { lkey: _, rkey } = remote.key {
-            return self.rdma_remote_write(remote, local_buf, len, rkey).await;
-        }
-
-        self.tcp_remote_write(remote, local_buf, len).await
-    }
-
-    async fn tcp_remote_read(
-        &self,
-        remote: &crate::RemoteBufferInfo,
-        local_buf: &mut crate::Buffer,
-    ) -> Result<()> {
-        use crate::services::{MemoryReadReq, MemoryService};
-
-        let req = MemoryReadReq {
-            key: remote.key,
-            addr: remote.addr,
-            len: remote.len,
+    pub async fn remote_write(&self, remote: &RemoteBufferInfo, local: Buffer) -> Result<Buffer> {
+        let socket = match &self.endpoint {
+            SocketEndpoint::Connected(s) => s,
+            _ => {
+                return Err(Error::new(
+                    crate::ErrorKind::InvalidArgument,
+                    "remote write requires a connected socket".into(),
+                ));
+            }
         };
-        let client = crate::Client::default();
-        let data: Vec<u8> = client.read(self, &req).await?;
-        if data.len() > local_buf.len() {
-            return Err(Error::new(
-                crate::ErrorKind::InvalidArgument,
-                format!(
-                    "remote read returned {} bytes but local buffer is {} bytes",
-                    data.len(),
-                    local_buf.len()
-                ),
-            ));
-        }
-        local_buf[..data.len()].copy_from_slice(&data);
-        Ok(())
-    }
-
-    async fn tcp_remote_write(
-        &self,
-        remote: &crate::RemoteBufferInfo,
-        local_buf: &crate::Buffer,
-        len: usize,
-    ) -> Result<()> {
-        use crate::services::{MemoryService, MemoryWriteReq};
-
-        let req = MemoryWriteReq {
-            key: remote.key,
-            addr: remote.addr,
-            data: local_buf[..len].to_vec(),
-        };
-        let client = crate::Client::default();
-        client.write(self, &req).await?;
-        Ok(())
-    }
-
-    #[cfg(feature = "rdma")]
-    async fn rdma_remote_read(
-        &self,
-        remote: &crate::RemoteBufferInfo,
-        local_buf: &mut crate::Buffer,
-        rkey: u32,
-    ) -> Result<()> {
-        let rdma_socket = self.get_rdma_socket()?;
-        let mr = Self::register_on_qp_device(&rdma_socket, local_buf)?;
-
-        let rx = Self::post_rdma_verb(
-            &rdma_socket,
-            &mr,
-            remote.len as usize,
-            remote.addr,
-            rkey,
-            true,
-        )?;
-
-        let result = Self::await_rdma_completion(rx).await;
-        drop(mr);
-        result
-    }
-
-    #[cfg(feature = "rdma")]
-    async fn rdma_remote_write(
-        &self,
-        remote: &crate::RemoteBufferInfo,
-        local_buf: &crate::Buffer,
-        len: usize,
-        rkey: u32,
-    ) -> Result<()> {
-        let rdma_socket = self.get_rdma_socket()?;
-        let mr = Self::register_on_qp_device(&rdma_socket, local_buf)?;
-
-        let rx = Self::post_rdma_verb(&rdma_socket, &mr, len, remote.addr, rkey, false)?;
-
-        let result = Self::await_rdma_completion(rx).await;
-        drop(mr);
-        result
-    }
-
-    /// Posts an RDMA Read or Write verb via the safe QueuePair API.
-    ///
-    /// Separated from the async methods so that the `!Send` types inside
-    /// `QueuePair` do not live across an await point.
-    #[cfg(feature = "rdma")]
-    fn post_rdma_verb(
-        rdma_socket: &crate::rdma::RdmaSocket,
-        mr: &ruapc_rdma_sys::MemoryRegion,
-        length: usize,
-        remote_addr: u64,
-        rkey: u32,
-        is_read: bool,
-    ) -> Result<tokio::sync::oneshot::Receiver<ruapc_rdma_sys::ibv_wc_status>> {
-        let buf_ref = crate::rdma::MrBufferRef::new(mr, length);
-
-        let wr_id = if is_read {
-            rdma_socket
-                .queue_pair
-                .read_untracked(&buf_ref, remote_addr, rkey)
-        } else {
-            rdma_socket
-                .queue_pair
-                .write_untracked(&buf_ref, remote_addr, rkey)
-        }
-        .map_err(|e| Error::new(crate::ErrorKind::RdmaSendFailed, e.to_string()))?;
-
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        rdma_socket.rdma_completions.insert(wr_id, tx);
-        Ok(rx)
-    }
-
-    #[cfg(feature = "rdma")]
-    fn get_rdma_socket(&self) -> Result<Arc<crate::rdma::RdmaSocket>> {
-        match &self.endpoint {
-            SocketEndpoint::Connected(Socket::RDMA(s)) => Ok(s.clone()),
-            _ => Err(Error::new(
-                crate::ErrorKind::InvalidArgument,
-                "RDMA remote read/write requires a connected RDMA socket".into(),
-            )),
-        }
-    }
-
-    /// Registers a buffer's memory on the QP's protection domain.
-    #[cfg(feature = "rdma")]
-    #[allow(unsafe_code)]
-    fn register_on_qp_device(
-        rdma_socket: &crate::rdma::RdmaSocket,
-        buf: &crate::Buffer,
-    ) -> Result<ruapc_rdma_sys::MemoryRegion> {
-        let pd = match rdma_socket.device.as_ref() {
-            crate::Device::Rdma(r) => r.pd(),
-            _ => unreachable!("RdmaSocket should always have an RDMA device"),
-        };
-        let access = ruapc_rdma_sys::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0
-            | ruapc_rdma_sys::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE.0
-            | ruapc_rdma_sys::ibv_access_flags::IBV_ACCESS_REMOTE_READ.0
-            | ruapc_rdma_sys::ibv_access_flags::IBV_ACCESS_RELAXED_ORDERING.0;
-        let mr = unsafe {
-            ruapc_rdma_sys::MemoryRegion::register(
-                pd,
-                buf.as_ptr() as *mut _,
-                buf.len(),
-                access as _,
-            )
-        }
-        .map_err(|e| {
-            Error::new(
-                crate::ErrorKind::RdmaSendFailed,
-                format!("failed to register local buffer on QP device: {e}"),
-            )
-        })?;
-        Ok(mr)
-    }
-
-    #[cfg(feature = "rdma")]
-    async fn await_rdma_completion(
-        rx: tokio::sync::oneshot::Receiver<ruapc_rdma_sys::ibv_wc_status>,
-    ) -> Result<()> {
-        let status = rx.await.map_err(|_| {
-            Error::new(
-                crate::ErrorKind::RdmaSendFailed,
-                "RDMA completion channel closed".into(),
-            )
-        })?;
-        if status != ruapc_rdma_sys::ibv_wc_status::IBV_WC_SUCCESS {
-            return Err(Error::new(
-                crate::ErrorKind::RdmaSendFailed,
-                format!("RDMA operation failed with status {:?}", status),
-            ));
-        }
-        Ok(())
+        socket.remote_write(self, local, remote).await
     }
 }
