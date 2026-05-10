@@ -126,14 +126,11 @@ use receiver::Receiver;
 
 /// Device abstraction layer (TCP, RDMA).
 pub mod device;
-pub use device::{Device, Devices, DevicesExt};
+pub use device::{Device, Devices};
 
 /// Memory management (aligned allocation, registration, keys).
 pub mod memory;
-pub use memory::{
-    Buffer, BufferExt, BufferPool, Memory, MemoryExt, MemoryKey, MemoryRegistration,
-    RemoteBufferInfo,
-};
+pub use memory::{Buffer, BufferPool, MemoryKey, MemoryRegistration, RemoteBufferInfo};
 
 /// Socket abstraction layer.
 mod sockets;
@@ -161,3 +158,6 @@ pub use client::Client;
 /// RPC server for handling incoming requests.
 mod server;
 pub use server::Server;
+
+pub use ruapc_bufpool::Device as _;
+pub use ruapc_bufpool::Devices as _;

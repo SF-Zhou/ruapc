@@ -2,7 +2,6 @@ use std::{net::SocketAddr, sync::Arc};
 
 use tokio_util::sync::DropGuard;
 
-use crate::device::DevicesExt;
 use crate::{
     Context, Devices, Message, RawStream, Result, Router, Socket, SocketPool, SocketPoolConfig,
     Waiter,
@@ -82,11 +81,9 @@ impl State {
     /// socket type is RDMA or UNIFIED, automatically discovers available
     /// RDMA devices.
     fn discover_devices(config: &SocketPoolConfig) -> Devices {
-        let mut devices = Devices::new();
-        devices.add_tcp_device();
-
         #[cfg(feature = "rdma")]
         {
+            let mut devices = Devices::new();
             use crate::SocketType;
             if matches!(config.socket_type, SocketType::RDMA | SocketType::UNIFIED)
                 && let Ok(active_devices) = ruapc_rdma_sys::ActiveDevice::available()
@@ -99,10 +96,13 @@ impl State {
                     devices.add_rdma_device(dev);
                 }
             }
+            devices
         }
-
-        let _ = config; // suppress unused warning when rdma feature is off
-        devices
+        #[cfg(not(feature = "rdma"))]
+        {
+            let _ = config;
+            Devices::new()
+        }
     }
 
     /// Handles a received message from a socket.

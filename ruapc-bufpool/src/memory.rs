@@ -1,5 +1,4 @@
 use std::io::{Error, ErrorKind, Result};
-use std::sync::Arc;
 
 use crate::AlignedMemory;
 use crate::device::{Device, Devices, Registration};
@@ -16,9 +15,11 @@ use crate::device::{Device, Devices, Registration};
 /// registration fails, the `RegisteredMemory` still holds registrations
 /// from previously successful devices, ensuring correct cleanup on drop.
 pub struct RegisteredMemory<R: Registration> {
-    aligned_memory: Arc<AlignedMemory>,
+    aligned_memory: AlignedMemory,
     registrations: Vec<R>,
 }
+
+pub type Reg<DS> = <<DS as Devices>::Device as Device>::Registration;
 
 impl<R: Registration> RegisteredMemory<R> {
     /// Creates a new `RegisteredMemory` by allocating aligned memory and
@@ -26,7 +27,13 @@ impl<R: Registration> RegisteredMemory<R> {
     ///
     /// If any device registration fails, the `RegisteredMemory` is dropped,
     /// which unregisters all previously successful registrations.
-    pub fn new<D: Device<Registration = R>>(size: usize, devices: &Devices<D>) -> Result<Self> {
+    pub fn new<T, DS>(size: usize, devices: &T) -> Result<Self>
+    where
+        T: AsRef<DS>,
+        DS: Devices + ?Sized,
+        DS::Device: Device<Registration = R>,
+    {
+        let devices = devices.as_ref();
         let mut mem = Self::new_unregistered(size)?;
 
         for device in devices.iter() {
@@ -42,7 +49,7 @@ impl<R: Registration> RegisteredMemory<R> {
     /// Use [`Device::register`] to register on individual devices
     /// afterwards.
     pub fn new_unregistered(size: usize) -> Result<Self> {
-        let aligned_memory = Arc::new(AlignedMemory::new(size)?);
+        let aligned_memory = AlignedMemory::new(size)?;
         Ok(Self {
             aligned_memory,
             registrations: Vec::new(),
@@ -57,17 +64,17 @@ impl<R: Registration> RegisteredMemory<R> {
         self.registrations.push(reg);
     }
 
-    /// Returns a reference to the underlying `Arc<AlignedMemory>`.
-    pub fn aligned_memory(&self) -> &Arc<AlignedMemory> {
+    pub fn aligned_memory(&self) -> &AlignedMemory {
         &self.aligned_memory
     }
 
-    /// Returns a reference to the registration for the given device index.
-    pub fn registration(&self, device_index: usize) -> Result<&R> {
-        self.registrations.get(device_index).ok_or_else(|| {
+    /// Returns a reference to the registration for the given device.
+    pub fn registration<D: Device<Registration = R>>(&self, device: &D) -> Result<&R> {
+        let idx = device.index();
+        self.registrations.get(idx).ok_or_else(|| {
             Error::new(
                 ErrorKind::InvalidInput,
-                format!("memory not registered on device index {device_index}"),
+                format!("memory not registered on device index {idx}"),
             )
         })
     }
@@ -80,9 +87,8 @@ impl<R: Registration> RegisteredMemory<R> {
 
 impl<R: Registration> Drop for RegisteredMemory<R> {
     fn drop(&mut self) {
-        let buf = self.aligned_memory.as_slice();
         for reg in &self.registrations {
-            reg.unregister(buf);
+            reg.unregister(&self.aligned_memory);
         }
     }
 }

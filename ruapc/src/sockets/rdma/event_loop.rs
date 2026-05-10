@@ -51,7 +51,7 @@ impl RecvHandler {
     }
 
     fn post_recv(&mut self, buf: Buffer, socket: &RdmaSocket) -> Result<()> {
-        let buf_ref = socket.make_buffer_ref(Arc::new(buf)).ok_or_else(|| {
+        let buf_ref = socket.make_buffer_ref(buf).ok_or_else(|| {
             Error::new(
                 ErrorKind::RdmaRecvFailed,
                 "buffer not registered on QP device".into(),
@@ -92,16 +92,13 @@ impl RecvHandler {
 
             // Handle regular data message
             if let Some(buf_ref) = buffer {
-                let arc_buf = buf_ref.into_buffer();
-                // We should be the only holder of this Arc at this point.
-                if let Ok(mut buf) = Arc::try_unwrap(arc_buf) {
-                    buf.set_len(wc.byte_len as usize);
+                let mut buf = buf_ref.into_buffer();
+                buf.set_len(wc.byte_len as usize);
 
-                    if let Ok(msg) = Message::parse(buf)
-                        && let Err(e) = state.handle_recv(&Socket::from(socket), msg)
-                    {
-                        tracing::error!("Failed to handle message: {}", e);
-                    }
+                if let Ok(msg) = Message::parse(buf)
+                    && let Err(e) = state.handle_recv(&Socket::from(socket), msg)
+                {
+                    tracing::error!("Failed to handle message: {}", e);
                 }
             }
         }
@@ -142,12 +139,14 @@ impl SendHandler {
     fn handle_completion(
         &mut self,
         wc: &ibv_wc,
-        _buffer: Option<RdmaBufferRef>,
+        buffer: Option<RdmaBufferRef>,
         socket: &RdmaSocket,
     ) -> Result<()> {
         // Check if this is an RDMA one-sided operation completion.
+        // If so, return the buffer (whose ownership was held by the QP) back
+        // to the caller through the oneshot channel.
         if let Some((_, sender)) = socket.rdma_completions.remove(&wc.wr_id) {
-            let _ = sender.send(wc.status);
+            let _ = sender.send((wc.status, buffer));
             return Ok(());
         }
 
@@ -325,12 +324,8 @@ impl EventLoop {
     #[allow(unsafe_code)]
     pub async fn run(&mut self) -> Result<()> {
         // Extract the raw fd to avoid borrowing `self` through BorrowedFd.
-        let raw_fd = {
-            use std::os::unix::io::AsRawFd;
-            self.comp_channel.fd().as_raw_fd()
-        };
-        let borrowed_fd = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(raw_fd) };
-        let async_fd = AsyncFd::with_interest(borrowed_fd, Interest::READABLE)
+        let comp_channel = self.comp_channel.clone();
+        let async_fd = AsyncFd::with_interest(comp_channel.fd(), Interest::READABLE)
             .map_err(|e| Error::new(ErrorKind::InvalidArgument, e.to_string()))?;
 
         let mut wcs_buf = [ibv_wc::default(); 32];
@@ -389,16 +384,25 @@ impl EventLoop {
 
             tokio::select! {
                 guard = async_fd.readable() => {
-                    match self.comp_channel.get_event() {
-                        Ok(_) => self.unack_cq_events += 1,
-                        Err(e) => {
-                            // EAGAIN means no event ready yet, that's fine
-                            if e.kind != ruapc_rdma_sys::ErrorKind::IBGetCompQueueEventFail {
-                                tracing::error!("get_cq_event error: {e}");
+                    match guard {
+                        Ok(mut g) => {
+                            match self.comp_channel.get_event() {
+                                Ok(_) => self.unack_cq_events += 1,
+                                Err(e) => {
+                                    // EAGAIN means no event ready yet, that's fine
+                                    if e.kind != ruapc_rdma_sys::ErrorKind::IBGetCompQueueEventFail {
+                                        tracing::error!("get_cq_event error: {e}");
+                                    }
+                                }
                             }
+                            g.clear_ready();
+                        }
+                        Err(e) => {
+                            tracing::error!("async_fd readable error: {e}");
+                            self.socket.set_error();
+                            break;
                         }
                     }
-                    guard.unwrap().clear_ready();
                 },
                 _ = self.pending_receiver.recv_many(&mut pending_sends, 256) => {
                     self.pending_sends.extend(pending_sends.iter());

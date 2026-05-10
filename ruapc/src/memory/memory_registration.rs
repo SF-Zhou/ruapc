@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use ruapc_bufpool::AlignedMemory;
+
 use crate::device::{Device, TcpDevice};
 use crate::memory::MemoryKey;
 
@@ -10,7 +12,7 @@ use crate::memory::MemoryKey;
 pub enum MemoryRegistration {
     Tcp {
         device: Arc<Device>,
-        id: u32,
+        id: u64,
     },
     #[cfg(feature = "rdma")]
     Rdma {
@@ -48,7 +50,7 @@ impl ruapc_bufpool::Registration for MemoryRegistration {
     /// For TCP, removes the ID from the registry.
     /// For RDMA, the `MemoryRegion` is dropped (handled by the enum
     /// variant being dropped), which calls `ibv_dereg_mr` automatically.
-    fn unregister(&self, _buf: &[u8]) {
+    fn unregister(&self, _buf: &AlignedMemory) {
         match self {
             MemoryRegistration::Tcp { device, id } => {
                 if let Some(tcp) = as_tcp_device(device) {

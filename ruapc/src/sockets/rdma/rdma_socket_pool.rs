@@ -1,6 +1,12 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::Arc,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use foldhash::fast::RandomState;
+use ruapc_bufpool::Devices as _;
 use ruapc_rdma_sys::{
     CompChannel, CompletionQueue, QueuePair, ibv_qp_cap, ibv_qp_init_attr, ibv_qp_type,
 };
@@ -8,7 +14,6 @@ use tokio::sync::RwLock;
 use tokio_util::sync::DropGuard;
 
 use super::{Endpoint, EventLoop, RdmaBufferRef, RdmaInfo, RdmaService, RdmaSocket};
-use crate::device::DevicesExt;
 use crate::{
     Client, Context, Device, Devices, Error, ErrorKind, Result, Socket, SocketPoolConfig,
     SocketPoolTrait, SocketType, State, TaskSupervisor, memory::BufferPool,
@@ -41,6 +46,8 @@ pub struct RdmaSocketPool {
     /// Global device collection (owned by State, kept alive via Arc).
     /// Dropped last → destroys PD and closes device context.
     pub devices: Arc<Devices>,
+    /// Counter for round-robin device selection.
+    next_device: AtomicUsize,
 }
 
 impl SocketPoolTrait for RdmaSocketPool {
@@ -72,22 +79,27 @@ impl SocketPoolTrait for RdmaSocketPool {
         Ok(RdmaInfo {
             devices: self
                 .devices
-                .rdma_inner_devices()
                 .iter()
-                .map(|d| d.info().clone())
+                .flat_map(|d| {
+                    if let Device::Rdma(r) = d.as_ref() {
+                        Some(r.inner().info().clone())
+                    } else {
+                        None
+                    }
+                })
                 .collect(),
         })
     }
 
     /// Establishes a new RDMA connection with the specified endpoint.
     fn rdma_connect(&self, endpoint: &Endpoint, state: &Arc<State>) -> Result<Endpoint> {
-        let (queue_pair, comp_channel, cq) = self.create_queue_pair()?;
+        let device = self.pick_rdma_device()?;
+        let (queue_pair, comp_channel, cq) = self.create_queue_pair(&device)?;
         queue_pair
             .connect(endpoint.qp_num, endpoint.gid, endpoint.lid)
             .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
 
-        let local_endpoint = self.make_endpoint(&queue_pair);
-        let device = self.first_rdma_device()?.clone();
+        let local_endpoint = self.make_endpoint(&queue_pair, &device);
         let (tx, rx) = tokio::sync::mpsc::channel::<u64>(1024);
         let rdma_socket = RdmaSocket::new(queue_pair, device, self.buffer_pool.clone(), tx);
         self.start_event_loop(Arc::new(rdma_socket), state.clone(), comp_channel, cq, rx)?;
@@ -121,8 +133,9 @@ impl SocketPoolTrait for RdmaSocketPool {
             return Ok(socket.into());
         }
 
-        let (queue_pair, comp_channel, cq) = self.create_queue_pair()?;
-        let local_endpoint = self.make_endpoint(&queue_pair);
+        let device = self.pick_rdma_device()?;
+        let (queue_pair, comp_channel, cq) = self.create_queue_pair(&device)?;
+        let local_endpoint = self.make_endpoint(&queue_pair, &device);
 
         let acquire_ctx = Context::create_with_state_and_addr(state, addr);
         let remote_endpoint =
@@ -136,7 +149,6 @@ impl SocketPoolTrait for RdmaSocketPool {
             .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
         tracing::info!("acquired socket: {:?}", queue_pair);
 
-        let device = self.first_rdma_device()?.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<u64>(1024);
         let socket = RdmaSocket::new(queue_pair, device, self.buffer_pool.clone(), tx);
         let socket = Arc::new(socket);
@@ -171,31 +183,32 @@ impl RdmaSocketPool {
             socket_map: RwLock::default(),
             buffer_pool,
             devices,
+            next_device: AtomicUsize::new(0),
         }
     }
 
-    /// Returns the first RDMA device from the devices collection.
-    fn first_rdma_device(&self) -> Result<&Arc<Device>> {
-        self.devices
-            .iter()
-            .find(|d| matches!(d.as_ref(), Device::Rdma(_)))
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::InvalidArgument,
-                    "no RDMA device available".into(),
-                )
-            })
+    /// Returns an RDMA device and its index using round-robin selection.
+    fn pick_rdma_device(&self) -> Result<Arc<Device>> {
+        let rdma_devices = self.devices.rdma_devices();
+        if rdma_devices.is_empty() {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "no RDMA device available".into(),
+            ));
+        }
+        let idx = self.next_device.fetch_add(1, Ordering::Relaxed) % rdma_devices.len();
+        Ok(rdma_devices[idx].clone())
     }
 
     /// Creates a QueuePair along with its CompChannel and CompletionQueue.
     fn create_queue_pair(
         &self,
+        device: &Arc<Device>,
     ) -> Result<(
         QueuePair<RdmaBufferRef>,
         Arc<CompChannel>,
         Arc<CompletionQueue>,
     )> {
-        let device = self.first_rdma_device()?;
         let rdma = match device.as_ref() {
             Device::Rdma(r) => r,
             _ => unreachable!(),
@@ -231,8 +244,7 @@ impl RdmaSocketPool {
     }
 
     /// Constructs an Endpoint from a QueuePair.
-    fn make_endpoint(&self, qp: &QueuePair<RdmaBufferRef>) -> Endpoint {
-        let device = self.first_rdma_device().unwrap();
+    fn make_endpoint(&self, qp: &QueuePair<RdmaBufferRef>, device: &Arc<Device>) -> Endpoint {
         let rdma = match device.as_ref() {
             Device::Rdma(r) => r,
             _ => unreachable!(),

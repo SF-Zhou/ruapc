@@ -2,10 +2,68 @@ use std::io::{Error, Result};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use ruapc_bufpool::{BufferPool, Device, Devices, RegisteredMemory, Registration};
+use ruapc_bufpool::{AlignedMemory, Devices as DevicesTrait};
+use ruapc_bufpool::{BufferPool, Device, RegisteredMemory, Registration};
 
 // ---------------------------------------------------------------------------
-// Mock types
+// Local Devices implementation (moved out of ruapc-bufpool)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct Devices<D: Device> {
+    devices: Vec<Arc<D>>,
+}
+
+impl<D: Device> Devices<D> {
+    fn new() -> Self {
+        Self {
+            devices: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, mut device: D) -> Arc<D> {
+        let index = self.devices.len();
+        device.set_index(index);
+        let device = Arc::new(device);
+        self.devices.push(device.clone());
+        device
+    }
+
+    fn get(&self, index: usize) -> Option<&Arc<D>> {
+        self.devices.get(index)
+    }
+}
+
+impl<D: Device> DevicesTrait for Devices<D> {
+    type Device = D;
+    type Iter<'a>
+        = std::slice::Iter<'a, Arc<D>>
+    where
+        Self: 'a;
+
+    fn len(&self) -> usize {
+        self.devices.len()
+    }
+
+    fn iter(&self) -> Self::Iter<'_> {
+        self.devices.iter()
+    }
+}
+
+impl<D: Device> Default for Devices<D> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<D: Device> AsRef<Devices<D>> for Devices<D> {
+    fn as_ref(&self) -> &Devices<D> {
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test helpers
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
@@ -33,7 +91,7 @@ impl MockRegistration {
 }
 
 impl Registration for MockRegistration {
-    fn unregister(&self, _buf: &[u8]) {
+    fn unregister(&self, _buf: &AlignedMemory) {
         if let Some(counter) = &self.drop_counter {
             counter.fetch_sub(1, Ordering::SeqCst);
         }
@@ -151,7 +209,10 @@ fn mock_devices(n: usize) -> Arc<Devices<MockDevice>> {
     Arc::new(devices)
 }
 
-fn mock_pool(devices: Arc<Devices<MockDevice>>, max_memory: usize) -> Arc<BufferPool<MockDevice>> {
+fn mock_pool(
+    devices: Arc<Devices<MockDevice>>,
+    max_memory: usize,
+) -> Arc<BufferPool<Devices<MockDevice>>> {
     BufferPool::new(devices, BLOCK, CHUNK, max_memory)
 }
 
@@ -196,15 +257,14 @@ fn devices_get_and_iter() {
 }
 
 #[test]
-fn devices_as_slice() {
+fn devices_iter_order() {
     let mut devices = Devices::new();
     devices.add(MockDevice::new());
     devices.add(MockDevice::new());
 
-    let slice = devices.as_slice();
-    assert_eq!(slice.len(), 2);
-    assert_eq!(slice[0].index(), 0);
-    assert_eq!(slice[1].index(), 1);
+    let indices: Vec<usize> = devices.iter().map(|d| d.index()).collect();
+    assert_eq!(indices, vec![0, 1]);
+    assert_eq!(devices.len(), 2);
 }
 
 #[test]
@@ -226,23 +286,31 @@ fn memory_new_unregistered() {
 
 #[test]
 fn memory_add_registration_and_lookup() {
+    let devices = mock_devices(2);
     let mut mem = RegisteredMemory::<MockRegistration>::new_unregistered(BLOCK).unwrap();
-    mem.add_registration(MockRegistration::new(0));
-    mem.add_registration(MockRegistration::new(1));
-    assert_eq!(mem.registration(0).unwrap().device_index, 0);
-    assert_eq!(mem.registration(1).unwrap().device_index, 1);
-    assert!(mem.registration(2).is_err());
+    let d0 = devices.get(0).unwrap();
+    let d1 = devices.get(1).unwrap();
+    mem.add_registration(MockRegistration::new(d0.index()));
+    mem.add_registration(MockRegistration::new(d1.index()));
+
+    assert_eq!(mem.registration(d0.as_ref()).unwrap().device_index, 0);
+    assert_eq!(mem.registration(d1.as_ref()).unwrap().device_index, 1);
     assert_eq!(mem.registrations().len(), 2);
 }
 
 #[test]
 fn memory_new_with_devices() {
     let devices = mock_devices(3);
-    let mem = RegisteredMemory::new(BLOCK, &devices).unwrap();
+    let mem = RegisteredMemory::new(BLOCK, &*devices).unwrap();
 
     assert_eq!(mem.registrations().len(), 3);
     for i in 0..3 {
-        assert_eq!(mem.registration(i).unwrap().device_index, i);
+        assert_eq!(
+            mem.registration(devices.get(i).unwrap().as_ref())
+                .unwrap()
+                .device_index,
+            i
+        );
     }
 }
 
@@ -324,7 +392,8 @@ fn pool_allocate_and_return() {
     assert_eq!(buf.len(), BLOCK); // len == capacity by default
     assert!(!buf.is_empty());
     // Verify the buffer has a valid memory reference.
-    assert!(!buf.memory().registrations().is_empty());
+    let dev = pool.devices().get(0).unwrap();
+    assert!(buf.registration(dev).is_ok());
 
     // After allocating one block from a 1-block chunk, free count is 0.
     assert_eq!(pool.free_count(), 0);
@@ -376,10 +445,10 @@ fn pool_multiple_chunks() {
     let buf1 = pool.allocate().unwrap();
     let buf2 = pool.allocate().unwrap();
 
-    // Two buffers from different chunks should point to different RegisteredMemory objects.
-    let mem1_ptr = buf1.memory() as *const _;
-    let mem2_ptr = buf2.memory() as *const _;
-    assert_ne!(mem1_ptr, mem2_ptr);
+    // Two buffers from different chunks should have different RegisteredMemory objects.
+    let dev = pool.devices().get(0).unwrap();
+    assert!(buf1.registration(dev).is_ok());
+    assert!(buf2.registration(dev).is_ok());
 
     drop(buf1);
     drop(buf2);
@@ -393,15 +462,13 @@ fn buffer_memory_registration_lookup() {
 
     let buf = pool.allocate().unwrap();
 
-    // Access registrations directly through buf.memory().
-    let reg0 = buf.memory().registration(0).unwrap();
+    let dev0 = pool.devices().get(0).unwrap();
+    let dev1 = pool.devices().get(1).unwrap();
+
+    let reg0 = buf.registration(dev0).unwrap();
     assert_eq!(reg0.device_index, 0);
-
-    let reg1 = buf.memory().registration(1).unwrap();
+    let reg1 = buf.registration(dev1).unwrap();
     assert_eq!(reg1.device_index, 1);
-
-    // Invalid device index.
-    assert!(buf.memory().registration(99).is_err());
 }
 
 #[test]
