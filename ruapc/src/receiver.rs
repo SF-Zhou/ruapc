@@ -38,3 +38,33 @@ impl Receiver<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Waiter;
+
+    #[tokio::test]
+    async fn test_receiver_none_returns_error() {
+        let result = Receiver::None.recv().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind, ErrorKind::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_receiver_receives_message() {
+        let waiter = std::sync::Arc::new(Waiter::default());
+        let (msgid, rx) = waiter.alloc();
+
+        let w = waiter.clone();
+        tokio::spawn(async move {
+            let mut msg = Message::default();
+            msg.meta.method = "ping".into();
+            w.post(msgid, msg);
+        });
+
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(msg.meta.method, "ping");
+    }
+}

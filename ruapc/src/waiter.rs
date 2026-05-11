@@ -132,4 +132,18 @@ mod tests {
         drop(rx); // drop the receiver to trigger the cleaner's Drop
         assert!(msg_waiter.id_map.get(&msgid).is_none());
     }
+
+    #[tokio::test]
+    async fn test_waiter_post_nonexistent_msgid() {
+        let waiter = Waiter::default();
+        // Posting to a non-existent msgid should log a warning and not panic.
+        waiter.post(42, Message::default());
+    }
+
+    #[test]
+    fn test_waiter_debug_format() {
+        let waiter = Waiter::default();
+        let debug = format!("{waiter:?}");
+        assert!(debug.contains("Waiter"));
+    }
 }

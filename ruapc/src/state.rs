@@ -140,3 +140,48 @@ impl std::fmt::Debug for State {
         f.debug_struct("State").finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        Message, MsgFlags, MsgMeta, Payload, SocketPoolConfig, SocketType, sockets::tcp::TcpSocket,
+    };
+
+    #[tokio::test]
+    async fn test_handle_recv_invalid_msg_type_warns_and_ok() {
+        let config = SocketPoolConfig {
+            socket_type: SocketType::TCP,
+        };
+        let router = crate::Router::default();
+        let (state, _guard) = State::create(router, &config).unwrap();
+
+        // Create a socket just so we have a value to pass (not actually used for this path).
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let tcp_socket = TcpSocket::new(tx);
+        let socket = crate::Socket::TCP(tcp_socket);
+
+        // A message with flags = 0 is neither IsReq nor IsRsp → triggers the warn! branch.
+        let msg = Message {
+            meta: MsgMeta {
+                method: "any/method".into(),
+                flags: MsgFlags::empty(),
+                msgid: 0,
+            },
+            payload: Payload::Empty,
+        };
+
+        let result = state.handle_recv(&socket, msg);
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_state_debug_format() {
+        // State::Debug is a stub that just prints "State { }".
+        // Trigger it through Context which holds an Arc<State>.
+        use crate::{Context, SocketPoolConfig};
+        let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
+        let debug = format!("{:?}", *ctx.state);
+        assert!(debug.contains("State"));
+    }
+}

@@ -42,3 +42,49 @@ impl RdmaService for () {
         ctx.state.socket_pool.rdma_connect(endpoint, &ctx.state)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{SocketPoolConfig, SocketType};
+
+    fn make_rdma_context() -> Context {
+        let active_devices =
+            ruapc_rdma_sys::ActiveDevice::available().expect("RDMA devices should be available");
+        let prefer_rxe = std::env::var("RUAPC_PREFER_RXE").is_ok();
+        let mut devices = crate::Devices::new();
+        for dev in active_devices {
+            if prefer_rxe && !dev.info().name.starts_with("rxe") {
+                continue;
+            }
+            devices.add_rdma_device(dev);
+        }
+        assert!(!devices.rdma_devices().is_empty(), "no RDMA device found");
+        let config = SocketPoolConfig {
+            socket_type: SocketType::RDMA,
+        };
+        Context::create(&config).expect("failed to create RDMA context")
+    }
+
+    #[tokio::test]
+    async fn test_rdma_service_info_returns_devices() {
+        let ctx = make_rdma_context();
+        let result = ().info(&ctx, &()).await;
+        assert!(result.is_ok());
+        let info = result.unwrap();
+        assert!(!info.devices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_rdma_service_connect_non_rdma_returns_err() {
+        // With a TCP pool, `connect` should propagate the error from rdma_connect.
+        let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
+        let endpoint = rdma::Endpoint {
+            qp_num: 0,
+            gid: ruapc_rdma_sys::ibv_gid::default(),
+            lid: 0,
+        };
+        let result = ().connect(&ctx, &endpoint).await;
+        assert!(result.is_err());
+    }
+}

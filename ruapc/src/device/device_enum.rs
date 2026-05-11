@@ -143,3 +143,128 @@ impl ruapc_bufpool::Device for Device {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::device::Devices;
+    use crate::memory::MemoryKey;
+    use crate::services::{MemoryReadReq, MemoryWriteReq};
+    use ruapc_bufpool::Device as _;
+
+    #[test]
+    fn test_device_tcp_index() {
+        let devices = Devices::new();
+        let dev = devices.tcp_device();
+        assert_eq!(dev.index(), 0);
+    }
+
+    #[test]
+    fn test_device_read_memory_unknown_tcp_key() {
+        let devices = Devices::new();
+        let dev = devices.tcp_device();
+        let req = MemoryReadReq {
+            key: MemoryKey::Tcp { id: 9999 },
+            addr: 0,
+            len: 10,
+        };
+        assert!(dev.read_memory(&req).is_err());
+    }
+
+    #[test]
+    fn test_device_write_memory_unknown_tcp_key() {
+        let devices = Devices::new();
+        let dev = devices.tcp_device();
+        let req = MemoryWriteReq {
+            key: MemoryKey::Tcp { id: 9999 },
+            addr: 0,
+            data: vec![1, 2, 3],
+        };
+        assert!(dev.write_memory(&req).is_err());
+    }
+
+    #[test]
+    fn test_device_debug_format() {
+        let devices = Devices::new();
+        let dev = devices.tcp_device();
+        let s = format!("{:?}", dev);
+        assert!(s.contains("Tcp"));
+    }
+
+    #[cfg(feature = "rdma")]
+    fn make_rdma_devices() -> Devices {
+        let active_devices =
+            ruapc_rdma_sys::ActiveDevice::available().expect("RDMA devices should be available");
+        let prefer_rxe = std::env::var("RUAPC_PREFER_RXE").is_ok();
+        let mut devices = Devices::new();
+        for dev in active_devices {
+            if prefer_rxe && !dev.info().name.starts_with("rxe") {
+                continue;
+            }
+            devices.add_rdma_device(dev);
+        }
+        assert!(!devices.rdma_devices().is_empty(), "no RDMA device found");
+        devices
+    }
+
+    #[cfg(feature = "rdma")]
+    #[test]
+    fn test_device_read_memory_rdma_device_returns_err() {
+        let devices = make_rdma_devices();
+        // Use a TCP-style key on an RDMA device to exercise the Device::Rdma arm.
+        let rdma_dev = devices.rdma_devices()[0].clone();
+        let req = crate::services::MemoryReadReq {
+            key: MemoryKey::Tcp { id: 9999 },
+            addr: 0,
+            len: 1,
+        };
+        assert!(rdma_dev.read_memory(&req).is_err());
+    }
+
+    #[cfg(feature = "rdma")]
+    #[test]
+    fn test_device_write_memory_rdma_device_returns_err() {
+        let devices = make_rdma_devices();
+        let rdma_dev = devices.rdma_devices()[0].clone();
+        let req = crate::services::MemoryWriteReq {
+            key: MemoryKey::Tcp { id: 9999 },
+            addr: 0,
+            data: vec![1, 2, 3],
+        };
+        assert!(rdma_dev.write_memory(&req).is_err());
+    }
+
+    #[cfg(feature = "rdma")]
+    #[test]
+    fn test_rdma_device_debug_format() {
+        let devices = make_rdma_devices();
+        let rdma_dev = devices.rdma_devices()[0].clone();
+        let debug = format!("{rdma_dev:?}");
+        assert!(debug.contains("Rdma"));
+    }
+
+    #[test]
+    fn test_device_read_write_via_buffer() {
+        let devices = std::sync::Arc::new(Devices::new());
+        let buffer_pool = std::sync::Arc::new(crate::memory::BufferPool::new(
+            devices.clone(),
+            4096,
+            4096,
+            0,
+        ));
+        let mut buf = buffer_pool.allocate().unwrap();
+        let test_data = b"device test data";
+        buf[..test_data.len()].copy_from_slice(test_data);
+
+        let tcp_dev = devices.tcp_device();
+        let rbi = tcp_dev.remote_buffer_info(&buf).unwrap();
+
+        // Use the returned key/addr to read back.
+        let read_req = MemoryReadReq {
+            key: rbi.key,
+            addr: rbi.addr,
+            len: test_data.len() as u64,
+        };
+        let data = tcp_dev.read_memory(&read_req).unwrap();
+        assert_eq!(&data, test_data);
+    }
+}

@@ -162,3 +162,113 @@ impl From<crate::memory::Buffer> for Payload {
         Payload::RDMA(value, 0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    fn json_meta() -> MsgMeta {
+        MsgMeta::default()
+    }
+
+    fn msgpack_meta() -> MsgMeta {
+        MsgMeta {
+            flags: MsgFlags::UseMessagePack,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_empty_payload_properties() {
+        let p = Payload::default();
+        assert!(p.is_empty());
+        assert_eq!(p.len(), 0);
+        assert_eq!(p.as_slice(), b"");
+        assert_eq!(&*p, b"");
+    }
+
+    #[test]
+    fn test_normal_payload_from_bytes() {
+        let p = Payload::from(Bytes::from_static(b"hello"));
+        assert!(!p.is_empty());
+        assert_eq!(p.len(), 5);
+        assert_eq!(p.as_slice(), b"hello");
+    }
+
+    #[test]
+    fn test_normal_payload_from_bytes_mut() {
+        let mut bm = BytesMut::new();
+        bm.extend_from_slice(b"world");
+        let p = Payload::from(bm);
+        assert_eq!(p.len(), 5);
+        assert_eq!(p.as_slice(), b"world");
+    }
+
+    #[test]
+    fn test_payload_into_bytes_empty() {
+        let p = Payload::Empty;
+        let b: Bytes = p.into();
+        assert!(b.is_empty());
+    }
+
+    #[test]
+    fn test_payload_into_bytes_normal() {
+        let p = Payload::from(Bytes::from_static(b"data"));
+        let b: Bytes = p.into();
+        assert_eq!(&b[..], b"data");
+    }
+
+    #[test]
+    fn test_advance_normal() {
+        let mut p = Payload::from(Bytes::from_static(b"abcdef"));
+        p.advance(3);
+        assert_eq!(p.as_slice(), b"def");
+        assert_eq!(p.len(), 3);
+    }
+
+    #[test]
+    fn test_advance_empty_is_noop() {
+        let mut p = Payload::Empty;
+        p.advance(0); // should not panic
+        assert!(p.is_empty());
+    }
+
+    #[test]
+    fn test_deserialize_empty_payload_as_null() {
+        // Empty payload is treated as JSON null (→ Option<String>::None etc.)
+        let p = Payload::Empty;
+        let v: Option<String> = p.deserialize(&json_meta()).unwrap();
+        assert!(v.is_none());
+    }
+
+    #[test]
+    fn test_deserialize_json() {
+        let data = serde_json::to_vec(&"hello json").unwrap();
+        let p = Payload::from(Bytes::from(data));
+        let s: String = p.deserialize(&json_meta()).unwrap();
+        assert_eq!(s, "hello json");
+    }
+
+    #[test]
+    fn test_deserialize_msgpack() {
+        let data = rmp_serde::to_vec_named(&42u64).unwrap();
+        let p = Payload::from(Bytes::from(data));
+        let n: u64 = p.deserialize(&msgpack_meta()).unwrap();
+        assert_eq!(n, 42);
+    }
+
+    #[test]
+    fn test_deserialize_invalid_json_returns_error() {
+        let p = Payload::from(Bytes::from_static(b"not valid json!"));
+        let result: Result<String> = p.deserialize(&json_meta());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_deref_coercion() {
+        let p = Payload::from(Bytes::from_static(b"deref"));
+        let slice: &[u8] = &p;
+        assert_eq!(slice, b"deref");
+    }
+}

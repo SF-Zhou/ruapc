@@ -147,5 +147,48 @@ mod tests {
     fn test_default_config() {
         let client = Client::default();
         assert_eq!(client.timeout, Duration::from_secs(1));
+        assert!(client.use_msgpack);
+        assert!(client.socket_type.is_none());
+    }
+
+    #[test]
+    fn test_client_serde_roundtrip() {
+        let client = Client {
+            timeout: Duration::from_millis(500),
+            use_msgpack: false,
+            socket_type: Some(SocketType::TCP),
+        };
+        let json = serde_json::to_string(&client).unwrap();
+        let recovered: Client = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered, client);
+    }
+
+    #[test]
+    fn test_client_serde_defaults_from_empty_object() {
+        // An empty JSON object should produce the same result as Client::default().
+        let client: Client =
+            serde_json::from_value(serde_json::Value::Object(serde_json::Map::default())).unwrap();
+        assert_eq!(client.timeout, Duration::from_secs(1));
+        assert!(client.use_msgpack);
+        assert!(client.socket_type.is_none());
+    }
+
+    #[test]
+    fn test_client_debug_format() {
+        let client = Client::default();
+        let debug = format!("{:?}", client);
+        assert!(debug.contains("Client"));
+    }
+
+    #[tokio::test]
+    async fn test_ruapc_request_invalid_endpoint_returns_err() {
+        use crate::{SocketPoolConfig, services::MetaService as _};
+        // Context::create() uses SocketEndpoint::Invalid by default.
+        let ctx = crate::Context::create(&SocketPoolConfig::default()).unwrap();
+        let client = Client::default();
+        let result = client.list_methods(&ctx, &()).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind, crate::ErrorKind::InvalidArgument);
     }
 }
