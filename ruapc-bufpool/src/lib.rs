@@ -1,5 +1,4 @@
-mod aligned_memory;
-pub use aligned_memory::AlignedMemory;
+pub use ruapc_memory::AlignedMemory;
 
 mod device;
 pub use device::{Device, Devices, Registration};

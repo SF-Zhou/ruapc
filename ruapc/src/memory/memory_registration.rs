@@ -14,7 +14,6 @@ pub enum MemoryRegistration {
     },
     #[cfg(feature = "rdma")]
     Rdma {
-        device: Arc<Device>,
         mr: ruapc_rdma_sys::MemoryRegion,
     },
 }
@@ -29,15 +28,6 @@ impl MemoryRegistration {
                 lkey: mr.lkey(),
                 rkey: mr.rkey(),
             },
-        }
-    }
-
-    /// Returns a reference to the device this registration belongs to.
-    pub fn device(&self) -> &Arc<Device> {
-        match self {
-            MemoryRegistration::Tcp { device, .. } => device,
-            #[cfg(feature = "rdma")]
-            MemoryRegistration::Rdma { device, .. } => device,
         }
     }
 }
@@ -95,7 +85,7 @@ pub(crate) fn as_tcp_device(device: &Device) -> Option<&TcpDevice> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::{Device, Devices};
+    use crate::device::Devices;
     use ruapc_bufpool::AlignedMemory;
 
     fn make_tcp_registration() -> (MemoryRegistration, Arc<AlignedMemory>) {
@@ -117,14 +107,6 @@ mod tests {
         let (reg, _mem) = make_tcp_registration();
         let key = reg.memory_key();
         assert!(matches!(key, crate::memory::MemoryKey::Tcp { .. }));
-    }
-
-    #[test]
-    fn test_memory_registration_tcp_device_ref() {
-        let (reg, _mem) = make_tcp_registration();
-        // `device()` must return the same Arc.
-        let dev = reg.device();
-        assert!(matches!(dev.as_ref(), Device::Tcp(_)));
     }
 
     #[test]
@@ -186,15 +168,6 @@ mod tests {
         with_rdma_registration(|reg| {
             let key = reg.memory_key();
             assert!(matches!(key, crate::memory::MemoryKey::Rdma { .. }));
-        });
-    }
-
-    #[cfg(feature = "rdma")]
-    #[test]
-    fn test_memory_registration_rdma_device_ref() {
-        with_rdma_registration(|reg| {
-            let dev = reg.device();
-            assert!(matches!(dev.as_ref(), Device::Rdma(_)));
         });
     }
 

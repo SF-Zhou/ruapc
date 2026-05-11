@@ -103,7 +103,6 @@ impl ruapc_bufpool::Device for Device {
         }
     }
 
-    #[allow(unsafe_code)]
     fn register(
         self: &Arc<Self>,
         mem: &mut ruapc_bufpool::RegisteredMemory<Self::Registration>,
@@ -119,26 +118,11 @@ impl ruapc_bufpool::Device for Device {
             }
             #[cfg(feature = "rdma")]
             Device::Rdma(rdma) => {
-                let aligned = mem.aligned_memory();
-                let ptr = aligned.as_ptr();
-                let size = aligned.size();
-                let access = ruapc_rdma_sys::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0
-                    | ruapc_rdma_sys::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE.0
-                    | ruapc_rdma_sys::ibv_access_flags::IBV_ACCESS_REMOTE_READ.0
-                    | ruapc_rdma_sys::ibv_access_flags::IBV_ACCESS_RELAXED_ORDERING.0;
-                let mr = unsafe {
-                    ruapc_rdma_sys::MemoryRegion::register(
-                        rdma.pd(),
-                        ptr as *mut _,
-                        size,
-                        access as _,
-                    )
-                }
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
-                mem.add_registration(MemoryRegistration::Rdma {
-                    device: self.clone(),
-                    mr,
-                });
+                let mr = rdma
+                    .inner()
+                    .register(mem.aligned_memory())
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                mem.add_registration(MemoryRegistration::Rdma { mr });
                 Ok(())
             }
         }

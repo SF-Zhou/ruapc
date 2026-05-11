@@ -5,7 +5,10 @@
 
 use std::{ffi::CStr, os::unix::ffi::OsStrExt, path::Path, sync::Arc};
 
-use super::{context::Context, device_list::DeviceList, protection_domain::ProtectionDomain};
+use super::{
+    context::Context, device_list::DeviceList, memory_region::MemoryRegion,
+    protection_domain::ProtectionDomain,
+};
 use crate::{DeviceInfo, Gid, Guid, Port, Result};
 
 /// Lightweight RDMA device handle.
@@ -137,6 +140,19 @@ impl ActiveDevice {
     /// Returns device information.
     pub fn info(&self) -> &DeviceInfo {
         &self.info
+    }
+
+    /// Registers an `AlignedMemory` for RDMA access with full remote
+    /// read/write permissions.
+    ///
+    /// The returned [`MemoryRegion`] holds a clone of the `Arc`, so the
+    /// memory stays alive until the MR is dropped and deregistered.
+    pub fn register(&self, memory: &Arc<ruapc_memory::AlignedMemory>) -> Result<MemoryRegion> {
+        let access = crate::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0
+            | crate::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE.0
+            | crate::ibv_access_flags::IBV_ACCESS_REMOTE_READ.0
+            | crate::ibv_access_flags::IBV_ACCESS_RELAXED_ORDERING.0;
+        MemoryRegion::register_memory(&self.pd, memory, access as _)
     }
 
     /// Updates device attributes by querying the hardware.

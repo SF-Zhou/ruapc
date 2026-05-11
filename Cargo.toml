@@ -1,5 +1,5 @@
 [workspace]
-members = ["ruapc", "ruapc-bufpool", "ruapc-demo", "ruapc-macro", "ruapc-rdma-sys"]
+members = ["ruapc", "ruapc-bufpool", "ruapc-demo", "ruapc-macro", "ruapc-memory", "ruapc-rdma-sys"]
 resolver = "2"
 
 [workspace.package]
