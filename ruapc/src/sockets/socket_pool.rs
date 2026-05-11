@@ -378,4 +378,119 @@ mod tests {
         assert_eq!(pool.socket_type(), SocketType::UNIFIED);
         pool.stop();
     }
+
+    #[cfg(feature = "rdma")]
+    fn make_rdma_devices() -> Option<std::sync::Arc<crate::Devices>> {
+        let active_devices = ruapc_rdma_sys::ActiveDevice::available().ok()?;
+        let prefer_rxe = std::env::var("RUAPC_PREFER_RXE").is_ok();
+        let mut devices = crate::Devices::new();
+        for dev in active_devices {
+            if prefer_rxe && !dev.info().name.starts_with("rxe") {
+                continue;
+            }
+            devices.add_rdma_device(dev);
+        }
+        if devices.rdma_devices().is_empty() {
+            None
+        } else {
+            Some(std::sync::Arc::new(devices))
+        }
+    }
+
+    #[cfg(feature = "rdma")]
+    #[tokio::test]
+    async fn test_socket_pool_rdma_socket_type() {
+        let devices = match make_rdma_devices() {
+            Some(d) => d,
+            None => return,
+        };
+        let config = SocketPoolConfig {
+            socket_type: SocketType::RDMA,
+        };
+        let buffer_pool =
+            std::sync::Arc::new(crate::BufferPool::new(devices.clone(), 4096, 4096, 0));
+        let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
+        assert_eq!(pool.socket_type(), SocketType::RDMA);
+        pool.stop();
+        drop(pool.drop_guard());
+        pool.join().await;
+    }
+
+    #[cfg(feature = "rdma")]
+    #[tokio::test]
+    async fn test_socket_pool_rdma_info_from_rdma_pool() {
+        let devices = match make_rdma_devices() {
+            Some(d) => d,
+            None => return,
+        };
+        let config = SocketPoolConfig {
+            socket_type: SocketType::RDMA,
+        };
+        let buffer_pool =
+            std::sync::Arc::new(crate::BufferPool::new(devices.clone(), 4096, 4096, 0));
+        let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
+        let info = pool.rdma_info().unwrap();
+        assert!(!info.devices.is_empty());
+    }
+
+    #[cfg(feature = "rdma")]
+    #[tokio::test]
+    async fn test_socket_pool_rdma_info_from_non_rdma_returns_err() {
+        let config = SocketPoolConfig::default(); // TCP pool
+        let devices = std::sync::Arc::new(crate::Devices::default());
+        let buffer_pool =
+            std::sync::Arc::new(crate::BufferPool::new(devices.clone(), 4096, 4096, 0));
+        let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
+        assert!(pool.rdma_info().is_err());
+        pool.stop();
+        pool.join().await;
+    }
+
+    #[cfg(feature = "rdma")]
+    #[tokio::test]
+    async fn test_socket_pool_rdma_connect_non_rdma_returns_err() {
+        let config = SocketPoolConfig::default(); // TCP pool
+        let devices = std::sync::Arc::new(crate::Devices::default());
+        let buffer_pool =
+            std::sync::Arc::new(crate::BufferPool::new(devices.clone(), 4096, 4096, 0));
+        let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
+        let (state, _guard) =
+            crate::state::State::create(crate::Router::default(), &config).unwrap();
+        let endpoint = crate::rdma::Endpoint {
+            qp_num: 0,
+            gid: ruapc_rdma_sys::ibv_gid::default(),
+            lid: 0,
+        };
+        assert!(pool.rdma_connect(&endpoint, &state).is_err());
+        pool.stop();
+        pool.join().await;
+    }
+
+    #[cfg(feature = "rdma")]
+    #[tokio::test]
+    async fn test_socket_pool_handle_new_stream_rdma_returns_err() {
+        use tokio::net::TcpListener;
+        let devices = match make_rdma_devices() {
+            Some(d) => d,
+            None => return,
+        };
+        let config = SocketPoolConfig {
+            socket_type: SocketType::RDMA,
+        };
+        let buffer_pool =
+            std::sync::Arc::new(crate::BufferPool::new(devices.clone(), 4096, 4096, 0));
+        let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
+        let (state, _guard) =
+            crate::state::State::create(crate::Router::default(), &config).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Connect a client to get a stream.
+        let client_task = tokio::spawn(tokio::net::TcpStream::connect(addr));
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _ = client_task.await;
+        let result = pool
+            .handle_new_stream(&state, RawStream::TCP(server_stream), addr)
+            .await;
+        assert!(result.is_err());
+    }
 }

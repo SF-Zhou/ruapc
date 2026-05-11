@@ -190,6 +190,69 @@ mod tests {
         assert!(s.contains("Tcp"));
     }
 
+    #[cfg(feature = "rdma")]
+    fn make_rdma_devices() -> Option<Devices> {
+        let active_devices = ruapc_rdma_sys::ActiveDevice::available().ok()?;
+        let prefer_rxe = std::env::var("RUAPC_PREFER_RXE").is_ok();
+        let mut devices = Devices::new();
+        for dev in active_devices {
+            if prefer_rxe && !dev.info().name.starts_with("rxe") {
+                continue;
+            }
+            devices.add_rdma_device(dev);
+        }
+        if devices.rdma_devices().is_empty() {
+            None
+        } else {
+            Some(devices)
+        }
+    }
+
+    #[cfg(feature = "rdma")]
+    #[test]
+    fn test_device_read_memory_rdma_key_returns_err() {
+        let devices = match make_rdma_devices() {
+            Some(d) => d,
+            None => return, // No RDMA device available; skip.
+        };
+        // read_memory with an RDMA key should return an error (not supported).
+        let rdma_dev = devices.rdma_devices()[0].clone();
+        let req = crate::services::MemoryReadReq {
+            key: MemoryKey::Rdma { lkey: 0, rkey: 0 },
+            addr: 0,
+            len: 1,
+        };
+        assert!(rdma_dev.read_memory(&req).is_err());
+    }
+
+    #[cfg(feature = "rdma")]
+    #[test]
+    fn test_device_write_memory_rdma_key_returns_err() {
+        let devices = match make_rdma_devices() {
+            Some(d) => d,
+            None => return, // No RDMA device available; skip.
+        };
+        let rdma_dev = devices.rdma_devices()[0].clone();
+        let req = crate::services::MemoryWriteReq {
+            key: MemoryKey::Rdma { lkey: 0, rkey: 0 },
+            addr: 0,
+            data: vec![1, 2, 3],
+        };
+        assert!(rdma_dev.write_memory(&req).is_err());
+    }
+
+    #[cfg(feature = "rdma")]
+    #[test]
+    fn test_rdma_device_debug_format() {
+        let devices = match make_rdma_devices() {
+            Some(d) => d,
+            None => return,
+        };
+        let rdma_dev = devices.rdma_devices()[0].clone();
+        let debug = format!("{rdma_dev:?}");
+        assert!(debug.contains("Rdma"));
+    }
+
     #[test]
     fn test_device_read_write_via_buffer() {
         let devices = std::sync::Arc::new(Devices::new());

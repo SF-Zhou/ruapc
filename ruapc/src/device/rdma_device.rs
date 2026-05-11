@@ -49,3 +49,47 @@ impl std::fmt::Debug for RdmaDevice {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_rdma_device() -> Option<ActiveDevice> {
+        let active_devices = ruapc_rdma_sys::ActiveDevice::available().ok()?;
+        let prefer_rxe = std::env::var("RUAPC_PREFER_RXE").is_ok();
+        active_devices.into_iter().find(|d| {
+            if prefer_rxe {
+                d.info().name.starts_with("rxe")
+            } else {
+                true
+            }
+        })
+    }
+
+    #[test]
+    fn test_rdma_device_debug_format() {
+        let active = match open_rdma_device() {
+            Some(d) => d,
+            None => return, // No RDMA device available; skip.
+        };
+        let mut rdma = RdmaDevice::new(active);
+        rdma.set_index(3);
+        let debug = format!("{rdma:?}");
+        assert!(debug.contains("RdmaDevice"));
+        assert!(debug.contains("index: 3"));
+    }
+
+    #[test]
+    fn test_rdma_device_index_and_inner() {
+        let active = match open_rdma_device() {
+            Some(d) => d,
+            None => return,
+        };
+        let mut rdma = RdmaDevice::new(active);
+        rdma.set_index(42);
+        assert_eq!(rdma.index(), 42);
+        // inner() and pd() should not panic.
+        let _ = rdma.inner();
+        let _ = rdma.pd();
+    }
+}
