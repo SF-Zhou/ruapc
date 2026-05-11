@@ -97,3 +97,34 @@ impl MetaService for () {
         Ok(ctx.state.waiter.contains_message_id(*msgid))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Context, SocketPoolConfig};
+
+    #[tokio::test]
+    async fn test_openapi_returns_json_object() {
+        let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
+        let result = ().openapi(&ctx, &()).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_object());
+    }
+
+    #[tokio::test]
+    async fn test_is_message_waiting_false_when_no_waiter() {
+        let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
+        let result = ().is_message_waiting(&ctx, &9999u64).await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_is_message_waiting_true_when_allocated() {
+        let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
+        let (msgid, _rx) = ctx.state.waiter.alloc();
+        let result = ().is_message_waiting(&ctx, &msgid).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+    }
+}

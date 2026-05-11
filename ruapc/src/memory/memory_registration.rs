@@ -92,3 +92,73 @@ pub(crate) fn as_tcp_device(device: &Device) -> Option<&TcpDevice> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device::{Device, Devices};
+    use ruapc_bufpool::AlignedMemory;
+
+    fn make_tcp_registration() -> (MemoryRegistration, Arc<AlignedMemory>) {
+        let devices = Devices::new();
+        let tcp_arc = devices.tcp_device().clone();
+        let mem = Arc::new(AlignedMemory::new(4096).unwrap());
+        let id = if let Device::Tcp(d) = tcp_arc.as_ref() {
+            d.register(mem.as_ptr(), mem.size())
+        } else {
+            panic!("expected TCP device");
+        };
+        let reg = MemoryRegistration::Tcp {
+            device: tcp_arc,
+            id,
+        };
+        (reg, mem)
+    }
+
+    #[test]
+    fn test_memory_registration_tcp_memory_key() {
+        let (reg, _mem) = make_tcp_registration();
+        let key = reg.memory_key();
+        assert!(matches!(key, crate::memory::MemoryKey::Tcp { .. }));
+    }
+
+    #[test]
+    fn test_memory_registration_tcp_device_ref() {
+        let (reg, _mem) = make_tcp_registration();
+        // `device()` must return the same Arc.
+        let dev = reg.device();
+        assert!(matches!(dev.as_ref(), Device::Tcp(_)));
+    }
+
+    #[test]
+    fn test_memory_registration_tcp_debug() {
+        let (reg, _mem) = make_tcp_registration();
+        let debug = format!("{reg:?}");
+        assert!(debug.contains("MemoryRegistration::Tcp"));
+    }
+
+    #[test]
+    fn test_memory_registration_unregister_removes_id() {
+        use ruapc_bufpool::Registration as _;
+        let devices = Devices::new();
+        let tcp_arc = devices.tcp_device().clone();
+        let mem = Arc::new(AlignedMemory::new(4096).unwrap());
+        let (id, ptr, size) = if let Device::Tcp(d) = tcp_arc.as_ref() {
+            let id = d.register(mem.as_ptr(), mem.size());
+            (id, mem.as_ptr(), mem.size())
+        } else {
+            panic!("expected TCP device");
+        };
+
+        let reg = MemoryRegistration::Tcp {
+            device: tcp_arc.clone(),
+            id,
+        };
+
+        // After unregister, reading should fail.
+        reg.unregister(&mem);
+        if let Device::Tcp(d) = tcp_arc.as_ref() {
+            assert!(d.read_memory(id, ptr as u64, size as u64).is_err());
+        }
+    }
+}

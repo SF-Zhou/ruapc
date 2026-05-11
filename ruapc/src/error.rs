@@ -280,4 +280,14 @@ mod tests {
         assert_eq!(error.kind, ErrorKind::DeserializeFailed);
         assert!(!error.msg.is_empty());
     }
+
+    #[test]
+    fn test_from_io_error() {
+        let io_error =
+            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused");
+        let error: Error = io_error.into();
+        // kind is Unknown(io_kind_string)
+        assert!(matches!(error.kind, ErrorKind::Unknown(_)));
+        assert!(!error.msg.is_empty());
+    }
 }

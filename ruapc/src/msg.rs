@@ -478,4 +478,52 @@ mod tests {
         buf.prepare().unwrap();
         assert_eq!(&buf[..], b"existing");
     }
+
+    #[test]
+    fn test_bytesmut_writer_write_and_flush() {
+        use std::io::Write as _;
+        let mut bm = BytesMut::new();
+        {
+            let mut w = bm.writer();
+            // `write()` calls `write_all()` internally.
+            w.write(b"hello").unwrap();
+            // `flush()` is a no-op but must be reachable.
+            w.flush().unwrap();
+        }
+        assert_eq!(&bm[..], b"hello");
+    }
+
+    #[test]
+    fn test_buffer_sendmsg_serialize() {
+        use crate::{Devices, memory::BufferPool};
+        use std::sync::Arc;
+        let devices = Arc::new(Devices::new());
+        let pool = BufferPool::new(devices, 4096, 4096, 0);
+        let mut buf = pool.allocate().unwrap();
+
+        let meta = make_meta("SomeService/rpc", false);
+        // serialize_to exercises Buffer::prepare, Buffer::writer, and Buffer::finish.
+        meta.serialize_to(&serde_json::json!({"x": 1}), &mut buf)
+            .unwrap();
+        assert!(buf.len() > 0);
+    }
+
+    #[test]
+    fn test_buffer_sendmsg_writer_write_and_flush() {
+        use crate::{Devices, memory::BufferPool};
+        use std::io::Write as _;
+        use std::sync::Arc;
+        let devices = Arc::new(Devices::new());
+        let pool = BufferPool::new(devices, 4096, 4096, 0);
+        let mut buf = pool.allocate().unwrap();
+        buf.set_len(0);
+        {
+            let mut w = buf.writer();
+            // Explicitly call `write()` (not `write_all()`).
+            w.write(b"test").unwrap();
+            // Explicitly call `flush()` (no-op but must be reachable).
+            w.flush().unwrap();
+        }
+        assert_eq!(buf.len(), 4);
+    }
 }

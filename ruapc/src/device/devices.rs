@@ -85,6 +85,20 @@ mod tests {
     }
 
     #[test]
+    fn test_devices_is_empty() {
+        let devices = Devices::new();
+        // Always has at least the TCP device, so not empty.
+        assert!(!devices.is_empty());
+    }
+
+    #[test]
+    fn test_devices_as_ref() {
+        let devices = Devices::new();
+        let r: &Devices = devices.as_ref();
+        assert_eq!(r.len(), devices.len());
+    }
+
+    #[test]
     fn test_tcp_device_register_validate() {
         let dev = TcpDevice::new();
         let mem = Arc::new(AlignedMemory::new(4096).unwrap());

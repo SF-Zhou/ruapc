@@ -330,6 +330,9 @@ mod tests {
             std::sync::Arc::new(crate::BufferPool::new(devices.clone(), 4096, 4096, 0));
         let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
         assert_eq!(pool.socket_type(), SocketType::TCP);
+        pool.stop();
+        drop(pool.drop_guard());
+        pool.join().await;
     }
 
     #[tokio::test]
@@ -342,5 +345,37 @@ mod tests {
             std::sync::Arc::new(crate::BufferPool::new(devices.clone(), 4096, 4096, 0));
         let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
         assert_eq!(pool.socket_type(), SocketType::WS);
+        pool.stop();
+        drop(pool.drop_guard());
+        pool.join().await;
+    }
+
+    #[tokio::test]
+    async fn test_socket_pool_http_socket_type() {
+        let config = SocketPoolConfig {
+            socket_type: SocketType::HTTP,
+        };
+        let devices = std::sync::Arc::new(crate::Devices::default());
+        let buffer_pool =
+            std::sync::Arc::new(crate::BufferPool::new(devices.clone(), 4096, 4096, 0));
+        let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
+        assert_eq!(pool.socket_type(), SocketType::HTTP);
+        // Verify stop/drop_guard/join can be called without panicking.
+        pool.stop();
+        drop(pool.drop_guard());
+        pool.join().await;
+    }
+
+    #[tokio::test]
+    async fn test_socket_pool_unified_socket_type() {
+        let config = SocketPoolConfig {
+            socket_type: SocketType::UNIFIED,
+        };
+        let devices = std::sync::Arc::new(crate::Devices::default());
+        let buffer_pool =
+            std::sync::Arc::new(crate::BufferPool::new(devices.clone(), 4096, 4096, 0));
+        let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
+        assert_eq!(pool.socket_type(), SocketType::UNIFIED);
+        pool.stop();
     }
 }

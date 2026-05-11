@@ -215,3 +215,41 @@ impl std::fmt::Debug for TcpSocketPool {
         f.debug_struct("TcpSocketPool").finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{SocketType, state::State};
+
+    async fn make_state() -> Arc<State> {
+        let (state, _guard) = State::create(
+            crate::Router::default(),
+            &crate::SocketPoolConfig {
+                socket_type: SocketType::TCP,
+            },
+        )
+        .unwrap();
+        state
+    }
+
+    #[tokio::test]
+    async fn test_acquire_wrong_socket_type_returns_err() {
+        let pool = TcpSocketPool::new();
+        let state = make_state().await;
+        let addr = "127.0.0.1:9999".parse().unwrap();
+        // Asking for a WS socket from a TCP pool is invalid.
+        let result = pool.acquire(&addr, SocketType::WS, &state).await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err().kind,
+            crate::error::ErrorKind::InvalidArgument
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_tcp_socket_pool_debug_format() {
+        let pool = TcpSocketPool::new();
+        let debug = format!("{pool:?}");
+        assert!(debug.contains("TcpSocketPool"));
+    }
+}

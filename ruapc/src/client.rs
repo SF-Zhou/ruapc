@@ -179,4 +179,16 @@ mod tests {
         let debug = format!("{:?}", client);
         assert!(debug.contains("Client"));
     }
+
+    #[tokio::test]
+    async fn test_ruapc_request_invalid_endpoint_returns_err() {
+        use crate::{SocketPoolConfig, services::MetaService as _};
+        // Context::create() uses SocketEndpoint::Invalid by default.
+        let ctx = crate::Context::create(&SocketPoolConfig::default()).unwrap();
+        let client = Client::default();
+        let result = client.list_methods(&ctx, &()).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind, crate::ErrorKind::InvalidArgument);
+    }
 }

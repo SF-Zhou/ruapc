@@ -153,3 +153,20 @@ impl std::fmt::Debug for UnifiedSocketPool {
         f.debug_struct("UnifiedSocketPool").finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_unified_socket_pool_debug_format() {
+        let config = crate::SocketPoolConfig {
+            socket_type: crate::SocketType::UNIFIED,
+        };
+        let devices = Arc::new(crate::Devices::new());
+        let buffer_pool = crate::BufferPool::new(devices.clone(), 4096, 4096, 0);
+        let pool = UnifiedSocketPool::create(&config, &devices, &buffer_pool).unwrap();
+        let debug = format!("{pool:?}");
+        assert!(debug.contains("UnifiedSocketPool"));
+    }
+}

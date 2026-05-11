@@ -196,3 +196,49 @@ impl std::fmt::Debug for WebSocketPool {
         f.debug_struct("WebSocketPool").finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_web_socket_pool_debug_format() {
+        let config = crate::SocketPoolConfig {
+            socket_type: crate::SocketType::WS,
+        };
+        let devices = Arc::new(crate::Devices::new());
+        let buffer_pool = crate::BufferPool::new(devices.clone(), 4096, 4096, 0);
+        let pool = WebSocketPool::create(&config, &devices, &buffer_pool).unwrap();
+        let debug = format!("{pool:?}");
+        assert!(debug.contains("WebSocketPool"));
+        // Exercise stop / drop_guard / join.
+        pool.stop();
+        drop(pool.drop_guard());
+        pool.join().await;
+    }
+
+    #[tokio::test]
+    async fn test_web_socket_pool_acquire_wrong_type_returns_err() {
+        let config = crate::SocketPoolConfig {
+            socket_type: crate::SocketType::WS,
+        };
+        let devices = Arc::new(crate::Devices::new());
+        let buffer_pool = crate::BufferPool::new(devices.clone(), 4096, 4096, 0);
+        let pool = WebSocketPool::create(&config, &devices, &buffer_pool).unwrap();
+
+        let (state, _guard) = crate::state::State::create(
+            crate::Router::default(),
+            &crate::SocketPoolConfig {
+                socket_type: crate::SocketType::TCP,
+            },
+        )
+        .unwrap();
+        let addr = "127.0.0.1:9999".parse().unwrap();
+        let result = pool.acquire(&addr, crate::SocketType::TCP, &state).await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err().kind,
+            crate::error::ErrorKind::InvalidArgument
+        ));
+    }
+}
