@@ -2,6 +2,8 @@
 
 use std::{os::raw::c_int, sync::Arc};
 
+use ruapc_memory::AlignedMemory;
+
 use super::protection_domain::ProtectionDomain;
 use crate::{ErrorKind, Result};
 
@@ -9,10 +11,18 @@ use crate::{ErrorKind, Result};
 ///
 /// Pins a contiguous block of memory for RDMA access. Holds a shared
 /// reference to the [`ProtectionDomain`] to ensure it outlives this MR.
+///
+/// When created via [`ActiveDevice::register`](super::ActiveDevice), also
+/// holds an `Arc<AlignedMemory>` that keeps the underlying memory alive
+/// for the lifetime of this MR. When created via the low-level
+/// [`MemoryRegion::register`] constructor, no such reference is held and
+/// the caller is responsible for keeping the memory alive.
 pub struct MemoryRegion {
     ptr: *mut crate::ibv_mr,
     /// Prevents the PD (and transitively the context) from being freed.
     _pd: Arc<ProtectionDomain>,
+    /// Keeps the underlying memory alive when created via `ActiveDevice::register`.
+    _memory: Option<Arc<AlignedMemory>>,
 }
 
 impl MemoryRegion {
@@ -36,6 +46,30 @@ impl MemoryRegion {
         Ok(Self {
             ptr,
             _pd: Arc::clone(pd),
+            _memory: None,
+        })
+    }
+
+    /// Registers an `Arc<AlignedMemory>` for RDMA access.
+    ///
+    /// The returned `MemoryRegion` holds a clone of the `Arc`, ensuring the
+    /// memory stays alive until the MR is dropped and deregistered. This
+    /// eliminates the need for the caller to manually manage memory lifetimes.
+    pub fn register_memory(
+        pd: &Arc<ProtectionDomain>,
+        memory: &Arc<AlignedMemory>,
+        access: c_int,
+    ) -> Result<Self> {
+        let ptr = unsafe {
+            crate::ibv_reg_mr(pd.as_ptr(), memory.as_mut_ptr() as _, memory.size(), access)
+        };
+        if ptr.is_null() {
+            return Err(ErrorKind::IBRegMemoryRegionFail.with_errno());
+        }
+        Ok(Self {
+            ptr,
+            _pd: Arc::clone(pd),
+            _memory: Some(Arc::clone(memory)),
         })
     }
 
@@ -67,6 +101,7 @@ impl MemoryRegion {
 
 impl Drop for MemoryRegion {
     fn drop(&mut self) {
+        // Deregister the MR first, then _pd and _memory are dropped.
         let _ = unsafe { crate::ibv_dereg_mr(self.ptr) };
     }
 }
@@ -89,6 +124,8 @@ unsafe impl Sync for MemoryRegion {}
 mod tests {
     use std::sync::Arc;
 
+    use ruapc_memory::AlignedMemory;
+
     use crate::test_utils::open_device;
     use crate::*;
 
@@ -109,6 +146,22 @@ mod tests {
         assert_ne!(mr.lkey(), 0);
         assert_eq!(mr.length(), 4096);
         assert!(!mr.addr().is_null());
+    }
+
+    #[test]
+    fn test_memory_region_register_memory() {
+        let dev = open_device();
+        let pd = Arc::clone(dev.pd());
+        let mem = Arc::new(AlignedMemory::new(4096).unwrap());
+        let mr = MemoryRegion::register_memory(
+            &pd,
+            &mem,
+            ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0 as _,
+        )
+        .unwrap();
+        assert_ne!(mr.lkey(), 0);
+        assert_eq!(mr.length(), mem.size());
+        assert_eq!(mr.addr(), mem.as_ptr() as *mut _);
     }
 
     #[test]

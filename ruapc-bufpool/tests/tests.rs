@@ -2,7 +2,7 @@ use std::io::{Error, Result};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use ruapc_bufpool::{AlignedMemory, Devices as DevicesTrait};
+use ruapc_bufpool::Devices as DevicesTrait;
 use ruapc_bufpool::{BufferPool, Device, RegisteredMemory, Registration};
 
 // ---------------------------------------------------------------------------
@@ -91,7 +91,7 @@ impl MockRegistration {
 }
 
 impl Registration for MockRegistration {
-    fn unregister(&self, _buf: &AlignedMemory) {
+    fn unregister(&self) {
         if let Some(counter) = &self.drop_counter {
             counter.fetch_sub(1, Ordering::SeqCst);
         }

@@ -1,13 +1,16 @@
 use std::io::{Error, ErrorKind, Result};
+use std::sync::Arc;
 
 use crate::AlignedMemory;
 use crate::device::{Device, Devices, Registration};
 
 /// A registered memory block.
 ///
-/// Contains an `AlignedMemory` together with its registrations on a set
-/// of devices. On drop, all registrations are undone before the underlying
-/// memory is freed.
+/// Contains an `Arc<AlignedMemory>` together with its registrations on a
+/// set of devices. The `Arc` allows devices (e.g. `TcpDevice`) to hold a
+/// reference to the underlying memory for safe read/write access.
+///
+/// On drop, all registrations are undone before the `Arc` is released.
 ///
 /// A `RegisteredMemory` can be created with no registrations via
 /// [`new_unregistered`](Self::new_unregistered), then registered on
@@ -15,7 +18,7 @@ use crate::device::{Device, Devices, Registration};
 /// registration fails, the `RegisteredMemory` still holds registrations
 /// from previously successful devices, ensuring correct cleanup on drop.
 pub struct RegisteredMemory<R: Registration> {
-    aligned_memory: AlignedMemory,
+    aligned_memory: Arc<AlignedMemory>,
     registrations: Vec<R>,
 }
 
@@ -49,7 +52,7 @@ impl<R: Registration> RegisteredMemory<R> {
     /// Use [`Device::register`] to register on individual devices
     /// afterwards.
     pub fn new_unregistered(size: usize) -> Result<Self> {
-        let aligned_memory = AlignedMemory::new(size)?;
+        let aligned_memory = Arc::new(AlignedMemory::new(size)?);
         Ok(Self {
             aligned_memory,
             registrations: Vec::new(),
@@ -64,7 +67,8 @@ impl<R: Registration> RegisteredMemory<R> {
         self.registrations.push(reg);
     }
 
-    pub fn aligned_memory(&self) -> &AlignedMemory {
+    /// Returns a shared reference to the underlying aligned memory.
+    pub fn aligned_memory(&self) -> &Arc<AlignedMemory> {
         &self.aligned_memory
     }
 
@@ -88,7 +92,7 @@ impl<R: Registration> RegisteredMemory<R> {
 impl<R: Registration> Drop for RegisteredMemory<R> {
     fn drop(&mut self) {
         for reg in &self.registrations {
-            reg.unregister(&self.aligned_memory);
+            reg.unregister();
         }
     }
 }

@@ -102,26 +102,21 @@ mod tests {
     fn test_tcp_device_register_validate() {
         let dev = TcpDevice::new();
         let mem = Arc::new(AlignedMemory::new(4096).unwrap());
-        let size = mem.size();
-        let id = dev.register(mem.as_ptr(), size);
+        let ptr = mem.as_ptr() as u64;
+        let size = mem.size() as u64;
+        let id = dev.register(Arc::clone(&mem));
 
         // Valid access.
-        assert!(dev.read_memory(id, mem.as_ptr() as u64, 100).is_ok());
-        assert!(
-            dev.read_memory(id, mem.as_ptr() as u64 + size as u64 - 96, 96)
-                .is_ok()
-        );
+        assert!(dev.read_memory(id, ptr, 100).is_ok());
+        assert!(dev.read_memory(id, ptr + size - 96, 96).is_ok());
 
         // Out of bounds.
-        assert!(
-            dev.read_memory(id, mem.as_ptr() as u64 + size as u64 - 96, 97)
-                .is_err()
-        );
+        assert!(dev.read_memory(id, ptr + size - 96, 97).is_err());
 
         // Unknown ID.
-        assert!(dev.read_memory(id + 1, mem.as_ptr() as u64, 1).is_err());
+        assert!(dev.read_memory(id + 1, ptr, 1).is_err());
 
         dev.unregister(id);
-        assert!(dev.read_memory(id, mem.as_ptr() as u64, 1).is_err());
+        assert!(dev.read_memory(id, ptr, 1).is_err());
     }
 }

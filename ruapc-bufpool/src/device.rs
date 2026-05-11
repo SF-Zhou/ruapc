@@ -1,10 +1,10 @@
 use std::io::Result;
 use std::sync::Arc;
 
-use crate::{AlignedMemory, RegisteredMemory};
+use crate::RegisteredMemory;
 
 pub trait Registration: Send + Sync + std::fmt::Debug {
-    fn unregister(&self, buf: &AlignedMemory);
+    fn unregister(&self);
 }
 
 pub trait Device: Send + Sync + std::fmt::Debug {

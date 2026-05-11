@@ -10,6 +10,7 @@ license.workspace = true
 
 [dependencies]
 libc.workspace = true
+ruapc-memory = { path = "../ruapc-memory" }
 schemars.workspace = true
 serde.workspace = true
 

@@ -103,14 +103,13 @@ impl ruapc_bufpool::Device for Device {
         }
     }
 
-    #[allow(unsafe_code)]
     fn register(
         self: &Arc<Self>,
         mem: &mut ruapc_bufpool::RegisteredMemory<Self::Registration>,
     ) -> std::io::Result<()> {
         match self.as_ref() {
             Device::Tcp(tcp) => {
-                let id = tcp.register(mem.aligned_memory().as_ptr(), mem.aligned_memory().size());
+                let id = tcp.register(Arc::clone(mem.aligned_memory()));
                 mem.add_registration(MemoryRegistration::Tcp {
                     device: self.clone(),
                     id,
@@ -119,25 +118,11 @@ impl ruapc_bufpool::Device for Device {
             }
             #[cfg(feature = "rdma")]
             Device::Rdma(rdma) => {
-                let ptr = mem.aligned_memory().as_ptr();
-                let size = mem.aligned_memory().size();
-                let access = ruapc_rdma_sys::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0
-                    | ruapc_rdma_sys::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE.0
-                    | ruapc_rdma_sys::ibv_access_flags::IBV_ACCESS_REMOTE_READ.0
-                    | ruapc_rdma_sys::ibv_access_flags::IBV_ACCESS_RELAXED_ORDERING.0;
-                let mr = unsafe {
-                    ruapc_rdma_sys::MemoryRegion::register(
-                        rdma.pd(),
-                        ptr as *mut _,
-                        size,
-                        access as _,
-                    )
-                }
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
-                mem.add_registration(MemoryRegistration::Rdma {
-                    device: self.clone(),
-                    mr,
-                });
+                let mr = rdma
+                    .inner()
+                    .register(mem.aligned_memory())
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                mem.add_registration(MemoryRegistration::Rdma { mr });
                 Ok(())
             }
         }

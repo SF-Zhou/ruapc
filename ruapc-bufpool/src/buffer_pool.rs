@@ -118,9 +118,9 @@ impl<DS: Devices> BufferPool<DS> {
 
     fn make_buffer(self: &Arc<Self>, inner: &PoolInner<DS>, slot: FreeSlot) -> Result<Buffer<DS>> {
         let mem: &RegisteredMemory<Reg<DS>> = &inner.memories[slot.memory_index];
-        let base = mem.aligned_memory().as_ptr();
+        let base = mem.aligned_memory().as_mut_ptr();
         let offset = slot.block_index * self.block_size;
-        let ptr = unsafe { NonNull::new_unchecked(base.add(offset) as *mut u8) };
+        let ptr = unsafe { NonNull::new_unchecked(base.add(offset)) };
         let memory = NonNull::from(mem);
         Ok(Buffer::new(
             Arc::clone(self),
