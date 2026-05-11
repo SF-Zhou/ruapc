@@ -103,11 +103,9 @@ mod tests {
         let devices = Devices::new();
         let tcp_arc = devices.tcp_device().clone();
         let mem = Arc::new(AlignedMemory::new(4096).unwrap());
-        let id = if let Device::Tcp(d) = tcp_arc.as_ref() {
-            d.register(mem.as_ptr(), mem.size())
-        } else {
-            panic!("expected TCP device");
-        };
+        let id = as_tcp_device(tcp_arc.as_ref())
+            .expect("expected TCP device")
+            .register(mem.as_ptr(), mem.size());
         let reg = MemoryRegistration::Tcp {
             device: tcp_arc,
             id,
@@ -143,12 +141,10 @@ mod tests {
         let devices = Devices::new();
         let tcp_arc = devices.tcp_device().clone();
         let mem = Arc::new(AlignedMemory::new(4096).unwrap());
-        let (id, ptr, size) = if let Device::Tcp(d) = tcp_arc.as_ref() {
-            let id = d.register(mem.as_ptr(), mem.size());
-            (id, mem.as_ptr(), mem.size())
-        } else {
-            panic!("expected TCP device");
-        };
+        let tcp = as_tcp_device(tcp_arc.as_ref()).expect("expected TCP device");
+        let id = tcp.register(mem.as_ptr(), mem.size());
+        let ptr = mem.as_ptr();
+        let size = mem.size();
 
         let reg = MemoryRegistration::Tcp {
             device: tcp_arc.clone(),
@@ -157,31 +153,19 @@ mod tests {
 
         // After unregister, reading should fail.
         reg.unregister(&mem);
-        if let Device::Tcp(d) = tcp_arc.as_ref() {
-            assert!(d.read_memory(id, ptr as u64, size as u64).is_err());
-        }
+        let tcp2 = as_tcp_device(tcp_arc.as_ref()).expect("expected TCP device");
+        assert!(tcp2.read_memory(id, ptr as u64, size as u64).is_err());
     }
 
     #[cfg(feature = "rdma")]
-    fn with_rdma_registration<F: FnOnce(&MemoryRegistration)>(f: F) -> bool {
-        use crate::device::{Device, Devices, RdmaDevice};
-        use std::sync::Arc;
-
-        let active_devices = match ruapc_rdma_sys::ActiveDevice::available() {
-            Ok(d) => d,
-            Err(_) => return false,
-        };
+    fn with_rdma_registration<F: FnOnce(&MemoryRegistration)>(f: F) {
+        let active_devices =
+            ruapc_rdma_sys::ActiveDevice::available().expect("RDMA devices should be available");
         let prefer_rxe = std::env::var("RUAPC_PREFER_RXE").is_ok();
-        let active = match active_devices.into_iter().find(|d| {
-            if prefer_rxe {
-                d.info().name.starts_with("rxe")
-            } else {
-                true
-            }
-        }) {
-            Some(a) => a,
-            None => return false,
-        };
+        let active = active_devices
+            .into_iter()
+            .find(|d| !prefer_rxe || d.info().name.starts_with("rxe"))
+            .expect("no RDMA device matching filter found");
 
         // Build Devices with TCP at 0 and RDMA at 1.
         let mut devices = Devices::new();
@@ -189,52 +173,38 @@ mod tests {
         let devices = Arc::new(devices);
 
         let pool = crate::memory::BufferPool::new(devices.clone(), 4096, 4096, 0);
-        let buf = match pool.allocate() {
-            Ok(b) => b,
-            Err(_) => return false,
-        };
+        let buf = pool.allocate().expect("failed to allocate RDMA buffer");
         let rdma_arc = devices.rdma_devices()[0].clone();
-        let reg = match buf.registration(rdma_arc.as_ref()) {
-            Ok(r) => r,
-            Err(_) => return false,
-        };
+        let reg = buf
+            .registration(rdma_arc.as_ref())
+            .expect("registration should exist");
         f(reg);
-        true
     }
 
     #[cfg(feature = "rdma")]
     #[test]
     fn test_memory_registration_rdma_memory_key() {
-        let found = with_rdma_registration(|reg| {
+        with_rdma_registration(|reg| {
             let key = reg.memory_key();
             assert!(matches!(key, crate::memory::MemoryKey::Rdma { .. }));
         });
-        if !found {
-            eprintln!("no RDMA device available; skipping");
-        }
     }
 
     #[cfg(feature = "rdma")]
     #[test]
     fn test_memory_registration_rdma_device_ref() {
-        let found = with_rdma_registration(|reg| {
+        with_rdma_registration(|reg| {
             let dev = reg.device();
             assert!(matches!(dev.as_ref(), Device::Rdma(_)));
         });
-        if !found {
-            eprintln!("no RDMA device available; skipping");
-        }
     }
 
     #[cfg(feature = "rdma")]
     #[test]
     fn test_memory_registration_rdma_debug() {
-        let found = with_rdma_registration(|reg| {
+        with_rdma_registration(|reg| {
             let debug = format!("{reg:?}");
             assert!(debug.contains("MemoryRegistration::Rdma"));
         });
-        if !found {
-            eprintln!("no RDMA device available; skipping");
-        }
     }
 }

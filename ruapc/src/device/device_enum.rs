@@ -191,8 +191,9 @@ mod tests {
     }
 
     #[cfg(feature = "rdma")]
-    fn make_rdma_devices() -> Option<Devices> {
-        let active_devices = ruapc_rdma_sys::ActiveDevice::available().ok()?;
+    fn make_rdma_devices() -> Devices {
+        let active_devices =
+            ruapc_rdma_sys::ActiveDevice::available().expect("RDMA devices should be available");
         let prefer_rxe = std::env::var("RUAPC_PREFER_RXE").is_ok();
         let mut devices = Devices::new();
         for dev in active_devices {
@@ -201,24 +202,18 @@ mod tests {
             }
             devices.add_rdma_device(dev);
         }
-        if devices.rdma_devices().is_empty() {
-            None
-        } else {
-            Some(devices)
-        }
+        assert!(!devices.rdma_devices().is_empty(), "no RDMA device found");
+        devices
     }
 
     #[cfg(feature = "rdma")]
     #[test]
-    fn test_device_read_memory_rdma_key_returns_err() {
-        let devices = match make_rdma_devices() {
-            Some(d) => d,
-            None => return, // No RDMA device available; skip.
-        };
-        // read_memory with an RDMA key should return an error (not supported).
+    fn test_device_read_memory_rdma_device_returns_err() {
+        let devices = make_rdma_devices();
+        // Use a TCP-style key on an RDMA device to exercise the Device::Rdma arm.
         let rdma_dev = devices.rdma_devices()[0].clone();
         let req = crate::services::MemoryReadReq {
-            key: MemoryKey::Rdma { lkey: 0, rkey: 0 },
+            key: MemoryKey::Tcp { id: 9999 },
             addr: 0,
             len: 1,
         };
@@ -227,14 +222,11 @@ mod tests {
 
     #[cfg(feature = "rdma")]
     #[test]
-    fn test_device_write_memory_rdma_key_returns_err() {
-        let devices = match make_rdma_devices() {
-            Some(d) => d,
-            None => return, // No RDMA device available; skip.
-        };
+    fn test_device_write_memory_rdma_device_returns_err() {
+        let devices = make_rdma_devices();
         let rdma_dev = devices.rdma_devices()[0].clone();
         let req = crate::services::MemoryWriteReq {
-            key: MemoryKey::Rdma { lkey: 0, rkey: 0 },
+            key: MemoryKey::Tcp { id: 9999 },
             addr: 0,
             data: vec![1, 2, 3],
         };
@@ -244,10 +236,7 @@ mod tests {
     #[cfg(feature = "rdma")]
     #[test]
     fn test_rdma_device_debug_format() {
-        let devices = match make_rdma_devices() {
-            Some(d) => d,
-            None => return,
-        };
+        let devices = make_rdma_devices();
         let rdma_dev = devices.rdma_devices()[0].clone();
         let debug = format!("{rdma_dev:?}");
         assert!(debug.contains("Rdma"));

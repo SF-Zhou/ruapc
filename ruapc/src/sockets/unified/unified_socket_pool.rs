@@ -158,8 +158,10 @@ impl std::fmt::Debug for UnifiedSocketPool {
 mod tests {
     use super::*;
 
-    fn make_rdma_devices() -> Option<Arc<crate::Devices>> {
-        let active_devices = ruapc_rdma_sys::ActiveDevice::available().ok()?;
+    #[cfg(feature = "rdma")]
+    fn make_rdma_devices() -> Arc<crate::Devices> {
+        let active_devices =
+            ruapc_rdma_sys::ActiveDevice::available().expect("RDMA devices should be available");
         let prefer_rxe = std::env::var("RUAPC_PREFER_RXE").is_ok();
         let mut devices = crate::Devices::new();
         for dev in active_devices {
@@ -168,11 +170,8 @@ mod tests {
             }
             devices.add_rdma_device(dev);
         }
-        if devices.rdma_devices().is_empty() {
-            None
-        } else {
-            Some(Arc::new(devices))
-        }
+        assert!(!devices.rdma_devices().is_empty(), "no RDMA device found");
+        Arc::new(devices)
     }
 
     #[tokio::test]
@@ -190,10 +189,7 @@ mod tests {
     #[cfg(feature = "rdma")]
     #[tokio::test]
     async fn test_unified_socket_pool_rdma_info() {
-        let devices = match make_rdma_devices() {
-            Some(d) => d,
-            None => return,
-        };
+        let devices = make_rdma_devices();
         let config = crate::SocketPoolConfig {
             socket_type: crate::SocketType::UNIFIED,
         };
@@ -207,14 +203,12 @@ mod tests {
 
     #[cfg(feature = "rdma")]
     #[tokio::test]
-    async fn test_unified_socket_pool_rdma_connect_err() {
-        let devices = match make_rdma_devices() {
-            Some(d) => d,
-            None => return,
-        };
+    async fn test_unified_socket_pool_rdma_connect_no_device_returns_err() {
+        // Unified pool without RDMA devices: rdma_connect should return an error.
         let config = crate::SocketPoolConfig {
             socket_type: crate::SocketType::UNIFIED,
         };
+        let devices = Arc::new(crate::Devices::new()); // TCP only
         let buffer_pool = crate::BufferPool::new(devices.clone(), 4096, 4096, 0);
         let pool = UnifiedSocketPool::create(&config, &devices, &buffer_pool).unwrap();
         let (state, _guard) =
@@ -224,10 +218,7 @@ mod tests {
             gid: ruapc_rdma_sys::ibv_gid::default(),
             lid: 0,
         };
-        // rdma_connect to an invalid endpoint (qp_num=0) should fail.
-        let result = pool.rdma_connect(&endpoint, &state);
-        // We just check it doesn't panic; may succeed or fail depending on device state.
-        let _ = result;
+        assert!(pool.rdma_connect(&endpoint, &state).is_err());
         pool.stop();
         pool.join().await;
     }

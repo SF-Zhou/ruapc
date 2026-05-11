@@ -380,8 +380,9 @@ mod tests {
     }
 
     #[cfg(feature = "rdma")]
-    fn make_rdma_devices() -> Option<std::sync::Arc<crate::Devices>> {
-        let active_devices = ruapc_rdma_sys::ActiveDevice::available().ok()?;
+    fn make_rdma_devices() -> std::sync::Arc<crate::Devices> {
+        let active_devices =
+            ruapc_rdma_sys::ActiveDevice::available().expect("RDMA devices should be available");
         let prefer_rxe = std::env::var("RUAPC_PREFER_RXE").is_ok();
         let mut devices = crate::Devices::new();
         for dev in active_devices {
@@ -390,20 +391,14 @@ mod tests {
             }
             devices.add_rdma_device(dev);
         }
-        if devices.rdma_devices().is_empty() {
-            None
-        } else {
-            Some(std::sync::Arc::new(devices))
-        }
+        assert!(!devices.rdma_devices().is_empty(), "no RDMA device found");
+        std::sync::Arc::new(devices)
     }
 
     #[cfg(feature = "rdma")]
     #[tokio::test]
     async fn test_socket_pool_rdma_socket_type() {
-        let devices = match make_rdma_devices() {
-            Some(d) => d,
-            None => return,
-        };
+        let devices = make_rdma_devices();
         let config = SocketPoolConfig {
             socket_type: SocketType::RDMA,
         };
@@ -419,10 +414,7 @@ mod tests {
     #[cfg(feature = "rdma")]
     #[tokio::test]
     async fn test_socket_pool_rdma_info_from_rdma_pool() {
-        let devices = match make_rdma_devices() {
-            Some(d) => d,
-            None => return,
-        };
+        let devices = make_rdma_devices();
         let config = SocketPoolConfig {
             socket_type: SocketType::RDMA,
         };
@@ -470,10 +462,7 @@ mod tests {
     #[tokio::test]
     async fn test_socket_pool_handle_new_stream_rdma_returns_err() {
         use tokio::net::TcpListener;
-        let devices = match make_rdma_devices() {
-            Some(d) => d,
-            None => return,
-        };
+        let devices = make_rdma_devices();
         let config = SocketPoolConfig {
             socket_type: SocketType::RDMA,
         };
