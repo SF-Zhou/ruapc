@@ -143,3 +143,76 @@ impl ruapc_bufpool::Device for Device {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::device::Devices;
+    use crate::memory::MemoryKey;
+    use crate::services::{MemoryReadReq, MemoryWriteReq};
+    use ruapc_bufpool::Device as _;
+
+    #[test]
+    fn test_device_tcp_index() {
+        let devices = Devices::new();
+        let dev = devices.tcp_device();
+        assert_eq!(dev.index(), 0);
+    }
+
+    #[test]
+    fn test_device_read_memory_unknown_tcp_key() {
+        let devices = Devices::new();
+        let dev = devices.tcp_device();
+        let req = MemoryReadReq {
+            key: MemoryKey::Tcp { id: 9999 },
+            addr: 0,
+            len: 10,
+        };
+        assert!(dev.read_memory(&req).is_err());
+    }
+
+    #[test]
+    fn test_device_write_memory_unknown_tcp_key() {
+        let devices = Devices::new();
+        let dev = devices.tcp_device();
+        let req = MemoryWriteReq {
+            key: MemoryKey::Tcp { id: 9999 },
+            addr: 0,
+            data: vec![1, 2, 3],
+        };
+        assert!(dev.write_memory(&req).is_err());
+    }
+
+    #[test]
+    fn test_device_debug_format() {
+        let devices = Devices::new();
+        let dev = devices.tcp_device();
+        let s = format!("{:?}", dev);
+        assert!(s.contains("Tcp"));
+    }
+
+    #[test]
+    fn test_device_read_write_via_buffer() {
+        let devices = std::sync::Arc::new(Devices::new());
+        let buffer_pool = std::sync::Arc::new(crate::memory::BufferPool::new(
+            devices.clone(),
+            4096,
+            4096,
+            0,
+        ));
+        let mut buf = buffer_pool.allocate().unwrap();
+        let test_data = b"device test data";
+        buf[..test_data.len()].copy_from_slice(test_data);
+
+        let tcp_dev = devices.tcp_device();
+        let rbi = tcp_dev.remote_buffer_info(&buf).unwrap();
+
+        // Use the returned key/addr to read back.
+        let read_req = MemoryReadReq {
+            key: rbi.key,
+            addr: rbi.addr,
+            len: test_data.len() as u64,
+        };
+        let data = tcp_dev.read_memory(&read_req).unwrap();
+        assert_eq!(&data, test_data);
+    }
+}

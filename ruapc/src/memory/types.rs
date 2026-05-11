@@ -25,3 +25,58 @@ pub struct RemoteBufferInfo {
     pub addr: u64,
     pub len: u64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_memory_key_tcp_serde_roundtrip() {
+        let key = MemoryKey::Tcp { id: 12345 };
+        let json = serde_json::to_string(&key).unwrap();
+        let recovered: MemoryKey = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered, key);
+    }
+
+    #[test]
+    fn test_memory_key_tcp_copy_and_clone() {
+        let key = MemoryKey::Tcp { id: 99 };
+        let key2 = key;
+        let key3 = key.clone();
+        assert_eq!(key, key2);
+        assert_eq!(key, key3);
+    }
+
+    #[test]
+    fn test_memory_key_debug_format() {
+        let key = MemoryKey::Tcp { id: 7 };
+        let s = format!("{:?}", key);
+        assert!(s.contains("Tcp"));
+        assert!(s.contains("7"));
+    }
+
+    #[test]
+    fn test_remote_buffer_info_serde_roundtrip() {
+        let rbi = RemoteBufferInfo {
+            key: MemoryKey::Tcp { id: 1 },
+            addr: 0xDEAD_BEEF,
+            len: 4096,
+        };
+        let json = serde_json::to_string(&rbi).unwrap();
+        let recovered: RemoteBufferInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered.addr, rbi.addr);
+        assert_eq!(recovered.len, rbi.len);
+        assert_eq!(recovered.key, rbi.key);
+    }
+
+    #[test]
+    fn test_remote_buffer_info_debug_format() {
+        let rbi = RemoteBufferInfo {
+            key: MemoryKey::Tcp { id: 5 },
+            addr: 0x1000,
+            len: 256,
+        };
+        let s = format!("{:?}", rbi);
+        assert!(s.contains("RemoteBufferInfo"));
+    }
+}

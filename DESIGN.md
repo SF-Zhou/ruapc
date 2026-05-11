@@ -41,7 +41,7 @@ pub struct AlignedMemory {
 ```rust
 pub enum MemoryKey {
     Tcp {
-        id: u32,
+        id: u64,
     },
     #[cfg(feature = "rdma")]
     Rdma {
@@ -63,7 +63,7 @@ pub enum MemoryKey {
 pub enum MemoryRegistration {
     Tcp {
         device: Arc<Device>,
-        id: u32,
+        id: u64,
     },
     #[cfg(feature = "rdma")]
     Rdma {
@@ -151,15 +151,15 @@ impl Device {
 ```rust
 pub struct TcpDevice {
     index: usize,
-    /// 注册表：ID → (内存起始地址, 长度)，用于安全校验
-    registry: Mutex<HashMap<u32, (usize, usize)>>,
-    next_id: AtomicU32,
+    /// 注册表：ID → (内存起始地址, 长度)，用于安全校验（使用 DashMap 支持并发访问）
+    registry: DashMap<u64, (usize, usize)>,
+    next_id: AtomicU64,
 }
 ```
 
-- `register_memory`：分配新的 u32 ID，记录内存地址和长度到 registry
+- `register_memory`：分配新的 u64 ID，记录内存地址和长度到 registry
 - `unregister`：从 registry 中移除该 ID
-- `validate_access(id, offset, len)`：校验 ID 存在性、offset + len 不越界
+- `validate_access(id, addr, len)`：校验 ID 存在性、addr 范围不越界
 
 #### RdmaDevice
 
@@ -303,47 +303,55 @@ pub struct RemoteBufferInfo {
 
 ### Socket 层接口
 
-Socket 持有 `Arc<Device>`，根据设备类型选择具体的实现机制。
+`SocketTrait` 提供统一的消息发送接口，并通过反向 RPC 实现 Remote Read/Write 的默认实现（各具体 socket 类型可覆盖）。
 
 ```rust
-impl Socket {
-    /// 从远端内存读取数据到本地 buffer
-    async fn remote_read(
+pub trait SocketTrait {
+    /// 发送消息
+    async fn send<P: Serialize>(
         &self,
-        remote: &RemoteBufferInfo,
-        local: &mut Buffer,
+        meta: &mut MsgMeta,
+        payload: &P,
+        state: &Arc<State>,
     ) -> Result<()>;
 
-    /// 将本地 buffer 的数据写入远端内存
+    /// 从远端内存读取数据到本地 buffer（消耗 buffer 所有权，返回填充后的 buffer）
+    async fn remote_read(
+        &self,
+        ctx: &Context,
+        local: Buffer,
+        remote: &RemoteBufferInfo,
+    ) -> Result<Buffer>;
+
+    /// 将本地 buffer 的数据写入远端内存（消耗 buffer 所有权，返回原 buffer）
     async fn remote_write(
         &self,
+        ctx: &Context,
+        local: Buffer,
         remote: &RemoteBufferInfo,
-        local: &Buffer,
-    ) -> Result<()>;
+    ) -> Result<Buffer>;
 }
 ```
 
 ### Context 层接口
 
-Context（上下文）提供更方便的封装，自动处理设备查找和 buffer 管理。
+`Context` 提供更方便的封装，自动处理 socket 查找和 buffer 所有权转移。
 
 ```rust
 impl Context {
-    /// 便捷接口：从远端读取数据
+    /// 便捷接口：从远端读取数据（消耗 buffer 所有权，返回填充后的 buffer）
     async fn remote_read(
         &self,
-        socket: &Socket,
         remote: &RemoteBufferInfo,
-        local: &mut Buffer,
-    ) -> Result<()>;
+        local: Buffer,
+    ) -> Result<Buffer>;
 
-    /// 便捷接口：向远端写入数据
+    /// 便捷接口：向远端写入数据（消耗 buffer 所有权，返回原 buffer）
     async fn remote_write(
         &self,
-        socket: &Socket,
         remote: &RemoteBufferInfo,
-        local: &Buffer,
-    ) -> Result<()>;
+        local: Buffer,
+    ) -> Result<Buffer>;
 }
 ```
 
@@ -371,7 +379,7 @@ TCP 设备上的 Remote Read/Write 通过反向 RPC 实现：
 
 **安全校验：**
 
-TCP Device 内部维护注册表 `HashMap<u32, (usize, usize)>`（ID → 内存起始地址和长度），每次 Remote Read/Write 时：
+TCP Device 内部维护注册表 `DashMap<u64, (usize, usize)>`（ID → 内存起始地址和长度），每次 Remote Read/Write 时：
 - 校验 ID 是否存在于注册表中
 - 校验 `offset + len` 是否在注册范围内，防止越界访问
 - 反注册时从注册表中移除条目

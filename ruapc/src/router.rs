@@ -266,3 +266,71 @@ impl std::fmt::Debug for Router {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use schemars::JsonSchema;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize, JsonSchema)]
+    struct DummyReq {
+        value: String,
+    }
+
+    #[derive(Serialize, Deserialize, JsonSchema)]
+    struct DummyRsp {
+        result: u64,
+    }
+
+    fn noop_func(_ctx: Context, _payload: Payload) -> Result<()> {
+        Ok(())
+    }
+
+    #[test]
+    fn test_router_default_has_meta_service() {
+        let router = Router::default();
+        // MetaService methods are registered by default.
+        let names: Vec<_> = router.method_names().collect();
+        assert!(
+            names.iter().any(|n| n.contains("MetaService")),
+            "MetaService should be registered by default"
+        );
+    }
+
+    #[test]
+    fn test_add_method_and_method_names() {
+        let mut router = Router::default();
+        let initial_count = router.method_names().count();
+
+        router.add_method::<DummyReq, DummyRsp>("TestSvc/do_thing", Box::new(noop_func));
+
+        let new_count = router.method_names().count();
+        assert_eq!(new_count, initial_count + 1);
+        assert!(router.method_names().any(|n| n == "TestSvc/do_thing"));
+    }
+
+    #[test]
+    fn test_build_open_api_populates_paths() {
+        let mut router = Router::default();
+        router.add_method::<DummyReq, DummyRsp>("MySvc/my_op", Box::new(noop_func));
+        router.build_open_api().unwrap();
+
+        let openapi = &router.openapi;
+        assert_eq!(openapi.openapi, "3.0.0");
+        // Paths should include the registered method.
+        let path_keys: Vec<_> = openapi.paths.paths.keys().collect();
+        assert!(
+            path_keys.iter().any(|k| k.contains("MySvc/my_op")),
+            "expected MySvc/my_op in OpenAPI paths, got: {:?}",
+            path_keys
+        );
+    }
+
+    #[test]
+    fn test_router_debug_format() {
+        let router = Router::default();
+        let debug = format!("{:?}", router);
+        assert!(debug.contains("Router"));
+    }
+}

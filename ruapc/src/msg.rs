@@ -343,3 +343,139 @@ impl SendMsg for BytesMut {
         Writer(self)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    fn make_meta(method: &str, use_msgpack: bool) -> MsgMeta {
+        let mut flags = MsgFlags::IsReq;
+        if use_msgpack {
+            flags |= MsgFlags::UseMessagePack;
+        }
+        MsgMeta {
+            method: method.to_string(),
+            flags,
+            msgid: 42,
+        }
+    }
+
+    /// Serialize `meta` + `payload` into a `BytesMut` and return the bytes.
+    fn serialize_to_bytes<P: serde::Serialize>(meta: &MsgMeta, payload: &P) -> BytesMut {
+        let mut buf = BytesMut::new();
+        meta.serialize_to(payload, &mut buf).unwrap();
+        buf
+    }
+
+    #[test]
+    fn test_msgflags_is_req_is_rsp() {
+        let mut meta = MsgMeta::default();
+        assert!(!meta.is_req());
+        assert!(!meta.is_rsp());
+
+        meta.flags = MsgFlags::IsReq;
+        assert!(meta.is_req());
+        assert!(!meta.is_rsp());
+
+        meta.flags = MsgFlags::IsRsp;
+        assert!(!meta.is_req());
+        assert!(meta.is_rsp());
+    }
+
+    #[test]
+    fn test_serialize_parse_json_roundtrip() {
+        let meta = make_meta("TestService/hello", false);
+        let payload_value = serde_json::json!({"key": "value", "num": 123});
+
+        let buf = serialize_to_bytes(&meta, &payload_value);
+
+        let msg = Message::parse(Bytes::from(buf)).unwrap();
+        assert_eq!(msg.meta.method, "TestService/hello");
+        assert_eq!(msg.meta.msgid, 42);
+        assert!(msg.meta.is_req());
+        assert!(!msg.meta.flags.contains(MsgFlags::UseMessagePack));
+
+        let recovered: serde_json::Value = serde_json::from_slice(&msg.payload).unwrap();
+        assert_eq!(recovered, payload_value);
+    }
+
+    #[test]
+    fn test_serialize_parse_msgpack_roundtrip() {
+        let meta = make_meta("TestService/hello", true);
+        let payload_str = "hello msgpack";
+
+        let buf = serialize_to_bytes(&meta, &payload_str);
+
+        let msg = Message::parse(Bytes::from(buf)).unwrap();
+        assert_eq!(msg.meta.method, "TestService/hello");
+        assert!(msg.meta.flags.contains(MsgFlags::UseMessagePack));
+
+        let recovered: String = rmp_serde::from_slice(&msg.payload).unwrap();
+        assert_eq!(recovered, payload_str);
+    }
+
+    #[test]
+    fn test_parse_too_short_returns_error() {
+        // 4 bytes of zeros → meta_len == 0, which is explicitly rejected.
+        let four_zero_bytes = Bytes::from_static(&[0u8, 0, 0, 0]);
+        assert!(Message::parse(four_zero_bytes).is_err());
+    }
+
+    #[test]
+    fn test_parse_zero_meta_len_returns_error() {
+        // 4 bytes of zeros => meta_len == 0, which is invalid.
+        let buf = Bytes::from_static(&[0u8, 0, 0, 0]);
+        assert!(Message::parse(buf).is_err());
+    }
+
+    #[test]
+    fn test_parse_meta_len_exceeds_payload_returns_error() {
+        // meta_len says 100, but total is only 8 bytes.
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&100u32.to_be_bytes()); // meta_len = 100
+        buf.extend_from_slice(b"short");
+        assert!(Message::parse(Bytes::from(buf)).is_err());
+    }
+
+    #[test]
+    fn test_message_new_and_default() {
+        let msg = Message::default();
+        assert!(msg.meta.method.is_empty());
+        assert!(msg.payload.is_empty());
+
+        let meta = MsgMeta {
+            method: "Svc/method".into(),
+            flags: MsgFlags::IsRsp,
+            msgid: 7,
+        };
+        let payload = crate::Payload::from(bytes::Bytes::from_static(b"data"));
+        let msg2 = Message::new(meta, payload);
+        assert_eq!(msg2.meta.method, "Svc/method");
+        assert!(!msg2.payload.is_empty());
+    }
+
+    #[test]
+    fn test_msgmeta_default() {
+        let meta = MsgMeta::default();
+        assert!(meta.method.is_empty());
+        assert_eq!(meta.flags, MsgFlags::default());
+        assert_eq!(meta.msgid, 0);
+    }
+
+    #[test]
+    fn test_msgflags_serde_roundtrip() {
+        let flags = MsgFlags::IsReq | MsgFlags::UseMessagePack;
+        let json = serde_json::to_string(&flags).unwrap();
+        let recovered: MsgFlags = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered, flags);
+    }
+
+    #[test]
+    fn test_bytesmut_sendmsg_prepare_is_noop() {
+        // BytesMut::prepare does nothing — the buffer is not cleared.
+        let mut buf = BytesMut::from(&b"existing"[..]);
+        buf.prepare().unwrap();
+        assert_eq!(&buf[..], b"existing");
+    }
+}

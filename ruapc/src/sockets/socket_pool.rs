@@ -293,3 +293,54 @@ impl SocketPool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_socket_pool_config_default_is_tcp() {
+        let config = SocketPoolConfig::default();
+        assert_eq!(config.socket_type, SocketType::TCP);
+    }
+
+    #[test]
+    fn test_socket_pool_config_serde_roundtrip() {
+        let config = SocketPoolConfig {
+            socket_type: SocketType::WS,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let recovered: SocketPoolConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered, config);
+    }
+
+    #[test]
+    fn test_socket_type_display() {
+        assert_eq!(SocketType::TCP.to_string(), "TCP");
+        assert_eq!(SocketType::WS.to_string(), "WS");
+        assert_eq!(SocketType::HTTP.to_string(), "HTTP");
+        assert_eq!(SocketType::UNIFIED.to_string(), "UNIFIED");
+    }
+
+    #[tokio::test]
+    async fn test_socket_pool_tcp_socket_type() {
+        let config = SocketPoolConfig::default();
+        let devices = std::sync::Arc::new(crate::Devices::default());
+        let buffer_pool =
+            std::sync::Arc::new(crate::BufferPool::new(devices.clone(), 4096, 4096, 0));
+        let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
+        assert_eq!(pool.socket_type(), SocketType::TCP);
+    }
+
+    #[tokio::test]
+    async fn test_socket_pool_ws_socket_type() {
+        let config = SocketPoolConfig {
+            socket_type: SocketType::WS,
+        };
+        let devices = std::sync::Arc::new(crate::Devices::default());
+        let buffer_pool =
+            std::sync::Arc::new(crate::BufferPool::new(devices.clone(), 4096, 4096, 0));
+        let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
+        assert_eq!(pool.socket_type(), SocketType::WS);
+    }
+}
