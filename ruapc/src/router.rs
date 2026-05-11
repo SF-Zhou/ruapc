@@ -364,10 +364,11 @@ mod tests {
         let mut ctx = ctx.with_addr("127.0.0.1:9999".parse().unwrap());
         ctx.msg_meta.method = "UnknownSvc/missing".to_string();
 
-        // dispatch() spawns a tokio task to send an error response.
+        // dispatch() spawns a tokio task that tries to send an error response for unknown
+        // methods. The task will fail silently since there is no connected socket endpoint.
+        // We just verify dispatch() can be called without panicking.
         router.dispatch(ctx, Payload::Empty);
-
-        // Give the spawned task a chance to run.
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        // Yield to give the runtime a chance to poll the spawned task.
+        tokio::task::yield_now().await;
     }
 }
