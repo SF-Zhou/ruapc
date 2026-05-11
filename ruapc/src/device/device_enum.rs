@@ -110,7 +110,7 @@ impl ruapc_bufpool::Device for Device {
     ) -> std::io::Result<()> {
         match self.as_ref() {
             Device::Tcp(tcp) => {
-                let id = tcp.register(mem.aligned_memory().as_ptr(), mem.aligned_memory().size());
+                let id = tcp.register(Arc::clone(mem.aligned_memory()));
                 mem.add_registration(MemoryRegistration::Tcp {
                     device: self.clone(),
                     id,
@@ -119,8 +119,9 @@ impl ruapc_bufpool::Device for Device {
             }
             #[cfg(feature = "rdma")]
             Device::Rdma(rdma) => {
-                let ptr = mem.aligned_memory().as_ptr();
-                let size = mem.aligned_memory().size();
+                let aligned = mem.aligned_memory();
+                let ptr = aligned.as_ptr();
+                let size = aligned.size();
                 let access = ruapc_rdma_sys::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0
                     | ruapc_rdma_sys::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE.0
                     | ruapc_rdma_sys::ibv_access_flags::IBV_ACCESS_REMOTE_READ.0

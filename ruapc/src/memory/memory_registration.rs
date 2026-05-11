@@ -1,7 +1,5 @@
 use std::sync::Arc;
 
-use ruapc_bufpool::AlignedMemory;
-
 use crate::device::{Device, TcpDevice};
 use crate::memory::MemoryKey;
 
@@ -47,10 +45,11 @@ impl MemoryRegistration {
 impl ruapc_bufpool::Registration for MemoryRegistration {
     /// Unregisters the memory from the associated device.
     ///
-    /// For TCP, removes the ID from the registry.
+    /// For TCP, removes the ID from the registry (which also releases the
+    /// `Arc<AlignedMemory>` held by `TcpDevice`).
     /// For RDMA, the `MemoryRegion` is dropped (handled by the enum
     /// variant being dropped), which calls `ibv_dereg_mr` automatically.
-    fn unregister(&self, _buf: &AlignedMemory) {
+    fn unregister(&self) {
         match self {
             MemoryRegistration::Tcp { device, id } => {
                 if let Some(tcp) = as_tcp_device(device) {
@@ -105,7 +104,7 @@ mod tests {
         let mem = Arc::new(AlignedMemory::new(4096).unwrap());
         let id = as_tcp_device(tcp_arc.as_ref())
             .expect("expected TCP device")
-            .register(mem.as_ptr(), mem.size());
+            .register(Arc::clone(&mem));
         let reg = MemoryRegistration::Tcp {
             device: tcp_arc,
             id,
@@ -142,7 +141,7 @@ mod tests {
         let tcp_arc = devices.tcp_device().clone();
         let mem = Arc::new(AlignedMemory::new(4096).unwrap());
         let tcp = as_tcp_device(tcp_arc.as_ref()).expect("expected TCP device");
-        let id = tcp.register(mem.as_ptr(), mem.size());
+        let id = tcp.register(Arc::clone(&mem));
         let ptr = mem.as_ptr();
         let size = mem.size();
 
@@ -152,7 +151,7 @@ mod tests {
         };
 
         // After unregister, reading should fail.
-        reg.unregister(&mem);
+        reg.unregister();
         let tcp2 = as_tcp_device(tcp_arc.as_ref()).expect("expected TCP device");
         assert!(tcp2.read_memory(id, ptr as u64, size as u64).is_err());
     }
