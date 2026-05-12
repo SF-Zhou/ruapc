@@ -81,7 +81,7 @@ impl SocketPoolTrait for RdmaSocketPool {
                 .devices
                 .iter()
                 .flat_map(|d| {
-                    if let Device::Rdma(r) = d.as_ref() {
+                    if let Device::Rdma(r) = d {
                         Some(r.inner().info().clone())
                     } else {
                         None
@@ -188,7 +188,7 @@ impl RdmaSocketPool {
     }
 
     /// Returns an RDMA device and its index using round-robin selection.
-    fn pick_rdma_device(&self) -> Result<Arc<Device>> {
+    fn pick_rdma_device(&self) -> Result<&Device> {
         let rdma_devices = self.devices.rdma_devices();
         if rdma_devices.is_empty() {
             return Err(Error::new(
@@ -197,19 +197,19 @@ impl RdmaSocketPool {
             ));
         }
         let idx = self.next_device.fetch_add(1, Ordering::Relaxed) % rdma_devices.len();
-        Ok(rdma_devices[idx].clone())
+        Ok(&rdma_devices[idx])
     }
 
     /// Creates a QueuePair along with its CompChannel and CompletionQueue.
     fn create_queue_pair(
         &self,
-        device: &Arc<Device>,
+        device: &Device,
     ) -> Result<(
         QueuePair<RdmaBufferRef>,
         Arc<CompChannel>,
         Arc<CompletionQueue>,
     )> {
-        let rdma = match device.as_ref() {
+        let rdma = match device {
             Device::Rdma(r) => r,
             _ => unreachable!(),
         };
@@ -244,8 +244,8 @@ impl RdmaSocketPool {
     }
 
     /// Constructs an Endpoint from a QueuePair.
-    fn make_endpoint(&self, qp: &QueuePair<RdmaBufferRef>, device: &Arc<Device>) -> Endpoint {
-        let rdma = match device.as_ref() {
+    fn make_endpoint(&self, qp: &QueuePair<RdmaBufferRef>, device: &Device) -> Endpoint {
+        let rdma = match device {
             Device::Rdma(r) => r,
             _ => unreachable!(),
         };

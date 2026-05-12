@@ -1,7 +1,7 @@
 pub use ruapc_memory::AlignedMemory;
 
 mod device;
-pub use device::{Device, Devices, Registration};
+pub use device::{Device, Devices};
 
 mod memory;
 pub use memory::RegisteredMemory;

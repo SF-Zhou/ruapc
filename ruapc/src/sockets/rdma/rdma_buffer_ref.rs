@@ -5,12 +5,9 @@
 //! different lkey/rkey), this wrapper binds a buffer to a specific device's
 //! memory registration, providing the correct lkey/rkey for that device.
 
-use std::sync::Arc;
+use crate::memory::{Buffer, MemoryKey};
 
 use ruapc_rdma_sys::RdmaBuffer;
-
-use crate::Device;
-use crate::memory::{Buffer, MemoryKey};
 
 /// A buffer bound to a specific RDMA device's memory registration.
 ///
@@ -37,9 +34,9 @@ impl RdmaBufferRef {
     ///
     /// Returns `None` if the buffer is not registered on the specified device
     /// or if the registration is not an RDMA registration.
-    pub fn new(buffer: Buffer, device: &Arc<Device>) -> Option<Self> {
-        let key = device.memory_key(&buffer).ok()?;
-        match key {
+    pub fn new(buffer: Buffer, device_index: usize) -> Option<Self> {
+        let registration = buffer.registration_by_index(device_index).ok()?;
+        match registration.memory_key() {
             MemoryKey::Rdma { lkey, rkey } => Some(Self {
                 buffer,
                 lkey,

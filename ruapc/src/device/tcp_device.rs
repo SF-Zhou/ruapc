@@ -8,15 +8,26 @@ use crate::{Error, ErrorKind, Result};
 
 pub struct TcpDevice {
     index: usize,
-    registry: DashMap<u64, Arc<AlignedMemory>>,
+    registry: Arc<DashMap<u64, Arc<AlignedMemory>>>,
     next_id: AtomicU64,
+}
+
+pub struct TcpMemoryRegistration {
+    registry: Arc<DashMap<u64, Arc<AlignedMemory>>>,
+    pub id: u64,
+}
+
+impl Drop for TcpMemoryRegistration {
+    fn drop(&mut self) {
+        self.registry.remove(&self.id);
+    }
 }
 
 impl TcpDevice {
     pub fn new() -> Self {
         Self {
             index: 0,
-            registry: DashMap::new(),
+            registry: Arc::default(),
             next_id: AtomicU64::new(1),
         }
     }
@@ -33,14 +44,13 @@ impl TcpDevice {
     ///
     /// The `Arc<AlignedMemory>` is stored in the registry, keeping the
     /// underlying memory alive as long as the registration exists.
-    pub(crate) fn register(&self, memory: Arc<AlignedMemory>) -> u64 {
+    pub fn register(&self, memory: Arc<AlignedMemory>) -> TcpMemoryRegistration {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.registry.insert(id, memory);
-        id
-    }
-
-    pub(crate) fn unregister(&self, id: u64) {
-        self.registry.remove(&id);
+        TcpMemoryRegistration {
+            registry: self.registry.clone(),
+            id,
+        }
     }
 
     /// Reads data from a registered memory region using absolute address.
@@ -105,7 +115,7 @@ impl TcpDevice {
         }
 
         let offset = (addr - region_start) as usize;
-        mem.as_mut_slice()[offset..offset + data.len()].copy_from_slice(data);
+        mem.as_ref().as_mut_slice()[offset..offset + data.len()].copy_from_slice(data);
         Ok(())
     }
 }
@@ -153,8 +163,8 @@ mod tests {
         let m2 = make_mem(4096);
         let id1 = dev.register(m1);
         let id2 = dev.register(m2);
-        assert_eq!(id1, 1);
-        assert_eq!(id2, 2);
+        assert_eq!(id1.id, 1);
+        assert_eq!(id2.id, 2);
     }
 
     #[test]
@@ -162,8 +172,9 @@ mod tests {
         let dev = TcpDevice::new();
         let mem = make_mem(4096);
         let ptr = mem.as_ptr() as u64;
-        let id = dev.register(mem);
-        dev.unregister(id);
+        let reg = dev.register(mem);
+        let id = reg.id;
+        drop(reg);
         assert!(dev.read_memory(id, ptr, 10).is_err());
     }
 
@@ -172,10 +183,10 @@ mod tests {
         let dev = TcpDevice::new();
         let mem = make_mem(4096);
         let ptr = mem.as_ptr() as u64;
-        mem.as_mut_slice()[10..21].copy_from_slice(b"hello_world");
+        mem.as_ref().as_mut_slice()[10..21].copy_from_slice(b"hello_world");
         let id = dev.register(mem);
 
-        let data = dev.read_memory(id, ptr + 10, 5).unwrap();
+        let data = dev.read_memory(id.id, ptr + 10, 5).unwrap();
         assert_eq!(data, b"hello");
     }
 
@@ -194,7 +205,7 @@ mod tests {
         let mem = make_mem(4096);
         let ptr = mem.as_ptr() as u64;
         let id = dev.register(mem);
-        assert!(dev.read_memory(id, ptr - 1, 10).is_err());
+        assert!(dev.read_memory(id.id, ptr - 1, 10).is_err());
     }
 
     #[test]
@@ -204,7 +215,7 @@ mod tests {
         let ptr = mem.as_ptr() as u64;
         let size = mem.size();
         let id = dev.register(mem);
-        assert!(dev.read_memory(id, ptr + size as u64 + 1, 1).is_err());
+        assert!(dev.read_memory(id.id, ptr + size as u64 + 1, 1).is_err());
     }
 
     #[test]
@@ -215,7 +226,7 @@ mod tests {
         let size = mem.size();
         let id = dev.register(mem);
         // addr within region but addr+len exceeds region end
-        assert!(dev.read_memory(id, ptr + size as u64 - 10, 20).is_err());
+        assert!(dev.read_memory(id.id, ptr + size as u64 - 10, 20).is_err());
     }
 
     #[test]
@@ -226,13 +237,13 @@ mod tests {
         let size = mem.size() as u64;
         let id = dev.register(mem);
         // Read exactly the whole region
-        let data = dev.read_memory(id, ptr, size).unwrap();
+        let data = dev.read_memory(id.id, ptr, size).unwrap();
         assert_eq!(data.len(), size as usize);
         // Read zero bytes
-        let data = dev.read_memory(id, ptr, 0).unwrap();
+        let data = dev.read_memory(id.id, ptr, 0).unwrap();
         assert!(data.is_empty());
         // Read exactly to the end
-        let data = dev.read_memory(id, ptr + size - 10, 10).unwrap();
+        let data = dev.read_memory(id.id, ptr + size - 10, 10).unwrap();
         assert_eq!(data.len(), 10);
     }
 
@@ -243,7 +254,7 @@ mod tests {
         let ptr = mem.as_ptr() as u64;
         let id = dev.register(Arc::clone(&mem));
 
-        dev.write_memory(id, ptr + 5, b"hello").unwrap();
+        dev.write_memory(id.id, ptr + 5, b"hello").unwrap();
         assert_eq!(&mem.as_slice()[5..10], b"hello");
     }
 
@@ -264,7 +275,7 @@ mod tests {
         let size = mem.size();
         let id = dev.register(mem);
         assert!(
-            dev.write_memory(id, ptr + size as u64 - 4, b"hello")
+            dev.write_memory(id.id, ptr + size as u64 - 4, b"hello")
                 .is_err()
         );
     }
@@ -275,7 +286,7 @@ mod tests {
         let mem = make_mem(4096);
         let ptr = mem.as_ptr() as u64;
         let id = dev.register(mem);
-        assert!(dev.write_memory(id, ptr - 1, b"x").is_err());
+        assert!(dev.write_memory(id.id, ptr - 1, b"x").is_err());
     }
 
     #[test]
@@ -283,7 +294,8 @@ mod tests {
         let dev = TcpDevice::new();
         let mem = make_mem(4096);
         let ptr = mem.as_ptr() as u64;
-        let id = dev.register(mem);
+        let reg = dev.register(mem);
+        let id = reg.id;
 
         let test_data: Vec<u8> = (0..128).map(|i| i as u8).collect();
         dev.write_memory(id, ptr + 10, &test_data).unwrap();
@@ -301,15 +313,17 @@ mod tests {
         let m2 = make_mem(4096);
         let p1 = m1.as_ptr() as u64;
         let p2 = m2.as_ptr() as u64;
-        let id1 = dev.register(m1);
-        let id2 = dev.register(m2);
+        let reg1 = dev.register(m1);
+        let reg2 = dev.register(m2);
+        let id1 = reg1.id;
+        let id2 = reg2.id;
 
         // Both IDs work independently
         assert!(dev.read_memory(id1, p1, 10).is_ok());
         assert!(dev.read_memory(id2, p2, 10).is_ok());
 
         // Unregister id1, id2 still works
-        dev.unregister(id1);
+        drop(reg1);
         assert!(dev.read_memory(id1, p1, 10).is_err());
         assert!(dev.read_memory(id2, p2, 10).is_ok());
     }
@@ -337,10 +351,10 @@ mod tests {
             let dev = dev.clone();
             let handle = thread::spawn(move || {
                 let mem = make_mem(4096);
-                mem.as_mut_slice()[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+                mem.as_ref().as_mut_slice()[0..8].copy_from_slice(&(i as u64).to_le_bytes());
                 let ptr = mem.as_ptr() as u64;
                 let id = dev.register(Arc::clone(&mem));
-                let data = dev.read_memory(id, ptr, 8).unwrap();
+                let data = dev.read_memory(id.id, ptr, 8).unwrap();
                 assert_eq!(&data[..8], &(i as u64).to_le_bytes());
                 id
             });
@@ -349,7 +363,7 @@ mod tests {
 
         for h in handles {
             let id = h.join().unwrap();
-            dev.unregister(id);
+            drop(id);
         }
     }
 }

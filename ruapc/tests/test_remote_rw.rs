@@ -189,7 +189,7 @@ async fn test_rdma_remote_read() {
         .state
         .devices
         .iter()
-        .find(|d| matches!(d.as_ref(), Device::Rdma(_)))
+        .find(|d| matches!(d, Device::Rdma(_)))
         .expect("no RDMA device discovered");
 
     // Allocate client buffer and fill with test data.
@@ -248,7 +248,7 @@ async fn test_rdma_remote_write() {
         .state
         .devices
         .iter()
-        .find(|d| matches!(d.as_ref(), Device::Rdma(_)))
+        .find(|d| matches!(d, Device::Rdma(_)))
         .expect("no RDMA device discovered");
 
     // Allocate client buffer (initially zeroed).

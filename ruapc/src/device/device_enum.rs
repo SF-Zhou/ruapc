@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use crate::Result;
 use crate::device::TcpDevice;
 use crate::memory::{MemoryKey, MemoryRegistration, RemoteBufferInfo};
@@ -104,16 +102,13 @@ impl ruapc_bufpool::Device for Device {
     }
 
     fn register(
-        self: &Arc<Self>,
+        &self,
         mem: &mut ruapc_bufpool::RegisteredMemory<Self::Registration>,
     ) -> std::io::Result<()> {
-        match self.as_ref() {
+        match self {
             Device::Tcp(tcp) => {
-                let id = tcp.register(Arc::clone(mem.aligned_memory()));
-                mem.add_registration(MemoryRegistration::Tcp {
-                    device: self.clone(),
-                    id,
-                });
+                let mr = tcp.register(mem.aligned_memory().clone());
+                mem.add_registration(MemoryRegistration::Tcp { mr });
                 Ok(())
             }
             #[cfg(feature = "rdma")]
@@ -196,7 +191,7 @@ mod tests {
     fn test_device_read_memory_rdma_device_returns_err() {
         let devices = make_rdma_devices();
         // Use a TCP-style key on an RDMA device to exercise the Device::Rdma arm.
-        let rdma_dev = devices.rdma_devices()[0].clone();
+        let rdma_dev = &devices.rdma_devices()[0];
         let req = crate::services::MemoryReadReq {
             key: MemoryKey::Tcp { id: 9999 },
             addr: 0,
@@ -209,7 +204,7 @@ mod tests {
     #[test]
     fn test_device_write_memory_rdma_device_returns_err() {
         let devices = make_rdma_devices();
-        let rdma_dev = devices.rdma_devices()[0].clone();
+        let rdma_dev = &devices.rdma_devices()[0];
         let req = crate::services::MemoryWriteReq {
             key: MemoryKey::Tcp { id: 9999 },
             addr: 0,
@@ -222,7 +217,7 @@ mod tests {
     #[test]
     fn test_rdma_device_debug_format() {
         let devices = make_rdma_devices();
-        let rdma_dev = devices.rdma_devices()[0].clone();
+        let rdma_dev = &devices.rdma_devices()[0];
         let debug = format!("{rdma_dev:?}");
         assert!(debug.contains("Rdma"));
     }

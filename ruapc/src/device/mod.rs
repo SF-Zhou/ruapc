@@ -1,5 +1,5 @@
 mod tcp_device;
-pub use tcp_device::TcpDevice;
+pub use tcp_device::{TcpDevice, TcpMemoryRegistration};
 
 #[cfg(feature = "rdma")]
 mod rdma_device;

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ruapc_bufpool::Devices as DevicesTrait;
-use ruapc_bufpool::{BufferPool, Device, RegisteredMemory, Registration};
+use ruapc_bufpool::{BufferPool, Device, RegisteredMemory};
 
 // ---------------------------------------------------------------------------
 // Local Devices implementation (moved out of ruapc-bufpool)
@@ -11,7 +11,7 @@ use ruapc_bufpool::{BufferPool, Device, RegisteredMemory, Registration};
 
 #[derive(Debug)]
 struct Devices<D: Device> {
-    devices: Vec<Arc<D>>,
+    devices: Vec<D>,
 }
 
 impl<D: Device> Devices<D> {
@@ -21,15 +21,14 @@ impl<D: Device> Devices<D> {
         }
     }
 
-    fn add(&mut self, mut device: D) -> Arc<D> {
+    fn add(&mut self, mut device: D) -> usize {
         let index = self.devices.len();
         device.set_index(index);
-        let device = Arc::new(device);
-        self.devices.push(device.clone());
-        device
+        self.devices.push(device);
+        index
     }
 
-    fn get(&self, index: usize) -> Option<&Arc<D>> {
+    fn get(&self, index: usize) -> Option<&D> {
         self.devices.get(index)
     }
 }
@@ -37,7 +36,7 @@ impl<D: Device> Devices<D> {
 impl<D: Device> DevicesTrait for Devices<D> {
     type Device = D;
     type Iter<'a>
-        = std::slice::Iter<'a, Arc<D>>
+        = std::slice::Iter<'a, D>
     where
         Self: 'a;
 
@@ -90,8 +89,8 @@ impl MockRegistration {
     }
 }
 
-impl Registration for MockRegistration {
-    fn unregister(&self) {
+impl Drop for MockRegistration {
+    fn drop(&mut self) {
         if let Some(counter) = &self.drop_counter {
             counter.fetch_sub(1, Ordering::SeqCst);
         }
@@ -120,7 +119,7 @@ impl Device for MockDevice {
         self.index = idx;
     }
 
-    fn register(self: &Arc<Self>, mem: &mut RegisteredMemory<Self::Registration>) -> Result<()> {
+    fn register(&self, mem: &mut RegisteredMemory<Self::Registration>) -> Result<()> {
         mem.add_registration(MockRegistration::new(self.index));
         Ok(())
     }
@@ -150,7 +149,7 @@ impl Device for CountingDevice {
         self.index = idx;
     }
 
-    fn register(self: &Arc<Self>, mem: &mut RegisteredMemory<Self::Registration>) -> Result<()> {
+    fn register(&self, mem: &mut RegisteredMemory<Self::Registration>) -> Result<()> {
         mem.add_registration(MockRegistration::with_counter(self.index, &self.counter));
         Ok(())
     }
@@ -185,7 +184,7 @@ impl Device for PartialDevice {
         self.index = idx;
     }
 
-    fn register(self: &Arc<Self>, mem: &mut RegisteredMemory<Self::Registration>) -> Result<()> {
+    fn register(&self, mem: &mut RegisteredMemory<Self::Registration>) -> Result<()> {
         let n = self.call_count.fetch_add(1, Ordering::SeqCst);
         if n < self.succeed_count {
             mem.add_registration(MockRegistration::new(self.index));
@@ -235,9 +234,9 @@ fn devices_add_assigns_indices() {
     let d1 = devices.add(MockDevice::new());
     let d2 = devices.add(MockDevice::new());
 
-    assert_eq!(d0.index(), 0);
-    assert_eq!(d1.index(), 1);
-    assert_eq!(d2.index(), 2);
+    assert_eq!(d0, 0);
+    assert_eq!(d1, 1);
+    assert_eq!(d2, 2);
     assert_eq!(devices.len(), 3);
     assert!(!devices.is_empty());
 }
@@ -293,8 +292,8 @@ fn memory_add_registration_and_lookup() {
     mem.add_registration(MockRegistration::new(d0.index()));
     mem.add_registration(MockRegistration::new(d1.index()));
 
-    assert_eq!(mem.registration(d0.as_ref()).unwrap().device_index, 0);
-    assert_eq!(mem.registration(d1.as_ref()).unwrap().device_index, 1);
+    assert_eq!(mem.registration(d0).unwrap().device_index, 0);
+    assert_eq!(mem.registration(d1).unwrap().device_index, 1);
     assert_eq!(mem.registrations().len(), 2);
 }
 
@@ -306,7 +305,7 @@ fn memory_new_with_devices() {
     assert_eq!(mem.registrations().len(), 3);
     for i in 0..3 {
         assert_eq!(
-            mem.registration(devices.get(i).unwrap().as_ref())
+            mem.registration(devices.get(i).unwrap())
                 .unwrap()
                 .device_index,
             i
