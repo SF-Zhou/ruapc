@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use ruapc_bufpool::Device as _;
 use ruapc_rdma_sys::{QueuePair, WRID, ibv_send_flags, ibv_wc_status};
 use serde::Serialize;
 use tokio::sync::mpsc::Sender;
@@ -34,7 +35,7 @@ pub struct RdmaSocket {
     /// The RDMA queue pair — destroyed after rdmabuf_pool Arcs.
     pub(crate) queue_pair: QueuePair<RdmaBufferRef>,
     /// The RDMA device (as the Device enum) this QP belongs to.
-    pub(crate) device: Arc<Device>,
+    pub(crate) device_index: usize,
     pub(crate) state: RdmaState,
     pub(crate) pending_sender: Sender<u64>,
 }
@@ -42,7 +43,7 @@ pub struct RdmaSocket {
 impl RdmaSocket {
     pub fn new(
         queue_pair: QueuePair<RdmaBufferRef>,
-        device: Arc<Device>,
+        device: &Device,
         rdmabuf_pool: Arc<BufferPool>,
         pending_sender: Sender<u64>,
     ) -> Self {
@@ -51,7 +52,7 @@ impl RdmaSocket {
             pending_buffers: dashmap::DashMap::default(),
             rdmabuf_pool,
             queue_pair,
-            device,
+            device_index: device.index(),
             state: RdmaState::new(32),
             pending_sender,
         }
@@ -70,7 +71,7 @@ impl RdmaSocket {
 
     /// Creates an `RdmaBufferRef` for the given buffer on this socket's device.
     pub(crate) fn make_buffer_ref(&self, buffer: Buffer) -> Option<RdmaBufferRef> {
-        RdmaBufferRef::new(buffer, &self.device)
+        RdmaBufferRef::new(buffer, self.device_index)
     }
 
     /// Posts a one-sided RDMA read or write verb using the **tracked** QP API.

@@ -1,26 +1,21 @@
 use std::io::Result;
-use std::sync::Arc;
 
 use crate::RegisteredMemory;
 
-pub trait Registration: Send + Sync + std::fmt::Debug {
-    fn unregister(&self);
-}
-
 pub trait Device: Send + Sync + std::fmt::Debug {
-    type Registration: Registration;
+    type Registration: Send + Sync + std::fmt::Debug;
 
     fn index(&self) -> usize;
 
     fn set_index(&mut self, idx: usize);
 
-    fn register(self: &Arc<Self>, mem: &mut RegisteredMemory<Self::Registration>) -> Result<()>;
+    fn register(&self, mem: &mut RegisteredMemory<Self::Registration>) -> Result<()>;
 }
 
 pub trait Devices: Send + Sync + std::fmt::Debug {
     type Device: Device;
 
-    type Iter<'a>: Iterator<Item = &'a Arc<Self::Device>>
+    type Iter<'a>: Iterator<Item = &'a Self::Device>
     where
         Self: 'a;
 

@@ -64,6 +64,10 @@ impl<DS: Devices> Buffer<DS> {
         self.memory().registration(device)
     }
 
+    pub fn registration_by_index(&self, device_index: usize) -> std::io::Result<&Reg<DS>> {
+        self.memory().registration_by_index(device_index)
+    }
+
     pub fn set_len(&mut self, len: usize) {
         assert!(
             len <= self.capacity,

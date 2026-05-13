@@ -2,7 +2,7 @@ use std::io::{Error, ErrorKind, Result};
 use std::sync::Arc;
 
 use crate::AlignedMemory;
-use crate::device::{Device, Devices, Registration};
+use crate::device::{Device, Devices};
 
 /// A registered memory block.
 ///
@@ -17,14 +17,14 @@ use crate::device::{Device, Devices, Registration};
 /// devices one at a time via [`Device::register`]. If a device's
 /// registration fails, the `RegisteredMemory` still holds registrations
 /// from previously successful devices, ensuring correct cleanup on drop.
-pub struct RegisteredMemory<R: Registration> {
+pub struct RegisteredMemory<R: Send + Sync + std::fmt::Debug> {
     aligned_memory: Arc<AlignedMemory>,
     registrations: Vec<R>,
 }
 
 pub type Reg<DS> = <<DS as Devices>::Device as Device>::Registration;
 
-impl<R: Registration> RegisteredMemory<R> {
+impl<R: Send + Sync + std::fmt::Debug> RegisteredMemory<R> {
     /// Creates a new `RegisteredMemory` by allocating aligned memory and
     /// registering it on every device in `devices`.
     ///
@@ -75,10 +75,15 @@ impl<R: Registration> RegisteredMemory<R> {
     /// Returns a reference to the registration for the given device.
     pub fn registration<D: Device<Registration = R>>(&self, device: &D) -> Result<&R> {
         let idx = device.index();
-        self.registrations.get(idx).ok_or_else(|| {
+        self.registration_by_index(idx)
+    }
+
+    /// Returns a reference to the registration for the given device index.
+    pub fn registration_by_index(&self, device_index: usize) -> Result<&R> {
+        self.registrations.get(device_index).ok_or_else(|| {
             Error::new(
                 ErrorKind::InvalidInput,
-                format!("memory not registered on device index {idx}"),
+                format!("memory not registered on device index {device_index}"),
             )
         })
     }
@@ -89,15 +94,7 @@ impl<R: Registration> RegisteredMemory<R> {
     }
 }
 
-impl<R: Registration> Drop for RegisteredMemory<R> {
-    fn drop(&mut self) {
-        for reg in &self.registrations {
-            reg.unregister();
-        }
-    }
-}
-
-impl<R: Registration> std::fmt::Debug for RegisteredMemory<R> {
+impl<R: Send + Sync + std::fmt::Debug> std::fmt::Debug for RegisteredMemory<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RegisteredMemory")
             .field("aligned_memory", &self.aligned_memory)

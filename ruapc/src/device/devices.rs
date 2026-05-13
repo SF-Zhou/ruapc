@@ -1,12 +1,10 @@
-use std::sync::Arc;
-
 use ruapc_bufpool::Device as _;
 
 use crate::Device;
 
 #[derive(Debug)]
 pub struct Devices {
-    inner: Vec<Arc<Device>>,
+    inner: Vec<Device>,
 }
 
 impl Devices {
@@ -18,13 +16,13 @@ impl Devices {
     }
 
     /// Returns a reference to the TCP device. The TCP device is always at index 0.
-    pub fn tcp_device(&self) -> &Arc<Device> {
+    pub fn tcp_device(&self) -> &Device {
         &self.inner[0]
     }
 
     #[cfg(feature = "rdma")]
     /// Returns a slice of RDMA devices. The TCP device is at index 0, so RDMA devices start from index 1.
-    pub fn rdma_devices(&self) -> &[Arc<Device>] {
+    pub fn rdma_devices(&self) -> &[Device] {
         &self.inner[1..]
     }
 
@@ -37,14 +35,13 @@ impl Devices {
     fn add(&mut self, mut device: Device) {
         let index = self.inner.len();
         device.set_index(index);
-        let device = Arc::new(device);
         self.inner.push(device);
     }
 }
 
 impl ruapc_bufpool::Devices for Devices {
     type Device = Device;
-    type Iter<'a> = std::slice::Iter<'a, Arc<Device>>;
+    type Iter<'a> = std::slice::Iter<'a, Device>;
 
     fn len(&self) -> usize {
         self.inner.len()
@@ -104,7 +101,8 @@ mod tests {
         let mem = Arc::new(AlignedMemory::new(4096).unwrap());
         let ptr = mem.as_ptr() as u64;
         let size = mem.size() as u64;
-        let id = dev.register(Arc::clone(&mem));
+        let reg = dev.register(Arc::clone(&mem));
+        let id = reg.id;
 
         // Valid access.
         assert!(dev.read_memory(id, ptr, 100).is_ok());
@@ -116,7 +114,7 @@ mod tests {
         // Unknown ID.
         assert!(dev.read_memory(id + 1, ptr, 1).is_err());
 
-        dev.unregister(id);
+        drop(reg);
         assert!(dev.read_memory(id, ptr, 1).is_err());
     }
 }
