@@ -46,9 +46,9 @@ pub struct MsgMeta {
     pub flags: MsgFlags,
     /// Message ID for correlating requests and responses.
     pub msgid: u64,
-    /// Optional remote buffer information attached by the client.
-    /// Present when the client sends a `Request::WithBuffer`, allowing the server
-    /// to perform `remote_read` on the client's registered memory.
+    /// Optional remote buffer information for server-side reading.
+    /// Present when the client uses `_with_read_buffer` methods, allowing the
+    /// server to perform `remote_read` on the client's registered memory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub buffer_info: Option<RemoteBufferInfo>,
 }

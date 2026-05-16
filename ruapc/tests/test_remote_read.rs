@@ -102,7 +102,7 @@ async fn run_test(tc: TestCase) {
         delay_ms: tc.delay_ms,
     };
 
-    let result: Result<ReadRsp> = client.read_buf_with_buffer(&ctx, &req, &buf).await;
+    let result: Result<ReadRsp> = client.with_read_buffer(&buf).read_buf(&ctx, &req).await;
 
     match tc.expect {
         Expected::Ok => {
