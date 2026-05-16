@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
+use ruapc_bufpool::RemoteBufferInfo;
 use serde::Serialize;
 
 use crate::{
-    Context, MsgMeta, RemoteBufferInfo, Result, State,
+    Buffer, Context, MsgMeta, Result, State,
     http::HttpSocket,
-    memory::Buffer,
     services::{MemoryReadReq, MemoryService, MemoryWriteReq},
     tcp::TcpSocket,
     ws::WebSocket,

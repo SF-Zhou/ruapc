@@ -105,7 +105,7 @@ pub trait SocketPoolTrait: Sized {
     fn create(
         config: &SocketPoolConfig,
         devices: &Arc<crate::Devices>,
-        buffer_pool: &Arc<crate::memory::BufferPool>,
+        buffer_pool: &Arc<crate::BufferPool>,
     ) -> Result<Self>;
 
     async fn acquire(
@@ -164,7 +164,7 @@ impl SocketPool {
     pub fn create(
         config: &SocketPoolConfig,
         devices: &Arc<crate::Devices>,
-        buffer_pool: &Arc<crate::memory::BufferPool>,
+        buffer_pool: &Arc<crate::BufferPool>,
     ) -> Result<Self> {
         match config.socket_type {
             SocketType::TCP => Ok(SocketPool::TCP(TcpSocketPool::create(
@@ -382,9 +382,9 @@ mod tests {
     #[cfg(feature = "rdma")]
     fn make_rdma_devices() -> std::sync::Arc<crate::Devices> {
         let active_devices =
-            ruapc_rdma_sys::ActiveDevice::available().expect("RDMA devices should be available");
+            ruapc_rdma::ActiveDevice::available().expect("RDMA devices should be available");
         let prefer_rxe = std::env::var("RUAPC_PREFER_RXE").is_ok();
-        let mut devices = crate::Devices::new();
+        let mut devices = crate::Devices::default();
         for dev in active_devices {
             if prefer_rxe && !dev.info().name.starts_with("rxe") {
                 continue;
@@ -446,11 +446,10 @@ mod tests {
         let buffer_pool =
             std::sync::Arc::new(crate::BufferPool::new(devices.clone(), 4096, 4096, 0));
         let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
-        let (state, _guard) =
-            crate::state::State::create(crate::Router::default(), &config).unwrap();
+        let (state, _guard) = crate::State::create(crate::Router::default(), &config).unwrap();
         let endpoint = crate::rdma::Endpoint {
             qp_num: 0,
-            gid: ruapc_rdma_sys::ibv_gid::default(),
+            gid: ruapc_rdma::ibv_gid::default(),
             lid: 0,
         };
         assert!(pool.rdma_connect(&endpoint, &state).is_err());
@@ -469,8 +468,7 @@ mod tests {
         let buffer_pool =
             std::sync::Arc::new(crate::BufferPool::new(devices.clone(), 4096, 4096, 0));
         let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
-        let (state, _guard) =
-            crate::state::State::create(crate::Router::default(), &config).unwrap();
+        let (state, _guard) = crate::State::create(crate::Router::default(), &config).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         // Connect a client to get a stream.

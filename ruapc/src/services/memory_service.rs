@@ -1,10 +1,7 @@
-use std::sync::Arc;
-
+use ruapc_bufpool::MemoryKey;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::device::Devices;
-use crate::memory::MemoryKey;
 use crate::{Context, Result};
 
 /// Request to read from a remote memory region.
@@ -38,16 +35,22 @@ pub trait MemoryService {
 }
 
 /// Implementation of MemoryService backed by a Devices collection.
-pub struct MemoryServiceImpl {
-    pub devices: Arc<Devices>,
-}
+pub struct MemoryServiceImpl;
 
 impl MemoryService for MemoryServiceImpl {
     async fn tcp_read(&self, ctx: &Context, req: &MemoryReadReq) -> Result<Vec<u8>> {
-        ctx.state.devices.tcp_device().read_memory(req)
+        ctx.state
+            .devices
+            .tcp_device()
+            .read_memory(req.key.lkey, req.addr, req.len)
+            .map_err(|e| crate::Error::new(crate::ErrorKind::InvalidArgument, e.to_string()))
     }
 
     async fn tcp_write(&self, ctx: &Context, req: &MemoryWriteReq) -> Result<()> {
-        ctx.state.devices.tcp_device().write_memory(req)
+        ctx.state
+            .devices
+            .tcp_device()
+            .write_memory(req.key.lkey, req.addr, &req.data)
+            .map_err(|e| crate::Error::new(crate::ErrorKind::InvalidArgument, e.to_string()))
     }
 }

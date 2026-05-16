@@ -86,7 +86,7 @@ async fn test_http() {
         .await
         .unwrap()
         .unwrap();
-    assert!(rsp.len() > 0);
+    assert!(!rsp.is_empty());
 
     server.stop();
     server.join().await;

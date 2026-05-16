@@ -1,29 +1,38 @@
 use std::io::Result;
+use std::sync::Arc;
 
-use crate::RegisteredMemory;
+use crate::{AlignedMemory, MemoryKey};
 
-pub trait Device: Send + Sync + std::fmt::Debug {
-    type Registration: Send + Sync + std::fmt::Debug;
-
-    fn index(&self) -> usize;
-
-    fn set_index(&mut self, idx: usize);
-
-    fn register(&self, mem: &mut RegisteredMemory<Self::Registration>) -> Result<()>;
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceIndex {
+    pub magic: u32,
+    pub index: u32,
 }
 
-pub trait Devices: Send + Sync + std::fmt::Debug {
-    type Device: Device;
+pub trait AsDeviceIndex {
+    fn as_device_index(&self) -> DeviceIndex;
+}
 
-    type Iter<'a>: Iterator<Item = &'a Self::Device>
-    where
-        Self: 'a;
+pub trait Registration: Send + Sync + std::fmt::Debug {
+    fn memory_key(&self) -> MemoryKey;
+}
 
-    fn len(&self) -> usize;
+pub trait Device: Send + Sync + std::fmt::Debug {
+    fn index(&self) -> DeviceIndex;
 
-    fn is_empty(&self) -> bool {
-        self.len() == 0
+    fn set_index(&mut self, idx: DeviceIndex);
+
+    fn register(&self, mem: &Arc<AlignedMemory>) -> Result<Box<dyn Registration>>;
+}
+
+impl AsDeviceIndex for DeviceIndex {
+    fn as_device_index(&self) -> DeviceIndex {
+        *self
     }
+}
 
-    fn iter(&self) -> Self::Iter<'_>;
+impl<T: Device> AsDeviceIndex for T {
+    fn as_device_index(&self) -> DeviceIndex {
+        self.index()
+    }
 }
