@@ -241,7 +241,6 @@ async fn test_http_concurrent_requests() {
     let tasks = (0..10)
         .map(|i| {
             let client = client.clone();
-            let addr = addr;
             tokio::spawn(async move {
                 // Test both static and dynamic endpoints
                 let openapi_response = client

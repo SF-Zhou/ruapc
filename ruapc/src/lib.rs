@@ -11,7 +11,8 @@ pub use msg::{Message, MsgFlags, MsgMeta, Payload};
 
 mod core;
 pub use core::{
-    Client, Context, Listener, MethodInfo, Request, Router, Server, SocketEndpoint, State,
+    Client, ClientWithReadBuffer, Context, Listener, MethodInfo, Router, Server, SocketEndpoint,
+    State,
 };
 
 mod task;

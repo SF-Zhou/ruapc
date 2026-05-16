@@ -32,7 +32,7 @@ impl UploadService for UploadServiceImpl {
     async fn upload(&self, ctx: &Context, req: &UploadReq) -> Result<UploadRsp> {
         // The server should see buffer_info in the message metadata.
         let buffer_info = ctx.msg_meta.buffer_info.as_ref().expect(
-            "expected buffer_info in msg_meta — client should have used upload_with_buffer",
+            "expected buffer_info in msg_meta — client should have used with_read_buffer()",
         );
 
         // Allocate a local buffer and remote_read the client's buffer.
@@ -64,7 +64,7 @@ impl PingService for PingServiceImpl {
             ctx.msg_meta.buffer_info.is_none(),
             "buffer_info should be None for normal requests"
         );
-        Ok(format!("pong"))
+        Ok("pong".to_string())
     }
 }
 
@@ -73,7 +73,7 @@ impl PingService for PingServiceImpl {
 // --------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_upload_with_buffer_tcp() {
+async fn test_upload_with_read_buffer_tcp() {
     let upload_svc = Arc::new(UploadServiceImpl);
     let ping_svc = Arc::new(PingServiceImpl);
     let mut router = Router::default();
@@ -94,8 +94,8 @@ async fn test_upload_with_buffer_tcp() {
     let rsp = client.ping(&ctx, &"hello".to_string()).await.unwrap();
     assert_eq!(rsp, "pong");
 
-    // 2. Test upload_with_buffer — client sends buffer to server.
-    let test_data = b"Hello, WithBuffer!";
+    // 2. Test with_read_buffer — client sends buffer for server to read.
+    let test_data = b"Hello, WithReadBuffer!";
     let mut buf = ctx.state.buffer_pool.allocate().unwrap();
     buf[..test_data.len()].copy_from_slice(test_data);
 
@@ -103,12 +103,20 @@ async fn test_upload_with_buffer_tcp() {
         expected_len: test_data.len(),
     };
 
-    // Use the generated _with_buffer method.
-    let rsp: UploadRsp = client.upload_with_buffer(&ctx, &req, &buf).await.unwrap();
+    // Use client.with_read_buffer(&buf) to attach the buffer.
+    let rsp: UploadRsp = client
+        .with_read_buffer(&buf)
+        .upload(&ctx, &req)
+        .await
+        .unwrap();
     assert_eq!(rsp.data, test_data);
 
     // 3. Verify the same buffer can be reused (retry scenario).
-    let rsp2: UploadRsp = client.upload_with_buffer(&ctx, &req, &buf).await.unwrap();
+    let rsp2: UploadRsp = client
+        .with_read_buffer(&buf)
+        .upload(&ctx, &req)
+        .await
+        .unwrap();
     assert_eq!(rsp2.data, test_data);
 
     // 4. Verify normal upload (without buffer) — should panic on server
@@ -121,7 +129,7 @@ async fn test_upload_with_buffer_tcp() {
 }
 
 #[tokio::test]
-async fn test_upload_with_buffer_websocket() {
+async fn test_upload_with_read_buffer_websocket() {
     let upload_svc = Arc::new(UploadServiceImpl);
     let mut router = Router::default();
     upload_svc.ruapc_export(&mut router);
@@ -149,7 +157,11 @@ async fn test_upload_with_buffer_websocket() {
         expected_len: test_data.len(),
     };
 
-    let rsp: UploadRsp = client.upload_with_buffer(&ctx, &req, &buf).await.unwrap();
+    let rsp: UploadRsp = client
+        .with_read_buffer(&buf)
+        .upload(&ctx, &req)
+        .await
+        .unwrap();
     assert_eq!(rsp.data, test_data);
 
     server.stop();
@@ -157,7 +169,7 @@ async fn test_upload_with_buffer_websocket() {
 }
 
 #[tokio::test]
-async fn test_upload_with_buffer_http() {
+async fn test_upload_with_read_buffer_http() {
     let upload_svc = Arc::new(UploadServiceImpl);
     let mut router = Router::default();
     upload_svc.ruapc_export(&mut router);
@@ -185,7 +197,11 @@ async fn test_upload_with_buffer_http() {
         expected_len: test_data.len(),
     };
 
-    let rsp: UploadRsp = client.upload_with_buffer(&ctx, &req, &buf).await.unwrap();
+    let rsp: UploadRsp = client
+        .with_read_buffer(&buf)
+        .upload(&ctx, &req)
+        .await
+        .unwrap();
     assert_eq!(rsp.data, test_data);
 
     server.stop();
