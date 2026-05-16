@@ -4,6 +4,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use ruapc::*;
+use ruapc_bufpool::RemoteBufferInfo;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -93,8 +94,8 @@ async fn test_tcp_remote_read() {
     client_buf[..test_data.len()].copy_from_slice(test_data);
 
     // Get RemoteBufferInfo for the client's buffer (use first device = TCP).
-    let client_device = ctx.state.devices.iter().next().unwrap();
-    let rbi = client_device.remote_buffer_info(&client_buf).unwrap();
+    let client_device = ctx.state.devices.tcp_device();
+    let rbi = client_buf.remote_buffer_info(client_device).unwrap();
     let rbi_for_req = RemoteBufferInfo {
         key: rbi.key,
         addr: rbi.addr,
@@ -136,8 +137,8 @@ async fn test_tcp_remote_write() {
     assert!(client_buf[..10].iter().all(|&b| b == 0));
 
     // Get RemoteBufferInfo for the client's buffer.
-    let client_device = ctx.state.devices.iter().next().unwrap();
-    let rbi = client_device.remote_buffer_info(&client_buf).unwrap();
+    let client_device = ctx.state.devices.tcp_device();
+    let rbi = client_buf.remote_buffer_info(client_device).unwrap();
     let write_data = b"Hello, Remote Write!";
     let rbi_for_req = RemoteBufferInfo {
         key: rbi.key,
@@ -188,8 +189,9 @@ async fn test_rdma_remote_read() {
     let rdma_device = ctx
         .state
         .devices
+        .rdma_devices()
         .iter()
-        .find(|d| matches!(d, Device::Rdma(_)))
+        .next()
         .expect("no RDMA device discovered");
 
     // Allocate client buffer and fill with test data.
@@ -198,8 +200,7 @@ async fn test_rdma_remote_read() {
     client_buf[..test_data.len()].copy_from_slice(test_data);
 
     // Get RemoteBufferInfo with RDMA key.
-    let rbi = rdma_device.remote_buffer_info(&client_buf).unwrap();
-    assert!(matches!(rbi.key, MemoryKey::Rdma { .. }));
+    let rbi = client_buf.remote_buffer_info(rdma_device).unwrap();
     let rbi_for_req = RemoteBufferInfo {
         key: rbi.key,
         addr: rbi.addr,
@@ -247,8 +248,9 @@ async fn test_rdma_remote_write() {
     let rdma_device = ctx
         .state
         .devices
+        .rdma_devices()
         .iter()
-        .find(|d| matches!(d, Device::Rdma(_)))
+        .next()
         .expect("no RDMA device discovered");
 
     // Allocate client buffer (initially zeroed).
@@ -256,8 +258,7 @@ async fn test_rdma_remote_write() {
     assert!(client_buf[..10].iter().all(|&b| b == 0));
 
     // Get RemoteBufferInfo with RDMA key.
-    let rbi = rdma_device.remote_buffer_info(&client_buf).unwrap();
-    assert!(matches!(rbi.key, MemoryKey::Rdma { .. }));
+    let rbi = client_buf.remote_buffer_info(rdma_device).unwrap();
     let write_data = b"Hello, RDMA Remote Write!";
     let rbi_for_req = RemoteBufferInfo {
         key: rbi.key,
@@ -307,9 +308,9 @@ async fn test_tcp_remote_read_bounds_check() {
     let ctx = Context::create(&config).unwrap();
     let ctx = ctx.with_addr(addr);
 
-    let client_device = ctx.state.devices.iter().next().unwrap();
+    let client_device = ctx.state.devices.tcp_device();
     let client_buf = ctx.state.buffer_pool.allocate().unwrap();
-    let rbi = client_device.remote_buffer_info(&client_buf).unwrap();
+    let rbi = client_buf.remote_buffer_info(client_device).unwrap();
 
     // Try to read beyond the buffer bounds.
     let bad_rbi = RemoteBufferInfo {

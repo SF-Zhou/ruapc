@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{Context, Result, router::MethodInfo};
+use crate::{Context, MethodInfo, Result};
 
 /// Service metadata information.
 ///
@@ -90,7 +90,9 @@ impl MetaService for () {
     }
 
     async fn list_methods(&self, ctx: &Context, (): &()) -> Result<Vec<String>> {
-        Ok(ctx.state.router.methods.keys().cloned().collect())
+        let mut methods: Vec<_> = ctx.state.router.methods.keys().cloned().collect();
+        methods.sort();
+        Ok(methods)
     }
 
     async fn is_message_waiting(&self, ctx: &Context, msgid: &u64) -> Result<bool> {

@@ -8,9 +8,6 @@ pub use socket_pool::{RawStream, SocketPool, SocketPoolConfig, SocketPoolTrait, 
 
 /// HTTP transport implementation.
 pub mod http;
-/// RDMA (Remote Direct Memory Access) transport implementation.
-#[cfg(feature = "rdma")]
-pub mod rdma;
 /// TCP transport implementation.
 pub mod tcp;
 /// Unified transport that supports multiple protocols simultaneously.

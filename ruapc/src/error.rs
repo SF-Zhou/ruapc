@@ -51,7 +51,7 @@ pub enum ErrorKind {
     RdmaRecvFailed,
     /// RDMA-specific error (only available with "rdma" feature).
     #[cfg(feature = "rdma")]
-    RdmaError(ruapc_rdma_sys::ErrorKind),
+    RdmaError(ruapc_rdma::ErrorKind),
     /// Unknown or unclassified error with a custom message.
     #[serde(untagged)]
     Unknown(String),
@@ -122,8 +122,8 @@ impl From<ErrorKind> for Error {
 }
 
 #[cfg(feature = "rdma")]
-impl From<ruapc_rdma_sys::Error> for Error {
-    fn from(value: ruapc_rdma_sys::Error) -> Self {
+impl From<ruapc_rdma::Error> for Error {
+    fn from(value: ruapc_rdma::Error) -> Self {
         Self::new(ErrorKind::RdmaError(value.kind), value.msg)
     }
 }

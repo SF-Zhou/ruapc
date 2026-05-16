@@ -3,29 +3,27 @@ use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use crate::buffer_pool::BufferPool;
-use crate::device::Devices;
-use crate::memory::{Reg, RegisteredMemory};
+use crate::{AsDeviceIndex, BufferPool, MemoryKey, RegisteredMemory, RemoteBufferInfo};
 
-pub struct Buffer<DS: Devices> {
-    pool: Arc<BufferPool<DS>>,
+pub struct Buffer {
+    pool: Arc<BufferPool>,
     ptr: NonNull<u8>,
     capacity: usize,
     len: usize,
-    memory: NonNull<RegisteredMemory<Reg<DS>>>,
+    memory: NonNull<RegisteredMemory>,
     memory_index: usize,
     block_index: usize,
 }
 
-unsafe impl<DS: Devices> Send for Buffer<DS> {}
-unsafe impl<DS: Devices> Sync for Buffer<DS> {}
+unsafe impl Send for Buffer {}
+unsafe impl Sync for Buffer {}
 
-impl<DS: Devices> Buffer<DS> {
+impl Buffer {
     pub(crate) fn new(
-        pool: Arc<BufferPool<DS>>,
+        pool: Arc<BufferPool>,
         ptr: NonNull<u8>,
         capacity: usize,
-        memory: NonNull<RegisteredMemory<Reg<DS>>>,
+        memory: NonNull<RegisteredMemory>,
         memory_index: usize,
         block_index: usize,
     ) -> Self {
@@ -48,24 +46,29 @@ impl<DS: Devices> Buffer<DS> {
         self.capacity
     }
 
-    pub fn pool(&self) -> &Arc<BufferPool<DS>> {
-        &self.pool
-    }
-
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    fn memory(&self) -> &RegisteredMemory<Reg<DS>> {
+    fn memory(&self) -> &RegisteredMemory {
         unsafe { self.memory.as_ref() }
     }
 
-    pub fn registration(&self, device: &DS::Device) -> std::io::Result<&Reg<DS>> {
-        self.memory().registration(device)
+    pub fn memory_key(&self, device_index: &impl AsDeviceIndex) -> Result<MemoryKey> {
+        let reg = self.memory().registration(device_index)?;
+        Ok(reg.memory_key())
     }
 
-    pub fn registration_by_index(&self, device_index: usize) -> std::io::Result<&Reg<DS>> {
-        self.memory().registration_by_index(device_index)
+    pub fn remote_buffer_info(
+        &self,
+        device_index: &impl AsDeviceIndex,
+    ) -> Result<RemoteBufferInfo> {
+        let key = self.memory_key(device_index)?;
+        Ok(RemoteBufferInfo {
+            key,
+            addr: self.as_ptr() as u64,
+            len: self.capacity() as u64,
+        })
     }
 
     pub fn set_len(&mut self, len: usize) {
@@ -110,7 +113,7 @@ impl<DS: Devices> Buffer<DS> {
     }
 }
 
-impl<DS: Devices> Deref for Buffer<DS> {
+impl Deref for Buffer {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
@@ -118,31 +121,31 @@ impl<DS: Devices> Deref for Buffer<DS> {
     }
 }
 
-impl<DS: Devices> DerefMut for Buffer<DS> {
+impl DerefMut for Buffer {
     fn deref_mut(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 }
 
-impl<DS: Devices> AsRef<[u8]> for Buffer<DS> {
+impl AsRef<[u8]> for Buffer {
     fn as_ref(&self) -> &[u8] {
         self
     }
 }
 
-impl<DS: Devices> AsMut<[u8]> for Buffer<DS> {
+impl AsMut<[u8]> for Buffer {
     fn as_mut(&mut self) -> &mut [u8] {
         self
     }
 }
 
-impl<DS: Devices> Drop for Buffer<DS> {
+impl Drop for Buffer {
     fn drop(&mut self) {
         self.pool.return_buffer(self.memory_index, self.block_index);
     }
 }
 
-impl<DS: Devices> std::fmt::Debug for Buffer<DS> {
+impl std::fmt::Debug for Buffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Buffer")
             .field("ptr", &self.ptr)

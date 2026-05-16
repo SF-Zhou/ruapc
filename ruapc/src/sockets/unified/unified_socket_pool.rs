@@ -6,10 +6,9 @@ use tokio_util::sync::DropGuard;
 #[cfg(feature = "rdma")]
 use crate::rdma::{Endpoint, RdmaInfo, RdmaSocketPool};
 use crate::{
-    Devices, Error, ErrorKind, RawStream, Result, Socket, SocketPoolConfig, SocketPoolTrait,
-    SocketType, State, TaskSupervisor,
+    BufferPool, Devices, Error, ErrorKind, RawStream, Result, Socket, SocketPoolConfig,
+    SocketPoolTrait, SocketType, State, TaskSupervisor,
     http::HttpSocketPool,
-    memory::BufferPool,
     tcp::{self, TcpSocketPool},
     ws::WebSocketPool,
 };
@@ -161,9 +160,9 @@ mod tests {
     #[cfg(feature = "rdma")]
     fn make_rdma_devices() -> Arc<crate::Devices> {
         let active_devices =
-            ruapc_rdma_sys::ActiveDevice::available().expect("RDMA devices should be available");
+            ruapc_rdma::ActiveDevice::available().expect("RDMA devices should be available");
         let prefer_rxe = std::env::var("RUAPC_PREFER_RXE").is_ok();
-        let mut devices = crate::Devices::new();
+        let mut devices = crate::Devices::default();
         for dev in active_devices {
             if prefer_rxe && !dev.info().name.starts_with("rxe") {
                 continue;
@@ -179,7 +178,7 @@ mod tests {
         let config = crate::SocketPoolConfig {
             socket_type: crate::SocketType::UNIFIED,
         };
-        let devices = Arc::new(crate::Devices::new());
+        let devices = Arc::new(crate::Devices::default());
         let buffer_pool = crate::BufferPool::new(devices.clone(), 4096, 4096, 0);
         let pool = UnifiedSocketPool::create(&config, &devices, &buffer_pool).unwrap();
         let debug = format!("{pool:?}");
@@ -208,14 +207,13 @@ mod tests {
         let config = crate::SocketPoolConfig {
             socket_type: crate::SocketType::UNIFIED,
         };
-        let devices = Arc::new(crate::Devices::new()); // TCP only
+        let devices = Arc::new(crate::Devices::default()); // TCP only
         let buffer_pool = crate::BufferPool::new(devices.clone(), 4096, 4096, 0);
         let pool = UnifiedSocketPool::create(&config, &devices, &buffer_pool).unwrap();
-        let (state, _guard) =
-            crate::state::State::create(crate::Router::default(), &config).unwrap();
+        let (state, _guard) = crate::State::create(crate::Router::default(), &config).unwrap();
         let endpoint = crate::rdma::Endpoint {
             qp_num: 0,
-            gid: ruapc_rdma_sys::ibv_gid::default(),
+            gid: ruapc_rdma::ibv_gid::default(),
             lid: 0,
         };
         assert!(pool.rdma_connect(&endpoint, &state).is_err());

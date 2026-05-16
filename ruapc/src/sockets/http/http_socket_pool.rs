@@ -25,7 +25,7 @@ impl SocketPoolTrait for HttpSocketPool {
     fn create(
         _config: &SocketPoolConfig,
         _devices: &std::sync::Arc<crate::Devices>,
-        _buffer_pool: &std::sync::Arc<crate::memory::BufferPool>,
+        _buffer_pool: &std::sync::Arc<crate::BufferPool>,
     ) -> Result<Self> {
         let mut http = Builder::new(TokioExecutor::new());
         http.http1().keep_alive(true);

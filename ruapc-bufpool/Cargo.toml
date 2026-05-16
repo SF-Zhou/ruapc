@@ -12,7 +12,9 @@ license.workspace = true
 
 [dependencies]
 aliasable = "0.1.3"
-ruapc-memory = { path = "../ruapc-memory" }
+dashmap.workspace = true
+schemars.workspace = true
+serde.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]

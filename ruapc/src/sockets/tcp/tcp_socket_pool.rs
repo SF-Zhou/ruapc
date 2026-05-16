@@ -28,7 +28,7 @@ impl SocketPoolTrait for TcpSocketPool {
     fn create(
         _config: &SocketPoolConfig,
         _devices: &Arc<crate::Devices>,
-        _buffer_pool: &Arc<crate::memory::BufferPool>,
+        _buffer_pool: &Arc<crate::BufferPool>,
     ) -> Result<Self> {
         Ok(Self::new())
     }
@@ -219,7 +219,7 @@ impl std::fmt::Debug for TcpSocketPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SocketType, state::State};
+    use crate::{SocketType, State};
 
     async fn make_state() -> Arc<State> {
         let (state, _guard) = State::create(

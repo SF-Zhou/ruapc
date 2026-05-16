@@ -29,7 +29,7 @@ impl SocketPoolTrait for WebSocketPool {
     fn create(
         _config: &SocketPoolConfig,
         _devices: &Arc<crate::Devices>,
-        _buffer_pool: &Arc<crate::memory::BufferPool>,
+        _buffer_pool: &Arc<crate::BufferPool>,
     ) -> Result<Self> {
         Ok(Self {
             socket_map: Arc::default(),
@@ -206,7 +206,7 @@ mod tests {
         let config = crate::SocketPoolConfig {
             socket_type: crate::SocketType::WS,
         };
-        let devices = Arc::new(crate::Devices::new());
+        let devices = Arc::new(crate::Devices::default());
         let buffer_pool = crate::BufferPool::new(devices.clone(), 4096, 4096, 0);
         let pool = WebSocketPool::create(&config, &devices, &buffer_pool).unwrap();
         let debug = format!("{pool:?}");
@@ -222,11 +222,11 @@ mod tests {
         let config = crate::SocketPoolConfig {
             socket_type: crate::SocketType::WS,
         };
-        let devices = Arc::new(crate::Devices::new());
+        let devices = Arc::new(crate::Devices::default());
         let buffer_pool = crate::BufferPool::new(devices.clone(), 4096, 4096, 0);
         let pool = WebSocketPool::create(&config, &devices, &buffer_pool).unwrap();
 
-        let (state, _guard) = crate::state::State::create(
+        let (state, _guard) = crate::State::create(
             crate::Router::default(),
             &crate::SocketPoolConfig {
                 socket_type: crate::SocketType::TCP,

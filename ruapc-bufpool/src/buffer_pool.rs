@@ -6,20 +6,18 @@ use std::sync::{Arc, Mutex};
 use aliasable::boxed::AliasableBox;
 use tokio::sync::oneshot;
 
-use crate::buffer::Buffer;
-use crate::device::Devices;
-use crate::memory::{Reg, RegisteredMemory};
+use crate::{Buffer, Devices, RegisteredMemory};
 
-pub struct BufferPool<DS: Devices> {
-    devices: Arc<DS>,
-    inner: Mutex<PoolInner<DS>>,
+pub struct BufferPool {
+    devices: Arc<dyn Devices>,
+    inner: Mutex<PoolInner>,
     block_size: usize,
     chunk_size: usize,
     max_memory: usize,
 }
 
-struct PoolInner<DS: Devices> {
-    memories: Vec<AliasableBox<RegisteredMemory<Reg<DS>>>>,
+struct PoolInner {
+    memories: Vec<AliasableBox<RegisteredMemory>>,
     free_list: VecDeque<FreeSlot>,
     allocated_memory: usize,
     waiters: VecDeque<oneshot::Sender<()>>,
@@ -31,9 +29,9 @@ struct FreeSlot {
     block_index: usize,
 }
 
-impl<DS: Devices> BufferPool<DS> {
+impl BufferPool {
     pub fn new(
-        devices: Arc<DS>,
+        devices: Arc<dyn Devices>,
         block_size: usize,
         chunk_size: usize,
         max_memory: usize,
@@ -58,12 +56,12 @@ impl<DS: Devices> BufferPool<DS> {
         })
     }
 
-    pub fn allocate(self: &Arc<Self>) -> Result<Buffer<DS>> {
+    pub fn allocate(self: &Arc<Self>) -> Result<Buffer> {
         let mut inner = self.inner.lock().unwrap();
         self.allocate_inner(&mut inner)
     }
 
-    pub async fn async_allocate(self: &Arc<Self>) -> Result<Buffer<DS>> {
+    pub async fn async_allocate(self: &Arc<Self>) -> Result<Buffer> {
         loop {
             let rx = {
                 let mut inner = self.inner.lock().unwrap();
@@ -80,7 +78,7 @@ impl<DS: Devices> BufferPool<DS> {
         }
     }
 
-    fn allocate_inner(self: &Arc<Self>, inner: &mut PoolInner<DS>) -> Result<Buffer<DS>> {
+    fn allocate_inner(self: &Arc<Self>, inner: &mut PoolInner) -> Result<Buffer> {
         if let Some(slot) = inner.free_list.pop_front() {
             return self.make_buffer(inner, slot);
         }
@@ -97,8 +95,8 @@ impl<DS: Devices> BufferPool<DS> {
         Err(Error::other("buffer pool exhausted"))
     }
 
-    fn allocate_chunk(&self, inner: &mut PoolInner<DS>) -> Result<()> {
-        let mem = RegisteredMemory::new(self.chunk_size, &self.devices)?;
+    fn allocate_chunk(&self, inner: &mut PoolInner) -> Result<()> {
+        let mem = RegisteredMemory::new(self.chunk_size, &*self.devices)?;
         let memory_index = inner.memories.len();
         let blocks_per_chunk = self.chunk_size / self.block_size;
 
@@ -116,11 +114,11 @@ impl<DS: Devices> BufferPool<DS> {
         Ok(())
     }
 
-    fn make_buffer(self: &Arc<Self>, inner: &PoolInner<DS>, slot: FreeSlot) -> Result<Buffer<DS>> {
-        let mem: &RegisteredMemory<Reg<DS>> = &inner.memories[slot.memory_index];
-        let base = mem.aligned_memory().as_mut_ptr();
+    fn make_buffer(self: &Arc<Self>, inner: &PoolInner, slot: FreeSlot) -> Result<Buffer> {
+        let mem: &RegisteredMemory = &inner.memories[slot.memory_index];
+        let base = mem.aligned_memory().as_ptr();
         let offset = slot.block_index * self.block_size;
-        let ptr = unsafe { NonNull::new_unchecked(base.add(offset)) };
+        let ptr = unsafe { NonNull::new_unchecked(base.add(offset) as *mut u8) };
         let memory = NonNull::from(mem);
         Ok(Buffer::new(
             Arc::clone(self),
@@ -146,25 +144,21 @@ impl<DS: Devices> BufferPool<DS> {
     pub fn allocated_memory(&self) -> usize {
         self.inner.lock().unwrap().allocated_memory
     }
-
     pub fn free_count(&self) -> usize {
         self.inner.lock().unwrap().free_list.len()
     }
-
     pub fn block_size(&self) -> usize {
         self.block_size
     }
-
     pub fn chunk_size(&self) -> usize {
         self.chunk_size
     }
-
-    pub fn devices(&self) -> &Arc<DS> {
+    pub fn devices(&self) -> &Arc<dyn Devices> {
         &self.devices
     }
 }
 
-impl<DS: Devices> std::fmt::Debug for BufferPool<DS> {
+impl std::fmt::Debug for BufferPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let inner = self.inner.lock().unwrap();
         f.debug_struct("BufferPool")
