@@ -196,6 +196,7 @@ impl HttpSocketPool {
             method: req.uri().path().trim_start_matches('/').to_string(),
             flags: MsgFlags::IsReq,
             msgid,
+            buffer_info: None,
         };
         let bytes = match req.into_body().collect().await {
             Ok(collected) => collected.to_bytes(),

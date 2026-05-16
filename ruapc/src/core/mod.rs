@@ -4,6 +4,9 @@ pub use client::Client;
 mod context;
 pub use context::{Context, SocketEndpoint};
 
+mod request;
+pub use request::Request;
+
 mod server;
 pub use server::Server;
 

@@ -4,7 +4,7 @@ use serde_inline_default::serde_inline_default;
 use std::time::Duration;
 
 use crate::{
-    Context, SocketEndpoint, SocketTrait, SocketType,
+    Context, Request, SocketEndpoint, SocketTrait, SocketType,
     error::{Error, ErrorKind},
     msg::{MsgFlags, MsgMeta},
 };
@@ -22,7 +22,7 @@ use crate::{
 /// let addr = SocketAddr::from_str("127.0.0.1:8000").unwrap();
 /// let ctx = Context::create(&SocketPoolConfig::default()).unwrap().with_addr(addr);
 ///
-/// let rsp = client.echo(&ctx, &Request("hello".into())).await;
+/// let rsp = client.echo(&ctx, Request::Normal(&"hello".into())).await;
 /// ```
 #[serde_inline_default]
 #[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone)]
@@ -53,7 +53,7 @@ impl Client {
     /// This is the internal method used by service trait implementations to
     /// send requests and receive responses. It handles:
     /// - Socket acquisition from the context
-    /// - Request serialization
+    /// - Request serialization (and buffer info extraction if present)
     /// - Response waiting with timeout
     /// - Response deserialization
     ///
@@ -66,7 +66,7 @@ impl Client {
     /// # Arguments
     ///
     /// * `ctx` - The RPC context containing connection information
-    /// * `req` - The request to send
+    /// * `req` - The request to send, wrapped in [`Request`]
     /// * `method_name` - The name of the RPC method to invoke
     ///
     /// # Errors
@@ -85,7 +85,7 @@ impl Client {
     pub async fn ruapc_request<Req, Rsp, E>(
         &self,
         ctx: &Context,
-        req: &Req,
+        req: Request<'_, Req>,
         method_name: &str,
     ) -> std::result::Result<Rsp, E>
     where
@@ -120,13 +120,25 @@ impl Client {
             flags |= MsgFlags::UseMessagePack;
         }
 
+        // Extract buffer info if the request carries a buffer.
+        let buffer_info = if let Some(buf) = req.buffer() {
+            let device_index = socket.device_index(&ctx.state);
+            Some(
+                buf.remote_buffer_info(&device_index)
+                    .map_err(|e| Error::new(ErrorKind::InvalidArgument, e.to_string()))?,
+            )
+        } else {
+            None
+        };
+
         let (msgid, receiver) = ctx.state.waiter.alloc();
         let mut meta = MsgMeta {
             method: method_name.into(),
             flags,
             msgid,
+            buffer_info,
         };
-        socket.send(&mut meta, req, &ctx.state).await?;
+        socket.send(&mut meta, req.inner(), &ctx.state).await?;
 
         // 3. recv response with timeout.
         if let Ok(result) = tokio::time::timeout(self.timeout, receiver.recv()).await {

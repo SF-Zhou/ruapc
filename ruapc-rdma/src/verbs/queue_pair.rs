@@ -27,7 +27,6 @@ pub struct QueuePair {
     recv_cq: Arc<CompletionQueue>,
     wrs: Mutex<HashMap<u64, Buffer>>,
     next_id: AtomicU64,
-    #[allow(dead_code)]
     pub device_index: DeviceIndex,
 }
 

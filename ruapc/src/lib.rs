@@ -10,7 +10,9 @@ mod msg;
 pub use msg::{Message, MsgFlags, MsgMeta, Payload};
 
 mod core;
-pub use core::{Client, Context, Listener, MethodInfo, Router, Server, SocketEndpoint, State};
+pub use core::{
+    Client, Context, Listener, MethodInfo, Request, Router, Server, SocketEndpoint, State,
+};
 
 mod task;
 pub(crate) use task::Receiver;

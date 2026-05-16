@@ -4,6 +4,8 @@ use bitflags::bitflags;
 use bytes::BytesMut;
 use serde::{Deserialize, Serialize};
 
+use ruapc_bufpool::RemoteBufferInfo;
+
 use crate::{
     Payload,
     error::{Error, ErrorKind, Result},
@@ -44,6 +46,11 @@ pub struct MsgMeta {
     pub flags: MsgFlags,
     /// Message ID for correlating requests and responses.
     pub msgid: u64,
+    /// Optional remote buffer information attached by the client.
+    /// Present when the client sends a `Request::WithBuffer`, allowing the server
+    /// to perform `remote_read` on the client's registered memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_info: Option<RemoteBufferInfo>,
 }
 
 impl MsgMeta {
@@ -358,6 +365,7 @@ mod tests {
             method: method.to_string(),
             flags,
             msgid: 42,
+            buffer_info: None,
         }
     }
 
@@ -448,6 +456,7 @@ mod tests {
             method: "Svc/method".into(),
             flags: MsgFlags::IsRsp,
             msgid: 7,
+            buffer_info: None,
         };
         let payload = crate::Payload::from(bytes::Bytes::from_static(b"data"));
         let msg2 = Message::new(meta, payload);

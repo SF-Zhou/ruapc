@@ -30,10 +30,12 @@
 //! The macro generates:
 //! 1. A `ruapc_export` method for registering the service with a router
 //! 2. Client trait implementation on `Client` for making requests
-//! 3. Proper error handling and message serialization
+//! 3. A `WithBuffer` extension trait with `_with_buffer` methods for each
+//!    trait method, allowing callers to attach registered memory buffers
+//! 4. Proper error handling and message serialization
 
 use proc_macro::TokenStream;
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::{FnArg, ItemTrait, ReturnType, TraitItem, parse_macro_input};
 
 /// Procedural macro for defining RPC services.
@@ -66,8 +68,13 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
     let mut send_bounds = vec![];
     let mut invoke_branchs = vec![];
     let mut client_methods = vec![];
+    let mut with_buffer_trait_methods = vec![];
+    let mut with_buffer_impl_methods = vec![];
 
     let krate = get_crate_name();
+
+    // Generate the WithBuffer trait name: e.g., EchoServiceWithBuffer
+    let with_buffer_trait_ident = format_ident!("{}WithBuffer", trait_ident);
 
     let input_items = input.items;
     for item in &input_items {
@@ -86,9 +93,26 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
 
             let req_type = req_type.ty.clone();
             let output = &method.sig.output;
+
+            // Client trait impl: wraps &req in Request::Normal
             client_methods.push(quote! {
                 async fn #method_ident(#receiver, ctx: &#krate::Context, req: #req_type) #output {
-                    self.ruapc_request(ctx, req, #method_name).await
+                    self.ruapc_request(ctx, #krate::Request::Normal(req), #method_name).await
+                }
+            });
+
+            // Generate _with_buffer method name
+            let with_buffer_ident = format_ident!("{}_with_buffer", method_ident);
+
+            // WithBuffer trait method declaration
+            with_buffer_trait_methods.push(quote! {
+                async fn #with_buffer_ident(#receiver, ctx: &#krate::Context, req: #req_type, buffer: &#krate::Buffer) #output;
+            });
+
+            // WithBuffer trait implementation for Client
+            with_buffer_impl_methods.push(quote! {
+                async fn #with_buffer_ident(#receiver, ctx: &#krate::Context, req: #req_type, buffer: &#krate::Buffer) #output {
+                    self.ruapc_request(ctx, #krate::Request::WithBuffer(req, buffer), #method_name).await
                 }
             });
 
@@ -138,6 +162,19 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
 
         impl #trait_ident for #krate::Client {
             #(#client_methods)*
+        }
+
+        /// Extension trait providing `_with_buffer` variants for each method.
+        ///
+        /// These methods allow attaching a registered memory [`Buffer`] to the
+        /// request. The buffer's `RemoteBufferInfo` will be included in the
+        /// message metadata so the server can `remote_read` the buffer.
+        #visibility trait #with_buffer_trait_ident {
+            #(#with_buffer_trait_methods)*
+        }
+
+        impl #with_buffer_trait_ident for #krate::Client {
+            #(#with_buffer_impl_methods)*
         }
     }
     .into()

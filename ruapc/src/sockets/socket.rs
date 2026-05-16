@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use ruapc_bufpool::RemoteBufferInfo;
+use ruapc_bufpool::{DeviceIndex, RemoteBufferInfo};
 use serde::Serialize;
 
 use crate::{
@@ -76,10 +76,13 @@ pub trait SocketTrait {
         mut local: Buffer,
         remote: &RemoteBufferInfo,
     ) -> Result<Buffer> {
+        // Pass msgid so that tcp_read on the client side verifies
+        // the original request is still alive after reading the buffer.
         let req = MemoryReadReq {
             key: remote.key,
             addr: remote.addr,
             len: remote.len,
+            msgid: ctx.msg_meta.msgid,
         };
         let client = crate::Client::default();
         let data: Vec<u8> = client.tcp_read(ctx, &req).await?;
@@ -111,6 +114,22 @@ pub trait SocketTrait {
         let client = crate::Client::default();
         client.tcp_write(ctx, &req).await?;
         Ok(local)
+    }
+}
+
+impl Socket {
+    /// Returns the device index associated with this socket.
+    ///
+    /// TCP, WebSocket, and HTTP sockets use the TCP device (looked up from state).
+    /// RDMA sockets use the device associated with their QueuePair.
+    pub fn device_index(&self, state: &State) -> DeviceIndex {
+        match self {
+            Socket::TCP(_) | Socket::WS(_) | Socket::HTTP(_) => {
+                ruapc_bufpool::Device::index(state.devices.tcp_device())
+            }
+            #[cfg(feature = "rdma")]
+            Socket::RDMA(rdma_socket) => rdma_socket.queue_pair.device_index,
+        }
     }
 }
 
