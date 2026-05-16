@@ -14,7 +14,17 @@ pub struct MemoryKey {
     pub rkey: u32,
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
 pub struct RemoteBufferInfo {
     pub key: MemoryKey,
     pub addr: u64,

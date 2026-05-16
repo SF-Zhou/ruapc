@@ -11,6 +11,7 @@ use crate::{
     error::{ErrorKind, Result},
     msg::MsgMeta,
     rdma::event_loop::SendMsg,
+    services::MetaService,
     {Buffer, BufferPool},
 };
 
@@ -144,11 +145,26 @@ impl SocketTrait for RdmaSocket {
 
     async fn remote_read(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         local: Buffer,
         remote: &RemoteBufferInfo,
     ) -> Result<Buffer> {
-        self.remote_op(local, remote, true).await
+        let local = self.remote_op(local, remote, true).await?;
+
+        // After RDMA Read completes, verify the client's original request is still
+        // alive. If the client has timed out, the buffer may have been reclaimed
+        // and the data read via RDMA could be invalid.
+        let msgid = ctx.msg_meta.msgid;
+        let client = crate::Client::default();
+        let still_waiting: bool = client.is_message_waiting(ctx, &msgid).await?;
+        if !still_waiting {
+            return Err(Error::new(
+                ErrorKind::Timeout,
+                "RDMA read completed but client request has already timed out".into(),
+            ));
+        }
+
+        Ok(local)
     }
 
     async fn remote_write(

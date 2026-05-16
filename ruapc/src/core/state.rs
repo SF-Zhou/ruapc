@@ -164,6 +164,7 @@ mod tests {
                 method: "any/method".into(),
                 flags: MsgFlags::empty(),
                 msgid: 0,
+                buffer_info: None,
             },
             payload: Payload::Empty,
         };
