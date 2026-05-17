@@ -104,7 +104,7 @@ impl MemoryService for MemoryServiceImpl {
         let mut buf = ctx
             .state
             .buffer_pool
-            .allocate()
+            .allocate(1024 * 1024)
             .map_err(|e| crate::Error::new(crate::ErrorKind::InvalidArgument, e.to_string()))?;
         buf[..req.data.len()].copy_from_slice(&req.data);
         buf.set_len(req.data.len());
@@ -135,7 +135,7 @@ impl MemoryService for MemoryServiceImpl {
         let mut local_buf = ctx
             .state
             .buffer_pool
-            .allocate()
+            .allocate(1024 * 1024)
             .map_err(|e| crate::Error::new(crate::ErrorKind::InvalidArgument, e.to_string()))?;
         let options = RemoteReadOptions { skip_verify: true };
         local_buf = ctx

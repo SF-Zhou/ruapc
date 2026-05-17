@@ -44,7 +44,7 @@ struct RecvHandler {
 impl RecvHandler {
     fn init_buffers(&mut self, count: usize, socket: &RdmaSocket) -> Result<()> {
         for _ in 0..count {
-            let buf = socket.rdmabuf_pool.allocate()?;
+            let buf = socket.rdmabuf_pool.allocate(1024 * 1024)?;
             self.post_recv(buf, socket)?;
         }
         Ok(())
@@ -97,7 +97,7 @@ impl RecvHandler {
         }
 
         // Post a new recv buffer
-        let new_buf = socket.rdmabuf_pool.allocate()?;
+        let new_buf = socket.rdmabuf_pool.allocate(1024 * 1024)?;
         self.post_recv(new_buf, socket)?;
         Ok(())
     }

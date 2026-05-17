@@ -174,16 +174,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_waiter_store_write_buffer() {
-        use crate::{BufferPool, Devices};
+        use crate::Devices;
 
         let devices = Arc::new(Devices::default());
-        let pool = BufferPool::new(devices, 4096, 4096, 0);
+        let pool = ruapc_bufpool::BufferPoolBuilder::new(devices).build();
 
         let waiter = Waiter::default();
         let (msgid, rx) = waiter.alloc();
 
         // Store a write buffer while the request is pending.
-        let mut buf = pool.allocate().unwrap();
+        let mut buf = pool.allocate(1024 * 1024).unwrap();
         buf[..5].copy_from_slice(b"hello");
         buf.set_len(5);
         assert!(waiter.store_write_buffer(msgid, buf));
@@ -199,10 +199,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_waiter_store_write_buffer_after_timeout() {
-        use crate::{BufferPool, Devices};
+        use crate::Devices;
 
         let devices = Arc::new(Devices::default());
-        let pool = BufferPool::new(devices, 4096, 4096, 0);
+        let pool = ruapc_bufpool::BufferPoolBuilder::new(devices).build();
 
         let waiter = Waiter::default();
         let (msgid, rx) = waiter.alloc();
@@ -211,7 +211,7 @@ mod tests {
         drop(rx);
 
         // Store should fail since the entry was removed.
-        let buf = pool.allocate().unwrap();
+        let buf = pool.allocate(1024 * 1024).unwrap();
         assert!(!waiter.store_write_buffer(msgid, buf));
     }
 

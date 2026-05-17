@@ -326,8 +326,7 @@ mod tests {
     async fn test_socket_pool_tcp_socket_type() {
         let config = SocketPoolConfig::default();
         let devices = std::sync::Arc::new(crate::Devices::default());
-        let buffer_pool =
-            std::sync::Arc::new(crate::BufferPool::new(devices.clone(), 4096, 4096, 0));
+        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
         assert_eq!(pool.socket_type(), SocketType::TCP);
         pool.stop();
@@ -341,8 +340,7 @@ mod tests {
             socket_type: SocketType::WS,
         };
         let devices = std::sync::Arc::new(crate::Devices::default());
-        let buffer_pool =
-            std::sync::Arc::new(crate::BufferPool::new(devices.clone(), 4096, 4096, 0));
+        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
         assert_eq!(pool.socket_type(), SocketType::WS);
         pool.stop();
@@ -356,8 +354,7 @@ mod tests {
             socket_type: SocketType::HTTP,
         };
         let devices = std::sync::Arc::new(crate::Devices::default());
-        let buffer_pool =
-            std::sync::Arc::new(crate::BufferPool::new(devices.clone(), 4096, 4096, 0));
+        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
         assert_eq!(pool.socket_type(), SocketType::HTTP);
         // Verify stop/drop_guard/join can be called without panicking.
@@ -372,8 +369,7 @@ mod tests {
             socket_type: SocketType::UNIFIED,
         };
         let devices = std::sync::Arc::new(crate::Devices::default());
-        let buffer_pool =
-            std::sync::Arc::new(crate::BufferPool::new(devices.clone(), 4096, 4096, 0));
+        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
         assert_eq!(pool.socket_type(), SocketType::UNIFIED);
         pool.stop();
@@ -402,8 +398,7 @@ mod tests {
         let config = SocketPoolConfig {
             socket_type: SocketType::RDMA,
         };
-        let buffer_pool =
-            std::sync::Arc::new(crate::BufferPool::new(devices.clone(), 4096, 4096, 0));
+        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
         assert_eq!(pool.socket_type(), SocketType::RDMA);
         pool.stop();
@@ -418,8 +413,7 @@ mod tests {
         let config = SocketPoolConfig {
             socket_type: SocketType::RDMA,
         };
-        let buffer_pool =
-            std::sync::Arc::new(crate::BufferPool::new(devices.clone(), 4096, 4096, 0));
+        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
         let info = pool.rdma_info().unwrap();
         assert!(!info.devices.is_empty());
@@ -430,8 +424,7 @@ mod tests {
     async fn test_socket_pool_rdma_info_from_non_rdma_returns_err() {
         let config = SocketPoolConfig::default(); // TCP pool
         let devices = std::sync::Arc::new(crate::Devices::default());
-        let buffer_pool =
-            std::sync::Arc::new(crate::BufferPool::new(devices.clone(), 4096, 4096, 0));
+        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
         assert!(pool.rdma_info().is_err());
         pool.stop();
@@ -443,8 +436,7 @@ mod tests {
     async fn test_socket_pool_rdma_connect_non_rdma_returns_err() {
         let config = SocketPoolConfig::default(); // TCP pool
         let devices = std::sync::Arc::new(crate::Devices::default());
-        let buffer_pool =
-            std::sync::Arc::new(crate::BufferPool::new(devices.clone(), 4096, 4096, 0));
+        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
         let (state, _guard) = crate::State::create(crate::Router::default(), &config).unwrap();
         let endpoint = crate::rdma::Endpoint {
@@ -465,8 +457,7 @@ mod tests {
         let config = SocketPoolConfig {
             socket_type: SocketType::RDMA,
         };
-        let buffer_pool =
-            std::sync::Arc::new(crate::BufferPool::new(devices.clone(), 4096, 4096, 0));
+        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
         let (state, _guard) = crate::State::create(crate::Router::default(), &config).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

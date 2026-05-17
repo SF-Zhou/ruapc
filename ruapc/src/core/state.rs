@@ -51,7 +51,7 @@ impl State {
         let devices = Arc::new(Self::discover_devices(config));
 
         // Create a shared buffer pool backed by all discovered devices.
-        let buffer_pool = BufferPool::new(devices.clone(), 4096, 4096, 0);
+        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
 
         // Always register MemoryService for Remote Read/Write support.
         let mem_svc = Arc::new(MemoryServiceImpl);

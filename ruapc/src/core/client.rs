@@ -58,7 +58,7 @@ impl Client {
     /// # Examples
     ///
     /// ```rust,ignore
-    /// let buf = pool.allocate()?;
+    /// let buf = pool.allocate(1024 * 1024)?;
     /// buf[..data.len()].copy_from_slice(data);
     /// let rsp = client.with_read_buffer(&buf).upload(&ctx, &req).await?;
     /// ```

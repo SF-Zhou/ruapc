@@ -13,6 +13,7 @@ categories = ["network-programming", "asynchronous"]
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
+aliasable = "0.1"
 bindgen = "0.72"
 bitflags = "2.9"
 bytes = "1.10"
