@@ -1,11 +1,11 @@
 //! Buffer type that automatically returns to the pool on drop.
 
-use std::io::Result;
+use std::io::{Error, ErrorKind, Result};
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use crate::buddy::{BuddyBlock, FreeNode};
+use crate::buddy::BuddyBlock;
 use crate::{AsDeviceIndex, BufferPool, MemoryKey, RemoteBufferInfo};
 
 /// A buffer allocated from the pool.
@@ -25,9 +25,6 @@ pub struct Buffer {
 
     /// Pointer to the buddy block this buffer belongs to.
     block: NonNull<BuddyBlock>,
-
-    /// Index of the block within the pool's block list (for registration lookup).
-    block_index: usize,
 
     /// Logical length of data in the buffer (may be less than capacity).
     len: usize,
@@ -62,20 +59,19 @@ impl Buffer {
         level: usize,
         index: usize,
         block: NonNull<BuddyBlock>,
-        block_index: usize,
         pool: Arc<BufferPool>,
     ) -> Self {
         debug_assert!(level < crate::buddy::NUM_LEVELS, "level must be 0-3");
         debug_assert!(
-            index < crate::buddy::NODES_PER_LEVEL[0],
-            "index must be less than 64"
+            index < crate::buddy::NODES_PER_LEVEL[level],
+            "index must be less than {}",
+            crate::buddy::NODES_PER_LEVEL[level]
         );
         let capacity = crate::buddy::LEVEL_SIZES[level];
         Self {
             ptr,
             pool,
             block,
-            block_index,
             len: capacity,
             #[allow(clippy::cast_possible_truncation)]
             level: level as u8,
@@ -87,7 +83,6 @@ impl Buffer {
     /// Returns the logical length of the buffer in bytes.
     ///
     /// Initially set to the full capacity. Use `set_len` to adjust.
-    #[inline]
     #[must_use]
     pub const fn len(&self) -> usize {
         self.len
@@ -99,14 +94,12 @@ impl Buffer {
     /// - Level 1: 4 MiB
     /// - Level 2: 16 MiB
     /// - Level 3: 64 MiB
-    #[inline]
     #[must_use]
     pub const fn capacity(&self) -> usize {
         crate::buddy::LEVEL_SIZES[self.level as usize]
     }
 
     /// Returns `true` if the buffer's logical length is 0.
-    #[inline]
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.len == 0
@@ -117,7 +110,6 @@ impl Buffer {
     /// # Panics
     ///
     /// Panics if `len` exceeds the buffer's capacity.
-    #[inline]
     pub fn set_len(&mut self, len: usize) {
         assert!(
             len <= self.capacity(),
@@ -157,60 +149,27 @@ impl Buffer {
     }
 
     /// Returns a raw pointer to the buffer's memory.
-    #[inline]
     #[must_use]
     pub const fn as_ptr(&self) -> *const u8 {
         self.ptr.as_ptr()
     }
 
     /// Returns a mutable raw pointer to the buffer's memory.
-    #[inline]
     #[must_use]
     pub const fn as_mut_ptr(&mut self) -> *mut u8 {
         self.ptr.as_ptr()
     }
 
     /// Returns the buffer as a byte slice (up to the logical length).
-    #[inline]
     #[must_use]
     pub const fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 
     /// Returns the buffer as a mutable byte slice (up to the logical length).
-    #[inline]
     #[must_use]
     pub const fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
-    }
-
-    /// Returns the allocation level of this buffer (0-3).
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) const fn level(&self) -> usize {
-        self.level as usize
-    }
-
-    /// Returns the index within the level (0-63).
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) const fn index(&self) -> usize {
-        self.index as usize
-    }
-
-    /// Returns the buddy block pointer.
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) const fn block(&self) -> NonNull<BuddyBlock> {
-        self.block
-    }
-
-    /// Returns a pointer to the free node for this buffer.
-    #[allow(dead_code)]
-    pub(crate) unsafe fn free_node(&self) -> NonNull<FreeNode> {
-        unsafe {
-            (*self.block.as_ptr()).get_free_node_mut(self.level as usize, self.index as usize)
-        }
     }
 
     /// Returns the memory key for this buffer's underlying block on the given device.
@@ -219,7 +178,17 @@ impl Buffer {
     ///
     /// Returns an error if the device index is not registered.
     pub fn memory_key(&self, device_index: &impl AsDeviceIndex) -> Result<MemoryKey> {
-        self.pool.memory_key(self.block_index, device_index)
+        let idx = device_index.as_device_index();
+        unsafe { &*self.block.as_ptr() }
+            .registrations
+            .get(idx.index as usize)
+            .map(|r| r.memory_key())
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("memory not registered on device index {}", idx.index),
+                )
+            })
     }
 
     /// Returns the remote buffer info for RDMA-style operations.
@@ -252,28 +221,24 @@ impl Drop for Buffer {
 impl Deref for Buffer {
     type Target = [u8];
 
-    #[inline]
     fn deref(&self) -> &Self::Target {
         self.as_slice()
     }
 }
 
 impl DerefMut for Buffer {
-    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.as_mut_slice()
     }
 }
 
 impl AsRef<[u8]> for Buffer {
-    #[inline]
     fn as_ref(&self) -> &[u8] {
         self.as_slice()
     }
 }
 
 impl AsMut<[u8]> for Buffer {
-    #[inline]
     fn as_mut(&mut self) -> &mut [u8] {
         self.as_mut_slice()
     }

@@ -5,7 +5,6 @@ use tokio_util::sync::DropGuard;
 use crate::{
     BufferPool, Context, Devices, Message, RawStream, Result, Router, Socket, SocketPool,
     SocketPoolConfig, Waiter,
-    services::{MemoryService, MemoryServiceImpl},
 };
 
 /// Shared state for the RPC system.
@@ -52,10 +51,6 @@ impl State {
 
         // Create a shared buffer pool backed by all discovered devices.
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
-
-        // Always register MemoryService for Remote Read/Write support.
-        let mem_svc = Arc::new(MemoryServiceImpl);
-        mem_svc.ruapc_export(&mut router);
 
         router.build_open_api()?;
         let socket_pool = SocketPool::create(config, &devices, &buffer_pool)?;

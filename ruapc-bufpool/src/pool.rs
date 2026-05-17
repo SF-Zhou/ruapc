@@ -186,27 +186,6 @@ impl BufferPool {
     pub fn devices(&self) -> &Arc<dyn Devices> {
         &self.devices
     }
-
-    /// Returns the memory key for a given block and device.
-    pub(crate) fn memory_key(
-        &self,
-        block_index: usize,
-        device_index: &impl crate::AsDeviceIndex,
-    ) -> Result<crate::MemoryKey> {
-        let inner = self.inner.lock().expect("BufferPool mutex poisoned");
-        let idx = device_index.as_device_index();
-        inner
-            .blocks
-            .get(block_index)
-            .and_then(|block| block.registrations.get(idx.index as usize))
-            .map(|r| r.memory_key())
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::InvalidInput,
-                    format!("memory not registered on device index {}", idx.index),
-                )
-            })
-    }
 }
 
 impl std::fmt::Debug for BufferPool {
@@ -285,14 +264,8 @@ impl PoolInner {
     ) -> Buffer {
         let node = self.free_lists[from_level].pop_front().unwrap();
 
-        let (block, block_index, index_in_level) = unsafe {
-            let node_ref = &*node.as_ptr();
-            (
-                node_ref.data.block,
-                node_ref.data.block_index,
-                node_ref.data.index_in_level,
-            )
-        };
+        let block = unsafe { (*node.as_ptr()).data.block };
+        let index_in_level = unsafe { (*block.as_ptr()).node_index_in_level(node, from_level) };
 
         let block_ref = unsafe { &mut *block.as_ptr() };
 
@@ -306,26 +279,17 @@ impl PoolInner {
                     from_level,
                     index_in_level,
                     block,
-                    block_index,
                     pool,
                 )
             }
         } else {
-            self.split_and_allocate(
-                block,
-                block_index,
-                from_level,
-                index_in_level,
-                target_level,
-                pool,
-            )
+            self.split_and_allocate(block, from_level, index_in_level, target_level, pool)
         }
     }
 
     fn split_and_allocate(
         &mut self,
         block: NonNull<BuddyBlock>,
-        block_index: usize,
         from_level: usize,
         from_index: usize,
         target_level: usize,
@@ -366,7 +330,6 @@ impl PoolInner {
                 current_level,
                 current_index,
                 block,
-                block_index,
                 pool,
             )
         }
@@ -383,10 +346,8 @@ impl PoolInner {
         // Register with all devices.
         let regs = devices.register(&aligned)?;
 
-        let block_index = self.blocks.len();
-
         // Create buddy block with memory and registrations.
-        let block = BuddyBlock::new(aligned, block_index, regs);
+        let block = BuddyBlock::new(aligned, regs);
 
         // Wrap in AliasableBox to allow aliasing via NonNull<BuddyBlock> in
         // Buffer and free-list nodes without violating noalias semantics.

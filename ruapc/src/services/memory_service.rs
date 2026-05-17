@@ -76,10 +76,7 @@ pub trait MemoryService {
     async fn rdma_pull(&self, ctx: &Context, req: &MemoryPullReq) -> Result<()>;
 }
 
-/// Implementation of MemoryService backed by a Devices collection.
-pub struct MemoryServiceImpl;
-
-impl MemoryService for MemoryServiceImpl {
+impl MemoryService for () {
     async fn tcp_read(&self, ctx: &Context, req: &MemoryReadReq) -> Result<Vec<u8>> {
         let data = ctx
             .state
