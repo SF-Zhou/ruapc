@@ -9,4 +9,6 @@ mod meta_service;
 pub use meta_service::{MetaService, Metadata};
 
 mod memory_service;
-pub use memory_service::{MemoryReadReq, MemoryService, MemoryServiceImpl, MemoryWriteReq};
+pub use memory_service::{
+    MemoryPullReq, MemoryPushReq, MemoryReadReq, MemoryService, MemoryServiceImpl,
+};

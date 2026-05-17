@@ -1,6 +1,6 @@
 use tokio::sync::oneshot;
 
-use crate::{Error, ErrorKind, Message, Result, WaiterCleaner};
+use crate::{Error, ErrorKind, Result, WaiterCleaner, task::waiter::WaiterResponse};
 
 /// Internal receiver for RPC response messages.
 ///
@@ -10,29 +10,28 @@ pub enum Receiver<'a> {
     /// No receiver (placeholder state).
     None,
     /// Active oneshot receiver with cleanup guard.
-    OneShotRx(oneshot::Receiver<Message>, WaiterCleaner<'a>),
+    OneShotRx(oneshot::Receiver<WaiterResponse>, WaiterCleaner<'a>),
 }
 
 impl Receiver<'_> {
-    /// Receives a response message.
+    /// Receives a response message along with any write buffer.
     ///
-    /// This method waits for a response message to arrive through the channel.
-    /// If the message is successfully received, the cleanup guard is forgotten
-    /// to keep the waiter entry until the message is processed.
+    /// This method waits for a response to arrive through the channel.
+    /// If received successfully, the cleanup guard is forgotten (the entry
+    /// was already removed by `Waiter::post`).
     ///
-    /// # Errors
+    /// # Returns
     ///
-    /// Returns an error if:
-    /// - The receiver is in the `None` state
-    /// - The channel is closed before receiving a message
-    pub async fn recv(self) -> Result<Message> {
+    /// A tuple of (Message, Option<Buffer>). The buffer is present if the
+    /// server stored one via `store_write_buffer` during the request.
+    pub async fn recv(self) -> Result<WaiterResponse> {
         match self {
             Receiver::None => Err(Error::kind(ErrorKind::InvalidArgument)),
             Receiver::OneShotRx(rx, cleaner) => {
                 let result = rx
                     .await
                     .map_err(|e| Error::new(ErrorKind::TcpRecvMsgFailed, e.to_string()));
-                std::mem::forget(cleaner); // do not call cleaner's Drop if we successfully received the message.
+                std::mem::forget(cleaner);
                 result
             }
         }
@@ -42,7 +41,7 @@ impl Receiver<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Waiter;
+    use crate::{Message, Waiter};
 
     #[tokio::test]
     async fn test_receiver_none_returns_error() {
@@ -64,7 +63,7 @@ mod tests {
             w.post(msgid, msg);
         });
 
-        let msg = rx.recv().await.unwrap();
+        let (msg, _write_buf) = rx.recv().await.unwrap();
         assert_eq!(msg.meta.method, "ping");
     }
 }

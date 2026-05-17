@@ -101,36 +101,6 @@ impl TcpDevice {
         let offset = (addr - region_start) as usize;
         Ok(mem.as_slice()[offset..offset + len as usize].to_vec())
     }
-
-    pub fn write_memory(&self, id: u32, addr: u64, data: &[u8]) -> std::io::Result<()> {
-        let entry = self.registry.map.get(&id).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("memory region ID {id} not registered"),
-            )
-        })?;
-        let mem = entry.value();
-
-        let region_start = mem.as_ptr() as u64;
-        let region_end = region_start + mem.size() as u64;
-        let len = data.len() as u64;
-        let access_end = addr.checked_add(len).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "addr + len overflow")
-        })?;
-
-        if addr < region_start || access_end > region_end {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "access out of bounds: addr={addr:#x} len={len} outside region [{region_start:#x}, {region_end:#x})"
-                ),
-            ));
-        }
-
-        let offset = (addr - region_start) as usize;
-        mem.as_ref().as_mut_slice()[offset..offset + data.len()].copy_from_slice(data);
-        Ok(())
-    }
 }
 
 impl Debug for TcpDevice {

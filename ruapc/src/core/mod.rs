@@ -1,5 +1,5 @@
 mod client;
-pub use client::{Client, ClientWithReadBuffer};
+pub use client::{Client, ClientWithBuffer};
 
 mod context;
 pub use context::{Context, SocketEndpoint};

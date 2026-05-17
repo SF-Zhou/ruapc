@@ -5,7 +5,7 @@ use serde::Serialize;
 use tokio_util::sync::DropGuard;
 
 use crate::{
-    Buffer, Error, Result, Router, Socket, SocketPoolConfig, SocketTrait, State,
+    Buffer, Error, RemoteReadOptions, Result, Router, Socket, SocketPoolConfig, SocketTrait, State,
     msg::{MsgFlags, MsgMeta},
 };
 
@@ -135,6 +135,20 @@ impl Context {
     /// For TCP: sends a `MemoryService/read` reverse RPC request.
     /// For RDMA: issues a one-sided RDMA Read via QP verbs.
     pub async fn remote_read(&self, remote: &RemoteBufferInfo, local: Buffer) -> Result<Buffer> {
+        self.remote_read_with_options(remote, local, &Default::default())
+            .await
+    }
+
+    /// Reads data from a remote peer's registered memory with custom options.
+    ///
+    /// `options.skip_verify` can only be set within this crate, preventing
+    /// external code from bypassing the UUID liveness check.
+    pub(crate) async fn remote_read_with_options(
+        &self,
+        remote: &RemoteBufferInfo,
+        local: Buffer,
+        options: &RemoteReadOptions,
+    ) -> Result<Buffer> {
         let socket = match &self.endpoint {
             SocketEndpoint::Connected(s) => s,
             _ => {
@@ -144,11 +158,17 @@ impl Context {
                 ));
             }
         };
-        socket.remote_read(self, local, remote).await
+        socket.remote_read(self, local, remote, options).await
     }
 
-    /// Writes data from a local buffer to a remote peer's registered memory.
-    pub async fn remote_write(&self, remote: &RemoteBufferInfo, local: Buffer) -> Result<Buffer> {
+    /// Writes data to the remote peer (client) via reverse RPC.
+    ///
+    /// For TCP: sends data inline via `tcp_push`.
+    /// For RDMA: lets the client pull data via `rdma_pull`.
+    ///
+    /// The client stores the received buffer in the waiter and returns it
+    /// to the caller via [`ClientWithBuffer::take_write_buffer`].
+    pub async fn remote_write(&self, local: Buffer) -> Result<Buffer> {
         let socket = match &self.endpoint {
             SocketEndpoint::Connected(s) => s,
             _ => {
@@ -158,7 +178,7 @@ impl Context {
                 ));
             }
         };
-        socket.remote_write(self, local, remote).await
+        socket.remote_write(self, local).await
     }
 }
 
@@ -193,13 +213,8 @@ mod tests {
     #[tokio::test]
     async fn test_remote_write_invalid_endpoint_returns_err() {
         let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
-        let remote = RemoteBufferInfo {
-            key: ruapc_bufpool::MemoryKey { lkey: 0, rkey: 0 },
-            addr: 0,
-            len: 1,
-        };
         let local = ctx.state.buffer_pool.allocate().unwrap();
-        let result = ctx.remote_write(&remote, local).await;
+        let result = ctx.remote_write(local).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.kind, ErrorKind::InvalidArgument);
