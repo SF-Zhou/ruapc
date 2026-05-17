@@ -15,10 +15,10 @@ aliasable.workspace = true
 dashmap.workspace = true
 schemars.workspace = true
 serde.workspace = true
-tokio = { workspace = true, features = ["sync", "macros", "time", "rt"] }
+tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["sync", "rt", "rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["sync", "rt", "rt-multi-thread", "macros", "time"] }
 
 [lints]
 workspace = true

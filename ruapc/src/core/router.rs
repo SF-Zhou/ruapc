@@ -17,7 +17,7 @@ use crate::rdma::RdmaService;
 use crate::{
     Context, Payload,
     error::{Error, ErrorKind, Result},
-    services::MetaService,
+    services::{MemoryService, MetaService},
 };
 
 /// Type alias for service method handler functions.
@@ -74,9 +74,11 @@ impl Default for Router {
             methods: HashMap::default(),
             openapi: OpenAPI::default(),
         };
-        MetaService::ruapc_export(Arc::new(()), &mut this);
+        let dummy = Arc::new(());
+        MetaService::ruapc_export(dummy.clone(), &mut this);
+        MemoryService::ruapc_export(dummy.clone(), &mut this);
         #[cfg(feature = "rdma")]
-        RdmaService::ruapc_export(Arc::new(()), &mut this);
+        RdmaService::ruapc_export(dummy.clone(), &mut this);
         this
     }
 }

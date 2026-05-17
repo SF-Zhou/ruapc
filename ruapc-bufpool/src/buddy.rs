@@ -54,12 +54,10 @@ pub enum NodeState {
 }
 
 impl NodeState {
-    #[inline]
     pub const fn as_bits(self) -> u8 {
         self as u8
     }
 
-    #[inline]
     pub const fn from_bits(bits: u8) -> Self {
         match bits {
             0 => Self::Allocated,
@@ -75,10 +73,6 @@ impl NodeState {
 pub struct FreeNodeData {
     /// Pointer to the parent `BuddyBlock`.
     pub block: NonNull<BuddyBlock>,
-    /// Index of this block within the pool's block list.
-    pub block_index: usize,
-    /// Index within the level (0-based).
-    pub index_in_level: usize,
 }
 
 // SAFETY: FreeNodeData only contains NonNull which is Send if the pointed type is Send
@@ -104,76 +98,34 @@ pub struct BuddyBlock {
     /// Bit-packed allocation state for all nodes in the buddy tree.
     pub states: [u8; STATE_ARRAY_BYTES],
 
-    /// Free list nodes for level 0 (64 nodes of 1MiB each).
-    pub level0_nodes: [FreeNode; 64],
-
-    /// Free list nodes for level 1 (16 nodes of 4MiB each).
-    pub level1_nodes: [FreeNode; 16],
-
-    /// Free list nodes for level 2 (4 nodes of 16MiB each).
-    pub level2_nodes: [FreeNode; 4],
-
-    /// Free list node for level 3 (1 node of 64MiB).
-    pub level3_node: FreeNode,
+    /// Free list nodes for all levels, laid out as a flat array:
+    /// [level0: 64 nodes][level1: 16 nodes][level2: 4 nodes][level3: 1 node]
+    /// Use `LEVEL_STATE_OFFSETS[level] + index` to compute the flat index.
+    pub nodes: [FreeNode; TOTAL_STATE_NODES],
 }
 
 impl BuddyBlock {
     /// Creates a new `BuddyBlock` managing the given aligned memory.
     ///
-    /// `block_index` is the index of this block within the pool's block list.
     /// `registrations` are the device registrations for this memory region.
-    pub fn new(
-        memory: Arc<AlignedMemory>,
-        block_index: usize,
-        registrations: Vec<Box<dyn Registration>>,
-    ) -> Box<Self> {
-        const fn placeholder_data() -> FreeNodeData {
-            FreeNodeData {
-                block: NonNull::dangling(),
-                block_index: 0,
-                index_in_level: 0,
-            }
-        }
-
+    pub fn new(memory: Arc<AlignedMemory>, registrations: Vec<Box<dyn Registration>>) -> Box<Self> {
         let mut block = Box::new(Self {
             memory,
             registrations,
             states: [0u8; STATE_ARRAY_BYTES],
-            level0_nodes: std::array::from_fn(|_| FreeNode::new(placeholder_data())),
-            level1_nodes: std::array::from_fn(|_| FreeNode::new(placeholder_data())),
-            level2_nodes: std::array::from_fn(|_| FreeNode::new(placeholder_data())),
-            level3_node: FreeNode::new(placeholder_data()),
+            nodes: std::array::from_fn(|_| {
+                FreeNode::new(FreeNodeData {
+                    block: NonNull::dangling(),
+                })
+            }),
         });
 
         let block_ptr = NonNull::new(std::ptr::from_mut::<Self>(block.as_mut())).unwrap();
 
-        // Initialize all free list nodes with correct back-pointers
-        for (i, node) in block.level0_nodes.iter_mut().enumerate() {
-            node.data = FreeNodeData {
-                block: block_ptr,
-                block_index,
-                index_in_level: i,
-            };
+        // Initialize all free list nodes with correct back-pointer
+        for node in block.nodes.iter_mut() {
+            node.data = FreeNodeData { block: block_ptr };
         }
-        for (i, node) in block.level1_nodes.iter_mut().enumerate() {
-            node.data = FreeNodeData {
-                block: block_ptr,
-                block_index,
-                index_in_level: i,
-            };
-        }
-        for (i, node) in block.level2_nodes.iter_mut().enumerate() {
-            node.data = FreeNodeData {
-                block: block_ptr,
-                block_index,
-                index_in_level: i,
-            };
-        }
-        block.level3_node.data = FreeNodeData {
-            block: block_ptr,
-            block_index,
-            index_in_level: 0,
-        };
 
         // Initialize all states to Allocated (0x00) - already zeroed
         // Set root node to Free
@@ -184,27 +136,28 @@ impl BuddyBlock {
 
     /// Gets a mutable pointer to the free node for the given level and index.
     pub fn get_free_node_mut(&mut self, level: usize, index: usize) -> NonNull<FreeNode> {
-        let node = match level {
-            0 => &mut self.level0_nodes[index],
-            1 => &mut self.level1_nodes[index],
-            2 => &mut self.level2_nodes[index],
-            3 => {
-                debug_assert_eq!(index, 0);
-                &mut self.level3_node
-            }
-            _ => panic!("invalid level: {level}"),
-        };
-        NonNull::new(node).unwrap()
+        let flat_index = LEVEL_STATE_OFFSETS[level] + index;
+        NonNull::new(&mut self.nodes[flat_index]).unwrap()
+    }
+
+    /// Computes the index within a level from a node pointer.
+    ///
+    /// Given a node that was popped from `free_lists[level]`, returns its
+    /// index within that level by computing its offset in the flat `nodes` array.
+    pub fn node_index_in_level(&self, node: NonNull<FreeNode>, level: usize) -> usize {
+        let base = self.nodes.as_ptr() as usize;
+        let node_addr = node.as_ptr() as usize;
+        let flat_index = (node_addr - base) / std::mem::size_of::<FreeNode>();
+        debug_assert!(flat_index < TOTAL_STATE_NODES);
+        flat_index - LEVEL_STATE_OFFSETS[level]
     }
 
     /// Gets the state array index for a node at the given level and index.
-    #[inline]
     pub const fn state_index(level: usize, index: usize) -> usize {
         LEVEL_STATE_OFFSETS[level] + index
     }
 
     /// Gets the state of a node.
-    #[inline]
     pub const fn get_state(&self, level: usize, index: usize) -> NodeState {
         let idx = Self::state_index(level, index);
         let byte_idx = idx / 4;
@@ -215,7 +168,6 @@ impl BuddyBlock {
     }
 
     /// Sets the state of a node.
-    #[inline]
     pub const fn set_state(&mut self, level: usize, index: usize, state: NodeState) {
         let idx = Self::state_index(level, index);
         let byte_idx = idx / 4;
@@ -227,7 +179,6 @@ impl BuddyBlock {
     }
 
     /// Gets the memory address for a node at the given level and index.
-    #[inline]
     pub fn get_memory_addr(&self, level: usize, index: usize) -> *mut u8 {
         let offset = index * LEVEL_SIZES[level];
         unsafe { self.memory.as_mut_ptr().add(offset) }
@@ -235,7 +186,6 @@ impl BuddyBlock {
 
     /// Gets the parent level and index for a node.
     /// Returns `None` for level 3 (root) nodes.
-    #[inline]
     pub const fn get_parent(level: usize, index: usize) -> Option<(usize, usize)> {
         if level >= 3 {
             None
@@ -245,7 +195,6 @@ impl BuddyBlock {
     }
 
     /// Gets the sibling indices for a node (all 4 siblings including itself).
-    #[inline]
     pub const fn get_siblings(index: usize) -> [usize; 4] {
         let base = (index / 4) * 4;
         [base, base + 1, base + 2, base + 3]
@@ -253,7 +202,6 @@ impl BuddyBlock {
 
     /// Gets the first child index for a node.
     /// Returns `None` for level 0 (leaf) nodes.
-    #[inline]
     pub const fn get_first_child(level: usize, index: usize) -> Option<(usize, usize)> {
         if level == 0 {
             None
@@ -351,7 +299,7 @@ mod tests {
     #[test]
     fn test_buddy_block_creation() {
         let mem = Arc::new(crate::AlignedMemory::new(SIZE_64MIB).unwrap());
-        let block = BuddyBlock::new(mem, 0, Vec::new());
+        let block = BuddyBlock::new(mem, Vec::new());
 
         // Root is free
         assert_eq!(block.get_state(3, 0), NodeState::Free);
@@ -372,7 +320,7 @@ mod tests {
     fn test_memory_address_calculation() {
         let mem = Arc::new(crate::AlignedMemory::new(SIZE_64MIB).unwrap());
         let base = mem.as_mut_ptr();
-        let block = BuddyBlock::new(mem, 0, Vec::new());
+        let block = BuddyBlock::new(mem, Vec::new());
 
         assert_eq!(block.get_memory_addr(3, 0), base);
         assert_eq!(block.get_memory_addr(2, 0), base);
