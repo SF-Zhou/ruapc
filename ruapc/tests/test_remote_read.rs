@@ -41,7 +41,7 @@ impl RemoteReadService for RemoteReadServiceImpl {
             .buffer_info
             .as_ref()
             .expect("expected buffer_info in msg_meta");
-        let local_buf = ctx.state.buffer_pool.allocate().unwrap();
+        let local_buf = ctx.state.buffer_pool.allocate(1024 * 1024).unwrap();
         let local_buf = ctx.remote_read(buffer_info, local_buf).await?;
         Ok(ReadRsp {
             data: local_buf[..req.expected_len].to_vec(),
@@ -87,7 +87,7 @@ async fn run_test(tc: TestCase) {
     let addr = server.clone().listen(addr).await.unwrap();
     let ctx = Context::create(&config).unwrap().with_addr(addr);
 
-    let mut buf = ctx.state.buffer_pool.allocate().unwrap();
+    let mut buf = ctx.state.buffer_pool.allocate(1024 * 1024).unwrap();
     if !tc.data.is_empty() {
         buf[..tc.data.len()].copy_from_slice(tc.data);
     }

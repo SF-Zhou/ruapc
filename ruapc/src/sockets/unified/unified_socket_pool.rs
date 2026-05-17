@@ -179,7 +179,7 @@ mod tests {
             socket_type: crate::SocketType::UNIFIED,
         };
         let devices = Arc::new(crate::Devices::default());
-        let buffer_pool = crate::BufferPool::new(devices.clone(), 4096, 4096, 0);
+        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = UnifiedSocketPool::create(&config, &devices, &buffer_pool).unwrap();
         let debug = format!("{pool:?}");
         assert!(debug.contains("UnifiedSocketPool"));
@@ -192,7 +192,7 @@ mod tests {
         let config = crate::SocketPoolConfig {
             socket_type: crate::SocketType::UNIFIED,
         };
-        let buffer_pool = crate::BufferPool::new(devices.clone(), 4096, 4096, 0);
+        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = UnifiedSocketPool::create(&config, &devices, &buffer_pool).unwrap();
         let info = pool.rdma_info().unwrap();
         assert!(!info.devices.is_empty());
@@ -208,7 +208,7 @@ mod tests {
             socket_type: crate::SocketType::UNIFIED,
         };
         let devices = Arc::new(crate::Devices::default()); // TCP only
-        let buffer_pool = crate::BufferPool::new(devices.clone(), 4096, 4096, 0);
+        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = UnifiedSocketPool::create(&config, &devices, &buffer_pool).unwrap();
         let (state, _guard) = crate::State::create(crate::Router::default(), &config).unwrap();
         let endpoint = crate::rdma::Endpoint {

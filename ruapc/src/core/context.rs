@@ -203,7 +203,7 @@ mod tests {
             addr: 0,
             len: 1,
         };
-        let local = ctx.state.buffer_pool.allocate().unwrap();
+        let local = ctx.state.buffer_pool.allocate(1024 * 1024).unwrap();
         let result = ctx.remote_read(&remote, local).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -213,7 +213,7 @@ mod tests {
     #[tokio::test]
     async fn test_remote_write_invalid_endpoint_returns_err() {
         let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
-        let local = ctx.state.buffer_pool.allocate().unwrap();
+        let local = ctx.state.buffer_pool.allocate(1024 * 1024).unwrap();
         let result = ctx.remote_write(local).await;
         assert!(result.is_err());
         let err = result.unwrap_err();

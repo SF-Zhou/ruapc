@@ -32,7 +32,7 @@ impl WriteTestService for WriteTestImpl {
             tokio::time::sleep(Duration::from_millis(req.delay_ms)).await;
         }
         // Allocate a server-side buffer, fill with data, push to client.
-        let mut local_buf = ctx.state.buffer_pool.allocate().unwrap();
+        let mut local_buf = ctx.state.buffer_pool.allocate(1024 * 1024).unwrap();
         local_buf[..req.data.len()].copy_from_slice(&req.data);
         local_buf.set_len(req.data.len());
 

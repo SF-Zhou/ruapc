@@ -108,7 +108,7 @@ impl SocketTrait for RdmaSocket {
         payload: &P,
         _: &Arc<State>,
     ) -> Result<()> {
-        let mut buf = self.rdmabuf_pool.allocate()?;
+        let mut buf = self.rdmabuf_pool.allocate(1024 * 1024)?;
         meta.serialize_to(payload, &mut buf)?;
 
         let index = self.state.apply_send_index();

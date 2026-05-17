@@ -1,3 +1,5 @@
+//! TCP device implementation for non-RDMA transports.
+
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -19,6 +21,7 @@ impl Debug for TcpRegistry {
     }
 }
 
+/// A TCP "device" that simulates memory registration for TCP transports.
 #[derive(Default)]
 pub struct TcpDevice {
     index: DeviceIndex,
@@ -26,9 +29,11 @@ pub struct TcpDevice {
     next_id: AtomicU32,
 }
 
+/// Registration handle for TCP device.
 #[derive(Debug)]
 pub struct TcpMemoryRegistration {
     registry: Arc<TcpRegistry>,
+    /// The registration ID.
     pub id: u32,
 }
 
@@ -74,6 +79,9 @@ impl Device for TcpDevice {
 }
 
 impl TcpDevice {
+    /// Reads memory from a registered region by ID.
+    ///
+    /// This enables TCP-based remote memory reads (simulating RDMA read semantics).
     pub fn read_memory(&self, id: u32, addr: u64, len: u64) -> std::io::Result<Vec<u8>> {
         let entry = self.registry.map.get(&id).ok_or_else(|| {
             std::io::Error::new(

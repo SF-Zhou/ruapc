@@ -36,7 +36,7 @@ impl UploadService for UploadServiceImpl {
         );
 
         // Allocate a local buffer and remote_read the client's buffer.
-        let mut local_buf = ctx.state.buffer_pool.allocate().unwrap();
+        let mut local_buf = ctx.state.buffer_pool.allocate(1024 * 1024).unwrap();
         local_buf = ctx.remote_read(buffer_info, local_buf).await?;
 
         // Return the data read from the client's buffer.
@@ -96,7 +96,7 @@ async fn test_upload_with_read_buffer_tcp() {
 
     // 2. Test with_read_buffer — client sends buffer for server to read.
     let test_data = b"Hello, WithReadBuffer!";
-    let mut buf = ctx.state.buffer_pool.allocate().unwrap();
+    let mut buf = ctx.state.buffer_pool.allocate(1024 * 1024).unwrap();
     buf[..test_data.len()].copy_from_slice(test_data);
 
     let req = UploadReq {
@@ -146,7 +146,7 @@ async fn test_upload_with_read_buffer_websocket() {
     let ctx = ctx.with_addr(addr);
 
     let test_data = b"WebSocket buffer test!";
-    let mut buf = ctx.state.buffer_pool.allocate().unwrap();
+    let mut buf = ctx.state.buffer_pool.allocate(1024 * 1024).unwrap();
     buf[..test_data.len()].copy_from_slice(test_data);
 
     let client = Client {
@@ -186,7 +186,7 @@ async fn test_upload_with_read_buffer_http() {
     let ctx = ctx.with_addr(addr);
 
     let test_data = b"HTTP buffer test!";
-    let mut buf = ctx.state.buffer_pool.allocate().unwrap();
+    let mut buf = ctx.state.buffer_pool.allocate(1024 * 1024).unwrap();
     buf[..test_data.len()].copy_from_slice(test_data);
 
     let client = Client {

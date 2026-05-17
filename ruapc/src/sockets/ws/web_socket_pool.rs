@@ -207,7 +207,7 @@ mod tests {
             socket_type: crate::SocketType::WS,
         };
         let devices = Arc::new(crate::Devices::default());
-        let buffer_pool = crate::BufferPool::new(devices.clone(), 4096, 4096, 0);
+        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = WebSocketPool::create(&config, &devices, &buffer_pool).unwrap();
         let debug = format!("{pool:?}");
         assert!(debug.contains("WebSocketPool"));
@@ -223,7 +223,7 @@ mod tests {
             socket_type: crate::SocketType::WS,
         };
         let devices = Arc::new(crate::Devices::default());
-        let buffer_pool = crate::BufferPool::new(devices.clone(), 4096, 4096, 0);
+        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = WebSocketPool::create(&config, &devices, &buffer_pool).unwrap();
 
         let (state, _guard) = crate::State::create(

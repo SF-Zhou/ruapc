@@ -504,11 +504,11 @@ mod tests {
 
     #[test]
     fn test_buffer_sendmsg_serialize() {
-        use crate::{BufferPool, Devices};
+        use crate::Devices;
         use std::sync::Arc;
         let devices = Arc::new(Devices::default());
-        let pool = BufferPool::new(devices, 4096, 4096, 0);
-        let mut buf = pool.allocate().unwrap();
+        let pool = ruapc_bufpool::BufferPoolBuilder::new(devices).build();
+        let mut buf = pool.allocate(1024 * 1024).unwrap();
 
         let meta = make_meta("SomeService/rpc", false);
         // serialize_to exercises Buffer::prepare, Buffer::writer, and Buffer::finish.
@@ -519,12 +519,12 @@ mod tests {
 
     #[test]
     fn test_buffer_sendmsg_writer_write_and_flush() {
-        use crate::{BufferPool, Devices};
+        use crate::Devices;
         use std::io::Write as _;
         use std::sync::Arc;
         let devices = Arc::new(Devices::default());
-        let pool = BufferPool::new(devices, 4096, 4096, 0);
-        let mut buf = pool.allocate().unwrap();
+        let pool = ruapc_bufpool::BufferPoolBuilder::new(devices).build();
+        let mut buf = pool.allocate(1024 * 1024).unwrap();
         buf.set_len(0);
         {
             let mut w = buf.writer();

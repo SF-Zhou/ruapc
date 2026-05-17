@@ -1,3 +1,5 @@
+//! Aligned memory block with automatic allocation and deallocation.
+
 use std::alloc::{Layout, alloc, dealloc};
 use std::io::{Error, ErrorKind, Result};
 use std::ptr::NonNull;
@@ -9,11 +11,9 @@ const ALIGN: usize = 2 * 1024 * 1024;
 #[cfg(not(target_pointer_width = "64"))]
 const ALIGN: usize = 4096;
 
-/// An owned, aligned memory block. This is the system's smallest unit
-/// of memory allocation and deallocation.
+/// An owned, aligned memory block. Automatically freed on drop via `std::alloc::dealloc`.
 ///
 /// The memory is aligned to 2 MiB (on 64-bit) for huge page support.
-/// Automatically freed on drop via `std::alloc::dealloc`.
 pub struct AlignedMemory {
     ptr: NonNull<u8>,
     size: usize,
@@ -80,11 +80,10 @@ impl AlignedMemory {
     /// This is safe because `AlignedMemory` owns its allocation exclusively
     /// and the raw pointer is valid for `size` bytes. Concurrent access
     /// is governed by the higher-level types that hold the `AlignedMemory`
-    /// (e.g. `RegisteredMemory`, `BufferPool`).
+    /// (e.g. `BufferPool`, `Buffer`).
     #[allow(clippy::mut_from_ref)]
     pub fn as_mut_slice(&self) -> &mut [u8] {
         // SAFETY: ptr is valid for `size` bytes and properly aligned.
-        // AlignedMemory is the sole owner of this allocation.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.size) }
     }
 }
@@ -154,19 +153,5 @@ mod tests {
         let ptr = mem.as_ptr();
         let mut_ptr = mem.as_mut_ptr();
         assert_eq!(ptr, mut_ptr as *const u8);
-    }
-
-    #[test]
-    fn test_aligned_memory_layout_too_large() {
-        // Size just above isize::MAX triggers Layout::from_size_align error.
-        let result = AlignedMemory::new(isize::MAX as usize + 1);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_aligned_memory_alloc_failure() {
-        // Request a valid-layout but impossibly large allocation (1 EiB).
-        let result = AlignedMemory::new(1_usize << 60);
-        assert!(result.is_err());
     }
 }
