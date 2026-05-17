@@ -2,17 +2,34 @@ use foldhash::fast::RandomState;
 use std::sync::atomic::AtomicU64;
 use tokio::sync::oneshot;
 
-use crate::{Message, Receiver};
+use crate::{Buffer, Message, Receiver};
+
+/// The response sent through the waiter channel, including the RPC response
+/// message and an optional write buffer received from the server.
+pub type WaiterResponse = (Message, Option<Buffer>);
+
+/// Entry stored in the waiter's id_map for each pending request.
+struct WaiterEntry {
+    /// Channel to send the response through.
+    sender: oneshot::Sender<WaiterResponse>,
+    /// Write buffer stored by `MemoryService::tcp_push` / `rdma_pull` during
+    /// the request. Sent together with the response when `post` is called.
+    write_buffer: Option<Buffer>,
+}
 
 /// Response waiter for correlating RPC requests with responses.
 ///
 /// The `Waiter` provides a mechanism for asynchronous RPC calls to wait for
 /// their responses. It assigns unique message IDs to requests and stores
 /// channels that will receive the corresponding responses.
+///
+/// Write buffers received during a request (via `store_write_buffer`) are
+/// stored alongside the channel sender and delivered together with the
+/// response message when `post` is called, ensuring atomicity.
 #[derive(Default)]
 pub struct Waiter {
     index: AtomicU64,
-    id_map: dashmap::DashMap<u64, oneshot::Sender<Message>, RandomState>,
+    id_map: dashmap::DashMap<u64, WaiterEntry, RandomState>,
 }
 
 /// RAII guard for automatic cleanup of waiter entries.
@@ -47,7 +64,13 @@ impl Waiter {
     pub fn alloc(&self) -> (u64, Receiver<'_>) {
         let msgid = self.index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
-        self.id_map.insert(msgid, tx);
+        self.id_map.insert(
+            msgid,
+            WaiterEntry {
+                sender: tx,
+                write_buffer: None,
+            },
+        );
         (
             msgid,
             Receiver::OneShotRx(
@@ -62,33 +85,41 @@ impl Waiter {
 
     /// Posts a response message to the waiting receiver.
     ///
-    /// This method looks up the message ID and sends the response through
-    /// the corresponding channel. If no waiter is found (e.g., because of
-    /// timeout), a warning is logged.
+    /// Removes the entry from the map and sends the response message along
+    /// with any write buffer that was stored during the request.
     ///
-    /// # Arguments
-    ///
-    /// * `msgid` - The message ID to match
-    /// * `result` - The response message to send
+    /// If no waiter is found (e.g., because of timeout), a warning is logged.
     pub fn post(&self, msgid: u64, result: Message) {
-        if let Some((_, tx)) = self.id_map.remove(&msgid) {
-            let _ = tx.send(result);
+        if let Some((_, entry)) = self.id_map.remove(&msgid) {
+            let _ = entry.sender.send((result, entry.write_buffer));
         } else {
             tracing::warn!("Waiter post failed for msgid: {}", msgid);
         }
     }
 
     /// Checks if a message ID is currently being waited on.
+    pub fn contains_message_id(&self, msgid: u64) -> bool {
+        self.id_map.contains_key(&msgid)
+    }
+
+    /// Stores a write buffer for a pending request.
     ///
-    /// # Arguments
-    ///
-    /// * `msgid` - The message ID to check
+    /// Called by `MemoryService` handlers when the server performs a
+    /// `remote_write`. The buffer is stored in the same entry as the
+    /// response channel, ensuring it is delivered atomically with the
+    /// response when `post` is called.
     ///
     /// # Returns
     ///
-    /// Returns true if the message ID exists in the waiter's map.
-    pub fn contains_message_id(&self, msgid: u64) -> bool {
-        self.id_map.contains_key(&msgid)
+    /// Returns `true` if the buffer was stored successfully (msgid still active),
+    /// `false` if the request has already completed or timed out.
+    pub fn store_write_buffer(&self, msgid: u64, buffer: Buffer) -> bool {
+        if let Some(mut entry) = self.id_map.get_mut(&msgid) {
+            entry.write_buffer = Some(buffer);
+            true
+        } else {
+            false
+        }
     }
 
     fn remove(&self, msgid: u64) {
@@ -124,8 +155,9 @@ mod tests {
             })
         };
 
-        let msg = rx.recv().await.unwrap();
+        let (msg, write_buf) = rx.recv().await.unwrap();
         assert_eq!(msg.meta.method, "dummy");
+        assert!(write_buf.is_none());
         handle.await.unwrap();
 
         let (msgid, rx) = msg_waiter.alloc();
@@ -138,6 +170,49 @@ mod tests {
         let waiter = Waiter::default();
         // Posting to a non-existent msgid should log a warning and not panic.
         waiter.post(42, Message::default());
+    }
+
+    #[tokio::test]
+    async fn test_waiter_store_write_buffer() {
+        use crate::{BufferPool, Devices};
+
+        let devices = Arc::new(Devices::default());
+        let pool = BufferPool::new(devices, 4096, 4096, 0);
+
+        let waiter = Waiter::default();
+        let (msgid, rx) = waiter.alloc();
+
+        // Store a write buffer while the request is pending.
+        let mut buf = pool.allocate().unwrap();
+        buf[..5].copy_from_slice(b"hello");
+        buf.set_len(5);
+        assert!(waiter.store_write_buffer(msgid, buf));
+
+        // Post the response.
+        waiter.post(msgid, Message::default());
+
+        // Receive should include the write buffer.
+        let (_msg, write_buf) = rx.recv().await.unwrap();
+        let write_buf = write_buf.expect("expected write buffer");
+        assert_eq!(&write_buf[..], b"hello");
+    }
+
+    #[tokio::test]
+    async fn test_waiter_store_write_buffer_after_timeout() {
+        use crate::{BufferPool, Devices};
+
+        let devices = Arc::new(Devices::default());
+        let pool = BufferPool::new(devices, 4096, 4096, 0);
+
+        let waiter = Waiter::default();
+        let (msgid, rx) = waiter.alloc();
+
+        // Drop receiver (simulates timeout cleanup).
+        drop(rx);
+
+        // Store should fail since the entry was removed.
+        let buf = pool.allocate().unwrap();
+        assert!(!waiter.store_write_buffer(msgid, buf));
     }
 
     #[test]

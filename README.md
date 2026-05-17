@@ -23,7 +23,7 @@ A high-performance Rust RPC library that supports multiple transport protocols (
 
 - **Multiple Transport Protocols**: TCP, WebSocket, HTTP/1.1 and HTTP/2 (h2c), RDMA (optional), and a unified protocol that supports all simultaneously
 - **Reverse RPC**: Server can call back into client services over established HTTP/2 or WebSocket connections
-- **Remote Read/Write**: Zero-copy remote memory access over TCP (reverse RPC) and RDMA, backed by a generic registered buffer pool ([ruapc-bufpool](ruapc-bufpool/))
+- **Remote Read/Write**: Server-side access to client memory via registered buffer pool ([ruapc-bufpool](ruapc-bufpool/)). `remote_read` lets the server read a client-provided buffer; `remote_write` pushes server data into a client-allocated buffer. Transfers use data-copy over TCP or zero-copy RDMA READ, with runtime UUID validation ensuring buffer lifetime safety
 - **Multiple Serialization Formats**: JSON (default) and MessagePack support
 - **OpenAPI Integration**: Automatic OpenAPI 3.0 specification generation with JSON Schema support
 - **Built-in Documentation**: RapiDoc integration for interactive API documentation

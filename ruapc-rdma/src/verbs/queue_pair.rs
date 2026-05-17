@@ -171,34 +171,6 @@ impl QueuePair {
         Ok(wr_id)
     }
 
-    pub fn write(
-        &self,
-        buffer: Buffer,
-        remote_addr: u64,
-        rkey: u32,
-        flags: crate::ibv_send_flags,
-    ) -> Result<WRID> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let wr_id = WRID::send_data(id);
-        let addr = buffer.as_ptr() as u64;
-        let len = buffer.len() as u32;
-        let lkey = self.lkey(&buffer)?;
-        self.wrs.lock().unwrap().insert(id, buffer);
-        self.post_send_verb(
-            wr_id,
-            addr,
-            len,
-            lkey,
-            crate::ibv_wr_opcode::IBV_WR_RDMA_WRITE,
-            flags.0,
-            Some((remote_addr, rkey)),
-        )
-        .inspect_err(|_e| {
-            self.wrs.lock().unwrap().remove(&id);
-        })?;
-        Ok(wr_id)
-    }
-
     fn post_send_verb(
         &self,
         wr_id: WRID,

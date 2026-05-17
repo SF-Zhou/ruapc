@@ -7,12 +7,11 @@ use tokio::sync::mpsc::Sender;
 
 use super::RdmaState;
 use crate::{
-    Context, Error, SocketTrait, State,
+    Buffer, BufferPool, Context, Error, RemoteReadOptions, SocketTrait, State,
     error::{ErrorKind, Result},
     msg::MsgMeta,
     rdma::event_loop::SendMsg,
-    services::MetaService,
-    {Buffer, BufferPool},
+    services::{MemoryService, MetaService},
 };
 
 pub(crate) type RdmaCompletion = (ibv_wc_status, Option<Buffer>);
@@ -52,21 +51,16 @@ impl RdmaSocket {
         let _ = self.queue_pair.modify(&mut attr, mask.0 as _);
     }
 
-    fn post_rdma_verb(
+    fn post_rdma_read(
         &self,
         buffer: Buffer,
         remote_addr: u64,
         rkey: u32,
-        is_read: bool,
     ) -> Result<tokio::sync::oneshot::Receiver<RdmaCompletion>> {
-        let wr_id = if is_read {
-            self.queue_pair
-                .read(buffer, remote_addr, rkey, ibv_send_flags::IBV_SEND_SIGNALED)
-        } else {
-            self.queue_pair
-                .write(buffer, remote_addr, rkey, ibv_send_flags::IBV_SEND_SIGNALED)
-        }
-        .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
+        let wr_id = self
+            .queue_pair
+            .read(buffer, remote_addr, rkey, ibv_send_flags::IBV_SEND_SIGNALED)
+            .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.rdma_completions.insert(wr_id, tx);
@@ -99,15 +93,10 @@ impl RdmaSocket {
 }
 
 impl RdmaSocket {
-    async fn remote_op(
-        &self,
-        mut local: Buffer,
-        remote: &RemoteBufferInfo,
-        is_read: bool,
-    ) -> Result<Buffer> {
+    async fn remote_read_op(&self, mut local: Buffer, remote: &RemoteBufferInfo) -> Result<Buffer> {
         let rkey = remote.key.rkey;
         local.set_len(remote.len as usize);
-        let rx = self.post_rdma_verb(local, remote.addr, rkey, is_read)?;
+        let rx = self.post_rdma_read(local, remote.addr, rkey)?;
         Self::await_completion(rx).await
     }
 }
@@ -148,8 +137,13 @@ impl SocketTrait for RdmaSocket {
         ctx: &Context,
         local: Buffer,
         remote: &RemoteBufferInfo,
+        options: &RemoteReadOptions,
     ) -> Result<Buffer> {
-        let local = self.remote_op(local, remote, true).await?;
+        let local = self.remote_read_op(local, remote).await?;
+
+        if options.skip_verify {
+            return Ok(local);
+        }
 
         // After RDMA Read completes, verify the client's original request is still
         // alive. If the client has timed out, the buffer may have been reclaimed
@@ -167,12 +161,16 @@ impl SocketTrait for RdmaSocket {
         Ok(local)
     }
 
-    async fn remote_write(
-        &self,
-        _ctx: &Context,
-        local: Buffer,
-        remote: &RemoteBufferInfo,
-    ) -> Result<Buffer> {
-        self.remote_op(local, remote, false).await
+    async fn remote_write(&self, ctx: &Context, local: Buffer) -> Result<Buffer> {
+        // Instead of one-sided RDMA WRITE (unsafe for client buffer lifetime),
+        // send a reverse RPC to the client with our buffer attached. The client
+        // will perform an RDMA READ from our buffer into its own local buffer.
+        let req = crate::services::MemoryPullReq {
+            msgid: ctx.msg_meta.msgid,
+            len: local.len() as u64,
+        };
+        let client = crate::Client::default();
+        client.with_read_buffer(&local).rdma_pull(ctx, &req).await?;
+        Ok(local)
     }
 }

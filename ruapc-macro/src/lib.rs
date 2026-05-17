@@ -30,8 +30,8 @@
 //! The macro generates:
 //! 1. A `ruapc_export` method for registering the service with a router
 //! 2. Client trait implementation on `Client` for making normal requests
-//! 3. Client trait implementation on `ClientWithReadBuffer` for requests that
-//!    attach a read buffer for server-side `remote_read`
+//! 3. Client trait implementation on `ClientWithBuffer` for requests with
+//!    attached read/write buffers
 //! 4. Proper error handling and message serialization
 
 use proc_macro::TokenStream;
@@ -68,7 +68,7 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
     let mut send_bounds = vec![];
     let mut invoke_branchs = vec![];
     let mut client_methods = vec![];
-    let mut client_with_read_buffer_methods = vec![];
+    let mut client_with_buffer_methods = vec![];
 
     let krate = get_crate_name();
 
@@ -90,15 +90,15 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
             let req_type = req_type.ty.clone();
             let output = &method.sig.output;
 
-            // Client trait impl: passes None for read_buffer
+            // Client trait impl: no read_buffer, no write_buffer_slot
             client_methods.push(quote! {
                 async fn #method_ident(#receiver, ctx: &#krate::Context, req: #req_type) #output {
-                    self.ruapc_request(ctx, req, None, #method_name).await
+                    self.ruapc_request(ctx, req, None, None, #method_name).await
                 }
             });
 
-            // ClientWithReadBuffer trait impl: passes Some(self.buffer)
-            client_with_read_buffer_methods.push(quote! {
+            // ClientWithBuffer trait impl: delegates to its ruapc_request
+            client_with_buffer_methods.push(quote! {
                 async fn #method_ident(#receiver, ctx: &#krate::Context, req: #req_type) #output {
                     self.ruapc_request(ctx, req, #method_name).await
                 }
@@ -152,8 +152,8 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
             #(#client_methods)*
         }
 
-        impl #trait_ident for #krate::ClientWithReadBuffer<'_> {
-            #(#client_with_read_buffer_methods)*
+        impl #trait_ident for #krate::ClientWithBuffer<'_> {
+            #(#client_with_buffer_methods)*
         }
     }
     .into()

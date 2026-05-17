@@ -6,10 +6,25 @@ use serde::Serialize;
 use crate::{
     Buffer, Context, MsgMeta, Result, State,
     http::HttpSocket,
-    services::{MemoryReadReq, MemoryService, MemoryWriteReq},
+    services::{MemoryPushReq, MemoryReadReq, MemoryService},
     tcp::TcpSocket,
     ws::WebSocket,
 };
+
+/// Options controlling `remote_read` behavior.
+///
+/// The `skip_verify` field is `pub(crate)` to prevent external code from
+/// bypassing the UUID liveness check.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RemoteReadOptions {
+    /// When true, skips the post-read UUID liveness verification.
+    ///
+    /// Only safe when the remote buffer's lifetime is guaranteed by the
+    /// calling context (e.g., the server holds `&buf` across `.await`).
+    /// Only used by the RDMA path; the TCP path always verifies inline.
+    #[cfg_attr(not(feature = "rdma"), allow(dead_code))]
+    pub(crate) skip_verify: bool,
+}
 
 /// Socket abstraction supporting multiple transport protocols.
 ///
@@ -34,35 +49,8 @@ pub enum Socket {
 }
 
 /// Trait defining the interface for sending messages through different socket types.
-///
-/// `SocketTrait` provides a unified interface for message transmission across
-/// different transport protocols (TCP, WebSocket, HTTP, RDMA). Each socket type
-/// implements this trait to provide its own send mechanism while maintaining
-/// a consistent API.
-///
-/// # Implementors
-///
-/// - [`Socket`] - The main enum implementing this trait for all transport types
-/// - Individual socket types (TcpSocket, WebSocket, HttpSocket, etc.) also implement this
 pub trait SocketTrait {
     /// Sends a message through this socket.
-    ///
-    /// This method serializes and sends a message with the given metadata and payload.
-    /// The actual transmission mechanism depends on the underlying socket type.
-    ///
-    /// # Type Parameters
-    ///
-    /// * `P` - The payload type to serialize
-    ///
-    /// # Arguments
-    ///
-    /// * `meta` - Message metadata (method name, flags, etc.)
-    /// * `payload` - The data to send
-    /// * `state` - Shared state for request/response correlation
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if sending fails.
     async fn send<P: Serialize>(
         &self,
         meta: &mut MsgMeta,
@@ -75,6 +63,7 @@ pub trait SocketTrait {
         ctx: &Context,
         mut local: Buffer,
         remote: &RemoteBufferInfo,
+        _options: &RemoteReadOptions,
     ) -> Result<Buffer> {
         // Pass msgid so that tcp_read on the client side verifies
         // the original request is still alive after reading the buffer.
@@ -100,28 +89,20 @@ pub trait SocketTrait {
         Ok(local)
     }
 
-    async fn remote_write(
-        &self,
-        ctx: &Context,
-        local: Buffer,
-        remote: &RemoteBufferInfo,
-    ) -> Result<Buffer> {
-        let req = MemoryWriteReq {
-            key: remote.key,
-            addr: remote.addr,
-            data: local[..remote.len as usize].to_vec(),
+    async fn remote_write(&self, ctx: &Context, local: Buffer) -> Result<Buffer> {
+        // Push data to the client via tcp_push.
+        let req = MemoryPushReq {
+            msgid: ctx.msg_meta.msgid,
+            data: local[..].to_vec(),
         };
         let client = crate::Client::default();
-        client.tcp_write(ctx, &req).await?;
+        client.tcp_push(ctx, &req).await?;
         Ok(local)
     }
 }
 
 impl Socket {
     /// Returns the device index associated with this socket.
-    ///
-    /// TCP, WebSocket, and HTTP sockets use the TCP device (looked up from state).
-    /// RDMA sockets use the device associated with their QueuePair.
     pub fn device_index(&self, state: &State) -> DeviceIndex {
         match self {
             Socket::TCP(_) | Socket::WS(_) | Socket::HTTP(_) => {
@@ -154,28 +135,24 @@ impl SocketTrait for Socket {
         ctx: &Context,
         local: Buffer,
         remote: &RemoteBufferInfo,
+        options: &RemoteReadOptions,
     ) -> Result<Buffer> {
         match self {
-            Socket::TCP(tcp_socket) => tcp_socket.remote_read(ctx, local, remote).await,
-            Socket::WS(web_socket) => web_socket.remote_read(ctx, local, remote).await,
-            Socket::HTTP(http_socket) => http_socket.remote_read(ctx, local, remote).await,
+            Socket::TCP(tcp_socket) => tcp_socket.remote_read(ctx, local, remote, options).await,
+            Socket::WS(web_socket) => web_socket.remote_read(ctx, local, remote, options).await,
+            Socket::HTTP(http_socket) => http_socket.remote_read(ctx, local, remote, options).await,
             #[cfg(feature = "rdma")]
-            Socket::RDMA(rdma_socket) => rdma_socket.remote_read(ctx, local, remote).await,
+            Socket::RDMA(rdma_socket) => rdma_socket.remote_read(ctx, local, remote, options).await,
         }
     }
 
-    async fn remote_write(
-        &self,
-        ctx: &Context,
-        local: Buffer,
-        remote: &RemoteBufferInfo,
-    ) -> Result<Buffer> {
+    async fn remote_write(&self, ctx: &Context, local: Buffer) -> Result<Buffer> {
         match self {
-            Socket::TCP(tcp_socket) => tcp_socket.remote_write(ctx, local, remote).await,
-            Socket::WS(web_socket) => web_socket.remote_write(ctx, local, remote).await,
-            Socket::HTTP(http_socket) => http_socket.remote_write(ctx, local, remote).await,
+            Socket::TCP(tcp_socket) => tcp_socket.remote_write(ctx, local).await,
+            Socket::WS(web_socket) => web_socket.remote_write(ctx, local).await,
+            Socket::HTTP(http_socket) => http_socket.remote_write(ctx, local).await,
             #[cfg(feature = "rdma")]
-            Socket::RDMA(rdma_socket) => rdma_socket.remote_write(ctx, local, remote).await,
+            Socket::RDMA(rdma_socket) => rdma_socket.remote_write(ctx, local).await,
         }
     }
 }

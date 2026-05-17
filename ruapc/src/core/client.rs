@@ -1,6 +1,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_inline_default::serde_inline_default;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::{
@@ -48,8 +49,7 @@ impl Default for Client {
 }
 
 impl Client {
-    /// Creates a [`ClientWithReadBuffer`] that attaches the given buffer to all
-    /// subsequent RPC requests made through it.
+    /// Creates a [`ClientWithBuffer`] that attaches a read buffer to requests.
     ///
     /// The returned wrapper implements the same service traits as `Client`, but
     /// includes the buffer's `RemoteBufferInfo` in each request's metadata,
@@ -61,53 +61,54 @@ impl Client {
     /// let buf = pool.allocate()?;
     /// buf[..data.len()].copy_from_slice(data);
     /// let rsp = client.with_read_buffer(&buf).upload(&ctx, &req).await?;
-    /// // buf is guaranteed alive until here due to the borrow
     /// ```
-    pub fn with_read_buffer<'a>(&'a self, buffer: &'a Buffer) -> ClientWithReadBuffer<'a> {
-        ClientWithReadBuffer {
+    pub fn with_read_buffer<'a>(&'a self, buffer: &'a Buffer) -> ClientWithBuffer<'a> {
+        ClientWithBuffer {
             client: self,
-            buffer,
+            read_buffer: Some(buffer),
+            write_buffer: Mutex::new(None),
+        }
+    }
+
+    /// Creates a [`ClientWithBuffer`] ready to receive a write buffer from the server.
+    ///
+    /// During the RPC call, if the server performs a `remote_write`, the data will
+    /// be received into a buffer allocated from the client's buffer pool and stored
+    /// in this wrapper. After the call completes, use [`ClientWithBuffer::take_write_buffer`]
+    /// to retrieve the received buffer.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let mut c = client.ready_to_recv();
+    /// c.download(&ctx, &req).await?;
+    /// let received_data = c.take_write_buffer().unwrap();
+    /// ```
+    pub fn ready_to_recv(&self) -> ClientWithBuffer<'_> {
+        ClientWithBuffer {
+            client: self,
+            read_buffer: None,
+            write_buffer: Mutex::new(None),
         }
     }
 
     /// Makes an RPC request to a remote service.
-    ///
-    /// This is the internal method used by service trait implementations to
-    /// send requests and receive responses. It handles:
-    /// - Socket acquisition from the context
-    /// - Request serialization (and buffer info extraction if present)
-    /// - Response waiting with timeout
-    /// - Response deserialization
-    ///
-    /// # Type Parameters
-    ///
-    /// * `Req` - The request type, must be serializable and have a JSON schema
-    /// * `Rsp` - The response type, must be deserializable and have a JSON schema
-    /// * `E` - The error type that can be returned
     ///
     /// # Arguments
     ///
     /// * `ctx` - The RPC context containing connection information
     /// * `req` - The request payload to send
     /// * `read_buffer` - Optional registered memory buffer for the server to read.
-    ///   When provided, the buffer's `RemoteBufferInfo` is included in the message
-    ///   metadata, allowing the server to perform `remote_read` on the client's
-    ///   memory. The buffer must remain alive for the duration of the RPC call.
+    /// * `write_buffer_slot` - Optional slot to receive a buffer written by the server.
+    ///   If the server performs a `remote_write` during handling, the received buffer
+    ///   will be placed here after the response arrives.
     /// * `method_name` - The name of the RPC method to invoke
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The context doesn't have a valid endpoint
-    /// - Socket acquisition fails
-    /// - Request sending fails
-    /// - Response timeout occurs
-    /// - Response deserialization fails
     pub async fn ruapc_request<Req, Rsp, E>(
         &self,
         ctx: &Context,
         req: &Req,
         read_buffer: Option<&Buffer>,
+        write_buffer_slot: Option<&mut Option<Buffer>>,
         method_name: &str,
     ) -> std::result::Result<Rsp, E>
     where
@@ -164,7 +165,11 @@ impl Client {
 
         // 3. recv response with timeout.
         if let Ok(result) = tokio::time::timeout(self.timeout, receiver.recv()).await {
-            let response = result?;
+            let (response, write_buffer) = result?;
+            // Pass the write buffer to the caller if a slot was provided.
+            if let Some(slot) = write_buffer_slot {
+                *slot = write_buffer;
+            }
             response.payload.deserialize(&response.meta)?
         } else {
             Err(Error::kind(ErrorKind::Timeout).into())
@@ -172,37 +177,72 @@ impl Client {
     }
 }
 
-/// A client wrapper that attaches a read buffer to every RPC request.
+/// A client wrapper that supports attaching a read buffer and/or receiving
+/// a write buffer during RPC calls.
 ///
-/// Created via [`Client::with_read_buffer`]. This struct implements the same
-/// service traits as `Client` (generated by `#[service]` macro), but every
-/// request includes the buffer's `RemoteBufferInfo` in the message metadata,
-/// enabling the server to `remote_read` the client's registered memory.
+/// Created via [`Client::with_read_buffer`] or [`Client::ready_to_recv`].
+/// Implements the same service traits as `Client` (generated by `#[service]` macro).
 ///
-/// The lifetime `'a` ensures the buffer outlives all RPC calls made through
-/// this wrapper, preventing use-after-free in remote memory operations.
+/// # Read buffer
+///
+/// When a read buffer is attached, its `RemoteBufferInfo` is included in every
+/// request's metadata, allowing the server to `remote_read` the client's memory.
+///
+/// # Write buffer
+///
+/// When the server performs a `remote_write` during request handling, the data
+/// is received into a buffer from the client's pool and stored here. After the
+/// call completes, retrieve it with [`take_write_buffer`](Self::take_write_buffer).
 ///
 /// # Examples
 ///
 /// ```rust,ignore
-/// let buf = pool.allocate()?;
-/// buf[..data.len()].copy_from_slice(data);
-///
-/// // Server can remote_read this buffer during the RPC call
+/// // Read buffer only (server reads from client)
 /// let rsp = client.with_read_buffer(&buf).upload(&ctx, &req).await?;
 ///
-/// // Buffer can be reused for retry
-/// let rsp = client.with_read_buffer(&buf).upload(&ctx, &req).await?;
+/// // Write buffer only (server writes to client)
+/// let mut c = client.ready_to_recv();
+/// c.download(&ctx, &req).await?;
+/// let data = c.take_write_buffer().unwrap();
+///
+/// // Both read and write buffers
+/// let mut c = client.with_read_buffer(&buf).ready_to_recv();
+/// c.transform(&ctx, &req).await?;
+/// let result = c.take_write_buffer().unwrap();
 /// ```
-pub struct ClientWithReadBuffer<'a> {
+pub struct ClientWithBuffer<'a> {
     client: &'a Client,
-    buffer: &'a Buffer,
+    read_buffer: Option<&'a Buffer>,
+    write_buffer: Mutex<Option<Buffer>>,
 }
 
-impl ClientWithReadBuffer<'_> {
-    /// Makes an RPC request with the attached read buffer.
+impl<'a> ClientWithBuffer<'a> {
+    /// Attaches a read buffer to this wrapper.
     ///
-    /// Delegates to [`Client::ruapc_request`] with `Some(self.buffer)`.
+    /// The buffer's `RemoteBufferInfo` will be included in request metadata,
+    /// allowing the server to `remote_read` the client's memory.
+    pub fn with_read_buffer(mut self, buffer: &'a Buffer) -> Self {
+        self.read_buffer = Some(buffer);
+        self
+    }
+
+    /// Marks this wrapper as ready to receive a write buffer from the server.
+    ///
+    /// This is a no-op if already in this state, but makes the intent explicit
+    /// when chaining with `with_read_buffer`.
+    pub fn ready_to_recv(self) -> Self {
+        self
+    }
+
+    /// Takes the write buffer received from the server, if any.
+    ///
+    /// Returns `None` if the server did not perform a `remote_write` during
+    /// the RPC call, or if the buffer has already been taken.
+    pub fn take_write_buffer(&self) -> Option<Buffer> {
+        self.write_buffer.lock().unwrap().take()
+    }
+
+    /// Makes an RPC request with the configured buffers.
     pub async fn ruapc_request<Req, Rsp, E>(
         &self,
         ctx: &Context,
@@ -214,9 +254,13 @@ impl ClientWithReadBuffer<'_> {
         Rsp: for<'c> Deserialize<'c> + JsonSchema,
         E: std::error::Error + From<crate::Error> + for<'c> Deserialize<'c>,
     {
-        self.client
-            .ruapc_request(ctx, req, Some(self.buffer), method_name)
-            .await
+        let mut slot = self.write_buffer.lock().unwrap().take();
+        let result = self
+            .client
+            .ruapc_request(ctx, req, self.read_buffer, Some(&mut slot), method_name)
+            .await;
+        *self.write_buffer.lock().unwrap() = slot;
+        result
     }
 }
 
