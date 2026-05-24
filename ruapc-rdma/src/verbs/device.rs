@@ -22,6 +22,7 @@ pub struct Device {
     ptr: *mut crate::ibv_device,
     name: String,
     guid: Guid,
+    transport_type: crate::ibv_transport_type,
     ibdev_path: std::path::PathBuf,
 }
 
@@ -33,6 +34,7 @@ impl Device {
                 .to_string()
         };
         let guid = Guid::from_be(unsafe { crate::ibv_get_device_guid(ptr) });
+        let transport_type = unsafe { (*ptr).transport_type };
         let ibdev_path = unsafe {
             Path::new(std::ffi::OsStr::from_bytes(
                 CStr::from_ptr((*ptr).ibdev_path.as_ptr()).to_bytes(),
@@ -44,6 +46,7 @@ impl Device {
             ptr,
             name,
             guid,
+            transport_type,
             ibdev_path,
         }
     }
@@ -77,6 +80,7 @@ impl Device {
             info: DeviceInfo {
                 name: self.name.clone(),
                 guid: self.guid,
+                transport_type: self.transport_type,
                 ibdev_path: self.ibdev_path.clone(),
                 ..Default::default()
             },
@@ -92,6 +96,7 @@ impl std::fmt::Debug for Device {
         f.debug_struct("Device")
             .field("name", &self.name)
             .field("guid", &self.guid)
+            .field("transport_type", &self.transport_type)
             .finish()
     }
 }

@@ -16,7 +16,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::{Guid, ibv_device_attr, ibv_gid, ibv_port_attr};
+use crate::{Guid, ibv_device_attr, ibv_gid, ibv_port_attr, ibv_transport_type};
 
 /// Information about an RDMA device.
 ///
@@ -28,6 +28,8 @@ pub struct DeviceInfo {
     pub name: String,
     /// Globally unique identifier for the device.
     pub guid: Guid,
+    /// Transport type of the device.
+    pub transport_type: ibv_transport_type,
     /// Path to the device in sysfs.
     pub ibdev_path: PathBuf,
     /// Device attributes including capabilities.

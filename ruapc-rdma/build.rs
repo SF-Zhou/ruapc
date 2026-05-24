@@ -22,8 +22,15 @@ impl ParseCallbacks for CustomDerive {
     /// These types need JSON serialization support for the ruapc project
     fn add_derives(&self, info: &DeriveInfo<'_>) -> Vec<String> {
         match info.name {
-            "ibv_device_attr" | "ibv_atomic_cap" | "ibv_port_state" | "ibv_mtu"
-            | "ibv_port_cap_flags" | "ibv_port_attr" => {
+            "ibv_device_attr"
+            | "ibv_atomic_cap"
+            | "ibv_port_state"
+            | "ibv_mtu"
+            | "ibv_port_cap_flags"
+            | "ibv_port_cap_flags2"
+            | "ibv_port_attr"
+            | "ibv_transport_type"
+            | "ibv_device_cap_flags" => {
                 vec![
                     "Serialize".to_string(),
                     "Deserialize".to_string(),
@@ -63,6 +70,10 @@ fn replace_custom_types(input: &str) -> String {
                                         field.ty = syn::parse_str("Guid")
                                             .expect("Failed to parse Guid type");
                                     }
+                                    "device_cap_flags" => {
+                                        field.ty = syn::parse_str("ibv_device_cap_flags")
+                                            .expect("Failed to parse ibv_device_cap_flags type");
+                                    }
                                     _ => {}
                                 }
                             }
@@ -72,11 +83,22 @@ fn replace_custom_types(input: &str) -> String {
                 "ibv_port_attr" => {
                     if let syn::Fields::Named(ref mut fields) = struct_item.fields {
                         for field in fields.named.iter_mut() {
-                            if let Some(ident) = &field.ident
-                                && ident == "link_layer"
-                            {
-                                field.ty = syn::parse_str("LinkLayer")
-                                    .expect("Failed to parse LinkLayer type");
+                            if let Some(ident) = &field.ident {
+                                match ident.to_string().as_str() {
+                                    "link_layer" => {
+                                        field.ty = syn::parse_str("LinkLayer")
+                                            .expect("Failed to parse LinkLayer type");
+                                    }
+                                    "port_cap_flags" => {
+                                        field.ty = syn::parse_str("ibv_port_cap_flags")
+                                            .expect("Failed to parse ibv_port_cap_flags type");
+                                    }
+                                    "port_cap_flags2" => {
+                                        field.ty = syn::parse_str("ibv_port_cap_flags2")
+                                            .expect("Failed to parse ibv_port_cap_flags2 type");
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
                     }
@@ -152,6 +174,8 @@ fn main() {
         .allowlist_type("ibv_atomic_cap")
         .allowlist_type("ibv_device_attr")
         .allowlist_type("ibv_device_cap_flags")
+        .allowlist_type("ibv_port_cap_flags")
+        .allowlist_type("ibv_port_cap_flags2")
         .allowlist_function("ibv_ack_cq_events")
         .allowlist_function("ibv_alloc_pd")
         .allowlist_function("ibv_close_device")
@@ -182,6 +206,8 @@ fn main() {
         .bitfield_enum("ibv_wc_flags")
         .bitfield_enum("ibv_qp_attr_mask")
         .bitfield_enum("ibv_device_cap_flags")
+        .bitfield_enum("ibv_port_cap_flags")
+        .bitfield_enum("ibv_port_cap_flags2")
         .parse_callbacks(Box::new(CustomDerive))
         // Types with function pointers shouldn't implement Copy
         .no_copy("ibv_context")

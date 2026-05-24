@@ -1,6 +1,6 @@
 [package]
 name = "ruapc-rdma"
-version = "0.1.2"
+version = "0.1.4"
 description = "Low-level FFI bindings to libibverbs with type-safe device management for RDMA operations"
 authors.workspace = true
 edition.workspace = true
@@ -8,11 +8,20 @@ homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[features]
+bin = ["dep:clap"]
+
 [dependencies]
+clap = { workspace = true, optional = true }
 libc.workspace = true
 ruapc-bufpool = { path = "../ruapc-bufpool" }
 schemars.workspace = true
 serde.workspace = true
+
+[[bin]]
+name = "ibv_devinfo"
+path = "src/bin/ibv_devinfo.rs"
+required-features = ["bin"]
 
 [dev-dependencies]
 serde_json.workspace = true
