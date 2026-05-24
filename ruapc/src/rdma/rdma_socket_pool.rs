@@ -8,12 +8,16 @@ use std::{
 use foldhash::fast::RandomState;
 use ruapc_bufpool::Device as _;
 use ruapc_rdma::{
-    CompChannel, CompletionQueue, QueuePair, ibv_qp_cap, ibv_qp_init_attr, ibv_qp_type,
+    CompChannel, CompletionQueue, DeviceInfo, Gid, GidType, LinkLayer, Port, QueuePair, ibv_mtu,
+    ibv_port_state, ibv_qp_cap, ibv_qp_init_attr, ibv_qp_type,
 };
 use tokio::sync::RwLock;
 use tokio_util::sync::DropGuard;
 
-use super::{Endpoint, EventLoop, RdmaDevice, RdmaInfo, RdmaService, RdmaSocket};
+use super::{
+    ConnectRequest, DeviceSelection, Endpoint, EventLoop, RdmaDevice, RdmaDeviceRefresher,
+    RdmaInfo, RdmaService, RdmaSocket,
+};
 use crate::{
     BufferPool, Client, Context, Devices, Error, ErrorKind, Result, Socket, SocketPoolConfig,
     SocketPoolTrait, SocketType, State, TaskSupervisor, rdma::event_loop::SendMsg,
@@ -37,6 +41,8 @@ pub struct RdmaSocketPool {
     /// Supervisor for managing asynchronous tasks — dropped first so that
     /// all spawned EventLoop tasks finish and release their `Arc<RdmaSocket>`.
     pub task_supervisor: TaskSupervisor,
+    /// Background port/GID cache refresher. Dropped before RDMA devices.
+    pub(crate) port_refresher: RdmaDeviceRefresher,
     /// Thread-safe map of active RDMA sockets indexed by their addresses.
     /// Dropped after tasks stop → destroys QPs.
     pub socket_map: RwLock<HashMap<SocketAddr, Arc<RdmaSocket>, RandomState>>,
@@ -56,12 +62,13 @@ impl SocketPoolTrait for RdmaSocketPool {
         devices: &Arc<Devices>,
         buffer_pool: &Arc<BufferPool>,
     ) -> Result<Self> {
-        Ok(Self::new(devices.clone(), buffer_pool.clone()))
+        Self::new(devices.clone(), buffer_pool.clone())
     }
 
     /// Stops all tasks managed by the socket pool.
     fn stop(&self) {
         self.task_supervisor.stop();
+        self.port_refresher.stop();
     }
 
     /// Returns a guard that will stop all tasks when dropped.
@@ -81,20 +88,23 @@ impl SocketPoolTrait for RdmaSocketPool {
                 .devices
                 .rdma_devices()
                 .iter()
-                .map(|d| d.inner().info().clone())
+                .map(|d| (*d.info()).clone())
                 .collect(),
         })
     }
 
     /// Establishes a new RDMA connection with the specified endpoint.
-    fn rdma_connect(&self, endpoint: &Endpoint, state: &Arc<State>) -> Result<Endpoint> {
-        let device = self.pick_rdma_device()?;
+    fn rdma_connect(&self, request: &ConnectRequest, state: &Arc<State>) -> Result<Endpoint> {
+        let device = self.find_rdma_device(&request.target)?;
         let (queue_pair, comp_channel, cq) = self.create_queue_pair(device)?;
-        queue_pair
-            .connect(endpoint.qp_num, endpoint.gid, endpoint.lid)
-            .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
+        let local_endpoint = self.make_endpoint(
+            &queue_pair,
+            device,
+            request.target.port_num,
+            request.target.gid_index,
+        )?;
+        self.connect_queue_pair(&queue_pair, &local_endpoint, &request.endpoint)?;
 
-        let local_endpoint = self.make_endpoint(&queue_pair, device);
         let (tx, rx) = tokio::sync::mpsc::channel::<SendMsg>(1024);
         let rdma_socket = RdmaSocket::new(queue_pair, self.buffer_pool.clone(), tx);
         self.start_event_loop(Arc::new(rdma_socket), state.clone(), comp_channel, cq, rx)?;
@@ -128,20 +138,35 @@ impl SocketPoolTrait for RdmaSocketPool {
             return Ok(socket.into());
         }
 
-        let device = self.pick_rdma_device()?;
-        let (queue_pair, comp_channel, cq) = self.create_queue_pair(device)?;
-        let local_endpoint = self.make_endpoint(&queue_pair, device);
-
         let acquire_ctx = Context::create_with_state_and_addr(state, addr);
+        let remote_info = Box::pin(self.acquire_client.info(&acquire_ctx, &())).await?;
+        let selection = self.select_device(&remote_info)?;
+
+        let device = self
+            .devices
+            .rdma_devices()
+            .get(selection.local_device_index)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidArgument,
+                    "selected RDMA device disappeared".into(),
+                )
+            })?;
+        let (queue_pair, comp_channel, cq) = self.create_queue_pair(device)?;
+        let local_endpoint = self.make_endpoint(
+            &queue_pair,
+            device,
+            selection.local_port_num,
+            selection.local_gid_index,
+        )?;
+
+        let connect_request = ConnectRequest {
+            endpoint: local_endpoint,
+            target: selection.remote,
+        };
         let remote_endpoint =
-            Box::pin(self.acquire_client.connect(&acquire_ctx, &local_endpoint)).await?;
-        queue_pair
-            .connect(
-                remote_endpoint.qp_num,
-                remote_endpoint.gid,
-                remote_endpoint.lid,
-            )
-            .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
+            Box::pin(self.acquire_client.connect(&acquire_ctx, &connect_request)).await?;
+        self.connect_queue_pair(&queue_pair, &local_endpoint, &remote_endpoint)?;
         tracing::info!("acquired socket: {:?}", queue_pair);
 
         let (tx, rx) = tokio::sync::mpsc::channel::<SendMsg>(1024);
@@ -167,32 +192,33 @@ impl SocketPoolTrait for RdmaSocketPool {
 
 impl RdmaSocketPool {
     /// Creates a new pool using the shared devices and buffer pool.
-    pub fn new(devices: Arc<Devices>, buffer_pool: Arc<BufferPool>) -> Self {
-        Self {
+    pub fn new(devices: Arc<Devices>, buffer_pool: Arc<BufferPool>) -> Result<Self> {
+        Ok(Self {
             acquire_client: Client {
                 timeout: std::time::Duration::from_secs(5),
                 use_msgpack: true,
                 socket_type: Some(SocketType::TCP),
             },
             task_supervisor: TaskSupervisor::create(),
+            port_refresher: RdmaDeviceRefresher::start(devices.clone())?,
             socket_map: RwLock::default(),
             buffer_pool,
             devices,
             next_device: AtomicUsize::new(0),
-        }
+        })
     }
 
-    /// Returns an RDMA device and its index using round-robin selection.
-    fn pick_rdma_device(&self) -> Result<&RdmaDevice> {
-        let rdma_devices = self.devices.rdma_devices();
-        if rdma_devices.is_empty() {
-            return Err(Error::new(
-                ErrorKind::InvalidArgument,
-                "no RDMA device available".into(),
-            ));
-        }
-        let idx = self.next_device.fetch_add(1, Ordering::Relaxed) % rdma_devices.len();
-        Ok(&rdma_devices[idx])
+    fn find_rdma_device(&self, selection: &DeviceSelection) -> Result<&RdmaDevice> {
+        self.devices
+            .rdma_devices()
+            .iter()
+            .find(|device| device.info().name.as_str() == selection.device_name)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidArgument,
+                    format!("RDMA device {} not found", selection.device_name),
+                )
+            })
     }
 
     /// Creates a QueuePair along with its CompChannel and CompletionQueue.
@@ -231,14 +257,239 @@ impl RdmaSocketPool {
         Ok((queue_pair, comp_channel, cq))
     }
 
-    /// Constructs an Endpoint from a QueuePair.
-    fn make_endpoint(&self, qp: &QueuePair, device: &RdmaDevice) -> Endpoint {
-        let info = device.inner().info();
-        Endpoint {
-            qp_num: qp.qp_num(),
-            lid: 0,
-            gid: info.ports[0].gids[1].gid,
+    fn select_device(&self, remote_info: &RdmaInfo) -> Result<SelectedDevice> {
+        let local_devices = self.devices.rdma_devices();
+        if local_devices.is_empty() {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "no local RDMA device available".into(),
+            ));
         }
+
+        let mut ib_matches = Vec::new();
+        let mut roce_matches = Vec::new();
+        let mut remote_usable_ports = 0usize;
+        let mut local_usable_ports = 0usize;
+        let mut link_layer_matches = 0usize;
+
+        for remote_device in &remote_info.devices {
+            for remote_port in &remote_device.ports {
+                if !Self::port_is_usable(remote_port) {
+                    continue;
+                }
+                remote_usable_ports += 1;
+
+                for (local_device_index, local_device) in local_devices.iter().enumerate() {
+                    let local_info = local_device.info();
+                    for local_port in &local_info.ports {
+                        if !Self::port_is_usable(local_port) {
+                            continue;
+                        }
+                        local_usable_ports += 1;
+                        if local_port.port_attr.link_layer != remote_port.port_attr.link_layer {
+                            continue;
+                        }
+                        link_layer_matches += 1;
+
+                        let Some((local_gid_index, remote_gid_index)) =
+                            Self::select_gid_pair(local_port, remote_port)
+                        else {
+                            continue;
+                        };
+
+                        let selected = SelectedDevice {
+                            local_device_index,
+                            local_port_num: local_port.port_num,
+                            local_gid_index,
+                            remote: DeviceSelection {
+                                device_name: remote_device.name.clone(),
+                                port_num: remote_port.port_num,
+                                gid_index: remote_gid_index,
+                            },
+                        };
+
+                        match local_port.port_attr.link_layer {
+                            LinkLayer::InfiniBand => ib_matches.push(selected),
+                            LinkLayer::Ethernet => roce_matches.push(selected),
+                            LinkLayer::Unspecified => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        let matches = if ib_matches.is_empty() {
+            &roce_matches
+        } else {
+            &ib_matches
+        };
+        if matches.is_empty() {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                format!(
+                    "no compatible RDMA device/port/GID pair found: remote_devices={} local_devices={} remote_usable_ports={} local_usable_ports={} link_layer_matches={}",
+                    remote_info.devices.len(),
+                    local_devices.len(),
+                    remote_usable_ports,
+                    local_usable_ports,
+                    link_layer_matches
+                ),
+            ));
+        }
+
+        let idx = self.next_device.fetch_add(1, Ordering::Relaxed) % matches.len();
+        Ok(matches[idx].clone())
+    }
+
+    fn port_is_usable(port: &Port) -> bool {
+        matches!(
+            port.port_attr.state,
+            ibv_port_state::IBV_PORT_ACTIVE | ibv_port_state::IBV_PORT_ACTIVE_DEFER
+        ) && matches!(
+            port.port_attr.link_layer,
+            LinkLayer::InfiniBand | LinkLayer::Ethernet
+        )
+    }
+
+    fn select_gid_pair(local_port: &Port, remote_port: &Port) -> Option<(u8, u8)> {
+        match local_port.port_attr.link_layer {
+            LinkLayer::InfiniBand => Some((
+                Self::first_gid_index(local_port, |_| true).unwrap_or(0),
+                Self::first_gid_index(remote_port, |_| true).unwrap_or(0),
+            )),
+            LinkLayer::Ethernet => Self::select_roce_gid_pair(local_port, remote_port),
+            LinkLayer::Unspecified => None,
+        }
+    }
+
+    fn select_roce_gid_pair(local_port: &Port, remote_port: &Port) -> Option<(u8, u8)> {
+        let preferred = [
+            (
+                Self::first_gid_index(local_port, |gid| matches!(gid.gid_type, GidType::RoCEv2)),
+                Self::first_gid_index(remote_port, |gid| matches!(gid.gid_type, GidType::RoCEv2)),
+            ),
+            (
+                Self::first_gid_index(local_port, |gid| matches!(gid.gid_type, GidType::RoCEv1)),
+                Self::first_gid_index(remote_port, |gid| matches!(gid.gid_type, GidType::RoCEv1)),
+            ),
+        ];
+
+        for (local, remote) in preferred {
+            if let (Some(local), Some(remote)) = (local, remote) {
+                return Some((local, remote));
+            }
+        }
+
+        for local_gid in &local_port.gids {
+            for remote_gid in &remote_port.gids {
+                if local_gid.gid_type == remote_gid.gid_type {
+                    return Some((
+                        u8::try_from(local_gid.index).ok()?,
+                        u8::try_from(remote_gid.index).ok()?,
+                    ));
+                }
+            }
+        }
+
+        Some((
+            Self::first_gid_index(local_port, |_| true)?,
+            Self::first_gid_index(remote_port, |_| true)?,
+        ))
+    }
+
+    fn first_gid_index(port: &Port, mut predicate: impl FnMut(&Gid) -> bool) -> Option<u8> {
+        port.gids
+            .iter()
+            .find(|gid| predicate(gid))
+            .and_then(|gid| u8::try_from(gid.index).ok())
+    }
+
+    /// Constructs an Endpoint from a QueuePair and selected local port/GID.
+    fn make_endpoint(
+        &self,
+        qp: &QueuePair,
+        device: &RdmaDevice,
+        port_num: u8,
+        gid_index: u8,
+    ) -> Result<Endpoint> {
+        let info = device.info();
+        let port = Self::find_port(&info, port_num)?;
+        if !Self::port_is_usable(port) {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                format!("RDMA port {}:{} is not active", info.name, port_num),
+            ));
+        }
+
+        let gid = port
+            .gids
+            .iter()
+            .find(|gid| u8::try_from(gid.index).ok() == Some(gid_index))
+            .map(|gid| gid.gid);
+        if port.port_attr.link_layer.is_ethernet() && gid.is_none() {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                format!(
+                    "RDMA port {}:{} does not have GID index {}",
+                    info.name, port_num, gid_index
+                ),
+            ));
+        }
+
+        Ok(Endpoint {
+            qp_num: qp.qp_num(),
+            port_num,
+            gid_index,
+            lid: port.port_attr.lid,
+            gid: gid.unwrap_or_default(),
+            link_layer: port.port_attr.link_layer,
+            active_mtu: port.port_attr.active_mtu,
+        })
+    }
+
+    fn find_port(info: &DeviceInfo, port_num: u8) -> Result<&Port> {
+        info.ports
+            .iter()
+            .find(|port| port.port_num == port_num)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidArgument,
+                    format!("RDMA port {}:{} not found", info.name, port_num),
+                )
+            })
+    }
+
+    fn connect_queue_pair(
+        &self,
+        qp: &QueuePair,
+        local: &Endpoint,
+        remote: &Endpoint,
+    ) -> Result<()> {
+        if local.link_layer != remote.link_layer {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                format!(
+                    "RDMA link layer mismatch: local {} remote {}",
+                    local.link_layer, remote.link_layer
+                ),
+            ));
+        }
+
+        let path_mtu = Self::min_mtu(local.active_mtu, remote.active_mtu);
+        qp.connect(
+            local.port_num,
+            local.gid_index,
+            local.link_layer,
+            path_mtu,
+            remote.qp_num,
+            remote.gid,
+            remote.lid,
+        )
+        .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))
+    }
+
+    fn min_mtu(a: ibv_mtu, b: ibv_mtu) -> ibv_mtu {
+        if (a as u32) <= (b as u32) { a } else { b }
     }
 
     /// Starts the event loop for handling RDMA events on a socket.
@@ -276,6 +527,7 @@ impl RdmaSocketPool {
 impl Drop for RdmaSocketPool {
     fn drop(&mut self) {
         self.task_supervisor.stop();
+        self.port_refresher.stop();
         self.socket_map.get_mut().clear();
     }
 }
@@ -284,4 +536,12 @@ impl std::fmt::Debug for RdmaSocketPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RdmaSocketPool").finish()
     }
+}
+
+#[derive(Clone)]
+struct SelectedDevice {
+    local_device_index: usize,
+    local_port_num: u8,
+    local_gid_index: u8,
+    remote: DeviceSelection,
 }
