@@ -7,7 +7,7 @@ use crate::{Context, Result, rdma, service};
 ///
 /// This structure is used to exchange RDMA device capabilities and
 /// configuration between services.
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
 pub struct RdmaInfo {
     /// List of available RDMA devices and their capabilities
     pub devices: Vec<ruapc_rdma::DeviceInfo>,
@@ -23,8 +23,12 @@ pub trait RdmaService {
     /// Retrieves information about available RDMA devices.
     async fn info(&self, ctx: &Context, _: &()) -> Result<rdma::RdmaInfo>;
 
-    /// Establishes an RDMA connection with the specified endpoint.
-    async fn connect(&self, ctx: &Context, endpoint: &rdma::Endpoint) -> Result<rdma::Endpoint>;
+    /// Establishes an RDMA connection with the selected server endpoint.
+    async fn connect(
+        &self,
+        ctx: &Context,
+        request: &rdma::ConnectRequest,
+    ) -> Result<rdma::Endpoint>;
 }
 
 /// Default implementation of `RdmaService` for the unit type.
@@ -38,8 +42,12 @@ impl RdmaService for () {
     }
 
     /// Establishes an RDMA connection using the socket pool.
-    async fn connect(&self, ctx: &Context, endpoint: &rdma::Endpoint) -> Result<rdma::Endpoint> {
-        ctx.state.socket_pool.rdma_connect(endpoint, &ctx.state)
+    async fn connect(
+        &self,
+        ctx: &Context,
+        request: &rdma::ConnectRequest,
+    ) -> Result<rdma::Endpoint> {
+        ctx.state.socket_pool.rdma_connect(request, &ctx.state)
     }
 }
 
@@ -81,10 +89,22 @@ mod tests {
         let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
         let endpoint = rdma::Endpoint {
             qp_num: 0,
+            port_num: 1,
+            gid_index: 0,
             gid: ruapc_rdma::ibv_gid::default(),
             lid: 0,
+            link_layer: ruapc_rdma::LinkLayer::Ethernet,
+            active_mtu: ruapc_rdma::ibv_mtu::IBV_MTU_512,
         };
-        let result = ().connect(&ctx, &endpoint).await;
+        let request = rdma::ConnectRequest {
+            endpoint,
+            target: rdma::DeviceSelection {
+                device_name: "missing".into(),
+                port_num: 1,
+                gid_index: 0,
+            },
+        };
+        let result = ().connect(&ctx, &request).await;
         assert!(result.is_err());
     }
 }

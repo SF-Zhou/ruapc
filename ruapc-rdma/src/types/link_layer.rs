@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 /// Corresponds to the `ibv_link_layer` enum from libibverbs:
 /// - IBV_LINK_LAYER_UNSPECIFIED = 0
 /// - IBV_LINK_LAYER_INFINIBAND = 1
-/// - IBV_LINK_LAYER_ETHERNET = 4
+/// - IBV_LINK_LAYER_ETHERNET = 2
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, JsonSchema)]
 pub enum LinkLayer {
@@ -21,7 +21,7 @@ pub enum LinkLayer {
     /// InfiniBand link layer
     InfiniBand = 1,
     /// Ethernet link layer (used for RoCE)
-    Ethernet = 4,
+    Ethernet = 2,
 }
 
 impl LinkLayer {
@@ -32,7 +32,7 @@ impl LinkLayer {
         match value {
             0 => Self::Unspecified,
             1 => Self::InfiniBand,
-            4 => Self::Ethernet,
+            2 => Self::Ethernet,
             _ => Self::Unspecified,
         }
     }
@@ -83,7 +83,7 @@ mod tests {
     fn test_link_layer_from_u8() {
         assert_eq!(LinkLayer::from_u8(0), LinkLayer::Unspecified);
         assert_eq!(LinkLayer::from_u8(1), LinkLayer::InfiniBand);
-        assert_eq!(LinkLayer::from_u8(4), LinkLayer::Ethernet);
+        assert_eq!(LinkLayer::from_u8(2), LinkLayer::Ethernet);
         assert_eq!(LinkLayer::from_u8(99), LinkLayer::Unspecified);
     }
 
@@ -91,14 +91,14 @@ mod tests {
     fn test_link_layer_from() {
         assert_eq!(LinkLayer::from(0u8), LinkLayer::Unspecified);
         assert_eq!(LinkLayer::from(1u8), LinkLayer::InfiniBand);
-        assert_eq!(LinkLayer::from(4u8), LinkLayer::Ethernet);
+        assert_eq!(LinkLayer::from(2u8), LinkLayer::Ethernet);
     }
 
     #[test]
     fn test_link_layer_to_u8() {
         assert_eq!(u8::from(LinkLayer::Unspecified), 0);
         assert_eq!(u8::from(LinkLayer::InfiniBand), 1);
-        assert_eq!(u8::from(LinkLayer::Ethernet), 4);
+        assert_eq!(u8::from(LinkLayer::Ethernet), 2);
     }
 
     #[test]

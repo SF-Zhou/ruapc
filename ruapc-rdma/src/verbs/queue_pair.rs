@@ -11,8 +11,8 @@ use ruapc_bufpool::{Buffer, DeviceIndex};
 
 use super::{completion_queue::CompletionQueue, protection_domain::ProtectionDomain};
 use crate::{
-    Error, ErrorKind, Result, WRID, ibv_gid, ibv_mtu, ibv_qp_attr, ibv_qp_attr_mask, ibv_qp_state,
-    ibv_wc,
+    Error, ErrorKind, LinkLayer, Result, WRID, ibv_gid, ibv_mtu, ibv_qp_attr, ibv_qp_attr_mask,
+    ibv_qp_state, ibv_wc,
 };
 
 pub struct Completion {
@@ -285,29 +285,55 @@ impl QueuePair {
         self.modify(&mut attr, mask.0 as _)
     }
 
-    pub fn ready_to_recv(&self, remote_qp_num: u32, gid: ibv_gid, lid: u16) -> Result<()> {
+    pub fn ready_to_recv(
+        &self,
+        remote_qp_num: u32,
+        remote_gid: ibv_gid,
+        remote_lid: u16,
+        local_port_num: u8,
+        local_gid_index: u8,
+        link_layer: LinkLayer,
+        path_mtu: ibv_mtu,
+    ) -> Result<()> {
+        let mut ah_attr = crate::ibv_ah_attr {
+            sl: 0,
+            src_path_bits: 0,
+            static_rate: 0,
+            port_num: local_port_num,
+            ..Default::default()
+        };
+
+        match link_layer {
+            LinkLayer::InfiniBand => {
+                ah_attr.dlid = remote_lid;
+                ah_attr.is_global = 0;
+            }
+            LinkLayer::Ethernet => {
+                ah_attr.grh = crate::ibv_global_route {
+                    dgid: remote_gid,
+                    flow_label: 0,
+                    sgid_index: local_gid_index,
+                    hop_limit: 0xff,
+                    traffic_class: 0,
+                };
+                ah_attr.is_global = 1;
+            }
+            LinkLayer::Unspecified => {
+                return Err(Error::new(
+                    ErrorKind::IBModifyQueuePairFail,
+                    "RDMA link layer is unspecified".into(),
+                ));
+            }
+        }
+
         let mut attr = ibv_qp_attr {
             qp_state: ibv_qp_state::IBV_QPS_RTR,
-            path_mtu: ibv_mtu::IBV_MTU_512,
+            path_mtu,
             dest_qp_num: remote_qp_num,
             rq_psn: 0,
             max_dest_rd_atomic: 1,
             min_rnr_timer: 0x12,
-            ah_attr: crate::ibv_ah_attr {
-                grh: crate::ibv_global_route {
-                    dgid: gid,
-                    flow_label: 0,
-                    sgid_index: 1,
-                    hop_limit: 0xff,
-                    traffic_class: 0,
-                },
-                dlid: lid,
-                sl: 0,
-                src_path_bits: 0,
-                static_rate: 0,
-                is_global: 1,
-                port_num: 1,
-            },
+            ah_attr,
             ..Default::default()
         };
         let mask = ibv_qp_attr_mask::IBV_QP_STATE
@@ -339,9 +365,26 @@ impl QueuePair {
         self.modify(&mut attr, mask.0 as _)
     }
 
-    pub fn connect(&self, remote_qp_num: u32, gid: ibv_gid, lid: u16) -> Result<()> {
-        self.init(1)?;
-        self.ready_to_recv(remote_qp_num, gid, lid)?;
+    pub fn connect(
+        &self,
+        local_port_num: u8,
+        local_gid_index: u8,
+        link_layer: LinkLayer,
+        path_mtu: ibv_mtu,
+        remote_qp_num: u32,
+        remote_gid: ibv_gid,
+        remote_lid: u16,
+    ) -> Result<()> {
+        self.init(local_port_num)?;
+        self.ready_to_recv(
+            remote_qp_num,
+            remote_gid,
+            remote_lid,
+            local_port_num,
+            local_gid_index,
+            link_layer,
+            path_mtu,
+        )?;
         self.ready_to_send()
     }
 

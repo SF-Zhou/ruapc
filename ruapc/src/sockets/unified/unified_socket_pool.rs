@@ -4,7 +4,7 @@ use futures_util::TryFutureExt;
 use tokio_util::sync::DropGuard;
 
 #[cfg(feature = "rdma")]
-use crate::rdma::{Endpoint, RdmaInfo, RdmaSocketPool};
+use crate::rdma::{ConnectRequest, Endpoint, RdmaInfo, RdmaSocketPool};
 use crate::{
     BufferPool, Devices, Error, ErrorKind, RawStream, Result, Socket, SocketPoolConfig,
     SocketPoolTrait, SocketType, State, TaskSupervisor,
@@ -125,8 +125,8 @@ impl SocketPoolTrait for UnifiedSocketPool {
     }
 
     #[cfg(feature = "rdma")]
-    fn rdma_connect(&self, endpoint: &Endpoint, state: &Arc<State>) -> Result<Endpoint> {
-        self.rdma_socket_pool.rdma_connect(endpoint, state)
+    fn rdma_connect(&self, request: &ConnectRequest, state: &Arc<State>) -> Result<Endpoint> {
+        self.rdma_socket_pool.rdma_connect(request, state)
     }
 
     fn stop(&self) {
@@ -211,12 +211,23 @@ mod tests {
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = UnifiedSocketPool::create(&config, &devices, &buffer_pool).unwrap();
         let (state, _guard) = crate::State::create(crate::Router::default(), &config).unwrap();
-        let endpoint = crate::rdma::Endpoint {
-            qp_num: 0,
-            gid: ruapc_rdma::ibv_gid::default(),
-            lid: 0,
+        let request = crate::rdma::ConnectRequest {
+            target: crate::rdma::DeviceSelection {
+                device_name: "missing".into(),
+                port_num: 1,
+                gid_index: 0,
+            },
+            endpoint: crate::rdma::Endpoint {
+                qp_num: 0,
+                port_num: 1,
+                gid_index: 0,
+                gid: ruapc_rdma::ibv_gid::default(),
+                lid: 0,
+                link_layer: ruapc_rdma::LinkLayer::Ethernet,
+                active_mtu: ruapc_rdma::ibv_mtu::IBV_MTU_512,
+            },
         };
-        assert!(pool.rdma_connect(&endpoint, &state).is_err());
+        assert!(pool.rdma_connect(&request, &state).is_err());
         pool.stop();
         pool.join().await;
     }
