@@ -43,3 +43,9 @@ pub use buffer::RdmaBuffer;
 
 mod device_info;
 pub use device_info::{DeviceInfo, Gid, GidType, Port};
+
+mod device_cap_flags;
+
+mod port_cap_flags;
+
+mod port_cap_flags2;

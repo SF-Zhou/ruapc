@@ -37,9 +37,10 @@ pub(crate) use ffi::*;
 // Publicly expose the generated types that appear in public API signatures
 pub use ffi::{
     ibv_access_flags, ibv_atomic_cap, ibv_comp_channel, ibv_context, ibv_cq, ibv_device_attr,
-    ibv_device_cap_flags, ibv_gid, ibv_mr, ibv_mtu, ibv_pd, ibv_port_attr, ibv_port_state, ibv_qp,
-    ibv_qp_attr, ibv_qp_attr_mask, ibv_qp_cap, ibv_qp_init_attr, ibv_qp_state, ibv_qp_type,
-    ibv_recv_wr, ibv_send_flags, ibv_send_wr, ibv_wc, ibv_wc_flags, ibv_wc_status,
+    ibv_device_cap_flags, ibv_gid, ibv_mr, ibv_mtu, ibv_pd, ibv_port_attr, ibv_port_cap_flags,
+    ibv_port_cap_flags2, ibv_port_state, ibv_qp, ibv_qp_attr, ibv_qp_attr_mask, ibv_qp_cap,
+    ibv_qp_init_attr, ibv_qp_state, ibv_qp_type, ibv_recv_wr, ibv_send_flags, ibv_send_wr,
+    ibv_transport_type, ibv_wc, ibv_wc_flags, ibv_wc_status,
 };
 
 mod error;
