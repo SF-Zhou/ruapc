@@ -3,6 +3,7 @@ use std::{
     net::SocketAddr,
     sync::Arc,
     sync::atomic::{AtomicUsize, Ordering},
+    time::{Duration, Instant},
 };
 
 use foldhash::fast::RandomState;
@@ -42,7 +43,11 @@ pub struct RdmaSocketPool {
     /// all spawned EventLoop tasks finish and release their `Arc<RdmaSocket>`.
     pub task_supervisor: TaskSupervisor,
     /// Background port/GID cache refresher. Dropped before RDMA devices.
-    pub(crate) port_refresher: RdmaDeviceRefresher,
+    port_refresher: RdmaDeviceRefresher,
+    /// Per-peer connection locks prevent duplicate in-flight RDMA handshakes.
+    connect_locks: dashmap::DashMap<SocketAddr, Arc<tokio::sync::Mutex<()>>, RandomState>,
+    /// Short-lived cache for the first-stage server RDMA device query.
+    query_cache: RwLock<HashMap<SocketAddr, CachedRdmaInfo, RandomState>>,
     /// Thread-safe map of active RDMA sockets indexed by their addresses.
     /// Dropped after tasks stop → destroys QPs.
     pub socket_map: RwLock<HashMap<SocketAddr, Arc<RdmaSocket>, RandomState>>,
@@ -132,49 +137,18 @@ impl SocketPoolTrait for RdmaSocketPool {
             return Ok(socket.into());
         }
 
-        // If not, create a new socket and insert it into the socket map.
-        let mut socket_map = self.socket_map.write().await;
-        if let Some(socket) = socket_map.get(addr) {
-            return Ok(socket.into());
-        }
-
-        let acquire_ctx = Context::create_with_state_and_addr(state, addr);
-        let remote_info = Box::pin(self.acquire_client.info(&acquire_ctx, &())).await?;
-        let selection = self.select_device(&remote_info)?;
-
-        let device = self
-            .devices
-            .rdma_devices()
-            .get(selection.local_device_index)
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::InvalidArgument,
-                    "selected RDMA device disappeared".into(),
-                )
-            })?;
-        let (queue_pair, comp_channel, cq) = self.create_queue_pair(device)?;
-        let local_endpoint = self.make_endpoint(
-            &queue_pair,
-            device,
-            selection.local_port_num,
-            selection.local_gid_index,
-        )?;
-
-        let connect_request = ConnectRequest {
-            endpoint: local_endpoint,
-            target: selection.remote,
-        };
-        let remote_endpoint =
-            Box::pin(self.acquire_client.connect(&acquire_ctx, &connect_request)).await?;
-        self.connect_queue_pair(&queue_pair, &local_endpoint, &remote_endpoint)?;
-        tracing::info!("acquired socket: {:?}", queue_pair);
-
-        let (tx, rx) = tokio::sync::mpsc::channel::<SendMsg>(1024);
-        let socket = RdmaSocket::new(queue_pair, self.buffer_pool.clone(), tx);
-        let socket = Arc::new(socket);
-        socket_map.insert(*addr, socket.clone());
-        self.start_event_loop(socket.clone(), state.clone(), comp_channel, cq, rx)?;
-        Ok(socket.into())
+        let connect_lock = self
+            .connect_locks
+            .entry(*addr)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let guard = connect_lock.lock().await;
+        let result = self.acquire_with_connect_lock(addr, state).await;
+        self.connect_locks.remove_if(addr, |_, value| {
+            Arc::ptr_eq(value, &connect_lock) && Arc::strong_count(value) == 2
+        });
+        drop(guard);
+        result
     }
 
     async fn handle_new_stream(
@@ -191,6 +165,8 @@ impl SocketPoolTrait for RdmaSocketPool {
 }
 
 impl RdmaSocketPool {
+    const QUERY_CACHE_TTL: Duration = Duration::from_secs(5);
+
     /// Creates a new pool using the shared devices and buffer pool.
     pub fn new(devices: Arc<Devices>, buffer_pool: Arc<BufferPool>) -> Result<Self> {
         Ok(Self {
@@ -201,6 +177,8 @@ impl RdmaSocketPool {
             },
             task_supervisor: TaskSupervisor::create(),
             port_refresher: RdmaDeviceRefresher::start(devices.clone())?,
+            connect_locks: dashmap::DashMap::default(),
+            query_cache: RwLock::default(),
             socket_map: RwLock::default(),
             buffer_pool,
             devices,
@@ -255,6 +233,108 @@ impl RdmaSocketPool {
             .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
 
         Ok((queue_pair, comp_channel, cq))
+    }
+
+    async fn acquire_with_connect_lock(
+        &self,
+        addr: &SocketAddr,
+        state: &Arc<State>,
+    ) -> Result<Socket> {
+        if let Some(socket) = self.socket_map.read().await.get(addr).cloned() {
+            return Ok(socket.into());
+        }
+
+        let acquire_ctx = Context::create_with_state_and_addr(state, addr);
+        let remote_info = self.query_remote_info(addr, &acquire_ctx).await?;
+        let selection = match self.select_device(&remote_info) {
+            Ok(selection) => selection,
+            Err(err) => {
+                self.invalidate_query_cache(addr).await;
+                return Err(err);
+            }
+        };
+
+        let device = self
+            .devices
+            .rdma_devices()
+            .get(selection.local_device_index)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidArgument,
+                    "selected RDMA device disappeared".into(),
+                )
+            })?;
+        let (queue_pair, comp_channel, cq) = self.create_queue_pair(device)?;
+        let local_endpoint = self.make_endpoint(
+            &queue_pair,
+            device,
+            selection.local_port_num,
+            selection.local_gid_index,
+        )?;
+
+        let connect_request = ConnectRequest {
+            endpoint: local_endpoint,
+            target: selection.remote.clone(),
+        };
+        let remote_endpoint =
+            match Box::pin(self.acquire_client.connect(&acquire_ctx, &connect_request)).await {
+                Ok(endpoint) => endpoint,
+                Err(err) => {
+                    self.invalidate_query_cache(addr).await;
+                    return Err(err);
+                }
+            };
+        self.connect_queue_pair(&queue_pair, &local_endpoint, &remote_endpoint)?;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<SendMsg>(1024);
+        let socket = RdmaSocket::new(queue_pair, self.buffer_pool.clone(), tx);
+        let socket = Arc::new(socket);
+        self.start_event_loop(socket.clone(), state.clone(), comp_channel, cq, rx)?;
+        {
+            let mut socket_map = self.socket_map.write().await;
+            socket_map.insert(*addr, socket.clone());
+        }
+        let local_info = device.info();
+        tracing::info!(
+            local_device = %local_info.name,
+            local_port = selection.local_port_num,
+            local_gid_index = selection.local_gid_index,
+            remote_device = %selection.remote.device_name,
+            remote_port = selection.remote.port_num,
+            remote_gid_index = selection.remote.gid_index,
+            "acquired RDMA socket"
+        );
+        Ok(socket.into())
+    }
+
+    async fn query_remote_info(&self, addr: &SocketAddr, ctx: &Context) -> Result<RdmaInfo> {
+        if let Some(info) = self.cached_remote_info(addr).await {
+            return Ok(info);
+        }
+
+        let info = Box::pin(self.acquire_client.info(ctx, &())).await?;
+        self.query_cache.write().await.insert(
+            *addr,
+            CachedRdmaInfo {
+                info: info.clone(),
+                cached_at: Instant::now(),
+            },
+        );
+        Ok(info)
+    }
+
+    async fn cached_remote_info(&self, addr: &SocketAddr) -> Option<RdmaInfo> {
+        let cache = self.query_cache.read().await;
+        let cached = cache.get(addr)?;
+        if cached.cached_at.elapsed() < Self::QUERY_CACHE_TTL {
+            Some(cached.info.clone())
+        } else {
+            None
+        }
+    }
+
+    async fn invalidate_query_cache(&self, addr: &SocketAddr) {
+        self.query_cache.write().await.remove(addr);
     }
 
     fn select_device(&self, remote_info: &RdmaInfo) -> Result<SelectedDevice> {
@@ -544,4 +624,9 @@ struct SelectedDevice {
     local_port_num: u8,
     local_gid_index: u8,
     remote: DeviceSelection,
+}
+
+struct CachedRdmaInfo {
+    info: RdmaInfo,
+    cached_at: Instant,
 }

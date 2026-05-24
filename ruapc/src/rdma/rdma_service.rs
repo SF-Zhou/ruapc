@@ -7,7 +7,7 @@ use crate::{Context, Result, rdma, service};
 ///
 /// This structure is used to exchange RDMA device capabilities and
 /// configuration between services.
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
 pub struct RdmaInfo {
     /// List of available RDMA devices and their capabilities
     pub devices: Vec<ruapc_rdma::DeviceInfo>,
