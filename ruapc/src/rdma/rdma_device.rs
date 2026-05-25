@@ -1,15 +1,8 @@
-use std::{
-    sync::{
-        Arc, Condvar, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
-    thread,
-    time::Duration,
-};
+use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use ruapc_bufpool::DeviceIndex;
-use ruapc_rdma::{ActiveDevice, DeviceInfo, Gid, ProtectionDomain};
+use ruapc_rdma::{ActiveDevice, Context, DeviceInfo, Gid, GidType, ProtectionDomain};
 
 pub struct RdmaDevice {
     index: DeviceIndex,
@@ -27,8 +20,8 @@ impl RdmaDevice {
         }
     }
 
-    pub fn inner(&self) -> &ActiveDevice {
-        &self.inner
+    pub fn context(&self) -> &Arc<Context> {
+        self.inner.context()
     }
 
     pub fn pd(&self) -> &Arc<ProtectionDomain> {
@@ -77,6 +70,11 @@ impl RdmaDevice {
                 &info.ibdev_path,
                 port_attr,
             ) {
+                // Filter out loopback addresses for RoCE v2 GIDs since they
+                // cannot be used for RDMA communication.
+                if matches!(gid_type, GidType::RoCEv2) && gid.as_ipv6().is_loopback() {
+                    continue;
+                }
                 gids.push(Gid {
                     index: gid_index,
                     gid,
@@ -85,99 +83,6 @@ impl RdmaDevice {
             }
         }
         gids
-    }
-}
-
-struct RefreshSignal {
-    stop: AtomicBool,
-    mutex: Mutex<()>,
-    condvar: Condvar,
-}
-
-impl RefreshSignal {
-    fn new() -> Self {
-        Self {
-            stop: AtomicBool::new(false),
-            mutex: Mutex::new(()),
-            condvar: Condvar::new(),
-        }
-    }
-}
-
-pub(crate) struct RdmaDeviceRefresher {
-    signal: Arc<RefreshSignal>,
-    handle: Mutex<Option<thread::JoinHandle<()>>>,
-}
-
-impl RdmaDeviceRefresher {
-    const REFRESH_INTERVAL: Duration = Duration::from_secs(15);
-
-    pub(crate) fn start(devices: Arc<crate::Devices>) -> crate::Result<Self> {
-        let signal = Arc::new(RefreshSignal::new());
-        let thread_signal = signal.clone();
-        let handle = thread::Builder::new()
-            .name("ruapc-rdma-port-refresh".into())
-            .spawn(move || {
-                while !thread_signal.stop.load(Ordering::Relaxed) {
-                    Self::refresh_all(&devices);
-
-                    let guard = thread_signal.mutex.lock().expect("RDMA refresher poisoned");
-                    let _ = thread_signal
-                        .condvar
-                        .wait_timeout_while(guard, Self::REFRESH_INTERVAL, |_| {
-                            !thread_signal.stop.load(Ordering::Relaxed)
-                        })
-                        .expect("RDMA refresher poisoned");
-                }
-            })
-            .map_err(|e| {
-                crate::Error::new(
-                    crate::ErrorKind::Unknown("RdmaDeviceRefresher".into()),
-                    e.to_string(),
-                )
-            })?;
-
-        Ok(Self {
-            signal,
-            handle: Mutex::new(Some(handle)),
-        })
-    }
-
-    pub(crate) fn stop(&self) {
-        self.signal.stop.store(true, Ordering::Relaxed);
-        self.signal.condvar.notify_all();
-
-        let Some(handle) = self
-            .handle
-            .lock()
-            .expect("RDMA refresher handle poisoned")
-            .take()
-        else {
-            return;
-        };
-
-        if handle.join().is_err() {
-            tracing::warn!("RDMA port attribute refresher thread panicked");
-        }
-    }
-
-    fn refresh_all(devices: &crate::Devices) {
-        for dev in devices.rdma_devices() {
-            if let Err(err) = dev.refresh_port_attrs() {
-                let info = dev.info();
-                tracing::warn!(
-                    device = %info.name,
-                    error = %err,
-                    "failed to refresh RDMA port attributes"
-                );
-            }
-        }
-    }
-}
-
-impl Drop for RdmaDeviceRefresher {
-    fn drop(&mut self) {
-        self.stop();
     }
 }
 
@@ -195,7 +100,7 @@ impl ruapc_bufpool::Device for RdmaDevice {
         mem: &Arc<ruapc_bufpool::AlignedMemory>,
     ) -> std::io::Result<Box<dyn ruapc_bufpool::Registration>> {
         let mr = self
-            .inner()
+            .inner
             .register(mem)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         Ok(Box::new(mr))
@@ -241,8 +146,8 @@ mod tests {
             index: 42,
         });
         assert_eq!(rdma.index().index, 42);
-        // inner() and pd() should not panic.
-        let _ = rdma.inner();
+        // context() and pd() should not panic.
+        let _ = rdma.context();
         let _ = rdma.pd();
     }
 }

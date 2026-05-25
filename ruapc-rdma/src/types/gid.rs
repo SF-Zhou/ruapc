@@ -160,4 +160,25 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
     }
+
+    #[test]
+    fn test_gid_is_loopback() {
+        // IPv6 loopback ::1
+        let loopback_v6 = make_gid(0, 1);
+        assert!(loopback_v6.as_ipv6().is_loopback());
+
+        // IPv4-mapped loopback ::ffff:127.0.0.1 — Ipv6Addr::is_loopback()
+        // only returns true for ::1, so IPv4-mapped addresses are not detected
+        // by the standard library method. This is expected behavior.
+        let loopback_v4_mapped = make_gid(0, 0x0000_ffff_7f00_0001);
+        assert!(!loopback_v4_mapped.as_ipv6().is_loopback());
+
+        // Non-loopback address
+        let normal = make_gid(0xfe80_0000_0000_0000, 1);
+        assert!(!normal.as_ipv6().is_loopback());
+
+        // Null GID is not loopback
+        let null = ibv_gid::default();
+        assert!(!null.as_ipv6().is_loopback());
+    }
 }
