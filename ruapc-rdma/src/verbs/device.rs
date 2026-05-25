@@ -9,7 +9,7 @@ use super::{
     context::Context, device_list::DeviceList, memory_region::MemoryRegion,
     protection_domain::ProtectionDomain,
 };
-use crate::{DeviceInfo, Gid, Guid, Port, Result};
+use crate::{DeviceInfo, Gid, GidType, Guid, Port, Result};
 
 /// Lightweight RDMA device handle.
 ///
@@ -192,6 +192,11 @@ impl ActiveDevice {
                 self.context
                     .query_gid_type(port_num, gid_index, &self.info.ibdev_path, port_attr)
             {
+                // Filter out loopback addresses for RoCE v2 GIDs since they
+                // cannot be used for RDMA communication.
+                if matches!(gid_type, GidType::RoCEv2) && gid.is_loopback() {
+                    continue;
+                }
                 gids.push(Gid {
                     index: gid_index,
                     gid,

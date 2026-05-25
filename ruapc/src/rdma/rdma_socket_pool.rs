@@ -176,7 +176,7 @@ impl RdmaSocketPool {
                 socket_type: Some(SocketType::TCP),
             },
             task_supervisor: TaskSupervisor::create(),
-            port_refresher: RdmaDeviceRefresher::start(devices.clone())?,
+            port_refresher: RdmaDeviceRefresher::start(devices.clone()),
             connect_locks: dashmap::DashMap::default(),
             query_cache: RwLock::default(),
             socket_map: RwLock::default(),

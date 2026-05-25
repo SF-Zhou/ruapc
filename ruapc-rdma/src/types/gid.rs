@@ -47,6 +47,23 @@ impl ibv_gid {
     pub fn is_null(&self) -> bool {
         self.interface_id() == 0
     }
+
+    /// Checks if the GID represents a loopback address.
+    ///
+    /// Returns `true` for IPv6 loopback (`::1`) and IPv4-mapped loopback
+    /// (`::ffff:127.x.x.x`).
+    pub fn is_loopback(&self) -> bool {
+        let addr = self.as_ipv6();
+        // IPv6 loopback ::1
+        if addr == Ipv6Addr::LOCALHOST {
+            return true;
+        }
+        // IPv4-mapped loopback ::ffff:127.x.x.x
+        if let Some(ipv4) = addr.to_ipv4_mapped() {
+            return ipv4.is_loopback();
+        }
+        false
+    }
 }
 
 impl std::fmt::Debug for ibv_gid {
@@ -159,5 +176,28 @@ mod tests {
         let c = make_gid(0xfe80_0000_0000_0000, 2);
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_gid_is_loopback() {
+        // IPv6 loopback ::1
+        let loopback_v6 = make_gid(0, 1);
+        assert!(loopback_v6.is_loopback());
+
+        // IPv4-mapped loopback ::ffff:127.0.0.1
+        let loopback_v4_mapped = make_gid(0, 0x0000_ffff_7f00_0001);
+        assert!(loopback_v4_mapped.is_loopback());
+
+        // IPv4-mapped loopback ::ffff:127.1.2.3
+        let loopback_v4_other = make_gid(0, 0x0000_ffff_7f01_0203);
+        assert!(loopback_v4_other.is_loopback());
+
+        // Non-loopback address
+        let normal = make_gid(0xfe80_0000_0000_0000, 1);
+        assert!(!normal.is_loopback());
+
+        // Null GID is not loopback
+        let null = ibv_gid::default();
+        assert!(!null.is_loopback());
     }
 }
