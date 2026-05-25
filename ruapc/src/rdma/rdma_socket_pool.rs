@@ -44,7 +44,7 @@ pub struct RdmaSocketPool {
     /// all spawned EventLoop tasks finish and release their `Arc<RdmaSocket>`.
     pub task_supervisor: TaskSupervisor,
     /// Background port/GID cache refresher. Dropped before RDMA devices.
-    port_refresher: RdmaDeviceRefresher,
+    _port_refresher: RdmaDeviceRefresher,
     /// Per-peer connection locks prevent duplicate in-flight RDMA handshakes.
     connect_locks: dashmap::DashMap<SocketAddr, Arc<tokio::sync::Mutex<()>>, RandomState>,
     /// Short-lived cache for the first-stage server RDMA device query.
@@ -74,7 +74,6 @@ impl SocketPoolTrait for RdmaSocketPool {
     /// Stops all tasks managed by the socket pool.
     fn stop(&self) {
         self.task_supervisor.stop();
-        self.port_refresher.stop();
     }
 
     /// Returns a guard that will stop all tasks when dropped.
@@ -163,14 +162,16 @@ impl RdmaSocketPool {
 
     /// Creates a new pool using the shared devices and buffer pool.
     pub fn new(devices: Arc<Devices>, buffer_pool: Arc<BufferPool>) -> Result<Self> {
+        let task_supervisor = TaskSupervisor::create();
+        let port_refresher = RdmaDeviceRefresher::start(devices.clone(), &task_supervisor);
         Ok(Self {
             acquire_client: Client {
                 timeout: std::time::Duration::from_secs(5),
                 use_msgpack: true,
                 socket_type: Some(SocketType::TCP),
             },
-            task_supervisor: TaskSupervisor::create(),
-            port_refresher: RdmaDeviceRefresher::start(devices.clone()),
+            task_supervisor,
+            _port_refresher: port_refresher,
             connect_locks: dashmap::DashMap::default(),
             device_list_cache: RwLock::default(),
             socket_map: RwLock::default(),
@@ -612,7 +613,6 @@ impl RdmaSocketPool {
 impl Drop for RdmaSocketPool {
     fn drop(&mut self) {
         self.task_supervisor.stop();
-        self.port_refresher.stop();
         self.socket_map.get_mut().clear();
     }
 }
