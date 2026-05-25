@@ -2,7 +2,10 @@ mod endpoint;
 pub(crate) use endpoint::{ConnectRequest, DeviceSelection, Endpoint};
 
 mod rdma_device;
-pub(crate) use rdma_device::{RdmaDevice, RdmaDeviceRefresher};
+pub(crate) use rdma_device::RdmaDevice;
+
+mod rdma_device_refresher;
+pub(crate) use rdma_device_refresher::RdmaDeviceRefresher;
 
 mod rdma_service;
 pub(crate) use rdma_service::{RdmaInfo, RdmaService};

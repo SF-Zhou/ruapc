@@ -9,12 +9,13 @@ use std::{
 use foldhash::fast::RandomState;
 use ruapc_bufpool::Device as _;
 use ruapc_rdma::{
-    CompChannel, CompletionQueue, DeviceInfo, Gid, GidType, LinkLayer, Port, QueuePair, ibv_mtu,
+    CompChannel, CompletionQueue, DeviceInfo, GidType, LinkLayer, Port, QueuePair, ibv_mtu,
     ibv_port_state, ibv_qp_cap, ibv_qp_init_attr, ibv_qp_type,
 };
 use tokio::sync::RwLock;
 use tokio_util::sync::DropGuard;
 
+use super::rdma_service::{RdmaGidInfo, RdmaPortInfo};
 use super::{
     ConnectRequest, DeviceSelection, Endpoint, EventLoop, RdmaDevice, RdmaDeviceRefresher,
     RdmaInfo, RdmaService, RdmaSocket,
@@ -88,14 +89,7 @@ impl SocketPoolTrait for RdmaSocketPool {
 
     /// Returns information about the available RDMA devices.
     fn rdma_info(&self) -> Result<RdmaInfo> {
-        Ok(RdmaInfo {
-            devices: self
-                .devices
-                .rdma_devices()
-                .iter()
-                .map(|d| (*d.info()).clone())
-                .collect(),
-        })
+        Ok(RdmaInfo::from_devices(self.devices.rdma_devices()))
     }
 
     /// Establishes a new RDMA connection with the specified endpoint.
@@ -354,7 +348,7 @@ impl RdmaSocketPool {
 
         for remote_device in &remote_info.devices {
             for remote_port in &remote_device.ports {
-                if !Self::port_is_usable(remote_port) {
+                if !Self::remote_port_is_usable(remote_port) {
                     continue;
                 }
                 remote_usable_ports += 1;
@@ -366,13 +360,13 @@ impl RdmaSocketPool {
                             continue;
                         }
                         local_usable_ports += 1;
-                        if local_port.port_attr.link_layer != remote_port.port_attr.link_layer {
+                        if local_port.port_attr.link_layer != remote_port.link_layer {
                             continue;
                         }
                         link_layer_matches += 1;
 
                         let Some((local_gid_index, remote_gid_index)) =
-                            Self::select_gid_pair(local_port, remote_port)
+                            Self::select_gid_pair_mixed(local_port, remote_port)
                         else {
                             continue;
                         };
@@ -431,26 +425,44 @@ impl RdmaSocketPool {
         )
     }
 
-    fn select_gid_pair(local_port: &Port, remote_port: &Port) -> Option<(u8, u8)> {
+    fn remote_port_is_usable(port: &RdmaPortInfo) -> bool {
+        matches!(
+            port.state,
+            ibv_port_state::IBV_PORT_ACTIVE | ibv_port_state::IBV_PORT_ACTIVE_DEFER
+        ) && matches!(port.link_layer, LinkLayer::InfiniBand | LinkLayer::Ethernet)
+    }
+
+    fn select_gid_pair_mixed(local_port: &Port, remote_port: &RdmaPortInfo) -> Option<(u8, u8)> {
         match local_port.port_attr.link_layer {
             LinkLayer::InfiniBand => Some((
-                Self::first_gid_index(local_port, |_| true).unwrap_or(0),
-                Self::first_gid_index(remote_port, |_| true).unwrap_or(0),
+                Self::first_local_gid_index(local_port, |_| true).unwrap_or(0),
+                Self::first_remote_gid_index(remote_port, |_| true).unwrap_or(0),
             )),
-            LinkLayer::Ethernet => Self::select_roce_gid_pair(local_port, remote_port),
+            LinkLayer::Ethernet => Self::select_roce_gid_pair_mixed(local_port, remote_port),
             LinkLayer::Unspecified => None,
         }
     }
 
-    fn select_roce_gid_pair(local_port: &Port, remote_port: &Port) -> Option<(u8, u8)> {
+    fn select_roce_gid_pair_mixed(
+        local_port: &Port,
+        remote_port: &RdmaPortInfo,
+    ) -> Option<(u8, u8)> {
         let preferred = [
             (
-                Self::first_gid_index(local_port, |gid| matches!(gid.gid_type, GidType::RoCEv2)),
-                Self::first_gid_index(remote_port, |gid| matches!(gid.gid_type, GidType::RoCEv2)),
+                Self::first_local_gid_index(local_port, |gid| {
+                    matches!(gid.gid_type, GidType::RoCEv2)
+                }),
+                Self::first_remote_gid_index(remote_port, |gid| {
+                    matches!(gid.gid_type, GidType::RoCEv2)
+                }),
             ),
             (
-                Self::first_gid_index(local_port, |gid| matches!(gid.gid_type, GidType::RoCEv1)),
-                Self::first_gid_index(remote_port, |gid| matches!(gid.gid_type, GidType::RoCEv1)),
+                Self::first_local_gid_index(local_port, |gid| {
+                    matches!(gid.gid_type, GidType::RoCEv1)
+                }),
+                Self::first_remote_gid_index(remote_port, |gid| {
+                    matches!(gid.gid_type, GidType::RoCEv1)
+                }),
             ),
         ];
 
@@ -472,12 +484,25 @@ impl RdmaSocketPool {
         }
 
         Some((
-            Self::first_gid_index(local_port, |_| true)?,
-            Self::first_gid_index(remote_port, |_| true)?,
+            Self::first_local_gid_index(local_port, |_| true)?,
+            Self::first_remote_gid_index(remote_port, |_| true)?,
         ))
     }
 
-    fn first_gid_index(port: &Port, mut predicate: impl FnMut(&Gid) -> bool) -> Option<u8> {
+    fn first_local_gid_index(
+        port: &Port,
+        mut predicate: impl FnMut(&ruapc_rdma::Gid) -> bool,
+    ) -> Option<u8> {
+        port.gids
+            .iter()
+            .find(|gid| predicate(gid))
+            .and_then(|gid| u8::try_from(gid.index).ok())
+    }
+
+    fn first_remote_gid_index(
+        port: &RdmaPortInfo,
+        mut predicate: impl FnMut(&RdmaGidInfo) -> bool,
+    ) -> Option<u8> {
         port.gids
             .iter()
             .find(|gid| predicate(gid))

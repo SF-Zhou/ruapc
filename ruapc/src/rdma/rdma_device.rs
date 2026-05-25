@@ -1,9 +1,8 @@
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use ruapc_bufpool::DeviceIndex;
-use ruapc_rdma::{ActiveDevice, DeviceInfo, Gid, ProtectionDomain};
-use tokio_util::sync::CancellationToken;
+use ruapc_rdma::{ActiveDevice, DeviceInfo, Gid, GidType, ProtectionDomain};
 
 pub struct RdmaDevice {
     index: DeviceIndex,
@@ -73,7 +72,7 @@ impl RdmaDevice {
             ) {
                 // Filter out loopback addresses for RoCE v2 GIDs since they
                 // cannot be used for RDMA communication.
-                if matches!(gid_type, ruapc_rdma::GidType::RoCEv2) && gid.is_loopback() {
+                if matches!(gid_type, GidType::RoCEv2) && gid.as_ipv6().is_loopback() {
                     continue;
                 }
                 gids.push(Gid {
@@ -84,57 +83,6 @@ impl RdmaDevice {
             }
         }
         gids
-    }
-}
-
-pub(crate) struct RdmaDeviceRefresher {
-    cancel: CancellationToken,
-    handle: tokio::task::JoinHandle<()>,
-}
-
-impl RdmaDeviceRefresher {
-    const REFRESH_INTERVAL: Duration = Duration::from_secs(15);
-
-    pub(crate) fn start(devices: Arc<crate::Devices>) -> Self {
-        let cancel = CancellationToken::new();
-        let token = cancel.clone();
-        let handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Self::REFRESH_INTERVAL);
-            loop {
-                tokio::select! {
-                    _ = token.cancelled() => break,
-                    _ = interval.tick() => {
-                        Self::refresh_all(&devices);
-                    }
-                }
-            }
-        });
-
-        Self { cancel, handle }
-    }
-
-    pub(crate) fn stop(&self) {
-        self.cancel.cancel();
-    }
-
-    fn refresh_all(devices: &crate::Devices) {
-        for dev in devices.rdma_devices() {
-            if let Err(err) = dev.refresh_port_attrs() {
-                let info = dev.info();
-                tracing::warn!(
-                    device = %info.name,
-                    error = %err,
-                    "failed to refresh RDMA port attributes"
-                );
-            }
-        }
-    }
-}
-
-impl Drop for RdmaDeviceRefresher {
-    fn drop(&mut self) {
-        self.cancel.cancel();
-        self.handle.abort();
     }
 }
 
