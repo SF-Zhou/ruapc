@@ -199,7 +199,7 @@ impl RdmaSocketPool {
         device: &RdmaDevice,
     ) -> Result<(QueuePair, Arc<CompChannel>, Arc<CompletionQueue>)> {
         let rdma = device;
-        let ctx = rdma.inner().context();
+        let ctx = rdma.context();
         let pd = rdma.pd();
 
         let comp_channel = CompChannel::create(ctx)

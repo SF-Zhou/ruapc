@@ -4,16 +4,15 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) struct RdmaDeviceRefresher {
     cancel: CancellationToken,
-    handle: tokio::task::JoinHandle<()>,
 }
 
 impl RdmaDeviceRefresher {
-    const REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+    const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
     pub(crate) fn start(devices: Arc<crate::Devices>) -> Self {
         let cancel = CancellationToken::new();
         let token = cancel.clone();
-        let handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             let mut interval = tokio::time::interval(Self::REFRESH_INTERVAL);
             loop {
                 tokio::select! {
@@ -25,7 +24,7 @@ impl RdmaDeviceRefresher {
             }
         });
 
-        Self { cancel, handle }
+        Self { cancel }
     }
 
     pub(crate) fn stop(&self) {
@@ -49,6 +48,5 @@ impl RdmaDeviceRefresher {
 impl Drop for RdmaDeviceRefresher {
     fn drop(&mut self) {
         self.cancel.cancel();
-        self.handle.abort();
     }
 }

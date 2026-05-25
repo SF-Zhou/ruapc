@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use ruapc_bufpool::DeviceIndex;
-use ruapc_rdma::{ActiveDevice, DeviceInfo, Gid, GidType, ProtectionDomain};
+use ruapc_rdma::{ActiveDevice, Context, DeviceInfo, Gid, GidType, ProtectionDomain};
 
 pub struct RdmaDevice {
     index: DeviceIndex,
@@ -20,8 +20,8 @@ impl RdmaDevice {
         }
     }
 
-    pub fn inner(&self) -> &ActiveDevice {
-        &self.inner
+    pub fn context(&self) -> &Arc<Context> {
+        self.inner.context()
     }
 
     pub fn pd(&self) -> &Arc<ProtectionDomain> {
@@ -100,7 +100,7 @@ impl ruapc_bufpool::Device for RdmaDevice {
         mem: &Arc<ruapc_bufpool::AlignedMemory>,
     ) -> std::io::Result<Box<dyn ruapc_bufpool::Registration>> {
         let mr = self
-            .inner()
+            .inner
             .register(mem)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         Ok(Box::new(mr))
@@ -146,8 +146,8 @@ mod tests {
             index: 42,
         });
         assert_eq!(rdma.index().index, 42);
-        // inner() and pd() should not panic.
-        let _ = rdma.inner();
+        // context() and pd() should not panic.
+        let _ = rdma.context();
         let _ = rdma.pd();
     }
 }
