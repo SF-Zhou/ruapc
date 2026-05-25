@@ -120,13 +120,13 @@ impl SocketPoolTrait for UnifiedSocketPool {
     }
 
     #[cfg(feature = "rdma")]
-    fn rdma_info(&self) -> Result<RdmaInfo> {
-        self.rdma_socket_pool.rdma_info()
+    fn rdma_device_list(&self) -> Result<RdmaInfo> {
+        self.rdma_socket_pool.rdma_device_list()
     }
 
     #[cfg(feature = "rdma")]
-    fn rdma_connect(&self, request: &ConnectRequest, state: &Arc<State>) -> Result<Endpoint> {
-        self.rdma_socket_pool.rdma_connect(request, state)
+    fn rdma_accept(&self, request: &ConnectRequest, state: &Arc<State>) -> Result<Endpoint> {
+        self.rdma_socket_pool.rdma_accept(request, state)
     }
 
     fn stop(&self) {
@@ -187,14 +187,14 @@ mod tests {
 
     #[cfg(feature = "rdma")]
     #[tokio::test]
-    async fn test_unified_socket_pool_rdma_info() {
+    async fn test_unified_socket_pool_rdma_device_list() {
         let devices = make_rdma_devices();
         let config = crate::SocketPoolConfig {
             socket_type: crate::SocketType::UNIFIED,
         };
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = UnifiedSocketPool::create(&config, &devices, &buffer_pool).unwrap();
-        let info = pool.rdma_info().unwrap();
+        let info = pool.rdma_device_list().unwrap();
         assert!(!info.devices.is_empty());
         pool.stop();
         pool.join().await;
@@ -202,8 +202,8 @@ mod tests {
 
     #[cfg(feature = "rdma")]
     #[tokio::test]
-    async fn test_unified_socket_pool_rdma_connect_no_device_returns_err() {
-        // Unified pool without RDMA devices: rdma_connect should return an error.
+    async fn test_unified_socket_pool_rdma_accept_no_device_returns_err() {
+        // Unified pool without RDMA devices: rdma_accept should return an error.
         let config = crate::SocketPoolConfig {
             socket_type: crate::SocketType::UNIFIED,
         };
@@ -227,7 +227,7 @@ mod tests {
                 active_mtu: ruapc_rdma::ibv_mtu::IBV_MTU_512,
             },
         };
-        assert!(pool.rdma_connect(&request, &state).is_err());
+        assert!(pool.rdma_accept(&request, &state).is_err());
         pool.stop();
         pool.join().await;
     }

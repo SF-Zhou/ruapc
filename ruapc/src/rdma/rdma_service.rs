@@ -123,7 +123,7 @@ pub trait RdmaService {
 impl RdmaService for () {
     /// Retrieves RDMA device information from the socket pool.
     async fn info(&self, ctx: &Context, (): &()) -> Result<rdma::RdmaInfo> {
-        ctx.state.socket_pool.rdma_info()
+        ctx.state.socket_pool.rdma_device_list()
     }
 
     /// Establishes an RDMA connection using the socket pool.
@@ -132,7 +132,7 @@ impl RdmaService for () {
         ctx: &Context,
         request: &rdma::ConnectRequest,
     ) -> Result<rdma::Endpoint> {
-        ctx.state.socket_pool.rdma_connect(request, &ctx.state)
+        ctx.state.socket_pool.rdma_accept(request, &ctx.state)
     }
 }
 
@@ -170,7 +170,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rdma_service_connect_non_rdma_returns_err() {
-        // With a TCP pool, `connect` should propagate the error from rdma_connect.
+        // With a TCP pool, `connect` should propagate the error from rdma_accept.
         let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
         let endpoint = rdma::Endpoint {
             qp_num: 0,

@@ -130,7 +130,7 @@ pub trait SocketPoolTrait: Sized {
     async fn join(&self);
 
     #[cfg(feature = "rdma")]
-    fn rdma_info(&self) -> Result<crate::rdma::RdmaInfo> {
+    fn rdma_device_list(&self) -> Result<crate::rdma::RdmaInfo> {
         Err(Error::new(
             ErrorKind::InvalidArgument,
             "RDMA is not supported: invalid socket type".into(),
@@ -139,7 +139,7 @@ pub trait SocketPoolTrait: Sized {
 
     #[cfg(feature = "rdma")]
     #[allow(unused_variables)]
-    fn rdma_connect(&self, request: &ConnectRequest, state: &Arc<State>) -> Result<Endpoint> {
+    fn rdma_accept(&self, request: &ConnectRequest, state: &Arc<State>) -> Result<Endpoint> {
         Err(Error::new(
             ErrorKind::InvalidArgument,
             "RDMA is not supported: invalid socket type".into(),
@@ -235,10 +235,10 @@ impl SocketPool {
     }
 
     #[cfg(feature = "rdma")]
-    pub fn rdma_info(&self) -> Result<crate::rdma::RdmaInfo> {
+    pub fn rdma_device_list(&self) -> Result<crate::rdma::RdmaInfo> {
         match self {
-            SocketPool::RDMA(p) => p.rdma_info(),
-            SocketPool::UNIFIED(p) => p.rdma_info(),
+            SocketPool::RDMA(p) => p.rdma_device_list(),
+            SocketPool::UNIFIED(p) => p.rdma_device_list(),
             _ => Err(Error::new(
                 ErrorKind::InvalidArgument,
                 "RDMA is not supported: invalid socket type".into(),
@@ -247,10 +247,10 @@ impl SocketPool {
     }
 
     #[cfg(feature = "rdma")]
-    pub fn rdma_connect(&self, request: &ConnectRequest, state: &Arc<State>) -> Result<Endpoint> {
+    pub fn rdma_accept(&self, request: &ConnectRequest, state: &Arc<State>) -> Result<Endpoint> {
         match self {
-            SocketPool::RDMA(p) => p.rdma_connect(request, state),
-            SocketPool::UNIFIED(p) => p.rdma_connect(request, state),
+            SocketPool::RDMA(p) => p.rdma_accept(request, state),
+            SocketPool::UNIFIED(p) => p.rdma_accept(request, state),
             _ => Err(Error::new(
                 ErrorKind::InvalidArgument,
                 "RDMA is not supported: invalid socket type".into(),
@@ -409,32 +409,32 @@ mod tests {
 
     #[cfg(feature = "rdma")]
     #[tokio::test]
-    async fn test_socket_pool_rdma_info_from_rdma_pool() {
+    async fn test_socket_pool_rdma_device_list_from_rdma_pool() {
         let devices = make_rdma_devices();
         let config = SocketPoolConfig {
             socket_type: SocketType::RDMA,
         };
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
-        let info = pool.rdma_info().unwrap();
+        let info = pool.rdma_device_list().unwrap();
         assert!(!info.devices.is_empty());
     }
 
     #[cfg(feature = "rdma")]
     #[tokio::test]
-    async fn test_socket_pool_rdma_info_from_non_rdma_returns_err() {
+    async fn test_socket_pool_rdma_device_list_from_non_rdma_returns_err() {
         let config = SocketPoolConfig::default(); // TCP pool
         let devices = std::sync::Arc::new(crate::Devices::default());
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
-        assert!(pool.rdma_info().is_err());
+        assert!(pool.rdma_device_list().is_err());
         pool.stop();
         pool.join().await;
     }
 
     #[cfg(feature = "rdma")]
     #[tokio::test]
-    async fn test_socket_pool_rdma_connect_non_rdma_returns_err() {
+    async fn test_socket_pool_rdma_accept_non_rdma_returns_err() {
         let config = SocketPoolConfig::default(); // TCP pool
         let devices = std::sync::Arc::new(crate::Devices::default());
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
@@ -456,7 +456,7 @@ mod tests {
                 active_mtu: ruapc_rdma::ibv_mtu::IBV_MTU_512,
             },
         };
-        assert!(pool.rdma_connect(&request, &state).is_err());
+        assert!(pool.rdma_accept(&request, &state).is_err());
         pool.stop();
         pool.join().await;
     }
