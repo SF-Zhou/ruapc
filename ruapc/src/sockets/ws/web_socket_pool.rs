@@ -205,6 +205,7 @@ mod tests {
     async fn test_web_socket_pool_debug_format() {
         let config = crate::SocketPoolConfig {
             socket_type: crate::SocketType::WS,
+            ..Default::default()
         };
         let devices = Arc::new(crate::Devices::default());
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
@@ -221,6 +222,7 @@ mod tests {
     async fn test_web_socket_pool_acquire_wrong_type_returns_err() {
         let config = crate::SocketPoolConfig {
             socket_type: crate::SocketType::WS,
+            ..Default::default()
         };
         let devices = Arc::new(crate::Devices::default());
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
@@ -230,6 +232,7 @@ mod tests {
             crate::Router::default(),
             &crate::SocketPoolConfig {
                 socket_type: crate::SocketType::TCP,
+                ..Default::default()
             },
         )
         .unwrap();

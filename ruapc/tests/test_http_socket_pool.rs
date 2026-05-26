@@ -26,6 +26,7 @@ async fn test_http_openapi_json_endpoint() {
 
     let config = SocketPoolConfig {
         socket_type: SocketType::UNIFIED,
+        ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
@@ -62,6 +63,7 @@ async fn test_http_rapidoc_js_endpoint() {
 
     let config = SocketPoolConfig {
         socket_type: SocketType::UNIFIED,
+        ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
@@ -97,6 +99,7 @@ async fn test_http_rapidoc_html_endpoints() {
 
     let config = SocketPoolConfig {
         socket_type: SocketType::UNIFIED,
+        ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
@@ -135,6 +138,7 @@ async fn test_http_not_found_endpoint() {
 
     let config = SocketPoolConfig {
         socket_type: SocketType::UNIFIED,
+        ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
@@ -165,6 +169,7 @@ async fn test_http_post_request_processing() {
 
     let config = SocketPoolConfig {
         socket_type: SocketType::UNIFIED,
+        ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
@@ -197,6 +202,7 @@ async fn test_http_websocket_upgrade() {
 
     let config = SocketPoolConfig {
         socket_type: SocketType::UNIFIED,
+        ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
@@ -230,6 +236,7 @@ async fn test_http_concurrent_requests() {
 
     let config = SocketPoolConfig {
         socket_type: SocketType::UNIFIED,
+        ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
@@ -285,6 +292,7 @@ async fn test_http_malformed_request_body() {
 
     let config = SocketPoolConfig {
         socket_type: SocketType::UNIFIED,
+        ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
@@ -316,6 +324,7 @@ async fn test_http_large_request_body() {
 
     let config = SocketPoolConfig {
         socket_type: SocketType::UNIFIED,
+        ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
@@ -349,6 +358,7 @@ async fn test_http_method_variants() {
 
     let config = SocketPoolConfig {
         socket_type: SocketType::UNIFIED,
+        ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
@@ -392,6 +402,7 @@ async fn test_http_edge_case_paths() {
 
     let config = SocketPoolConfig {
         socket_type: SocketType::UNIFIED,
+        ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();

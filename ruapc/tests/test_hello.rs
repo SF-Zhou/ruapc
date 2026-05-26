@@ -36,6 +36,7 @@ async fn test_hello() {
 
         let config = SocketPoolConfig {
             socket_type: SocketType::UNIFIED,
+            ..Default::default()
         };
         let server = ruapc::Server::create(router, &config).unwrap();
         let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
@@ -66,6 +67,7 @@ async fn test_http() {
 
     let config = SocketPoolConfig {
         socket_type: SocketType::UNIFIED,
+        ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
@@ -103,6 +105,7 @@ async fn test_rdma() {
 
     let config = SocketPoolConfig {
         socket_type: SocketType::UNIFIED,
+        ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();

@@ -177,6 +177,7 @@ mod tests {
     async fn test_unified_socket_pool_debug_format() {
         let config = crate::SocketPoolConfig {
             socket_type: crate::SocketType::UNIFIED,
+            ..Default::default()
         };
         let devices = Arc::new(crate::Devices::default());
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
@@ -191,6 +192,7 @@ mod tests {
         let devices = make_rdma_devices();
         let config = crate::SocketPoolConfig {
             socket_type: crate::SocketType::UNIFIED,
+            ..Default::default()
         };
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = UnifiedSocketPool::create(&config, &devices, &buffer_pool).unwrap();
@@ -206,11 +208,13 @@ mod tests {
         // Unified pool without RDMA devices: rdma_accept should return an error.
         let config = crate::SocketPoolConfig {
             socket_type: crate::SocketType::UNIFIED,
+            ..Default::default()
         };
         let devices = Arc::new(crate::Devices::default()); // TCP only
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = UnifiedSocketPool::create(&config, &devices, &buffer_pool).unwrap();
         let (state, _guard) = crate::State::create(crate::Router::default(), &config).unwrap();
+        let default_rdma = crate::RdmaConfig::default();
         let request = crate::rdma::ConnectRequest {
             target: crate::rdma::DeviceSelection {
                 device_name: "missing".into(),
@@ -225,6 +229,22 @@ mod tests {
                 lid: 0,
                 link_layer: ruapc_rdma::LinkLayer::Ethernet,
                 active_mtu: ruapc_rdma::ibv_mtu::IBV_MTU_512,
+            },
+            qp_caps: crate::rdma::RdmaQpCaps {
+                max_send_wr: default_rdma.max_send_wr,
+                max_recv_wr: default_rdma.max_recv_wr,
+                max_send_sge: default_rdma.max_send_sge,
+                max_recv_sge: default_rdma.max_recv_sge,
+                max_inline_data: default_rdma.max_inline_data,
+            },
+            qp_params: crate::rdma::RdmaQpParams {
+                pkey_index: default_rdma.pkey_index,
+                max_dest_rd_atomic: default_rdma.max_dest_rd_atomic,
+                min_rnr_timer: default_rdma.min_rnr_timer,
+                timeout: default_rdma.timeout,
+                retry_cnt: default_rdma.retry_cnt,
+                rnr_retry: default_rdma.rnr_retry,
+                max_rd_atomic: default_rdma.max_rd_atomic,
             },
         };
         assert!(pool.rdma_accept(&request, &state).is_err());

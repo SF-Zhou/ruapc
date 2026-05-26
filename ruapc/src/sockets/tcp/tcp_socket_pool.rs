@@ -226,6 +226,7 @@ mod tests {
             crate::Router::default(),
             &crate::SocketPoolConfig {
                 socket_type: SocketType::TCP,
+                ..Default::default()
             },
         )
         .unwrap();

@@ -1,3 +1,6 @@
+mod config;
+pub use config::RdmaConfig;
+
 mod endpoint;
 pub(crate) use endpoint::{ConnectRequest, DeviceSelection, Endpoint};
 
@@ -9,6 +12,9 @@ pub(crate) use rdma_device_refresher::RdmaDeviceRefresher;
 
 mod rdma_service;
 pub(crate) use rdma_service::{RdmaInfo, RdmaService};
+// Re-exported for use in tests and sibling modules.
+#[allow(unused_imports)]
+pub(crate) use rdma_service::{RdmaQpCaps, RdmaQpParams};
 
 mod rdma_state;
 pub(crate) use rdma_state::RdmaState;

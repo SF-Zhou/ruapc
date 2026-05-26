@@ -9,16 +9,16 @@ use std::{
 use foldhash::fast::RandomState;
 use ruapc_bufpool::Device as _;
 use ruapc_rdma::{
-    CompChannel, CompletionQueue, DeviceInfo, GidType, LinkLayer, Port, QueuePair, ibv_mtu,
-    ibv_port_state, ibv_qp_cap, ibv_qp_init_attr, ibv_qp_type,
+    CompChannel, CompletionQueue, DeviceInfo, GidType, LinkLayer, Port, QpConnectParams, QueuePair,
+    ibv_mtu, ibv_port_state, ibv_qp_cap, ibv_qp_init_attr, ibv_qp_type,
 };
 use tokio::sync::RwLock;
 use tokio_util::sync::DropGuard;
 
-use super::rdma_service::{RdmaGidInfo, RdmaPortInfo};
+use super::rdma_service::{RdmaGidInfo, RdmaPortInfo, RdmaQpCaps, RdmaQpParams};
 use super::{
-    ConnectRequest, DeviceSelection, Endpoint, EventLoop, RdmaDevice, RdmaDeviceRefresher,
-    RdmaInfo, RdmaService, RdmaSocket,
+    ConnectRequest, DeviceSelection, Endpoint, EventLoop, RdmaConfig, RdmaDevice,
+    RdmaDeviceRefresher, RdmaInfo, RdmaService, RdmaSocket,
 };
 use crate::{
     BufferPool, Client, Context, Devices, Error, ErrorKind, Result, Socket, SocketPoolConfig,
@@ -38,6 +38,8 @@ use crate::{
 /// Rust drops struct fields in **declaration order**, so the fields below
 /// are intentionally ordered to satisfy the ibverbs requirement.
 pub struct RdmaSocketPool {
+    /// RDMA-specific configuration for QP creation and state transitions.
+    pub config: RdmaConfig,
     /// Client used for acquiring RDMA connections (no RDMA resources).
     pub acquire_client: Client,
     /// Supervisor for managing asynchronous tasks — dropped first so that
@@ -64,11 +66,12 @@ pub struct RdmaSocketPool {
 
 impl SocketPoolTrait for RdmaSocketPool {
     fn create(
-        _config: &SocketPoolConfig,
+        config: &SocketPoolConfig,
         devices: &Arc<Devices>,
         buffer_pool: &Arc<BufferPool>,
     ) -> Result<Self> {
-        Self::new(devices.clone(), buffer_pool.clone())
+        let rdma_config = config.rdma.clone().unwrap_or_default();
+        Self::new(rdma_config, devices.clone(), buffer_pool.clone())
     }
 
     /// Stops all tasks managed by the socket pool.
@@ -88,24 +91,35 @@ impl SocketPoolTrait for RdmaSocketPool {
 
     /// Returns information about the available RDMA devices.
     fn rdma_device_list(&self) -> Result<RdmaInfo> {
-        Ok(RdmaInfo::from_devices(self.devices.rdma_devices()))
+        Ok(RdmaInfo::from_devices(
+            self.devices.rdma_devices(),
+            &self.config,
+        ))
     }
 
     /// Establishes a new RDMA connection with the specified endpoint.
     fn rdma_accept(&self, request: &ConnectRequest, state: &Arc<State>) -> Result<Endpoint> {
         let device = self.find_device_by_name(&request.target)?;
-        let (queue_pair, comp_channel, cq) = self.create_queue_pair(device)?;
+        let (queue_pair, comp_channel, cq) = self.create_queue_pair(device, &request.qp_caps)?;
         let local_endpoint = self.build_endpoint(
             &queue_pair,
             device,
             request.target.port_num,
             request.target.gid_index,
         )?;
-        self.bring_qp_to_rts(&queue_pair, &local_endpoint, &request.endpoint)?;
+        let params = QpConnectParams::from(&request.qp_params);
+        self.bring_qp_to_rts(&queue_pair, &local_endpoint, &request.endpoint, &params)?;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<SendMsg>(1024);
         let rdma_socket = RdmaSocket::new(queue_pair, self.buffer_pool.clone(), tx);
-        self.spawn_event_loop(Arc::new(rdma_socket), state.clone(), comp_channel, cq, rx)?;
+        self.spawn_event_loop(
+            Arc::new(rdma_socket),
+            state.clone(),
+            comp_channel,
+            cq,
+            rx,
+            request.qp_caps.max_recv_wr,
+        )?;
         Ok(local_endpoint)
     }
 
@@ -161,10 +175,15 @@ impl RdmaSocketPool {
     const DEVICE_LIST_CACHE_TTL: Duration = Duration::from_secs(5);
 
     /// Creates a new pool using the shared devices and buffer pool.
-    pub fn new(devices: Arc<Devices>, buffer_pool: Arc<BufferPool>) -> Result<Self> {
+    pub fn new(
+        config: RdmaConfig,
+        devices: Arc<Devices>,
+        buffer_pool: Arc<BufferPool>,
+    ) -> Result<Self> {
         let task_supervisor = TaskSupervisor::create();
         let port_refresher = RdmaDeviceRefresher::start(devices.clone(), &task_supervisor);
         Ok(Self {
+            config,
             acquire_client: Client {
                 timeout: std::time::Duration::from_secs(5),
                 use_msgpack: true,
@@ -198,6 +217,7 @@ impl RdmaSocketPool {
     fn create_queue_pair(
         &self,
         device: &RdmaDevice,
+        caps: &RdmaQpCaps,
     ) -> Result<(QueuePair, Arc<CompChannel>, Arc<CompletionQueue>)> {
         let rdma = device;
         let ctx = rdma.context();
@@ -209,17 +229,17 @@ impl RdmaSocketPool {
             .set_nonblock()
             .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
 
-        let cq = CompletionQueue::create(ctx, 128, Some(&comp_channel))
+        let cq = CompletionQueue::create(ctx, self.config.cq_size as _, Some(&comp_channel))
             .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
 
         let mut init_attr = ibv_qp_init_attr {
             qp_type: ibv_qp_type::IBV_QPT_RC,
             cap: ibv_qp_cap {
-                max_send_wr: 64,
-                max_recv_wr: 64,
-                max_send_sge: 1,
-                max_recv_sge: 1,
-                max_inline_data: 0,
+                max_send_wr: caps.max_send_wr,
+                max_recv_wr: caps.max_recv_wr,
+                max_send_sge: caps.max_send_sge,
+                max_recv_sge: caps.max_recv_sge,
+                max_inline_data: caps.max_inline_data,
             },
             ..Default::default()
         };
@@ -245,6 +265,10 @@ impl RdmaSocketPool {
             }
         };
 
+        // Negotiate QP caps: use the minimum of local config and server's advertised caps.
+        let negotiated_caps = self.negotiate_caps(&remote_info.qp_caps);
+        let negotiated_params = self.negotiate_params(&remote_info.qp_params);
+
         let device = self
             .devices
             .rdma_devices()
@@ -255,7 +279,7 @@ impl RdmaSocketPool {
                     "selected RDMA device disappeared".into(),
                 )
             })?;
-        let (queue_pair, comp_channel, cq) = self.create_queue_pair(device)?;
+        let (queue_pair, comp_channel, cq) = self.create_queue_pair(device, &negotiated_caps)?;
         let local_endpoint = self.build_endpoint(
             &queue_pair,
             device,
@@ -266,6 +290,8 @@ impl RdmaSocketPool {
         let connect_request = ConnectRequest {
             endpoint: local_endpoint,
             target: selection.remote.clone(),
+            qp_caps: negotiated_caps,
+            qp_params: negotiated_params,
         };
         let remote_endpoint =
             match Box::pin(self.acquire_client.connect(&acquire_ctx, &connect_request)).await {
@@ -275,12 +301,20 @@ impl RdmaSocketPool {
                     return Err(err);
                 }
             };
-        self.bring_qp_to_rts(&queue_pair, &local_endpoint, &remote_endpoint)?;
+        let params = QpConnectParams::from(&negotiated_params);
+        self.bring_qp_to_rts(&queue_pair, &local_endpoint, &remote_endpoint, &params)?;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<SendMsg>(1024);
         let socket = RdmaSocket::new(queue_pair, self.buffer_pool.clone(), tx);
         let socket = Arc::new(socket);
-        self.spawn_event_loop(socket.clone(), state.clone(), comp_channel, cq, rx)?;
+        self.spawn_event_loop(
+            socket.clone(),
+            state.clone(),
+            comp_channel,
+            cq,
+            rx,
+            self.config.recv_buffer_count,
+        )?;
         {
             let mut socket_map = self.socket_map.write().await;
             socket_map.insert(*addr, socket.clone());
@@ -550,7 +584,13 @@ impl RdmaSocketPool {
             })
     }
 
-    fn bring_qp_to_rts(&self, qp: &QueuePair, local: &Endpoint, remote: &Endpoint) -> Result<()> {
+    fn bring_qp_to_rts(
+        &self,
+        qp: &QueuePair,
+        local: &Endpoint,
+        remote: &Endpoint,
+        params: &QpConnectParams,
+    ) -> Result<()> {
         if local.link_layer != remote.link_layer {
             return Err(Error::new(
                 ErrorKind::InvalidArgument,
@@ -570,12 +610,42 @@ impl RdmaSocketPool {
             remote.qp_num,
             remote.gid,
             remote.lid,
+            params,
         )
         .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))
     }
 
     fn min_mtu(a: ibv_mtu, b: ibv_mtu) -> ibv_mtu {
         if (a as u32) <= (b as u32) { a } else { b }
+    }
+
+    /// Negotiate QP capabilities by taking the minimum of local config and server's caps.
+    fn negotiate_caps(&self, remote_caps: &RdmaQpCaps) -> RdmaQpCaps {
+        RdmaQpCaps {
+            max_send_wr: self.config.max_send_wr.min(remote_caps.max_send_wr),
+            max_recv_wr: self.config.max_recv_wr.min(remote_caps.max_recv_wr),
+            max_send_sge: self.config.max_send_sge.min(remote_caps.max_send_sge),
+            max_recv_sge: self.config.max_recv_sge.min(remote_caps.max_recv_sge),
+            max_inline_data: self.config.max_inline_data.min(remote_caps.max_inline_data),
+        }
+    }
+
+    /// Negotiate QP state transition params; for most fields use the server's values
+    /// since they describe the server's capabilities. The client uses its own config
+    /// as a preference that should not exceed the server's.
+    fn negotiate_params(&self, remote_params: &RdmaQpParams) -> RdmaQpParams {
+        RdmaQpParams {
+            pkey_index: remote_params.pkey_index,
+            max_dest_rd_atomic: self
+                .config
+                .max_dest_rd_atomic
+                .min(remote_params.max_dest_rd_atomic),
+            min_rnr_timer: remote_params.min_rnr_timer,
+            timeout: remote_params.timeout,
+            retry_cnt: remote_params.retry_cnt,
+            rnr_retry: remote_params.rnr_retry,
+            max_rd_atomic: self.config.max_rd_atomic.min(remote_params.max_rd_atomic),
+        }
     }
 
     /// Starts the event loop for handling RDMA events on a socket.
@@ -586,10 +656,11 @@ impl RdmaSocketPool {
         comp_channel: Arc<CompChannel>,
         cq: Arc<CompletionQueue>,
         pending_receiver: tokio::sync::mpsc::Receiver<SendMsg>,
+        recv_buffer_count: u32,
     ) -> Result<()> {
         let socket_clone = socket.clone();
         let mut event_loop = EventLoop::new(socket, state, comp_channel, cq, pending_receiver);
-        event_loop.submit_recv_tasks(64)?;
+        event_loop.submit_recv_tasks(recv_buffer_count as usize)?;
 
         let task_supervisor = self.task_supervisor.start_async_task();
         tokio::spawn(async move {
@@ -607,6 +678,20 @@ impl RdmaSocketPool {
         });
 
         Ok(())
+    }
+}
+
+impl From<&RdmaQpParams> for QpConnectParams {
+    fn from(p: &RdmaQpParams) -> Self {
+        Self {
+            pkey_index: p.pkey_index,
+            max_dest_rd_atomic: p.max_dest_rd_atomic,
+            min_rnr_timer: p.min_rnr_timer,
+            timeout: p.timeout,
+            retry_cnt: p.retry_cnt,
+            rnr_retry: p.rnr_retry,
+            max_rd_atomic: p.max_rd_atomic,
+        }
     }
 }
 

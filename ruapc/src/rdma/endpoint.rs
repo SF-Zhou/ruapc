@@ -2,6 +2,8 @@ use ruapc_rdma::{LinkLayer, ibv_gid, ibv_mtu};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use super::rdma_service::{RdmaQpCaps, RdmaQpParams};
+
 /// RDMA connection endpoint information.
 ///
 /// Contains the QP and address metadata needed to move a queue pair to RTR/RTS.
@@ -41,4 +43,8 @@ pub struct ConnectRequest {
     pub endpoint: Endpoint,
     /// Server device/port/GID that should accept this connection.
     pub target: DeviceSelection,
+    /// Negotiated QP capabilities the client chose (bounded by server's advertised caps).
+    pub qp_caps: RdmaQpCaps,
+    /// Negotiated QP state transition parameters.
+    pub qp_params: RdmaQpParams,
 }

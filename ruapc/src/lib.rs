@@ -31,3 +31,5 @@ pub use ruapc_bufpool::Devices as _;
 
 #[cfg(feature = "rdma")]
 mod rdma;
+#[cfg(feature = "rdma")]
+pub use rdma::RdmaConfig;

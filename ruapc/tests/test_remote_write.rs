@@ -69,6 +69,7 @@ enum Expected {
 async fn run_test(tc: TestCase) {
     let config = SocketPoolConfig {
         socket_type: SocketType::UNIFIED,
+        ..Default::default()
     };
     let mut router = Router::default();
     Arc::new(WriteTestImpl).ruapc_export(&mut router);

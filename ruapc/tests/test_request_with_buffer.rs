@@ -136,6 +136,7 @@ async fn test_upload_with_read_buffer_websocket() {
 
     let config = SocketPoolConfig {
         socket_type: SocketType::UNIFIED,
+        ..Default::default()
     };
     let server = Server::create(router, &config).unwrap();
     let server = Arc::new(server);
@@ -176,6 +177,7 @@ async fn test_upload_with_read_buffer_http() {
 
     let config = SocketPoolConfig {
         socket_type: SocketType::UNIFIED,
+        ..Default::default()
     };
     let server = Server::create(router, &config).unwrap();
     let server = Arc::new(server);

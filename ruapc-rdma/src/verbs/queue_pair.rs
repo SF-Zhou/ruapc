@@ -15,6 +15,42 @@ use crate::{
     ibv_qp_state, ibv_wc,
 };
 
+/// Parameters for QP state transitions (INIT → RTR → RTS).
+///
+/// These are typically negotiated between client and server during
+/// connection establishment.
+#[derive(Debug, Clone, Copy)]
+pub struct QpConnectParams {
+    /// Partition key index for QP INIT state.
+    pub pkey_index: u16,
+    /// Maximum outstanding RDMA reads/atomics as destination (RTR).
+    pub max_dest_rd_atomic: u8,
+    /// Minimum RNR NAK timer (RTR).
+    pub min_rnr_timer: u8,
+    /// Local ACK timeout (RTS).
+    pub timeout: u8,
+    /// Transport-level retry count (RTS).
+    pub retry_cnt: u8,
+    /// RNR retry count (RTS, 7 = infinite).
+    pub rnr_retry: u8,
+    /// Maximum outstanding RDMA reads/atomics as initiator (RTS).
+    pub max_rd_atomic: u8,
+}
+
+impl Default for QpConnectParams {
+    fn default() -> Self {
+        Self {
+            pkey_index: 0,
+            max_dest_rd_atomic: 1,
+            min_rnr_timer: 0x12,
+            timeout: 0x12,
+            retry_cnt: 6,
+            rnr_retry: 6,
+            max_rd_atomic: 1,
+        }
+    }
+}
+
 pub struct Completion {
     pub wc: ibv_wc,
     pub buffer: Option<Buffer>,
@@ -270,10 +306,10 @@ impl QueuePair {
         | crate::ibv_access_flags::IBV_ACCESS_REMOTE_READ.0
         | crate::ibv_access_flags::IBV_ACCESS_RELAXED_ORDERING.0;
 
-    pub fn init(&self, port_num: u8) -> Result<()> {
+    pub fn init(&self, port_num: u8, pkey_index: u16) -> Result<()> {
         let mut attr = ibv_qp_attr {
             qp_state: ibv_qp_state::IBV_QPS_INIT,
-            pkey_index: 0,
+            pkey_index,
             port_num,
             qp_access_flags: Self::ACCESS_FLAGS,
             ..Default::default()
@@ -294,6 +330,8 @@ impl QueuePair {
         local_gid_index: u8,
         link_layer: LinkLayer,
         path_mtu: ibv_mtu,
+        max_dest_rd_atomic: u8,
+        min_rnr_timer: u8,
     ) -> Result<()> {
         let mut ah_attr = crate::ibv_ah_attr {
             sl: 0,
@@ -331,8 +369,8 @@ impl QueuePair {
             path_mtu,
             dest_qp_num: remote_qp_num,
             rq_psn: 0,
-            max_dest_rd_atomic: 1,
-            min_rnr_timer: 0x12,
+            max_dest_rd_atomic,
+            min_rnr_timer,
             ah_attr,
             ..Default::default()
         };
@@ -346,14 +384,20 @@ impl QueuePair {
         self.modify(&mut attr, mask.0 as _)
     }
 
-    pub fn ready_to_send(&self) -> Result<()> {
+    pub fn ready_to_send(
+        &self,
+        timeout: u8,
+        retry_cnt: u8,
+        rnr_retry: u8,
+        max_rd_atomic: u8,
+    ) -> Result<()> {
         let mut attr = ibv_qp_attr {
             qp_state: ibv_qp_state::IBV_QPS_RTS,
-            timeout: 0x12,
-            retry_cnt: 6,
-            rnr_retry: 6,
+            timeout,
+            retry_cnt,
+            rnr_retry,
             sq_psn: 0,
-            max_rd_atomic: 1,
+            max_rd_atomic,
             ..Default::default()
         };
         let mask = ibv_qp_attr_mask::IBV_QP_STATE
@@ -374,8 +418,9 @@ impl QueuePair {
         remote_qp_num: u32,
         remote_gid: ibv_gid,
         remote_lid: u16,
+        params: &QpConnectParams,
     ) -> Result<()> {
-        self.init(local_port_num)?;
+        self.init(local_port_num, params.pkey_index)?;
         self.ready_to_recv(
             remote_qp_num,
             remote_gid,
@@ -384,8 +429,15 @@ impl QueuePair {
             local_gid_index,
             link_layer,
             path_mtu,
+            params.max_dest_rd_atomic,
+            params.min_rnr_timer,
         )?;
-        self.ready_to_send()
+        self.ready_to_send(
+            params.timeout,
+            params.retry_cnt,
+            params.rnr_retry,
+            params.max_rd_atomic,
+        )
     }
 
     pub(crate) unsafe fn post_send(

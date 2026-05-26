@@ -4,6 +4,44 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Context, Result, rdma, service};
 
+/// Negotiated QP capabilities exchanged during RDMA connection setup.
+///
+/// The server advertises its configured maximum values via [`RdmaInfo`], and the
+/// client responds with the values it will actually use in [`ConnectRequest`].
+/// Both sides create their QPs using these negotiated values.
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone, Copy, PartialEq, Eq)]
+pub struct RdmaQpCaps {
+    /// Maximum number of outstanding send work requests.
+    pub max_send_wr: u32,
+    /// Maximum number of outstanding receive work requests.
+    pub max_recv_wr: u32,
+    /// Maximum scatter/gather elements per send WR.
+    pub max_send_sge: u32,
+    /// Maximum scatter/gather elements per receive WR.
+    pub max_recv_sge: u32,
+    /// Maximum inline data size (0 = disabled).
+    pub max_inline_data: u32,
+}
+
+/// Negotiated QP state transition parameters exchanged during RDMA connection setup.
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone, Copy, PartialEq, Eq)]
+pub struct RdmaQpParams {
+    /// Partition key index for QP INIT state.
+    pub pkey_index: u16,
+    /// Maximum outstanding RDMA reads/atomics as destination (RTR).
+    pub max_dest_rd_atomic: u8,
+    /// Minimum RNR NAK timer (RTR).
+    pub min_rnr_timer: u8,
+    /// Local ACK timeout (RTS).
+    pub timeout: u8,
+    /// Transport-level retry count (RTS).
+    pub retry_cnt: u8,
+    /// RNR retry count (RTS, 7 = infinite).
+    pub rnr_retry: u8,
+    /// Maximum outstanding RDMA reads/atomics as initiator (RTS).
+    pub max_rd_atomic: u8,
+}
+
 /// Minimal port information for RDMA connection negotiation.
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
 pub struct RdmaPortInfo {
@@ -48,17 +86,22 @@ pub struct RdmaDeviceInfo {
 ///
 /// This structure is exchanged between client and server during
 /// RDMA connection negotiation. It contains only the minimal
-/// information needed to select a compatible device/port/GID pair.
+/// information needed to select a compatible device/port/GID pair,
+/// plus the server's QP capability limits for negotiation.
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
 pub struct RdmaInfo {
     /// List of available RDMA devices with connection-relevant info
     pub devices: Vec<RdmaDeviceInfo>,
+    /// Server's QP capability limits (the maximum the server supports).
+    pub qp_caps: RdmaQpCaps,
+    /// Server's QP state transition parameters.
+    pub qp_params: RdmaQpParams,
 }
 
 impl RdmaInfo {
-    /// Build `RdmaInfo` from the full device info list, filtering out
+    /// Build `RdmaInfo` from the full device info list and server config, filtering out
     /// loopback GIDs for RoCE v2 since they cannot be used for communication.
-    pub(crate) fn from_devices(devices: &[super::RdmaDevice]) -> Self {
+    pub(crate) fn from_devices(devices: &[super::RdmaDevice], config: &super::RdmaConfig) -> Self {
         RdmaInfo {
             devices: devices
                 .iter()
@@ -94,6 +137,22 @@ impl RdmaInfo {
                     }
                 })
                 .collect(),
+            qp_caps: RdmaQpCaps {
+                max_send_wr: config.max_send_wr,
+                max_recv_wr: config.max_recv_wr,
+                max_send_sge: config.max_send_sge,
+                max_recv_sge: config.max_recv_sge,
+                max_inline_data: config.max_inline_data,
+            },
+            qp_params: RdmaQpParams {
+                pkey_index: config.pkey_index,
+                max_dest_rd_atomic: config.max_dest_rd_atomic,
+                min_rnr_timer: config.min_rnr_timer,
+                timeout: config.timeout,
+                retry_cnt: config.retry_cnt,
+                rnr_retry: config.rnr_retry,
+                max_rd_atomic: config.max_rd_atomic,
+            },
         }
     }
 }
@@ -155,6 +214,7 @@ mod tests {
         assert!(!devices.rdma_devices().is_empty(), "no RDMA device found");
         let config = SocketPoolConfig {
             socket_type: SocketType::RDMA,
+            rdma: None,
         };
         Context::create(&config).expect("failed to create RDMA context")
     }
@@ -181,12 +241,29 @@ mod tests {
             link_layer: ruapc_rdma::LinkLayer::Ethernet,
             active_mtu: ruapc_rdma::ibv_mtu::IBV_MTU_512,
         };
+        let default_config = super::super::RdmaConfig::default();
         let request = rdma::ConnectRequest {
             endpoint,
             target: rdma::DeviceSelection {
                 device_name: "missing".into(),
                 port_num: 1,
                 gid_index: 0,
+            },
+            qp_caps: RdmaQpCaps {
+                max_send_wr: default_config.max_send_wr,
+                max_recv_wr: default_config.max_recv_wr,
+                max_send_sge: default_config.max_send_sge,
+                max_recv_sge: default_config.max_recv_sge,
+                max_inline_data: default_config.max_inline_data,
+            },
+            qp_params: RdmaQpParams {
+                pkey_index: default_config.pkey_index,
+                max_dest_rd_atomic: default_config.max_dest_rd_atomic,
+                min_rnr_timer: default_config.min_rnr_timer,
+                timeout: default_config.timeout,
+                retry_cnt: default_config.retry_cnt,
+                rnr_retry: default_config.rnr_retry,
+                max_rd_atomic: default_config.max_rd_atomic,
             },
         };
         let result = ().connect(&ctx, &request).await;
