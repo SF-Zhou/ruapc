@@ -144,6 +144,7 @@ mod tests {
     async fn test_handle_recv_invalid_msg_type_warns_and_ok() {
         let config = SocketPoolConfig {
             socket_type: SocketType::TCP,
+            ..Default::default()
         };
         let router = crate::Router::default();
         let (state, _guard) = State::create(router, &config).unwrap();

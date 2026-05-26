@@ -270,10 +270,10 @@ impl QueuePair {
         | crate::ibv_access_flags::IBV_ACCESS_REMOTE_READ.0
         | crate::ibv_access_flags::IBV_ACCESS_RELAXED_ORDERING.0;
 
-    pub fn init(&self, port_num: u8) -> Result<()> {
+    pub fn init(&self, port_num: u8, pkey_index: u16) -> Result<()> {
         let mut attr = ibv_qp_attr {
             qp_state: ibv_qp_state::IBV_QPS_INIT,
-            pkey_index: 0,
+            pkey_index,
             port_num,
             qp_access_flags: Self::ACCESS_FLAGS,
             ..Default::default()
@@ -369,13 +369,14 @@ impl QueuePair {
         &self,
         local_port_num: u8,
         local_gid_index: u8,
+        pkey_index: u16,
         link_layer: LinkLayer,
         path_mtu: ibv_mtu,
         remote_qp_num: u32,
         remote_gid: ibv_gid,
         remote_lid: u16,
     ) -> Result<()> {
-        self.init(local_port_num)?;
+        self.init(local_port_num, pkey_index)?;
         self.ready_to_recv(
             remote_qp_num,
             remote_gid,

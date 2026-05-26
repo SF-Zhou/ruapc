@@ -2,6 +2,8 @@ use std::{net::SocketAddr, sync::Arc};
 
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
+#[cfg(feature = "rdma")]
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_inline_default::serde_inline_default;
 use tokio::net::TcpStream;
@@ -57,6 +59,7 @@ impl std::fmt::Display for SocketType {
 ///
 /// let config = SocketPoolConfig {
 ///     socket_type: SocketType::TCP,
+///     ..Default::default()
 /// };
 /// ```
 #[serde_inline_default]
@@ -65,6 +68,60 @@ pub struct SocketPoolConfig {
     /// The transport protocol type to use. Default is TCP.
     #[serde_inline_default(SocketType::TCP)]
     pub socket_type: SocketType,
+    /// RDMA-specific connection and Queue Pair settings.
+    #[cfg(feature = "rdma")]
+    #[serde(default)]
+    pub rdma: RdmaSocketPoolConfig,
+}
+
+/// RDMA socket pool configuration.
+#[cfg(feature = "rdma")]
+#[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone)]
+pub struct RdmaSocketPoolConfig {
+    /// Requested Queue Pair capabilities for newly created RDMA connections.
+    pub qp: RdmaQueuePairConfig,
+    /// Completion Queue length requested for each RDMA connection.
+    pub cq_len: u32,
+    /// Number of receive buffers to pre-post for each RDMA connection.
+    pub recv_queue_len: u32,
+    /// P_Key table index used when moving the Queue Pair to INIT.
+    pub pkey_index: u16,
+}
+
+#[cfg(feature = "rdma")]
+impl Default for RdmaSocketPoolConfig {
+    fn default() -> Self {
+        Self {
+            qp: RdmaQueuePairConfig::default(),
+            cq_len: 128,
+            recv_queue_len: 64,
+            pkey_index: 0,
+        }
+    }
+}
+
+/// Queue Pair capabilities requested or negotiated for an RDMA connection.
+#[cfg(feature = "rdma")]
+#[derive(Deserialize, Serialize, JsonSchema, Debug, PartialEq, Eq, Clone, Copy)]
+pub struct RdmaQueuePairConfig {
+    pub max_send_wr: u32,
+    pub max_recv_wr: u32,
+    pub max_send_sge: u32,
+    pub max_recv_sge: u32,
+    pub max_inline_data: u32,
+}
+
+#[cfg(feature = "rdma")]
+impl Default for RdmaQueuePairConfig {
+    fn default() -> Self {
+        Self {
+            max_send_wr: 64,
+            max_recv_wr: 64,
+            max_send_sge: 1,
+            max_recv_sge: 1,
+            max_inline_data: 0,
+        }
+    }
 }
 
 impl Default for SocketPoolConfig {
@@ -309,6 +366,7 @@ mod tests {
     fn test_socket_pool_config_serde_roundtrip() {
         let config = SocketPoolConfig {
             socket_type: SocketType::WS,
+            ..Default::default()
         };
         let json = serde_json::to_string(&config).unwrap();
         let recovered: SocketPoolConfig = serde_json::from_str(&json).unwrap();
@@ -339,6 +397,7 @@ mod tests {
     async fn test_socket_pool_ws_socket_type() {
         let config = SocketPoolConfig {
             socket_type: SocketType::WS,
+            ..Default::default()
         };
         let devices = std::sync::Arc::new(crate::Devices::default());
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
@@ -353,6 +412,7 @@ mod tests {
     async fn test_socket_pool_http_socket_type() {
         let config = SocketPoolConfig {
             socket_type: SocketType::HTTP,
+            ..Default::default()
         };
         let devices = std::sync::Arc::new(crate::Devices::default());
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
@@ -368,6 +428,7 @@ mod tests {
     async fn test_socket_pool_unified_socket_type() {
         let config = SocketPoolConfig {
             socket_type: SocketType::UNIFIED,
+            ..Default::default()
         };
         let devices = std::sync::Arc::new(crate::Devices::default());
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
@@ -398,6 +459,7 @@ mod tests {
         let devices = make_rdma_devices();
         let config = SocketPoolConfig {
             socket_type: SocketType::RDMA,
+            ..Default::default()
         };
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
@@ -413,6 +475,7 @@ mod tests {
         let devices = make_rdma_devices();
         let config = SocketPoolConfig {
             socket_type: SocketType::RDMA,
+            ..Default::default()
         };
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
@@ -455,6 +518,11 @@ mod tests {
                 link_layer: ruapc_rdma::LinkLayer::Ethernet,
                 active_mtu: ruapc_rdma::ibv_mtu::IBV_MTU_512,
             },
+            config: crate::rdma::RdmaConnectionConfig {
+                qp: RdmaQueuePairConfig::default(),
+                cq_len: 128,
+                recv_queue_len: 64,
+            },
         };
         assert!(pool.rdma_accept(&request, &state).is_err());
         pool.stop();
@@ -468,6 +536,7 @@ mod tests {
         let devices = make_rdma_devices();
         let config = SocketPoolConfig {
             socket_type: SocketType::RDMA,
+            ..Default::default()
         };
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();

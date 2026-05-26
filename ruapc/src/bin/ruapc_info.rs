@@ -27,6 +27,7 @@ async fn main() {
 
     let ctx = Context::create(&SocketPoolConfig {
         socket_type: args.socket_type,
+        ..Default::default()
     })
     .unwrap()
     .with_addr(args.addr);

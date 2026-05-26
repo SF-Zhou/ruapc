@@ -1,5 +1,5 @@
 mod endpoint;
-pub(crate) use endpoint::{ConnectRequest, DeviceSelection, Endpoint};
+pub(crate) use endpoint::{ConnectRequest, DeviceSelection, Endpoint, RdmaConnectionConfig};
 
 mod rdma_device;
 pub(crate) use rdma_device::RdmaDevice;
