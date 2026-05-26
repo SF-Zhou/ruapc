@@ -2,6 +2,8 @@ use ruapc_rdma::{LinkLayer, ibv_gid, ibv_mtu};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::RdmaQueuePairConfig;
+
 /// RDMA connection endpoint information.
 ///
 /// Contains the QP and address metadata needed to move a queue pair to RTR/RTS.
@@ -34,6 +36,17 @@ pub struct DeviceSelection {
     pub gid_index: u8,
 }
 
+/// Queue Pair and completion queue settings for this RDMA connection.
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy)]
+pub struct RdmaConnectionConfig {
+    /// Negotiated Queue Pair capabilities.
+    pub qp: RdmaQueuePairConfig,
+    /// Completion Queue length requested for this connection.
+    pub cq_len: u32,
+    /// Number of receive buffers pre-posted by this endpoint.
+    pub recv_queue_len: u32,
+}
+
 /// RDMA connection request sent after the client has selected a server port.
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
 pub struct ConnectRequest {
@@ -41,4 +54,6 @@ pub struct ConnectRequest {
     pub endpoint: Endpoint,
     /// Server device/port/GID that should accept this connection.
     pub target: DeviceSelection,
+    /// Queue Pair settings negotiated by the client for this connection.
+    pub config: RdmaConnectionConfig,
 }

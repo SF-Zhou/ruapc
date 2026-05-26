@@ -177,6 +177,7 @@ mod tests {
     async fn test_unified_socket_pool_debug_format() {
         let config = crate::SocketPoolConfig {
             socket_type: crate::SocketType::UNIFIED,
+            ..Default::default()
         };
         let devices = Arc::new(crate::Devices::default());
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
@@ -191,6 +192,7 @@ mod tests {
         let devices = make_rdma_devices();
         let config = crate::SocketPoolConfig {
             socket_type: crate::SocketType::UNIFIED,
+            ..Default::default()
         };
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = UnifiedSocketPool::create(&config, &devices, &buffer_pool).unwrap();
@@ -206,6 +208,7 @@ mod tests {
         // Unified pool without RDMA devices: rdma_accept should return an error.
         let config = crate::SocketPoolConfig {
             socket_type: crate::SocketType::UNIFIED,
+            ..Default::default()
         };
         let devices = Arc::new(crate::Devices::default()); // TCP only
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
@@ -225,6 +228,11 @@ mod tests {
                 lid: 0,
                 link_layer: ruapc_rdma::LinkLayer::Ethernet,
                 active_mtu: ruapc_rdma::ibv_mtu::IBV_MTU_512,
+            },
+            config: crate::rdma::RdmaConnectionConfig {
+                qp: crate::RdmaQueuePairConfig::default(),
+                cq_len: 128,
+                recv_queue_len: 64,
             },
         };
         assert!(pool.rdma_accept(&request, &state).is_err());

@@ -2,7 +2,7 @@ use ruapc_rdma::{GidType, LinkLayer, ibv_gid, ibv_mtu, ibv_port_state};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{Context, Result, rdma, service};
+use crate::{Context, RdmaQueuePairConfig, Result, rdma, service};
 
 /// Minimal port information for RDMA connection negotiation.
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
@@ -40,6 +40,8 @@ pub struct RdmaGidInfo {
 pub struct RdmaDeviceInfo {
     /// Device name (e.g., "mlx5_0").
     pub name: String,
+    /// Server-advertised per-connection RDMA resource limits for this device.
+    pub connection: rdma::RdmaConnectionConfig,
     /// Available ports on this device.
     pub ports: Vec<RdmaPortInfo>,
 }
@@ -58,7 +60,10 @@ pub struct RdmaInfo {
 impl RdmaInfo {
     /// Build `RdmaInfo` from the full device info list, filtering out
     /// loopback GIDs for RoCE v2 since they cannot be used for communication.
-    pub(crate) fn from_devices(devices: &[super::RdmaDevice]) -> Self {
+    pub(crate) fn from_devices(
+        devices: &[super::RdmaDevice],
+        config: &crate::RdmaSocketPoolConfig,
+    ) -> Self {
         RdmaInfo {
             devices: devices
                 .iter()
@@ -66,6 +71,29 @@ impl RdmaInfo {
                     let info = d.info();
                     RdmaDeviceInfo {
                         name: info.name.clone(),
+                        connection: rdma::RdmaConnectionConfig {
+                            qp: RdmaQueuePairConfig {
+                                max_send_wr: config
+                                    .qp
+                                    .max_send_wr
+                                    .min(info.device_attr.max_qp_wr as u32),
+                                max_recv_wr: config
+                                    .qp
+                                    .max_recv_wr
+                                    .min(info.device_attr.max_qp_wr as u32),
+                                max_send_sge: config
+                                    .qp
+                                    .max_send_sge
+                                    .min(info.device_attr.max_sge as u32),
+                                max_recv_sge: config
+                                    .qp
+                                    .max_recv_sge
+                                    .min(info.device_attr.max_sge as u32),
+                                max_inline_data: config.qp.max_inline_data,
+                            },
+                            cq_len: config.cq_len.min(info.device_attr.max_cqe as u32),
+                            recv_queue_len: config.recv_queue_len,
+                        },
                         ports: info
                             .ports
                             .iter()
@@ -155,6 +183,7 @@ mod tests {
         assert!(!devices.rdma_devices().is_empty(), "no RDMA device found");
         let config = SocketPoolConfig {
             socket_type: SocketType::RDMA,
+            ..Default::default()
         };
         Context::create(&config).expect("failed to create RDMA context")
     }
@@ -187,6 +216,11 @@ mod tests {
                 device_name: "missing".into(),
                 port_num: 1,
                 gid_index: 0,
+            },
+            config: rdma::RdmaConnectionConfig {
+                qp: RdmaQueuePairConfig::default(),
+                cq_len: 128,
+                recv_queue_len: 64,
             },
         };
         let result = ().connect(&ctx, &request).await;

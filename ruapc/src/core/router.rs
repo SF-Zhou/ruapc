@@ -345,6 +345,7 @@ mod tests {
         // Build a context so dispatch has something to work with.
         let ctx = crate::Context::create(&SocketPoolConfig {
             socket_type: SocketType::TCP,
+            ..Default::default()
         })
         .unwrap();
         let mut ctx = ctx.with_addr("127.0.0.1:9999".parse().unwrap());
@@ -361,6 +362,7 @@ mod tests {
 
         let ctx = crate::Context::create(&SocketPoolConfig {
             socket_type: SocketType::TCP,
+            ..Default::default()
         })
         .unwrap();
         let mut ctx = ctx.with_addr("127.0.0.1:9999".parse().unwrap());

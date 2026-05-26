@@ -53,6 +53,7 @@ async fn stress_test(args: Args) {
     let mut tasks = vec![];
     let ctx = Context::create(&SocketPoolConfig {
         socket_type: SocketType::UNIFIED,
+        ..Default::default()
     })
     .unwrap()
     .with_addr(args.addr);
@@ -113,6 +114,7 @@ async fn main() {
     } else {
         let ctx = Context::create(&SocketPoolConfig {
             socket_type: SocketType::UNIFIED,
+            ..Default::default()
         })
         .unwrap()
         .with_addr(args.addr);

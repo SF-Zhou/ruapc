@@ -55,6 +55,7 @@ async fn main() {
         router,
         &SocketPoolConfig {
             socket_type: args.socket_type,
+            ..Default::default()
         },
     )
     .unwrap();
