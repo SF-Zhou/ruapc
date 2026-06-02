@@ -233,6 +233,7 @@ mod tests {
                 qp: crate::RdmaQueuePairConfig::default(),
                 cq_len: 128,
                 recv_queue_len: 64,
+                recv_buffer_size: 64 * 1024,
             },
         };
         assert!(pool.rdma_accept(&request, &state).is_err());

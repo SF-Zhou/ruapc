@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::RdmaQueuePairConfig;
 
+const fn default_recv_buffer_size() -> usize {
+    64 * 1024
+}
+
 /// RDMA connection endpoint information.
 ///
 /// Contains the QP and address metadata needed to move a queue pair to RTR/RTS.
@@ -45,6 +49,9 @@ pub struct RdmaConnectionConfig {
     pub cq_len: u32,
     /// Number of receive buffers pre-posted by this endpoint.
     pub recv_queue_len: u32,
+    /// Size in bytes of each pre-posted receive buffer.
+    #[serde(default = "default_recv_buffer_size")]
+    pub recv_buffer_size: usize,
 }
 
 /// RDMA connection request sent after the client has selected a server port.

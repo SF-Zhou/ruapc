@@ -27,6 +27,8 @@ use super::RdmaSocket;
 /// - Managing acknowledgments for received messages
 #[derive(Debug, Default)]
 struct RecvHandler {
+    /// Size of each pre-posted receive buffer.
+    buffer_size: usize,
     /// Number of recv WRs submitted
     submitted: u64,
     /// Number of recv WRs completed
@@ -42,9 +44,15 @@ struct RecvHandler {
 }
 
 impl RecvHandler {
-    fn init_buffers(&mut self, count: usize, socket: &RdmaSocket) -> Result<()> {
+    fn init_buffers(
+        &mut self,
+        count: usize,
+        buffer_size: usize,
+        socket: &RdmaSocket,
+    ) -> Result<()> {
+        self.buffer_size = buffer_size;
         for _ in 0..count {
-            let buf = socket.rdmabuf_pool.allocate(1024 * 1024)?;
+            let buf = socket.rdmabuf_pool.allocate(buffer_size)?;
             self.post_recv(buf, socket)?;
         }
         Ok(())
@@ -97,7 +105,7 @@ impl RecvHandler {
         }
 
         // Post a new recv buffer
-        let new_buf = socket.rdmabuf_pool.allocate(1024 * 1024)?;
+        let new_buf = socket.rdmabuf_pool.allocate(self.buffer_size)?;
         self.post_recv(new_buf, socket)?;
         Ok(())
     }
@@ -305,8 +313,8 @@ impl EventLoop {
     ///
     /// # Errors
     /// Returns error if buffer allocation or work request posting fails
-    pub fn submit_recv_tasks(&mut self, count: usize) -> Result<()> {
-        self.recv.init_buffers(count, &self.socket)
+    pub fn submit_recv_tasks(&mut self, count: usize, buffer_size: usize) -> Result<()> {
+        self.recv.init_buffers(count, buffer_size, &self.socket)
     }
 
     /// Runs the main event processing loop

@@ -5,7 +5,7 @@
 //!
 //! ## Features
 //!
-//! - **Buddy Memory Allocation**: Supports allocation of 1MiB, 4MiB, 16MiB, and 64MiB buffers
+//! - **Buddy Memory Allocation**: Supports allocation of 64KiB, 256KiB, 1MiB, 4MiB, 16MiB, and 64MiB buffers
 //! - **Both Sync and Async APIs**: Designed for tokio environments with async-first design
 //! - **Automatic Memory Reclamation**: Buffers are automatically returned to the pool on drop
 //! - **Memory Limits**: Configurable maximum memory usage with async waiting when limits are reached
@@ -25,9 +25,9 @@
 //!     .max_memory(256 * 1024 * 1024)
 //!     .build();
 //!
-//! // Allocate a 1MiB buffer synchronously
-//! let buffer = pool.allocate(1024 * 1024)?;
-//! assert!(buffer.len() >= 1024 * 1024);
+//! // Allocate a 64KiB buffer synchronously
+//! let buffer = pool.allocate(64 * 1024)?;
+//! assert!(buffer.len() >= 64 * 1024);
 //!
 //! // Buffer is automatically returned to the pool when dropped
 //! drop(buffer);

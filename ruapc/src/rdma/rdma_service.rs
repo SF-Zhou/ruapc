@@ -93,6 +93,7 @@ impl RdmaInfo {
                             },
                             cq_len: config.cq_len.min(info.device_attr.max_cqe as u32),
                             recv_queue_len: config.recv_queue_len,
+                            recv_buffer_size: config.recv_buffer_size,
                         },
                         ports: info
                             .ports
@@ -221,6 +222,7 @@ mod tests {
                 qp: RdmaQueuePairConfig::default(),
                 cq_len: 128,
                 recv_queue_len: 64,
+                recv_buffer_size: 64 * 1024,
             },
         };
         let result = ().connect(&ctx, &request).await;

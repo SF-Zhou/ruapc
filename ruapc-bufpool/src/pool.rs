@@ -9,7 +9,7 @@ use aliasable::boxed::AliasableBox;
 use tokio::sync::oneshot;
 
 use crate::AlignedMemory;
-use crate::buddy::{BuddyBlock, NUM_LEVELS, NodeState, SIZE_64MIB, size_to_level};
+use crate::buddy::{BuddyBlock, NUM_LEVELS, NodeState, ROOT_LEVEL, SIZE_64MIB, size_to_level};
 use crate::buffer::Buffer;
 use crate::devices::Devices;
 use crate::intrusive_list::IntrusiveList;
@@ -77,7 +77,7 @@ impl BufferPoolBuilder {
 /// A high-performance memory pool using buddy memory allocation.
 ///
 /// Manages memory in 64 MiB blocks and supports allocation of buffers
-/// at four size levels: 1 MiB, 4 MiB, 16 MiB, and 64 MiB.
+/// at six size levels: 64 KiB, 256 KiB, 1 MiB, 4 MiB, 16 MiB, and 64 MiB.
 pub struct BufferPool {
     devices: Arc<dyn Devices>,
     inner: Mutex<PoolInner>,
@@ -106,7 +106,7 @@ impl BufferPool {
     /// Allocates a buffer of at least the specified size.
     ///
     /// The returned buffer may be larger than requested, rounded up to the
-    /// nearest allocation level (1 MiB, 4 MiB, 16 MiB, or 64 MiB).
+    /// nearest allocation level (64 KiB, 256 KiB, 1 MiB, 4 MiB, 16 MiB, or 64 MiB).
     ///
     /// # Errors
     ///
@@ -132,7 +132,7 @@ impl BufferPool {
         let level = size_to_level(size).ok_or_else(|| {
             Error::new(
                 ErrorKind::InvalidInput,
-                format!("invalid size: {size} (must be 1-67108864 bytes)"),
+                format!("invalid size: {size} (must be 1..={SIZE_64MIB} bytes)"),
             )
         })?;
 
@@ -223,7 +223,7 @@ impl PoolInner {
         let level = size_to_level(size).ok_or_else(|| {
             Error::new(
                 ErrorKind::InvalidInput,
-                format!("invalid size: {size} (must be 1-67108864 bytes)"),
+                format!("invalid size: {size} (must be 1..={SIZE_64MIB} bytes)"),
             )
         })?;
 
@@ -355,10 +355,10 @@ impl PoolInner {
 
         let block_ptr = NonNull::new(std::ptr::from_ref::<BuddyBlock>(&block).cast_mut()).unwrap();
 
-        // Add root node to level 3 free list.
+        // Add root node to the root-level free list.
         unsafe {
-            let node = (*block_ptr.as_ptr()).get_free_node_mut(3, 0);
-            self.free_lists[3].push_front(node);
+            let node = (*block_ptr.as_ptr()).get_free_node_mut(ROOT_LEVEL, 0);
+            self.free_lists[ROOT_LEVEL].push_front(node);
         }
 
         self.blocks.push(block);
@@ -396,7 +396,7 @@ impl PoolInner {
         let mut current_index = index;
 
         loop {
-            if current_level >= 3 {
+            if current_level >= ROOT_LEVEL {
                 block.set_state(current_level, current_index, NodeState::Free);
                 let node = block.get_free_node_mut(current_level, current_index);
                 unsafe {
@@ -468,7 +468,7 @@ impl PoolInner {
 mod tests {
     use super::*;
     use crate::EmptyDevices;
-    use crate::buddy::{LEVEL_SIZES, SIZE_1MIB};
+    use crate::buddy::{LEVEL_SIZES, SIZE_1MIB, SIZE_64KIB};
 
     fn test_pool() -> Arc<BufferPool> {
         BufferPoolBuilder::new(Arc::new(EmptyDevices)).build()
@@ -495,8 +495,8 @@ mod tests {
     #[test]
     fn test_simple_allocation() {
         let pool = test_pool();
-        let buffer = pool.allocate(SIZE_1MIB).unwrap();
-        assert_eq!(buffer.len(), SIZE_1MIB);
+        let buffer = pool.allocate(SIZE_64KIB).unwrap();
+        assert_eq!(buffer.len(), SIZE_64KIB);
     }
 
     #[test]
@@ -504,9 +504,9 @@ mod tests {
         let pool = test_pool();
 
         let b1 = pool.allocate(1).unwrap();
-        assert_eq!(b1.len(), SIZE_1MIB);
+        assert_eq!(b1.len(), SIZE_64KIB);
 
-        let b2 = pool.allocate(SIZE_1MIB + 1).unwrap();
+        let b2 = pool.allocate(SIZE_64KIB + 1).unwrap();
         assert_eq!(b2.len(), LEVEL_SIZES[1]);
 
         let b3 = pool.allocate(LEVEL_SIZES[1] + 1).unwrap();
@@ -514,6 +514,12 @@ mod tests {
 
         let b4 = pool.allocate(LEVEL_SIZES[2] + 1).unwrap();
         assert_eq!(b4.len(), LEVEL_SIZES[3]);
+
+        let b5 = pool.allocate(LEVEL_SIZES[3] + 1).unwrap();
+        assert_eq!(b5.len(), LEVEL_SIZES[4]);
+
+        let b6 = pool.allocate(LEVEL_SIZES[4] + 1).unwrap();
+        assert_eq!(b6.len(), LEVEL_SIZES[5]);
     }
 
     #[test]
@@ -538,7 +544,7 @@ mod tests {
 
         let _b1 = pool.allocate(SIZE_64MIB).unwrap();
 
-        let result = pool.allocate(SIZE_1MIB);
+        let result = pool.allocate(SIZE_64KIB);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), ErrorKind::OutOfMemory);
     }
@@ -558,15 +564,17 @@ mod tests {
     fn test_buddy_splitting() {
         let pool = test_pool_with_max(SIZE_64MIB);
 
-        let buffers: Vec<_> = (0..64).map(|_| pool.allocate(SIZE_1MIB).unwrap()).collect();
+        let buffers: Vec<_> = (0..1024)
+            .map(|_| pool.allocate(SIZE_64KIB).unwrap())
+            .collect();
 
-        assert_eq!(buffers.len(), 64);
+        assert_eq!(buffers.len(), 1024);
 
         let base = buffers[0].as_ptr() as usize;
         for buf in &buffers {
             let addr = buf.as_ptr() as usize;
             assert!(addr >= base - SIZE_64MIB && addr < base + SIZE_64MIB);
-            assert_eq!(buf.len(), SIZE_1MIB);
+            assert_eq!(buf.len(), SIZE_64KIB);
         }
     }
 
@@ -574,12 +582,12 @@ mod tests {
     fn test_buddy_merging() {
         let pool = test_pool_with_max(SIZE_64MIB);
 
-        let b1 = pool.allocate(LEVEL_SIZES[2]).unwrap();
-        let b2 = pool.allocate(LEVEL_SIZES[2]).unwrap();
-        let b3 = pool.allocate(LEVEL_SIZES[2]).unwrap();
-        let b4 = pool.allocate(LEVEL_SIZES[2]).unwrap();
+        let b1 = pool.allocate(LEVEL_SIZES[4]).unwrap();
+        let b2 = pool.allocate(LEVEL_SIZES[4]).unwrap();
+        let b3 = pool.allocate(LEVEL_SIZES[4]).unwrap();
+        let b4 = pool.allocate(LEVEL_SIZES[4]).unwrap();
 
-        assert!(pool.allocate(SIZE_1MIB).is_err());
+        assert!(pool.allocate(SIZE_64KIB).is_err());
 
         drop(b1);
         drop(b2);
@@ -593,8 +601,8 @@ mod tests {
     #[tokio::test]
     async fn test_async_allocation() {
         let pool = test_pool();
-        let buffer = pool.async_allocate(SIZE_1MIB).await.unwrap();
-        assert_eq!(buffer.len(), SIZE_1MIB);
+        let buffer = pool.async_allocate(SIZE_64KIB).await.unwrap();
+        assert_eq!(buffer.len(), SIZE_64KIB);
     }
 
     #[tokio::test]
@@ -608,7 +616,7 @@ mod tests {
 
         let pool_clone = pool.clone();
 
-        let handle = tokio::spawn(async move { pool_clone.async_allocate(SIZE_1MIB).await });
+        let handle = tokio::spawn(async move { pool_clone.async_allocate(SIZE_64KIB).await });
 
         tokio::time::sleep(Duration::from_millis(10)).await;
 
@@ -617,7 +625,7 @@ mod tests {
         let result = timeout(Duration::from_secs(1), handle).await;
         assert!(result.is_ok());
         let buffer = result.unwrap().unwrap().unwrap();
-        assert_eq!(buffer.len(), SIZE_1MIB);
+        assert_eq!(buffer.len(), SIZE_64KIB);
     }
 
     #[tokio::test]
@@ -634,7 +642,7 @@ mod tests {
     #[test]
     fn test_buffer_write_read() {
         let pool = test_pool();
-        let mut buffer = pool.allocate(SIZE_1MIB).unwrap();
+        let mut buffer = pool.allocate(SIZE_64KIB).unwrap();
 
         for (i, byte) in buffer.iter_mut().enumerate() {
             *byte = (i % 256) as u8;
@@ -665,11 +673,11 @@ mod tests {
 
         let b1 = pool.allocate(SIZE_64MIB).unwrap();
 
-        let result = pool_clone.allocate(SIZE_1MIB);
+        let result = pool_clone.allocate(SIZE_64KIB);
         assert!(result.is_err());
 
         drop(b1);
 
-        let _b2 = pool_clone.allocate(SIZE_1MIB).unwrap();
+        let _b2 = pool_clone.allocate(SIZE_64KIB).unwrap();
     }
 }

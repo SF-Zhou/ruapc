@@ -29,11 +29,11 @@ pub struct Buffer {
     /// Logical length of data in the buffer (may be less than capacity).
     len: usize,
 
-    /// The allocation level (0-3).
+    /// The allocation level.
     level: u8,
 
     /// Index within the level in the buddy block.
-    index: u8,
+    index: u16,
 }
 
 // SAFETY: Buffer can be sent between threads as it only contains
@@ -52,7 +52,7 @@ impl Buffer {
     /// The caller must ensure:
     /// - `ptr` points to a valid memory region of the appropriate size for `level`
     /// - `block` points to a valid `BuddyBlock`
-    /// - `level` is in range 0-3
+    /// - `level` is in range for the buddy allocator
     /// - `index` is valid for the given level
     pub(crate) unsafe fn new(
         ptr: NonNull<u8>,
@@ -61,7 +61,7 @@ impl Buffer {
         block: NonNull<BuddyBlock>,
         pool: Arc<BufferPool>,
     ) -> Self {
-        debug_assert!(level < crate::buddy::NUM_LEVELS, "level must be 0-3");
+        debug_assert!(level < crate::buddy::NUM_LEVELS, "level out of range");
         debug_assert!(
             index < crate::buddy::NODES_PER_LEVEL[level],
             "index must be less than {}",
@@ -76,7 +76,7 @@ impl Buffer {
             #[allow(clippy::cast_possible_truncation)]
             level: level as u8,
             #[allow(clippy::cast_possible_truncation)]
-            index: index as u8,
+            index: index as u16,
         }
     }
 
@@ -90,10 +90,12 @@ impl Buffer {
 
     /// Returns the capacity of the buffer in bytes (determined by allocation level).
     ///
-    /// - Level 0: 1 MiB
-    /// - Level 1: 4 MiB
-    /// - Level 2: 16 MiB
-    /// - Level 3: 64 MiB
+    /// - Level 0: 64 KiB
+    /// - Level 1: 256 KiB
+    /// - Level 2: 1 MiB
+    /// - Level 3: 4 MiB
+    /// - Level 4: 16 MiB
+    /// - Level 5: 64 MiB
     #[must_use]
     pub const fn capacity(&self) -> usize {
         crate::buddy::LEVEL_SIZES[self.level as usize]

@@ -124,6 +124,7 @@ impl SocketPoolTrait for RdmaSocketPool {
             cq,
             rx,
             connection_config.recv_queue_len,
+            connection_config.recv_buffer_size,
         )?;
         Ok(local_endpoint)
     }
@@ -319,21 +320,12 @@ impl RdmaSocketPool {
             cq,
             rx,
             connection_config.recv_queue_len,
+            connection_config.recv_buffer_size,
         )?;
         {
             let mut socket_map = self.socket_map.write().await;
             socket_map.insert(*addr, socket.clone());
         }
-        let local_info = device.info();
-        tracing::info!(
-            local_device = %local_info.name,
-            local_port = selection.local_port_num,
-            local_gid_index = selection.local_gid_index,
-            remote_device = %selection.remote.device_name,
-            remote_port = selection.remote.port_num,
-            remote_gid_index = selection.remote.gid_index,
-            "acquired RDMA socket"
-        );
         Ok(socket.into())
     }
 
@@ -552,6 +544,7 @@ impl RdmaSocketPool {
             },
             cq_len: local.cq_len.min(remote.cq_len),
             recv_queue_len: local.recv_queue_len.min(remote.recv_queue_len),
+            recv_buffer_size: local.recv_buffer_size.min(remote.recv_buffer_size),
         }
     }
 
@@ -571,6 +564,7 @@ impl RdmaSocketPool {
             },
             cq_len: requested.cq_len.min(local.cq_len),
             recv_queue_len: requested.recv_queue_len.min(local.recv_queue_len),
+            recv_buffer_size: requested.recv_buffer_size.min(local.recv_buffer_size),
         }
     }
 
@@ -602,6 +596,7 @@ impl RdmaSocketPool {
             },
             cq_len: self.config.cq_len.min(info.device_attr.max_cqe as u32),
             recv_queue_len: self.config.recv_queue_len,
+            recv_buffer_size: self.config.recv_buffer_size,
         }
     }
 
@@ -704,10 +699,11 @@ impl RdmaSocketPool {
         cq: Arc<CompletionQueue>,
         pending_receiver: tokio::sync::mpsc::Receiver<SendMsg>,
         recv_queue_len: u32,
+        recv_buffer_size: usize,
     ) -> Result<()> {
         let socket_clone = socket.clone();
         let mut event_loop = EventLoop::new(socket, state, comp_channel, cq, pending_receiver);
-        event_loop.submit_recv_tasks(recv_queue_len as usize)?;
+        event_loop.submit_recv_tasks(recv_queue_len as usize, recv_buffer_size)?;
 
         let task_supervisor = self.task_supervisor.start_async_task();
         tokio::spawn(async move {
@@ -718,7 +714,7 @@ impl RdmaSocketPool {
         let task_supervisor = self.task_supervisor.start_async_task();
         tokio::spawn(async move {
             match event_loop.run().await {
-                Ok(()) => tracing::info!("rdma socket event loop stopped"),
+                Ok(()) => {}
                 Err(e) => tracing::error!("rdma socket event loop error: {}", e),
             }
             drop(task_supervisor);

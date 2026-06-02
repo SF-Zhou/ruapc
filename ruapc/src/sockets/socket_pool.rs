@@ -76,6 +76,11 @@ pub struct SocketPoolConfig {
 
 /// RDMA socket pool configuration.
 #[cfg(feature = "rdma")]
+const fn default_rdma_recv_buffer_size() -> usize {
+    64 * 1024
+}
+
+#[cfg(feature = "rdma")]
 #[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone)]
 pub struct RdmaSocketPoolConfig {
     /// Requested Queue Pair capabilities for newly created RDMA connections.
@@ -84,6 +89,9 @@ pub struct RdmaSocketPoolConfig {
     pub cq_len: u32,
     /// Number of receive buffers to pre-post for each RDMA connection.
     pub recv_queue_len: u32,
+    /// Size in bytes of each pre-posted RDMA receive buffer.
+    #[serde(default = "default_rdma_recv_buffer_size")]
+    pub recv_buffer_size: usize,
     /// P_Key table index used when moving the Queue Pair to INIT.
     pub pkey_index: u16,
 }
@@ -95,6 +103,7 @@ impl Default for RdmaSocketPoolConfig {
             qp: RdmaQueuePairConfig::default(),
             cq_len: 128,
             recv_queue_len: 64,
+            recv_buffer_size: default_rdma_recv_buffer_size(),
             pkey_index: 0,
         }
     }
@@ -522,6 +531,7 @@ mod tests {
                 qp: RdmaQueuePairConfig::default(),
                 cq_len: 128,
                 recv_queue_len: 64,
+                recv_buffer_size: 64 * 1024,
             },
         };
         assert!(pool.rdma_accept(&request, &state).is_err());

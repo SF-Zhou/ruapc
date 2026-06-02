@@ -39,6 +39,10 @@ pub struct Args {
     /// The number of coroutines.
     #[arg(long, default_value = "32")]
     pub coroutines: usize,
+
+    /// Use a separate Context and socket pool for each stress coroutine.
+    #[arg(long, default_value_t = false)]
+    pub per_coroutine_ctx: bool,
 }
 
 #[derive(Default)]
@@ -51,17 +55,31 @@ async fn stress_test(args: Args) {
     let state = Arc::new(State::default());
     let start_time = std::time::Instant::now();
     let mut tasks = vec![];
-    let ctx = Context::create(&SocketPoolConfig {
-        socket_type: SocketType::UNIFIED,
-        ..Default::default()
-    })
-    .unwrap()
-    .with_addr(args.addr);
+    let shared_ctx = if args.per_coroutine_ctx {
+        None
+    } else {
+        Some(
+            Context::create(&SocketPoolConfig {
+                socket_type: SocketType::UNIFIED,
+                ..Default::default()
+            })
+            .unwrap()
+            .with_addr(args.addr),
+        )
+    };
     for _ in 0..args.coroutines {
         let value = Request(args.value.clone());
         let state = state.clone();
-        let ctx = ctx.clone();
+        let shared_ctx = shared_ctx.clone();
         tasks.push(tokio::spawn(async move {
+            let ctx = shared_ctx.unwrap_or_else(|| {
+                Context::create(&SocketPoolConfig {
+                    socket_type: SocketType::UNIFIED,
+                    ..Default::default()
+                })
+                .unwrap()
+                .with_addr(args.addr)
+            });
             while start_time.elapsed().as_secs() < args.secs {
                 let client = Client {
                     timeout: Duration::from_secs(5),
