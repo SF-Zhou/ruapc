@@ -7,10 +7,11 @@
 //!
 //! - **RAII wrappers**: All libibverbs resources (context, PD, CQ, QP, MR,
 //!   completion channel) are wrapped in types that automatically clean up on drop.
-//! - **QueuePair\<B\>**: Generic over a user-provided [`RdmaBuffer`] type.
-//!   High-level [`send`](QueuePair::send) / [`recv`](QueuePair::recv) /
-//!   [`read`](QueuePair::read) take ownership of the buffer and return it via
-//!   [`Completion`] when the work request completes.  Low-level
+//! - **QueuePair**: [`send`](QueuePair::send) / [`recv`](QueuePair::recv) /
+//!   [`read`](QueuePair::read) post work requests under a caller-assigned
+//!   `wr_id`; buffer ownership is tracked by the caller (a per-CQ work-request
+//!   registry), and completions are reaped by polling the shared
+//!   [`CompletionQueue`] directly.  Low-level
 //!   [`post_send`](QueuePair::post_send) / [`post_recv`](QueuePair::post_recv)
 //!   accept raw work request pointers for advanced use cases.
 //! - **Type-safe bindings**: Generated FFI types have custom Rust wrappers
@@ -47,12 +48,12 @@ mod error;
 pub use error::{Error, ErrorKind, Result};
 
 mod types;
-pub use types::{DeviceInfo, FwVer, Gid, GidType, Guid, LinkLayer, Port, RdmaBuffer, WRID, WRType};
+pub use types::{DeviceInfo, FwVer, Gid, GidType, Guid, LinkLayer, Port, RdmaBuffer, WRID};
 
 mod verbs;
 pub use verbs::{
-    ActiveDevice, CompChannel, Completion, CompletionQueue, Context, Device, DeviceList,
-    MemoryRegion, ProtectionDomain, QueuePair,
+    ActiveDevice, CompChannel, CompletionQueue, Context, Device, DeviceList, MemoryRegion,
+    ProtectionDomain, QueuePair,
 };
 
 #[cfg(test)]

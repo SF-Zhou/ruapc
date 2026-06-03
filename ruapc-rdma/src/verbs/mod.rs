@@ -37,4 +37,4 @@ mod protection_domain;
 pub use protection_domain::ProtectionDomain;
 
 mod queue_pair;
-pub use queue_pair::{Completion, QueuePair};
+pub use queue_pair::QueuePair;

@@ -2,30 +2,17 @@
 //!
 //! Provides type-safe helper methods for checking work completion status
 //! and extracting completion data.
+//!
+//! Note: the operation kind (receive / send / ack / RDMA read) is **not**
+//! derivable from the work completion alone anymore — the `wr_id` is an opaque
+//! identifier. The higher layer resolves the operation kind by looking the
+//! `wr_id` up in its work-request registry. The helpers here only expose
+//! information that is intrinsic to the completion: success status and any
+//! immediate data.
 
-use crate::{WRType, ibv_wc, ibv_wc_flags, ibv_wc_status};
+use crate::{ibv_wc, ibv_wc_flags, ibv_wc_status};
 
 impl ibv_wc {
-    /// Checks if this work completion is for a receive operation
-    pub fn is_recv(&self) -> bool {
-        self.wr_id.get_type() == WRType::Recv
-    }
-
-    /// Checks if this work completion is for a send data operation
-    pub fn is_send_data(&self) -> bool {
-        self.wr_id.get_type() == WRType::SendData
-    }
-
-    /// Checks if this work completion is for a send with immediate data operation
-    pub fn is_send_imm(&self) -> bool {
-        self.wr_id.get_type() == WRType::SendImm
-    }
-
-    /// Checks if this work completion is for an RDMA read operation
-    pub fn is_read(&self) -> bool {
-        self.wr_id.get_type() == WRType::Read
-    }
-
     /// Checks if the work completed successfully
     ///
     /// Returns true if the completion status is IBV_WC_SUCCESS
@@ -75,42 +62,24 @@ mod tests {
     }
 
     #[test]
-    fn test_wc_type_checks() {
-        let wc = make_wc(WRID::recv(1), ibv_wc_status::IBV_WC_SUCCESS, 0);
-        assert!(wc.is_recv());
-        assert!(!wc.is_send_data());
-        assert!(!wc.is_send_imm());
-
-        let wc = make_wc(WRID::send_data(2), ibv_wc_status::IBV_WC_SUCCESS, 0);
-        assert!(!wc.is_recv());
-        assert!(wc.is_send_data());
-        assert!(!wc.is_send_imm());
-
-        let wc = make_wc(WRID::send_imm(3), ibv_wc_status::IBV_WC_SUCCESS, 0);
-        assert!(!wc.is_recv());
-        assert!(!wc.is_send_data());
-        assert!(wc.is_send_imm());
-    }
-
-    #[test]
     fn test_wc_succ() {
-        let wc = make_wc(WRID::recv(0), ibv_wc_status::IBV_WC_SUCCESS, 0);
+        let wc = make_wc(WRID::new(0), ibv_wc_status::IBV_WC_SUCCESS, 0);
         assert!(wc.succ());
 
-        let wc = make_wc(WRID::recv(0), ibv_wc_status::IBV_WC_LOC_LEN_ERR, 0);
+        let wc = make_wc(WRID::new(0), ibv_wc_status::IBV_WC_LOC_LEN_ERR, 0);
         assert!(!wc.succ());
     }
 
     #[test]
     fn test_wc_imm_none() {
-        let wc = make_wc(WRID::recv(0), ibv_wc_status::IBV_WC_SUCCESS, 0);
+        let wc = make_wc(WRID::new(0), ibv_wc_status::IBV_WC_SUCCESS, 0);
         assert_eq!(wc.imm(), None);
     }
 
     #[test]
     fn test_wc_imm_some() {
         let mut wc = make_wc(
-            WRID::recv(0),
+            WRID::new(0),
             ibv_wc_status::IBV_WC_SUCCESS,
             ibv_wc_flags::IBV_WC_WITH_IMM.0,
         );
@@ -120,9 +89,9 @@ mod tests {
 
     #[test]
     fn test_wc_debug() {
-        let wc = make_wc(WRID::recv(123), ibv_wc_status::IBV_WC_SUCCESS, 0);
+        let wc = make_wc(WRID::new(123), ibv_wc_status::IBV_WC_SUCCESS, 0);
         let debug = format!("{:?}", wc);
-        assert!(debug.contains("Recv(123)"));
+        assert!(debug.contains("WRID(123)"));
         assert!(debug.contains("IBV_WC_SUCCESS"));
     }
 }

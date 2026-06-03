@@ -1,44 +1,60 @@
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use ruapc_bufpool::RemoteBufferInfo;
-use ruapc_rdma::{QueuePair, WRID, ibv_send_flags, ibv_wc_status};
+use ruapc_rdma::{QueuePair, ibv_send_flags};
 use serde::Serialize;
 use tokio::sync::mpsc::Sender;
 
 use super::RdmaState;
+use super::cq_poller::{RdmaCompletion, SendMsg, WrContext, WrOp, WrRegistry};
 use crate::{
     Buffer, BufferPool, Context, Error, RemoteReadOptions, SocketTrait, State,
     error::{ErrorKind, Result},
     msg::MsgMeta,
-    rdma::event_loop::SendMsg,
     services::{MemoryService, MetaService},
 };
 
-pub(crate) type RdmaCompletion = (ibv_wc_status, Option<Buffer>);
-
 #[derive(Debug)]
 pub struct RdmaSocket {
-    pub(crate) rdma_completions:
-        dashmap::DashMap<WRID, tokio::sync::oneshot::Sender<RdmaCompletion>>,
+    /// Weak self-handle, used to tag work requests with their owning connection
+    /// so the shared-CQ poller can route completions back here. Set once at
+    /// construction via `Arc::new_cyclic`.
+    pub(crate) weak_self: Weak<RdmaSocket>,
+    /// The shared CQ's work-request registry this connection posts into.
+    pub(crate) registry: Arc<WrRegistry>,
     pub(crate) rdmabuf_pool: Arc<BufferPool>,
     pub(crate) queue_pair: QueuePair,
     pub(crate) state: RdmaState,
     pub(crate) pending_sender: Sender<SendMsg>,
+    /// Maximum size of a send buffer. Bounded by the peer's pre-posted recv
+    /// buffer size so an inbound SEND never overruns the receiver.
+    pub(crate) send_buffer_size: usize,
 }
 
 impl RdmaSocket {
-    pub fn new(
+    /// Creates an `Arc<RdmaSocket>` whose work requests are registered into
+    /// `registry` (the shared CQ this connection is pinned to).
+    pub(crate) fn new(
+        registry: Arc<WrRegistry>,
         queue_pair: QueuePair,
         rdmabuf_pool: Arc<BufferPool>,
         pending_sender: Sender<SendMsg>,
-    ) -> Self {
-        Self {
-            rdma_completions: dashmap::DashMap::default(),
+        send_buffer_size: usize,
+        max_send_wr: u32,
+    ) -> Arc<Self> {
+        // The QP send queue is shared by data SENDs, ACK SEND_WITH_IMM, and
+        // RDMA READs. Reserve half of the send-queue depth for those auxiliary
+        // operations so data sends never starve them or overflow the SQ.
+        let max_send_limit = (max_send_wr / 2).max(1);
+        Arc::new_cyclic(|weak_self| Self {
+            weak_self: weak_self.clone(),
+            registry,
             rdmabuf_pool,
             queue_pair,
-            state: RdmaState::new(32),
+            state: RdmaState::new(max_send_limit),
             pending_sender,
-        }
+            send_buffer_size,
+        })
     }
 
     pub fn set_error(&self) {
@@ -51,19 +67,84 @@ impl RdmaSocket {
         let _ = self.queue_pair.modify(&mut attr, mask.0 as _);
     }
 
+    /// Posts a pre-posted receive buffer, registering it in the shared registry.
+    pub(crate) fn post_recv(&self, buf: Buffer) -> Result<()> {
+        self.registry.register_and_post(
+            WrContext {
+                socket: self.weak_self.clone(),
+                buf: Some(buf),
+                op: WrOp::Recv,
+            },
+            |id, buf| {
+                self.queue_pair
+                    .recv(id, buf.expect("recv buffer present"))
+                    .map_err(|e| Error::new(ErrorKind::RdmaRecvFailed, e.to_string()))
+            },
+        )
+    }
+
+    /// Posts a data SEND for `buf`. Always signaled so the completion advances
+    /// flow-control bookkeeping and returns the buffer to the pool.
+    pub(crate) fn post_data_send(&self, buf: Buffer) -> Result<()> {
+        self.registry.register_and_post(
+            WrContext {
+                socket: self.weak_self.clone(),
+                buf: Some(buf),
+                op: WrOp::DataSend,
+            },
+            |id, buf| {
+                self.queue_pair
+                    .send(
+                        id,
+                        buf.expect("send buffer present"),
+                        ibv_send_flags::IBV_SEND_SIGNALED,
+                    )
+                    .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))
+            },
+        )
+    }
+
+    /// Posts a zero-length flow-control ACK (SEND_WITH_IMM, no buffer).
+    pub(crate) fn post_ack(&self, imm: u32) -> Result<()> {
+        self.registry.register_and_post(
+            WrContext {
+                socket: self.weak_self.clone(),
+                buf: None,
+                op: WrOp::Ack,
+            },
+            |id, _buf| {
+                self.queue_pair
+                    .send_imm_only(id, imm, ibv_send_flags::IBV_SEND_SIGNALED)
+                    .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))
+            },
+        )
+    }
+
     fn post_rdma_read(
         &self,
         buffer: Buffer,
         remote_addr: u64,
         rkey: u32,
     ) -> Result<tokio::sync::oneshot::Receiver<RdmaCompletion>> {
-        let wr_id = self
-            .queue_pair
-            .read(buffer, remote_addr, rkey, ibv_send_flags::IBV_SEND_SIGNALED)
-            .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
-
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.rdma_completions.insert(wr_id, tx);
+        self.registry.register_and_post(
+            WrContext {
+                socket: self.weak_self.clone(),
+                buf: Some(buffer),
+                op: WrOp::RdmaRead(tx),
+            },
+            |id, buf| {
+                self.queue_pair
+                    .read(
+                        id,
+                        buf.expect("read buffer present"),
+                        remote_addr,
+                        rkey,
+                        ibv_send_flags::IBV_SEND_SIGNALED,
+                    )
+                    .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))
+            },
+        )?;
         Ok(rx)
     }
 
@@ -82,7 +163,7 @@ impl RdmaSocket {
                 "RDMA completion did not return buffer".into(),
             )
         })?;
-        if status != ibv_wc_status::IBV_WC_SUCCESS {
+        if status != ruapc_rdma::ibv_wc_status::IBV_WC_SUCCESS {
             return Err(Error::new(
                 ErrorKind::RdmaSendFailed,
                 format!("RDMA operation failed with status {status:?}"),
@@ -108,15 +189,13 @@ impl SocketTrait for RdmaSocket {
         payload: &P,
         _: &Arc<State>,
     ) -> Result<()> {
-        let mut buf = self.rdmabuf_pool.allocate(1024 * 1024)?;
+        let mut buf = self.rdmabuf_pool.allocate(self.send_buffer_size)?;
         meta.serialize_to(payload, &mut buf)?;
 
         let index = self.state.apply_send_index();
         if index.is_ok() {
             if self.state.ready_to_send(index) {
-                self.queue_pair
-                    .send(buf, ibv_send_flags::IBV_SEND_SIGNALED)
-                    .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
+                self.post_data_send(buf)?;
             } else {
                 self.pending_sender
                     .send(SendMsg {

@@ -89,7 +89,6 @@ impl RdmaInfo {
                                     .qp
                                     .max_recv_sge
                                     .min(info.device_attr.max_sge as u32),
-                                max_inline_data: config.qp.max_inline_data,
                             },
                             cq_len: config.cq_len.min(info.device_attr.max_cqe as u32),
                             recv_queue_len: config.recv_queue_len,

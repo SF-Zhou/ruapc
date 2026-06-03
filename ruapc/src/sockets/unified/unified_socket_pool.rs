@@ -131,6 +131,11 @@ impl SocketPoolTrait for UnifiedSocketPool {
 
     fn stop(&self) {
         self.task_supervisor.stop();
+        // Forward stop to the RDMA pool so its dedicated CQ poller threads are
+        // signalled and joined (they are OS threads, not tracked by the unified
+        // task supervisor).
+        #[cfg(feature = "rdma")]
+        self.rdma_socket_pool.stop();
     }
 
     fn drop_guard(&self) -> DropGuard {

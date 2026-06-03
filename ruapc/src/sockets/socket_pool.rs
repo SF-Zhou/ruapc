@@ -81,12 +81,34 @@ const fn default_rdma_recv_buffer_size() -> usize {
 }
 
 #[cfg(feature = "rdma")]
+const fn default_rdma_cq_count() -> u32 {
+    4
+}
+
+#[cfg(feature = "rdma")]
+const fn default_rdma_cq_size() -> usize {
+    1_000_000
+}
+
+#[cfg(feature = "rdma")]
 #[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone)]
 pub struct RdmaSocketPoolConfig {
     /// Requested Queue Pair capabilities for newly created RDMA connections.
     pub qp: RdmaQueuePairConfig,
     /// Completion Queue length requested for each RDMA connection.
     pub cq_len: u32,
+    /// Number of shared completion queues (and dedicated poller threads) to
+    /// create **per RDMA device**. Connections are spread across these CQs, so
+    /// this bounds the number of busy-polling threads independently of the
+    /// connection count.
+    #[serde(default = "default_rdma_cq_count")]
+    pub cq_count: u32,
+    /// Requested size (number of CQEs) for each shared completion queue. Capped
+    /// at the device's `max_cqe`. Must be large enough to hold the worst-case
+    /// in-flight completions of all connections sharing the CQ
+    /// (`Σ (max_send_wr + max_recv_wr)`); see [`effective_cq_size`].
+    #[serde(default = "default_rdma_cq_size")]
+    pub cq_size: usize,
     /// Number of receive buffers to pre-post for each RDMA connection.
     pub recv_queue_len: u32,
     /// Size in bytes of each pre-posted RDMA receive buffer.
@@ -97,12 +119,23 @@ pub struct RdmaSocketPoolConfig {
 }
 
 #[cfg(feature = "rdma")]
+impl RdmaSocketPoolConfig {
+    /// The requested per-CQ size, before the per-device `max_cqe` cap is
+    /// applied at creation time.
+    pub(crate) fn effective_cq_size(&self) -> usize {
+        self.cq_size.max(1)
+    }
+}
+
+#[cfg(feature = "rdma")]
 impl Default for RdmaSocketPoolConfig {
     fn default() -> Self {
         Self {
             qp: RdmaQueuePairConfig::default(),
-            cq_len: 128,
-            recv_queue_len: 64,
+            cq_len: 1024,
+            cq_count: default_rdma_cq_count(),
+            cq_size: default_rdma_cq_size(),
+            recv_queue_len: 128,
             recv_buffer_size: default_rdma_recv_buffer_size(),
             pkey_index: 0,
         }
@@ -117,18 +150,21 @@ pub struct RdmaQueuePairConfig {
     pub max_recv_wr: u32,
     pub max_send_sge: u32,
     pub max_recv_sge: u32,
-    pub max_inline_data: u32,
 }
 
 #[cfg(feature = "rdma")]
 impl Default for RdmaQueuePairConfig {
     fn default() -> Self {
+        // Per-connection depths are kept moderate: with many connections
+        // multiplexed onto a few shared CQs, the CQ must hold
+        // `Σ (max_send_wr + max_recv_wr)` worst-case completions, so very deep
+        // per-connection queues do not scale. 128/128 balances single-stream
+        // pipelining against connection density.
         Self {
-            max_send_wr: 64,
-            max_recv_wr: 64,
+            max_send_wr: 128,
+            max_recv_wr: 128,
             max_send_sge: 1,
             max_recv_sge: 1,
-            max_inline_data: 0,
         }
     }
 }

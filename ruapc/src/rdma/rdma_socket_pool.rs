@@ -17,13 +17,13 @@ use tokio_util::sync::DropGuard;
 
 use super::rdma_service::{RdmaDeviceInfo, RdmaGidInfo, RdmaPortInfo};
 use super::{
-    ConnectRequest, DeviceSelection, Endpoint, EventLoop, RdmaConnectionConfig, RdmaDevice,
-    RdmaDeviceRefresher, RdmaInfo, RdmaService, RdmaSocket,
+    ConnState, ConnectRequest, CqPool, DeviceSelection, Endpoint, RdmaConnectionConfig, RdmaDevice,
+    RdmaDeviceRefresher, RdmaInfo, RdmaService, RdmaSocket, SendMsg, SharedCq,
 };
 use crate::{
     BufferPool, Client, Context, Devices, Error, ErrorKind, RdmaQueuePairConfig,
     RdmaSocketPoolConfig, Result, Socket, SocketPoolConfig, SocketPoolTrait, SocketType, State,
-    TaskSupervisor, rdma::event_loop::SendMsg,
+    TaskSupervisor,
 };
 
 /// A pool managing RDMA sockets and their associated resources.
@@ -31,7 +31,9 @@ use crate::{
 /// # Drop order
 ///
 /// RDMA resources **must** be destroyed in this order:
-///   1. Stop all async tasks (so EventLoop drops its `Arc<RdmaSocket>`)
+///   1. Stop async tasks and **join the CQ poller threads** (`cq_pool`), so no
+///      thread polls a CQ/QP after it is destroyed and every poller releases
+///      its `ConnState` (and thus its `Arc<RdmaSocket>`).
 ///   2. Destroy QPs (`socket_map`)
 ///   3. Deregister MRs (`buffer_pool`)
 ///   4. Destroy PD / close device context (`devices`)
@@ -41,8 +43,7 @@ use crate::{
 pub struct RdmaSocketPool {
     /// Client used for acquiring RDMA connections (no RDMA resources).
     pub acquire_client: Client,
-    /// Supervisor for managing asynchronous tasks — dropped first so that
-    /// all spawned EventLoop tasks finish and release their `Arc<RdmaSocket>`.
+    /// Supervisor for managing asynchronous helper tasks (port refresher).
     pub task_supervisor: TaskSupervisor,
     /// Background port/GID cache refresher. Dropped before RDMA devices.
     _port_refresher: RdmaDeviceRefresher,
@@ -50,8 +51,11 @@ pub struct RdmaSocketPool {
     connect_locks: dashmap::DashMap<SocketAddr, Arc<tokio::sync::Mutex<()>>, RandomState>,
     /// Short-lived cache for the first-stage server RDMA device query.
     device_list_cache: RwLock<HashMap<SocketAddr, CachedRdmaInfo, RandomState>>,
+    /// Shared completion-queue pool + dedicated poller threads. Dropped first
+    /// (joins poller threads) so nothing polls a CQ/QP during teardown.
+    cq_pool: CqPool,
     /// Thread-safe map of active RDMA sockets indexed by their addresses.
-    /// Dropped after tasks stop → destroys QPs.
+    /// Dropped after pollers stop → destroys QPs.
     pub socket_map: RwLock<HashMap<SocketAddr, Arc<RdmaSocket>, RandomState>>,
     /// Shared buffer pool (owned by State, kept alive via Arc).
     /// Dropped after QPs → deregisters MRs.
@@ -63,6 +67,8 @@ pub struct RdmaSocketPool {
     pub config: RdmaSocketPoolConfig,
     /// Counter for round-robin device selection.
     next_device: AtomicUsize,
+    /// Counter for spreading connections across the shared CQs.
+    next_cq: AtomicUsize,
 }
 
 impl SocketPoolTrait for RdmaSocketPool {
@@ -77,6 +83,10 @@ impl SocketPoolTrait for RdmaSocketPool {
     /// Stops all tasks managed by the socket pool.
     fn stop(&self) {
         self.task_supervisor.stop();
+        // Signal the CQ pollers to drain their connections and join the poller
+        // threads. After this returns no thread is polling, so the QPs/CQs can
+        // be safely destroyed.
+        self.cq_pool.shutdown();
     }
 
     /// Returns a guard that will stop all tasks when dropped.
@@ -99,9 +109,10 @@ impl SocketPoolTrait for RdmaSocketPool {
 
     /// Establishes a new RDMA connection with the specified endpoint.
     fn rdma_accept(&self, request: &ConnectRequest, state: &Arc<State>) -> Result<Endpoint> {
-        let device = self.find_device_by_name(&request.target)?;
+        let (device_index, device) = self.find_device_by_name(&request.target)?;
         let connection_config = self.clamp_connection_config(device, request.config);
-        let (queue_pair, comp_channel, cq) = self.create_queue_pair(device, &connection_config)?;
+        let shared = self.pick_cq(device_index);
+        let queue_pair = self.create_queue_pair(device, &connection_config, &shared)?;
         let local_endpoint = self.build_endpoint(
             &queue_pair,
             device,
@@ -115,17 +126,7 @@ impl SocketPoolTrait for RdmaSocketPool {
             self.config.pkey_index,
         )?;
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<SendMsg>(1024);
-        let rdma_socket = RdmaSocket::new(queue_pair, self.buffer_pool.clone(), tx);
-        self.spawn_event_loop(
-            Arc::new(rdma_socket),
-            state.clone(),
-            comp_channel,
-            cq,
-            rx,
-            connection_config.recv_queue_len,
-            connection_config.recv_buffer_size,
-        )?;
+        self.establish_connection(queue_pair, &shared, state, &connection_config)?;
         Ok(local_endpoint)
     }
 
@@ -188,6 +189,26 @@ impl RdmaSocketPool {
     ) -> Result<Self> {
         let task_supervisor = TaskSupervisor::create();
         let port_refresher = RdmaDeviceRefresher::start(devices.clone(), &task_supervisor);
+
+        // Build the shared completion-queue pool: `cq_count` CQs (each with a
+        // dedicated poller thread) per RDMA device. Connections are pinned to
+        // one CQ for their lifetime, so a fixed (O(cores)) number of poller
+        // threads serves an unbounded number of connections.
+        let rdma_devices = devices.rdma_devices();
+        let device_count = rdma_devices.len();
+        let cq_size = config.effective_cq_size();
+        let runtime = tokio::runtime::Handle::current();
+        let cq_pool = CqPool::new(device_count, config.cq_count as usize, runtime, |dev| {
+            let device = &rdma_devices[dev];
+            let ctx = device.context();
+            let comp_channel = CompChannel::create(ctx)
+                .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
+            let cqe = cq_size.min(device.info().device_attr.max_cqe as usize);
+            let cq = CompletionQueue::create(ctx, cqe as _, Some(&comp_channel))
+                .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
+            Ok((cq, comp_channel))
+        })?;
+
         Ok(Self {
             acquire_client: Client {
                 timeout: std::time::Duration::from_secs(5),
@@ -198,19 +219,22 @@ impl RdmaSocketPool {
             _port_refresher: port_refresher,
             connect_locks: dashmap::DashMap::default(),
             device_list_cache: RwLock::default(),
+            cq_pool,
             socket_map: RwLock::default(),
             buffer_pool,
             devices,
             config,
             next_device: AtomicUsize::new(0),
+            next_cq: AtomicUsize::new(0),
         })
     }
 
-    fn find_device_by_name(&self, selection: &DeviceSelection) -> Result<&RdmaDevice> {
+    fn find_device_by_name(&self, selection: &DeviceSelection) -> Result<(usize, &RdmaDevice)> {
         self.devices
             .rdma_devices()
             .iter()
-            .find(|device| device.info().name.as_str() == selection.device_name)
+            .enumerate()
+            .find(|(_, device)| device.info().name.as_str() == selection.device_name)
             .ok_or_else(|| {
                 Error::new(
                     ErrorKind::InvalidArgument,
@@ -219,24 +243,15 @@ impl RdmaSocketPool {
             })
     }
 
-    /// Creates a QueuePair along with its CompChannel and CompletionQueue.
+    /// Creates a QueuePair attached to the given shared completion queue (used
+    /// for both send and recv).
     fn create_queue_pair(
         &self,
         device: &RdmaDevice,
         config: &RdmaConnectionConfig,
-    ) -> Result<(QueuePair, Arc<CompChannel>, Arc<CompletionQueue>)> {
-        let rdma = device;
-        let ctx = rdma.context();
-        let pd = rdma.pd();
-
-        let comp_channel = CompChannel::create(ctx)
-            .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
-        comp_channel
-            .set_nonblock()
-            .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
-
-        let cq = CompletionQueue::create(ctx, config.cq_len as _, Some(&comp_channel))
-            .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
+        shared: &SharedCq,
+    ) -> Result<QueuePair> {
+        let pd = device.pd();
 
         let mut init_attr = ibv_qp_init_attr {
             qp_type: ibv_qp_type::IBV_QPT_RC,
@@ -245,15 +260,49 @@ impl RdmaSocketPool {
                 max_recv_wr: config.qp.max_recv_wr,
                 max_send_sge: config.qp.max_send_sge,
                 max_recv_sge: config.qp.max_recv_sge,
-                max_inline_data: config.qp.max_inline_data,
+                max_inline_data: 0,
             },
             ..Default::default()
         };
 
-        let queue_pair = QueuePair::create(pd, &cq, &cq, &mut init_attr, device.index())
-            .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
+        let queue_pair =
+            QueuePair::create(pd, &shared.cq, &shared.cq, &mut init_attr, device.index())
+                .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
 
-        Ok((queue_pair, comp_channel, cq))
+        Ok(queue_pair)
+    }
+
+    /// Builds the `RdmaSocket` + per-connection `ConnState`, pre-posts recv
+    /// buffers, and registers the connection with the poller that owns
+    /// `shared`. Inserting into `socket_map` is the caller's responsibility.
+    fn establish_connection(
+        &self,
+        queue_pair: QueuePair,
+        shared: &SharedCq,
+        state: &Arc<State>,
+        connection_config: &RdmaConnectionConfig,
+    ) -> Result<Arc<RdmaSocket>> {
+        let qp_num = queue_pair.qp_num();
+        let (tx, rx) = tokio::sync::mpsc::channel::<SendMsg>(1024);
+        let socket = RdmaSocket::new(
+            shared.registry.clone(),
+            queue_pair,
+            self.buffer_pool.clone(),
+            tx,
+            connection_config.recv_buffer_size,
+            connection_config.qp.max_send_wr,
+        );
+
+        let mut conn = ConnState::new(
+            socket.clone(),
+            state.clone(),
+            rx,
+            connection_config.recv_buffer_size,
+        );
+        conn.submit_recv_tasks(connection_config.recv_queue_len as usize)?;
+
+        self.cq_pool.register_conn(shared, qp_num, conn);
+        Ok(socket)
     }
 
     async fn handshake(&self, addr: &SocketAddr, state: &Arc<State>) -> Result<Socket> {
@@ -282,7 +331,8 @@ impl RdmaSocketPool {
                 )
             })?;
         let connection_config = self.negotiate_connection_config(device, &selection.remote_device);
-        let (queue_pair, comp_channel, cq) = self.create_queue_pair(device, &connection_config)?;
+        let shared = self.pick_cq(selection.local_device_index);
+        let queue_pair = self.create_queue_pair(device, &connection_config, &shared)?;
         let local_endpoint = self.build_endpoint(
             &queue_pair,
             device,
@@ -310,23 +360,19 @@ impl RdmaSocketPool {
             self.config.pkey_index,
         )?;
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<SendMsg>(1024);
-        let socket = RdmaSocket::new(queue_pair, self.buffer_pool.clone(), tx);
-        let socket = Arc::new(socket);
-        self.spawn_event_loop(
-            socket.clone(),
-            state.clone(),
-            comp_channel,
-            cq,
-            rx,
-            connection_config.recv_queue_len,
-            connection_config.recv_buffer_size,
-        )?;
+        let socket = self.establish_connection(queue_pair, &shared, state, &connection_config)?;
         {
             let mut socket_map = self.socket_map.write().await;
             socket_map.insert(*addr, socket.clone());
         }
         Ok(socket.into())
+    }
+
+    /// Picks a shared CQ for a new connection on the given device position,
+    /// spreading load across the per-device CQs round-robin.
+    fn pick_cq(&self, device_index: usize) -> SharedCq {
+        let sel = self.next_cq.fetch_add(1, Ordering::Relaxed);
+        self.cq_pool.pick(device_index, sel)
     }
 
     async fn fetch_remote_device_list(&self, addr: &SocketAddr, ctx: &Context) -> Result<RdmaInfo> {
@@ -540,7 +586,6 @@ impl RdmaSocketPool {
                 max_recv_wr: local.qp.max_recv_wr.min(remote.qp.max_send_wr),
                 max_send_sge: local.qp.max_send_sge.min(remote.qp.max_recv_sge),
                 max_recv_sge: local.qp.max_recv_sge.min(remote.qp.max_send_sge),
-                max_inline_data: local.qp.max_inline_data.min(remote.qp.max_inline_data),
             },
             cq_len: local.cq_len.min(remote.cq_len),
             recv_queue_len: local.recv_queue_len.min(remote.recv_queue_len),
@@ -560,7 +605,6 @@ impl RdmaSocketPool {
                 max_recv_wr: requested.qp.max_recv_wr.min(local.qp.max_recv_wr),
                 max_send_sge: requested.qp.max_send_sge.min(local.qp.max_send_sge),
                 max_recv_sge: requested.qp.max_recv_sge.min(local.qp.max_recv_sge),
-                max_inline_data: requested.qp.max_inline_data.min(local.qp.max_inline_data),
             },
             cq_len: requested.cq_len.min(local.cq_len),
             recv_queue_len: requested.recv_queue_len.min(local.recv_queue_len),
@@ -592,7 +636,6 @@ impl RdmaSocketPool {
                     .qp
                     .max_recv_sge
                     .min(info.device_attr.max_sge as u32),
-                max_inline_data: self.config.qp.max_inline_data,
             },
             cq_len: self.config.cq_len.min(info.device_attr.max_cqe as u32),
             recv_queue_len: self.config.recv_queue_len,
@@ -689,44 +732,17 @@ impl RdmaSocketPool {
     fn min_mtu(a: ibv_mtu, b: ibv_mtu) -> ibv_mtu {
         if (a as u32) <= (b as u32) { a } else { b }
     }
-
-    /// Starts the event loop for handling RDMA events on a socket.
-    pub fn spawn_event_loop(
-        &self,
-        socket: Arc<RdmaSocket>,
-        state: Arc<State>,
-        comp_channel: Arc<CompChannel>,
-        cq: Arc<CompletionQueue>,
-        pending_receiver: tokio::sync::mpsc::Receiver<SendMsg>,
-        recv_queue_len: u32,
-        recv_buffer_size: usize,
-    ) -> Result<()> {
-        let socket_clone = socket.clone();
-        let mut event_loop = EventLoop::new(socket, state, comp_channel, cq, pending_receiver);
-        event_loop.submit_recv_tasks(recv_queue_len as usize, recv_buffer_size)?;
-
-        let task_supervisor = self.task_supervisor.start_async_task();
-        tokio::spawn(async move {
-            task_supervisor.stopped().await;
-            socket_clone.set_error();
-        });
-
-        let task_supervisor = self.task_supervisor.start_async_task();
-        tokio::spawn(async move {
-            match event_loop.run().await {
-                Ok(()) => {}
-                Err(e) => tracing::error!("rdma socket event loop error: {}", e),
-            }
-            drop(task_supervisor);
-        });
-
-        Ok(())
-    }
 }
 
 impl Drop for RdmaSocketPool {
     fn drop(&mut self) {
+        // Stop helper tasks, then stop+join the CQ poller threads BEFORE the
+        // QPs/CQs are destroyed. `cq_pool` is also dropped after this (it is
+        // declared before `socket_map`), and its Drop calls `shutdown` again
+        // (idempotent); doing it explicitly here makes the ordering obvious:
+        //   pollers joined → QPs destroyed (socket_map) → MRs → PD/context.
         self.task_supervisor.stop();
+        self.cq_pool.shutdown();
         self.socket_map.get_mut().clear();
     }
 }

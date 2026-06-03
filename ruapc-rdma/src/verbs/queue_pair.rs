@@ -1,32 +1,18 @@
-use std::{
-    collections::HashMap,
-    os::raw::c_int,
-    ptr,
-    sync::Arc,
-    sync::Mutex,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::{os::raw::c_int, ptr, sync::Arc};
 
 use ruapc_bufpool::{Buffer, DeviceIndex};
 
 use super::{completion_queue::CompletionQueue, protection_domain::ProtectionDomain};
 use crate::{
     Error, ErrorKind, LinkLayer, Result, WRID, ibv_gid, ibv_mtu, ibv_qp_attr, ibv_qp_attr_mask,
-    ibv_qp_state, ibv_wc,
+    ibv_qp_state,
 };
-
-pub struct Completion {
-    pub wc: ibv_wc,
-    pub buffer: Option<Buffer>,
-}
 
 pub struct QueuePair {
     ptr: *mut crate::ibv_qp,
     _pd: Arc<ProtectionDomain>,
     send_cq: Arc<CompletionQueue>,
     recv_cq: Arc<CompletionQueue>,
-    wrs: Mutex<HashMap<u64, Buffer>>,
-    next_id: AtomicU64,
     pub device_index: DeviceIndex,
 }
 
@@ -49,10 +35,18 @@ impl QueuePair {
             _pd: Arc::clone(pd),
             send_cq: Arc::clone(send_cq),
             recv_cq: Arc::clone(recv_cq),
-            wrs: Mutex::new(HashMap::new()),
-            next_id: AtomicU64::new(0),
             device_index,
         })
+    }
+
+    /// Returns the send completion queue this QP is attached to.
+    pub fn send_cq(&self) -> &Arc<CompletionQueue> {
+        &self.send_cq
+    }
+
+    /// Returns the receive completion queue this QP is attached to.
+    pub fn recv_cq(&self) -> &Arc<CompletionQueue> {
+        &self.recv_cq
     }
 
     fn lkey(&self, buffer: &Buffer) -> Result<u32> {
@@ -70,15 +64,19 @@ impl QueuePair {
         unsafe { (*self.ptr).qp_num }
     }
 
-    pub fn send(&self, buffer: Buffer, flags: crate::ibv_send_flags) -> Result<()> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let wr_id = WRID::send_data(id);
+    /// Posts a SEND work request for `buffer` with the caller-assigned `wr_id`.
+    ///
+    /// The buffer's memory must remain valid and pinned until the matching
+    /// completion is reaped. Ownership of the buffer is tracked by the caller
+    /// (the per-CQ work-request registry); this method only borrows it to read
+    /// its address / length / lkey, so the caller must register the buffer
+    /// under `wr_id` **before** calling this (and unregister on error).
+    pub fn send(&self, wr_id: u64, buffer: &Buffer, flags: crate::ibv_send_flags) -> Result<()> {
         let addr = buffer.as_ptr() as u64;
         let len = buffer.len() as u32;
-        let lkey = self.lkey(&buffer)?;
-        self.wrs.lock().unwrap().insert(id, buffer);
+        let lkey = self.lkey(buffer)?;
         self.post_send_verb(
-            wr_id,
+            WRID::new(wr_id),
             addr,
             len,
             lkey,
@@ -86,25 +84,28 @@ impl QueuePair {
             flags.0,
             None,
         )
-        .inspect_err(|_e| {
-            self.wrs.lock().unwrap().remove(&id);
-        })
     }
 
-    pub fn send_imm(&self, buffer: Buffer, imm: u32, flags: crate::ibv_send_flags) -> Result<()> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let wr_id = WRID::send_imm(id);
+    /// Posts a SEND_WITH_IMM carrying `buffer` and `imm`, with `wr_id`.
+    ///
+    /// See [`send`](Self::send) for the buffer-ownership contract.
+    pub fn send_imm(
+        &self,
+        wr_id: u64,
+        buffer: &Buffer,
+        imm: u32,
+        flags: crate::ibv_send_flags,
+    ) -> Result<()> {
         let addr = buffer.as_ptr() as u64;
         let len = buffer.len() as u32;
-        let lkey = self.lkey(&buffer)?;
-        self.wrs.lock().unwrap().insert(id, buffer);
+        let lkey = self.lkey(buffer)?;
         let mut sge = crate::ibv_sge {
             addr,
             length: len,
             lkey,
         };
         let mut wr = crate::ibv_send_wr {
-            wr_id,
+            wr_id: WRID::new(wr_id),
             sg_list: &mut sge,
             num_sge: 1,
             opcode: crate::ibv_wr_opcode::IBV_WR_SEND_WITH_IMM,
@@ -114,19 +115,14 @@ impl QueuePair {
             },
             ..Default::default()
         };
-        let result = unsafe { self.post_send(&mut wr) };
-        if let Err((_, err)) = result {
-            self.wrs.lock().unwrap().remove(&id);
-            return Err(err);
-        }
-        Ok(())
+        unsafe { self.post_send(&mut wr) }.map_err(|(_, err)| err)
     }
 
-    pub fn send_imm_only(&self, imm: u32, flags: crate::ibv_send_flags) -> Result<()> {
-        let _id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let wr_id = WRID::send_imm(_id);
+    /// Posts a zero-length SEND_WITH_IMM (used for flow-control ACKs) with
+    /// `wr_id`. No buffer is associated.
+    pub fn send_imm_only(&self, wr_id: u64, imm: u32, flags: crate::ibv_send_flags) -> Result<()> {
         let mut wr = crate::ibv_send_wr {
-            wr_id,
+            wr_id: WRID::new(wr_id),
             sg_list: ptr::null_mut(),
             num_sge: 0,
             opcode: crate::ibv_wr_opcode::IBV_WR_SEND_WITH_IMM,
@@ -136,28 +132,25 @@ impl QueuePair {
             },
             ..Default::default()
         };
-        let result = unsafe { self.post_send(&mut wr) };
-        if let Err((_, err)) = result {
-            return Err(err);
-        }
-        Ok(())
+        unsafe { self.post_send(&mut wr) }.map_err(|(_, err)| err)
     }
 
+    /// Posts an RDMA READ into `buffer` from `remote_addr`/`rkey`, with `wr_id`.
+    ///
+    /// See [`send`](Self::send) for the buffer-ownership contract.
     pub fn read(
         &self,
-        buffer: Buffer,
+        wr_id: u64,
+        buffer: &Buffer,
         remote_addr: u64,
         rkey: u32,
         flags: crate::ibv_send_flags,
-    ) -> Result<WRID> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let wr_id = WRID::read(id);
+    ) -> Result<()> {
         let addr = buffer.as_ptr() as u64;
         let len = buffer.len() as u32;
-        let lkey = self.lkey(&buffer)?;
-        self.wrs.lock().unwrap().insert(id, buffer);
+        let lkey = self.lkey(buffer)?;
         self.post_send_verb(
-            wr_id,
+            WRID::new(wr_id),
             addr,
             len,
             lkey,
@@ -165,10 +158,6 @@ impl QueuePair {
             flags.0,
             Some((remote_addr, rkey)),
         )
-        .inspect_err(|_e| {
-            self.wrs.lock().unwrap().remove(&id);
-        })?;
-        Ok(wr_id)
     }
 
     fn post_send_verb(
@@ -199,62 +188,29 @@ impl QueuePair {
                 rdma: crate::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 { remote_addr, rkey },
             };
         }
-        let result = unsafe { self.post_send(&mut wr) };
-        if let Err((_, err)) = result {
-            return Err(err);
-        }
-        Ok(())
+        unsafe { self.post_send(&mut wr) }.map_err(|(_, err)| err)
     }
 
-    pub fn recv(&self, buffer: Buffer) -> Result<()> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let wr_id = WRID::recv(id);
+    /// Posts a RECV work request for `buffer` with the caller-assigned `wr_id`.
+    ///
+    /// See [`send`](Self::send) for the buffer-ownership contract; the buffer is
+    /// posted at its full capacity to receive an inbound message.
+    pub fn recv(&self, wr_id: u64, buffer: &Buffer) -> Result<()> {
         let addr = buffer.as_ptr() as u64;
         let len = buffer.capacity() as u32;
-        let lkey = self.lkey(&buffer)?;
-        self.wrs.lock().unwrap().insert(id, buffer);
+        let lkey = self.lkey(buffer)?;
         let mut sge = crate::ibv_sge {
             addr,
             length: len,
             lkey,
         };
         let mut wr = crate::ibv_recv_wr {
-            wr_id,
+            wr_id: WRID::new(wr_id),
             sg_list: &mut sge,
             num_sge: 1,
             ..Default::default()
         };
-        let result = unsafe { self.post_recv(&mut wr) };
-        if let Err((_, err)) = result {
-            self.wrs.lock().unwrap().remove(&id);
-            return Err(err);
-        }
-        Ok(())
-    }
-
-    pub fn poll_send(&self, wc: &mut [ibv_wc]) -> Result<Vec<Completion>> {
-        let n = self.send_cq.poll(wc)?;
-        Ok(self.take_buffers(&wc[..n]))
-    }
-
-    pub fn poll_recv(&self, wc: &mut [ibv_wc]) -> Result<Vec<Completion>> {
-        let n = self.recv_cq.poll(wc)?;
-        Ok(self.take_buffers(&wc[..n]))
-    }
-
-    fn take_buffers(&self, wc: &[ibv_wc]) -> Vec<Completion> {
-        let mut completions = Vec::with_capacity(wc.len());
-        let mut wrs = self.wrs.lock().unwrap();
-        for wc in wc {
-            let id = wc.wr_id.get_id();
-            let buffer = wrs.remove(&id);
-            completions.push(Completion { wc: *wc, buffer });
-        }
-        completions
-    }
-
-    pub fn take_buffer(&self, wr_id: &WRID) -> Option<Buffer> {
-        self.wrs.lock().unwrap().remove(&wr_id.get_id())
+        unsafe { self.post_recv(&mut wr) }.map_err(|(_, err)| err)
     }
 
     pub fn modify(&self, attr: &mut crate::ibv_qp_attr, attr_mask: c_int) -> Result<()> {

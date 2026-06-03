@@ -36,7 +36,7 @@ mod pthread;
 pub use pthread::{pthread_cond_t, pthread_mutex_t};
 
 mod wrid;
-pub use wrid::{WRID, WRType};
+pub use wrid::WRID;
 
 mod buffer;
 pub use buffer::RdmaBuffer;
