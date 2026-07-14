@@ -29,10 +29,12 @@ pub struct Buffer {
     /// Logical length of data in the buffer (may be less than capacity).
     len: usize,
 
-    /// The allocation level (0-3).
+    /// The allocation kind: buddy level (0-3) for buddy buffers, or
+    /// `NUM_LEVELS + class` for slab chunks (64 KiB / 256 KiB).
     level: u8,
 
-    /// Index within the level in the buddy block.
+    /// Index within the level in the buddy block (buddy buffers), or the
+    /// chunk index within the slab (slab chunks).
     index: u8,
 }
 
@@ -80,6 +82,42 @@ impl Buffer {
         }
     }
 
+    /// Creates a new buffer for a slab chunk.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure:
+    /// - `ptr` points to a valid chunk of `SLAB_CLASS_SIZES[class]` bytes
+    ///   inside a slab owned by the pool's slab layer
+    /// - `block` points to the `BuddyBlock` containing the chunk
+    /// - `class` is a valid slab class and `index` a valid chunk index
+    pub(crate) unsafe fn new_chunk(
+        ptr: NonNull<u8>,
+        class: usize,
+        index: usize,
+        block: NonNull<BuddyBlock>,
+        pool: Arc<BufferPool>,
+    ) -> Self {
+        debug_assert!(class < crate::slab::NUM_SLAB_CLASSES);
+        let capacity = crate::slab::SLAB_CLASS_SIZES[class];
+        debug_assert!(index < crate::slab::SLAB_BACKING_SIZE / capacity);
+        Self {
+            ptr,
+            pool,
+            block,
+            len: capacity,
+            #[allow(clippy::cast_possible_truncation)]
+            level: (crate::buddy::NUM_LEVELS + class) as u8,
+            #[allow(clippy::cast_possible_truncation)]
+            index: index as u8,
+        }
+    }
+
+    /// Returns the buddy block containing this buffer.
+    pub(crate) const fn block_ptr(&self) -> NonNull<BuddyBlock> {
+        self.block
+    }
+
     /// Returns the logical length of the buffer in bytes.
     ///
     /// Initially set to the full capacity. Use `set_len` to adjust.
@@ -88,15 +126,17 @@ impl Buffer {
         self.len
     }
 
-    /// Returns the capacity of the buffer in bytes (determined by allocation level).
-    ///
-    /// - Level 0: 1 MiB
-    /// - Level 1: 4 MiB
-    /// - Level 2: 16 MiB
-    /// - Level 3: 64 MiB
+    /// Returns the capacity of the buffer in bytes (determined by the
+    /// allocation size class): 64 KiB, 256 KiB, 1 MiB, 4 MiB, 16 MiB or
+    /// 64 MiB.
     #[must_use]
     pub const fn capacity(&self) -> usize {
-        crate::buddy::LEVEL_SIZES[self.level as usize]
+        let level = self.level as usize;
+        if level < crate::buddy::NUM_LEVELS {
+            crate::buddy::LEVEL_SIZES[level]
+        } else {
+            crate::slab::SLAB_CLASS_SIZES[level - crate::buddy::NUM_LEVELS]
+        }
     }
 
     /// Returns `true` if the buffer's logical length is 0.
@@ -191,6 +231,29 @@ impl Buffer {
             })
     }
 
+    /// Decomposes the buffer into its raw parts without running `Drop`.
+    ///
+    /// Used by the pool to reclaim a buffer while already holding the pool
+    /// mutex (e.g. when a waiter cancelled before receiving a handed-off
+    /// buffer): running `Drop` would re-enter the non-reentrant mutex.
+    ///
+    /// The internal `Arc<BufferPool>` reference is released here. This is
+    /// safe to call while holding the pool mutex as long as the caller owns
+    /// another reference to the pool (always true inside pool methods), so
+    /// the decrement can never be the final one.
+    pub(crate) fn into_raw_parts(self) -> (usize, usize, NonNull<BuddyBlock>) {
+        debug_assert!(
+            (self.level as usize) < crate::buddy::NUM_LEVELS,
+            "into_raw_parts is only valid for buddy buffers"
+        );
+        let this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: `this` is never accessed as a whole again; we move the Arc
+        // out to release the pool reference without running Buffer::drop.
+        let pool = unsafe { std::ptr::read(&this.pool) };
+        drop(pool);
+        (this.level as usize, this.index as usize, this.block)
+    }
+
     /// Returns the remote buffer info for RDMA-style operations.
     ///
     /// Note: uses the buffer's capacity (not logical length) for the remote info.
@@ -213,8 +276,17 @@ impl Buffer {
 
 impl Drop for Buffer {
     fn drop(&mut self) {
-        self.pool
-            .return_buffer(self.level as usize, self.index as usize, self.block);
+        let level = self.level as usize;
+        if level < crate::buddy::NUM_LEVELS {
+            self.pool
+                .return_buffer(level, self.index as usize, self.block);
+        } else {
+            self.pool.return_chunk(
+                level - crate::buddy::NUM_LEVELS,
+                self.ptr,
+                self.index as usize,
+            );
+        }
     }
 }
 

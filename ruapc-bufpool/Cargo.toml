@@ -13,12 +13,21 @@ license.workspace = true
 [dependencies]
 aliasable.workspace = true
 dashmap.workspace = true
+foldhash.workspace = true
 schemars.workspace = true
 serde.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync", "rt", "rt-multi-thread", "macros", "time"] }
+
+[[bench]]
+name = "lazy_merge"
+harness = false
+
+[[bench]]
+name = "contention"
+harness = false
 
 [lints]
 workspace = true

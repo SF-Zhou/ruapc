@@ -6,11 +6,21 @@ fixed-size buffer management. This crate is part of the [ruapc](../ruapc/) proje
 ## Features
 
 - **Buddy Memory Allocation**: Supports allocation of 1MiB, 4MiB, 16MiB, and 64MiB buffers
+- **Slab Layer for Small Buffers**: 64KiB and 256KiB allocations are served from slabs
+  (1MiB buddy leaves carved into fixed-size chunks) behind per-class mutexes, keeping
+  small-buffer traffic off the buddy pool's global mutex; empty slabs are cached up to a
+  watermark and returned to the buddy pool on demand
 - **Both Sync and Async APIs**: Designed for tokio environments with async-first design
 - **Automatic Memory Reclamation**: Buffers are automatically returned to the pool on drop
 - **Memory Limits**: Configurable maximum memory usage with async waiting when limits are reached
 - **Custom Allocators**: Pluggable allocator trait for memory allocation backend
 - **O(1) Buddy Merging**: Intrusive doubly-linked list with O(1) free/merge operations
+- **Lazy Buddy Merging**: Per-level watermarks defer merging on free to avoid split/merge
+  thrashing; complete-but-unmerged quads are tracked on intrusive pending-merge lists and
+  coalesced on demand in O(merges performed), independent of pool size
+- **Starvation Protection**: Async waiters are served smallest-request-first; a large
+  waiter queued past a configurable timeout gets a reserved subtree whose capacity is
+  drained toward it and protected from smaller allocations until it is satisfied
 - **Device Registration**: Optional device registration support for RDMA and TCP transports
 
 ## Architecture
@@ -30,6 +40,7 @@ fixed-size buffer management. This crate is part of the [ruapc](../ruapc/) proje
 │  └─────────────────────────────────────────────────────┘    │
 │                                                             │
 │  free_lists: [IntrusiveList; 4]  (one per level)            │
+│  pending_lists: [IntrusiveList; 4]  (deferred merge quads)  │
 │  waiting_lists: [VecDeque<Sender>; 4]  (async waiters)      │
 └─────────────────────────────────────────────────────────────┘
          │
