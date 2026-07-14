@@ -39,7 +39,7 @@ pub const LEVEL_STATE_OFFSETS: [usize; NUM_LEVELS] = [0, 64, 80, 84];
 
 /// State of a node in the buddy tree.
 ///
-/// Each node uses 2 bits (00=Allocated, 01=Free, 10=Split).
+/// Each node uses 2 bits (00=Allocated, 01=Free, 10=Split, 11=SplitPending).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 #[derive(Default)]
@@ -51,6 +51,10 @@ pub enum NodeState {
     Free = 1,
     /// The node has been split into smaller children.
     Split = 2,
+    /// The node is split and all 4 children are free, but merging has been
+    /// deferred (lazy buddy). The node's intrusive list node is linked into
+    /// the pool's pending-merge list for its level.
+    SplitPending = 3,
 }
 
 impl NodeState {
@@ -63,6 +67,7 @@ impl NodeState {
             0 => Self::Allocated,
             1 => Self::Free,
             2 => Self::Split,
+            3 => Self::SplitPending,
             _ => panic!("invalid bits"),
         }
     }

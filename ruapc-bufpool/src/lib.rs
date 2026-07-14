@@ -40,6 +40,7 @@ mod buddy;
 mod buffer;
 mod intrusive_list;
 mod pool;
+mod slab;
 
 pub use aligned::AlignedMemory;
 pub use buffer::Buffer;
