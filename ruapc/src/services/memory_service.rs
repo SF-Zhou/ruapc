@@ -97,11 +97,11 @@ impl MemoryService for () {
     }
 
     async fn tcp_push(&self, ctx: &Context, req: &MemoryPushReq) -> Result<()> {
-        // Allocate a buffer from the client's pool and copy data in.
+        // Allocate a right-sized buffer from the client's pool and copy data in.
         let mut buf = ctx
             .state
             .buffer_pool
-            .allocate(1024 * 1024)
+            .allocate(req.data.len().max(1))
             .map_err(|e| crate::Error::new(crate::ErrorKind::InvalidArgument, e.to_string()))?;
         buf[..req.data.len()].copy_from_slice(&req.data);
         buf.set_len(req.data.len());
@@ -132,7 +132,7 @@ impl MemoryService for () {
         let mut local_buf = ctx
             .state
             .buffer_pool
-            .allocate(1024 * 1024)
+            .allocate((req.len as usize).max(1))
             .map_err(|e| crate::Error::new(crate::ErrorKind::InvalidArgument, e.to_string()))?;
         let options = RemoteReadOptions { skip_verify: true };
         local_buf = ctx

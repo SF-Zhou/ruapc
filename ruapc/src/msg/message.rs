@@ -53,7 +53,88 @@ pub struct MsgMeta {
     pub buffer_info: Option<RemoteBufferInfo>,
 }
 
+/// Extensible (serde-encoded) part of the wire metadata. New metadata
+/// fields belong here with `#[serde(default)]`; only `flags` and `msgid`
+/// live in the fixed binary prefix because the transport hot path (e.g. the
+/// RDMA poll thread) needs them to route every message.
+#[derive(Serialize)]
+struct MetaTailRef<'a> {
+    method: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    buffer_info: Option<&'a RemoteBufferInfo>,
+}
+
+/// Deserialization counterpart of [`MetaTailRef`].
+#[derive(Deserialize, Default)]
+struct MetaTail {
+    #[serde(default)]
+    method: String,
+    #[serde(default)]
+    buffer_info: Option<RemoteBufferInfo>,
+}
+
 impl MsgMeta {
+    /// Size of the fixed binary prefix: flags (1) + msgid (8).
+    const FIXED_PREFIX_LEN: usize = 9;
+
+    /// Encodes the metadata as a fixed binary prefix plus an optional
+    /// serde-encoded tail:
+    ///
+    /// ```text
+    /// | 1B    | 8B    | 0..N bytes                                |
+    /// | flags | msgid | serde tail (method, buffer_info, ...)     |
+    /// ```
+    ///
+    /// The prefix carries exactly what message routing needs; everything
+    /// else stays serde-encoded (JSON, or MessagePack when the
+    /// `UseMessagePack` flag is set) so new fields remain easy to add. The
+    /// tail is omitted entirely when it holds no information — notably for
+    /// responses — making their decode allocation- and serde-free.
+    fn encode_to<W: Write>(&self, mut w: W) -> Result<()> {
+        w.write_all(&[self.flags.bits()])
+            .and_then(|()| w.write_all(&self.msgid.to_be_bytes()))
+            .map_err(|e| Error::new(ErrorKind::SerializeFailed, e.to_string()))?;
+        if self.method.is_empty() && self.buffer_info.is_none() {
+            return Ok(());
+        }
+        let tail = MetaTailRef {
+            method: &self.method,
+            buffer_info: self.buffer_info.as_ref(),
+        };
+        if self.flags.contains(MsgFlags::UseMessagePack) {
+            rmp_serde::encode::write_named(&mut w, &tail)?;
+        } else {
+            serde_json::to_writer(w, &tail)?;
+        }
+        Ok(())
+    }
+
+    /// Decodes metadata encoded by [`encode_to`](Self::encode_to).
+    fn decode(buf: &[u8]) -> Result<Self> {
+        if buf.len() < Self::FIXED_PREFIX_LEN {
+            return Err(Error::new(
+                ErrorKind::DeserializeFailed,
+                format!("invalid msg meta: len {}", buf.len()),
+            ));
+        }
+        let flags = MsgFlags::from_bits_retain(buf[0]);
+        let msgid = u64::from_be_bytes(buf[1..9].try_into().unwrap());
+        let tail = &buf[Self::FIXED_PREFIX_LEN..];
+        let tail: MetaTail = if tail.is_empty() {
+            MetaTail::default()
+        } else if flags.contains(MsgFlags::UseMessagePack) {
+            rmp_serde::from_slice(tail)?
+        } else {
+            serde_json::from_slice(tail)?
+        };
+        Ok(Self {
+            method: tail.method,
+            flags,
+            msgid,
+            buffer_info: tail.buffer_info,
+        })
+    }
+
     /// Checks if this message is a request.
     ///
     /// # Examples
@@ -120,8 +201,8 @@ impl Message {
 
     /// Parses a message from raw bytes.
     ///
-    /// This method deserializes the message metadata and extracts the payload.
-    /// The metadata can be in JSON or MessagePack format (auto-detected).
+    /// This method decodes the binary message metadata and extracts the
+    /// payload.
     ///
     /// # Message Format
     ///
@@ -174,12 +255,7 @@ impl Message {
             ));
         }
 
-        let meta: MsgMeta = if payload[S] == b'{' {
-            serde_json::from_slice(&payload[S..offset])?
-        } else {
-            rmp_serde::from_slice(&payload[S..offset])?
-        };
-
+        let meta = MsgMeta::decode(&payload[S..offset])?;
         payload.advance(offset);
         Ok(Message { meta, payload })
     }
@@ -245,17 +321,14 @@ impl MsgMeta {
     pub fn serialize_to<M: SendMsg, P: Serialize>(&self, payload: &P, msg: &mut M) -> Result<()> {
         msg.prepare()?;
 
-        // serialize meta.
+        // serialize meta (compact binary layout; the `UseMessagePack` flag
+        // only affects the payload).
         let meta_offset = msg.size();
         // reserve for meta len.
         msg.writer()
             .write_all(&0u32.to_be_bytes())
             .map_err(|e| Error::new(ErrorKind::SerializeFailed, e.to_string()))?;
-        if self.flags.contains(MsgFlags::UseMessagePack) {
-            rmp_serde::encode::write_named(&mut msg.writer(), self)?;
-        } else {
-            serde_json::to_writer(msg.writer(), self)?;
-        }
+        self.encode_to(msg.writer())?;
 
         // serialize payload.
         let payload_offset = msg.size();
@@ -392,6 +465,51 @@ mod tests {
     }
 
     #[test]
+    fn test_meta_roundtrip_with_buffer_info() {
+        let meta = MsgMeta {
+            method: "MemoryService/rdma_pull".into(),
+            flags: MsgFlags::IsReq | MsgFlags::UseMessagePack,
+            msgid: u64::MAX - 1,
+            buffer_info: Some(ruapc_bufpool::RemoteBufferInfo {
+                key: ruapc_bufpool::MemoryKey {
+                    lkey: 0x1122_3344,
+                    rkey: 0x5566_7788,
+                },
+                addr: 0xdead_beef_cafe_f00d,
+                len: 1 << 40,
+            }),
+        };
+        let buf = serialize_to_bytes(&meta, &serde_json::json!({"x": 1}));
+        let msg = Message::parse(Bytes::from(buf)).unwrap();
+        assert_eq!(msg.meta, meta);
+    }
+
+    #[test]
+    fn test_meta_decode_rejects_garbage() {
+        // Too short.
+        assert!(MsgMeta::decode(&[0u8; 4]).is_err());
+        // Garbage serde tail (JSON expected because UseMessagePack is unset).
+        let mut bytes = vec![0u8; MsgMeta::FIXED_PREFIX_LEN];
+        bytes.extend_from_slice(b"\xff\xff");
+        assert!(MsgMeta::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn test_meta_empty_tail_decodes_to_defaults() {
+        // A prefix-only meta (as produced for responses) decodes without any
+        // serde work.
+        let meta = MsgMeta {
+            method: String::new(),
+            flags: MsgFlags::IsRsp,
+            msgid: 42,
+            buffer_info: None,
+        };
+        let buf = serialize_to_bytes(&meta, &serde_json::json!({"ok": true}));
+        let msg = Message::parse(Bytes::from(buf)).unwrap();
+        assert_eq!(msg.meta, meta);
+    }
+
+    #[test]
     fn test_serialize_parse_json_roundtrip() {
         let meta = make_meta("TestService/hello", false);
         let payload_value = serde_json::json!({"key": "value", "num": 123});
@@ -495,7 +613,7 @@ mod tests {
         {
             let mut w = bm.writer();
             // `write()` calls `write_all()` internally.
-            w.write(b"hello").unwrap();
+            assert_eq!(w.write(b"hello").unwrap(), 5);
             // `flush()` is a no-op but must be reachable.
             w.flush().unwrap();
         }
@@ -529,7 +647,7 @@ mod tests {
         {
             let mut w = buf.writer();
             // Explicitly call `write()` (not `write_all()`).
-            w.write(b"test").unwrap();
+            assert_eq!(w.write(b"test").unwrap(), 4);
             // Explicitly call `flush()` (no-op but must be reachable).
             w.flush().unwrap();
         }

@@ -124,7 +124,7 @@ mod tests {
     #[tokio::test]
     async fn test_is_message_waiting_true_when_allocated() {
         let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
-        let (msgid, _rx) = ctx.state.waiter.alloc();
+        let (msgid, _rx) = ctx.state.waiter.alloc(std::time::Duration::from_secs(1));
         let result = ().is_message_waiting(&ctx, &msgid).await;
         assert!(result.is_ok());
         assert!(result.unwrap());

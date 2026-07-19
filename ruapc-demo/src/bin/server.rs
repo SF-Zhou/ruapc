@@ -16,6 +16,26 @@ pub struct Args {
     /// Socket type.
     #[arg(long, default_value = "unified")]
     pub socket_type: SocketType,
+
+    /// RDMA: number of (CQ + poll thread) shards per device.
+    #[arg(long, default_value = "1")]
+    pub poll_threads: u32,
+
+    /// RDMA: comma-separated device allowlist (e.g. "mlx5_0").
+    #[arg(long, value_delimiter = ',')]
+    pub rdma_devices: Vec<String>,
+
+    /// Buffer pool memory limit in MiB (0 = library default).
+    #[arg(long, default_value = "0")]
+    pub pool_mem_mb: usize,
+
+    /// Tokio worker threads (0 = number of CPUs).
+    #[arg(long, default_value = "0")]
+    pub worker_threads: usize,
+
+    /// RDMA: poll-thread busy-poll window in microseconds.
+    #[arg(long, default_value = "50")]
+    pub poll_spin_us: u64,
 }
 
 #[derive(Default)]
@@ -39,26 +59,43 @@ impl GreetService for DemoImpl {
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-#[tokio::main]
-async fn main() {
+fn main() {
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
 
     let args = Args::parse();
 
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    if args.worker_threads > 0 {
+        builder.worker_threads(args.worker_threads);
+    }
+    let runtime = builder.build().expect("failed to build tokio runtime");
+    runtime.block_on(async_main(args));
+}
+
+async fn async_main(args: Args) {
     let demo = Arc::new(DemoImpl::default());
     let mut router = Router::default();
     EchoService::ruapc_export(demo.clone(), &mut router);
     GreetService::ruapc_export(demo.clone(), &mut router);
-    let server = Server::create(
-        router,
-        &SocketPoolConfig {
-            socket_type: args.socket_type,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    #[allow(unused_mut)]
+    let mut config = SocketPoolConfig {
+        socket_type: args.socket_type,
+        buffer_pool_memory: args.pool_mem_mb * 1024 * 1024,
+        ..Default::default()
+    };
+    #[cfg(feature = "rdma")]
+    {
+        config.rdma.poll_threads_per_device = args.poll_threads;
+        config.rdma.device_filter = args.rdma_devices.clone();
+        config.rdma.poll_spin_us = args.poll_spin_us;
+    }
+    let server = Server::create(router, &config).unwrap();
 
     let server = Arc::new(server);
     let addr = server.listen(args.addr).await.unwrap();

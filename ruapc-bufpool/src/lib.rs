@@ -41,6 +41,7 @@ mod buffer;
 mod intrusive_list;
 mod pool;
 mod slab;
+mod thread_cache;
 
 pub use aligned::AlignedMemory;
 pub use buffer::Buffer;

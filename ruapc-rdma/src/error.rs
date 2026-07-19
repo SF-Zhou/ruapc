@@ -49,6 +49,8 @@ pub enum ErrorKind {
     IBPostSendFail,
     /// Buffer size insufficient for operation.
     InsufficientBuffer,
+    /// Failed to wait on file descriptors via `poll(2)`.
+    PollFdFail,
     /// Unknown or unclassified error with a custom message.
     #[serde(untagged)]
     Unknown(String),

@@ -46,6 +46,9 @@ pub use ffi::{
 mod error;
 pub use error::{Error, ErrorKind, Result};
 
+mod fd_poll;
+pub use fd_poll::poll_readable2;
+
 mod types;
 pub use types::{DeviceInfo, FwVer, Gid, GidType, Guid, LinkLayer, Port, RdmaBuffer, WRID, WRType};
 

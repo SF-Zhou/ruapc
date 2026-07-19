@@ -228,11 +228,13 @@ mod tests {
                 lid: 0,
                 link_layer: ruapc_rdma::LinkLayer::Ethernet,
                 active_mtu: ruapc_rdma::ibv_mtu::IBV_MTU_512,
+                psn: 0,
             },
             config: crate::rdma::RdmaConnectionConfig {
                 qp: crate::RdmaQueuePairConfig::default(),
                 cq_len: 128,
                 recv_queue_len: 64,
+                max_msg_size: 1024 * 1024,
             },
         };
         assert!(pool.rdma_accept(&request, &state).is_err());

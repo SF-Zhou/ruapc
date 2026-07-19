@@ -112,7 +112,15 @@ impl Context {
         Rsp: Serialize,
         E: std::error::Error + From<Error> + Serialize,
     {
-        let mut meta = self.msg_meta.clone();
+        // Responses are correlated by msgid alone: drop the request's method
+        // and buffer_info so the response meta encodes as a fixed prefix
+        // with no serde tail (decoded allocation-free on the hot path).
+        let mut meta = MsgMeta {
+            method: String::new(),
+            flags: self.msg_meta.flags,
+            msgid: self.msg_meta.msgid,
+            buffer_info: None,
+        };
         meta.flags.remove(MsgFlags::IsReq);
         meta.flags.insert(MsgFlags::IsRsp);
         match &mut self.endpoint {

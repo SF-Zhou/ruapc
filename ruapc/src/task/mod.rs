@@ -1,5 +1,5 @@
 mod supervisor;
-pub use supervisor::TaskSupervisor;
+pub use supervisor::{TaskSupervisor, TaskSupervisorGuard};
 
 pub(crate) mod waiter;
 pub use waiter::{Waiter, WaiterCleaner};

@@ -93,6 +93,7 @@ impl RdmaInfo {
                             },
                             cq_len: config.cq_len.min(info.device_attr.max_cqe as u32),
                             recv_queue_len: config.recv_queue_len,
+                            max_msg_size: config.max_msg_size.max(16 * 1024),
                         },
                         ports: info
                             .ports
@@ -209,6 +210,7 @@ mod tests {
             lid: 0,
             link_layer: ruapc_rdma::LinkLayer::Ethernet,
             active_mtu: ruapc_rdma::ibv_mtu::IBV_MTU_512,
+            psn: 0,
         };
         let request = rdma::ConnectRequest {
             endpoint,
@@ -221,6 +223,7 @@ mod tests {
                 qp: RdmaQueuePairConfig::default(),
                 cq_len: 128,
                 recv_queue_len: 64,
+                max_msg_size: 1024 * 1024,
             },
         };
         let result = ().connect(&ctx, &request).await;

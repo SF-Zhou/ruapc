@@ -16,6 +16,7 @@ rdma = ["ruapc/rdma"]
 ruapc = { path = "../ruapc" }
 
 clap.workspace = true
+hdrhistogram.workspace = true
 schemars.workspace = true
 serde.workspace = true
 tikv-jemallocator.workspace = true

@@ -68,6 +68,12 @@ pub struct SocketPoolConfig {
     /// The transport protocol type to use. Default is TCP.
     #[serde_inline_default(SocketType::TCP)]
     pub socket_type: SocketType,
+    /// Maximum memory of the shared buffer pool in bytes (0 = library
+    /// default, currently 256 MiB). Size it for the workload: every RDMA
+    /// connection pre-posts `recv_queue_len x max_msg_size` receive
+    /// buffers, and in-flight sends allocate from the same pool.
+    #[serde_inline_default(0usize)]
+    pub buffer_pool_memory: usize,
     /// RDMA-specific connection and Queue Pair settings.
     #[cfg(feature = "rdma")]
     #[serde(default)]
@@ -86,6 +92,87 @@ pub struct RdmaSocketPoolConfig {
     pub recv_queue_len: u32,
     /// P_Key table index used when moving the Queue Pair to INIT.
     pub pkey_index: u16,
+    /// Selective signaling interval for data sends (local behavior, not
+    /// negotiated). With interval `N > 1` only every Nth data send requests
+    /// a completion; buffers of unsignaled sends are reclaimed when a later
+    /// signaled completion arrives (RC SQs complete in order). `1` signals
+    /// every send. Clamped to `max_send_wr / 2`.
+    #[serde(default = "default_send_signal_interval")]
+    pub send_signal_interval: u32,
+    /// Capacity (entries) of the per-device shared completion queue used by
+    /// the dedicated poll thread. Bounds the number of concurrent
+    /// connections per device: the sum of every connection's queue depths
+    /// must fit.
+    #[serde(default = "default_device_cq_len")]
+    pub device_cq_len: u32,
+    /// Busy-poll window of the per-device poll thread, in microseconds:
+    /// after the last completion the thread keeps polling for this long
+    /// before arming the CQ interrupt and sleeping. `0` disables spinning
+    /// (pure event-driven mode).
+    #[serde(default = "default_poll_spin_us")]
+    pub poll_spin_us: u64,
+    /// Maximum serialized message size for RDMA sends; also the size of
+    /// each pre-posted receive buffer (negotiated to the minimum of both
+    /// sides). Larger payloads must use the remote read/write paths.
+    #[serde(default = "default_max_msg_size")]
+    pub max_msg_size: u32,
+    /// Whether to aggregate sends: under backlog, multiple small
+    /// window-blocked sends are packed into a single RDMA send. Send-side
+    /// toggle only; receivers always understand aggregated frames.
+    #[serde(default = "default_msg_aggregation")]
+    pub msg_aggregation: bool,
+    /// Number of (shared CQ + poll thread) shards per RDMA device.
+    /// Connections are assigned round-robin, spreading completion
+    /// processing across cores. Each shard burns up to one core while
+    /// spinning.
+    #[serde(default = "default_poll_threads_per_device")]
+    pub poll_threads_per_device: u32,
+    /// Number of RDMA connections (QPs) to establish per peer. Requests
+    /// are striped round-robin across them; combined with poll thread
+    /// shards this scales single-peer throughput across cores. RPC
+    /// messages carry no cross-message ordering guarantees.
+    #[serde(default = "default_connections_per_peer")]
+    pub connections_per_peer: u32,
+    /// If non-empty, only RDMA devices whose name is listed are used.
+    /// Useful when a host has NICs without connectivity to the target
+    /// fabric (device matching cannot verify reachability).
+    #[serde(default)]
+    pub device_filter: Vec<String>,
+}
+
+#[cfg(feature = "rdma")]
+fn default_send_signal_interval() -> u32 {
+    8
+}
+
+#[cfg(feature = "rdma")]
+fn default_device_cq_len() -> u32 {
+    65536
+}
+
+#[cfg(feature = "rdma")]
+fn default_poll_spin_us() -> u64 {
+    50
+}
+
+#[cfg(feature = "rdma")]
+fn default_max_msg_size() -> u32 {
+    256 * 1024
+}
+
+#[cfg(feature = "rdma")]
+fn default_msg_aggregation() -> bool {
+    true
+}
+
+#[cfg(feature = "rdma")]
+fn default_poll_threads_per_device() -> u32 {
+    1
+}
+
+#[cfg(feature = "rdma")]
+fn default_connections_per_peer() -> u32 {
+    1
 }
 
 #[cfg(feature = "rdma")]
@@ -96,6 +183,14 @@ impl Default for RdmaSocketPoolConfig {
             cq_len: 128,
             recv_queue_len: 64,
             pkey_index: 0,
+            send_signal_interval: default_send_signal_interval(),
+            device_cq_len: default_device_cq_len(),
+            poll_spin_us: default_poll_spin_us(),
+            max_msg_size: default_max_msg_size(),
+            msg_aggregation: default_msg_aggregation(),
+            poll_threads_per_device: default_poll_threads_per_device(),
+            connections_per_peer: default_connections_per_peer(),
+            device_filter: Vec::new(),
         }
     }
 }
@@ -517,11 +612,13 @@ mod tests {
                 lid: 0,
                 link_layer: ruapc_rdma::LinkLayer::Ethernet,
                 active_mtu: ruapc_rdma::ibv_mtu::IBV_MTU_512,
+                psn: 0,
             },
             config: crate::rdma::RdmaConnectionConfig {
                 qp: RdmaQueuePairConfig::default(),
                 cq_len: 128,
                 recv_queue_len: 64,
+                max_msg_size: 1024 * 1024,
             },
         };
         assert!(pool.rdma_accept(&request, &state).is_err());
