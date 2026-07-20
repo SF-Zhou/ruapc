@@ -170,28 +170,13 @@ mod tests {
     use super::*;
     use crate::{SocketPoolConfig, SocketType};
 
-    fn make_rdma_context() -> Context {
-        let active_devices =
-            ruapc_rdma::ActiveDevice::available().expect("RDMA devices should be available");
-        let prefer_rxe = std::env::var("RUAPC_PREFER_RXE").is_ok();
-        let mut devices = crate::Devices::default();
-        for dev in active_devices {
-            if prefer_rxe && !dev.info().name.starts_with("rxe") {
-                continue;
-            }
-            devices.add_rdma_device(dev);
-        }
-        assert!(!devices.rdma_devices().is_empty(), "no RDMA device found");
+    #[tokio::test]
+    async fn test_rdma_service_info_returns_devices() {
         let config = SocketPoolConfig {
             socket_type: SocketType::RDMA,
             ..Default::default()
         };
-        Context::create(&config).expect("failed to create RDMA context")
-    }
-
-    #[tokio::test]
-    async fn test_rdma_service_info_returns_devices() {
-        let ctx = make_rdma_context();
+        let ctx = Context::create(&config).expect("failed to create RDMA context");
         let result = ().info(&ctx, &()).await;
         assert!(result.is_ok());
         let info = result.unwrap();

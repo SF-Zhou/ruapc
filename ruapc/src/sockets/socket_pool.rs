@@ -533,25 +533,9 @@ mod tests {
     }
 
     #[cfg(feature = "rdma")]
-    fn make_rdma_devices() -> std::sync::Arc<crate::Devices> {
-        let active_devices =
-            ruapc_rdma::ActiveDevice::available().expect("RDMA devices should be available");
-        let prefer_rxe = std::env::var("RUAPC_PREFER_RXE").is_ok();
-        let mut devices = crate::Devices::default();
-        for dev in active_devices {
-            if prefer_rxe && !dev.info().name.starts_with("rxe") {
-                continue;
-            }
-            devices.add_rdma_device(dev);
-        }
-        assert!(!devices.rdma_devices().is_empty(), "no RDMA device found");
-        std::sync::Arc::new(devices)
-    }
-
-    #[cfg(feature = "rdma")]
     #[tokio::test]
     async fn test_socket_pool_rdma_socket_type() {
-        let devices = make_rdma_devices();
+        let devices = crate::rdma::test_utils::make_rdma_devices();
         let config = SocketPoolConfig {
             socket_type: SocketType::RDMA,
             ..Default::default()
@@ -567,7 +551,7 @@ mod tests {
     #[cfg(feature = "rdma")]
     #[tokio::test]
     async fn test_socket_pool_rdma_device_list_from_rdma_pool() {
-        let devices = make_rdma_devices();
+        let devices = crate::rdma::test_utils::make_rdma_devices();
         let config = SocketPoolConfig {
             socket_type: SocketType::RDMA,
             ..Default::default()
@@ -630,7 +614,7 @@ mod tests {
     #[tokio::test]
     async fn test_socket_pool_handle_new_stream_rdma_returns_err() {
         use tokio::net::TcpListener;
-        let devices = make_rdma_devices();
+        let devices = crate::rdma::test_utils::make_rdma_devices();
         let config = SocketPoolConfig {
             socket_type: SocketType::RDMA,
             ..Default::default()
