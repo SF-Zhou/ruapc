@@ -21,3 +21,6 @@ pub(crate) use rdma_socket::RdmaSocket;
 
 mod rdma_socket_pool;
 pub(crate) use rdma_socket_pool::RdmaSocketPool;
+
+#[cfg(test)]
+pub(crate) mod test_utils;

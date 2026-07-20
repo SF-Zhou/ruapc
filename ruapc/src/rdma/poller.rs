@@ -1235,12 +1235,7 @@ mod tests {
     /// driver caps `max_cqe` at 32767, below the default `device_cq_len`).
     #[tokio::test]
     async fn test_cq_len_clamped_to_device_max() {
-        let Ok(devices) = ruapc_rdma::ActiveDevice::available() else {
-            return; // no RDMA device in this environment
-        };
-        let Some(device) = devices.first() else {
-            return;
-        };
+        let device = crate::rdma::test_utils::open_rdma_device();
         let config = PollerConfig {
             cq_len: u32::MAX,
             spin_us: 0,

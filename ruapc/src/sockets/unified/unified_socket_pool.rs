@@ -157,22 +157,6 @@ impl std::fmt::Debug for UnifiedSocketPool {
 mod tests {
     use super::*;
 
-    #[cfg(feature = "rdma")]
-    fn make_rdma_devices() -> Arc<crate::Devices> {
-        let active_devices =
-            ruapc_rdma::ActiveDevice::available().expect("RDMA devices should be available");
-        let prefer_rxe = std::env::var("RUAPC_PREFER_RXE").is_ok();
-        let mut devices = crate::Devices::default();
-        for dev in active_devices {
-            if prefer_rxe && !dev.info().name.starts_with("rxe") {
-                continue;
-            }
-            devices.add_rdma_device(dev);
-        }
-        assert!(!devices.rdma_devices().is_empty(), "no RDMA device found");
-        Arc::new(devices)
-    }
-
     #[tokio::test]
     async fn test_unified_socket_pool_debug_format() {
         let config = crate::SocketPoolConfig {
@@ -189,7 +173,7 @@ mod tests {
     #[cfg(feature = "rdma")]
     #[tokio::test]
     async fn test_unified_socket_pool_rdma_device_list() {
-        let devices = make_rdma_devices();
+        let devices = crate::rdma::test_utils::make_rdma_devices();
         let config = crate::SocketPoolConfig {
             socket_type: crate::SocketType::UNIFIED,
             ..Default::default()

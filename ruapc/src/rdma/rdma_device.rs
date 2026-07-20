@@ -120,19 +120,9 @@ mod tests {
     use super::*;
     use ruapc_bufpool::Device as _;
 
-    fn open_rdma_device() -> ActiveDevice {
-        let active_devices =
-            ruapc_rdma::ActiveDevice::available().expect("RDMA devices should be available");
-        let prefer_rxe = std::env::var("RUAPC_PREFER_RXE").is_ok();
-        active_devices
-            .into_iter()
-            .find(|d| !prefer_rxe || d.info().name.starts_with("rxe"))
-            .expect("no RDMA device matching filter found")
-    }
-
     #[test]
     fn test_rdma_device_debug_format() {
-        let mut rdma = RdmaDevice::new(open_rdma_device());
+        let mut rdma = RdmaDevice::new(crate::rdma::test_utils::open_rdma_device());
         rdma.set_index(DeviceIndex { magic: 0, index: 3 });
         let debug = format!("{rdma:?}");
         assert!(debug.contains("RdmaDevice"));
@@ -140,7 +130,7 @@ mod tests {
 
     #[test]
     fn test_rdma_device_index_and_inner() {
-        let mut rdma = RdmaDevice::new(open_rdma_device());
+        let mut rdma = RdmaDevice::new(crate::rdma::test_utils::open_rdma_device());
         rdma.set_index(DeviceIndex {
             magic: 0,
             index: 42,
