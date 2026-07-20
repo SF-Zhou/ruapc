@@ -19,6 +19,7 @@ use crate::buffer::Buffer;
 use crate::devices::Devices;
 use crate::intrusive_list::IntrusiveList;
 use crate::slab::{NUM_SLAB_CLASSES, SlabClass, size_to_class};
+use crate::thread_cache::{self, CacheShard, MAG_REFILL, RawChunk};
 
 /// Default maximum memory limit (256 MiB).
 const DEFAULT_MAX_MEMORY: usize = 256 * 1024 * 1024;
@@ -66,6 +67,7 @@ pub struct BufferPoolBuilder {
     merge_watermarks: [usize; NUM_LEVELS],
     starvation_timeout: Duration,
     slab_empty_watermark: usize,
+    thread_cache: bool,
 }
 
 impl BufferPoolBuilder {
@@ -80,7 +82,26 @@ impl BufferPoolBuilder {
             merge_watermarks: DEFAULT_MERGE_WATERMARKS,
             starvation_timeout: DEFAULT_STARVATION_TIMEOUT,
             slab_empty_watermark: DEFAULT_SLAB_EMPTY_WATERMARK,
+            thread_cache: true,
         }
+    }
+
+    /// Enables or disables the per-thread chunk cache (enabled by default).
+    ///
+    /// When enabled, small-buffer (slab chunk) allocations and frees are
+    /// served from per-thread cache shards; the shared per-class slab lock
+    /// is only touched for batched refills and overflows. Threads that free
+    /// chunks keep up to 2 MiB cached per slab class. The pool reclaims all
+    /// cached chunks whenever it actually needs the memory (buddy
+    /// allocation miss or a queued async waiter), and each thread flushes
+    /// its shards on exit.
+    ///
+    /// Disable for exact accounting of free chunk counts (e.g. in tests
+    /// asserting [`BufferPool::slab_free_counts`]).
+    #[must_use]
+    pub const fn thread_cache(mut self, enabled: bool) -> Self {
+        self.thread_cache = enabled;
+        self
     }
 
     /// Sets the number of empty slabs cached per slab size class.
@@ -158,8 +179,10 @@ impl BufferPoolBuilder {
             max_memory: self.max_memory,
             starvation_timeout: self.starvation_timeout,
             slab_empty_watermark: self.slab_empty_watermark,
+            thread_cache: self.thread_cache,
             has_demand: AtomicBool::new(false),
             slab_classes: std::array::from_fn(|class| Mutex::new(SlabClass::new(class))),
+            thread_shards: Mutex::new(Vec::new()),
             inner: Mutex::new(inner),
         })
     }
@@ -174,6 +197,9 @@ pub struct BufferPool {
     max_memory: usize,
     starvation_timeout: Duration,
     slab_empty_watermark: usize,
+    /// Whether the per-thread chunk cache is enabled.
+    /// See [`BufferPoolBuilder::thread_cache`].
+    thread_cache: bool,
     /// Hint that the buddy pool has pending demand (async waiters or an
     /// active reservation). Read lock-free by the slab layer to bypass the
     /// empty-slab watermark, so that cached slabs cannot stall waiters or
@@ -184,6 +210,10 @@ pub struct BufferPool {
     /// Lock ordering: a slab class lock may be taken before `inner`, never
     /// after.
     slab_classes: [Mutex<SlabClass>; NUM_SLAB_CLASSES],
+    /// Per-thread cache shards registered by threads that use this pool.
+    /// Lock ordering: this lock and shard locks are leaves — never acquire
+    /// a slab class lock or `inner` while holding them.
+    thread_shards: Mutex<Vec<Arc<CacheShard>>>,
     inner: Mutex<PoolInner>,
 }
 
@@ -226,7 +256,7 @@ impl BufferPool {
     /// - Underlying allocator fails
     pub fn allocate(self: &Arc<Self>, size: usize) -> Result<Buffer> {
         if let Some(class) = size_to_class(size) {
-            if let Some(buffer) = self.try_take_chunk(class) {
+            if let Some(buffer) = self.try_take_chunk_fast(class) {
                 return Ok(buffer);
             }
             let backing = self.allocate_buddy(0)?;
@@ -245,6 +275,10 @@ impl BufferPool {
                 return Ok(buffer);
             }
         }
+
+        // Cached chunks keep their slabs non-empty; reclaiming them from
+        // all threads lets the empty-slab reclamation below make progress.
+        self.flush_thread_cache();
 
         // The slab layer may be caching empty slabs; releasing them can
         // satisfy this allocation without growing the pool.
@@ -296,7 +330,7 @@ impl BufferPool {
     /// - Underlying allocator fails
     pub async fn async_allocate(self: &Arc<Self>, size: usize) -> Result<Buffer> {
         if let Some(class) = size_to_class(size) {
-            if let Some(buffer) = self.try_take_chunk(class) {
+            if let Some(buffer) = self.try_take_chunk_fast(class) {
                 return Ok(buffer);
             }
             let backing = self.async_allocate_buddy(0).await?;
@@ -323,6 +357,11 @@ impl BufferPool {
                 }
             }
 
+            // Cached chunks keep their slabs non-empty; reclaiming them
+            // from all threads lets the empty-slab reclamation below make
+            // progress.
+            self.flush_thread_cache();
+
             // The slab layer may be caching empty slabs; releasing them can
             // satisfy this allocation without growing or waiting.
             self.reclaim_empty_slabs();
@@ -344,11 +383,21 @@ impl BufferPool {
                     });
                     inner.update_min_waiting_level_on_add(level);
                     // Hint the slab layer that cached empty slabs must be
-                    // released as soon as they appear.
-                    self.has_demand.store(true, Ordering::Relaxed);
+                    // released as soon as they appear. SeqCst pairs with the
+                    // load in `return_chunk`: a concurrent free either sees
+                    // the demand (and bypasses/flushes its cache shard), or
+                    // its cached push is visible to the reclaim sweep below.
+                    self.has_demand.store(true, Ordering::SeqCst);
                     Step::Wait(receiver)
                 }
             };
+
+            if matches!(step, Step::Wait(_)) {
+                // Reclaim chunks cached by all threads before parking: a
+                // cached chunk on an idle thread must not stall this waiter.
+                self.flush_thread_cache();
+                self.reclaim_empty_slabs();
+            }
 
             match step {
                 Step::Grow => {
@@ -448,6 +497,45 @@ impl BufferPool {
         Some(unsafe { Buffer::new_chunk(ptr, class, index, block, Arc::clone(self)) })
     }
 
+    /// Takes a chunk, preferring the current thread's cache shard.
+    ///
+    /// On a shard miss, refills it with a batch of chunks taken from the
+    /// shared slab layer under a single lock acquisition.
+    fn try_take_chunk_fast(self: &Arc<Self>, class: usize) -> Option<Buffer> {
+        if !self.thread_cache {
+            return self.try_take_chunk(class);
+        }
+        let Some(shard) = thread_cache::shard_for(self) else {
+            return self.try_take_chunk(class);
+        };
+        let chunk = match shard.pop(class) {
+            Some(chunk) => chunk,
+            None => {
+                let mut batch = Vec::with_capacity(MAG_REFILL[class] + 1);
+                self.take_chunk_batch(class, MAG_REFILL[class] + 1, &mut batch);
+                let chunk = batch.pop()?;
+                shard.store_batch(class, batch);
+                chunk
+            }
+        };
+        Some(unsafe {
+            Buffer::new_chunk(chunk.ptr, class, chunk.index, chunk.block, Arc::clone(self))
+        })
+    }
+
+    /// Takes up to `n` chunks from the slab layer under one lock acquisition.
+    fn take_chunk_batch(&self, class: usize, n: usize, out: &mut Vec<RawChunk>) {
+        let mut slab_class = self.slab_classes[class]
+            .lock()
+            .expect("SlabClass mutex poisoned");
+        for _ in 0..n {
+            match slab_class.alloc() {
+                Some((ptr, index, block)) => out.push(RawChunk { ptr, index, block }),
+                None => break,
+            }
+        }
+    }
+
     /// Installs a fresh 1 MiB backing buffer as a slab of the given class
     /// and takes the first chunk from it.
     fn install_backing_and_take(self: &Arc<Self>, class: usize, backing: Buffer) -> Buffer {
@@ -463,26 +551,115 @@ impl BufferPool {
         unsafe { Buffer::new_chunk(ptr, class, index, block, Arc::clone(self)) }
     }
 
-    /// Returns a chunk to its slab.
+    /// Returns a chunk to the pool.
     ///
-    /// Called automatically when a slab-chunk [`Buffer`] is dropped. If the
-    /// slab becomes fully free and exceeds the empty-slab watermark — or the
-    /// buddy pool has pending demand — the slab's backing buffer is released
-    /// to the buddy pool (outside the class lock; its `Drop` re-enters the
-    /// pool through the regular buddy free path).
-    pub(crate) fn return_chunk(self: &Arc<Self>, class: usize, ptr: NonNull<u8>, index: usize) {
-        let released = {
-            let max_empty = if self.has_demand.load(Ordering::Relaxed) {
+    /// Called automatically when a slab-chunk [`Buffer`] is dropped. The
+    /// chunk is cached in the current thread's shard when possible;
+    /// otherwise (cache disabled, shard overflow, buddy demand or thread
+    /// destruction) it goes back to the shared slab layer.
+    pub(crate) fn return_chunk(
+        self: &Arc<Self>,
+        class: usize,
+        ptr: NonNull<u8>,
+        index: usize,
+        block: NonNull<BuddyBlock>,
+    ) {
+        let chunk = RawChunk { ptr, index, block };
+        if self.thread_cache
+            && !self.has_demand.load(Ordering::SeqCst)
+            && let Some(shard) = thread_cache::shard_for(self)
+        {
+            if let Some(overflow) = shard.push(class, chunk) {
+                self.return_chunks_direct(class, overflow);
+            }
+            // Close the race against a waiter registering between the
+            // demand check above and the push: if demand appeared, flush
+            // the shard we just pushed to. Either this load sees the
+            // (SeqCst) demand store, or the waiter's reclaim sweep sees
+            // our push — the chunk cannot be stranded.
+            if self.has_demand.load(Ordering::SeqCst) {
+                self.flush_shard(&shard);
+            }
+            return;
+        }
+        self.return_chunks_direct(class, [chunk]);
+    }
+
+    /// Returns chunks to their slabs under one lock acquisition.
+    ///
+    /// If a slab becomes fully free and exceeds the empty-slab watermark —
+    /// or the buddy pool has pending demand — the slab's backing buffer is
+    /// released to the buddy pool (outside the class lock; its `Drop`
+    /// re-enters the pool through the regular buddy free path).
+    pub(crate) fn return_chunks_direct(
+        &self,
+        class: usize,
+        chunks: impl IntoIterator<Item = RawChunk>,
+    ) {
+        let mut released = Vec::new();
+        {
+            let max_empty = if self.has_demand.load(Ordering::SeqCst) {
                 0
             } else {
                 self.slab_empty_watermark
             };
-            self.slab_classes[class]
+            let mut slab_class = self.slab_classes[class]
                 .lock()
-                .expect("SlabClass mutex poisoned")
-                .free(ptr.as_ptr() as usize, index, max_empty)
-        };
+                .expect("SlabClass mutex poisoned");
+            for chunk in chunks {
+                if let Some(backing) =
+                    slab_class.free(chunk.ptr.as_ptr() as usize, chunk.index, max_empty)
+                {
+                    released.push(backing);
+                }
+            }
+        }
         drop(released);
+    }
+
+    /// Registers a thread's cache shard (called via TLS on first use).
+    pub(crate) fn register_shard(&self, shard: Arc<CacheShard>) {
+        self.thread_shards
+            .lock()
+            .expect("thread_shards mutex poisoned")
+            .push(shard);
+    }
+
+    /// Flushes and unregisters a thread's cache shard (thread exit).
+    pub(crate) fn release_shard(&self, shard: &Arc<CacheShard>) {
+        self.flush_shard(shard);
+        self.thread_shards
+            .lock()
+            .expect("thread_shards mutex poisoned")
+            .retain(|s| !Arc::ptr_eq(s, shard));
+    }
+
+    /// Returns all chunks cached in `shard` to the slab layer.
+    fn flush_shard(&self, shard: &CacheShard) {
+        for (class, mag) in shard.drain_all().into_iter().enumerate() {
+            if !mag.is_empty() {
+                self.return_chunks_direct(class, mag);
+            }
+        }
+    }
+
+    /// Reclaims cached chunks from all threads' cache shards.
+    ///
+    /// Called when the pool actually needs memory: a buddy allocation miss
+    /// or a newly queued async waiter. Guarantees that cached capacity can
+    /// never strand an allocation, no matter which thread it is cached on.
+    fn flush_thread_cache(&self) {
+        if !self.thread_cache {
+            return;
+        }
+        let shards: Vec<Arc<CacheShard>> = self
+            .thread_shards
+            .lock()
+            .expect("thread_shards mutex poisoned")
+            .clone();
+        for shard in shards {
+            self.flush_shard(&shard);
+        }
     }
 
     /// Releases all cached empty slabs back to the buddy pool.
@@ -870,10 +1047,10 @@ impl PoolInner {
             }
         }
 
-        // Refresh the demand hint for the slab layer.
+        // Refresh the demand hint for the slab layer and thread caches.
         pool.has_demand.store(
             self.min_waiting_level.is_some() || self.reservation.is_some(),
-            Ordering::Relaxed,
+            Ordering::SeqCst,
         );
     }
 
@@ -1399,7 +1576,10 @@ mod tests {
 
         // Small sizes are served by the slab layer.
         let s1 = pool.allocate(1).unwrap();
-        assert_eq!(s1.len(), 64 * 1024);
+        assert_eq!(s1.len(), 16 * 1024);
+
+        let s1b = pool.allocate(16 * 1024 + 1).unwrap();
+        assert_eq!(s1b.len(), 64 * 1024);
 
         let s2 = pool.allocate(64 * 1024).unwrap();
         assert_eq!(s2.len(), 64 * 1024);
@@ -2058,7 +2238,11 @@ mod tests {
     #[test]
     fn test_chunks_share_slab() {
         const KIB64: usize = 64 * 1024;
-        let pool = test_pool_with_max(SIZE_64MIB);
+        // Exact slab accounting: keep chunks out of the per-thread cache.
+        let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
+            .max_memory(SIZE_64MIB)
+            .thread_cache(false)
+            .build();
 
         // 16 x 64KiB fit in one slab (one 1MiB buddy leaf).
         let chunks: Vec<_> = (0..16).map(|_| pool.allocate(KIB64).unwrap()).collect();
@@ -2073,12 +2257,12 @@ mod tests {
             assert_eq!(addr & !(SIZE_1MIB - 1), base, "chunks must share one slab");
             assert_eq!(addr % KIB64, 0, "chunks must be 64KiB-aligned");
         }
-        assert_eq!(pool.slab_free_counts(), [0, 0]);
+        assert_eq!(pool.slab_free_counts(), [0, 0, 0]);
 
         // The 17th chunk opens a second slab.
         let extra = pool.allocate(KIB64).unwrap();
         assert_ne!(extra.as_ptr() as usize & !(SIZE_1MIB - 1), base);
-        assert_eq!(pool.slab_free_counts(), [15, 0]);
+        assert_eq!(pool.slab_free_counts(), [0, 15, 0]);
     }
 
     #[test]
@@ -2086,6 +2270,7 @@ mod tests {
         let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
             .max_memory(SIZE_64MIB)
             .slab_empty_watermark(0)
+            .thread_cache(false)
             .build();
 
         let chunk = pool.allocate(64 * 1024).unwrap();
@@ -2093,7 +2278,7 @@ mod tests {
 
         // Watermark 0: the empty slab returns to the buddy pool at once,
         // and the whole 64MiB is recoverable.
-        assert_eq!(pool.slab_free_counts(), [0, 0]);
+        assert_eq!(pool.slab_free_counts(), [0, 0, 0]);
         let buffer = pool.allocate(SIZE_64MIB).unwrap();
         assert_eq!(buffer.len(), SIZE_64MIB);
     }
@@ -2103,6 +2288,7 @@ mod tests {
         let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
             .max_memory(SIZE_64MIB)
             .slab_empty_watermark(1)
+            .thread_cache(false)
             .build();
 
         let chunk = pool.allocate(64 * 1024).unwrap();
@@ -2111,11 +2297,11 @@ mod tests {
 
         // The empty slab stays cached: buddy free lists are untouched and
         // all 16 chunks are available for reuse without a refill.
-        assert_eq!(pool.slab_free_counts(), [16, 0]);
+        assert_eq!(pool.slab_free_counts(), [0, 16, 0]);
         assert_eq!(pool.free_counts(), buddy_free);
 
         let chunk = pool.allocate(64 * 1024).unwrap();
-        assert_eq!(pool.slab_free_counts(), [15, 0]);
+        assert_eq!(pool.slab_free_counts(), [0, 15, 0]);
         assert_eq!(pool.free_counts(), buddy_free);
         drop(chunk);
     }
@@ -2125,17 +2311,18 @@ mod tests {
         let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
             .max_memory(SIZE_64MIB)
             .slab_empty_watermark(8)
+            .thread_cache(false)
             .build();
 
         let chunk = pool.allocate(64 * 1024).unwrap();
         drop(chunk);
-        assert_eq!(pool.slab_free_counts(), [16, 0]);
+        assert_eq!(pool.slab_free_counts(), [0, 16, 0]);
 
         // The 64MiB allocation misses the buddy free lists; the reclaim
         // hook must release the cached empty slab instead of failing.
         let buffer = pool.allocate(SIZE_64MIB).unwrap();
         assert_eq!(buffer.len(), SIZE_64MIB);
-        assert_eq!(pool.slab_free_counts(), [0, 0]);
+        assert_eq!(pool.slab_free_counts(), [0, 0, 0]);
     }
 
     #[tokio::test]
@@ -2200,7 +2387,7 @@ mod tests {
     fn test_chunk_write_read_and_drop() {
         let pool = test_pool();
         let mut chunk = pool.allocate(100).unwrap();
-        assert_eq!(chunk.capacity(), 64 * 1024);
+        assert_eq!(chunk.capacity(), 16 * 1024);
 
         chunk.set_len(0);
         chunk.extend_from_slice(&[0xAB; 128]).unwrap();
@@ -2208,7 +2395,7 @@ mod tests {
         assert!(chunk.iter().all(|&b| b == 0xAB));
 
         // Overflowing the (now smaller) capacity must fail cleanly.
-        chunk.set_len(64 * 1024);
+        chunk.set_len(16 * 1024);
         assert!(chunk.extend_from_slice(&[0u8; 1]).is_err());
     }
 
@@ -2231,6 +2418,84 @@ mod tests {
             .map(|(c, s)| c * s)
             .sum();
         assert_eq!(free_bytes, SIZE_64MIB);
+    }
+
+    #[test]
+    fn test_thread_cache_roundtrip() {
+        let pool = test_pool_with_max(SIZE_64MIB);
+
+        // Freed chunks go to the thread cache and come back on allocation.
+        let addr = {
+            let chunk = pool.allocate(64 * 1024).unwrap();
+            chunk.as_ptr() as usize
+        };
+        let chunk = pool.allocate(64 * 1024).unwrap();
+        assert_eq!(chunk.as_ptr() as usize, addr, "must reuse the cached chunk");
+        drop(chunk);
+
+        // Overflow: freeing more chunks than the magazine holds must not
+        // lose any (all chunks remain allocatable).
+        let chunks: Vec<_> = (0..64).map(|_| pool.allocate(64 * 1024).unwrap()).collect();
+        drop(chunks);
+        let chunks: Vec<_> = (0..64).map(|_| pool.allocate(64 * 1024).unwrap()).collect();
+        assert_eq!(chunks.len(), 64);
+    }
+
+    #[test]
+    fn test_thread_cache_flushes_on_buddy_miss() {
+        // A chunk cached on this thread keeps its slab non-empty; a buddy
+        // allocation of the whole pool must flush the cache to succeed.
+        let pool = test_pool_with_max(SIZE_64MIB);
+        let chunk = pool.allocate(64 * 1024).unwrap();
+        drop(chunk); // now cached in this thread's magazine
+
+        let buffer = pool.allocate(SIZE_64MIB).unwrap();
+        assert_eq!(buffer.len(), SIZE_64MIB);
+    }
+
+    #[test]
+    fn test_thread_cache_cross_thread_free() {
+        // Chunks allocated here, freed on another thread (its cache), then
+        // the pool must still be fully recoverable from this thread.
+        let pool = test_pool_with_max(SIZE_64MIB);
+        let chunks: Vec<_> = (0..16).map(|_| pool.allocate(64 * 1024).unwrap()).collect();
+
+        let pool2 = Arc::clone(&pool);
+        std::thread::spawn(move || drop(chunks)).join().unwrap();
+        drop(pool2);
+
+        // The other thread exited: its cache was flushed on thread exit.
+        let buffer = pool.allocate(SIZE_64MIB).unwrap();
+        assert_eq!(buffer.len(), SIZE_64MIB);
+    }
+
+    #[tokio::test]
+    async fn test_thread_cache_demand_flush_unblocks_waiter() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let pool = test_pool_with_max(SIZE_64MIB);
+        // Fill the pool: 63 x 1MiB + one full slab.
+        let bufs: Vec<_> = (0..63).map(|_| pool.allocate(SIZE_1MIB).unwrap()).collect();
+        let chunks: Vec<_> = (0..16).map(|_| pool.allocate(64 * 1024).unwrap()).collect();
+
+        let waiter = {
+            let pool = pool.clone();
+            tokio::spawn(async move { pool.async_allocate(SIZE_64MIB).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        drop(bufs);
+        // Demand is signalled: these frees must bypass the thread cache so
+        // the slab can be released to the waiter.
+        drop(chunks);
+
+        let buffer = timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter starved: thread cache held the last slab")
+            .unwrap()
+            .unwrap();
+        assert_eq!(buffer.len(), SIZE_64MIB);
     }
 
     #[test]

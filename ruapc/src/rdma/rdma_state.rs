@@ -17,10 +17,6 @@ impl AtomicIndex {
         self.0.load(Ordering::Acquire)
     }
 
-    fn store(&self, val: u64) {
-        self.0.store(val, Ordering::Release);
-    }
-
     fn fetch_add(&self, cnt: u64) -> u64 {
         self.0.fetch_add(cnt, Ordering::AcqRel)
     }
@@ -48,6 +44,11 @@ impl TaskIndex {
     pub fn is_ok(self) -> bool {
         self.0 & ERROR == 0
     }
+
+    /// Returns the numeric send index (without the error bit).
+    pub fn value(self) -> u64 {
+        self.0 & !ERROR
+    }
 }
 
 /// Manages the state of RDMA (Remote Direct Memory Access) operations.
@@ -62,7 +63,6 @@ pub struct RdmaState {
     max_send_limit: u64,
     send_submitted: AtomicIndex,
     send_finished: AtomicU64,
-    last_send_index: AtomicIndex,
 }
 
 impl RdmaState {
@@ -75,7 +75,6 @@ impl RdmaState {
             max_send_limit: u64::from(max_send_limit),
             send_submitted: AtomicIndex::default(),
             send_finished: AtomicU64::default(),
-            last_send_index: AtomicIndex::default(),
         }
     }
 
@@ -123,14 +122,7 @@ impl RdmaState {
     /// * `false` if the error state was already set
     pub fn set_error(&self) -> bool {
         let bits = self.send_submitted.set_error();
-
-        if bits & ERROR == 0 {
-            // first to set error.
-            self.last_send_index.store(bits | ERROR);
-            true
-        } else {
-            false
-        }
+        bits & ERROR == 0
     }
 
     /// Checks if the RDMA state is in a normal (non-error) state.
@@ -140,18 +132,6 @@ impl RdmaState {
     /// * `false` if in error state
     pub fn is_ok(&self) -> bool {
         self.send_submitted.is_ok()
-    }
-
-    /// Checks if the RDMA connection is ready to be removed based on completed sends.
-    ///
-    /// # Arguments
-    /// * `send_completed` - The index of the last completed send operation
-    ///
-    /// # Returns
-    /// * `true` if the connection can be safely removed
-    /// * `false` if there are still pending operations
-    pub fn ready_to_remove(&self, send_completed: u64) -> bool {
-        send_completed | ERROR == self.last_send_index.load()
     }
 }
 
@@ -182,8 +162,5 @@ mod tests {
         assert!(!state.is_ok());
         assert!(!state.apply_send_index().is_ok());
         println!("{:#?}", state);
-
-        assert!(!state.ready_to_remove(16));
-        assert!(state.ready_to_remove(17));
     }
 }

@@ -154,7 +154,9 @@ impl Client {
             None
         };
 
-        let (msgid, receiver) = ctx.state.waiter.alloc();
+        // The waiter entry expires after `self.timeout` (coarse, swept
+        // periodically); no per-request timer is registered.
+        let (msgid, receiver) = ctx.state.waiter.alloc(self.timeout);
         let mut meta = MsgMeta {
             method: method_name.into(),
             flags,
@@ -163,17 +165,13 @@ impl Client {
         };
         socket.send(&mut meta, req, &ctx.state).await?;
 
-        // 3. recv response with timeout.
-        if let Ok(result) = tokio::time::timeout(self.timeout, receiver.recv()).await {
-            let (response, write_buffer) = result?;
-            // Pass the write buffer to the caller if a slot was provided.
-            if let Some(slot) = write_buffer_slot {
-                *slot = write_buffer;
-            }
-            response.payload.deserialize(&response.meta)?
-        } else {
-            Err(Error::kind(ErrorKind::Timeout).into())
+        // 3. recv response (fails with Timeout once the entry expires).
+        let (response, write_buffer) = receiver.recv().await?;
+        // Pass the write buffer to the caller if a slot was provided.
+        if let Some(slot) = write_buffer_slot {
+            *slot = write_buffer;
         }
+        response.payload.deserialize(&response.meta)?
     }
 }
 

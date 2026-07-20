@@ -94,6 +94,50 @@ async fn test_http() {
     server.join().await;
 }
 
+/// Drives many concurrent requests over one RDMA connection so the send
+/// window (32) overflows: exercises the pending-send path and opportunistic
+/// aggregation, and validates every response.
+#[cfg(feature = "rdma")]
+#[tokio::test]
+async fn test_rdma_concurrent() {
+    let foo = Arc::new(FooImpl);
+    let mut router = ruapc::Router::default();
+    foo.ruapc_export(&mut router);
+
+    let config = SocketPoolConfig {
+        socket_type: SocketType::UNIFIED,
+        ..Default::default()
+    };
+    let server = ruapc::Server::create(router, &config).unwrap();
+    let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
+    let addr = server.listen(addr).await.unwrap();
+
+    let ctx = ruapc::Context::create(&config).unwrap().with_addr(addr);
+    let mut tasks = Vec::new();
+    for task_id in 0..128 {
+        let ctx = ctx.clone();
+        tasks.push(tokio::spawn(async move {
+            let client = ruapc::Client {
+                socket_type: Some(SocketType::RDMA),
+                ..Default::default()
+            };
+            for round in 0..8 {
+                let name = format!("task{task_id}-round{round}");
+                let rsp = client.hello(&ctx, &name).await.unwrap();
+                assert_eq!(rsp, format!("hello {name}!"));
+            }
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+
+    server.stop();
+    tokio::time::timeout(std::time::Duration::from_secs(30), server.join())
+        .await
+        .unwrap();
+}
+
 #[cfg(feature = "rdma")]
 #[tokio::test]
 async fn test_rdma() {

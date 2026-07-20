@@ -10,7 +10,7 @@ use crate::{
     Buffer, BufferPool, Context, Error, RemoteReadOptions, SocketTrait, State,
     error::{ErrorKind, Result},
     msg::MsgMeta,
-    rdma::event_loop::SendMsg,
+    rdma::poller::{PollerWaker, SendMsg},
     services::{MemoryService, MetaService},
 };
 
@@ -24,6 +24,11 @@ pub struct RdmaSocket {
     pub(crate) queue_pair: QueuePair,
     pub(crate) state: RdmaState,
     pub(crate) pending_sender: Sender<SendMsg>,
+    /// Wakes the device poll thread (pending sends, error teardown).
+    pub(crate) poller_waker: PollerWaker,
+    /// Negotiated maximum serialized message size (= the peer's receive
+    /// buffer size).
+    pub(crate) max_msg_size: usize,
 }
 
 impl RdmaSocket {
@@ -31,14 +36,49 @@ impl RdmaSocket {
         queue_pair: QueuePair,
         rdmabuf_pool: Arc<BufferPool>,
         pending_sender: Sender<SendMsg>,
+        poller_waker: PollerWaker,
+        max_msg_size: usize,
+        send_window: u32,
     ) -> Self {
         Self {
             rdma_completions: dashmap::DashMap::default(),
             rdmabuf_pool,
             queue_pair,
-            state: RdmaState::new(32),
+            state: RdmaState::new(send_window.max(1)),
             pending_sender,
+            poller_waker,
+            max_msg_size,
         }
+    }
+
+    /// Serializes a message into a right-sized buffer.
+    ///
+    /// The serialized size is unknown upfront, so try increasingly larger
+    /// buffers (4 KiB → 64 KiB → 256 KiB → negotiated `max_msg_size`).
+    /// Typical RPC messages fit the first rung; larger payloads should use
+    /// the remote read/write paths.
+    fn serialize_msg<P: Serialize>(&self, meta: &MsgMeta, payload: &P) -> Result<Buffer> {
+        let mut last_err = None;
+        for size in [4 * 1024, 64 * 1024, 256 * 1024, self.max_msg_size] {
+            let size = size.min(self.max_msg_size);
+            let mut buf = self.rdmabuf_pool.allocate(size)?;
+            match meta.serialize_to(payload, &mut buf) {
+                Ok(()) => return Ok(buf),
+                Err(e) => last_err = Some(e),
+            }
+            if size == self.max_msg_size {
+                break;
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            Error::new(
+                ErrorKind::RdmaSendFailed,
+                format!(
+                    "message exceeds negotiated max_msg_size ({}); use remote read/write for large payloads",
+                    self.max_msg_size
+                ),
+            )
+        }))
     }
 
     pub fn set_error(&self) {
@@ -49,6 +89,9 @@ impl RdmaSocket {
         };
         let mask = ruapc_rdma::ibv_qp_attr_mask::IBV_QP_STATE;
         let _ = self.queue_pair.modify(&mut attr, mask.0 as _);
+        // Ensure the poll thread notices the error even when the QP had no
+        // outstanding work requests to flush.
+        self.poller_waker.wake();
     }
 
     fn post_rdma_read(
@@ -95,7 +138,10 @@ impl RdmaSocket {
 impl RdmaSocket {
     async fn remote_read_op(&self, mut local: Buffer, remote: &RemoteBufferInfo) -> Result<Buffer> {
         let rkey = remote.key.rkey;
-        local.set_len(remote.len as usize);
+        // The remote buffer info advertises the full registered region
+        // (capacity); read at most what the local buffer can hold. Callers
+        // that need fewer bytes truncate afterwards.
+        local.set_len((remote.len as usize).min(local.capacity()));
         let rx = self.post_rdma_read(local, remote.addr, rkey)?;
         Self::await_completion(rx).await
     }
@@ -108,23 +154,41 @@ impl SocketTrait for RdmaSocket {
         payload: &P,
         _: &Arc<State>,
     ) -> Result<()> {
-        let mut buf = self.rdmabuf_pool.allocate(1024 * 1024)?;
-        meta.serialize_to(payload, &mut buf)?;
+        let buf = self.serialize_msg(meta, payload)?;
 
         let index = self.state.apply_send_index();
         if index.is_ok() {
             if self.state.ready_to_send(index) {
-                self.queue_pair
-                    .send(buf, ibv_send_flags::IBV_SEND_SIGNALED)
-                    .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
+                // Invariant: a fully consumed send window must contain at
+                // least one signaled WR, otherwise its slots stay stranded
+                // (unsignaled completions are only swept by later signaled
+                // ones) and the connection stalls until the 5s keepalive.
+                // Direct sends within the window make the window-tail send
+                // signaled; pending flushes (the other way slots get
+                // consumed) are always signaled by the poll thread.
+                let window_tail = index.value() + 1 >= self.state.sendable_bound();
+                let posted = if window_tail {
+                    self.queue_pair
+                        .send_signaled(buf, ibv_send_flags::IBV_SEND_SIGNALED)
+                } else {
+                    self.queue_pair.send(buf, ibv_send_flags::IBV_SEND_SIGNALED)
+                };
+                posted.map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
             } else {
+                // Key pending sends by this socket's send index: the flush
+                // condition compares against the send window bound, which
+                // lives in the same space (msgids are global across
+                // connections and would drift arbitrarily far ahead).
                 self.pending_sender
                     .send(SendMsg {
-                        id: meta.msgid,
+                        id: index.value(),
                         buf,
                     })
                     .await
                     .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
+                // The poll thread may be sleeping; enqueueing a pending send
+                // produces no completion event, so wake it explicitly.
+                self.poller_waker.wake();
             }
             Ok(())
         } else {

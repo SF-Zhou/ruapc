@@ -1,18 +1,17 @@
 use std::{
-    collections::HashMap,
     os::raw::c_int,
     ptr,
-    sync::Arc,
-    sync::Mutex,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{Arc, Mutex},
 };
 
 use ruapc_bufpool::{Buffer, DeviceIndex};
 
-use super::{completion_queue::CompletionQueue, protection_domain::ProtectionDomain};
+use super::{
+    completion_queue::CompletionQueue, protection_domain::ProtectionDomain, wr_slots::WrSlots,
+};
 use crate::{
-    Error, ErrorKind, LinkLayer, Result, WRID, ibv_gid, ibv_mtu, ibv_qp_attr, ibv_qp_attr_mask,
-    ibv_qp_state, ibv_wc,
+    Error, ErrorKind, LinkLayer, Result, WRID, WRType, ibv_gid, ibv_mtu, ibv_qp_attr,
+    ibv_qp_attr_mask, ibv_qp_state, ibv_wc,
 };
 
 pub struct Completion {
@@ -25,8 +24,30 @@ pub struct QueuePair {
     _pd: Arc<ProtectionDomain>,
     send_cq: Arc<CompletionQueue>,
     recv_cq: Arc<CompletionQueue>,
-    wrs: Mutex<HashMap<u64, Buffer>>,
-    next_id: AtomicU64,
+    /// In-flight buffers of send-queue work requests (send/send_imm/read).
+    send_wrs: WrSlots,
+    /// In-flight buffers of receive-queue work requests.
+    recv_wrs: WrSlots,
+    /// Selective signaling interval for data sends posted via [`send`].
+    ///
+    /// `0` or `1` signals every work request. With interval `N > 1`, only
+    /// data sends whose SQ id is a multiple of `N` carry
+    /// `IBV_SEND_SIGNALED`; completions of the unsignaled ones are inferred
+    /// from later signaled completions (RC SQs complete in order) and their
+    /// buffers are reclaimed via [`take_send_buffer`](Self::take_send_buffer).
+    ///
+    /// [`send`]: Self::send
+    send_signal_interval: u64,
+    /// Serializes send-queue posts so that SQ ids are allocated in post
+    /// order.
+    ///
+    /// Selective signaling infers completion of unsignaled sends from later
+    /// signaled completions, which requires the SQ id order to match the
+    /// hardware post order exactly. Without this lock, two concurrent
+    /// posters could allocate ids in one order and post in the other,
+    /// letting the completion sweep reclaim the buffer of a still-in-flight
+    /// work request. The completion path stays lock-free.
+    sq_post_lock: Mutex<()>,
     pub device_index: DeviceIndex,
 }
 
@@ -44,15 +65,38 @@ impl QueuePair {
         if ptr.is_null() {
             return Err(ErrorKind::IBCreateQueuePairFail.with_errno());
         }
+        // `ibv_create_qp` updates `init_attr.cap` with the actual (possibly
+        // larger) queue depths; size the slot arrays from those.
         Ok(Self {
             ptr,
             _pd: Arc::clone(pd),
             send_cq: Arc::clone(send_cq),
             recv_cq: Arc::clone(recv_cq),
-            wrs: Mutex::new(HashMap::new()),
-            next_id: AtomicU64::new(0),
+            send_wrs: WrSlots::new(init_attr.cap.max_send_wr),
+            recv_wrs: WrSlots::new(init_attr.cap.max_recv_wr),
+            send_signal_interval: 1,
+            sq_post_lock: Mutex::new(()),
             device_index,
         })
+    }
+
+    /// Sets the selective signaling interval for data sends.
+    ///
+    /// The interval is clamped to `max(1, max_send_wr / 2)` so that the send
+    /// queue can always be reclaimed by polling a signaled completion.
+    pub fn set_send_signal_interval(&mut self, interval: u32, max_send_wr: u32) {
+        let limit = (max_send_wr / 2).max(1);
+        self.send_signal_interval = u64::from(interval.clamp(1, limit));
+    }
+
+    /// Computes the send flags for a data send with the given SQ id,
+    /// applying the selective signaling policy.
+    fn data_send_flags(&self, id: u64, flags: crate::ibv_send_flags) -> crate::ibv_send_flags {
+        if self.send_signal_interval > 1 && !id.is_multiple_of(self.send_signal_interval) {
+            crate::ibv_send_flags(flags.0 & !crate::ibv_send_flags::IBV_SEND_SIGNALED.0)
+        } else {
+            flags | crate::ibv_send_flags::IBV_SEND_SIGNALED
+        }
     }
 
     fn lkey(&self, buffer: &Buffer) -> Result<u32> {
@@ -70,13 +114,44 @@ impl QueuePair {
         unsafe { (*self.ptr).qp_num }
     }
 
-    pub fn send(&self, buffer: Buffer, flags: crate::ibv_send_flags) -> Result<()> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let wr_id = WRID::send_data(id);
+    /// Posts a data send and returns its send-queue id.
+    ///
+    /// Subject to the selective signaling policy: the completion of an
+    /// unsignaled send is only observed (and its send-window slot only
+    /// released) when a *later* signaled work request completes. Callers
+    /// posting a send that may be the last one for a while — in particular
+    /// one that consumes the tail of the send window — must use
+    /// [`send_signaled`](Self::send_signaled) instead, or the window slots
+    /// stay stranded until an unrelated signaled WR (e.g. a keepalive ACK)
+    /// happens to sweep them.
+    pub fn send(&self, buffer: Buffer, flags: crate::ibv_send_flags) -> Result<u64> {
+        self.send_data(buffer, flags, false)
+    }
+
+    /// Posts a data send with `IBV_SEND_SIGNALED` enforced, bypassing the
+    /// selective signaling policy.
+    pub fn send_signaled(&self, buffer: Buffer, flags: crate::ibv_send_flags) -> Result<u64> {
+        self.send_data(buffer, flags, true)
+    }
+
+    fn send_data(
+        &self,
+        buffer: Buffer,
+        flags: crate::ibv_send_flags,
+        force_signal: bool,
+    ) -> Result<u64> {
         let addr = buffer.as_ptr() as u64;
         let len = buffer.len() as u32;
         let lkey = self.lkey(&buffer)?;
-        self.wrs.lock().unwrap().insert(id, buffer);
+        let _guard = self.sq_post_lock.lock().unwrap();
+        let id = self.send_wrs.alloc_id();
+        let flags = if force_signal {
+            flags | crate::ibv_send_flags::IBV_SEND_SIGNALED
+        } else {
+            self.data_send_flags(id, flags)
+        };
+        let wr_id = WRID::send_data(id);
+        self.send_wrs.insert(id, buffer);
         self.post_send_verb(
             wr_id,
             addr,
@@ -87,17 +162,20 @@ impl QueuePair {
             None,
         )
         .inspect_err(|_e| {
-            self.wrs.lock().unwrap().remove(&id);
-        })
+            self.send_wrs.take(id);
+        })?;
+        Ok(id)
     }
 
-    pub fn send_imm(&self, buffer: Buffer, imm: u32, flags: crate::ibv_send_flags) -> Result<()> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let wr_id = WRID::send_imm(id);
+    /// Posts a send with immediate data and returns its send-queue id.
+    pub fn send_imm(&self, buffer: Buffer, imm: u32, flags: crate::ibv_send_flags) -> Result<u64> {
         let addr = buffer.as_ptr() as u64;
         let len = buffer.len() as u32;
         let lkey = self.lkey(&buffer)?;
-        self.wrs.lock().unwrap().insert(id, buffer);
+        let _guard = self.sq_post_lock.lock().unwrap();
+        let id = self.send_wrs.alloc_id();
+        let wr_id = WRID::send_imm(id);
+        self.send_wrs.insert(id, buffer);
         let mut sge = crate::ibv_sge {
             addr,
             length: len,
@@ -116,15 +194,18 @@ impl QueuePair {
         };
         let result = unsafe { self.post_send(&mut wr) };
         if let Err((_, err)) = result {
-            self.wrs.lock().unwrap().remove(&id);
+            self.send_wrs.take(id);
             return Err(err);
         }
-        Ok(())
+        Ok(id)
     }
 
     pub fn send_imm_only(&self, imm: u32, flags: crate::ibv_send_flags) -> Result<()> {
-        let _id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let wr_id = WRID::send_imm(_id);
+        // Allocates an ID (the WR consumes a hardware SQ slot) but stores no
+        // buffer; the slot stays empty and `take` will return `None`.
+        let _guard = self.sq_post_lock.lock().unwrap();
+        let id = self.send_wrs.alloc_id();
+        let wr_id = WRID::send_imm(id);
         let mut wr = crate::ibv_send_wr {
             wr_id,
             sg_list: ptr::null_mut(),
@@ -150,12 +231,13 @@ impl QueuePair {
         rkey: u32,
         flags: crate::ibv_send_flags,
     ) -> Result<WRID> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let wr_id = WRID::read(id);
         let addr = buffer.as_ptr() as u64;
         let len = buffer.len() as u32;
         let lkey = self.lkey(&buffer)?;
-        self.wrs.lock().unwrap().insert(id, buffer);
+        let _guard = self.sq_post_lock.lock().unwrap();
+        let id = self.send_wrs.alloc_id();
+        let wr_id = WRID::read(id);
+        self.send_wrs.insert(id, buffer);
         self.post_send_verb(
             wr_id,
             addr,
@@ -166,7 +248,7 @@ impl QueuePair {
             Some((remote_addr, rkey)),
         )
         .inspect_err(|_e| {
-            self.wrs.lock().unwrap().remove(&id);
+            self.send_wrs.take(id);
         })?;
         Ok(wr_id)
     }
@@ -207,12 +289,12 @@ impl QueuePair {
     }
 
     pub fn recv(&self, buffer: Buffer) -> Result<()> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = self.recv_wrs.alloc_id();
         let wr_id = WRID::recv(id);
         let addr = buffer.as_ptr() as u64;
         let len = buffer.capacity() as u32;
         let lkey = self.lkey(&buffer)?;
-        self.wrs.lock().unwrap().insert(id, buffer);
+        self.recv_wrs.insert(id, buffer);
         let mut sge = crate::ibv_sge {
             addr,
             length: len,
@@ -226,7 +308,7 @@ impl QueuePair {
         };
         let result = unsafe { self.post_recv(&mut wr) };
         if let Err((_, err)) = result {
-            self.wrs.lock().unwrap().remove(&id);
+            self.recv_wrs.take(id);
             return Err(err);
         }
         Ok(())
@@ -244,17 +326,39 @@ impl QueuePair {
 
     fn take_buffers(&self, wc: &[ibv_wc]) -> Vec<Completion> {
         let mut completions = Vec::with_capacity(wc.len());
-        let mut wrs = self.wrs.lock().unwrap();
         for wc in wc {
-            let id = wc.wr_id.get_id();
-            let buffer = wrs.remove(&id);
+            let buffer = self.take_buffer(&wc.wr_id);
             completions.push(Completion { wc: *wc, buffer });
         }
         completions
     }
 
     pub fn take_buffer(&self, wr_id: &WRID) -> Option<Buffer> {
-        self.wrs.lock().unwrap().remove(&wr_id.get_id())
+        match wr_id.get_type() {
+            WRType::Recv => self.recv_wrs.take(wr_id.get_id()),
+            WRType::SendData | WRType::SendImm | WRType::Read => self.send_wrs.take(wr_id.get_id()),
+        }
+    }
+
+    /// Takes the buffer of a send-queue work request by raw SQ id.
+    ///
+    /// Used by the completion handler to reclaim buffers of *unsignaled*
+    /// data sends: when a signaled completion with id `X` is polled, all SQ
+    /// work requests with ids below `X` are guaranteed complete (RC SQs
+    /// complete in order). Returns `None` for ids without a stored buffer
+    /// (buffer-less immediate sends or failed posts).
+    pub fn take_send_buffer(&self, id: u64) -> Option<Buffer> {
+        self.send_wrs.take(id)
+    }
+
+    /// Reclaims every in-flight send buffer, returning how many were taken.
+    ///
+    /// Only safe to call after the QP has transitioned to the error state
+    /// and its outstanding completions have been drained: buffers of
+    /// unsignaled data sends that completed successfully never produce a
+    /// CQE, so teardown must reclaim them explicitly.
+    pub fn reclaim_send_buffers(&self) -> usize {
+        self.send_wrs.reclaim_all()
     }
 
     pub fn modify(&self, attr: &mut crate::ibv_qp_attr, attr_mask: c_int) -> Result<()> {
@@ -294,6 +398,7 @@ impl QueuePair {
         local_gid_index: u8,
         link_layer: LinkLayer,
         path_mtu: ibv_mtu,
+        rq_psn: u32,
     ) -> Result<()> {
         let mut ah_attr = crate::ibv_ah_attr {
             sl: 0,
@@ -330,9 +435,14 @@ impl QueuePair {
             qp_state: ibv_qp_state::IBV_QPS_RTR,
             path_mtu,
             dest_qp_num: remote_qp_num,
-            rq_psn: 0,
+            rq_psn: rq_psn & 0xFF_FFFF,
             max_dest_rd_atomic: 1,
-            min_rnr_timer: 0x12,
+            // 0.01ms (encoding 1): an RNR NAK costs ~10µs instead of the
+            // common-default 1.28ms (0x12). The receive ring is normally
+            // pre-posted ahead of the peer's send window, so RNR is a rare
+            // transient (repost lag); a short backoff keeps it invisible
+            // instead of quantizing the connection's RTT in 1.28ms steps.
+            min_rnr_timer: 0x01,
             ah_attr,
             ..Default::default()
         };
@@ -346,13 +456,13 @@ impl QueuePair {
         self.modify(&mut attr, mask.0 as _)
     }
 
-    pub fn ready_to_send(&self) -> Result<()> {
+    pub fn ready_to_send(&self, sq_psn: u32) -> Result<()> {
         let mut attr = ibv_qp_attr {
             qp_state: ibv_qp_state::IBV_QPS_RTS,
             timeout: 0x12,
             retry_cnt: 6,
             rnr_retry: 6,
-            sq_psn: 0,
+            sq_psn: sq_psn & 0xFF_FFFF,
             max_rd_atomic: 1,
             ..Default::default()
         };
@@ -375,6 +485,8 @@ impl QueuePair {
         remote_qp_num: u32,
         remote_gid: ibv_gid,
         remote_lid: u16,
+        local_psn: u32,
+        remote_psn: u32,
     ) -> Result<()> {
         self.init(local_port_num, pkey_index)?;
         self.ready_to_recv(
@@ -385,8 +497,9 @@ impl QueuePair {
             local_gid_index,
             link_layer,
             path_mtu,
+            remote_psn,
         )?;
-        self.ready_to_send()
+        self.ready_to_send(local_psn)
     }
 
     pub(crate) unsafe fn post_send(

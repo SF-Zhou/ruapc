@@ -50,14 +50,22 @@ impl State {
         let devices = Arc::new(Self::discover_devices(config));
 
         // Create a shared buffer pool backed by all discovered devices.
-        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+        let mut pool_builder = ruapc_bufpool::BufferPoolBuilder::new(devices.clone());
+        if config.buffer_pool_memory > 0 {
+            pool_builder = pool_builder.max_memory(config.buffer_pool_memory);
+        }
+        let buffer_pool = pool_builder.build();
 
         router.build_open_api()?;
         let socket_pool = SocketPool::create(config, &devices, &buffer_pool)?;
 
+        let waiter: Arc<Waiter> = Arc::default();
+        // Coarse request-timeout sweeping (no per-request timers).
+        waiter.spawn_sweeper();
+
         let state = Self {
             router,
-            waiter: Arc::default(),
+            waiter,
             socket_pool,
             devices,
             buffer_pool,
@@ -81,8 +89,12 @@ impl State {
                 && let Ok(active_devices) = ruapc_rdma::ActiveDevice::available()
             {
                 let prefer_rxe = std::env::var("RUAPC_PREFER_RXE").is_ok();
+                let filter = &config.rdma.device_filter;
                 for dev in active_devices {
                     if prefer_rxe && !dev.info().name.starts_with("rxe") {
+                        continue;
+                    }
+                    if !filter.is_empty() && !filter.iter().any(|f| f == dev.info().name.as_str()) {
                         continue;
                     }
                     devices.add_rdma_device(dev);

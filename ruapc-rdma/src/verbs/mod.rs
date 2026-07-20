@@ -38,3 +38,5 @@ pub use protection_domain::ProtectionDomain;
 
 mod queue_pair;
 pub use queue_pair::{Completion, QueuePair};
+
+mod wr_slots;

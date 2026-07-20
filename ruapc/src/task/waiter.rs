@@ -1,5 +1,6 @@
 use foldhash::fast::RandomState;
 use std::sync::atomic::AtomicU64;
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 use crate::{Buffer, Message, Receiver};
@@ -15,6 +16,15 @@ struct WaiterEntry {
     /// Write buffer stored by `MemoryService::tcp_push` / `rdma_pull` during
     /// the request. Sent together with the response when `post` is called.
     write_buffer: Option<Buffer>,
+    /// Coarse expiry: the entry is dropped by the periodic sweep once the
+    /// deadline passed, waking the waiting task with a timeout error.
+    ///
+    /// Per-request `tokio::time::timeout` is deliberately avoided: at
+    /// hundreds of thousands of requests per second the timer wheel
+    /// registration/cancellation lock becomes a process-wide bottleneck.
+    /// RPC timeouts don't need millisecond precision; the sweep interval
+    /// adds at most [`Waiter::SWEEP_INTERVAL`] of slack.
+    deadline: Instant,
 }
 
 /// Response waiter for correlating RPC requests with responses.
@@ -60,8 +70,9 @@ impl Waiter {
     /// # Returns
     ///
     /// Returns a tuple of (message_id, receiver). The receiver will automatically
-    /// clean up the waiter entry when dropped.
-    pub fn alloc(&self) -> (u64, Receiver<'_>) {
+    /// clean up the waiter entry when dropped. The entry expires `timeout`
+    /// after allocation (with up to [`Self::SWEEP_INTERVAL`] of slack).
+    pub fn alloc(&self, timeout: Duration) -> (u64, Receiver<'_>) {
         let msgid = self.index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.id_map.insert(
@@ -69,6 +80,7 @@ impl Waiter {
             WaiterEntry {
                 sender: tx,
                 write_buffer: None,
+                deadline: Instant::now() + timeout,
             },
         );
         (
@@ -125,6 +137,32 @@ impl Waiter {
     fn remove(&self, msgid: u64) {
         self.id_map.remove(&msgid);
     }
+
+    /// Interval of the expiry sweep; bounds the timeout slack.
+    pub const SWEEP_INTERVAL: Duration = Duration::from_millis(50);
+
+    /// Drops all entries whose deadline has passed; their waiting tasks wake
+    /// with a timeout error. Called periodically by the sweeper task.
+    pub fn expire(&self, now: Instant) {
+        self.id_map.retain(|_, entry| entry.deadline > now);
+    }
+
+    /// Spawns the periodic expiry sweeper for this waiter. The task exits
+    /// once the waiter is dropped.
+    pub fn spawn_sweeper(self: &std::sync::Arc<Self>) {
+        let weak = std::sync::Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Self::SWEEP_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let Some(waiter) = weak.upgrade() else {
+                    break;
+                };
+                waiter.expire(Instant::now());
+            }
+        });
+    }
 }
 
 impl std::fmt::Debug for Waiter {
@@ -142,7 +180,7 @@ mod tests {
     async fn test_waiter() {
         let msg_waiter = Arc::new(Waiter::default());
 
-        let (msgid, rx) = msg_waiter.alloc();
+        let (msgid, rx) = msg_waiter.alloc(std::time::Duration::from_secs(30));
         assert_eq!(msgid, 0);
 
         let handle = {
@@ -160,7 +198,7 @@ mod tests {
         assert!(write_buf.is_none());
         handle.await.unwrap();
 
-        let (msgid, rx) = msg_waiter.alloc();
+        let (msgid, rx) = msg_waiter.alloc(std::time::Duration::from_secs(30));
         drop(rx); // drop the receiver to trigger the cleaner's Drop
         assert!(msg_waiter.id_map.get(&msgid).is_none());
     }
@@ -180,7 +218,7 @@ mod tests {
         let pool = ruapc_bufpool::BufferPoolBuilder::new(devices).build();
 
         let waiter = Waiter::default();
-        let (msgid, rx) = waiter.alloc();
+        let (msgid, rx) = waiter.alloc(std::time::Duration::from_secs(30));
 
         // Store a write buffer while the request is pending.
         let mut buf = pool.allocate(1024 * 1024).unwrap();
@@ -205,7 +243,7 @@ mod tests {
         let pool = ruapc_bufpool::BufferPoolBuilder::new(devices).build();
 
         let waiter = Waiter::default();
-        let (msgid, rx) = waiter.alloc();
+        let (msgid, rx) = waiter.alloc(std::time::Duration::from_secs(30));
 
         // Drop receiver (simulates timeout cleanup).
         drop(rx);

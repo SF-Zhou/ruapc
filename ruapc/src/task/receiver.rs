@@ -28,9 +28,9 @@ impl Receiver<'_> {
         match self {
             Receiver::None => Err(Error::kind(ErrorKind::InvalidArgument)),
             Receiver::OneShotRx(rx, cleaner) => {
-                let result = rx
-                    .await
-                    .map_err(|e| Error::new(ErrorKind::TcpRecvMsgFailed, e.to_string()));
+                // A dropped sender means the waiter entry vanished without a
+                // response — most commonly the coarse expiry sweep.
+                let result = rx.await.map_err(|_| Error::kind(ErrorKind::Timeout));
                 std::mem::forget(cleaner);
                 result
             }
@@ -54,7 +54,7 @@ mod tests {
     #[tokio::test]
     async fn test_receiver_receives_message() {
         let waiter = std::sync::Arc::new(Waiter::default());
-        let (msgid, rx) = waiter.alloc();
+        let (msgid, rx) = waiter.alloc(std::time::Duration::from_secs(30));
 
         let w = waiter.clone();
         tokio::spawn(async move {

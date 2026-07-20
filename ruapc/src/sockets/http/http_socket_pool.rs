@@ -191,7 +191,7 @@ impl HttpSocketPool {
             }
         }
 
-        let (msgid, rx) = state.waiter.alloc();
+        let (msgid, rx) = state.waiter.alloc(std::time::Duration::from_secs(30));
         let meta = MsgMeta {
             method: req.uri().path().trim_start_matches('/').to_string(),
             flags: MsgFlags::IsReq,

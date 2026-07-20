@@ -13,8 +13,8 @@ pub(crate) use rdma_service::{RdmaInfo, RdmaService};
 mod rdma_state;
 pub(crate) use rdma_state::RdmaState;
 
-mod event_loop;
-pub(crate) use event_loop::EventLoop;
+mod poller;
+pub(crate) use poller::{DevicePollers, PollerConfig, RegisterConn};
 
 mod rdma_socket;
 pub(crate) use rdma_socket::RdmaSocket;

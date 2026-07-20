@@ -285,6 +285,7 @@ impl Drop for Buffer {
                 level - crate::buddy::NUM_LEVELS,
                 self.ptr,
                 self.index as usize,
+                self.block,
             );
         }
     }

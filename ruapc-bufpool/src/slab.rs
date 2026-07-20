@@ -1,4 +1,4 @@
-//! Slab layer for small buffer classes (64 KiB and 256 KiB).
+//! Slab layer for small buffer classes (16 KiB, 64 KiB and 256 KiB).
 //!
 //! Small allocations are served from *slabs*: 1 MiB leaves taken from the
 //! buddy pool and carved into fixed-size chunks. Each size class keeps its
@@ -27,10 +27,22 @@ type SlabMap = HashMap<usize, Slab, foldhash::fast::FixedState>;
 pub(crate) const SLAB_BACKING_SIZE: usize = SIZE_1MIB;
 
 /// Number of slab size classes.
-pub(crate) const NUM_SLAB_CLASSES: usize = 2;
+pub(crate) const NUM_SLAB_CLASSES: usize = 3;
 
 /// Chunk sizes for each slab class.
-pub(crate) const SLAB_CLASS_SIZES: [usize; NUM_SLAB_CLASSES] = [64 * 1024, 256 * 1024];
+///
+/// The 16 KiB class exists for small RPC messages: a typical serialized
+/// request/response is well under 4 KiB, and rounding it up to 64 KiB
+/// multiplied the memory footprint of every in-flight message by 16x,
+/// exhausting small pools under high concurrency. 16 KiB is the smallest
+/// chunk whose per-slab count (1 MiB / 16 KiB = 64) still fits the u64
+/// free-chunk bitmask.
+pub(crate) const SLAB_CLASS_SIZES: [usize; NUM_SLAB_CLASSES] = [16 * 1024, 64 * 1024, 256 * 1024];
+
+/// Returns a mask with the low `n` bits set (`n <= 64`).
+const fn checked_low_mask(n: usize) -> u64 {
+    if n >= 64 { u64::MAX } else { (1u64 << n) - 1 }
+}
 
 /// Returns the slab class for a request size, or `None` if the size is 0 or
 /// belongs to the buddy allocator (> 256 KiB).
@@ -47,7 +59,7 @@ struct Slab {
     /// through the regular buddy free path.
     backing: Buffer,
     /// Bitmask of free chunks (bit `i` set = chunk `i` is free).
-    free_mask: u32,
+    free_mask: u64,
     /// Whether this slab's address is currently on the `available` stack.
     in_available: bool,
 }
@@ -56,7 +68,7 @@ struct Slab {
 pub(crate) struct SlabClass {
     chunk_size: usize,
     /// Mask with one bit set per chunk (the "fully free" pattern).
-    full_mask: u32,
+    full_mask: u64,
     /// All slabs of this class, keyed by the 1 MiB-aligned base address.
     slabs: SlabMap,
     /// LIFO stack of slab base addresses that may have free chunks.
@@ -72,10 +84,10 @@ impl SlabClass {
     pub(crate) fn new(class: usize) -> Self {
         let chunk_size = SLAB_CLASS_SIZES[class];
         let chunks = SLAB_BACKING_SIZE / chunk_size;
-        debug_assert!(chunks <= 32);
+        debug_assert!(chunks <= 64);
         Self {
             chunk_size,
-            full_mask: ((1u64 << chunks) - 1) as u32,
+            full_mask: checked_low_mask(chunks),
             slabs: SlabMap::default(),
             available: Vec::new(),
             empty_count: 0,
@@ -105,7 +117,7 @@ impl SlabClass {
                 self.empty_count -= 1;
             }
             let index = slab.free_mask.trailing_zeros() as usize;
-            slab.free_mask &= !(1u32 << index);
+            slab.free_mask &= !(1u64 << index);
             if slab.free_mask == 0 {
                 slab.in_available = false;
                 self.available.pop();
@@ -163,9 +175,9 @@ impl SlabClass {
             .get_mut(&base)
             .expect("chunk freed into unknown slab");
         debug_assert_eq!((chunk_addr - base) / self.chunk_size, index);
-        debug_assert_eq!(slab.free_mask & (1u32 << index), 0, "double free of chunk");
+        debug_assert_eq!(slab.free_mask & (1u64 << index), 0, "double free of chunk");
 
-        slab.free_mask |= 1u32 << index;
+        slab.free_mask |= 1u64 << index;
         if !slab.in_available {
             slab.in_available = true;
             self.available.push(base);

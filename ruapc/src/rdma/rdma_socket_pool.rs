@@ -9,21 +9,21 @@ use std::{
 use foldhash::fast::RandomState;
 use ruapc_bufpool::Device as _;
 use ruapc_rdma::{
-    CompChannel, CompletionQueue, DeviceInfo, GidType, LinkLayer, Port, QueuePair, ibv_mtu,
-    ibv_port_state, ibv_qp_cap, ibv_qp_init_attr, ibv_qp_type,
+    DeviceInfo, GidType, LinkLayer, Port, QueuePair, ibv_mtu, ibv_port_state, ibv_qp_cap,
+    ibv_qp_init_attr, ibv_qp_type,
 };
 use tokio::sync::RwLock;
 use tokio_util::sync::DropGuard;
 
 use super::rdma_service::{RdmaDeviceInfo, RdmaGidInfo, RdmaPortInfo};
 use super::{
-    ConnectRequest, DeviceSelection, Endpoint, EventLoop, RdmaConnectionConfig, RdmaDevice,
-    RdmaDeviceRefresher, RdmaInfo, RdmaService, RdmaSocket,
+    ConnectRequest, DevicePollers, DeviceSelection, Endpoint, PollerConfig, RdmaConnectionConfig,
+    RdmaDevice, RdmaDeviceRefresher, RdmaInfo, RdmaService, RdmaSocket, RegisterConn,
 };
 use crate::{
     BufferPool, Client, Context, Devices, Error, ErrorKind, RdmaQueuePairConfig,
     RdmaSocketPoolConfig, Result, Socket, SocketPoolConfig, SocketPoolTrait, SocketType, State,
-    TaskSupervisor, rdma::event_loop::SendMsg,
+    TaskSupervisor, rdma::poller::SendMsg,
 };
 
 /// A pool managing RDMA sockets and their associated resources.
@@ -31,8 +31,10 @@ use crate::{
 /// # Drop order
 ///
 /// RDMA resources **must** be destroyed in this order:
-///   1. Stop all async tasks (so EventLoop drops its `Arc<RdmaSocket>`)
-///   2. Destroy QPs (`socket_map`)
+///   1. Stop all async tasks and join the device poll threads (so all
+///      per-connection state drops its `Arc<RdmaSocket>`)
+///   2. Destroy QPs (`socket_map`) — the shared CQs are destroyed via their
+///      `Arc` chain once the last QP referencing them is gone
 ///   3. Deregister MRs (`buffer_pool`)
 ///   4. Destroy PD / close device context (`devices`)
 ///
@@ -42,17 +44,21 @@ pub struct RdmaSocketPool {
     /// Client used for acquiring RDMA connections (no RDMA resources).
     pub acquire_client: Client,
     /// Supervisor for managing asynchronous tasks — dropped first so that
-    /// all spawned EventLoop tasks finish and release their `Arc<RdmaSocket>`.
+    /// watcher tasks finish and connections are marked for teardown.
     pub task_supervisor: TaskSupervisor,
+    /// Per-device completion poll threads. Dropped before `socket_map` so
+    /// the threads are joined and release their `Arc<RdmaSocket>` clones.
+    pollers: DevicePollers,
     /// Background port/GID cache refresher. Dropped before RDMA devices.
     _port_refresher: RdmaDeviceRefresher,
     /// Per-peer connection locks prevent duplicate in-flight RDMA handshakes.
     connect_locks: dashmap::DashMap<SocketAddr, Arc<tokio::sync::Mutex<()>>, RandomState>,
     /// Short-lived cache for the first-stage server RDMA device query.
     device_list_cache: RwLock<HashMap<SocketAddr, CachedRdmaInfo, RandomState>>,
-    /// Thread-safe map of active RDMA sockets indexed by their addresses.
+    /// Thread-safe map of active RDMA connection stripes indexed by peer
+    /// address; requests are spread round-robin across the stripes.
     /// Dropped after tasks stop → destroys QPs.
-    pub socket_map: RwLock<HashMap<SocketAddr, Arc<RdmaSocket>, RandomState>>,
+    pub socket_map: RwLock<HashMap<SocketAddr, Vec<Arc<RdmaSocket>>, RandomState>>,
     /// Shared buffer pool (owned by State, kept alive via Arc).
     /// Dropped after QPs → deregisters MRs.
     pub buffer_pool: Arc<BufferPool>,
@@ -63,6 +69,8 @@ pub struct RdmaSocketPool {
     pub config: RdmaSocketPoolConfig,
     /// Counter for round-robin device selection.
     next_device: AtomicUsize,
+    /// Counter for round-robin stripe selection in `acquire`.
+    next_stripe: AtomicUsize,
 }
 
 impl SocketPoolTrait for RdmaSocketPool {
@@ -101,7 +109,12 @@ impl SocketPoolTrait for RdmaSocketPool {
     fn rdma_accept(&self, request: &ConnectRequest, state: &Arc<State>) -> Result<Endpoint> {
         let device = self.find_device_by_name(&request.target)?;
         let connection_config = self.clamp_connection_config(device, request.config);
-        let (queue_pair, comp_channel, cq) = self.create_queue_pair(device, &connection_config)?;
+        let poller = self.pollers.get_or_start(
+            device,
+            self.poller_config(),
+            self.config.poll_threads_per_device,
+        )?;
+        let queue_pair = self.create_queue_pair(device, &connection_config, &poller)?;
         let local_endpoint = self.build_endpoint(
             &queue_pair,
             device,
@@ -115,16 +128,12 @@ impl SocketPoolTrait for RdmaSocketPool {
             self.config.pkey_index,
         )?;
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<SendMsg>(1024);
-        let rdma_socket = RdmaSocket::new(queue_pair, self.buffer_pool.clone(), tx);
-        self.spawn_event_loop(
-            Arc::new(rdma_socket),
-            state.clone(),
-            comp_channel,
-            cq,
-            rx,
-            connection_config.recv_queue_len,
-        )?;
+        let socket = self.register_socket(queue_pair, state, &poller, &connection_config)?;
+        tracing::debug!(
+            local_qp = socket.queue_pair.qp_num(),
+            remote_qp = request.endpoint.qp_num,
+            "accepted RDMA connection"
+        );
         Ok(local_endpoint)
     }
 
@@ -144,9 +153,9 @@ impl SocketPoolTrait for RdmaSocketPool {
 
         // Check if the socket is already in the socket map.
         if let Ok(socket_map) = self.socket_map.try_read()
-            && let Some(socket) = socket_map.get(addr)
+            && let Some(socket) = socket_map.get(addr).and_then(|s| self.pick_stripe(s))
         {
-            return Ok(socket.into());
+            return Ok(socket);
         }
 
         let connect_lock = self
@@ -194,6 +203,7 @@ impl RdmaSocketPool {
                 socket_type: Some(SocketType::TCP),
             },
             task_supervisor,
+            pollers: DevicePollers::default(),
             _port_refresher: port_refresher,
             connect_locks: dashmap::DashMap::default(),
             device_list_cache: RwLock::default(),
@@ -202,7 +212,21 @@ impl RdmaSocketPool {
             devices,
             config,
             next_device: AtomicUsize::new(0),
+            next_stripe: AtomicUsize::new(0),
         })
+    }
+
+    /// Picks one healthy connection stripe round-robin, skipping stripes
+    /// that entered the error state.
+    fn pick_stripe(&self, stripes: &[Arc<RdmaSocket>]) -> Option<Socket> {
+        if stripes.is_empty() {
+            return None;
+        }
+        let start = self.next_stripe.fetch_add(1, Ordering::Relaxed);
+        (0..stripes.len())
+            .map(|i| &stripes[(start + i) % stripes.len()])
+            .find(|s| s.state.is_ok())
+            .map(|s| s.into())
     }
 
     fn find_device_by_name(&self, selection: &DeviceSelection) -> Result<&RdmaDevice> {
@@ -218,24 +242,23 @@ impl RdmaSocketPool {
             })
     }
 
-    /// Creates a QueuePair along with its CompChannel and CompletionQueue.
+    /// Poll thread tunables derived from the pool configuration.
+    fn poller_config(&self) -> PollerConfig {
+        PollerConfig {
+            cq_len: self.config.device_cq_len,
+            spin_us: self.config.poll_spin_us,
+        }
+    }
+
+    /// Creates a QueuePair attached to the device's shared completion queue.
     fn create_queue_pair(
         &self,
         device: &RdmaDevice,
         config: &RdmaConnectionConfig,
-    ) -> Result<(QueuePair, Arc<CompChannel>, Arc<CompletionQueue>)> {
-        let rdma = device;
-        let ctx = rdma.context();
-        let pd = rdma.pd();
-
-        let comp_channel = CompChannel::create(ctx)
-            .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
-        comp_channel
-            .set_nonblock()
-            .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
-
-        let cq = CompletionQueue::create(ctx, config.cq_len as _, Some(&comp_channel))
-            .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
+        poller: &super::poller::DevicePoller,
+    ) -> Result<QueuePair> {
+        let pd = device.pd();
+        let cq = poller.cq();
 
         let mut init_attr = ibv_qp_init_attr {
             qp_type: ibv_qp_type::IBV_QPT_RC,
@@ -249,17 +272,96 @@ impl RdmaSocketPool {
             ..Default::default()
         };
 
-        let queue_pair = QueuePair::create(pd, &cq, &cq, &mut init_attr, device.index())
+        let mut queue_pair = QueuePair::create(pd, cq, cq, &mut init_attr, device.index())
             .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
+        queue_pair
+            .set_send_signal_interval(self.config.send_signal_interval, config.qp.max_send_wr);
 
-        Ok((queue_pair, comp_channel, cq))
+        Ok(queue_pair)
+    }
+
+    /// Wraps a connected QueuePair into an `RdmaSocket`, pre-posts receive
+    /// buffers and registers the connection with the device poll thread.
+    fn register_socket(
+        &self,
+        queue_pair: QueuePair,
+        state: &Arc<State>,
+        poller: &super::poller::DevicePoller,
+        config: &RdmaConnectionConfig,
+    ) -> Result<Arc<RdmaSocket>> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<SendMsg>(1024);
+        let socket = Arc::new(RdmaSocket::new(
+            queue_pair,
+            self.buffer_pool.clone(),
+            tx,
+            poller.waker(),
+            config.max_msg_size as usize,
+            // In-flight messages are bounded by the peer's receive ring;
+            // half the (negotiated) ring keeps ample headroom for ACK
+            // latency before the receiver could be overrun.
+            config.recv_queue_len / 2,
+        ));
+
+        // Pre-post receive buffers *before* the remote can send: the
+        // registration command is processed asynchronously by the poll
+        // thread, but the recv ring must be ready as soon as the handshake
+        // response reaches the peer.
+        for _ in 0..config.recv_queue_len {
+            let buf = self.buffer_pool.allocate(config.max_msg_size as usize)?;
+            socket
+                .queue_pair
+                .recv(buf)
+                .map_err(|e| Error::new(ErrorKind::RdmaRecvFailed, e.to_string()))?;
+        }
+
+        let qp_depth = (config.qp.max_send_wr + config.qp.max_recv_wr).saturating_mul(2);
+        poller.register(
+            RegisterConn {
+                socket: socket.clone(),
+                state: state.clone(),
+                pending_receiver: rx,
+                recv_submitted: u64::from(config.recv_queue_len),
+                recv_buf_size: config.max_msg_size as usize,
+                // Local-only send-side toggle; receivers always understand
+                // aggregated frames.
+                msg_aggregation: self.config.msg_aggregation,
+                supervisor_guard: self.task_supervisor.start_async_task(),
+            },
+            qp_depth,
+        )?;
+
+        // Mark the socket as failed when the pool shuts down so the poll
+        // thread tears the connection down.
+        let socket_clone = socket.clone();
+        let task_supervisor = self.task_supervisor.start_async_task();
+        tokio::spawn(async move {
+            task_supervisor.stopped().await;
+            socket_clone.set_error();
+        });
+
+        Ok(socket)
     }
 
     async fn handshake(&self, addr: &SocketAddr, state: &Arc<State>) -> Result<Socket> {
-        if let Some(socket) = self.socket_map.read().await.get(addr).cloned() {
-            return Ok(socket.into());
+        // Re-check under the connect lock: another task may have connected,
+        // or every stripe may have failed and must be replaced.
+        {
+            let mut socket_map = self.socket_map.write().await;
+            if let Some(stripes) = socket_map.get(addr) {
+                if let Some(socket) = self.pick_stripe(stripes) {
+                    return Ok(socket);
+                }
+                // All stripes are dead: drop them and reconnect. The poll
+                // thread reclaims the connections independently.
+                tracing::info!("all RDMA stripes to {addr} failed, reconnecting");
+                socket_map.remove(addr);
+            }
         }
 
+        // Establish `connections_per_peer` stripes towards this peer;
+        // requests are spread round-robin across them (and, with poll
+        // thread shards, across cores). All stripes share one device/GID
+        // selection: verified connectivity matters more than NIC spreading.
         let acquire_ctx = Context::create_with_state_and_addr(state, addr);
         let remote_info = self.fetch_remote_device_list(addr, &acquire_ctx).await?;
         let selection = match self.match_remote_device(&remote_info) {
@@ -270,6 +372,41 @@ impl RdmaSocketPool {
             }
         };
 
+        let stripe_count = self.config.connections_per_peer.max(1);
+        let mut stripes = Vec::with_capacity(stripe_count as usize);
+        for _ in 0..stripe_count {
+            match self
+                .connect_stripe(addr, state, &acquire_ctx, &selection)
+                .await
+            {
+                Ok(stripe) => stripes.push(stripe),
+                Err(err) => {
+                    // Don't leak the stripes established so far: mark them
+                    // failed so the poll thread tears them down.
+                    for stripe in &stripes {
+                        stripe.set_error();
+                    }
+                    return Err(err);
+                }
+            }
+        }
+
+        let socket = self
+            .pick_stripe(&stripes)
+            .expect("stripe count is at least 1");
+        self.socket_map.write().await.insert(*addr, stripes);
+        Ok(socket)
+    }
+
+    /// Establishes one RDMA connection (stripe) towards `addr` using the
+    /// given device/GID selection.
+    async fn connect_stripe(
+        &self,
+        addr: &SocketAddr,
+        state: &Arc<State>,
+        acquire_ctx: &Context,
+        selection: &DeviceMatch,
+    ) -> Result<Arc<RdmaSocket>> {
         let device = self
             .devices
             .rdma_devices()
@@ -281,7 +418,12 @@ impl RdmaSocketPool {
                 )
             })?;
         let connection_config = self.negotiate_connection_config(device, &selection.remote_device);
-        let (queue_pair, comp_channel, cq) = self.create_queue_pair(device, &connection_config)?;
+        let poller = self.pollers.get_or_start(
+            device,
+            self.poller_config(),
+            self.config.poll_threads_per_device,
+        )?;
+        let queue_pair = self.create_queue_pair(device, &connection_config, &poller)?;
         let local_endpoint = self.build_endpoint(
             &queue_pair,
             device,
@@ -295,7 +437,7 @@ impl RdmaSocketPool {
             config: connection_config,
         };
         let remote_endpoint =
-            match Box::pin(self.acquire_client.connect(&acquire_ctx, &connect_request)).await {
+            match Box::pin(self.acquire_client.connect(acquire_ctx, &connect_request)).await {
                 Ok(endpoint) => endpoint,
                 Err(err) => {
                     self.invalidate_device_list_cache(addr).await;
@@ -309,21 +451,7 @@ impl RdmaSocketPool {
             self.config.pkey_index,
         )?;
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<SendMsg>(1024);
-        let socket = RdmaSocket::new(queue_pair, self.buffer_pool.clone(), tx);
-        let socket = Arc::new(socket);
-        self.spawn_event_loop(
-            socket.clone(),
-            state.clone(),
-            comp_channel,
-            cq,
-            rx,
-            connection_config.recv_queue_len,
-        )?;
-        {
-            let mut socket_map = self.socket_map.write().await;
-            socket_map.insert(*addr, socket.clone());
-        }
+        let socket = self.register_socket(queue_pair, state, &poller, &connection_config)?;
         let local_info = device.info();
         tracing::info!(
             local_device = %local_info.name,
@@ -332,9 +460,11 @@ impl RdmaSocketPool {
             remote_device = %selection.remote.device_name,
             remote_port = selection.remote.port_num,
             remote_gid_index = selection.remote.gid_index,
+            local_qp = socket.queue_pair.qp_num(),
+            remote_qp = remote_endpoint.qp_num,
             "acquired RDMA socket"
         );
-        Ok(socket.into())
+        Ok(socket)
     }
 
     async fn fetch_remote_device_list(&self, addr: &SocketAddr, ctx: &Context) -> Result<RdmaInfo> {
@@ -552,6 +682,7 @@ impl RdmaSocketPool {
             },
             cq_len: local.cq_len.min(remote.cq_len),
             recv_queue_len: local.recv_queue_len.min(remote.recv_queue_len),
+            max_msg_size: local.max_msg_size.min(remote.max_msg_size),
         }
     }
 
@@ -571,6 +702,7 @@ impl RdmaSocketPool {
             },
             cq_len: requested.cq_len.min(local.cq_len),
             recv_queue_len: requested.recv_queue_len.min(local.recv_queue_len),
+            max_msg_size: requested.max_msg_size.min(local.max_msg_size),
         }
     }
 
@@ -602,6 +734,9 @@ impl RdmaSocketPool {
             },
             cq_len: self.config.cq_len.min(info.device_attr.max_cqe as u32),
             recv_queue_len: self.config.recv_queue_len,
+            // Enforce a small floor so a tiny misconfiguration cannot break
+            // the RPC control plane.
+            max_msg_size: self.config.max_msg_size.max(16 * 1024),
         }
     }
 
@@ -645,7 +780,23 @@ impl RdmaSocketPool {
             gid: gid.unwrap_or_default(),
             link_layer: port.port_attr.link_layer,
             active_mtu: port.port_attr.active_mtu,
+            psn: Self::random_psn(qp.qp_num()),
         })
+    }
+
+    /// Generates a pseudo-random 24-bit initial packet sequence number.
+    ///
+    /// Uniqueness across QP incarnations is what matters: drivers recycle
+    /// qp numbers, and a fresh QP reusing the (qp_num, GID) pair of a
+    /// recently destroyed one with a predictable PSN can silently blackhole
+    /// against stale peer state.
+    fn random_psn(qp_num: u32) -> u32 {
+        use std::hash::BuildHasher as _;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        (RandomState::default().hash_one((qp_num, nanos)) as u32) & 0xFF_FFFF
     }
 
     fn find_port(info: &DeviceInfo, port_num: u8) -> Result<&Port> {
@@ -687,44 +838,14 @@ impl RdmaSocketPool {
             remote.qp_num,
             remote.gid,
             remote.lid,
+            local.psn,
+            remote.psn,
         )
         .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))
     }
 
     fn min_mtu(a: ibv_mtu, b: ibv_mtu) -> ibv_mtu {
         if (a as u32) <= (b as u32) { a } else { b }
-    }
-
-    /// Starts the event loop for handling RDMA events on a socket.
-    pub fn spawn_event_loop(
-        &self,
-        socket: Arc<RdmaSocket>,
-        state: Arc<State>,
-        comp_channel: Arc<CompChannel>,
-        cq: Arc<CompletionQueue>,
-        pending_receiver: tokio::sync::mpsc::Receiver<SendMsg>,
-        recv_queue_len: u32,
-    ) -> Result<()> {
-        let socket_clone = socket.clone();
-        let mut event_loop = EventLoop::new(socket, state, comp_channel, cq, pending_receiver);
-        event_loop.submit_recv_tasks(recv_queue_len as usize)?;
-
-        let task_supervisor = self.task_supervisor.start_async_task();
-        tokio::spawn(async move {
-            task_supervisor.stopped().await;
-            socket_clone.set_error();
-        });
-
-        let task_supervisor = self.task_supervisor.start_async_task();
-        tokio::spawn(async move {
-            match event_loop.run().await {
-                Ok(()) => tracing::info!("rdma socket event loop stopped"),
-                Err(e) => tracing::error!("rdma socket event loop error: {}", e),
-            }
-            drop(task_supervisor);
-        });
-
-        Ok(())
     }
 }
 

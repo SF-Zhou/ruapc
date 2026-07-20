@@ -23,6 +23,13 @@ pub struct Endpoint {
     pub link_layer: LinkLayer,
     /// Active MTU for the selected port.
     pub active_mtu: ibv_mtu,
+    /// Initial packet sequence number this endpoint will use on its send
+    /// queue (the peer programs it as `rq_psn`).
+    ///
+    /// Randomized per QP: qp numbers are recycled by the driver, and a new
+    /// QP reusing the (qp_num, GID) pair of a recently destroyed one with a
+    /// predictable PSN can silently blackhole against stale peer state.
+    pub psn: u32,
 }
 
 /// Server-side RDMA device/port/GID selected by the client.
@@ -45,6 +52,10 @@ pub struct RdmaConnectionConfig {
     pub cq_len: u32,
     /// Number of receive buffers pre-posted by this endpoint.
     pub recv_queue_len: u32,
+    /// Maximum serialized message size accepted by this endpoint; the
+    /// receive buffers are sized accordingly. Negotiated as the minimum of
+    /// both sides.
+    pub max_msg_size: u32,
 }
 
 /// RDMA connection request sent after the client has selected a server port.
