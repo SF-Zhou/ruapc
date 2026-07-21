@@ -21,9 +21,9 @@ use super::{
     RdmaDevice, RdmaDeviceRefresher, RdmaInfo, RdmaService, RdmaSocket, RegisterConn,
 };
 use crate::{
-    BufferPool, Client, Context, Devices, Error, ErrorKind, RdmaQueuePairConfig,
+    Buffer, BufferPool, Client, Context, Devices, Error, ErrorKind, RdmaQueuePairConfig,
     RdmaSocketPoolConfig, Result, Socket, SocketPoolConfig, SocketPoolTrait, SocketType, State,
-    TaskSupervisor, rdma::poller::SendMsg,
+    TaskSupervisor,
 };
 
 /// A pool managing RDMA sockets and their associated resources.
@@ -71,6 +71,10 @@ pub struct RdmaSocketPool {
     next_device: AtomicUsize,
     /// Counter for round-robin stripe selection in `acquire`.
     next_stripe: AtomicUsize,
+    /// Buffer pool bytes pinned by the receive rings of live connections.
+    ring_bytes: Arc<AtomicUsize>,
+    /// Ensures the pool-undersized warning fires at most once.
+    pool_capacity_warned: std::sync::atomic::AtomicBool,
 }
 
 impl SocketPoolTrait for RdmaSocketPool {
@@ -213,6 +217,8 @@ impl RdmaSocketPool {
             config,
             next_device: AtomicUsize::new(0),
             next_stripe: AtomicUsize::new(0),
+            ring_bytes: Arc::new(AtomicUsize::new(0)),
+            pool_capacity_warned: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -247,6 +253,7 @@ impl RdmaSocketPool {
         PollerConfig {
             cq_len: self.config.device_cq_len,
             spin_us: self.config.poll_spin_us,
+            dispatch_workers: self.config.dispatch_workers,
         }
     }
 
@@ -284,28 +291,65 @@ impl RdmaSocketPool {
     /// buffers and registers the connection with the device poll thread.
     fn register_socket(
         &self,
-        queue_pair: QueuePair,
+        mut queue_pair: QueuePair,
         state: &Arc<State>,
         poller: &super::poller::DevicePoller,
         config: &RdmaConnectionConfig,
     ) -> Result<Arc<RdmaSocket>> {
-        let (tx, rx) = tokio::sync::mpsc::channel::<SendMsg>(1024);
+        // Reserve the poller slot first: its tag must be stamped into the
+        // QP before any work request is posted, since completions map back
+        // to the connection through the tag in their `wr_id`.
+        let qp_depth = (config.qp.max_send_wr + config.qp.max_recv_wr).saturating_mul(2);
+        let reservation = poller.reserve(qp_depth)?;
+        queue_pair.set_wr_tag(reservation.tag());
+
+        // Account the registered memory this connection's receive ring
+        // pins in the shared buffer pool, and warn when the pool is
+        // undersized for the connection count (before the ring allocation
+        // below starts failing under load). Steady-state traffic needs a
+        // multiple of the ring size: zero-copy dispatch holds ring-sized
+        // chunks for in-flight messages (each triggering a fresh repost
+        // allocation), and send serialization draws from the same pool —
+        // so rings exceeding a quarter of the pool are a reliable
+        // exhaustion predictor.
+        let ring_bytes = config.recv_queue_len as usize * config.max_msg_size as usize;
+        let (ring_reservation, ring_total) =
+            super::poller::RingReservation::add(&self.ring_bytes, ring_bytes);
+        let pool_capacity = self.buffer_pool.max_memory();
+        if ring_total.saturating_mul(4) >= pool_capacity
+            && !self.pool_capacity_warned.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                "RDMA buffer pool likely undersized: receive rings pin {ring_total}B of the \
+                 {pool_capacity}B pool (each connection pins recv_queue_len ({}) x \
+                 max_msg_size ({}) = {ring_bytes}B, and in-flight messages typically need a \
+                 multiple of that); raise SocketPoolConfig::buffer_pool_memory to >= 4x the \
+                 ring total, or lower rdma.recv_queue_len / rdma.max_msg_size / \
+                 rdma.connections_per_peer",
+                config.recv_queue_len,
+                config.max_msg_size,
+            );
+        }
+
+        // In-flight data WRs are bounded by the peer's receive ring; half
+        // the (negotiated) ring keeps ample headroom for ACK latency (and
+        // in-flight standalone ACKs) before the receiver could be overrun.
+        let send_window = (config.recv_queue_len / 2).max(1);
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Buffer>(1024);
         let socket = Arc::new(RdmaSocket::new(
             queue_pair,
             self.buffer_pool.clone(),
             tx,
             poller.waker(),
             config.max_msg_size as usize,
-            // In-flight messages are bounded by the peer's receive ring;
-            // half the (negotiated) ring keeps ample headroom for ACK
-            // latency before the receiver could be overrun.
-            config.recv_queue_len / 2,
+            send_window,
         ));
 
         // Pre-post receive buffers *before* the remote can send: the
-        // registration command is processed asynchronously by the poll
-        // thread, but the recv ring must be ready as soon as the handshake
-        // response reaches the peer.
+        // registration is picked up asynchronously by the poll thread, but
+        // the recv ring must be ready as soon as the handshake response
+        // reaches the peer.
         for _ in 0..config.recv_queue_len {
             let buf = self.buffer_pool.allocate(config.max_msg_size as usize)?;
             socket
@@ -314,20 +358,21 @@ impl RdmaSocketPool {
                 .map_err(|e| Error::new(ErrorKind::RdmaRecvFailed, e.to_string()))?;
         }
 
-        let qp_depth = (config.qp.max_send_wr + config.qp.max_recv_wr).saturating_mul(2);
         poller.register(
+            reservation,
             RegisterConn {
                 socket: socket.clone(),
                 state: state.clone(),
                 pending_receiver: rx,
                 recv_submitted: u64::from(config.recv_queue_len),
                 recv_buf_size: config.max_msg_size as usize,
-                // Local-only send-side toggle; receivers always understand
-                // aggregated frames.
+                send_window,
+                // Local-only send-side toggle; receivers walk the same
+                // frame loop either way.
                 msg_aggregation: self.config.msg_aggregation,
                 supervisor_guard: self.task_supervisor.start_async_task(),
+                ring_reservation,
             },
-            qp_depth,
         )?;
 
         // Mark the socket as failed when the pool shuts down so the poll
@@ -676,8 +721,12 @@ impl RdmaSocketPool {
             qp: RdmaQueuePairConfig {
                 max_send_wr: local.qp.max_send_wr.min(remote.qp.max_recv_wr),
                 max_recv_wr: local.qp.max_recv_wr.min(remote.qp.max_send_wr),
-                max_send_sge: local.qp.max_send_sge.min(remote.qp.max_recv_sge),
-                max_recv_sge: local.qp.max_recv_sge.min(remote.qp.max_send_sge),
+                // Scatter/gather lists are purely local WQE properties: a
+                // gather-list SEND arrives as one contiguous message no
+                // matter how many SGEs composed it, so neither side's SGE
+                // capability constrains the other.
+                max_send_sge: local.qp.max_send_sge,
+                max_recv_sge: local.qp.max_recv_sge,
                 max_inline_data: local.qp.max_inline_data.min(remote.qp.max_inline_data),
             },
             cq_len: local.cq_len.min(remote.cq_len),
@@ -696,8 +745,11 @@ impl RdmaSocketPool {
             qp: RdmaQueuePairConfig {
                 max_send_wr: requested.qp.max_send_wr.min(local.qp.max_send_wr),
                 max_recv_wr: requested.qp.max_recv_wr.min(local.qp.max_recv_wr),
-                max_send_sge: requested.qp.max_send_sge.min(local.qp.max_send_sge),
-                max_recv_sge: requested.qp.max_recv_sge.min(local.qp.max_recv_sge),
+                // SGE lists are local WQE properties (see
+                // `negotiate_connection_config`): use our own capabilities
+                // regardless of what the initiator requested for itself.
+                max_send_sge: local.qp.max_send_sge,
+                max_recv_sge: local.qp.max_recv_sge,
                 max_inline_data: requested.qp.max_inline_data.min(local.qp.max_inline_data),
             },
             cq_len: requested.cq_len.min(local.cq_len),

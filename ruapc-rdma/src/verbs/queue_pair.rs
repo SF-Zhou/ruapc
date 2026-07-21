@@ -14,9 +14,38 @@ use crate::{
     ibv_qp_attr_mask, ibv_qp_state, ibv_wc,
 };
 
+/// Maximum gather-list length accepted by [`QueuePair::send_gather`];
+/// bounds its stack-allocated SGE array.
+pub const MAX_GATHER_SGE: usize = 32;
+
+/// Buffers owned by one in-flight work request: receives, reads and plain
+/// sends hold one buffer; gather-list sends hold several.
+#[derive(Debug)]
+pub enum WrBuffers {
+    One(Buffer),
+    Many(Box<[Buffer]>),
+}
+
+impl WrBuffers {
+    /// Returns the buffer of a single-buffer work request; `None` for a
+    /// gather list.
+    pub fn into_single(self) -> Option<Buffer> {
+        match self {
+            Self::One(buffer) => Some(buffer),
+            Self::Many(_) => None,
+        }
+    }
+}
+
+impl From<Buffer> for WrBuffers {
+    fn from(buffer: Buffer) -> Self {
+        Self::One(buffer)
+    }
+}
+
 pub struct Completion {
     pub wc: ibv_wc,
-    pub buffer: Option<Buffer>,
+    pub buffer: Option<WrBuffers>,
 }
 
 pub struct QueuePair {
@@ -38,6 +67,14 @@ pub struct QueuePair {
     ///
     /// [`send`]: Self::send
     send_signal_interval: u64,
+    /// Opaque connection tag stamped into every [`WRID`] this QP posts, so
+    /// completion consumers can map a `wr_id` back to the owning
+    /// connection without a `qp_num` lookup. Must be set (via
+    /// [`set_wr_tag`](Self::set_wr_tag)) before any work request is posted.
+    wr_tag: u32,
+    /// Negotiated gather-list capability (`init_attr.cap.max_send_sge`
+    /// after creation).
+    max_send_sge: usize,
     /// Serializes send-queue posts so that SQ ids are allocated in post
     /// order.
     ///
@@ -74,10 +111,22 @@ impl QueuePair {
             recv_cq: Arc::clone(recv_cq),
             send_wrs: WrSlots::new(init_attr.cap.max_send_wr),
             recv_wrs: WrSlots::new(init_attr.cap.max_recv_wr),
+            max_send_sge: init_attr.cap.max_send_sge as usize,
             send_signal_interval: 1,
+            wr_tag: 0,
             sq_post_lock: Mutex::new(()),
             device_index,
         })
+    }
+
+    /// Sets the connection tag embedded in every posted `wr_id`.
+    ///
+    /// Must be called before any work request is posted: completions of
+    /// work requests posted with a different tag would be attributed to
+    /// the wrong (or no) connection.
+    pub fn set_wr_tag(&mut self, tag: u32) {
+        assert!(tag <= WRID::TAG_MAX, "wr tag too large");
+        self.wr_tag = tag;
     }
 
     /// Sets the selective signaling interval for data sends.
@@ -150,8 +199,8 @@ impl QueuePair {
         } else {
             self.data_send_flags(id, flags)
         };
-        let wr_id = WRID::send_data(id);
-        self.send_wrs.insert(id, buffer);
+        let wr_id = WRID::send_data(self.wr_tag, id);
+        self.send_wrs.insert(id, buffer.into());
         self.post_send_verb(
             wr_id,
             addr,
@@ -167,6 +216,78 @@ impl QueuePair {
         Ok(id)
     }
 
+    /// Longest gather list this QP can post (negotiated `max_send_sge`,
+    /// bounded by [`MAX_GATHER_SGE`]).
+    pub fn gather_limit(&self) -> usize {
+        self.max_send_sge.min(MAX_GATHER_SGE)
+    }
+
+    /// Posts one data send gathering several framed buffers into a single
+    /// wire message (zero-copy aggregation) and returns its send-queue id.
+    ///
+    /// The receiver sees the plain concatenation of the buffers, exactly
+    /// as if they had been copied into one; the gather list is purely a
+    /// local property of the send WQE. With `imm` the send carries the
+    /// value as immediate data (piggybacked ACK) and is posted as an
+    /// immediate work request.
+    ///
+    /// Always posted signaled, bypassing selective signaling: gather
+    /// aggregates are flushed from backlogs and may be the last WR for a
+    /// while, so their completion (and the buffers it releases) must not
+    /// wait for an unrelated signaled send.
+    pub fn send_gather(&self, buffers: Box<[Buffer]>, imm: Option<u32>) -> Result<u64> {
+        if buffers.is_empty() || buffers.len() > self.gather_limit() {
+            return Err(Error::new(
+                ErrorKind::IBPostSendFail,
+                format!(
+                    "invalid gather list length {} (limit {})",
+                    buffers.len(),
+                    self.gather_limit()
+                ),
+            ));
+        }
+        let mut sges = [crate::ibv_sge::default(); MAX_GATHER_SGE];
+        for (sge, buffer) in sges.iter_mut().zip(buffers.iter()) {
+            *sge = crate::ibv_sge {
+                addr: buffer.as_ptr() as u64,
+                length: buffer.len() as u32,
+                lkey: self.lkey(buffer)?,
+            };
+        }
+        let num_sge = buffers.len() as c_int;
+
+        let _guard = self.sq_post_lock.lock().unwrap();
+        let id = self.send_wrs.alloc_id();
+        let (wr_id, opcode, imm_data) = match imm {
+            Some(imm) => (
+                WRID::send_imm(self.wr_tag, id),
+                crate::ibv_wr_opcode::IBV_WR_SEND_WITH_IMM,
+                imm.to_be(),
+            ),
+            None => (
+                WRID::send_data(self.wr_tag, id),
+                crate::ibv_wr_opcode::IBV_WR_SEND,
+                0,
+            ),
+        };
+        self.send_wrs.insert(id, WrBuffers::Many(buffers));
+        let mut wr = crate::ibv_send_wr {
+            wr_id,
+            sg_list: sges.as_mut_ptr(),
+            num_sge,
+            opcode,
+            send_flags: crate::ibv_send_flags::IBV_SEND_SIGNALED.0,
+            __bindgen_anon_1: crate::ibv_send_wr__bindgen_ty_1 { imm_data },
+            ..Default::default()
+        };
+        let result = unsafe { self.post_send(&mut wr) };
+        if let Err((_, err)) = result {
+            self.send_wrs.take(id);
+            return Err(err);
+        }
+        Ok(id)
+    }
+
     /// Posts a send with immediate data and returns its send-queue id.
     pub fn send_imm(&self, buffer: Buffer, imm: u32, flags: crate::ibv_send_flags) -> Result<u64> {
         let addr = buffer.as_ptr() as u64;
@@ -174,8 +295,8 @@ impl QueuePair {
         let lkey = self.lkey(&buffer)?;
         let _guard = self.sq_post_lock.lock().unwrap();
         let id = self.send_wrs.alloc_id();
-        let wr_id = WRID::send_imm(id);
-        self.send_wrs.insert(id, buffer);
+        let wr_id = WRID::send_imm(self.wr_tag, id);
+        self.send_wrs.insert(id, buffer.into());
         let mut sge = crate::ibv_sge {
             addr,
             length: len,
@@ -205,7 +326,7 @@ impl QueuePair {
         // buffer; the slot stays empty and `take` will return `None`.
         let _guard = self.sq_post_lock.lock().unwrap();
         let id = self.send_wrs.alloc_id();
-        let wr_id = WRID::send_imm(id);
+        let wr_id = WRID::send_imm(self.wr_tag, id);
         let mut wr = crate::ibv_send_wr {
             wr_id,
             sg_list: ptr::null_mut(),
@@ -236,8 +357,8 @@ impl QueuePair {
         let lkey = self.lkey(&buffer)?;
         let _guard = self.sq_post_lock.lock().unwrap();
         let id = self.send_wrs.alloc_id();
-        let wr_id = WRID::read(id);
-        self.send_wrs.insert(id, buffer);
+        let wr_id = WRID::read(self.wr_tag, id);
+        self.send_wrs.insert(id, buffer.into());
         self.post_send_verb(
             wr_id,
             addr,
@@ -290,11 +411,11 @@ impl QueuePair {
 
     pub fn recv(&self, buffer: Buffer) -> Result<()> {
         let id = self.recv_wrs.alloc_id();
-        let wr_id = WRID::recv(id);
+        let wr_id = WRID::recv(self.wr_tag, id);
         let addr = buffer.as_ptr() as u64;
         let len = buffer.capacity() as u32;
         let lkey = self.lkey(&buffer)?;
-        self.recv_wrs.insert(id, buffer);
+        self.recv_wrs.insert(id, buffer.into());
         let mut sge = crate::ibv_sge {
             addr,
             length: len,
@@ -333,21 +454,21 @@ impl QueuePair {
         completions
     }
 
-    pub fn take_buffer(&self, wr_id: &WRID) -> Option<Buffer> {
+    pub fn take_buffer(&self, wr_id: &WRID) -> Option<WrBuffers> {
         match wr_id.get_type() {
             WRType::Recv => self.recv_wrs.take(wr_id.get_id()),
             WRType::SendData | WRType::SendImm | WRType::Read => self.send_wrs.take(wr_id.get_id()),
         }
     }
 
-    /// Takes the buffer of a send-queue work request by raw SQ id.
+    /// Takes the buffer(s) of a send-queue work request by raw SQ id.
     ///
     /// Used by the completion handler to reclaim buffers of *unsignaled*
     /// data sends: when a signaled completion with id `X` is polled, all SQ
     /// work requests with ids below `X` are guaranteed complete (RC SQs
-    /// complete in order). Returns `None` for ids without a stored buffer
+    /// complete in order). Returns `None` for ids without stored buffers
     /// (buffer-less immediate sends or failed posts).
-    pub fn take_send_buffer(&self, id: u64) -> Option<Buffer> {
+    pub fn take_send_buffer(&self, id: u64) -> Option<WrBuffers> {
         self.send_wrs.take(id)
     }
 

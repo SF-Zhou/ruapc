@@ -76,6 +76,16 @@ pub struct Args {
     /// RDMA: poll-thread busy-poll window in microseconds.
     #[arg(long, default_value = "50")]
     pub poll_spin_us: u64,
+
+    /// RDMA: number of dispatch worker tasks shared by all poll threads.
+    #[arg(long, default_value = "32")]
+    pub dispatch_workers: u32,
+
+    /// RDMA: receive ring depth per connection (negotiated to the minimum
+    /// of both sides); the send window is half of it. Small values force
+    /// aggregation under load; raise for large-message pipelines.
+    #[arg(long, default_value = "8")]
+    pub recv_queue_len: u32,
 }
 
 fn socket_pool_config(args: &Args) -> SocketPoolConfig {
@@ -91,6 +101,8 @@ fn socket_pool_config(args: &Args) -> SocketPoolConfig {
         config.rdma.connections_per_peer = args.conns_per_peer;
         config.rdma.device_filter = args.rdma_devices.clone();
         config.rdma.poll_spin_us = args.poll_spin_us;
+        config.rdma.dispatch_workers = args.dispatch_workers;
+        config.rdma.recv_queue_len = args.recv_queue_len;
     }
     config
 }

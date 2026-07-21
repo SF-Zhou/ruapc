@@ -24,19 +24,19 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use ruapc_bufpool::Buffer;
+use super::queue_pair::WrBuffers;
 
 /// Slot is free and may be claimed by a poster.
 const EMPTY: u64 = 0;
 /// Slot is being written to or drained; transient state.
 const WRITING: u64 = 1;
-/// Occupied slots store `id + TAG_BASE`. IDs are bounded to 62 bits by
+/// Occupied slots store `id + TAG_BASE`. IDs are bounded to 40 bits by
 /// [`crate::WRID`], so this never collides with `EMPTY`/`WRITING`.
 const TAG_BASE: u64 = 2;
 
 struct Slot {
     tag: AtomicU64,
-    buffer: UnsafeCell<Option<Buffer>>,
+    buffer: UnsafeCell<Option<WrBuffers>>,
 }
 
 /// SAFETY: access to `buffer` is serialized by the `tag` state machine:
@@ -85,7 +85,7 @@ impl WrSlots {
     ///
     /// May briefly spin if the slot's previous occupant has been polled from
     /// the CQ but not yet taken by the completion handler.
-    pub fn insert(&self, id: u64, buffer: Buffer) {
+    pub fn insert(&self, id: u64, buffer: WrBuffers) {
         let slot = &self.slots[(id & self.mask) as usize];
         let mut spins = 0u32;
         while slot
@@ -109,7 +109,7 @@ impl WrSlots {
     ///
     /// Returns `None` if no buffer was stored for this ID (e.g. buffer-less
     /// immediate-only sends).
-    pub fn take(&self, id: u64) -> Option<Buffer> {
+    pub fn take(&self, id: u64) -> Option<WrBuffers> {
         let slot = &self.slots[(id & self.mask) as usize];
         let tag = id.wrapping_add(TAG_BASE);
         if slot
@@ -184,7 +184,7 @@ mod tests {
         for _ in 0..64 {
             let id = slots.alloc_id();
             let buf = pool.allocate(1024).unwrap();
-            slots.insert(id, buf);
+            slots.insert(id, buf.into());
             assert!(slots.take(id).is_some());
             // Double take returns None.
             assert!(slots.take(id).is_none());
@@ -206,7 +206,7 @@ mod tests {
         let mut in_flight = std::collections::VecDeque::new();
         for _ in 0..1000 {
             let id = slots.alloc_id();
-            slots.insert(id, pool.allocate(64).unwrap());
+            slots.insert(id, pool.allocate(64).unwrap().into());
             in_flight.push_back(id);
             if in_flight.len() == 2 {
                 let id = in_flight.pop_front().unwrap();
@@ -231,7 +231,7 @@ mod tests {
             posters.push(std::thread::spawn(move || {
                 for _ in 0..10_000 {
                     let id = slots.alloc_id();
-                    slots.insert(id, pool.allocate(64).unwrap());
+                    slots.insert(id, pool.allocate(64).unwrap().into());
                     tx.send(id).unwrap();
                 }
             }));

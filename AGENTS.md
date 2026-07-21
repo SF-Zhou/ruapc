@@ -30,8 +30,9 @@ RuaPC ("Rua! Procedure Call") is a high-performance Rust RPC library supporting 
 
 - **Enum dispatch over `dyn Trait`**: All runtime polymorphism uses enum variants (e.g. `Socket`, `SocketPool`, `HttpSocket`) instead of trait objects. Two reasons: (1) we don't need open-ended extensibility and won't sacrifice performance for it; (2) `async`-compatible `dyn Trait` has high runtime cost and is not mature enough. When adding new transport types or socket variants, add enum variants rather than trait objects.
 
-### Wire Format (TCP/HTTP/2 Stream)
-`[4B magic "RUA!"][4B total_len][4B meta_len][meta bytes][payload bytes]`
+### Wire Format
+- TCP / HTTP-2 stream: `[4B magic "RUA!"][4B total_len][4B meta_len][meta bytes][payload bytes]`
+- RDMA send: a sequence of self-delimiting frames `[4B frame_len][4B meta_len][meta][payload]` (usually one). Window-blocked sends are aggregated by plain frame concatenation; one RDMA send consumes one flow-control credit (= one peer receive buffer) regardless of frame count. The poll thread never parses messages — received buffers are batched per CQ drain and routed (sticky, spilling on pressure) to a fixed pool of dispatch worker tasks (`rdma.dispatch_workers`, default 32), each owning one SPSC queue, that walk and parse the frames; when every worker is saturated the poll thread falls back to a one-shot `tokio::spawn` per batch.
 
 ### Serialization
 - JSON (default) or MessagePack (via `MsgFlags::UseMessagePack`)
