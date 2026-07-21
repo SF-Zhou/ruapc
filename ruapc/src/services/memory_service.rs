@@ -121,7 +121,7 @@ impl MemoryService for () {
         // Get the server's buffer info from msg_meta.
         let buffer_info = ctx.msg_meta.buffer_info.as_ref().ok_or_else(|| {
             crate::Error::new(
-                crate::ErrorKind::InvalidArgument,
+                crate::ErrorKind::MissingBufferInfo,
                 "rdma_pull: missing buffer_info in msg_meta".into(),
             )
         })?;
@@ -138,9 +138,10 @@ impl MemoryService for () {
         local_buf = ctx
             .remote_read_with_options(buffer_info, local_buf, &options)
             .await?;
-        // remote_read_op may set len to the full buffer_info capacity;
-        // truncate to the actual data length specified in the request.
-        local_buf.set_len(req.len as usize);
+        // `buffer_info.len` is the server's logical data length, so the
+        // returned buffer already has len == req.len; truncate defensively
+        // in case a peer advertises more than the requested length.
+        local_buf.set_len((req.len as usize).min(local_buf.len()));
 
         // Store the buffer in the waiter.
         if !ctx.state.waiter.store_write_buffer(req.msgid, local_buf) {

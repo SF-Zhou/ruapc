@@ -23,7 +23,7 @@ A high-performance Rust RPC library that supports multiple transport protocols (
 
 - **Multiple Transport Protocols**: TCP, WebSocket, HTTP/1.1 and HTTP/2 (h2c), RDMA (optional), and a unified protocol that supports all simultaneously
 - **Reverse RPC**: Server can call back into client services over established HTTP/2 or WebSocket connections
-- **Remote Read/Write**: Server-side access to client memory via registered buffer pool ([ruapc-bufpool](ruapc-bufpool/)). `remote_read` lets the server read a client-provided buffer; `remote_write` pushes server data into a client-allocated buffer. Transfers use data-copy over TCP or zero-copy RDMA READ, with runtime UUID validation ensuring buffer lifetime safety
+- **Remote Read/Write**: Server-side access to client memory via registered buffer pool ([ruapc-bufpool](ruapc-bufpool/)). `remote_read` / `remote_read_request` let the server read a client-provided buffer; `ctx.remote_write(buf)` returns a `SentBuffer` witness, then `sent.reply(rsp)` builds the `WithBuffer<T>` return value — the push is observable (measurable latency, retryable errors), and `Buffer::empty` creates a zero-cost no-payload sentinel. Transfers use data-copy over TCP or zero-copy RDMA READ, with runtime request-liveness (msgid) validation ensuring buffer lifetime safety
 - **Multiple Serialization Formats**: JSON (default) and MessagePack support
 - **OpenAPI Integration**: Automatic OpenAPI 3.0 specification generation with JSON Schema support
 - **Built-in Documentation**: RapiDoc integration for interactive API documentation
@@ -137,6 +137,16 @@ curl -s -X POST http://0.0.0.0:8000/MetaService/list_methods | json_pp
 
 # Access interactive API documentation
 open http://0.0.0.0:8000/rapidoc
+```
+
+### Remote Read/Write
+
+```bash
+# Self-contained demo: client uploads a registered buffer (server pulls it
+# via remote_read_request) and downloads a server-pushed buffer (typed
+# Result<WithBuffer<T>> contract). Works over any transport.
+cargo run --bin remote_memory -- --socket-type tcp
+cargo run --bin remote_memory --features rdma -- --socket-type rdma
 ```
 
 ### RDMA Support

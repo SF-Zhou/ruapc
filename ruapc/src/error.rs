@@ -11,6 +11,14 @@ pub enum ErrorKind {
     Timeout,
     /// Invalid argument or parameter provided.
     InvalidArgument,
+    /// Operation requires a connected socket (e.g. `remote_read` /
+    /// `remote_write` called outside a server-side handler context).
+    NotConnected,
+    /// Local buffer capacity is too small for the requested transfer.
+    BufferTooSmall,
+    /// The request carries no `buffer_info` (client did not attach a read
+    /// buffer via `with_read_buffer`).
+    MissingBufferInfo,
     /// Failed to serialize data.
     SerializeFailed,
     /// Failed to deserialize data.
@@ -182,6 +190,83 @@ impl std::fmt::Display for Error {
         }
     }
 }
+
+/// Error from a remote read/write operation.
+///
+/// Remote read/write consume the local [`Buffer`](crate::Buffer) by value;
+/// on failure the buffer is handed back here whenever it survived the
+/// operation, so callers can reuse it (e.g. to retry) instead of losing it
+/// to the pool.
+///
+/// The buffer is `None` only for connection-fatal failures where the buffer
+/// is still referenced by in-flight hardware work (e.g. an RDMA post whose
+/// completion never arrived); in that case it is returned to the pool once
+/// the underlying work request is flushed.
+///
+/// Converting into [`Error`] (e.g. via the `?` operator) drops the buffer
+/// back to the pool.
+pub struct RemoteIoError {
+    /// The underlying error.
+    pub error: Error,
+    buffer: Option<crate::Buffer>,
+}
+
+impl RemoteIoError {
+    /// Creates a new remote I/O error, optionally carrying the local buffer.
+    #[must_use]
+    pub(crate) fn new(error: Error, buffer: Option<crate::Buffer>) -> Self {
+        Self { error, buffer }
+    }
+
+    /// Returns a reference to the recovered local buffer, if any.
+    #[must_use]
+    pub fn buffer(&self) -> Option<&crate::Buffer> {
+        self.buffer.as_ref()
+    }
+
+    /// Takes the recovered local buffer, if any.
+    pub fn take_buffer(&mut self) -> Option<crate::Buffer> {
+        self.buffer.take()
+    }
+
+    /// Decomposes into the underlying error and the recovered buffer.
+    #[must_use]
+    pub fn into_parts(self) -> (Error, Option<crate::Buffer>) {
+        (self.error, self.buffer)
+    }
+}
+
+impl From<RemoteIoError> for Error {
+    fn from(value: RemoteIoError) -> Self {
+        value.error
+    }
+}
+
+impl From<Error> for RemoteIoError {
+    fn from(error: Error) -> Self {
+        Self {
+            error,
+            buffer: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for RemoteIoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteIoError")
+            .field("error", &self.error)
+            .field("buffer_recovered", &self.buffer.is_some())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for RemoteIoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, f)
+    }
+}
+
+impl std::error::Error for RemoteIoError {}
 
 /// Result type alias using [`Error`] as the error type.
 ///

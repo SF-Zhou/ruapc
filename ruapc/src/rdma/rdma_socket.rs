@@ -7,7 +7,7 @@ use tokio::sync::mpsc::Sender;
 
 use super::{RdmaState, SendPermit};
 use crate::{
-    Buffer, BufferPool, Context, Error, RemoteReadOptions, SocketTrait, State,
+    Buffer, BufferPool, Context, Error, RemoteIoError, RemoteReadOptions, SocketTrait, State,
     error::{ErrorKind, Result},
     msg::MsgMeta,
     rdma::poller::{FRAME_HEADER, PollerWaker},
@@ -166,7 +166,10 @@ impl RdmaSocket {
 
     async fn await_completion(
         rx: tokio::sync::oneshot::Receiver<RdmaCompletion>,
-    ) -> Result<Buffer> {
+    ) -> std::result::Result<Buffer, RemoteIoError> {
+        // The buffer is only lost when the completion never surfaces
+        // (channel closed / missing buffer); a failed work completion still
+        // hands it back for reuse.
         let (status, buffer) = rx.await.map_err(|_| {
             Error::new(
                 ErrorKind::RdmaSendFailed,
@@ -180,9 +183,12 @@ impl RdmaSocket {
             )
         })?;
         if status != ibv_wc_status::IBV_WC_SUCCESS {
-            return Err(Error::new(
-                ErrorKind::RdmaSendFailed,
-                format!("RDMA operation failed with status {status:?}"),
+            return Err(RemoteIoError::new(
+                Error::new(
+                    ErrorKind::RdmaSendFailed,
+                    format!("RDMA operation failed with status {status:?}"),
+                ),
+                Some(buf),
             ));
         }
         Ok(buf)
@@ -190,12 +196,31 @@ impl RdmaSocket {
 }
 
 impl RdmaSocket {
-    async fn remote_read_op(&self, mut local: Buffer, remote: &RemoteBufferInfo) -> Result<Buffer> {
+    async fn remote_read_op(
+        &self,
+        mut local: Buffer,
+        remote: &RemoteBufferInfo,
+    ) -> std::result::Result<Buffer, RemoteIoError> {
         let rkey = remote.key.rkey;
-        // The remote buffer info advertises the full registered region
-        // (capacity); read at most what the local buffer can hold. Callers
-        // that need fewer bytes truncate afterwards.
-        local.set_len((remote.len as usize).min(local.capacity()));
+        // `remote.len` is the number of valid data bytes on the peer; read
+        // exactly that many. The returned buffer's logical length is set to
+        // the transferred size.
+        if remote.len as usize > local.capacity() {
+            return Err(RemoteIoError::new(
+                Error::new(
+                    ErrorKind::BufferTooSmall,
+                    format!(
+                        "remote buffer has {} bytes but local buffer capacity is {}",
+                        remote.len,
+                        local.capacity()
+                    ),
+                ),
+                Some(local),
+            ));
+        }
+        local.set_len(remote.len as usize);
+        // On a post failure the buffer is owned by the in-flight WR table
+        // and cannot be recovered here.
         let rx = self.post_rdma_read(local, remote.addr, rkey)?;
         Self::await_completion(rx).await
     }
@@ -251,7 +276,7 @@ impl SocketTrait for RdmaSocket {
         local: Buffer,
         remote: &RemoteBufferInfo,
         options: &RemoteReadOptions,
-    ) -> Result<Buffer> {
+    ) -> std::result::Result<Buffer, RemoteIoError> {
         let local = self.remote_read_op(local, remote).await?;
 
         if options.skip_verify {
@@ -263,18 +288,28 @@ impl SocketTrait for RdmaSocket {
         // and the data read via RDMA could be invalid.
         let msgid = ctx.msg_meta.msgid;
         let client = crate::Client::default();
-        let still_waiting: bool = client.is_message_waiting(ctx, &msgid).await?;
+        let still_waiting: bool = match client.is_message_waiting(ctx, &msgid).await {
+            Ok(w) => w,
+            Err(e) => return Err(RemoteIoError::new(e, Some(local))),
+        };
         if !still_waiting {
-            return Err(Error::new(
-                ErrorKind::Timeout,
-                "RDMA read completed but client request has already timed out".into(),
+            return Err(RemoteIoError::new(
+                Error::new(
+                    ErrorKind::Timeout,
+                    "RDMA read completed but client request has already timed out".into(),
+                ),
+                Some(local),
             ));
         }
 
         Ok(local)
     }
 
-    async fn remote_write(&self, ctx: &Context, local: Buffer) -> Result<Buffer> {
+    async fn remote_write(
+        &self,
+        ctx: &Context,
+        local: Buffer,
+    ) -> std::result::Result<Buffer, RemoteIoError> {
         // Instead of one-sided RDMA WRITE (unsafe for client buffer lifetime),
         // send a reverse RPC to the client with our buffer attached. The client
         // will perform an RDMA READ from our buffer into its own local buffer.
@@ -283,7 +318,9 @@ impl SocketTrait for RdmaSocket {
             len: local.len() as u64,
         };
         let client = crate::Client::default();
-        client.with_read_buffer(&local).rdma_pull(ctx, &req).await?;
-        Ok(local)
+        match client.with_read_buffer(&local).rdma_pull(ctx, &req).await {
+            Ok(()) => Ok(local),
+            Err(e) => Err(RemoteIoError::new(e, Some(local))),
+        }
     }
 }

@@ -12,9 +12,7 @@ use serde::{Deserialize, Serialize};
 // --------------------------------------------------------------------------
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-struct UploadReq {
-    expected_len: usize,
-}
+struct UploadReq {}
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 struct UploadRsp {
@@ -29,19 +27,15 @@ trait UploadService {
 struct UploadServiceImpl;
 
 impl UploadService for UploadServiceImpl {
-    async fn upload(&self, ctx: &Context, req: &UploadReq) -> Result<UploadRsp> {
-        // The server should see buffer_info in the message metadata.
-        let buffer_info = ctx.msg_meta.buffer_info.as_ref().expect(
-            "expected buffer_info in msg_meta — client should have used with_read_buffer()",
-        );
-
-        // Allocate a local buffer and remote_read the client's buffer.
-        let mut local_buf = ctx.state.buffer_pool.allocate(1024 * 1024).unwrap();
-        local_buf = ctx.remote_read(buffer_info, local_buf).await?;
+    async fn upload(&self, ctx: &Context, _req: &UploadReq) -> Result<UploadRsp> {
+        // Allocates a right-sized local buffer and reads exactly the
+        // client's logical data length. Returns MissingBufferInfo if the
+        // client did not attach a buffer.
+        let local_buf = ctx.remote_read_request().await?;
 
         // Return the data read from the client's buffer.
         Ok(UploadRsp {
-            data: local_buf[..req.expected_len].to_vec(),
+            data: local_buf[..].to_vec(),
         })
     }
 }
@@ -95,13 +89,14 @@ async fn test_upload_with_read_buffer_tcp() {
     assert_eq!(rsp, "pong");
 
     // 2. Test with_read_buffer — client sends buffer for server to read.
+    //    set_len marks the logical data length; the server reads exactly
+    //    this many bytes.
     let test_data = b"Hello, WithReadBuffer!";
     let mut buf = ctx.state.buffer_pool.allocate(1024 * 1024).unwrap();
     buf[..test_data.len()].copy_from_slice(test_data);
+    buf.set_len(test_data.len());
 
-    let req = UploadReq {
-        expected_len: test_data.len(),
-    };
+    let req = UploadReq {};
 
     // Use client.with_read_buffer(&buf) to attach the buffer.
     let rsp: UploadRsp = client
@@ -119,10 +114,11 @@ async fn test_upload_with_read_buffer_tcp() {
         .unwrap();
     assert_eq!(rsp2.data, test_data);
 
-    // 4. Verify normal upload (without buffer) — should panic on server
-    //    because buffer_info is None. We expect an error.
+    // 4. Verify upload without an attached buffer fails with a proper
+    //    MissingBufferInfo error (not a server panic / timeout).
     let rsp3 = client.upload(&ctx, &req).await;
-    assert!(rsp3.is_err(), "upload without buffer should fail");
+    let err = rsp3.expect_err("upload without buffer should fail");
+    assert_eq!(err.kind, ErrorKind::MissingBufferInfo);
 
     server.stop();
     server.join().await;
@@ -149,14 +145,13 @@ async fn test_upload_with_read_buffer_websocket() {
     let test_data = b"WebSocket buffer test!";
     let mut buf = ctx.state.buffer_pool.allocate(1024 * 1024).unwrap();
     buf[..test_data.len()].copy_from_slice(test_data);
+    buf.set_len(test_data.len());
 
     let client = Client {
         socket_type: Some(SocketType::WS),
         ..Default::default()
     };
-    let req = UploadReq {
-        expected_len: test_data.len(),
-    };
+    let req = UploadReq {};
 
     let rsp: UploadRsp = client
         .with_read_buffer(&buf)
@@ -190,14 +185,13 @@ async fn test_upload_with_read_buffer_http() {
     let test_data = b"HTTP buffer test!";
     let mut buf = ctx.state.buffer_pool.allocate(1024 * 1024).unwrap();
     buf[..test_data.len()].copy_from_slice(test_data);
+    buf.set_len(test_data.len());
 
     let client = Client {
         socket_type: Some(SocketType::HTTP),
         ..Default::default()
     };
-    let req = UploadReq {
-        expected_len: test_data.len(),
-    };
+    let req = UploadReq {};
 
     let rsp: UploadRsp = client
         .with_read_buffer(&buf)

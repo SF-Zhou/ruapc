@@ -14,7 +14,6 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct ReadReq {
-    expected_len: usize,
     #[serde(default)]
     delay_ms: u64,
 }
@@ -26,7 +25,14 @@ struct ReadRsp {
 
 #[service]
 trait RemoteReadService {
+    /// Reads the client's attached buffer via `remote_read_request` and
+    /// echoes the data back. The transferred size is exactly the client
+    /// buffer's logical length.
     async fn read_buf(&self, ctx: &Context, req: &ReadReq) -> Result<ReadRsp>;
+
+    /// Reads the client's attached buffer into a deliberately small local
+    /// buffer to exercise the `BufferTooSmall` error path.
+    async fn read_into_small_buf(&self, ctx: &Context, req: &ReadReq) -> Result<ReadRsp>;
 }
 
 struct RemoteReadServiceImpl;
@@ -36,16 +42,35 @@ impl RemoteReadService for RemoteReadServiceImpl {
         if req.delay_ms > 0 {
             tokio::time::sleep(Duration::from_millis(req.delay_ms)).await;
         }
-        let buffer_info = ctx
-            .msg_meta
-            .buffer_info
-            .as_ref()
-            .expect("expected buffer_info in msg_meta");
-        let local_buf = ctx.state.buffer_pool.allocate(1024 * 1024).unwrap();
-        let local_buf = ctx.remote_read(buffer_info, local_buf).await?;
+        // Allocates a right-sized buffer and reads exactly the client's
+        // logical data length; the returned buffer's len matches.
+        let local_buf = ctx.remote_read_request().await?;
         Ok(ReadRsp {
-            data: local_buf[..req.expected_len].to_vec(),
+            data: local_buf[..].to_vec(),
         })
+    }
+
+    async fn read_into_small_buf(&self, ctx: &Context, _req: &ReadReq) -> Result<ReadRsp> {
+        // 1 KiB request rounds up to the smallest size class (64 KiB), which
+        // is still smaller than the client's attached data.
+        let local_buf = ctx.state.buffer_pool.allocate(1024).unwrap();
+        match ctx.remote_read(ctx.request_buffer_info()?, local_buf).await {
+            Ok(buf) => Ok(ReadRsp {
+                data: buf[..].to_vec(),
+            }),
+            Err(mut e) => {
+                // The consumed buffer must be recoverable on this failure
+                // path. If it is not, report a different error kind so the
+                // client-side assertion on BufferTooSmall catches it.
+                if e.take_buffer().is_none() {
+                    return Err(Error::new(
+                        ErrorKind::InvalidArgument,
+                        "buffer not recovered from RemoteIoError".into(),
+                    ));
+                }
+                Err(e.into())
+            }
+        }
     }
 }
 
@@ -54,18 +79,23 @@ impl RemoteReadService for RemoteReadServiceImpl {
 // ==========================================================================
 
 struct TestCase {
-    /// Data to fill into the client buffer. If empty, buffer is left zeroed.
+    /// Data to fill into the client buffer.
     data: &'static [u8],
-    /// How many bytes the server should read from the buffer.
-    expected_len: usize,
     /// Server-side delay before performing remote_read (ms).
     delay_ms: u64,
     /// Client timeout duration.
     client_timeout: Duration,
     /// Client socket type.
     socket_type: SocketType,
+    /// Which service method to call.
+    method: Method,
     /// Expected outcome: Ok(data) or Err(error_kind).
     expect: Expected,
+}
+
+enum Method {
+    ReadBuf,
+    ReadIntoSmallBuf,
 }
 
 enum Expected {
@@ -88,10 +118,11 @@ async fn run_test(tc: TestCase) {
     let addr = server.clone().listen(addr).await.unwrap();
     let ctx = Context::create(&config).unwrap().with_addr(addr);
 
+    // Fill the client buffer and set its logical length; the server reads
+    // exactly `data.len()` bytes.
     let mut buf = ctx.state.buffer_pool.allocate(1024 * 1024).unwrap();
-    if !tc.data.is_empty() {
-        buf[..tc.data.len()].copy_from_slice(tc.data);
-    }
+    buf[..tc.data.len()].copy_from_slice(tc.data);
+    buf.set_len(tc.data.len());
 
     let client = Client {
         socket_type: Some(tc.socket_type),
@@ -99,11 +130,14 @@ async fn run_test(tc: TestCase) {
         ..Default::default()
     };
     let req = ReadReq {
-        expected_len: tc.expected_len,
         delay_ms: tc.delay_ms,
     };
 
-    let result: Result<ReadRsp> = client.with_read_buffer(&buf).read_buf(&ctx, &req).await;
+    let c = client.with_read_buffer(&buf);
+    let result: Result<ReadRsp> = match tc.method {
+        Method::ReadBuf => c.read_buf(&ctx, &req).await,
+        Method::ReadIntoSmallBuf => c.read_into_small_buf(&ctx, &req).await,
+    };
 
     match tc.expect {
         Expected::Ok => {
@@ -135,10 +169,10 @@ async fn run_test(tc: TestCase) {
 async fn test_tcp_uuid_validation_success() {
     run_test(TestCase {
         data: b"uuid-check-pass",
-        expected_len: 15,
         delay_ms: 50,
         client_timeout: Duration::from_secs(5),
         socket_type: SocketType::TCP,
+        method: Method::ReadBuf,
         expect: Expected::Ok,
     })
     .await;
@@ -148,26 +182,27 @@ async fn test_tcp_uuid_validation_success() {
 async fn test_tcp_uuid_validation_timeout() {
     run_test(TestCase {
         data: b"uuid-check-fail",
-        expected_len: 15,
         delay_ms: 200,
         client_timeout: Duration::from_millis(100),
         socket_type: SocketType::TCP,
+        method: Method::ReadBuf,
         expect: Expected::Err(ErrorKind::Timeout),
     })
     .await;
 }
 
-/// When expected_len exceeds the buffer capacity, the server handler panics
-/// (slice out of bounds), no response is sent, and the client times out.
+/// The client attaches more data than the server's local buffer can hold:
+/// the server fails fast with `BufferTooSmall` (no data is transferred) and
+/// the error propagates back to the client through the RPC response.
 #[tokio::test]
-async fn test_tcp_remote_read_expected_len_exceeds_buffer() {
+async fn test_tcp_remote_read_buffer_too_small() {
     run_test(TestCase {
-        data: b"",
-        expected_len: 3 * 1024 * 1024, // Exceeds 4 KiB local_buf
+        data: &[0x5a; 128 * 1024],
         delay_ms: 0,
-        client_timeout: Duration::from_millis(500),
+        client_timeout: Duration::from_secs(5),
         socket_type: SocketType::TCP,
-        expect: Expected::Err(ErrorKind::Timeout),
+        method: Method::ReadIntoSmallBuf,
+        expect: Expected::Err(ErrorKind::BufferTooSmall),
     })
     .await;
 }
@@ -177,10 +212,10 @@ async fn test_tcp_remote_read_expected_len_exceeds_buffer() {
 async fn test_rdma_uuid_validation_success() {
     run_test(TestCase {
         data: b"rdma-uuid-pass",
-        expected_len: 14,
         delay_ms: 50,
         client_timeout: Duration::from_secs(5),
         socket_type: SocketType::RDMA,
+        method: Method::ReadBuf,
         expect: Expected::Ok,
     })
     .await;
@@ -191,11 +226,25 @@ async fn test_rdma_uuid_validation_success() {
 async fn test_rdma_uuid_validation_timeout() {
     run_test(TestCase {
         data: b"rdma-uuid-fail",
-        expected_len: 14,
         delay_ms: 200,
         client_timeout: Duration::from_millis(100),
         socket_type: SocketType::RDMA,
+        method: Method::ReadBuf,
         expect: Expected::Err(ErrorKind::Timeout),
+    })
+    .await;
+}
+
+#[cfg(feature = "rdma")]
+#[tokio::test]
+async fn test_rdma_remote_read_buffer_too_small() {
+    run_test(TestCase {
+        data: &[0xa5; 128 * 1024],
+        delay_ms: 0,
+        client_timeout: Duration::from_secs(5),
+        socket_type: SocketType::RDMA,
+        method: Method::ReadIntoSmallBuf,
+        expect: Expected::Err(ErrorKind::BufferTooSmall),
     })
     .await;
 }
