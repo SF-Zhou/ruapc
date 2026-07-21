@@ -25,14 +25,48 @@
 //! - Three parameters: `&self`, `&Context`, and a request reference
 //! - Return type must be `Result<T>` where T is the response type
 //!
+//! ### `Result<WithBuffer<T>, E>` Return Type
+//!
+//! Declaring a method whose return type is `Result<WithBuffer<T>, E>` makes
+//! the buffer transfer part of the method's contract on both sides. The
+//! contract is recognized by the *type system* (trait dispatch inside
+//! `ruapc`), not by this macro, so any type alias (e.g.
+//! `ruapc::ResultWithBuffer<T>` or a user-defined alias fixing a custom
+//! error type) works:
+//!
+//! ```rust,ignore
+//! #[ruapc::service]
+//! pub trait BlobService {
+//!     async fn download(&self, ctx: &Context, req: &DownloadReq) -> Result<WithBuffer<()>>;
+//! }
+//!
+//! // Server handler: `WithBuffer` can only be produced by a completed
+//! // `ctx.remote_write` (via the returned `SentBuffer` witness). The push
+//! // happens inside the handler — observable, impossible to forget. For
+//! // code paths with no payload, `Buffer::empty` costs no memory:
+//! async fn download(&self, ctx: &Context, req: &DownloadReq) -> Result<WithBuffer<()>> {
+//!     let buf = /* fill a pool buffer, set_len, or Buffer::empty(...) */;
+//!     let sent = ctx.remote_write(buf).await?;
+//!     Ok(sent.reply(()))
+//! }
+//!
+//! // Client receives the buffer as part of the same signature:
+//! let (rsp, buffer) = client.download(&ctx, &req).await?.into_parts();
+//! ```
+//!
+//! The response arrives without a pushed buffer → the client-side glue
+//! materializes an empty buffer locally (the server must have used
+//! `Buffer::empty` which causes `remote_write` to short-circuit without
+//! touching the network).
+//!
 //! ### Generated Code
 //!
 //! The macro generates:
 //! 1. A `ruapc_export` method for registering the service with a router
-//! 2. Client trait implementation on `Client` for making normal requests
-//! 3. Client trait implementation on `ClientWithBuffer` for requests with
-//!    attached read/write buffers
-//! 4. Proper error handling and message serialization
+//! 2. Client trait implementations on `Client` and `ClientWithBuffer`, with
+//!    one uniform body per method; plain vs. buffer-carrying calls are
+//!    dispatched by return type through `ruapc`'s call glue traits
+//! 3. Proper error handling and message serialization
 
 use proc_macro::TokenStream;
 use quote::quote;
@@ -89,22 +123,29 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
 
             let req_type = req_type.ty.clone();
             let output = &method.sig.output;
-
-            // Client trait impl: no read_buffer, no write_buffer_slot
-            client_methods.push(quote! {
-                async fn #method_ident(#receiver, ctx: &#krate::Context, req: #req_type) #output {
-                    self.ruapc_request(ctx, req, None, None, #method_name).await
-                }
-            });
-
-            // ClientWithBuffer trait impl: delegates to its ruapc_request
-            client_with_buffer_methods.push(quote! {
-                async fn #method_ident(#receiver, ctx: &#krate::Context, req: #req_type) #output {
-                    self.ruapc_request(ctx, req, #method_name).await
-                }
-            });
-
             send_bounds.push(quote! { Self::#method_ident(..): Send, });
+
+            // One uniform client body for every method. Whether the call
+            // delivers a server-pushed buffer is decided by the *type
+            // system* (see `ruapc::core::contract`), not by this macro:
+            // `CallWithBuffer` applies iff the return type is
+            // `Result<WithBuffer<T>, E>` (through any alias), `CallPlain`
+            // otherwise. No name-based type detection is involved.
+            let client_body = quote! {
+                async fn #method_ident(#receiver, ctx: &#krate::Context, req: #req_type) #output {
+                    use #krate::{CallPlain as _, CallWithBuffer as _};
+                    (&#krate::RpcCall::<#rsp_type>::new())
+                        .ruapc_call(self, ctx, req, #method_name)
+                        .await
+                }
+            };
+            client_methods.push(client_body.clone());
+            client_with_buffer_methods.push(client_body);
+
+            // Server dispatch is uniform as well: `WithBuffer<T>` serializes
+            // transparently as `T`, and the push already happened inside the
+            // handler (the only way to construct a `WithBuffer` is through
+            // a completed `Context::remote_write` + `SentBuffer::reply`).
             invoke_branchs.push(quote! {
                 let this = self.clone();
                 router.add_method::<#req_type, #rsp_type>(#method_name, Box::new(move |mut ctx, payload| {

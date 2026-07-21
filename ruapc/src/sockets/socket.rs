@@ -4,7 +4,7 @@ use ruapc_bufpool::{DeviceIndex, RemoteBufferInfo};
 use serde::Serialize;
 
 use crate::{
-    Buffer, Context, MsgMeta, Result, State,
+    Buffer, Context, MsgMeta, RemoteIoError, Result, State,
     http::HttpSocket,
     services::{MemoryPushReq, MemoryReadReq, MemoryService},
     tcp::TcpSocket,
@@ -58,13 +58,31 @@ pub trait SocketTrait {
         state: &Arc<State>,
     ) -> Result<()>;
 
+    /// Reads `remote.len` bytes from the peer's registered memory into
+    /// `local`. On failure the buffer is handed back inside
+    /// [`RemoteIoError`] whenever it survived the operation.
     async fn remote_read(
         &self,
         ctx: &Context,
         mut local: Buffer,
         remote: &RemoteBufferInfo,
         _options: &RemoteReadOptions,
-    ) -> Result<Buffer> {
+    ) -> std::result::Result<Buffer, RemoteIoError> {
+        // `remote.len` is the number of valid data bytes; refuse early if the
+        // local buffer cannot hold them, before any data is transferred.
+        if remote.len as usize > local.capacity() {
+            return Err(RemoteIoError::new(
+                crate::Error::new(
+                    crate::ErrorKind::BufferTooSmall,
+                    format!(
+                        "remote buffer has {} bytes but local buffer capacity is {}",
+                        remote.len,
+                        local.capacity()
+                    ),
+                ),
+                Some(local),
+            ));
+        }
         // Pass msgid so that tcp_read on the client side verifies
         // the original request is still alive after reading the buffer.
         let req = MemoryReadReq {
@@ -74,30 +92,45 @@ pub trait SocketTrait {
             msgid: ctx.msg_meta.msgid,
         };
         let client = crate::Client::default();
-        let data: Vec<u8> = client.tcp_read(ctx, &req).await?;
-        if data.len() > local.len() {
-            return Err(crate::Error::new(
-                crate::ErrorKind::InvalidArgument,
-                format!(
-                    "remote read returned {} bytes but local buffer is {} bytes",
-                    data.len(),
-                    local.len()
+        let data: Vec<u8> = match client.tcp_read(ctx, &req).await {
+            Ok(data) => data,
+            Err(e) => return Err(RemoteIoError::new(e, Some(local))),
+        };
+        if data.len() > local.capacity() {
+            return Err(RemoteIoError::new(
+                crate::Error::new(
+                    crate::ErrorKind::BufferTooSmall,
+                    format!(
+                        "remote read returned {} bytes but local buffer capacity is {}",
+                        data.len(),
+                        local.capacity()
+                    ),
                 ),
+                Some(local),
             ));
         }
-        local[..data.len()].copy_from_slice(&data);
+        local.set_len(data.len());
+        local[..].copy_from_slice(&data);
         Ok(local)
     }
 
-    async fn remote_write(&self, ctx: &Context, local: Buffer) -> Result<Buffer> {
+    /// Pushes `local`'s data to the client. On failure the buffer is handed
+    /// back inside [`RemoteIoError`].
+    async fn remote_write(
+        &self,
+        ctx: &Context,
+        local: Buffer,
+    ) -> std::result::Result<Buffer, RemoteIoError> {
         // Push data to the client via tcp_push.
         let req = MemoryPushReq {
             msgid: ctx.msg_meta.msgid,
             data: local[..].to_vec(),
         };
         let client = crate::Client::default();
-        client.tcp_push(ctx, &req).await?;
-        Ok(local)
+        match client.tcp_push(ctx, &req).await {
+            Ok(()) => Ok(local),
+            Err(e) => Err(RemoteIoError::new(e, Some(local))),
+        }
     }
 }
 
@@ -136,7 +169,7 @@ impl SocketTrait for Socket {
         local: Buffer,
         remote: &RemoteBufferInfo,
         options: &RemoteReadOptions,
-    ) -> Result<Buffer> {
+    ) -> std::result::Result<Buffer, RemoteIoError> {
         match self {
             Socket::TCP(tcp_socket) => tcp_socket.remote_read(ctx, local, remote, options).await,
             Socket::WS(web_socket) => web_socket.remote_read(ctx, local, remote, options).await,
@@ -146,7 +179,11 @@ impl SocketTrait for Socket {
         }
     }
 
-    async fn remote_write(&self, ctx: &Context, local: Buffer) -> Result<Buffer> {
+    async fn remote_write(
+        &self,
+        ctx: &Context,
+        local: Buffer,
+    ) -> std::result::Result<Buffer, RemoteIoError> {
         match self {
             Socket::TCP(tcp_socket) => tcp_socket.remote_write(ctx, local).await,
             Socket::WS(web_socket) => web_socket.remote_write(ctx, local).await,

@@ -4,14 +4,17 @@
 pub use ruapc_macro::service;
 
 mod error;
-pub use error::{Error, ErrorKind, Result};
+pub use error::{Error, ErrorKind, RemoteIoError, Result};
 
 mod msg;
 pub use msg::{Message, MsgFlags, MsgMeta, Payload};
 
 mod core;
+#[doc(hidden)]
+pub use core::{CallPlain, CallWithBuffer, RawCall, RpcCall};
 pub use core::{
-    Client, ClientWithBuffer, Context, Listener, MethodInfo, Router, Server, SocketEndpoint, State,
+    Client, ClientWithBuffer, Context, Listener, MethodInfo, ResultWithBuffer, Router, SentBuffer,
+    Server, SocketEndpoint, State, WithBuffer,
 };
 
 mod task;

@@ -113,6 +113,31 @@ impl Buffer {
         }
     }
 
+    /// Sentinel level for empty buffers that own no pool memory.
+    const EMPTY_LEVEL: u8 = u8::MAX;
+
+    /// Creates a zero-length buffer that owns no memory.
+    ///
+    /// Unlike a buffer allocated via [`BufferPool::allocate`](crate::BufferPool::allocate),
+    /// this buffer has capacity 0 and no backing memory — it is a pure
+    /// sentinel. Intended for `Context::remote_write` paths that have no
+    /// payload to transfer (the write short-circuits to a no-op).
+    ///
+    /// The returned buffer has `len() == 0`, `capacity() == 0`, and
+    /// `is_empty() == true`. Calling `memory_key()` or
+    /// `remote_buffer_info()` on it is not supported and will error.
+    #[must_use]
+    pub fn empty(pool: &Arc<BufferPool>) -> Self {
+        Self {
+            ptr: NonNull::dangling(),
+            pool: Arc::clone(pool),
+            block: NonNull::dangling(),
+            len: 0,
+            level: Self::EMPTY_LEVEL,
+            index: 0,
+        }
+    }
+
     /// Returns the buddy block containing this buffer.
     pub(crate) const fn block_ptr(&self) -> NonNull<BuddyBlock> {
         self.block
@@ -128,9 +153,12 @@ impl Buffer {
 
     /// Returns the capacity of the buffer in bytes (determined by the
     /// allocation size class): 64 KiB, 256 KiB, 1 MiB, 4 MiB, 16 MiB or
-    /// 64 MiB.
+    /// 64 MiB. Returns 0 for empty buffers created by [`empty`](Self::empty).
     #[must_use]
     pub const fn capacity(&self) -> usize {
+        if self.level == Self::EMPTY_LEVEL {
+            return 0;
+        }
         let level = self.level as usize;
         if level < crate::buddy::NUM_LEVELS {
             crate::buddy::LEVEL_SIZES[level]
@@ -149,7 +177,9 @@ impl Buffer {
     ///
     /// # Panics
     ///
-    /// Panics if `len` exceeds the buffer's capacity.
+    /// Panics if `len` exceeds the buffer's capacity (empty buffers
+    /// created by [`empty`](Self::empty) have capacity 0, so only
+    /// `set_len(0)` is valid).
     pub fn set_len(&mut self, len: usize) {
         assert!(
             len <= self.capacity(),
@@ -216,8 +246,15 @@ impl Buffer {
     ///
     /// # Errors
     ///
-    /// Returns an error if the device index is not registered.
+    /// Returns an error if the device index is not registered, or if this
+    /// is an empty buffer created by [`empty`](Self::empty).
     pub fn memory_key(&self, device_index: &impl AsDeviceIndex) -> Result<MemoryKey> {
+        if self.level == Self::EMPTY_LEVEL {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "memory not registered: empty buffer has no backing memory",
+            ));
+        }
         let idx = device_index.as_device_index();
         unsafe { &*self.block.as_ptr() }
             .registrations
@@ -256,7 +293,10 @@ impl Buffer {
 
     /// Returns the remote buffer info for RDMA-style operations.
     ///
-    /// Note: uses the buffer's capacity (not logical length) for the remote info.
+    /// The advertised `len` is the buffer's logical length (`self.len()`),
+    /// i.e. the number of valid data bytes a remote peer should transfer.
+    /// Callers that fill a buffer partially must call [`set_len`](Self::set_len)
+    /// before exporting it, otherwise the whole allocation is advertised.
     ///
     /// # Errors
     ///
@@ -269,13 +309,16 @@ impl Buffer {
         Ok(RemoteBufferInfo {
             key,
             addr: self.as_ptr() as u64,
-            len: self.capacity() as u64,
+            len: self.len() as u64,
         })
     }
 }
 
 impl Drop for Buffer {
     fn drop(&mut self) {
+        if self.level == Self::EMPTY_LEVEL {
+            return;
+        }
         let level = self.level as usize;
         if level < crate::buddy::NUM_LEVELS {
             self.pool

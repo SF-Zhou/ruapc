@@ -19,6 +19,8 @@ pub struct RemoteBufferInfo {
     pub key: MemoryKey,
     /// The address of the buffer.
     pub addr: u64,
-    /// The length of the buffer.
+    /// The number of valid data bytes in the buffer (the buffer's logical
+    /// length, not its capacity). A remote read transfers exactly this
+    /// many bytes.
     pub len: u64,
 }
