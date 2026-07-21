@@ -76,17 +76,17 @@ mod tests {
 
     #[test]
     fn test_wc_type_checks() {
-        let wc = make_wc(WRID::recv(1), ibv_wc_status::IBV_WC_SUCCESS, 0);
+        let wc = make_wc(WRID::recv(0, 1), ibv_wc_status::IBV_WC_SUCCESS, 0);
         assert!(wc.is_recv());
         assert!(!wc.is_send_data());
         assert!(!wc.is_send_imm());
 
-        let wc = make_wc(WRID::send_data(2), ibv_wc_status::IBV_WC_SUCCESS, 0);
+        let wc = make_wc(WRID::send_data(0, 2), ibv_wc_status::IBV_WC_SUCCESS, 0);
         assert!(!wc.is_recv());
         assert!(wc.is_send_data());
         assert!(!wc.is_send_imm());
 
-        let wc = make_wc(WRID::send_imm(3), ibv_wc_status::IBV_WC_SUCCESS, 0);
+        let wc = make_wc(WRID::send_imm(0, 3), ibv_wc_status::IBV_WC_SUCCESS, 0);
         assert!(!wc.is_recv());
         assert!(!wc.is_send_data());
         assert!(wc.is_send_imm());
@@ -94,23 +94,23 @@ mod tests {
 
     #[test]
     fn test_wc_succ() {
-        let wc = make_wc(WRID::recv(0), ibv_wc_status::IBV_WC_SUCCESS, 0);
+        let wc = make_wc(WRID::recv(0, 0), ibv_wc_status::IBV_WC_SUCCESS, 0);
         assert!(wc.succ());
 
-        let wc = make_wc(WRID::recv(0), ibv_wc_status::IBV_WC_LOC_LEN_ERR, 0);
+        let wc = make_wc(WRID::recv(0, 0), ibv_wc_status::IBV_WC_LOC_LEN_ERR, 0);
         assert!(!wc.succ());
     }
 
     #[test]
     fn test_wc_imm_none() {
-        let wc = make_wc(WRID::recv(0), ibv_wc_status::IBV_WC_SUCCESS, 0);
+        let wc = make_wc(WRID::recv(0, 0), ibv_wc_status::IBV_WC_SUCCESS, 0);
         assert_eq!(wc.imm(), None);
     }
 
     #[test]
     fn test_wc_imm_some() {
         let mut wc = make_wc(
-            WRID::recv(0),
+            WRID::recv(0, 0),
             ibv_wc_status::IBV_WC_SUCCESS,
             ibv_wc_flags::IBV_WC_WITH_IMM.0,
         );
@@ -120,9 +120,9 @@ mod tests {
 
     #[test]
     fn test_wc_debug() {
-        let wc = make_wc(WRID::recv(123), ibv_wc_status::IBV_WC_SUCCESS, 0);
+        let wc = make_wc(WRID::recv(0, 123), ibv_wc_status::IBV_WC_SUCCESS, 0);
         let debug = format!("{:?}", wc);
-        assert!(debug.contains("Recv(123)"));
+        assert!(debug.contains("Recv(0:123)"));
         assert!(debug.contains("IBV_WC_SUCCESS"));
     }
 }

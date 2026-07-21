@@ -5,16 +5,68 @@ use ruapc_rdma::{QueuePair, WRID, ibv_send_flags, ibv_wc_status};
 use serde::Serialize;
 use tokio::sync::mpsc::Sender;
 
-use super::RdmaState;
+use super::{RdmaState, SendPermit};
 use crate::{
     Buffer, BufferPool, Context, Error, RemoteReadOptions, SocketTrait, State,
     error::{ErrorKind, Result},
     msg::MsgMeta,
-    rdma::poller::{PollerWaker, SendMsg},
+    rdma::poller::{FRAME_HEADER, PollerWaker},
     services::{MemoryService, MetaService},
 };
 
 pub(crate) type RdmaCompletion = (ibv_wc_status, Option<Buffer>);
+
+/// Serializes a message as one wire frame: `[4B frame_len][4B meta_len]
+/// [meta][payload]`.
+///
+/// Every RDMA send is a sequence of such frames (usually one). The frame
+/// header makes messages self-delimiting, so the poll thread can aggregate
+/// window-blocked sends by plain concatenation and the receive side always
+/// walks the same frame loop — no aggregation magic, no special cases.
+struct FramedBuffer<'a>(&'a mut Buffer);
+
+impl crate::msg::SendMsg for FramedBuffer<'_> {
+    fn size(&self) -> usize {
+        self.0.len()
+    }
+
+    fn prepare(&mut self) -> Result<()> {
+        self.0.set_len(0);
+        // Reserve the frame length header; patched in `finish`.
+        self.0.extend_from_slice(&0u32.to_be_bytes())?;
+        Ok(())
+    }
+
+    fn finish(&mut self, meta_offset: usize, payload_offset: usize) -> Result<()> {
+        let meta_len = u32::try_from(payload_offset - meta_offset - FRAME_HEADER)?;
+        self.0[meta_offset..meta_offset + FRAME_HEADER].copy_from_slice(&meta_len.to_be_bytes());
+        let frame_len = u32::try_from(self.0.len() - FRAME_HEADER)?;
+        self.0[..FRAME_HEADER].copy_from_slice(&frame_len.to_be_bytes());
+        Ok(())
+    }
+
+    fn writer(&mut self) -> impl std::io::Write {
+        #[repr(transparent)]
+        struct Writer<'a>(&'a mut Buffer);
+
+        impl std::io::Write for Writer<'_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.write_all(buf)?;
+                Ok(buf.len())
+            }
+
+            fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+                self.0.extend_from_slice(buf).map_err(std::io::Error::other)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        Writer(self.0)
+    }
+}
 
 #[derive(Debug)]
 pub struct RdmaSocket {
@@ -23,7 +75,9 @@ pub struct RdmaSocket {
     pub(crate) rdmabuf_pool: Arc<BufferPool>,
     pub(crate) queue_pair: QueuePair,
     pub(crate) state: RdmaState,
-    pub(crate) pending_sender: Sender<SendMsg>,
+    /// Window-blocked framed sends, flushed by the poll thread once
+    /// credits free up.
+    pub(crate) pending_sender: Sender<Buffer>,
     /// Wakes the device poll thread (pending sends, error teardown).
     pub(crate) poller_waker: PollerWaker,
     /// Negotiated maximum serialized message size (= the peer's receive
@@ -35,7 +89,7 @@ impl RdmaSocket {
     pub fn new(
         queue_pair: QueuePair,
         rdmabuf_pool: Arc<BufferPool>,
-        pending_sender: Sender<SendMsg>,
+        pending_sender: Sender<Buffer>,
         poller_waker: PollerWaker,
         max_msg_size: usize,
         send_window: u32,
@@ -51,7 +105,7 @@ impl RdmaSocket {
         }
     }
 
-    /// Serializes a message into a right-sized buffer.
+    /// Serializes a message into a right-sized framed buffer.
     ///
     /// The serialized size is unknown upfront, so try increasingly larger
     /// buffers (4 KiB → 64 KiB → 256 KiB → negotiated `max_msg_size`).
@@ -62,7 +116,7 @@ impl RdmaSocket {
         for size in [4 * 1024, 64 * 1024, 256 * 1024, self.max_msg_size] {
             let size = size.min(self.max_msg_size);
             let mut buf = self.rdmabuf_pool.allocate(size)?;
-            match meta.serialize_to(payload, &mut buf) {
+            match meta.serialize_to(payload, &mut FramedBuffer(&mut buf)) {
                 Ok(()) => return Ok(buf),
                 Err(e) => last_err = Some(e),
             }
@@ -156,17 +210,15 @@ impl SocketTrait for RdmaSocket {
     ) -> Result<()> {
         let buf = self.serialize_msg(meta, payload)?;
 
-        let index = self.state.apply_send_index();
-        if index.is_ok() {
-            if self.state.ready_to_send(index) {
+        match self.state.try_acquire() {
+            SendPermit::Granted { window_tail } => {
                 // Invariant: a fully consumed send window must contain at
                 // least one signaled WR, otherwise its slots stay stranded
                 // (unsignaled completions are only swept by later signaled
                 // ones) and the connection stalls until the 5s keepalive.
                 // Direct sends within the window make the window-tail send
-                // signaled; pending flushes (the other way slots get
+                // signaled; pending flushes (the other way credits get
                 // consumed) are always signaled by the poll thread.
-                let window_tail = index.value() + 1 >= self.state.sendable_bound();
                 let posted = if window_tail {
                     self.queue_pair
                         .send_signaled(buf, ibv_send_flags::IBV_SEND_SIGNALED)
@@ -174,25 +226,22 @@ impl SocketTrait for RdmaSocket {
                     self.queue_pair.send(buf, ibv_send_flags::IBV_SEND_SIGNALED)
                 };
                 posted.map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
-            } else {
-                // Key pending sends by this socket's send index: the flush
-                // condition compares against the send window bound, which
-                // lives in the same space (msgids are global across
-                // connections and would drift arbitrarily far ahead).
+                Ok(())
+            }
+            SendPermit::Full => {
+                // Window exhausted: hand the framed message to the poll
+                // thread, which flushes (and opportunistically aggregates)
+                // pending sends as credits free up.
                 self.pending_sender
-                    .send(SendMsg {
-                        id: index.value(),
-                        buf,
-                    })
+                    .send(buf)
                     .await
                     .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
                 // The poll thread may be sleeping; enqueueing a pending send
                 // produces no completion event, so wake it explicitly.
                 self.poller_waker.wake();
+                Ok(())
             }
-            Ok(())
-        } else {
-            Err(ErrorKind::RdmaSendFailed.into())
+            SendPermit::Error => Err(ErrorKind::RdmaSendFailed.into()),
         }
     }
 

@@ -11,7 +11,7 @@ mod rdma_service;
 pub(crate) use rdma_service::{RdmaInfo, RdmaService};
 
 mod rdma_state;
-pub(crate) use rdma_state::RdmaState;
+pub(crate) use rdma_state::{RdmaState, SendPermit};
 
 mod poller;
 pub(crate) use poller::{DevicePollers, PollerConfig, RegisterConn};

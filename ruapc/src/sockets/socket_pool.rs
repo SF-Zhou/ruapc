@@ -88,7 +88,18 @@ pub struct RdmaSocketPoolConfig {
     pub qp: RdmaQueuePairConfig,
     /// Completion Queue length requested for each RDMA connection.
     pub cq_len: u32,
-    /// Number of receive buffers to pre-post for each RDMA connection.
+    /// Number of receive buffers to pre-post for each RDMA connection
+    /// (negotiated to the minimum of both sides). The send window is half
+    /// of it (the other half absorbs standalone ACKs).
+    ///
+    /// Deliberately small by default: a tight window makes high message
+    /// rates overflow into the pending path, where the poll thread packs
+    /// the backlog into few aggregated WRs — measured ~2x QPS on 1 KiB
+    /// echo at high concurrency versus a deep window posting one WR per
+    /// message, with no ping-pong latency cost (the window only binds
+    /// beyond `recv_queue_len / 2` in-flight sends). Raise it for
+    /// pipelines of large unaggregatable messages (up to `max_msg_size`
+    /// each), where more in-flight WRs are needed to fill the wire.
     pub recv_queue_len: u32,
     /// P_Key table index used when moving the Queue Pair to INIT.
     pub pkey_index: u16,
@@ -117,8 +128,11 @@ pub struct RdmaSocketPoolConfig {
     #[serde(default = "default_max_msg_size")]
     pub max_msg_size: u32,
     /// Whether to aggregate sends: under backlog, multiple small
-    /// window-blocked sends are packed into a single RDMA send. Send-side
-    /// toggle only; receivers always understand aggregated frames.
+    /// window-blocked sends are packed into a single RDMA send, which
+    /// consumes a single send-window credit and a single receive buffer
+    /// on the peer. Send-side toggle only; every RDMA send is a sequence
+    /// of length-prefixed frames, so receivers walk the same parse loop
+    /// either way.
     #[serde(default = "default_msg_aggregation")]
     pub msg_aggregation: bool,
     /// Number of (shared CQ + poll thread) shards per RDMA device.
@@ -127,6 +141,16 @@ pub struct RdmaSocketPoolConfig {
     /// spinning.
     #[serde(default = "default_poll_threads_per_device")]
     pub poll_threads_per_device: u32,
+    /// Number of long-lived dispatch worker tasks shared by all RDMA poll
+    /// threads of this pool, each owning one SPSC queue. Received buffers
+    /// are batched per CQ drain and routed to a per-poll-thread home
+    /// worker (spilling to further workers only under backlog pressure);
+    /// the workers walk and parse the contained message frames and hand
+    /// each to the router (requests) or waiter (responses). When every
+    /// worker is saturated the poll thread falls back to spawning a
+    /// one-shot task per batch, so it never blocks.
+    #[serde(default = "default_dispatch_workers")]
+    pub dispatch_workers: u32,
     /// Number of RDMA connections (QPs) to establish per peer. Requests
     /// are striped round-robin across them; combined with poll thread
     /// shards this scales single-peer throughput across cores. RPC
@@ -171,6 +195,11 @@ fn default_poll_threads_per_device() -> u32 {
 }
 
 #[cfg(feature = "rdma")]
+fn default_dispatch_workers() -> u32 {
+    32
+}
+
+#[cfg(feature = "rdma")]
 fn default_connections_per_peer() -> u32 {
     1
 }
@@ -181,7 +210,7 @@ impl Default for RdmaSocketPoolConfig {
         Self {
             qp: RdmaQueuePairConfig::default(),
             cq_len: 128,
-            recv_queue_len: 64,
+            recv_queue_len: 8,
             pkey_index: 0,
             send_signal_interval: default_send_signal_interval(),
             device_cq_len: default_device_cq_len(),
@@ -189,6 +218,7 @@ impl Default for RdmaSocketPoolConfig {
             max_msg_size: default_max_msg_size(),
             msg_aggregation: default_msg_aggregation(),
             poll_threads_per_device: default_poll_threads_per_device(),
+            dispatch_workers: default_dispatch_workers(),
             connections_per_peer: default_connections_per_peer(),
             device_filter: Vec::new(),
         }
@@ -212,7 +242,11 @@ impl Default for RdmaQueuePairConfig {
         Self {
             max_send_wr: 64,
             max_recv_wr: 64,
-            max_send_sge: 1,
+            // Gather-list capacity for zero-copy send aggregation: the
+            // poll thread packs window-blocked messages into one WR whose
+            // SGEs point at the original framed buffers. Clamped to the
+            // device's `max_sge` at connection setup.
+            max_send_sge: 16,
             max_recv_sge: 1,
             max_inline_data: 0,
         }

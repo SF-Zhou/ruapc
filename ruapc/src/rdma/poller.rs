@@ -1,8 +1,8 @@
 //! Dedicated per-device RDMA completion poll thread
 //!
-//! Replaces the previous per-connection async event loop. Each RDMA device
-//! gets one shared completion queue (send + recv for every connection on
-//! that device) and one dedicated OS thread that polls it:
+//! Each RDMA device gets one shared completion queue (send + recv for
+//! every connection on that device) and one dedicated OS thread that polls
+//! it:
 //!
 //! - **Busy phase**: after any completion, the thread keeps polling the CQ
 //!   for a configurable spin window (`poll_spin_us`), eliminating the
@@ -14,36 +14,57 @@
 //!   blocked) sends, by `RdmaSocket::set_error`, and by connection
 //!   registration/shutdown.
 //!
-//! Completions are routed to per-connection state by `ibv_wc::qp_num`.
-//! Response dispatch (`Waiter::post`) executes directly on the poll thread
-//! (a single oneshot wake to the awaiting task); request dispatch spawns
-//! onto the tokio runtime captured at poller creation.
+//! # Completion routing
+//!
+//! Every work request carries a connection *tag* (poller slot index +
+//! generation) in its `wr_id`, stamped into the QP at registration time.
+//! Routing a completion is a plain `Vec` index — no `qp_num` hash lookup,
+//! and no orphan window: the slot is reserved before the first work
+//! request is posted.
+//!
+//! # Zero-parse poll thread
+//!
+//! The poll thread never looks inside received bytes. Flow control is
+//! accounted per *work completion* (one receive WC = one credit,
+//! regardless of how many messages the buffer carries), so received
+//! buffers accumulate into per-drain batches that are routed to a fixed
+//! pool of long-lived dispatch worker tasks (`rdma.dispatch_workers`),
+//! each owning one SPSC queue; the workers walk the `[4B len][message]`
+//! frames and parse them on tokio worker threads. Routing is sticky
+//! (spill on pressure, see [`Dispatcher`]), the enqueue is a non-blocking
+//! push, and the poll thread issues no `tokio::spawn` on this path. Only
+//! when every worker is saturated does it degrade to spawning a one-shot
+//! task per batch, so it still never blocks.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::VecDeque,
     io::{Read as _, Write as _},
     os::unix::io::AsRawFd as _,
     os::unix::net::UnixStream,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU32, Ordering},
-        mpsc::{Receiver, Sender, TryRecvError},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::{Duration, Instant},
 };
 
+use bytes::Bytes;
 use foldhash::fast::RandomState;
-use ruapc_rdma::{CompChannel, CompletionQueue, WRType, ibv_send_flags, ibv_wc, poll_readable2};
+use ruapc_rdma::{
+    CompChannel, CompletionQueue, WRType, WrBuffers, ibv_send_flags, ibv_wc, poll_readable2,
+};
 
-use super::RdmaSocket;
+use super::{RdmaSocket, SendPermit};
 use crate::{Buffer, Error, ErrorKind, Message, Result, Socket, State, task::TaskSupervisorGuard};
 
-/// Magic prefix of an aggregated RDMA send containing multiple messages as
-/// `[4B big-endian frame length][message bytes]` frames. A plain message
-/// starts with its 4-byte metadata length, which can never equal this value.
-const AGG_MAGIC: [u8; 4] = *b"RUAG";
-/// Per-frame header size (big-endian u32 frame length).
-const AGG_FRAME_HEADER: usize = 4;
+/// Size of the per-frame header: a big-endian u32 frame length.
+///
+/// Every RDMA send is a sequence of `[4B frame_len][4B meta_len][meta]
+/// [payload]` frames — usually one. Uniform framing makes messages
+/// self-delimiting, so aggregation is plain concatenation and the receive
+/// path has a single parse loop.
+pub(crate) const FRAME_HEADER: usize = 4;
+
 /// Upper bound for one aggregated send; packing more rarely helps and would
 /// only add head-of-line latency for the packed messages.
 const MAX_AGG_BYTES: usize = 64 * 1024;
@@ -66,74 +87,243 @@ const MAX_AGG_BYTES: usize = 64 * 1024;
 ///   right-sized heap allocation.
 ///
 /// Large messages keep the zero-copy path: their copy cost would dominate
-/// and their volume is bounded by the window.
+/// and their volume is bounded by the send window.
 const SMALL_MSG_COPY_MAX: usize = 1024;
 
-/// A send that could not be posted immediately because the send window was
-/// full; forwarded to the poll thread for ordered flushing.
-pub struct SendMsg {
-    pub id: u64,
-    pub buf: Buffer,
+/// Number of bits of a connection tag holding the slot index; the
+/// remaining [`WRID::TAG_BITS`] bits hold the slot's generation.
+const SLOT_BITS: u32 = 14;
+/// Maximum number of live connections per poller shard.
+const MAX_SLOTS: usize = 1 << SLOT_BITS;
+
+/// Packs a slot index and its generation into a `wr_id` connection tag.
+fn conn_tag(slot: u16, generation: u8) -> u32 {
+    (u32::from(generation) << SLOT_BITS) | u32::from(slot)
 }
 
-/// Messages parsed from one completion batch, dispatched together.
-///
-/// Dispatching (request spawn / response oneshot wake) from the poll thread
-/// goes through tokio's remote-injection path, whose shared lock becomes the
-/// global throughput ceiling. Every `tokio::spawn` from the poll thread —
-/// even one per batch — takes that lock and a cross-thread wakeup.
-///
-/// Batches are therefore handed to a long-lived per-shard *dispatcher task*
-/// over an unbounded channel: the send is a lock-free enqueue, wakeups
-/// coalesce while the dispatcher is busy, and the per-request handler spawns
-/// happen on a runtime worker where they use the lock-free local queue (and
-/// are then work-stealable by other workers).
-type DispatchBatch = Vec<(Arc<State>, Socket, Message)>;
+/// Splits a `wr_id` connection tag into (slot index, generation).
+fn split_tag(tag: u32) -> (usize, u8) {
+    (
+        (tag & (MAX_SLOTS as u32 - 1)) as usize,
+        (tag >> SLOT_BITS) as u8,
+    )
+}
+
+/// One received buffer awaiting dispatch: the connection's shared state,
+/// the socket it arrived on and the raw `[4B len][message]` frames.
+type DispatchItem = (Arc<State>, Socket, Bytes);
+
+/// Received buffers of one completion batch, dispatched together. Handing
+/// batches (instead of single buffers) to the queue amortizes the enqueue
+/// and — more importantly — the worker wakeup over an entire CQ drain:
+/// per-buffer enqueueing measurably collapses throughput because nearly
+/// every message then pays one parked-task wakeup.
+type DispatchBatch = Vec<DispatchItem>;
 
 /// Flush threshold for a dispatch batch (bounds latency and memory).
 const MAX_DISPATCH_BATCH: usize = 256;
 
-/// Forwards the accumulated messages to the shard's dispatcher task.
-fn flush_dispatch(
-    tx: &tokio::sync::mpsc::UnboundedSender<DispatchBatch>,
-    batch: &mut DispatchBatch,
-) {
-    if batch.is_empty() {
-        return;
-    }
-    if let Err(e) = tx.send(std::mem::take(batch)) {
-        // Dispatcher gone: the runtime is shutting down; drop the messages.
-        tracing::debug!("dispatcher task gone; dropping {} message(s)", e.0.len());
-    }
+/// Batches a sticky worker may have queued before the router spills to
+/// the next worker.
+///
+/// Queueing a backlog on the current (busy, hence running and cache-hot)
+/// worker is cheaper than engaging another one: a drained worker is a
+/// parked task, and waking it is a cross-thread wake through tokio's
+/// remote-injection path — benchmarks show eager spilling (threshold 4)
+/// quadruples context switches and costs ~30% QPS at high load. Spilling
+/// only under real pressure keeps one hot worker per poll thread in the
+/// common case — wakeups coalesce exactly as they would with a dedicated
+/// dispatcher task — while still growing parallelism when a worker
+/// genuinely falls behind (a threshold of 16 batches is multiple
+/// milliseconds of parse backlog).
+const SPILL_BACKLOG: usize = 16;
+
+/// Batches queued per worker before the dispatcher considers it saturated
+/// and moves on (ultimately to the one-shot spawn fallback). Bounds the
+/// standing backlog per worker without a bounded channel.
+const MAX_WORKER_BACKLOG: usize = 32;
+
+/// One dispatch worker endpoint: an SPSC queue plus the number of batches
+/// sent to it that it has not finished processing yet.
+struct DispatchWorker {
+    tx: tokio::sync::mpsc::UnboundedSender<DispatchBatch>,
+    /// Incremented by the sender before each send, decremented by the
+    /// worker *after* processing a batch — `0` therefore means "drained
+    /// and done", i.e. sending now cannot queue behind anything.
+    backlog: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-/// Messages processed per dispatcher chunk. Handling a message wakes or
-/// spawns a task on the *current* worker's local queue; processing a large
-/// batch inline would pile them all onto one worker. Spawning the tail
-/// chunks as separate tasks keeps them work-stealable, so idle workers can
-/// spread the resulting wakes across the runtime.
-const DISPATCH_CHUNK: usize = 64;
+/// Hands received buffers from the poll threads to a fixed pool of
+/// long-lived dispatch worker tasks, each owning one SPSC queue.
+///
+/// Dispatching (frame walk, parse, request spawn / response oneshot wake)
+/// from the poll thread would serialize that work on the shard and — for
+/// spawns — go through tokio's remote-injection path, whose shared lock
+/// becomes the global throughput ceiling. Spawning a task per batch has
+/// the same problem: every spawn from the poll thread is a remote inject
+/// plus a task allocation.
+///
+/// Routing is *home worker + spill on pressure* — not blind round-robin,
+/// and deliberately not a shared MPMC queue:
+///
+/// - Each poll thread has a private home worker; while it keeps up
+///   (backlog below [`SPILL_BACKLOG`]) it receives every batch: it stays
+///   cache-hot, and its wakeups coalesce exactly like a dedicated
+///   dispatcher task's would (a send to a busy worker is just a
+///   lock-free push, no wake at all).
+/// - Only when it falls genuinely behind do batches spill to the next
+///   worker, so parallelism grows with load instead of rotating every
+///   batch through a different cold, parked task. (A shared MPMC queue
+///   does the opposite — each send wakes the longest-parked consumer —
+///   which benchmarked 20-30% slower at high load.)
+/// - With every worker past the spill threshold, batches queue (bounded
+///   by [`MAX_WORKER_BACKLOG`]) on the least-loaded worker; only beyond
+///   that does the poll thread degrade to a one-shot `tokio::spawn` per
+///   batch, so it never blocks and no buffer is dropped.
+pub(crate) struct Dispatcher {
+    workers: Arc<[DispatchWorker]>,
+    /// This clone's *home* worker. Every batch is offered to the home
+    /// worker first and only spills forward for that single batch, so a
+    /// poll thread always returns to its own worker once a burst is over.
+    /// A *sticky cursor* that moves on spill was measurably worse: two
+    /// poll threads whose cursors land on the same worker herd there —
+    /// both then spill in lockstep and keep sharing one worker, halving
+    /// dispatch throughput.
+    home: usize,
+    /// Hands every clone a distinct home, so poll threads stick to
+    /// *different* workers instead of piling onto the same one.
+    next_home: Arc<std::sync::atomic::AtomicUsize>,
+}
 
-/// Handles one chunk of dispatched messages.
-fn run_dispatch_chunk(chunk: Vec<(Arc<State>, Socket, Message)>) {
-    for (state, socket, msg) in chunk {
-        if let Err(e) = state.handle_recv(&socket, msg) {
-            tracing::error!("Failed to handle message: {e}");
+impl Clone for Dispatcher {
+    fn clone(&self) -> Self {
+        Self {
+            workers: self.workers.clone(),
+            home: self.next_home.fetch_add(1, Ordering::Relaxed) % self.workers.len(),
+            next_home: self.next_home.clone(),
         }
     }
 }
 
-/// Runs a shard's dispatcher: unpacks batches from the poll thread and
-/// hands each message to the router (requests) or waiter (responses) from a
-/// runtime worker thread.
-async fn run_dispatcher(mut rx: tokio::sync::mpsc::UnboundedReceiver<DispatchBatch>) {
-    while let Some(mut batch) = rx.recv().await {
-        while batch.len() > DISPATCH_CHUNK {
-            let chunk = batch.split_off(batch.len() - DISPATCH_CHUNK);
-            tokio::spawn(async move { run_dispatch_chunk(chunk) });
+impl Dispatcher {
+    /// Spawns `workers` long-lived dispatch worker tasks. Must be called
+    /// from within a tokio runtime. The workers exit once every
+    /// `Dispatcher` clone (one per poll thread, plus the owning pool's)
+    /// has been dropped.
+    pub fn start(workers: u32) -> Self {
+        let workers: Arc<[DispatchWorker]> = (0..workers.max(1))
+            .map(|_| {
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DispatchBatch>();
+                let backlog = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let worker_backlog = backlog.clone();
+                tokio::spawn(async move {
+                    while let Some(batch) = rx.recv().await {
+                        run_dispatch_batch(batch);
+                        worker_backlog.fetch_sub(1, Ordering::Release);
+                    }
+                });
+                DispatchWorker { tx, backlog }
+            })
+            .collect();
+        Self {
+            workers,
+            home: 0,
+            next_home: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
         }
-        run_dispatch_chunk(batch);
     }
+
+    /// Enqueues the accumulated buffers of one CQ drain for parsing.
+    /// Called from the poll threads; never blocks.
+    fn flush(&mut self, batch: &mut DispatchBatch) {
+        if batch.is_empty() {
+            return;
+        }
+        let batch = std::mem::take(batch);
+
+        // Stay with the home worker while it is not too far behind;
+        // otherwise spill — for this batch only — to the next worker
+        // below the spill threshold.
+        let n = self.workers.len();
+        for i in 0..n {
+            let idx = (self.home + i) % n;
+            if self.workers[idx].backlog.load(Ordering::Acquire) < SPILL_BACKLOG {
+                self.send(idx, batch);
+                return;
+            }
+        }
+
+        // Every worker is backlogged: queue (bounded) on the least loaded.
+        let (idx, backlog) = self
+            .workers
+            .iter()
+            .enumerate()
+            .map(|(idx, worker)| (idx, worker.backlog.load(Ordering::Acquire)))
+            .min_by_key(|(_, backlog)| *backlog)
+            .expect("at least one dispatch worker");
+        if backlog < MAX_WORKER_BACKLOG {
+            self.send(idx, batch);
+            return;
+        }
+
+        // Workers saturated beyond the backlog cap: fall back to a
+        // one-shot task doing the same work rather than blocking.
+        tokio::spawn(async move { run_dispatch_batch(batch) });
+    }
+
+    /// Sends one batch to the chosen worker, keeping its backlog counter
+    /// consistent. Send failures only happen when the runtime is shutting
+    /// down (the worker task is gone); the messages are dropped.
+    fn send(&self, idx: usize, batch: DispatchBatch) {
+        let worker = &self.workers[idx];
+        worker.backlog.fetch_add(1, Ordering::AcqRel);
+        if let Err(e) = worker.tx.send(batch) {
+            worker.backlog.fetch_sub(1, Ordering::AcqRel);
+            tracing::debug!("dispatch worker gone; dropping {} buffer(s)", e.0.len());
+        }
+    }
+}
+
+/// Handles one batch of dispatched buffers on a runtime worker thread.
+fn run_dispatch_batch(batch: DispatchBatch) {
+    for item in batch {
+        dispatch_item(item);
+    }
+}
+
+/// Walks the `[4B len][message]` frames of one received buffer, invoking
+/// `f` with each frame (a zero-copy slice of the refcounted buffer).
+fn for_each_frame(frames: &Bytes, mut f: impl FnMut(Bytes)) {
+    let mut offset = 0;
+    while offset < frames.len() {
+        let Some(header) = frames.get(offset..offset + FRAME_HEADER) else {
+            tracing::error!("truncated frame header at {offset}");
+            return;
+        };
+        let frame_len = u32::from_be_bytes(header.try_into().unwrap()) as usize;
+        let start = offset + FRAME_HEADER;
+        let Some(end) = start
+            .checked_add(frame_len)
+            .filter(|end| *end <= frames.len())
+        else {
+            tracing::error!("truncated frame ({frame_len}B) at {offset}");
+            return;
+        };
+        f(frames.slice(start..end));
+        offset = end;
+    }
+}
+
+/// Handles one dispatched buffer: frame walk + parse + routing to the
+/// router (requests) or waiter (responses) on a runtime worker thread.
+fn dispatch_item((state, socket, frames): DispatchItem) {
+    for_each_frame(&frames, |frame| match Message::parse(frame) {
+        Ok(msg) => {
+            if let Err(e) = state.handle_recv(&socket, msg) {
+                tracing::error!("Failed to handle message: {e}");
+            }
+        }
+        Err(e) => tracing::error!("Failed to parse message: {e}"),
+    });
 }
 
 /// Wakes the poll thread out of its idle `poll(2)` sleep.
@@ -148,34 +338,130 @@ impl PollerWaker {
     }
 }
 
+/// Tracks the registered memory pinned by one connection's receive ring
+/// (`recv_queue_len × max_msg_size`); the shared counter is decremented
+/// when the connection is torn down.
+pub struct RingReservation {
+    total: Arc<std::sync::atomic::AtomicUsize>,
+    bytes: usize,
+}
+
+impl RingReservation {
+    /// Adds `bytes` to the shared ring total and returns the guard plus
+    /// the new total.
+    pub fn add(total: &Arc<std::sync::atomic::AtomicUsize>, bytes: usize) -> (Self, usize) {
+        let previous = total.fetch_add(bytes, Ordering::AcqRel);
+        (
+            Self {
+                total: total.clone(),
+                bytes,
+            },
+            previous + bytes,
+        )
+    }
+}
+
+impl Drop for RingReservation {
+    fn drop(&mut self) {
+        self.total.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
 /// Everything the poll thread needs to manage one connection.
 pub struct RegisterConn {
     pub socket: Arc<RdmaSocket>,
     pub state: Arc<State>,
-    pub pending_receiver: tokio::sync::mpsc::Receiver<SendMsg>,
+    pub pending_receiver: tokio::sync::mpsc::Receiver<Buffer>,
     /// Number of receive work requests already posted by the registrar.
     pub recv_submitted: u64,
     /// Negotiated receive buffer size (`max_msg_size`).
     pub recv_buf_size: usize,
+    /// Negotiated send window in data WRs (`recv_queue_len / 2`); the
+    /// peer uses the same value, so the ACK cadence derives from it.
+    pub send_window: u32,
     /// Whether to aggregate window-blocked sends (local send-side toggle;
-    /// receivers always understand aggregated frames).
+    /// receivers walk the same frame loop either way).
     pub msg_aggregation: bool,
     /// Keeps `SocketPool::join` waiting until this connection is torn down.
     pub supervisor_guard: TaskSupervisorGuard,
+    /// Buffer pool bytes pinned by this connection's receive ring.
+    pub ring_reservation: RingReservation,
 }
 
-enum PollerCmd {
-    Register(Box<RegisterConn>, BudgetGuard),
+/// State shared between registrars and the poll thread: the slot
+/// allocator, the registration inbox and the shutdown flag.
+struct PollerShared {
+    inner: Mutex<SharedInner>,
+    /// Fast-path hint that `inner.incoming` is non-empty; written under
+    /// the `inner` lock, read lock-free by the poll thread.
+    has_incoming: AtomicBool,
+    /// Set (under the `inner` lock) when the poller shuts down; after the
+    /// poll thread's final inbox drain no registration can be lost.
+    shutdown: AtomicBool,
+}
+
+#[derive(Default)]
+struct SharedInner {
+    /// Freed slot indices available for reuse.
+    free_slots: Vec<u16>,
+    /// Current generation per ever-allocated slot; bumped on release so
+    /// stale completions of a previous occupant can never be attributed
+    /// to a new connection reusing the slot.
+    generations: Vec<u8>,
+    /// Registered connections awaiting pickup by the poll thread.
+    incoming: Vec<Incoming>,
+}
+
+struct Incoming {
+    slot: u16,
+    generation: u8,
+    conn: Box<RegisterConn>,
+    budget: BudgetGuard,
+}
+
+/// Releases a slot for reuse, invalidating its previous generation.
+fn release_slot(shared: &PollerShared, slot: u16) {
+    let mut inner = shared.inner.lock().unwrap();
+    let generation = &mut inner.generations[slot as usize];
+    *generation = generation.wrapping_add(1);
+    inner.free_slots.push(slot);
+}
+
+/// A reserved poller slot (plus CQ budget) for a connection about to be
+/// registered. Dropping an unconsumed reservation releases both.
+pub struct ConnReservation {
+    shared: Arc<PollerShared>,
+    slot: u16,
+    generation: u8,
+    budget: Option<BudgetGuard>,
+}
+
+impl ConnReservation {
+    /// The connection tag to stamp into the QP's work request IDs
+    /// (`QueuePair::set_wr_tag`) before posting anything.
+    pub fn tag(&self) -> u32 {
+        conn_tag(self.slot, self.generation)
+    }
+}
+
+impl Drop for ConnReservation {
+    fn drop(&mut self) {
+        // A consumed reservation (budget moved into the inbox) frees
+        // nothing; an abandoned one returns the slot.
+        if self.budget.is_some() {
+            release_slot(&self.shared, self.slot);
+        }
+    }
 }
 
 /// Handle to a per-device poll thread.
 ///
-/// Dropping the handle disconnects the command channel, wakes the thread and
-/// joins it (unless the drop happens on the poll thread itself, which can
-/// occur when the last `Arc<State>` is released during connection teardown).
+/// Dropping the handle flags shutdown, wakes the thread and joins it
+/// (unless the drop happens on the poll thread itself, which can occur
+/// when the last `Arc<State>` is released during connection teardown).
 pub struct DevicePoller {
     cq: Arc<CompletionQueue>,
-    cmd_tx: Option<Sender<PollerCmd>>,
+    shared: Arc<PollerShared>,
     waker: PollerWaker,
     thread: Option<std::thread::JoinHandle<()>>,
     /// Sum of (send + recv) queue depths registered on the shared CQ.
@@ -191,6 +477,9 @@ pub struct PollerConfig {
     /// Busy-poll window after the last completion, in microseconds.
     /// `0` disables spinning (pure event-driven mode).
     pub spin_us: u64,
+    /// Number of dispatch worker tasks shared by all shards of the pool
+    /// (consulted once, when the first shard starts).
+    pub dispatch_workers: u32,
 }
 
 impl DevicePoller {
@@ -202,6 +491,7 @@ impl DevicePoller {
         ctx: &Arc<ruapc_rdma::Context>,
         device_name: &str,
         config: PollerConfig,
+        dispatcher: Dispatcher,
     ) -> Result<Self> {
         let comp_channel = CompChannel::create(ctx)
             .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
@@ -239,17 +529,17 @@ impl DevicePoller {
             .set_nonblocking(true)
             .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
 
-        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let shared = Arc::new(PollerShared {
+            inner: Mutex::new(SharedInner::default()),
+            has_incoming: AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
+        });
         let handle = tokio::runtime::Handle::current();
-
-        // Long-lived dispatcher task for this shard; exits when the poll
-        // thread drops the sender.
-        let (dispatch_tx, dispatch_rx) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(run_dispatcher(dispatch_rx));
 
         let thread = {
             let cq = cq.clone();
             let comp_channel = comp_channel.clone();
+            let shared = shared.clone();
             std::thread::Builder::new()
                 .name(format!("ruapc-rdma-poll-{device_name}"))
                 .spawn(move || {
@@ -258,11 +548,10 @@ impl DevicePoller {
                         cq,
                         comp_channel,
                         wake_rx,
-                        cmd_rx,
-                        dispatch_tx,
+                        shared,
+                        dispatcher,
                         spin: Duration::from_micros(config.spin_us),
-                        conns: HashMap::default(),
-                        orphans: Vec::new(),
+                        conns: Vec::new(),
                         unack_cq_events: 0,
                     }
                     .run();
@@ -272,7 +561,7 @@ impl DevicePoller {
 
         Ok(Self {
             cq,
-            cmd_tx: Some(cmd_tx),
+            shared,
             waker: PollerWaker(Arc::new(wake_tx)),
             thread: Some(thread),
             wr_budget: Arc::new(AtomicU32::new(0)),
@@ -290,11 +579,13 @@ impl DevicePoller {
         self.waker.clone()
     }
 
-    /// Registers a connection with the poll thread.
+    /// Reserves a poller slot and CQ budget for a new connection.
     ///
     /// `qp_depth` is the connection's total queue depth (send + recv work
-    /// requests); registration fails if the shared CQ cannot absorb it.
-    pub fn register(&self, conn: RegisterConn, qp_depth: u32) -> Result<()> {
+    /// requests); the reservation fails if the shared CQ cannot absorb it.
+    /// The returned reservation's [`tag`](ConnReservation::tag) must be
+    /// stamped into the QP before any work request is posted.
+    pub fn reserve(&self, qp_depth: u32) -> Result<ConnReservation> {
         let budget = self.wr_budget.clone();
         if budget
             .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
@@ -312,24 +603,65 @@ impl DevicePoller {
                 ),
             ));
         }
-
-        // The budget guard travels with the command and lives inside the
-        // connection state; dropping it (send failure or teardown) releases
-        // the budget.
-        let guard = BudgetGuard {
+        let budget = BudgetGuard {
             budget,
             depth: qp_depth,
         };
-        let sent = self
-            .cmd_tx
-            .as_ref()
-            .map(|tx| tx.send(PollerCmd::Register(Box::new(conn), guard)).is_ok())
-            .unwrap_or(false);
-        if !sent {
+
+        let mut inner = self.shared.inner.lock().unwrap();
+        if self.shared.shutdown.load(Ordering::Acquire) {
             return Err(Error::new(
                 ErrorKind::RdmaSendFailed,
                 "RDMA poll thread is not running".into(),
             ));
+        }
+        let slot = match inner.free_slots.pop() {
+            Some(slot) => slot,
+            None => {
+                if inner.generations.len() >= MAX_SLOTS {
+                    return Err(Error::new(
+                        ErrorKind::RdmaSendFailed,
+                        format!("poller connection slots exhausted ({MAX_SLOTS})"),
+                    ));
+                }
+                inner.generations.push(0);
+                (inner.generations.len() - 1) as u16
+            }
+        };
+        let generation = inner.generations[slot as usize];
+        drop(inner);
+
+        Ok(ConnReservation {
+            shared: self.shared.clone(),
+            slot,
+            generation,
+            budget: Some(budget),
+        })
+    }
+
+    /// Registers a connection under a previously reserved slot.
+    pub fn register(&self, mut reservation: ConnReservation, conn: RegisterConn) -> Result<()> {
+        let budget = reservation
+            .budget
+            .take()
+            .expect("connection reservation used twice");
+        {
+            let mut inner = self.shared.inner.lock().unwrap();
+            if self.shared.shutdown.load(Ordering::Acquire) {
+                // Put the budget back so the reservation drop frees the slot.
+                reservation.budget = Some(budget);
+                return Err(Error::new(
+                    ErrorKind::RdmaSendFailed,
+                    "RDMA poll thread is not running".into(),
+                ));
+            }
+            inner.incoming.push(Incoming {
+                slot: reservation.slot,
+                generation: reservation.generation,
+                conn: Box::new(conn),
+                budget,
+            });
+            self.shared.has_incoming.store(true, Ordering::Release);
         }
         self.waker.wake();
         Ok(())
@@ -349,7 +681,10 @@ impl Drop for BudgetGuard {
 
 impl Drop for DevicePoller {
     fn drop(&mut self) {
-        self.cmd_tx.take();
+        {
+            let _inner = self.shared.inner.lock().unwrap();
+            self.shared.shutdown.store(true, Ordering::Release);
+        }
         self.waker.wake();
         if let Some(thread) = self.thread.take() {
             // Teardown can be triggered from the poll thread itself when the
@@ -376,22 +711,37 @@ impl std::fmt::Debug for DevicePoller {
 /// Flow control configuration for RDMA operations.
 #[derive(Debug)]
 struct FlowConfig {
-    /// Number of unacknowledged messages before triggering an acknowledgment.
+    /// Number of unacknowledged receive completions before triggering an
+    /// acknowledgment.
     ack_threshold: u32,
-    /// Maximum number of unacknowledged messages allowed.
+    /// Maximum number of unacknowledged receive completions allowed.
     ack_max_limit: u32,
 }
 
-impl Default for FlowConfig {
-    fn default() -> Self {
+impl FlowConfig {
+    /// Derives the ACK cadence from the peer's send window (both sides
+    /// compute the same negotiated value, `recv_queue_len / 2`).
+    ///
+    /// The threshold must stay below the window: the peer can never have
+    /// more than `window` unacknowledged data WRs in flight, so a larger
+    /// threshold would never fire and every credit return would wait for
+    /// the 5s keepalive ACK (a de-facto stall). Half the window keeps two
+    /// ACK batches per window worth of headroom. With the default window
+    /// (32) this reduces to the classic 16/32 cadence.
+    ///
+    /// `ack_max_limit` caps outstanding standalone ACK WRs; the receive
+    /// ring reserves its non-window half for exactly these, so the send
+    /// window is the bound.
+    fn for_window(send_window: u32) -> Self {
         Self {
-            ack_threshold: 16,
-            ack_max_limit: 32,
+            ack_threshold: (send_window / 2).max(1),
+            ack_max_limit: send_window.max(2),
         }
     }
 }
 
-/// Receive-side statistics and handling for one connection.
+/// Receive-side statistics for one connection; all counters are per work
+/// completion (= per receive-ring buffer), not per logical message.
 #[derive(Debug, Default)]
 struct RecvStats {
     submitted: u64,
@@ -402,7 +752,8 @@ struct RecvStats {
     data_acked: u64,
 }
 
-/// Send-side statistics for one connection.
+/// Send-side statistics for one connection; all counters are per work
+/// request.
 #[derive(Debug, Default)]
 struct SendStats {
     data_completed: u64,
@@ -417,57 +768,60 @@ struct SendStats {
 /// Field order matters for teardown: handlers holding buffers come before
 /// `socket` so buffers are released before the QP can be destroyed.
 struct ConnState {
+    /// Generation of the occupied slot; completions tagged with another
+    /// generation belonged to a previous occupant and are dropped.
+    generation: u8,
     recv: RecvStats,
     send: SendStats,
     last_ack_timestamp: Instant,
     flow: FlowConfig,
-    pending_sends: BTreeMap<u64, Buffer>,
-    pending_receiver: tokio::sync::mpsc::Receiver<SendMsg>,
+    /// Window-blocked framed sends in FIFO order.
+    pending_sends: VecDeque<Buffer>,
+    pending_receiver: tokio::sync::mpsc::Receiver<Buffer>,
     /// Next send-queue id that has not been swept yet (see `sweep_sq`).
     sq_swept: u64,
     /// Negotiated receive buffer size (`max_msg_size`).
     recv_buf_size: usize,
     /// Whether to aggregate window-blocked sends.
     msg_aggregation: bool,
-    /// Recycled receive buffers: pure-ACK completions and split aggregates
-    /// return their buffer here so the repost skips the shared pool.
+    /// Recycled receive buffers: pure-ACK completions and copied-out small
+    /// messages return their buffer here so the repost skips the shared
+    /// pool.
     recv_buf_cache: Vec<Buffer>,
     /// Receive work requests that could not be reposted (transient buffer
     /// pool exhaustion); retried on subsequent iterations instead of
     /// failing the connection.
     recv_deficit: u64,
-    /// Logical message count per aggregate SQ id: an aggregate send carries
-    /// several window-consuming messages, so its (swept) completion must
-    /// advance `data_completed` by the frame count.
-    agg_counts: BTreeMap<u64, u64>,
     socket: Arc<RdmaSocket>,
     state: Arc<State>,
     _budget: BudgetGuard,
     _supervisor_guard: TaskSupervisorGuard,
+    _ring_reservation: RingReservation,
 }
 
 impl ConnState {
-    fn new(reg: RegisterConn, budget: BudgetGuard) -> Self {
+    fn new(reg: RegisterConn, generation: u8, budget: BudgetGuard) -> Self {
         Self {
+            generation,
             recv: RecvStats {
                 submitted: reg.recv_submitted,
                 ..Default::default()
             },
             send: SendStats::default(),
             last_ack_timestamp: Instant::now(),
-            flow: FlowConfig::default(),
-            pending_sends: BTreeMap::new(),
+            flow: FlowConfig::for_window(reg.send_window),
+            pending_sends: VecDeque::new(),
             pending_receiver: reg.pending_receiver,
             sq_swept: 0,
             recv_buf_size: reg.recv_buf_size,
             msg_aggregation: reg.msg_aggregation,
             recv_buf_cache: Vec::new(),
             recv_deficit: 0,
-            agg_counts: BTreeMap::new(),
             socket: reg.socket,
             state: reg.state,
             _budget: budget,
             _supervisor_guard: reg.supervisor_guard,
+            _ring_reservation: reg.ring_reservation,
         }
     }
 
@@ -476,12 +830,13 @@ impl ConnState {
         if !wc.is_recv() {
             // Sweep unsignaled data sends completed before this SQ
             // completion (RC SQs complete in post order): reclaim their
-            // buffers and count them as completed. Aggregate sends count as
-            // their logical message count.
+            // buffers and count each as one completed data WR. Only plain
+            // data sends are ever unsignaled, so every swept buffer is a
+            // data WR.
             let id = wc.wr_id.get_id();
             for swept in self.sq_swept..id {
                 if self.socket.queue_pair.take_send_buffer(swept).is_some() {
-                    self.send.data_completed += self.agg_counts.remove(&swept).unwrap_or(1);
+                    self.send.data_completed += 1;
                 }
             }
             self.sq_swept = self.sq_swept.max(id + 1);
@@ -489,7 +844,8 @@ impl ConnState {
 
         let buffer = self.socket.queue_pair.take_buffer(&wc.wr_id);
         let result = if wc.is_recv() {
-            self.handle_recv_completion(wc, buffer, batch)
+            // Receive WRs always post a single buffer.
+            self.handle_recv_completion(wc, buffer.and_then(WrBuffers::into_single), batch)
         } else {
             self.handle_send_completion(wc, buffer)
         };
@@ -517,8 +873,8 @@ impl ConnState {
             ));
         }
 
-        // Immediate data (ACK counters) can arrive standalone or piggybacked
-        // on a data send.
+        // Immediate data (ACK credit counters) can arrive standalone or
+        // piggybacked on a data send.
         if let Some(ack) = wc.imm() {
             self.send.data_confirmed += u64::from(ack & 0xFFFF);
             self.send.ack_confirmed += u64::from(ack >> 16);
@@ -530,23 +886,23 @@ impl ConnState {
                 // Standalone ACK: the buffer is untouched, recycle it.
                 self.recv.imm_received += 1;
                 self.cache_recv_buf(buf);
-            } else if buf.len() >= AGG_MAGIC.len() && buf[..AGG_MAGIC.len()] == AGG_MAGIC {
-                self.handle_aggregate(buf, batch);
             } else {
+                // One receive completion = one flow control credit, no
+                // matter how many frames the buffer carries: the credit
+                // stands for the receive-ring buffer, which is consumed
+                // exactly once per WC. The frames are walked and parsed by
+                // the dispatch workers, never here.
                 self.recv.data_received += 1;
-                // Copy small messages out and recycle the receive buffer;
-                // see `SMALL_MSG_COPY_MAX` for why.
-                let parsed = if buf.len() <= SMALL_MSG_COPY_MAX {
-                    let copied = bytes::Bytes::copy_from_slice(&buf);
+                let frames = if buf.len() <= SMALL_MSG_COPY_MAX {
+                    // Copy small buffers out and recycle the receive
+                    // buffer; see `SMALL_MSG_COPY_MAX` for why.
+                    let copied = Bytes::copy_from_slice(&buf);
                     self.cache_recv_buf(buf);
-                    Message::parse(copied)
+                    copied
                 } else {
-                    Message::parse(buf)
+                    Bytes::from_owner(buf)
                 };
-                match parsed {
-                    Ok(msg) => batch.push((self.state.clone(), Socket::from(&self.socket), msg)),
-                    Err(e) => tracing::error!("Failed to parse message: {e}"),
-                }
+                batch.push((self.state.clone(), Socket::from(&self.socket), frames));
             }
         } else if wc.imm().is_some() {
             self.recv.imm_received += 1;
@@ -612,55 +968,23 @@ impl ConnState {
         }
     }
 
-    /// Parses an aggregate buffer (`AGG_MAGIC` + repeated `[4B len][msg]`
-    /// frames) and dispatches every contained message.
-    ///
-    /// Frames are zero-copy slices into the refcounted receive buffer; the
-    /// buffer returns to the pool once the last frame is dropped.
-    fn handle_aggregate(&mut self, buf: Buffer, batch: &mut DispatchBatch) {
-        let owner = bytes::Bytes::from_owner(buf);
-        let mut offset = AGG_MAGIC.len();
-        while offset < owner.len() {
-            let Some(header) = owner.get(offset..offset + 4) else {
-                tracing::error!("truncated aggregate frame header at {offset}");
-                break;
-            };
-            let frame_len = u32::from_be_bytes(header.try_into().unwrap()) as usize;
-            if offset + 4 + frame_len > owner.len() {
-                tracing::error!("truncated aggregate frame ({frame_len}B) at {offset}");
-                break;
-            }
-            let frame = owner.slice(offset + 4..offset + 4 + frame_len);
-            self.recv.data_received += 1;
-            match Message::parse(frame) {
-                Ok(msg) => batch.push((self.state.clone(), Socket::from(&self.socket), msg)),
-                Err(e) => tracing::error!("Failed to parse aggregated message: {e}"),
-            }
-            offset += 4 + frame_len;
-        }
-    }
-
-    fn handle_send_completion(&mut self, wc: &ibv_wc, buffer: Option<Buffer>) -> Result<()> {
-        // RDMA one-sided operation: hand the buffer back to the caller.
-        if let Some((_, sender)) = self.socket.rdma_completions.remove(&wc.wr_id) {
-            let _ = sender.send((wc.status, buffer));
-            return Ok(());
-        }
-
-        let id = wc.wr_id.get_id();
+    fn handle_send_completion(&mut self, wc: &ibv_wc, buffer: Option<WrBuffers>) -> Result<()> {
         match wc.wr_id.get_type() {
-            WRType::SendImm => {
-                if let Some(count) = self.agg_counts.remove(&id) {
-                    // A data send carrying a piggybacked ACK; it lives
-                    // outside the standalone-ACK ledger.
-                    self.send.data_completed += count;
-                } else {
-                    self.send.ack_completed += 1;
+            // RDMA one-sided operation: hand the buffer back to the
+            // caller. Reads consume no peer receive buffer, so they take
+            // part in no flow control accounting.
+            WRType::Read => {
+                if let Some((_, sender)) = self.socket.rdma_completions.remove(&wc.wr_id) {
+                    // Read WRs always post a single buffer.
+                    let _ = sender.send((wc.status, buffer.and_then(WrBuffers::into_single)));
+                    return Ok(());
                 }
             }
-            _ => {
-                self.send.data_completed += self.agg_counts.remove(&id).unwrap_or(1);
-            }
+            // A buffer-less immediate send is a standalone ACK; one with a
+            // buffer is a data send with a piggybacked ACK, which lives in
+            // the data ledger.
+            WRType::SendImm if buffer.is_none() => self.send.ack_completed += 1,
+            _ => self.send.data_completed += 1,
         }
 
         if wc.succ() {
@@ -674,10 +998,10 @@ impl ConnState {
         }
     }
 
-    /// Moves window-blocked sends from the mpsc channel into the ordered map.
+    /// Moves window-blocked sends from the mpsc channel into the FIFO.
     fn drain_pending(&mut self) {
-        while let Ok(msg) = self.pending_receiver.try_recv() {
-            self.pending_sends.insert(msg.id, msg.buf);
+        while let Ok(buf) = self.pending_receiver.try_recv() {
+            self.pending_sends.push_back(buf);
         }
     }
 
@@ -685,24 +1009,22 @@ impl ConnState {
     /// and emits acknowledgments when thresholds are reached.
     fn update_flow_control(&mut self) -> Result<()> {
         if !self.socket.state.is_ok() {
-            while let Some(_pending) = self.pending_sends.pop_first() {
-                self.send.data_completed += 1;
-            }
+            // Pending sends never acquired a credit; just drop them.
+            self.pending_sends.clear();
             return Ok(());
         }
 
-        let completed_sends = std::cmp::min(self.send.data_completed, self.send.data_confirmed);
-        let sendable_bound = self.socket.state.update_send_finished(completed_sends);
+        // One credit per data WR, returned once the WR completed locally
+        // (buffer reclaimed) *and* the peer acknowledged the matching
+        // receive completion.
+        let finished = std::cmp::min(self.send.data_completed, self.send.data_confirmed);
 
-        // Liveness diagnostics: a pending send that stays window-blocked for
-        // seconds indicates a flow control stall (peer ACKs missing or
+        // Liveness diagnostics: a pending send that stays window-blocked
+        // for seconds indicates a flow control stall (peer ACKs missing or
         // completion accounting gone wrong).
-        if let Some((first, _)) = self.pending_sends.first_key_value()
-            && *first >= sendable_bound
-            && self.last_ack_timestamp.elapsed().as_secs() >= 2
-        {
+        if !self.pending_sends.is_empty() && self.last_ack_timestamp.elapsed().as_secs() >= 2 {
             tracing::warn!(
-                "flow stall: qp={} pending={} first_key={first} bound={sendable_bound} ok={} send={:?} recv={:?}",
+                "flow stall: qp={} pending={} finished={finished} ok={} send={:?} recv={:?}",
                 self.socket.queue_pair.qp_num(),
                 self.pending_sends.len(),
                 self.socket.state.is_ok(),
@@ -728,7 +1050,13 @@ impl ConnState {
         // can piggyback on one of them (saving a standalone WR + CQE + a
         // recv buffer cycle on the peer).
         let mut ack = self.due_ack();
-        let flush_result = self.flush_pending(sendable_bound, &mut ack);
+
+        // Flush pending sends against the *unpublished* finished value:
+        // the backlog spends freshly freed credits before
+        // `update_send_finished` makes them visible to direct senders, so
+        // pending traffic cannot be starved by new sends.
+        let flush_result = self.flush_pending(finished, &mut ack);
+        self.socket.state.update_send_finished(finished);
 
         // Send the standalone ACK even when the flush failed (e.g. a
         // transient allocation error): the peer's send window depends on our
@@ -761,45 +1089,55 @@ impl ConnState {
             None
         }
     }
-    /// Records that all received messages have been acknowledged.
+    /// Records that all received completions have been acknowledged.
     fn mark_acked(&mut self) {
         self.recv.data_acked = self.recv.data_received;
         self.recv.imm_acked = self.recv.imm_received;
         self.last_ack_timestamp = Instant::now();
     }
 
-    /// Flushes window-unblocked pending sends in send-index order, attaching the
-    /// due ACK (if any) to the first posted send as immediate data.
+    /// Flushes pending sends in FIFO order while credits are available,
+    /// attaching the due ACK (if any) to the first posted send as
+    /// immediate data.
     ///
-    /// This is the opportunistic aggregation point: messages only queue here
-    /// when the send window was full, so packing whatever is *already
-    /// waiting* into one RDMA send amortizes per-message costs (doorbell,
-    /// CQE, recv processing on the peer) without adding any latency on the
+    /// This is the opportunistic aggregation point: messages only queue
+    /// here when the send window was full, so packing whatever is *already
+    /// waiting* into one RDMA send amortizes per-WR costs (doorbell, CQE,
+    /// recv buffer + credit on the peer) without adding any latency on the
     /// uncontended fast path, which posts directly from the sender task.
+    /// Messages are framed, so an aggregate is plain concatenation — and
+    /// since credits are per WR, an aggregate consumes a *single* credit,
+    /// making aggregation actively relieve the window pressure that caused
+    /// the queueing.
     ///
-    /// Messages are only removed from `pending_sends` once their posting no
-    /// longer needs a fallible allocation: a dropped pending message would
-    /// permanently shrink the send window (its index was already consumed,
-    /// but no completion will ever account for it), and 32 cumulative drops
-    /// deadlock the connection. The aggregate buffer is therefore allocated
-    /// from a *pre-scan* of the eligible run, before any message is popped;
-    /// if the pool is exhausted, the flush degrades to posting messages
-    /// unaggregated (which needs no allocation).
-    fn flush_pending(&mut self, sendable_bound: u64, ack: &mut Option<u32>) -> Result<()> {
+    /// Aggregation needs a fallible pool allocation for the scratch
+    /// buffer; when the pool is exhausted the flush falls back to a
+    /// zero-allocation *gather-list* send of the same run, keeping the
+    /// aggregation (and its per-WR credit savings) intact under memory
+    /// pressure.
+    fn flush_pending(&mut self, finished: u64, ack: &mut Option<u32>) -> Result<()> {
         let agg_cap = self.recv_buf_size.min(MAX_AGG_BYTES);
-        while let Some((&first_key, _)) = self.pending_sends.first_key_value()
-            && first_key < sendable_bound
-        {
-            // Pre-scan the eligible run: how many messages fit in one
-            // aggregate and their packed size. The first message is always
-            // counted, even when it alone exceeds `agg_cap` (oversized
-            // messages are posted unaggregated below).
-            let mut total = AGG_MAGIC.len();
-            let mut count = 0usize;
+        while !self.pending_sends.is_empty() {
+            match self.socket.state.try_acquire_at(finished) {
+                // Pending flushes are always posted signaled (see
+                // `post_data`), so the tail flag needs no handling here.
+                SendPermit::Granted { .. } => {}
+                SendPermit::Full => break,
+                SendPermit::Error => {
+                    self.pending_sends.clear();
+                    break;
+                }
+            }
+
+            // Determine the FIFO run that fits one aggregate. The first
+            // message always counts, even when it alone exceeds `agg_cap`
+            // (oversized messages are posted unaggregated below).
+            let mut count = 1;
+            let mut total = self.pending_sends[0].len();
             if self.msg_aggregation {
-                for (&key, buf) in self.pending_sends.iter() {
-                    let framed = AGG_FRAME_HEADER + buf.len();
-                    if key >= sendable_bound || (count > 0 && total + framed > agg_cap) {
+                while count < self.pending_sends.len() {
+                    let framed = self.pending_sends[count].len();
+                    if total + framed > agg_cap {
                         break;
                     }
                     total += framed;
@@ -808,54 +1146,61 @@ impl ConnState {
             }
 
             if count < 2 {
-                // No aggregation (disabled, oversized, or a single eligible
+                // No aggregation (disabled, oversized, or a single pending
                 // message): post directly, no allocation needed.
-                let (_, buf) = self.pending_sends.pop_first().unwrap();
-                self.post_data(buf, 1, ack)?;
+                let buf = self.pending_sends.pop_front().unwrap();
+                self.post_data(buf, ack)?;
                 continue;
             }
 
-            let mut agg = match self.socket.rdmabuf_pool.allocate(total) {
-                Ok(buf) => buf,
-                Err(e) => {
-                    // Transient pool exhaustion: keep traffic flowing by
-                    // posting the first message unaggregated; the rest of
-                    // the run is retried on the next loop iteration.
-                    tracing::debug!("aggregate allocation failed ({e}); posting unaggregated");
-                    let (_, buf) = self.pending_sends.pop_first().unwrap();
-                    self.post_data(buf, 1, ack)?;
-                    continue;
+            // Copy the run into one contiguous send: for the typically
+            // small frames queueing here, the sub-µs memcpy on this
+            // dedicated thread is measurably cheaper than the NIC-side
+            // cost of a many-SGE gather WQE (~10% peak QPS on 1 KiB
+            // echo). Under pool exhaustion, degrade to a zero-allocation
+            // gather-list send instead of per-message WRs, so aggregation
+            // (and the credits it saves) survives memory pressure.
+            match self.socket.rdmabuf_pool.allocate(total) {
+                Ok(mut agg) => {
+                    agg.set_len(0);
+                    for _ in 0..count {
+                        let frame = self.pending_sends.pop_front().unwrap();
+                        agg.extend_from_slice(&frame)?;
+                    }
+                    tracing::trace!("aggregating {count} pending messages into one {total}B send");
+                    self.post_data(agg, ack)?;
                 }
-            };
-            agg.set_len(0);
-            agg.extend_from_slice(&AGG_MAGIC)?;
-            for _ in 0..count {
-                let (_, frame) = self.pending_sends.pop_first().unwrap();
-                agg.extend_from_slice(&u32::try_from(frame.len())?.to_be_bytes())?;
-                agg.extend_from_slice(&frame)?;
+                Err(e) => {
+                    // The gather list is capped by the QP's SGE limit; any
+                    // remainder of the run is handled on the next loop
+                    // iteration.
+                    let take = count.min(self.socket.queue_pair.gather_limit());
+                    if take < 2 {
+                        let buf = self.pending_sends.pop_front().unwrap();
+                        self.post_data(buf, ack)?;
+                        continue;
+                    }
+                    tracing::debug!("aggregate allocation failed ({e}); posting a gather list");
+                    let frames: Box<[Buffer]> = self.pending_sends.drain(..take).collect();
+                    self.post_gather(frames, ack)?;
+                }
             }
-            tracing::debug!("aggregating {count} pending messages into one {total}B send");
-            self.post_data(agg, count as u64, ack)?;
         }
         Ok(())
     }
 
-    /// Posts a pending data send carrying `count` logical messages,
-    /// piggybacking the due ACK as immediate data when present.
+    /// Posts a pending data send (one WR = one credit), piggybacking the
+    /// due ACK as immediate data when present.
     ///
     /// Always signaled, bypassing the selective signaling interval: pending
     /// flushes only happen when the send window was full, so a flushed send
-    /// (especially an aggregate carrying a whole window's worth of
-    /// messages) can be the connection's *last* data WR for a while. If it
-    /// were unsignaled, its window slots would stay stranded until an
-    /// unrelated signaled WR sweeps them — when the aggregate covers the
-    /// entire window on both peers simultaneously, neither side can send,
-    /// neither receives (so no ACK-threshold ACKs are posted), and the
-    /// connection deadlocks until the 5s keepalive ACK completion finally
-    /// sweeps the SQ. That was the root cause of the sporadic 5s request
-    /// timeouts and the "flow stall" storms under deep backlog.
-    fn post_data(&mut self, buf: Buffer, count: u64, ack: &mut Option<u32>) -> Result<()> {
-        let piggyback = ack.is_some();
+    /// (especially an aggregate) can be the connection's *last* data WR for
+    /// a while. If it were unsignaled, its credit would stay stranded until
+    /// an unrelated signaled WR sweeps it — when that happens on both peers
+    /// simultaneously, neither side can send, neither receives (so no
+    /// ACK-threshold ACKs are posted), and the connection deadlocks until
+    /// the 5s keepalive ACK completion finally sweeps the SQ.
+    fn post_data(&mut self, buf: Buffer, ack: &mut Option<u32>) -> Result<()> {
         let result = match ack.take() {
             Some(imm) => {
                 let posted =
@@ -865,30 +1210,45 @@ impl ConnState {
                 if posted.is_ok() {
                     self.mark_acked();
                 }
-                posted
+                posted.map(|_| ())
             }
             None => self
                 .socket
                 .queue_pair
-                .send_signaled(buf, ibv_send_flags::IBV_SEND_SIGNALED),
+                .send_signaled(buf, ibv_send_flags::IBV_SEND_SIGNALED)
+                .map(|_| ()),
         };
-        match result {
-            Ok(sq_id) => {
-                // Record the logical message count for aggregates, and for
-                // every piggybacked send: SendImm completions consult
-                // `agg_counts` to tell piggybacked data sends (outside the
-                // standalone-ACK ledger) apart from standalone ACKs.
-                if piggyback || count > 1 {
-                    self.agg_counts.insert(sq_id, count);
+        result.map_err(|e| {
+            tracing::error!("failed to send pending buffer: {e}");
+            self.socket.set_error();
+            Error::new(
+                ErrorKind::RdmaSendFailed,
+                format!("failed to send pending buffer: {e}"),
+            )
+        })
+    }
+
+    /// Posts an aggregated pending send as one gather-list WR (one WR =
+    /// one credit), piggybacking the due ACK as immediate data when
+    /// present. Always signaled, for the same reason as [`post_data`].
+    ///
+    /// [`post_data`]: Self::post_data
+    fn post_gather(&mut self, frames: Box<[Buffer]>, ack: &mut Option<u32>) -> Result<()> {
+        let imm = ack.take();
+        let had_ack = imm.is_some();
+        match self.socket.queue_pair.send_gather(frames, imm) {
+            Ok(_) => {
+                if had_ack {
+                    self.mark_acked();
                 }
                 Ok(())
             }
             Err(e) => {
-                tracing::error!("failed to send pending buffer: {e}");
+                tracing::error!("failed to send gathered pending buffers: {e}");
                 self.socket.set_error();
                 Err(Error::new(
                     ErrorKind::RdmaSendFailed,
-                    format!("failed to send pending buffer: {e}"),
+                    format!("failed to send gathered pending buffers: {e}"),
                 ))
             }
         }
@@ -940,20 +1300,18 @@ struct PollLoop {
     cq: Arc<CompletionQueue>,
     comp_channel: Arc<CompChannel>,
     wake_rx: UnixStream,
-    cmd_rx: Receiver<PollerCmd>,
-    /// Hands parsed message batches to this shard's dispatcher task.
-    dispatch_tx: tokio::sync::mpsc::UnboundedSender<DispatchBatch>,
+    shared: Arc<PollerShared>,
+    /// Hands received buffers to the pool's dispatch worker tasks.
+    dispatcher: Dispatcher,
     spin: Duration,
-    conns: HashMap<u32, ConnState, RandomState>,
-    /// Completions whose qp_num had no registered connection yet (the
-    /// registration command may still be in flight); retried briefly.
-    orphans: Vec<(Instant, ibv_wc)>,
+    /// Connections indexed by their slot.
+    conns: Vec<Option<ConnState>>,
     unack_cq_events: u32,
 }
 
 impl PollLoop {
     /// Idle sleep timeout; bounds the latency of periodic housekeeping
-    /// (5s ACK timer, orphan expiry) when no completions arrive.
+    /// (5s ACK timer) when no completions arrive.
     const IDLE_TIMEOUT_MS: i32 = 100;
     /// Interval between per-connection state dumps (debug level).
     const DUMP_INTERVAL: Duration = Duration::from_secs(2);
@@ -973,17 +1331,14 @@ impl PollLoop {
         let mut last_dump = Instant::now();
 
         loop {
-            // 1. Retry completions that raced connection registration.
-            self.retry_orphans(&mut batch);
-
-            // 2. Drain the completion queue.
+            // 1. Drain the completion queue.
             let mut progressed = false;
             loop {
                 let n = match self.cq.poll(&mut wcs) {
                     Ok(n) => n,
                     Err(e) => {
                         tracing::error!("CQ poll failed, stopping RDMA poll thread: {e}");
-                        self.fail_all_conns();
+                        self.shutdown_cleanup();
                         return;
                     }
                 };
@@ -991,19 +1346,18 @@ impl PollLoop {
                     self.dispatch(wc, &mut batch);
                 }
                 if batch.len() >= MAX_DISPATCH_BATCH {
-                    flush_dispatch(&self.dispatch_tx, &mut batch);
+                    self.dispatcher.flush(&mut batch);
                 }
                 progressed |= n > 0;
                 if n < wcs.len() {
                     break;
                 }
             }
-            flush_dispatch(&self.dispatch_tx, &mut batch);
+            self.dispatcher.flush(&mut batch);
 
-            // 3. Registration commands and per-connection housekeeping:
+            // 2. Registration inbox and per-connection housekeeping:
             //    pending sends, flow control, teardown. This pass is
-            //    O(connections) including clock reads (and the command
-            //    channel's try_recv is not free either), so during the spin
+            //    O(connections) including clock reads, so during the spin
             //    window it only runs when a completion was processed or the
             //    periodic interval elapsed — not on every idle spin
             //    iteration. `register()` wakes the thread, so a registration
@@ -1012,20 +1366,19 @@ impl PollLoop {
             if progressed || now >= next_housekeeping {
                 next_housekeeping = now + Self::HOUSEKEEPING_INTERVAL;
 
-                // A disconnected command channel means the owning pool is
-                // being dropped.
-                match self.drain_cmds() {
-                    Ok(()) => {}
-                    Err(_disconnected) => break,
+                if self.shared.shutdown.load(Ordering::Acquire) {
+                    break;
                 }
+                self.drain_incoming();
 
                 if tracing::enabled!(tracing::Level::DEBUG)
                     && last_dump.elapsed() >= Self::DUMP_INTERVAL
                 {
                     last_dump = Instant::now();
-                    for (qp, conn) in &self.conns {
+                    for conn in self.conns.iter().flatten() {
                         tracing::debug!(
-                            "conn dump: qp={qp} ok={} pending={} send={:?} recv={:?}",
+                            "conn dump: qp={} ok={} pending={} send={:?} recv={:?}",
+                            conn.socket.queue_pair.qp_num(),
                             conn.socket.state.is_ok(),
                             conn.pending_sends.len(),
                             conn.send,
@@ -1034,7 +1387,10 @@ impl PollLoop {
                     }
                 }
 
-                self.conns.retain(|_, conn| {
+                for slot in 0..self.conns.len() {
+                    let Some(conn) = self.conns[slot].as_mut() else {
+                        continue;
+                    };
                     conn.drain_pending();
                     if conn.recv_deficit > 0 {
                         conn.retry_recv_deficit();
@@ -1042,8 +1398,13 @@ impl PollLoop {
                     if let Err(e) = conn.update_flow_control() {
                         tracing::error!("flow control update error: {e}");
                     }
-                    !conn.ready_to_remove()
-                });
+                    if conn.ready_to_remove() {
+                        // Drop the connection before recycling its slot so
+                        // no new occupant can race its teardown.
+                        self.conns[slot] = None;
+                        release_slot(&self.shared, slot as u16);
+                    }
+                }
             }
 
             if progressed {
@@ -1051,17 +1412,17 @@ impl PollLoop {
                 continue;
             }
 
-            // 4. Busy-poll window after the last completion.
+            // 3. Busy-poll window after the last completion.
             if now < spin_until {
                 std::hint::spin_loop();
                 continue;
             }
 
-            // 5. Idle: arm the CQ notification, close the race with one more
+            // 4. Idle: arm the CQ notification, close the race with one more
             //    poll, then sleep on the completion channel + wake pipe.
             if let Err(e) = self.cq.req_notify(false) {
                 tracing::error!("req_notify failed, stopping RDMA poll thread: {e}");
-                self.fail_all_conns();
+                self.shutdown_cleanup();
                 return;
             }
             match self.cq.poll(&mut wcs) {
@@ -1070,13 +1431,13 @@ impl PollLoop {
                     for wc in &wcs[..n] {
                         self.dispatch(wc, &mut batch);
                     }
-                    flush_dispatch(&self.dispatch_tx, &mut batch);
+                    self.dispatcher.flush(&mut batch);
                     spin_until = Instant::now() + self.spin;
                     continue;
                 }
                 Err(e) => {
                     tracing::error!("CQ poll failed, stopping RDMA poll thread: {e}");
-                    self.fail_all_conns();
+                    self.shutdown_cleanup();
                     return;
                 }
             }
@@ -1106,7 +1467,7 @@ impl PollLoop {
                 }
                 Err(e) => {
                     tracing::error!("poll(2) failed, stopping RDMA poll thread: {e}");
-                    self.fail_all_conns();
+                    self.shutdown_cleanup();
                     return;
                 }
             }
@@ -1114,55 +1475,72 @@ impl PollLoop {
 
         // Shutdown: connections are dropped here; their buffers return to
         // the pool when the QPs are destroyed.
-        self.fail_all_conns();
+        self.shutdown_cleanup();
     }
 
-    fn drain_cmds(&mut self) -> std::result::Result<(), ()> {
-        loop {
-            match self.cmd_rx.try_recv() {
-                Ok(PollerCmd::Register(reg, budget)) => {
-                    let qp_num = reg.socket.queue_pair.qp_num();
-                    let conn = ConnState::new(*reg, budget);
-                    if self.conns.insert(qp_num, conn).is_some() {
-                        tracing::error!("duplicate RDMA qp_num {qp_num} registered");
-                    }
-                }
-                Err(TryRecvError::Empty) => return Ok(()),
-                Err(TryRecvError::Disconnected) => return Err(()),
+    /// Moves newly registered connections from the shared inbox into their
+    /// slots.
+    fn drain_incoming(&mut self) {
+        if !self.shared.has_incoming.load(Ordering::Acquire) {
+            return;
+        }
+        let drained = {
+            let mut inner = self.shared.inner.lock().unwrap();
+            self.shared.has_incoming.store(false, Ordering::Release);
+            std::mem::take(&mut inner.incoming)
+        };
+        for incoming in drained {
+            let slot = incoming.slot as usize;
+            if self.conns.len() <= slot {
+                self.conns.resize_with(slot + 1, || None);
             }
+            debug_assert!(self.conns[slot].is_none(), "poller slot {slot} occupied");
+            self.conns[slot] = Some(ConnState::new(
+                *incoming.conn,
+                incoming.generation,
+                incoming.budget,
+            ));
         }
     }
 
     fn dispatch(&mut self, wc: &ibv_wc, batch: &mut DispatchBatch) {
-        if let Some(conn) = self.conns.get_mut(&wc.qp_num) {
+        let (slot, generation) = split_tag(wc.wr_id.get_tag());
+        if let Some(Some(conn)) = self.conns.get_mut(slot)
+            && conn.generation == generation
+        {
             conn.handle_wc(wc, batch);
-        } else {
-            self.orphans.push((Instant::now(), *wc));
-        }
-    }
-
-    fn retry_orphans(&mut self, batch: &mut DispatchBatch) {
-        if self.orphans.is_empty() {
             return;
         }
-        let orphans = std::mem::take(&mut self.orphans);
-        for (seen, wc) in orphans {
-            if let Some(conn) = self.conns.get_mut(&wc.qp_num) {
-                conn.handle_wc(&wc, batch);
-            } else if seen.elapsed() < Duration::from_secs(1) {
-                self.orphans.push((seen, wc));
-            } else {
-                tracing::warn!(
-                    "dropping completion for unknown qp_num {}: {:?}",
-                    wc.qp_num,
-                    wc
-                );
-            }
+        // The completion may have raced its connection's registration (the
+        // receive ring is posted before the connection reaches the inbox):
+        // pull the inbox and retry.
+        self.drain_incoming();
+        if let Some(Some(conn)) = self.conns.get_mut(slot)
+            && conn.generation == generation
+        {
+            conn.handle_wc(wc, batch);
+        } else {
+            tracing::warn!(
+                "dropping completion for unknown connection {slot}:{generation}: {wc:?}"
+            );
         }
     }
 
-    fn fail_all_conns(&mut self) {
-        for conn in self.conns.values() {
+    /// Marks shutdown, fails every connection and drains the inbox so no
+    /// registration (with its budget and supervisor guards) is leaked.
+    fn shutdown_cleanup(&mut self) {
+        let drained = {
+            let mut inner = self.shared.inner.lock().unwrap();
+            // Under the same lock registrars check the flag, so after this
+            // section the inbox stays empty forever.
+            self.shared.shutdown.store(true, Ordering::Release);
+            std::mem::take(&mut inner.incoming)
+        };
+        for incoming in &drained {
+            incoming.conn.socket.set_error();
+        }
+        drop(drained);
+        for conn in self.conns.iter().flatten() {
             conn.socket.set_error();
         }
         self.conns.clear();
@@ -1177,9 +1555,18 @@ impl PollLoop {
 ///
 /// A device may run several (shared CQ + poll thread) shards; connections
 /// are assigned round-robin so their completion processing spreads across
-/// cores.
+/// cores. All shards share one [`Dispatcher`] (created with the first
+/// shard), so the pool runs a single fixed set of dispatch worker tasks.
 #[derive(Default)]
-pub struct DevicePollers(Mutex<HashMap<String, DeviceShards, RandomState>>);
+pub struct DevicePollers(Mutex<PollersInner>);
+
+#[derive(Default)]
+struct PollersInner {
+    devices: std::collections::HashMap<String, DeviceShards, RandomState>,
+    /// Shared dispatch worker pool; started lazily so worker tasks only
+    /// exist once RDMA is actually used (and inside a runtime).
+    dispatcher: Option<Dispatcher>,
+}
 
 #[derive(Default)]
 struct DeviceShards {
@@ -1198,8 +1585,12 @@ impl DevicePollers {
     ) -> Result<Arc<DevicePoller>> {
         let name = device.info().name.clone();
         let shard_count = shard_count.max(1) as usize;
-        let mut map = self.0.lock().unwrap();
-        let entry = map.entry(name.clone()).or_default();
+        let mut inner = self.0.lock().unwrap();
+        let dispatcher = inner
+            .dispatcher
+            .get_or_insert_with(|| Dispatcher::start(config.dispatch_workers))
+            .clone();
+        let entry = inner.devices.entry(name.clone()).or_default();
         let index = entry.next % shard_count;
         entry.next = entry.next.wrapping_add(1);
         if let Some(poller) = entry.shards.get(index) {
@@ -1214,6 +1605,7 @@ impl DevicePollers {
             device.context(),
             &format!("{name}.{index}"),
             config,
+            dispatcher,
         )?);
         entry.shards.push(poller.clone());
         Ok(poller)
@@ -1228,6 +1620,8 @@ impl std::fmt::Debug for DevicePollers {
 
 #[cfg(test)]
 mod tests {
+    use ruapc_rdma::WRID;
+
     use super::*;
 
     /// The shared CQ length must be clamped to the device's `max_cqe`:
@@ -1239,11 +1633,70 @@ mod tests {
         let config = PollerConfig {
             cq_len: u32::MAX,
             spin_us: 0,
+            dispatch_workers: 1,
         };
-        let poller = DevicePoller::start(device.context(), "cq-clamp-test", config)
-            .expect("CQ creation must succeed with a clamped length");
+        let poller = DevicePoller::start(
+            device.context(),
+            "cq-clamp-test",
+            config,
+            Dispatcher::start(config.dispatch_workers),
+        )
+        .expect("CQ creation must succeed with a clamped length");
         let max_cqe = device.context().query_device().unwrap().max_cqe;
         assert!(poller.cq_capacity <= u32::try_from(max_cqe.max(1)).unwrap_or(u32::MAX));
         assert!(poller.cq_capacity > 0);
+    }
+
+    #[test]
+    fn test_ring_reservation_accounting() {
+        let total = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (a, after_a) = RingReservation::add(&total, 16);
+        assert_eq!(after_a, 16);
+        let (b, after_b) = RingReservation::add(&total, 32);
+        assert_eq!(after_b, 48);
+        drop(a);
+        assert_eq!(total.load(Ordering::Acquire), 32);
+        drop(b);
+        assert_eq!(total.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn test_conn_tag_roundtrip() {
+        for (slot, generation) in [(0u16, 0u8), (1, 255), (MAX_SLOTS as u16 - 1, 42)] {
+            let tag = conn_tag(slot, generation);
+            assert!(tag <= WRID::TAG_MAX);
+            assert_eq!(split_tag(tag), (slot as usize, generation));
+        }
+    }
+
+    #[test]
+    fn test_for_each_frame_walks_all_frames() {
+        let mut buf = Vec::new();
+        let frames: [&[u8]; 3] = [b"first", b"", b"third-frame"];
+        for frame in frames {
+            buf.extend_from_slice(&u32::try_from(frame.len()).unwrap().to_be_bytes());
+            buf.extend_from_slice(frame);
+        }
+        let mut seen = Vec::new();
+        for_each_frame(&Bytes::from(buf), |frame| seen.push(frame));
+        assert_eq!(seen, frames.map(Bytes::from_static).to_vec());
+    }
+
+    #[test]
+    fn test_for_each_frame_stops_on_truncation() {
+        // Header claims 100 bytes but only 3 follow.
+        let mut buf = 100u32.to_be_bytes().to_vec();
+        buf.extend_from_slice(b"abc");
+        let mut count = 0;
+        for_each_frame(&Bytes::from(buf), |_| count += 1);
+        assert_eq!(count, 0);
+
+        // One valid frame, then a truncated header.
+        let mut buf = 1u32.to_be_bytes().to_vec();
+        buf.extend_from_slice(b"x");
+        buf.extend_from_slice(&[0u8, 0]);
+        let mut count = 0;
+        for_each_frame(&Bytes::from(buf), |_| count += 1);
+        assert_eq!(count, 1);
     }
 }
