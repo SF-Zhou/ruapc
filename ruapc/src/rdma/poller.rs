@@ -386,6 +386,9 @@ pub struct RegisterConn {
     pub supervisor_guard: TaskSupervisorGuard,
     /// Buffer pool bytes pinned by this connection's receive ring.
     pub ring_reservation: RingReservation,
+    /// Keeps the pool's per-device connection count accurate until the
+    /// poll thread tears this connection down.
+    pub conn_count_guard: super::ConnCountGuard,
 }
 
 /// State shared between registrars and the poll thread: the slot
@@ -797,6 +800,7 @@ struct ConnState {
     _budget: BudgetGuard,
     _supervisor_guard: TaskSupervisorGuard,
     _ring_reservation: RingReservation,
+    _conn_count_guard: super::ConnCountGuard,
 }
 
 impl ConnState {
@@ -822,6 +826,7 @@ impl ConnState {
             _budget: budget,
             _supervisor_guard: reg.supervisor_guard,
             _ring_reservation: reg.ring_reservation,
+            _conn_count_guard: reg.conn_count_guard,
         }
     }
 

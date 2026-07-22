@@ -199,6 +199,7 @@ mod tests {
         let pool = UnifiedSocketPool::create(&config, &devices, &buffer_pool).unwrap();
         let (state, _guard) = crate::State::create(crate::Router::default(), &config).unwrap();
         let request = crate::rdma::ConnectRequest {
+            source_device: "test".into(),
             target: crate::rdma::DeviceSelection {
                 device_name: "missing".into(),
                 port_num: 1,

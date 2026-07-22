@@ -160,8 +160,13 @@ impl ActiveDevice {
         MemoryRegion::register(&self.pd, memory, access as _)
     }
 
-    /// Updates device attributes by querying the hardware.
-    pub fn update_attr(&mut self) -> Result<()> {
+    /// Queries the hardware and returns a fresh snapshot of the device
+    /// information (attributes, ports, and usable GIDs).
+    ///
+    /// Unusable GIDs (e.g. RoCE v2 GIDs derived from loopback or link-local
+    /// addresses, see [`crate::is_gid_usable`]) are filtered out at
+    /// collection time and never appear in the returned snapshot.
+    pub fn query_device_info(&self) -> Result<DeviceInfo> {
         let device_attr = self.context.query_device()?;
 
         let mut ports = Vec::with_capacity(device_attr.phys_port_cnt as usize);
@@ -176,27 +181,35 @@ impl ActiveDevice {
             });
         }
 
-        self.info.device_attr = device_attr;
-        self.info.ports = ports;
+        Ok(DeviceInfo {
+            device_attr,
+            ports,
+            ..self.info.clone()
+        })
+    }
 
+    /// Updates the cached device attributes by querying the hardware.
+    pub fn update_attr(&mut self) -> Result<()> {
+        self.info = self.query_device_info()?;
         Ok(())
     }
 
     fn collect_port_gids(&self, port_num: u8, port_attr: &crate::ibv_port_attr) -> Vec<Gid> {
-        let mut gids = Vec::with_capacity(port_attr.gid_tbl_len as usize);
-        for gid_index in 0..port_attr.gid_tbl_len as u16 {
+        // GID indices are exchanged as `u8` during connection negotiation,
+        // so entries beyond index 255 are unusable and not collected.
+        let gid_tbl_len = port_attr.gid_tbl_len.clamp(0, 1 + u8::MAX as i32);
+        let mut gids = Vec::with_capacity(gid_tbl_len as usize);
+        for gid_index in 0..gid_tbl_len {
+            let gid_index = gid_index as u8;
             let Ok(gid) = self.context.query_gid(port_num, gid_index) else {
                 continue;
             };
             if let Ok(gid_type) =
                 self.context
                     .query_gid_type(port_num, gid_index, &self.info.ibdev_path, port_attr)
+                && let Some(gid) = Gid::usable(gid_index, gid, gid_type)
             {
-                gids.push(Gid {
-                    index: gid_index,
-                    gid,
-                    gid_type,
-                })
+                gids.push(gid);
             }
         }
         gids

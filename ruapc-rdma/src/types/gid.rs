@@ -47,6 +47,11 @@ impl ibv_gid {
     pub fn is_null(&self) -> bool {
         self.interface_id() == 0
     }
+
+    /// Checks if the GID is an IPv6 unicast link-local address (`fe80::/10`).
+    pub fn is_unicast_link_local(&self) -> bool {
+        self.as_ipv6().is_unicast_link_local()
+    }
 }
 
 impl std::fmt::Debug for ibv_gid {

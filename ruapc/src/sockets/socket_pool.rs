@@ -162,6 +162,27 @@ pub struct RdmaSocketPoolConfig {
     /// fabric (device matching cannot verify reachability).
     #[serde(default)]
     pub device_filter: Vec<String>,
+    /// If non-empty, only remote RDMA devices whose name is listed are
+    /// considered when selecting a path. Per-request selection is also
+    /// available via `Context::with_rdma_path`.
+    #[serde(default)]
+    pub remote_device_filter: Vec<String>,
+    /// Interval (milliseconds) of the background maintenance task, which
+    /// fails connections on downed local ports, replaces dead stripes,
+    /// and migrates at most one connection per tick towards less loaded
+    /// NIC pairs (make-before-break). The interval is jittered by ±50%
+    /// per process. `0` disables maintenance entirely.
+    #[serde(default = "default_maintenance_interval_ms")]
+    pub maintenance_interval_ms: u64,
+    /// Minimum connection-count improvement required before a connection
+    /// is migrated to another NIC pair; provides hysteresis on top of the
+    /// self-excluding score model. Values below 1 are treated as 1.
+    #[serde(default = "default_rebalance_threshold")]
+    pub rebalance_threshold: u32,
+    /// Grace period (milliseconds) a migrated-away connection stays alive
+    /// after leaving the rotation, so its in-flight responses can arrive.
+    #[serde(default = "default_drain_timeout_ms")]
+    pub drain_timeout_ms: u64,
 }
 
 #[cfg(feature = "rdma")]
@@ -205,6 +226,21 @@ fn default_connections_per_peer() -> u32 {
 }
 
 #[cfg(feature = "rdma")]
+fn default_maintenance_interval_ms() -> u64 {
+    5000
+}
+
+#[cfg(feature = "rdma")]
+fn default_rebalance_threshold() -> u32 {
+    2
+}
+
+#[cfg(feature = "rdma")]
+fn default_drain_timeout_ms() -> u64 {
+    10_000
+}
+
+#[cfg(feature = "rdma")]
 impl Default for RdmaSocketPoolConfig {
     fn default() -> Self {
         Self {
@@ -221,6 +257,10 @@ impl Default for RdmaSocketPoolConfig {
             dispatch_workers: default_dispatch_workers(),
             connections_per_peer: default_connections_per_peer(),
             device_filter: Vec::new(),
+            remote_device_filter: Vec::new(),
+            maintenance_interval_ms: default_maintenance_interval_ms(),
+            rebalance_threshold: default_rebalance_threshold(),
+            drain_timeout_ms: default_drain_timeout_ms(),
         }
     }
 }
@@ -416,6 +456,34 @@ impl SocketPool {
             SocketPool::RDMA(_) => Err(Error::new(
                 ErrorKind::InvalidArgument,
                 "invalid socket type".into(),
+            )),
+        }
+    }
+
+    /// Returns the underlying RDMA socket pool, if this pool has one.
+    #[cfg(feature = "rdma")]
+    pub(crate) fn rdma_pool(&self) -> Option<&RdmaSocketPool> {
+        match self {
+            SocketPool::RDMA(p) => Some(p),
+            SocketPool::UNIFIED(p) => Some(&p.rdma_socket_pool),
+            _ => None,
+        }
+    }
+
+    /// Acquires an RDMA socket to `addr` whose path (NIC pair) matches
+    /// `selector`, establishing one when none exists.
+    #[cfg(feature = "rdma")]
+    pub(crate) async fn acquire_rdma_path(
+        &self,
+        addr: &SocketAddr,
+        selector: &crate::rdma::RdmaPathSelector,
+        state: &Arc<State>,
+    ) -> Result<Socket> {
+        match self.rdma_pool() {
+            Some(pool) => pool.acquire_path(addr, Some(selector), state).await,
+            None => Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "RDMA is not supported: invalid socket type".into(),
             )),
         }
     }
@@ -617,6 +685,7 @@ mod tests {
         let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
         let (state, _guard) = crate::State::create(crate::Router::default(), &config).unwrap();
         let request = crate::rdma::ConnectRequest {
+            source_device: "test".into(),
             target: crate::rdma::DeviceSelection {
                 device_name: "missing".into(),
                 port_num: 1,

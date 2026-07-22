@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use ruapc_bufpool::DeviceIndex;
-use ruapc_rdma::{ActiveDevice, Context, DeviceInfo, Gid, GidType, ProtectionDomain};
+use ruapc_rdma::{ActiveDevice, Context, DeviceInfo, ProtectionDomain};
 
 pub struct RdmaDevice {
     index: DeviceIndex,
@@ -32,57 +32,13 @@ impl RdmaDevice {
         self.info.load_full()
     }
 
+    /// Refreshes the cached device info snapshot from the hardware.
+    ///
+    /// GID filtering (RoCE v2 loopback / link-local) happens at collection
+    /// time inside [`ActiveDevice::query_device_info`].
     pub fn refresh_port_attrs(&self) -> ruapc_rdma::Result<()> {
-        let mut info = (*self.info()).clone();
-        let device_attr = self.inner.context().query_device()?;
-
-        let mut ports = Vec::with_capacity(device_attr.phys_port_cnt as usize);
-        for port_num in 1..=device_attr.phys_port_cnt {
-            let port_attr = self.inner.context().query_port(port_num)?;
-            let gids = self.collect_port_gids(port_num, &port_attr, &info);
-            ports.push(ruapc_rdma::Port {
-                port_num,
-                port_attr,
-                gids,
-            });
-        }
-
-        info.device_attr = device_attr;
-        info.ports = ports;
-        self.info.store(Arc::new(info));
+        self.info.store(Arc::new(self.inner.query_device_info()?));
         Ok(())
-    }
-
-    fn collect_port_gids(
-        &self,
-        port_num: u8,
-        port_attr: &ruapc_rdma::ibv_port_attr,
-        info: &DeviceInfo,
-    ) -> Vec<Gid> {
-        let mut gids = Vec::with_capacity(port_attr.gid_tbl_len as usize);
-        for gid_index in 0..port_attr.gid_tbl_len as u16 {
-            let Ok(gid) = self.inner.context().query_gid(port_num, gid_index) else {
-                continue;
-            };
-            if let Ok(gid_type) = self.inner.context().query_gid_type(
-                port_num,
-                gid_index,
-                &info.ibdev_path,
-                port_attr,
-            ) {
-                // Filter out loopback addresses for RoCE v2 GIDs since they
-                // cannot be used for RDMA communication.
-                if matches!(gid_type, GidType::RoCEv2) && gid.as_ipv6().is_loopback() {
-                    continue;
-                }
-                gids.push(Gid {
-                    index: gid_index,
-                    gid,
-                    gid_type,
-                });
-            }
-        }
-        gids
     }
 }
 

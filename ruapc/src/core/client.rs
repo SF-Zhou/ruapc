@@ -113,10 +113,28 @@ impl Client {
                 let socket_type = self
                     .socket_type
                     .unwrap_or(ctx.state.socket_pool.socket_type());
-                ctx.state
+                #[cfg(feature = "rdma")]
+                let socket = match &ctx.rdma_path {
+                    Some(selector) if socket_type == SocketType::RDMA => {
+                        ctx.state
+                            .socket_pool
+                            .acquire_rdma_path(socket_addr, selector, &ctx.state)
+                            .await?
+                    }
+                    _ => {
+                        ctx.state
+                            .socket_pool
+                            .acquire(socket_addr, socket_type, &ctx.state)
+                            .await?
+                    }
+                };
+                #[cfg(not(feature = "rdma"))]
+                let socket = ctx
+                    .state
                     .socket_pool
                     .acquire(socket_addr, socket_type, &ctx.state)
-                    .await?
+                    .await?;
+                socket
             }
         };
 

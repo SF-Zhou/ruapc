@@ -53,6 +53,10 @@ pub struct Context {
     pub(crate) endpoint: SocketEndpoint,
     /// Message metadata for the current RPC operation.
     pub msg_meta: MsgMeta,
+    /// Optional constraint on the RDMA path (NIC pair) used by requests
+    /// issued through this context. See [`Context::with_rdma_path`].
+    #[cfg(feature = "rdma")]
+    pub(crate) rdma_path: Option<crate::rdma::RdmaPathSelector>,
 }
 
 impl Context {
@@ -69,6 +73,8 @@ impl Context {
             endpoint: SocketEndpoint::Invalid,
             drop_guard: Some(Arc::new(drop_guard)),
             msg_meta: MsgMeta::default(),
+            #[cfg(feature = "rdma")]
+            rdma_path: None,
         })
     }
 
@@ -82,6 +88,7 @@ impl Context {
             endpoint: SocketEndpoint::Address(*addr),
             drop_guard: None,
             msg_meta: MsgMeta::default(),
+            rdma_path: None,
         }
     }
 
@@ -93,7 +100,34 @@ impl Context {
             endpoint: SocketEndpoint::Address(addr),
             drop_guard: self.drop_guard.clone(),
             msg_meta: MsgMeta::default(),
+            #[cfg(feature = "rdma")]
+            rdma_path: self.rdma_path.clone(),
         }
+    }
+
+    /// Constrains RDMA requests issued through this context to
+    /// connections whose path (local NIC, remote NIC) matches `selector`;
+    /// a matching connection is established on demand (and kept pinned:
+    /// it is exempt from automatic rebalancing).
+    ///
+    /// Only affects requests using [`SocketType::RDMA`](crate::SocketType);
+    /// other transports ignore the selector.
+    ///
+    /// ```rust,no_run
+    /// # use ruapc::{Context, RdmaPathSelector, SocketPoolConfig};
+    /// # use std::{net::SocketAddr, str::FromStr};
+    /// let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
+    /// let addr = SocketAddr::from_str("127.0.0.1:8000").unwrap();
+    /// let ctx = ctx
+    ///     .with_addr(addr)
+    ///     .with_rdma_path(RdmaPathSelector::local_device("mlx5_0"));
+    /// ```
+    #[cfg(feature = "rdma")]
+    #[must_use]
+    pub fn with_rdma_path(&self, selector: crate::rdma::RdmaPathSelector) -> Self {
+        let mut ctx = self.clone();
+        ctx.rdma_path = Some(selector);
+        ctx
     }
 
     /// Creates a server-side context with an established socket connection.
@@ -104,6 +138,8 @@ impl Context {
             endpoint: SocketEndpoint::Connected(socket),
             drop_guard: None,
             msg_meta,
+            #[cfg(feature = "rdma")]
+            rdma_path: None,
         }
     }
 

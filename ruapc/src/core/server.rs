@@ -62,6 +62,13 @@ impl Server {
         })
     }
 
+    /// The server's shared state (router, socket pool, buffer pool);
+    /// useful for introspection such as
+    /// [`State::rdma_path_report`](crate::State::rdma_path_report).
+    pub fn state(&self) -> &Arc<State> {
+        &self.state
+    }
+
     /// Stops the server, closing all listeners and connections.
     ///
     /// This method initiates a graceful shutdown by:
