@@ -282,6 +282,7 @@ impl RdmaSocketPool {
                 timeout: std::time::Duration::from_secs(5),
                 use_msgpack: true,
                 socket_type: Some(SocketType::TCP),
+                max_retries: 2,
             },
             task_supervisor,
             pollers: DevicePollers::default(),
@@ -435,7 +436,7 @@ impl RdmaSocketPool {
                 max_recv_wr: config.qp.max_recv_wr,
                 max_send_sge: config.qp.max_send_sge,
                 max_recv_sge: config.qp.max_recv_sge,
-                max_inline_data: config.qp.max_inline_data,
+                max_inline_data: 0,
             },
             ..Default::default()
         };
@@ -1103,7 +1104,6 @@ impl RdmaSocketPool {
                 // capability constrains the other.
                 max_send_sge: local.qp.max_send_sge,
                 max_recv_sge: local.qp.max_recv_sge,
-                max_inline_data: local.qp.max_inline_data.min(remote.qp.max_inline_data),
             },
             cq_len: local.cq_len.min(remote.cq_len),
             recv_queue_len: local.recv_queue_len.min(remote.recv_queue_len),
@@ -1126,7 +1126,6 @@ impl RdmaSocketPool {
                 // regardless of what the initiator requested for itself.
                 max_send_sge: local.qp.max_send_sge,
                 max_recv_sge: local.qp.max_recv_sge,
-                max_inline_data: requested.qp.max_inline_data.min(local.qp.max_inline_data),
             },
             cq_len: requested.cq_len.min(local.cq_len),
             recv_queue_len: requested.recv_queue_len.min(local.recv_queue_len),
@@ -1158,7 +1157,6 @@ impl RdmaSocketPool {
                     .qp
                     .max_recv_sge
                     .min(info.device_attr.max_sge as u32),
-                max_inline_data: self.config.qp.max_inline_data,
             },
             cq_len: self.config.cq_len.min(info.device_attr.max_cqe as u32),
             recv_queue_len: self.config.recv_queue_len,

@@ -130,6 +130,7 @@ async fn stress_test(args: Args) {
                     timeout: Duration::from_secs(5),
                     use_msgpack: args.use_msgpack,
                     socket_type: Some(args.socket_type),
+                    ..Default::default()
                 };
                 for _ in 0..256 {
                     let result = client.echo(&ctx, &value).await;
@@ -185,6 +186,7 @@ async fn bench_test(args: Args) {
                 timeout: Duration::from_secs(5),
                 use_msgpack: args.use_msgpack,
                 socket_type: Some(args.socket_type),
+                ..Default::default()
             };
             let mut fails = 0u64;
             loop {

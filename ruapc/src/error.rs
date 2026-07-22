@@ -55,6 +55,9 @@ pub enum ErrorKind {
     HttpUpgradeFailed,
     /// The connection was closed while requests were still in flight.
     ConnectionClosed,
+    /// The server rejected the request because its in-flight request cap
+    /// was reached (load shedding). Safe to retry after backoff.
+    Overloaded,
     /// The service handler panicked while processing the request.
     HandlerPanic,
     /// Failed to send message over RDMA.

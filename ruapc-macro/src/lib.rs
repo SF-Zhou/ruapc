@@ -148,9 +148,12 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
             // a completed `Context::remote_write` + `SentBuffer::reply`).
             invoke_branchs.push(quote! {
                 let this = self.clone();
-                router.add_method::<#req_type, #rsp_type>(#method_name, Box::new(move |mut ctx, payload| {
+                router.add_method::<#req_type, #rsp_type>(#method_name, Box::new(move |ctx, payload| {
                     let this = this.clone();
-                    ::tokio::spawn(async move {
+                    // `spawn_handler` applies the dispatch policies (load
+                    // shedding, deadline enforcement, cancellation
+                    // registration, metrics) around the handler future.
+                    #krate::spawn_handler(ctx, #method_name, payload, move |mut ctx, payload| async move {
                         match payload.deserialize(&ctx.msg_meta) {
                             Ok(req) => {
                                 // Convert handler panics into error responses;

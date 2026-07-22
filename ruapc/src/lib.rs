@@ -10,12 +10,15 @@ mod msg;
 pub use msg::{Message, MsgFlags, MsgMeta, Payload};
 
 mod core;
-#[doc(hidden)]
-pub use core::{CallPlain, CallWithBuffer, RawCall, RpcCall, catch_handler_panic};
 pub use core::{
-    Client, ClientWithBuffer, Context, Listener, MethodInfo, ResultWithBuffer, Router, SentBuffer,
-    Server, SocketEndpoint, State, WithBuffer,
+    AddrSet, Client, ClientWithBuffer, Context, Listener, MethodInfo, ResultWithBuffer, Router,
+    SentBuffer, Server, SocketEndpoint, State, WithBuffer,
 };
+#[doc(hidden)]
+pub use core::{CallPlain, CallWithBuffer, RawCall, RpcCall, catch_handler_panic, spawn_handler};
+
+mod metrics;
+pub(crate) use metrics::{MethodMetrics, Metrics};
 
 mod task;
 pub(crate) use task::Receiver;

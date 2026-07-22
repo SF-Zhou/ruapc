@@ -29,6 +29,7 @@ hyper.workspace = true
 hyper-tungstenite.workspace = true
 hyper-util.workspace = true
 indexmap.workspace = true
+metrics.workspace = true
 openapiv3.workspace = true
 rmp-serde.workspace = true
 schemars.workspace = true
@@ -48,4 +49,5 @@ libc.workspace = true
 workspace = true
 
 [dev-dependencies]
+metrics-util = "0.20"
 reqwest = { version = "0.12", features = ["json"] }

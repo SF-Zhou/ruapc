@@ -22,6 +22,7 @@ pub enum HttpSocket {
 pub struct StreamSocket {
     sender: mpsc::Sender<Bytes>,
     conn_id: u64,
+    closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl StreamSocket {
@@ -29,6 +30,7 @@ impl StreamSocket {
         Self {
             sender,
             conn_id: crate::task::next_conn_id(),
+            closed: Arc::default(),
         }
     }
 
@@ -40,6 +42,11 @@ impl StreamSocket {
     /// Whether `other` refers to the same underlying connection.
     pub(crate) fn same_socket(&self, other: &Self) -> bool {
         self.conn_id == other.conn_id
+    }
+
+    /// Marks the connection closed; returns `true` exactly once.
+    pub(crate) fn mark_closed(&self) -> bool {
+        !self.closed.swap(true, std::sync::atomic::Ordering::SeqCst)
     }
 }
 

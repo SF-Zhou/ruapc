@@ -29,6 +29,11 @@ use crate::{
 #[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone)]
 pub struct Client {
     /// Timeout duration for RPC requests. Default is 1 second.
+    ///
+    /// The effective per-request budget is the minimum of this value and
+    /// the remaining deadline of the context (for nested RPCs issued while
+    /// handling a request). The budget travels with the request so the
+    /// server can drop work the client no longer waits for.
     #[serde_inline_default(Duration::from_secs(1))]
     #[serde(with = "humantime_serde")]
     pub timeout: Duration,
@@ -40,6 +45,14 @@ pub struct Client {
     /// If None, uses the socket type from the context's socket pool.
     #[serde_inline_default(None)]
     pub socket_type: Option<SocketType>,
+    /// Maximum number of retries for failures that occur *before the
+    /// request reaches the wire* (connection acquire or send-queue
+    /// failures) — always safe, even for non-idempotent methods. With a
+    /// multi-address context (`Context::with_addrs`) each retry moves to
+    /// the next address. Waiting-phase failures (timeout, connection
+    /// closed mid-flight) are never retried automatically. Default is 2.
+    #[serde_inline_default(2u32)]
+    pub max_retries: u32,
 }
 
 impl Default for Client {
@@ -99,17 +112,117 @@ impl Client {
         Rsp: for<'c> Deserialize<'c> + JsonSchema,
         E: std::error::Error + From<crate::Error> + for<'c> Deserialize<'c>,
     {
-        // 1. get socket.
-        let socket = match &ctx.endpoint {
-            SocketEndpoint::Invalid => {
-                return Err(Error::new(
-                    ErrorKind::InvalidArgument,
-                    "client context without address".to_string(),
-                )
-                .into());
+        let metrics = ctx.state.metrics.client_method(method_name);
+        metrics.requests.increment(1);
+        metrics.inflight.increment(1.0);
+        let start = std::time::Instant::now();
+        let result = self
+            .request_inner(ctx, req, read_buffer, write_buffer_slot, method_name)
+            .await;
+        metrics.latency.record(start.elapsed().as_secs_f64());
+        metrics.inflight.decrement(1.0);
+        if result.is_err() {
+            metrics.errors.increment(1);
+        }
+        result
+    }
+
+    async fn request_inner<Req, Rsp, E>(
+        &self,
+        ctx: &Context,
+        req: &Req,
+        read_buffer: Option<&Buffer>,
+        write_buffer_slot: Option<&mut Option<Buffer>>,
+        method_name: &str,
+    ) -> std::result::Result<Rsp, E>
+    where
+        Req: Serialize + JsonSchema,
+        Rsp: for<'c> Deserialize<'c> + JsonSchema,
+        E: std::error::Error + From<crate::Error> + for<'c> Deserialize<'c>,
+    {
+        // Effective budget: the configured timeout, shrunk to the remaining
+        // deadline when issuing a nested RPC from within a handler.
+        let timeout = match ctx.remaining_time() {
+            Some(remaining) => {
+                if remaining.is_zero() {
+                    return Err(Error::new(
+                        ErrorKind::Timeout,
+                        "request deadline already expired".to_string(),
+                    )
+                    .into());
+                }
+                self.timeout.min(remaining)
             }
-            SocketEndpoint::Connected(socket) => socket.clone(),
-            SocketEndpoint::Address(socket_addr) => {
+            None => self.timeout,
+        };
+
+        let mut flags = MsgFlags::IsReq;
+        if self.use_msgpack {
+            flags |= MsgFlags::UseMessagePack;
+        }
+
+        // 1.+2. acquire a socket and send the request, retrying failures
+        // that provably happen before the request reaches the wire. Each
+        // attempt allocates its waiter entry *after* the connection is
+        // established, so connection setup (which can be slow, e.g. RDMA QP
+        // negotiation with path failover) does not consume the budget. A
+        // failed attempt drops its receiver, cleaning the entry up.
+        let addr_base = match &ctx.endpoint {
+            SocketEndpoint::Addresses(set) => set.next_base(),
+            _ => 0,
+        };
+        let mut attempt = 0usize;
+        let receiver = loop {
+            let addr = attempt_addr(ctx, addr_base, attempt)?;
+            let result = self
+                .try_send(ctx, req, read_buffer, method_name, flags, timeout, addr)
+                .await;
+            match result {
+                Ok(receiver) => break receiver,
+                Err(err) => {
+                    if attempt >= self.max_retries as usize {
+                        return Err(err.into());
+                    }
+                    tracing::warn!("attempt {attempt} for {method_name} failed, retrying: {err}");
+                    attempt += 1;
+                }
+            }
+        };
+
+        // 3. recv response (fails with Timeout once the entry expires).
+        let (response, write_buffer) = receiver.recv().await?;
+        // Pass the write buffer to the caller if a slot was provided.
+        if let Some(slot) = write_buffer_slot {
+            *slot = write_buffer;
+        }
+        response.payload.deserialize(&response.meta)?
+    }
+
+    /// One connect + send attempt. Failures here are always safe to retry:
+    /// an error from `acquire` or `send` means the request was never handed
+    /// to the transport.
+    ///
+    /// The waiter entry is allocated between the two phases so that
+    /// connection setup does not eat into the response budget; it is
+    /// returned as a [`Receiver`](crate::Receiver) whose drop (on send
+    /// failure) removes the entry again.
+    #[allow(clippy::too_many_arguments)]
+    async fn try_send<'a, Req>(
+        &self,
+        ctx: &'a Context,
+        req: &Req,
+        read_buffer: Option<&Buffer>,
+        method_name: &str,
+        flags: MsgFlags,
+        timeout: Duration,
+        addr: Option<std::net::SocketAddr>,
+    ) -> std::result::Result<crate::Receiver<'a>, Error>
+    where
+        Req: Serialize + JsonSchema,
+    {
+        let socket = match (&ctx.endpoint, addr) {
+            (SocketEndpoint::Connected(socket), _) => socket.clone(),
+            (_, Some(socket_addr)) => {
                 let socket_type = self
                     .socket_type
                     .unwrap_or(ctx.state.socket_pool.socket_type());
@@ -118,13 +231,13 @@ impl Client {
                     Some(selector) if socket_type == SocketType::RDMA => {
                         ctx.state
                             .socket_pool
-                            .acquire_rdma_path(socket_addr, selector, &ctx.state)
+                            .acquire_rdma_path(&socket_addr, selector, &ctx.state)
                             .await?
                     }
                     _ => {
                         ctx.state
                             .socket_pool
-                            .acquire(socket_addr, socket_type, &ctx.state)
+                            .acquire(&socket_addr, socket_type, &ctx.state)
                             .await?
                     }
                 };
@@ -132,17 +245,12 @@ impl Client {
                 let socket = ctx
                     .state
                     .socket_pool
-                    .acquire(socket_addr, socket_type, &ctx.state)
+                    .acquire(&socket_addr, socket_type, &ctx.state)
                     .await?;
                 socket
             }
+            _ => unreachable!("attempt_addr rejects endpoints without an address"),
         };
-
-        // 2. send request.
-        let mut flags = MsgFlags::IsReq;
-        if self.use_msgpack {
-            flags |= MsgFlags::UseMessagePack;
-        }
 
         // Extract buffer info if a read buffer is provided.
         let buffer_info = if let Some(buf) = read_buffer {
@@ -155,24 +263,43 @@ impl Client {
             None
         };
 
-        // The waiter entry expires after `self.timeout` (coarse, swept
+        // The waiter entry expires after `timeout` (coarse, swept
         // periodically); no per-request timer is registered.
-        let (msgid, receiver) = ctx.state.waiter.alloc(self.timeout);
+        let (msgid, receiver) = ctx.state.waiter.alloc(timeout);
         let mut meta = MsgMeta {
             method: method_name.into(),
             flags,
             msgid,
             buffer_info,
+            // Ship the *effective* budget so the whole downstream call
+            // tree inherits the shrunk deadline.
+            timeout_ms: Some(u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX)),
         };
         socket.send(&mut meta, req, &ctx.state).await?;
+        Ok(receiver)
+    }
+}
 
-        // 3. recv response (fails with Timeout once the entry expires).
-        let (response, write_buffer) = receiver.recv().await?;
-        // Pass the write buffer to the caller if a slot was provided.
-        if let Some(slot) = write_buffer_slot {
-            *slot = write_buffer;
-        }
-        response.payload.deserialize(&response.meta)?
+/// Resolves the target address for the `attempt`-th try, or `None` for an
+/// already-connected endpoint.
+fn attempt_addr(
+    ctx: &Context,
+    base: usize,
+    attempt: usize,
+) -> std::result::Result<Option<std::net::SocketAddr>, Error> {
+    match &ctx.endpoint {
+        SocketEndpoint::Invalid => Err(Error::new(
+            ErrorKind::InvalidArgument,
+            "client context without address".to_string(),
+        )),
+        SocketEndpoint::Connected(_) => Ok(None),
+        SocketEndpoint::Address(addr) => Ok(Some(*addr)),
+        SocketEndpoint::Addresses(set) => set.pick(base, attempt).map(Some).ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidArgument,
+                "client context with empty address set".to_string(),
+            )
+        }),
     }
 }
 
@@ -266,6 +393,7 @@ mod tests {
             timeout: Duration::from_millis(500),
             use_msgpack: false,
             socket_type: Some(SocketType::TCP),
+            max_retries: 4,
         };
         let json = serde_json::to_string(&client).unwrap();
         let recovered: Client = serde_json::from_str(&json).unwrap();

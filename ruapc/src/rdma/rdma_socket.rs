@@ -85,6 +85,8 @@ pub struct RdmaSocket {
     pub(crate) max_msg_size: usize,
     /// The (local NIC, remote NIC) pair this connection runs on.
     pub(crate) path: RdmaPathInfo,
+    /// Process-wide unique connection id (see [`crate::task::next_conn_id`]).
+    pub(crate) conn_id: u64,
 }
 
 impl RdmaSocket {
@@ -106,6 +108,7 @@ impl RdmaSocket {
             poller_waker,
             max_msg_size,
             path,
+            conn_id: crate::task::next_conn_id(),
         }
     }
 
@@ -235,9 +238,15 @@ impl SocketTrait for RdmaSocket {
         &self,
         meta: &mut MsgMeta,
         payload: &P,
-        _: &Arc<State>,
+        state: &Arc<State>,
     ) -> Result<()> {
         let buf = self.serialize_msg(meta, payload)?;
+
+        // Bind the pending request to this connection so it fails eagerly
+        // if the connection dies before the response arrives.
+        if meta.is_req() {
+            state.waiter.bind_connection(meta.msgid, self.conn_id);
+        }
 
         match self.state.try_acquire() {
             SendPermit::Granted { window_tail } => {

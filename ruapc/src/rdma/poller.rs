@@ -805,6 +805,7 @@ struct ConnState {
 
 impl ConnState {
     fn new(reg: RegisterConn, generation: u8, budget: BudgetGuard) -> Self {
+        reg.state.metrics.connection_opened("RDMA");
         Self {
             generation,
             recv: RecvStats {
@@ -1404,6 +1405,18 @@ impl PollLoop {
                         tracing::error!("flow control update error: {e}");
                     }
                     if conn.ready_to_remove() {
+                        // Eagerly fail requests waiting on this connection
+                        // and abort handlers serving its peer; all involved
+                        // structures are runtime-agnostic, safe to touch
+                        // from the poll thread.
+                        conn.state.metrics.connection_closed("RDMA");
+                        conn.state.connection_closed(
+                            conn.socket.conn_id,
+                            &Error::new(
+                                ErrorKind::ConnectionClosed,
+                                "rdma connection closed".into(),
+                            ),
+                        );
                         // Drop the connection before recycling its slot so
                         // no new occupant can race its teardown.
                         self.conns[slot] = None;

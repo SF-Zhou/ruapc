@@ -116,6 +116,7 @@ impl TcpSocketPool {
         let (recv_stream, send_stream) = stream.into_split();
         let (sender, receiver) = mpsc::channel(1024);
         let tcp_socket = TcpSocket::new(sender);
+        state.metrics.connection_opened("TCP");
 
         let task_supervisor = self.task_supervisor.start_async_task();
         tokio::spawn({
@@ -165,6 +166,11 @@ impl TcpSocketPool {
         state: &Arc<State>,
         err: &Error,
     ) {
+        // The send and recv loops both report failures; run teardown once.
+        if !socket.mark_closed() {
+            return;
+        }
+        state.metrics.connection_closed("TCP");
         {
             let mut socket_map = socket_map.write().await;
             // Identity check: don't evict a replacement connection.
@@ -178,7 +184,7 @@ impl TcpSocketPool {
             ErrorKind::ConnectionClosed,
             format!("connection to {addr} closed: {err}"),
         );
-        state.waiter.fail_connection(socket.conn_id(), &err);
+        state.connection_closed(socket.conn_id(), &err);
     }
 
     fn parse_message(buffer: &mut BytesMut) -> Result<Option<Bytes>> {
