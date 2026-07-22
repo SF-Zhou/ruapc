@@ -1,48 +1,37 @@
-use ruapc_rdma::{GidType, LinkLayer, ibv_gid, ibv_mtu, ibv_port_state};
+use ruapc_rdma::{Gid, LinkLayer};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{Context, RdmaQueuePairConfig, Result, rdma, service};
 
-/// Minimal port information for RDMA connection negotiation.
+/// Port information advertised for RDMA connection negotiation.
+///
+/// Deliberately kept independent of the `ibv_*` structures generated from
+/// the ibverbs headers: it carries exactly the fields the peer needs to
+/// select a port/GID pair, nothing else. Only usable ports (active, with an
+/// InfiniBand or Ethernet link layer) are advertised, so no port state
+/// travels on the wire.
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
 pub struct RdmaPortInfo {
     /// Port number (1-based).
     pub port_num: u8,
-    /// Port state (active, down, etc.).
-    pub state: ibv_port_state,
     /// Link layer type (InfiniBand or Ethernet).
     pub link_layer: LinkLayer,
-    /// Active MTU for the port.
-    pub active_mtu: ibv_mtu,
-    /// Local Identifier for InfiniBand routing.
-    pub lid: u16,
-    /// Available GIDs for this port.
-    pub gids: Vec<RdmaGidInfo>,
+    /// Usable GIDs of this port (filtered at collection time).
+    pub gids: Vec<Gid>,
 }
 
-/// Minimal GID information for RDMA connection negotiation.
-#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
-pub struct RdmaGidInfo {
-    /// GID index on the port.
-    pub index: u16,
-    /// The GID value.
-    pub gid: ibv_gid,
-    /// The type of this GID.
-    pub gid_type: GidType,
-}
-
-/// Minimal RDMA device information for connection negotiation.
-///
-/// Contains only the fields needed to establish an RDMA connection,
-/// without heavy metadata like device_attr or ibdev_path.
+/// RDMA device information for connection negotiation.
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
 pub struct RdmaDeviceInfo {
     /// Device name (e.g., "mlx5_0").
     pub name: String,
+    /// Live RDMA connections (outbound + inbound) currently on this device.
+    /// Advertised so that clients can prefer less-loaded server NICs.
+    pub active_connections: u32,
     /// Server-advertised per-connection RDMA resource limits for this device.
     pub connection: rdma::RdmaConnectionConfig,
-    /// Available ports on this device.
+    /// Usable ports on this device.
     pub ports: Vec<RdmaPortInfo>,
 }
 
@@ -58,19 +47,30 @@ pub struct RdmaInfo {
 }
 
 impl RdmaInfo {
-    /// Build `RdmaInfo` from the full device info list, filtering out
-    /// loopback GIDs for RoCE v2 since they cannot be used for communication.
+    /// Build `RdmaInfo` from the full device info list.
+    ///
+    /// Only usable ports are advertised. GIDs unusable for communication
+    /// (RoCE v2 GIDs derived from loopback or IPv6 link-local addresses)
+    /// are already filtered out at collection time.
     pub(crate) fn from_devices(
         devices: &[super::RdmaDevice],
         config: &crate::RdmaSocketPoolConfig,
+        conn_counts: &[std::sync::atomic::AtomicUsize],
     ) -> Self {
         RdmaInfo {
             devices: devices
                 .iter()
-                .map(|d| {
+                .enumerate()
+                .map(|(index, d)| {
                     let info = d.info();
                     RdmaDeviceInfo {
                         name: info.name.clone(),
+                        active_connections: conn_counts
+                            .get(index)
+                            .map(|c| c.load(std::sync::atomic::Ordering::Acquire))
+                            .unwrap_or(0)
+                            .try_into()
+                            .unwrap_or(u32::MAX),
                         connection: rdma::RdmaConnectionConfig {
                             qp: RdmaQueuePairConfig {
                                 max_send_wr: config
@@ -98,26 +98,11 @@ impl RdmaInfo {
                         ports: info
                             .ports
                             .iter()
+                            .filter(|port| port.is_usable())
                             .map(|port| RdmaPortInfo {
                                 port_num: port.port_num,
-                                state: port.port_attr.state,
                                 link_layer: port.port_attr.link_layer,
-                                active_mtu: port.port_attr.active_mtu,
-                                lid: port.port_attr.lid,
-                                gids: port
-                                    .gids
-                                    .iter()
-                                    .filter(|gid| {
-                                        // Filter out loopback addresses for RoCE v2
-                                        !(matches!(gid.gid_type, GidType::RoCEv2)
-                                            && gid.gid.as_ipv6().is_loopback())
-                                    })
-                                    .map(|gid| RdmaGidInfo {
-                                        index: gid.index,
-                                        gid: gid.gid,
-                                        gid_type: gid.gid_type.clone(),
-                                    })
-                                    .collect(),
+                                gids: port.gids.clone(),
                             })
                             .collect(),
                     }
@@ -199,6 +184,7 @@ mod tests {
         };
         let request = rdma::ConnectRequest {
             endpoint,
+            source_device: "test".into(),
             target: rdma::DeviceSelection {
                 device_name: "missing".into(),
                 port_num: 1,

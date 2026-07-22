@@ -60,7 +60,7 @@ impl Context {
     }
 
     /// Queries a GID for the specified port and index.
-    pub fn query_gid(&self, port_num: u8, gid_index: u16) -> Result<crate::ibv_gid> {
+    pub fn query_gid(&self, port_num: u8, gid_index: u8) -> Result<crate::ibv_gid> {
         let mut gid = crate::ibv_gid::default();
         let ret =
             unsafe { crate::ibv_query_gid(self.ptr, port_num as _, gid_index as _, &mut gid) };
@@ -75,7 +75,7 @@ impl Context {
     pub fn query_gid_type(
         &self,
         port_num: u8,
-        gid_index: u16,
+        gid_index: u8,
         ibdev_path: &Path,
         port_attr: &crate::ibv_port_attr,
     ) -> Result<GidType> {

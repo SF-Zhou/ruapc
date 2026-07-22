@@ -63,6 +63,9 @@ pub struct RdmaConnectionConfig {
 pub struct ConnectRequest {
     /// Client endpoint to connect with.
     pub endpoint: Endpoint,
+    /// Name of the client-side RDMA device this connection originates
+    /// from; gives the server full path (NIC pair) visibility.
+    pub source_device: String,
     /// Server device/port/GID that should accept this connection.
     pub target: DeviceSelection,
     /// Queue Pair settings negotiated by the client for this connection.

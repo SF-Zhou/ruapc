@@ -137,6 +137,24 @@ impl State {
     pub(crate) fn drop_guard(&self) -> DropGuard {
         self.socket_pool.drop_guard()
     }
+
+    /// Snapshot of every live RDMA connection with its path (local NIC,
+    /// remote NIC) and the per-device connection counts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidArgument`](crate::ErrorKind::InvalidArgument)
+    /// when the socket pool has no RDMA support (not an RDMA/UNIFIED pool).
+    #[cfg(feature = "rdma")]
+    pub async fn rdma_path_report(&self) -> Result<crate::RdmaPathReport> {
+        match self.socket_pool.rdma_pool() {
+            Some(pool) => Ok(pool.path_report().await),
+            None => Err(crate::Error::new(
+                crate::ErrorKind::InvalidArgument,
+                "RDMA is not supported: invalid socket type".into(),
+            )),
+        }
+    }
 }
 
 impl std::fmt::Debug for State {

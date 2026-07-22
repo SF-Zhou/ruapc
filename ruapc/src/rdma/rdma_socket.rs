@@ -5,7 +5,7 @@ use ruapc_rdma::{QueuePair, WRID, ibv_send_flags, ibv_wc_status};
 use serde::Serialize;
 use tokio::sync::mpsc::Sender;
 
-use super::{RdmaState, SendPermit};
+use super::{RdmaPathInfo, RdmaState, SendPermit};
 use crate::{
     Buffer, BufferPool, Context, Error, RemoteIoError, RemoteReadOptions, SocketTrait, State,
     error::{ErrorKind, Result},
@@ -83,6 +83,8 @@ pub struct RdmaSocket {
     /// Negotiated maximum serialized message size (= the peer's receive
     /// buffer size).
     pub(crate) max_msg_size: usize,
+    /// The (local NIC, remote NIC) pair this connection runs on.
+    pub(crate) path: RdmaPathInfo,
 }
 
 impl RdmaSocket {
@@ -93,6 +95,7 @@ impl RdmaSocket {
         poller_waker: PollerWaker,
         max_msg_size: usize,
         send_window: u32,
+        path: RdmaPathInfo,
     ) -> Self {
         Self {
             rdma_completions: dashmap::DashMap::default(),
@@ -102,6 +105,7 @@ impl RdmaSocket {
             pending_sender,
             poller_waker,
             max_msg_size,
+            path,
         }
     }
 
