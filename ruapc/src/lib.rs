@@ -11,7 +11,7 @@ pub use msg::{Message, MsgFlags, MsgMeta, Payload};
 
 mod core;
 #[doc(hidden)]
-pub use core::{CallPlain, CallWithBuffer, RawCall, RpcCall};
+pub use core::{CallPlain, CallWithBuffer, RawCall, RpcCall, catch_handler_panic};
 pub use core::{
     Client, ClientWithBuffer, Context, Listener, MethodInfo, ResultWithBuffer, Router, SentBuffer,
     Server, SocketEndpoint, State, WithBuffer,

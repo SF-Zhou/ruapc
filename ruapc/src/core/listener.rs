@@ -63,6 +63,7 @@ impl Listener {
                 () = async {
                     tracing::info!("start listening: {listener_addr}");
                     while let Ok((stream, addr)) = listener.accept().await {
+                        crate::sockets::tcp::configure_stream(&stream);
                         tokio::spawn(state.clone().handle_new_stream(RawStream::TCP(stream), addr));
                     }
                 } => {}

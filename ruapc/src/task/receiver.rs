@@ -1,6 +1,9 @@
 use tokio::sync::oneshot;
 
-use crate::{Error, ErrorKind, Result, WaiterCleaner, task::waiter::WaiterResponse};
+use crate::{
+    Error, ErrorKind, Result, WaiterCleaner,
+    task::waiter::{WaiterResponse, WaiterResult},
+};
 
 /// Internal receiver for RPC response messages.
 ///
@@ -10,7 +13,7 @@ pub enum Receiver<'a> {
     /// No receiver (placeholder state).
     None,
     /// Active oneshot receiver with cleanup guard.
-    OneShotRx(oneshot::Receiver<WaiterResponse>, WaiterCleaner<'a>),
+    OneShotRx(oneshot::Receiver<WaiterResult>, WaiterCleaner<'a>),
 }
 
 impl Receiver<'_> {
@@ -29,8 +32,13 @@ impl Receiver<'_> {
             Receiver::None => Err(Error::kind(ErrorKind::InvalidArgument)),
             Receiver::OneShotRx(rx, cleaner) => {
                 // A dropped sender means the waiter entry vanished without a
-                // response — most commonly the coarse expiry sweep.
-                let result = rx.await.map_err(|_| Error::kind(ErrorKind::Timeout));
+                // response — most commonly the coarse expiry sweep. An
+                // explicit `Err` is an eager failure (e.g. the connection
+                // carrying the request was closed).
+                let result = match rx.await {
+                    Ok(waiter_result) => waiter_result,
+                    Err(_) => Err(Error::kind(ErrorKind::Timeout)),
+                };
                 std::mem::forget(cleaner);
                 result
             }

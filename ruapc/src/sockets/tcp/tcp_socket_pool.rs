@@ -91,6 +91,7 @@ impl SocketPoolTrait for TcpSocketPool {
         let stream = TcpStream::connect(addr)
             .await
             .map_err(|e| Error::new(ErrorKind::TcpConnectFailed, e.to_string()))?;
+        super::configure_stream(&stream);
 
         let send_socket = self.add_socket(*addr, stream, state);
         socket_map.insert(*addr, send_socket.clone());
@@ -114,17 +115,8 @@ impl TcpSocketPool {
     ) -> TcpSocket {
         let (recv_stream, send_stream) = stream.into_split();
         let (sender, receiver) = mpsc::channel(1024);
-        let task_supervisor = self.task_supervisor.start_async_task();
-        tokio::spawn({
-            async move {
-                tokio::select! {
-                    () = task_supervisor.stopped() => {},
-                    _ = Self::start_send_loop(send_stream, receiver) => {}
-                }
-            }
-        });
-
         let tcp_socket = TcpSocket::new(sender);
+
         let task_supervisor = self.task_supervisor.start_async_task();
         tokio::spawn({
             let socket_map = self.socket_map.clone();
@@ -133,17 +125,60 @@ impl TcpSocketPool {
             async move {
                 tokio::select! {
                     () = task_supervisor.stopped() => {},
-                    r = Self::start_recv_loop(recv_stream, tcp_socket, &state) => {
+                    r = Self::start_send_loop(send_stream, receiver) => {
                         if let Err(e) = r {
-                            tracing::error!("recv loop for {addr} failed: {e}");
-                            let mut socket_map = socket_map.write().await;
-                            socket_map.remove(&addr);
+                            tracing::error!("send loop for {addr} failed: {e}");
+                            Self::evict_socket(&socket_map, &addr, &tcp_socket, &state, &e).await;
                         }
                     }
                 }
             }
         });
+
+        let task_supervisor = self.task_supervisor.start_async_task();
+        tokio::spawn({
+            let socket_map = self.socket_map.clone();
+            let tcp_socket = tcp_socket.clone();
+            let state = state.clone();
+            async move {
+                tokio::select! {
+                    () = task_supervisor.stopped() => {},
+                    r = Self::start_recv_loop(recv_stream, tcp_socket.clone(), &state) => {
+                        let e = r.err().unwrap_or_else(|| {
+                            Error::new(ErrorKind::ConnectionClosed, "connection closed".into())
+                        });
+                        tracing::error!("recv loop for {addr} failed: {e}");
+                        Self::evict_socket(&socket_map, &addr, &tcp_socket, &state, &e).await;
+                    }
+                }
+            }
+        });
         tcp_socket
+    }
+
+    /// Removes a dead socket from the map (if it is still the mapped one)
+    /// and eagerly fails every request pending on the connection.
+    async fn evict_socket(
+        socket_map: &Arc<RwLock<HashMap<SocketAddr, TcpSocket, RandomState>>>,
+        addr: &SocketAddr,
+        socket: &TcpSocket,
+        state: &Arc<State>,
+        err: &Error,
+    ) {
+        {
+            let mut socket_map = socket_map.write().await;
+            // Identity check: don't evict a replacement connection.
+            if let Some(existing) = socket_map.get(addr)
+                && existing.same_socket(socket)
+            {
+                socket_map.remove(addr);
+            }
+        }
+        let err = Error::new(
+            ErrorKind::ConnectionClosed,
+            format!("connection to {addr} closed: {err}"),
+        );
+        state.waiter.fail_connection(socket.conn_id(), &err);
     }
 
     fn parse_message(buffer: &mut BytesMut) -> Result<Option<Bytes>> {
