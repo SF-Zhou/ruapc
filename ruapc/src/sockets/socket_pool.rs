@@ -74,6 +74,11 @@ pub struct SocketPoolConfig {
     /// buffers, and in-flight sends allocate from the same pool.
     #[serde_inline_default(0usize)]
     pub buffer_pool_memory: usize,
+    /// Maximum number of server-side requests processed concurrently;
+    /// excess requests are rejected immediately with an `Overloaded` error
+    /// response (load shedding). `0` disables the cap.
+    #[serde_inline_default(0usize)]
+    pub max_inflight_requests: usize,
     /// RDMA-specific connection and Queue Pair settings.
     #[cfg(feature = "rdma")]
     #[serde(default)]
@@ -273,7 +278,6 @@ pub struct RdmaQueuePairConfig {
     pub max_recv_wr: u32,
     pub max_send_sge: u32,
     pub max_recv_sge: u32,
-    pub max_inline_data: u32,
 }
 
 #[cfg(feature = "rdma")]
@@ -288,7 +292,6 @@ impl Default for RdmaQueuePairConfig {
             // device's `max_sge` at connection setup.
             max_send_sge: 16,
             max_recv_sge: 1,
-            max_inline_data: 0,
         }
     }
 }

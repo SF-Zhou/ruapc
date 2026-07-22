@@ -164,6 +164,11 @@ impl Waiter {
         self.id_map.contains_key(&msgid)
     }
 
+    /// Number of requests currently waiting for a response.
+    pub fn pending_count(&self) -> usize {
+        self.id_map.len()
+    }
+
     /// Stores a write buffer for a pending request.
     ///
     /// Called by `MemoryService` handlers when the server performs a
@@ -202,6 +207,7 @@ impl Waiter {
     pub fn spawn_sweeper(self: &std::sync::Arc<Self>) {
         let weak = std::sync::Arc::downgrade(self);
         tokio::spawn(async move {
+            let pending = metrics::gauge!("ruapc_waiter_pending");
             let mut interval = tokio::time::interval(Self::SWEEP_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
@@ -210,6 +216,8 @@ impl Waiter {
                     break;
                 };
                 waiter.expire(Instant::now());
+                #[allow(clippy::cast_precision_loss)]
+                pending.set(waiter.pending_count() as f64);
             }
         });
     }

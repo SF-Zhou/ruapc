@@ -194,12 +194,14 @@ impl HttpSocketPool {
             }
         }
 
-        let (msgid, rx) = state.waiter.alloc(std::time::Duration::from_secs(30));
+        const UNARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        let (msgid, rx) = state.waiter.alloc(UNARY_TIMEOUT);
         let meta = MsgMeta {
             method: req.uri().path().trim_start_matches('/').to_string(),
             flags: MsgFlags::IsReq,
             msgid,
             buffer_info: None,
+            timeout_ms: Some(u32::try_from(UNARY_TIMEOUT.as_millis()).unwrap_or(u32::MAX)),
         };
         // Cap the request body at the wire-format message limit; an
         // unauthenticated POST must not be able to buffer unbounded data.
@@ -251,6 +253,7 @@ impl HttpSocketPool {
         let (tx, rx) = mpsc::channel::<Bytes>(1024);
         let stream_socket = StreamSocket::new(tx);
         let socket_for_recv = Socket::HTTP(HttpSocket::Stream(stream_socket.clone()));
+        state.metrics.connection_opened("HTTP");
 
         // Spawn recv loop: read framed messages from the request body.
         tokio::spawn({
@@ -262,12 +265,16 @@ impl HttpSocketPool {
                     tracing::error!("http rpc recv loop for {addr} failed: {e}");
                 }
                 // The stream ended: eagerly fail requests (e.g. reverse
-                // RPCs) still pending on this connection.
-                let err = Error::new(
-                    ErrorKind::ConnectionClosed,
-                    format!("http stream from {addr} closed: {:?}", r.err()),
-                );
-                state.waiter.fail_connection(stream_socket.conn_id(), &err);
+                // RPCs) still pending on this connection and abort
+                // handlers still serving its requests.
+                if stream_socket.mark_closed() {
+                    state.metrics.connection_closed("HTTP");
+                    let err = Error::new(
+                        ErrorKind::ConnectionClosed,
+                        format!("http stream from {addr} closed: {:?}", r.err()),
+                    );
+                    state.connection_closed(stream_socket.conn_id(), &err);
+                }
             }
         });
 
@@ -343,6 +350,7 @@ impl HttpSocketPool {
         // Create the socket for sending messages.
         let stream_socket = StreamSocket::new(req_tx);
         let socket = HttpSocket::Stream(stream_socket.clone());
+        state.metrics.connection_opened("HTTP");
 
         // Spawn recv loop on the response body. When it exits — error or
         // clean end of stream — evict the socket from the pool and eagerly
@@ -356,6 +364,10 @@ impl HttpSocketPool {
             if let Err(e) = &r {
                 tracing::error!("http rpc client recv loop for {addr} failed: {e}");
             }
+            if !stream_socket.mark_closed() {
+                return;
+            }
+            state.metrics.connection_closed("HTTP");
             {
                 let mut socket_map = socket_map.write().await;
                 // Identity check: don't evict a replacement connection.
@@ -369,7 +381,7 @@ impl HttpSocketPool {
                 ErrorKind::ConnectionClosed,
                 format!("http connection to {addr} closed: {:?}", r.err()),
             );
-            state.waiter.fail_connection(stream_socket.conn_id(), &err);
+            state.connection_closed(stream_socket.conn_id(), &err);
         });
 
         Ok(socket)

@@ -139,6 +139,7 @@ impl WebSocketPool {
         let (send_stream, recv_stream) = stream.split();
         let (sender, receiver) = mpsc::channel(1024);
         let web_socket = WebSocket::new(sender);
+        state.metrics.connection_opened("WS");
 
         let task_supervisor = self.task_supervisor.start_async_task();
         tokio::spawn({
@@ -188,6 +189,11 @@ impl WebSocketPool {
         state: &Arc<State>,
         err: &Error,
     ) {
+        // The send and recv loops both report failures; run teardown once.
+        if !socket.mark_closed() {
+            return;
+        }
+        state.metrics.connection_closed("WS");
         {
             let mut socket_map = socket_map.write().await;
             // Identity check: don't evict a replacement connection.
@@ -201,7 +207,7 @@ impl WebSocketPool {
             ErrorKind::ConnectionClosed,
             format!("connection to {addr} closed: {err}"),
         );
-        state.waiter.fail_connection(socket.conn_id(), &err);
+        state.connection_closed(socket.conn_id(), &err);
     }
 
     async fn start_recv_loop<S>(

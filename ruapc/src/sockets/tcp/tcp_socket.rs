@@ -14,6 +14,7 @@ use crate::{
 pub struct TcpSocket {
     stream: mpsc::Sender<Bytes>,
     conn_id: u64,
+    closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TcpSocket {
@@ -21,6 +22,7 @@ impl TcpSocket {
         Self {
             stream,
             conn_id: crate::task::next_conn_id(),
+            closed: Arc::default(),
         }
     }
 
@@ -32,6 +34,12 @@ impl TcpSocket {
     /// Whether `other` refers to the same underlying connection.
     pub(crate) fn same_socket(&self, other: &Self) -> bool {
         self.conn_id == other.conn_id
+    }
+
+    /// Marks the connection closed; returns `true` exactly once (the send
+    /// and recv loops both report failures — teardown must run once).
+    pub(crate) fn mark_closed(&self) -> bool {
+        !self.closed.swap(true, std::sync::atomic::Ordering::SeqCst)
     }
 }
 

@@ -25,6 +25,44 @@ pub enum SocketEndpoint {
     Connected(Socket),
     /// A socket address to establish a connection to.
     Address(SocketAddr),
+    /// Several equivalent server addresses; requests pick one round-robin
+    /// and connect-phase retries fail over to the next.
+    Addresses(Arc<AddrSet>),
+}
+
+/// A set of equivalent server addresses with a round-robin cursor.
+#[derive(Debug)]
+pub struct AddrSet {
+    addrs: Vec<SocketAddr>,
+    cursor: std::sync::atomic::AtomicUsize,
+}
+
+impl AddrSet {
+    /// Creates an address set. Empty sets are permitted but every request
+    /// through them fails with `InvalidArgument`.
+    #[must_use]
+    pub fn new(addrs: Vec<SocketAddr>) -> Self {
+        Self {
+            addrs,
+            cursor: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Address for the `attempt`-th try of one request: the first attempt
+    /// advances the round-robin cursor, retries move to subsequent
+    /// addresses.
+    pub(crate) fn pick(&self, base: usize, attempt: usize) -> Option<SocketAddr> {
+        if self.addrs.is_empty() {
+            return None;
+        }
+        Some(self.addrs[(base + attempt) % self.addrs.len()])
+    }
+
+    /// Reserves a starting position for a new request.
+    pub(crate) fn next_base(&self) -> usize {
+        self.cursor
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// RPC context carrying request metadata and connection information.
@@ -53,6 +91,10 @@ pub struct Context {
     pub(crate) endpoint: SocketEndpoint,
     /// Message metadata for the current RPC operation.
     pub msg_meta: MsgMeta,
+    /// Deadline of the request being handled, derived from the client's
+    /// `timeout_ms` budget on arrival. `None` when the request carries no
+    /// budget (or for client-created contexts).
+    pub(crate) deadline: Option<std::time::Instant>,
     /// Optional constraint on the RDMA path (NIC pair) used by requests
     /// issued through this context. See [`Context::with_rdma_path`].
     #[cfg(feature = "rdma")]
@@ -73,6 +115,7 @@ impl Context {
             endpoint: SocketEndpoint::Invalid,
             drop_guard: Some(Arc::new(drop_guard)),
             msg_meta: MsgMeta::default(),
+            deadline: None,
             #[cfg(feature = "rdma")]
             rdma_path: None,
         })
@@ -88,11 +131,15 @@ impl Context {
             endpoint: SocketEndpoint::Address(*addr),
             drop_guard: None,
             msg_meta: MsgMeta::default(),
+            deadline: None,
             rdma_path: None,
         }
     }
 
     /// Creates a new context with the specified target address.
+    ///
+    /// The deadline (if any) is inherited: nested RPCs issued while handling
+    /// a request keep the caller's remaining time budget.
     #[must_use]
     pub fn with_addr(&self, addr: SocketAddr) -> Self {
         Self {
@@ -100,9 +147,52 @@ impl Context {
             endpoint: SocketEndpoint::Address(addr),
             drop_guard: self.drop_guard.clone(),
             msg_meta: MsgMeta::default(),
+            deadline: self.deadline,
             #[cfg(feature = "rdma")]
             rdma_path: self.rdma_path.clone(),
         }
+    }
+
+    /// Creates a new context that load-balances across several addresses.
+    ///
+    /// Each request picks the next address round-robin; when an attempt
+    /// fails before the request reaches the wire (connect or send failure),
+    /// the retry moves on to the following address (see
+    /// [`Client::max_retries`](crate::Client::max_retries)).
+    #[must_use]
+    pub fn with_addrs(&self, addrs: Vec<SocketAddr>) -> Self {
+        Self {
+            state: self.state.clone(),
+            endpoint: SocketEndpoint::Addresses(Arc::new(AddrSet::new(addrs))),
+            drop_guard: self.drop_guard.clone(),
+            msg_meta: MsgMeta::default(),
+            deadline: self.deadline,
+            #[cfg(feature = "rdma")]
+            rdma_path: self.rdma_path.clone(),
+        }
+    }
+
+    /// Deadline of the request being handled, if the client sent a time
+    /// budget.
+    #[must_use]
+    pub fn deadline(&self) -> Option<std::time::Instant> {
+        self.deadline
+    }
+
+    /// Remaining time budget of the request being handled. Returns
+    /// `Duration::ZERO` when the deadline already passed and `None` when
+    /// the request carries no budget.
+    #[must_use]
+    pub fn remaining_time(&self) -> Option<std::time::Duration> {
+        self.deadline
+            .map(|d| d.saturating_duration_since(std::time::Instant::now()))
+    }
+
+    /// Whether the request's deadline has passed. Handlers of long-running
+    /// methods can poll this to stop work the client no longer waits for.
+    #[must_use]
+    pub fn is_expired(&self) -> bool {
+        self.remaining_time() == Some(std::time::Duration::ZERO)
     }
 
     /// Constrains RDMA requests issued through this context to
@@ -131,13 +221,20 @@ impl Context {
     }
 
     /// Creates a server-side context with an established socket connection.
+    ///
+    /// Derives the request deadline from the client-provided `timeout_ms`
+    /// budget, anchored at arrival time.
     #[must_use]
     pub(crate) fn server_ctx(state: &Arc<State>, socket: Socket, msg_meta: MsgMeta) -> Self {
+        let deadline = msg_meta
+            .timeout_ms
+            .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(u64::from(ms)));
         Self {
             state: state.clone(),
             endpoint: SocketEndpoint::Connected(socket),
             drop_guard: None,
             msg_meta,
+            deadline,
             #[cfg(feature = "rdma")]
             rdma_path: None,
         }
@@ -149,14 +246,24 @@ impl Context {
         Rsp: Serialize,
         E: std::error::Error + From<Error> + Serialize,
     {
+        // Error accounting for the method being handled (server side).
+        if rsp.is_err() && !self.msg_meta.method.is_empty() {
+            self.state
+                .metrics
+                .server_method(&self.msg_meta.method)
+                .errors
+                .increment(1);
+        }
+
         // Responses are correlated by msgid alone: drop the request's method
-        // and buffer_info so the response meta encodes as a fixed prefix
-        // with no serde tail (decoded allocation-free on the hot path).
+        // and buffer_info so the response meta stays minimal (flags + msgid
+        // only; absent fields are skipped by the meta encoding).
         let mut meta = MsgMeta {
             method: String::new(),
             flags: self.msg_meta.flags,
             msgid: self.msg_meta.msgid,
             buffer_info: None,
+            timeout_ms: None,
         };
         meta.flags.remove(MsgFlags::IsReq);
         meta.flags.insert(MsgFlags::IsRsp);

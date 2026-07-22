@@ -30,6 +30,15 @@ RuaPC ("Rua! Procedure Call") is a high-performance Rust RPC library supporting 
 
 - **Enum dispatch over `dyn Trait`**: All runtime polymorphism uses enum variants (e.g. `Socket`, `SocketPool`, `HttpSocket`) instead of trait objects. Two reasons: (1) we don't need open-ended extensibility and won't sacrifice performance for it; (2) `async`-compatible `dyn Trait` has high runtime cost and is not mature enough. When adding new transport types or socket variants, add enum variants rather than trait objects.
 
+### Request Lifecycle & Dispatch Policies
+
+- **Connection tracking**: every connection (TCP/WS/HTTP-stream/RDMA) has a process-unique `conn_id`. Requests bind to it on send (`Waiter::bind_connection`); when a connection dies, `State::connection_closed` eagerly fails its pending waiters (`ErrorKind::ConnectionClosed`). Transport pools evict dead sockets exactly once (`mark_closed`) with identity checks against replacements.
+- **Deadline propagation**: `Client.timeout` (min'd with the context's remaining budget for nested RPCs) travels as `MsgMeta.timeout_ms`; the server derives `Context::deadline()` / `remaining_time()` / `is_expired()` on arrival and drops requests that expire before execution.
+- **No mid-flight cancellation**: once a handler starts it runs to completion (aborting user code at await points risks broken invariants, and cancel signals are inherently unreliable). Long-running handlers should poll `Context::is_expired()` to stop wasted work; undeliverable responses are simply discarded.
+- **Server dispatch** (`spawn_handler`, called by macro-generated code): load shedding (`SocketPoolConfig.max_inflight_requests`, rejects with `Overloaded`), expired-request drop, panic containment (`catch_handler_panic` → `HandlerPanic` error response), per-method metrics.
+- **Client retries**: `Client.max_retries` (default 2) retries only pre-wire failures (acquire/send); the waiter entry is allocated *after* connect so slow connection setup doesn't consume the response budget. `Context::with_addrs` gives round-robin multi-address with connect-phase failover.
+- **Metrics**: emitted through the `metrics` facade crate (`ruapc_server_*` / `ruapc_client_*` per-method counters/gauges/latency histograms, `ruapc_connections`, shed/expired counters, `ruapc_waiter_pending`); see `ruapc/src/metrics.rs` for the full table. RuaPC never renders or exports — users install their own `metrics::Recorder`/exporter; without one, emissions are no-ops. Per-method handles are interned per `State` (install the recorder before serving traffic). The only locally-tracked value is `Metrics.server_inflight` (an `AtomicI64`), because load shedding needs a readable count and the facade is write-only.
+
 ### RDMA Multi-NIC Path Awareness
 
 - **Peer identity vs path**: peers are identified by their bootstrap TCP address (the socket_map key); the *path* — the (local NIC, remote NIC) pair, `RdmaPathInfo` — is a per-connection property carried on every `RdmaSocket`. Each stripe of a peer picks its own path.
@@ -43,7 +52,8 @@ RuaPC ("Rua! Procedure Call") is a high-performance Rust RPC library supporting 
 - RDMA send: a sequence of self-delimiting frames `[4B frame_len][4B meta_len][meta][payload]` (usually one). Window-blocked sends are aggregated by plain frame concatenation; one RDMA send consumes one flow-control credit (= one peer receive buffer) regardless of frame count. The poll thread never parses messages — received buffers are batched per CQ drain and routed (sticky, spilling on pressure) to a fixed pool of dispatch worker tasks (`rdma.dispatch_workers`, default 32), each owning one SPSC queue, that walk and parse the frames; when every worker is saturated the poll thread falls back to a one-shot `tokio::spawn` per batch.
 
 ### Serialization
-- JSON (default) or MessagePack (via `MsgFlags::UseMessagePack`)
+- Meta (`MsgMeta`): always MessagePack with named fields — the encoding cannot depend on a flag stored inside itself; new fields are added with `#[serde(default)]` + `skip_serializing_if` for compatible evolution
+- Payload: JSON (default) or MessagePack (via `MsgFlags::UseMessagePack`)
 
 ## Development
 

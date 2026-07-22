@@ -2,7 +2,7 @@ mod client;
 pub use client::{Client, ClientWithBuffer};
 
 mod context;
-pub use context::{Context, SocketEndpoint};
+pub use context::{AddrSet, Context, SocketEndpoint};
 
 mod server;
 pub use server::Server;
@@ -24,3 +24,6 @@ pub use contract::{CallPlain, CallWithBuffer, RawCall, RpcCall};
 
 mod panic_guard;
 pub use panic_guard::catch_handler_panic;
+
+mod dispatch;
+pub use dispatch::spawn_handler;

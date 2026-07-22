@@ -3,7 +3,7 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio_util::sync::DropGuard;
 
 use crate::{
-    BufferPool, Context, Devices, Message, RawStream, Result, Router, Socket, SocketPool,
+    BufferPool, Context, Devices, Message, Metrics, RawStream, Result, Router, Socket, SocketPool,
     SocketPoolConfig, Waiter,
 };
 
@@ -27,6 +27,12 @@ pub struct State {
     pub devices: Arc<Devices>,
     /// Shared buffer pool for RDMA and memory operations.
     pub buffer_pool: Arc<BufferPool>,
+    /// Metric emission helpers (see [`crate::metrics`]); the actual
+    /// storage/export belongs to the user-installed [`metrics::Recorder`].
+    pub(crate) metrics: Arc<Metrics>,
+    /// Server-side in-flight request cap (0 = unlimited); excess requests
+    /// are rejected with [`ErrorKind::Overloaded`](crate::ErrorKind).
+    pub(crate) max_inflight_requests: usize,
 }
 
 impl State {
@@ -69,6 +75,8 @@ impl State {
             socket_pool,
             devices,
             buffer_pool,
+            metrics: Arc::default(),
+            max_inflight_requests: config.max_inflight_requests,
         };
         let state = Arc::new(state);
         let drop_guard = state.drop_guard();
@@ -120,6 +128,14 @@ impl State {
             tracing::warn!("invalid msg type {:?}", msg.meta);
         }
         Ok(())
+    }
+
+    /// Central handling of a dead connection: eagerly fails requests still
+    /// waiting on a response over it. Handlers already executing keep
+    /// running to completion; their responses are simply discarded when
+    /// the send fails.
+    pub(crate) fn connection_closed(&self, conn_id: u64, err: &crate::Error) {
+        self.waiter.fail_connection(conn_id, err);
     }
 
     /// Handles a new incoming stream connection.
@@ -191,6 +207,7 @@ mod tests {
                 flags: MsgFlags::empty(),
                 msgid: 0,
                 buffer_info: None,
+                timeout_ms: None,
             },
             payload: Payload::Empty,
         };
