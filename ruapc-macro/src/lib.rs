@@ -153,8 +153,12 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
                     ::tokio::spawn(async move {
                         match payload.deserialize(&ctx.msg_meta) {
                             Ok(req) => {
-                                let result = this.#method_ident(&ctx, &req).await;
-                                ctx.send_rsp(result).await;
+                                // Convert handler panics into error responses;
+                                // otherwise the client would hang until timeout.
+                                match #krate::catch_handler_panic(this.#method_ident(&ctx, &req)).await {
+                                    Ok(result) => ctx.send_rsp(result).await,
+                                    Err(err) => ctx.send_err_rsp(err).await,
+                                }
                             }
                             Err(err) => {
                                 ctx.send_err_rsp(err).await;

@@ -21,3 +21,6 @@ pub use with_buffer::{ResultWithBuffer, SentBuffer, WithBuffer};
 
 mod contract;
 pub use contract::{CallPlain, CallWithBuffer, RawCall, RpcCall};
+
+mod panic_guard;
+pub use panic_guard::catch_handler_panic;

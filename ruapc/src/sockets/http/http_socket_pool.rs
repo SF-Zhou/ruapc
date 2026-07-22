@@ -9,14 +9,16 @@ use hyper_util::server::conn::auto::Builder;
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::DropGuard;
 
-use super::http_socket::{ChannelBody, HttpSocket};
+use super::http_socket::{ChannelBody, HttpSocket, StreamSocket};
 use crate::{
     Error, ErrorKind, Message, MsgFlags, MsgMeta, RawStream, Result, Socket, SocketPoolConfig,
     SocketPoolTrait, SocketType, State, TaskSupervisor, sockets::tcp,
 };
 
+type HttpSocketMap = Arc<RwLock<HashMap<SocketAddr, HttpSocket, RandomState>>>;
+
 pub struct HttpSocketPool {
-    socket_map: RwLock<HashMap<SocketAddr, HttpSocket, RandomState>>,
+    socket_map: HttpSocketMap,
     http: Builder<TokioExecutor>,
     task_supervisor: TaskSupervisor,
 }
@@ -30,7 +32,7 @@ impl SocketPoolTrait for HttpSocketPool {
         let mut http = Builder::new(TokioExecutor::new());
         http.http1().keep_alive(true);
         Ok(Self {
-            socket_map: RwLock::default(),
+            socket_map: Arc::default(),
             http,
             task_supervisor: TaskSupervisor::create(),
         })
@@ -83,7 +85,7 @@ impl SocketPoolTrait for HttpSocketPool {
             return Ok(socket.into());
         }
 
-        let socket = Self::connect_stream(addr, state).await?;
+        let socket = Self::connect_stream(addr, state, &self.socket_map).await?;
         socket_map.insert(*addr, socket.clone());
         Ok(socket.into())
     }
@@ -133,7 +135,8 @@ impl HttpSocketPool {
         addr: SocketAddr,
     ) -> Result<Response<Either<Full<Bytes>, ChannelBody>>> {
         if hyper_tungstenite::is_upgrade_request(&req) {
-            let (response, websocket) = hyper_tungstenite::upgrade(&mut req, None)
+            let ws_config = crate::sockets::ws::web_socket_config();
+            let (response, websocket) = hyper_tungstenite::upgrade(&mut req, Some(ws_config))
                 .map_err(|e| Error::new(ErrorKind::HttpUpgradeFailed, e.to_string()))?;
 
             let state = state.clone();
@@ -198,8 +201,17 @@ impl HttpSocketPool {
             msgid,
             buffer_info: None,
         };
-        let bytes = match req.into_body().collect().await {
+        // Cap the request body at the wire-format message limit; an
+        // unauthenticated POST must not be able to buffer unbounded data.
+        let limited = http_body_util::Limited::new(req.into_body(), tcp::MAX_MSG_SIZE);
+        let bytes = match limited.collect().await {
             Ok(collected) => collected.to_bytes(),
+            Err(e) if e.is::<http_body_util::LengthLimitError>() => {
+                return Ok(Response::builder()
+                    .status(413)
+                    .body(Either::Left(Full::new(Bytes::from("Payload Too Large"))))
+                    .unwrap());
+            }
             Err(_) => {
                 return Ok(Response::builder()
                     .status(500)
@@ -237,17 +249,25 @@ impl HttpSocketPool {
     ) -> Result<Response<Either<Full<Bytes>, ChannelBody>>> {
         // Create the send channel for server → client messages.
         let (tx, rx) = mpsc::channel::<Bytes>(1024);
-        let socket = HttpSocket::Stream(tx);
-        let socket_for_recv = Socket::HTTP(socket);
+        let stream_socket = StreamSocket::new(tx);
+        let socket_for_recv = Socket::HTTP(HttpSocket::Stream(stream_socket.clone()));
 
         // Spawn recv loop: read framed messages from the request body.
         tokio::spawn({
             let state = state.clone();
             let socket_for_recv = socket_for_recv.clone();
             async move {
-                if let Err(e) = Self::recv_loop(req.into_body(), &socket_for_recv, &state).await {
+                let r = Self::recv_loop(req.into_body(), &socket_for_recv, &state).await;
+                if let Err(e) = &r {
                     tracing::error!("http rpc recv loop for {addr} failed: {e}");
                 }
+                // The stream ended: eagerly fail requests (e.g. reverse
+                // RPCs) still pending on this connection.
+                let err = Error::new(
+                    ErrorKind::ConnectionClosed,
+                    format!("http stream from {addr} closed: {:?}", r.err()),
+                );
+                state.waiter.fail_connection(stream_socket.conn_id(), &err);
             }
         });
 
@@ -289,12 +309,17 @@ impl HttpSocketPool {
     ///
     /// Sends a POST request with a streaming body and starts a recv loop
     /// on the response body. Returns an `HttpSocket::Stream` for sending.
-    async fn connect_stream(addr: &SocketAddr, state: &Arc<State>) -> Result<HttpSocket> {
+    async fn connect_stream(
+        addr: &SocketAddr,
+        state: &Arc<State>,
+        socket_map: &HttpSocketMap,
+    ) -> Result<HttpSocket> {
         use hyper::client::conn::http2;
 
         let stream = tokio::net::TcpStream::connect(addr)
             .await
             .map_err(|e| Error::new(ErrorKind::TcpConnectFailed, e.to_string()))?;
+        tcp::configure_stream(&stream);
 
         let (mut sender, conn) = http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
             .await
@@ -316,16 +341,35 @@ impl HttpSocketPool {
             .map_err(|e| Error::new(ErrorKind::HttpSendReqFailed, e.to_string()))?;
 
         // Create the socket for sending messages.
-        let socket = HttpSocket::Stream(req_tx);
+        let stream_socket = StreamSocket::new(req_tx);
+        let socket = HttpSocket::Stream(stream_socket.clone());
 
-        // Spawn recv loop on the response body.
+        // Spawn recv loop on the response body. When it exits — error or
+        // clean end of stream — evict the socket from the pool and eagerly
+        // fail every request still pending on the connection.
         let socket_for_recv = Socket::HTTP(socket.clone());
         let state = state.clone();
+        let socket_map = socket_map.clone();
         let addr = *addr;
         tokio::spawn(async move {
-            if let Err(e) = Self::recv_loop(rsp.into_body(), &socket_for_recv, &state).await {
+            let r = Self::recv_loop(rsp.into_body(), &socket_for_recv, &state).await;
+            if let Err(e) = &r {
                 tracing::error!("http rpc client recv loop for {addr} failed: {e}");
             }
+            {
+                let mut socket_map = socket_map.write().await;
+                // Identity check: don't evict a replacement connection.
+                if let Some(HttpSocket::Stream(existing)) = socket_map.get(&addr)
+                    && existing.same_socket(&stream_socket)
+                {
+                    socket_map.remove(&addr);
+                }
+            }
+            let err = Error::new(
+                ErrorKind::ConnectionClosed,
+                format!("http connection to {addr} closed: {:?}", r.err()),
+            );
+            state.waiter.fail_connection(stream_socket.conn_id(), &err);
         });
 
         Ok(socket)

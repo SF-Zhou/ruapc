@@ -10,7 +10,9 @@ use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::{RwLock, mpsc},
 };
-use tokio_tungstenite::{WebSocketStream, accept_async, connect_async, tungstenite};
+use tokio_tungstenite::{
+    WebSocketStream, accept_async_with_config, client_async_with_config, tungstenite,
+};
 use tokio_util::sync::DropGuard;
 
 use super::WebSocket;
@@ -18,7 +20,16 @@ use crate::{
     Message, RawStream, Socket, SocketPoolConfig, SocketPoolTrait, SocketType, State,
     TaskSupervisor,
     error::{Error, ErrorKind, Result},
+    sockets::tcp,
 };
+
+/// WebSocket protocol limits aligned with the TCP transport's
+/// [`MAX_MSG_SIZE`](crate::sockets::tcp::MAX_MSG_SIZE).
+pub(crate) fn web_socket_config() -> tungstenite::protocol::WebSocketConfig {
+    tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(tcp::MAX_MSG_SIZE))
+        .max_frame_size(Some(16 << 20))
+}
 
 pub struct WebSocketPool {
     socket_map: Arc<RwLock<HashMap<SocketAddr, WebSocket, RandomState>>>,
@@ -45,7 +56,7 @@ impl SocketPoolTrait for WebSocketPool {
     ) -> Result<()> {
         match stream {
             RawStream::TCP(tcp_stream) => {
-                let stream = accept_async(tcp_stream)
+                let stream = accept_async_with_config(tcp_stream, Some(web_socket_config()))
                     .await
                     .map_err(|e| Error::new(ErrorKind::WebSocketAcceptFailed, e.to_string()))?;
                 self.add_socket(addr, stream, state);
@@ -95,9 +106,19 @@ impl SocketPoolTrait for WebSocketPool {
             return Ok(socket.into());
         }
 
-        let (stream, _) = connect_async(format!("ws://{addr}"))
+        // Connect the TCP stream ourselves so socket options (nodelay,
+        // keepalive) can be applied before the WebSocket handshake.
+        let tcp_stream = tokio::net::TcpStream::connect(addr)
             .await
             .map_err(|e| Error::new(ErrorKind::WebSocketConnectFailed, e.to_string()))?;
+        tcp::configure_stream(&tcp_stream);
+        let (stream, _) = client_async_with_config(
+            format!("ws://{addr}"),
+            tcp_stream,
+            Some(web_socket_config()),
+        )
+        .await
+        .map_err(|e| Error::new(ErrorKind::WebSocketConnectFailed, e.to_string()))?;
 
         let send_socket = self.add_socket(*addr, stream, state);
         socket_map.insert(*addr, send_socket.clone());
@@ -117,17 +138,8 @@ impl WebSocketPool {
     {
         let (send_stream, recv_stream) = stream.split();
         let (sender, receiver) = mpsc::channel(1024);
-        let task_supervisor = self.task_supervisor.start_async_task();
-        tokio::spawn({
-            async move {
-                tokio::select! {
-                    () = task_supervisor.stopped() => {},
-                    _ = Self::start_send_loop(send_stream, receiver) => {}
-                }
-            }
-        });
-
         let web_socket = WebSocket::new(sender);
+
         let task_supervisor = self.task_supervisor.start_async_task();
         tokio::spawn({
             let socket_map = self.socket_map.clone();
@@ -136,17 +148,60 @@ impl WebSocketPool {
             async move {
                 tokio::select! {
                     () = task_supervisor.stopped() => {},
-                    r = Self::start_recv_loop(recv_stream, web_socket, &state) => {
+                    r = Self::start_send_loop(send_stream, receiver) => {
                         if let Err(e) = r {
-                            tracing::error!("recv loop for {addr} failed: {e}");
-                            let mut socket_map = socket_map.write().await;
-                            socket_map.remove(&addr);
+                            tracing::error!("send loop for {addr} failed: {e}");
+                            Self::evict_socket(&socket_map, &addr, &web_socket, &state, &e).await;
                         }
                     }
                 }
             }
         });
+
+        let task_supervisor = self.task_supervisor.start_async_task();
+        tokio::spawn({
+            let socket_map = self.socket_map.clone();
+            let web_socket = web_socket.clone();
+            let state = state.clone();
+            async move {
+                tokio::select! {
+                    () = task_supervisor.stopped() => {},
+                    r = Self::start_recv_loop(recv_stream, web_socket.clone(), &state) => {
+                        let e = r.err().unwrap_or_else(|| {
+                            Error::new(ErrorKind::ConnectionClosed, "connection closed".into())
+                        });
+                        tracing::error!("recv loop for {addr} failed: {e}");
+                        Self::evict_socket(&socket_map, &addr, &web_socket, &state, &e).await;
+                    }
+                }
+            }
+        });
         web_socket
+    }
+
+    /// Removes a dead socket from the map (if it is still the mapped one)
+    /// and eagerly fails every request pending on the connection.
+    async fn evict_socket(
+        socket_map: &Arc<RwLock<HashMap<SocketAddr, WebSocket, RandomState>>>,
+        addr: &SocketAddr,
+        socket: &WebSocket,
+        state: &Arc<State>,
+        err: &Error,
+    ) {
+        {
+            let mut socket_map = socket_map.write().await;
+            // Identity check: don't evict a replacement connection.
+            if let Some(existing) = socket_map.get(addr)
+                && existing.same_socket(socket)
+            {
+                socket_map.remove(addr);
+            }
+        }
+        let err = Error::new(
+            ErrorKind::ConnectionClosed,
+            format!("connection to {addr} closed: {err}"),
+        );
+        state.waiter.fail_connection(socket.conn_id(), &err);
     }
 
     async fn start_recv_loop<S>(

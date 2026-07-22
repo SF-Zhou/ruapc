@@ -14,7 +14,33 @@ use crate::{Error, ErrorKind, Message, MsgMeta, Result, SocketTrait, State, msg:
 #[derive(Clone, Debug)]
 pub enum HttpSocket {
     ForResponse(u64),
-    Stream(mpsc::Sender<Bytes>),
+    Stream(StreamSocket),
+}
+
+/// Sender half of an HTTP/2 `/_rpc` bidirectional stream.
+#[derive(Clone, Debug)]
+pub struct StreamSocket {
+    sender: mpsc::Sender<Bytes>,
+    conn_id: u64,
+}
+
+impl StreamSocket {
+    pub(crate) fn new(sender: mpsc::Sender<Bytes>) -> Self {
+        Self {
+            sender,
+            conn_id: crate::task::next_conn_id(),
+        }
+    }
+
+    /// Unique id of the underlying connection.
+    pub(crate) fn conn_id(&self) -> u64 {
+        self.conn_id
+    }
+
+    /// Whether `other` refers to the same underlying connection.
+    pub(crate) fn same_socket(&self, other: &Self) -> bool {
+        self.conn_id == other.conn_id
+    }
 }
 
 /// A streaming body backed by an mpsc channel.
@@ -74,7 +100,7 @@ impl SocketTrait for HttpSocket {
                     ))
                 }
             }
-            HttpSocket::Stream(sender) => {
+            HttpSocket::Stream(stream_socket) => {
                 // Use TCP-style framing: magic + len + meta_len + meta + payload.
                 use crate::sockets::tcp::MAGIC_NUM;
 
@@ -114,7 +140,16 @@ impl SocketTrait for HttpSocket {
                 let mut bytes = StreamBytes(BytesMut::with_capacity(512));
                 meta.serialize_to(payload, &mut bytes)?;
 
-                sender
+                // Bind the pending request to this connection so it fails
+                // eagerly if the connection dies before the response arrives.
+                if meta.is_req() {
+                    state
+                        .waiter
+                        .bind_connection(meta.msgid, stream_socket.conn_id);
+                }
+
+                stream_socket
+                    .sender
                     .send(bytes.0.into())
                     .await
                     .map_err(|e| Error::new(ErrorKind::HttpSendReqFailed, e.to_string()))?;

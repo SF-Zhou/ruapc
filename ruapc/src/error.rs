@@ -53,6 +53,10 @@ pub enum ErrorKind {
     HttpSendReqFailed,
     /// Failed to upgrade HTTP connection.
     HttpUpgradeFailed,
+    /// The connection was closed while requests were still in flight.
+    ConnectionClosed,
+    /// The service handler panicked while processing the request.
+    HandlerPanic,
     /// Failed to send message over RDMA.
     RdmaSendFailed,
     /// Failed to receive message over RDMA.
