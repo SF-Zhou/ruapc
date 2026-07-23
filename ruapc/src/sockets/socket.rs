@@ -93,7 +93,7 @@ pub trait SocketTrait {
         };
         let client = crate::Client::default();
         let data: Vec<u8> = match client.tcp_read(ctx, &req).await {
-            Ok(data) => data,
+            Ok(rsp) => rsp.data,
             Err(e) => return Err(RemoteIoError::new(e, Some(local))),
         };
         if data.len() > local.capacity() {

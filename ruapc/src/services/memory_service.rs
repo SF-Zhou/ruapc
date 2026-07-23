@@ -31,6 +31,28 @@ pub struct MemoryPushReq {
     /// Message ID of the original client request.
     pub msgid: u64,
     /// Data to push to the client.
+    ///
+    /// `serde_bytes` routes the field through serde's byte-string channel:
+    /// MessagePack encodes it as a `bin` chunk (header + memcpy) instead of
+    /// a per-element integer array — this is the difference between an RPC
+    /// framework moving bulk data and one serializing a million tiny ints.
+    /// (Internal reverse RPCs always use MessagePack; the JSON fallback
+    /// still works, as an integer array.)
+    #[serde(with = "serde_bytes")]
+    #[schemars(with = "Vec<u8>")]
+    pub data: Vec<u8>,
+}
+
+/// Response of [`MemoryService::tcp_read`], carrying the bytes read from
+/// the client's registered memory.
+///
+/// A struct (rather than a bare `Vec<u8>`) so the field can opt into
+/// `serde_bytes` — see [`MemoryPushReq::data`] for why that matters.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct MemoryReadRsp {
+    /// The bytes read from the requested memory region.
+    #[serde(with = "serde_bytes")]
+    #[schemars(with = "Vec<u8>")]
     pub data: Vec<u8>,
 }
 
@@ -59,7 +81,7 @@ pub trait MemoryService {
     /// Reads data from a registered memory region over TCP.
     ///
     /// After reading, verifies the original request is still alive (not timed out).
-    async fn tcp_read(&self, ctx: &Context, req: &MemoryReadReq) -> Result<Vec<u8>>;
+    async fn tcp_read(&self, ctx: &Context, req: &MemoryReadReq) -> Result<MemoryReadRsp>;
 
     /// Receives data pushed by the server (TCP path).
     ///
@@ -77,7 +99,7 @@ pub trait MemoryService {
 }
 
 impl MemoryService for () {
-    async fn tcp_read(&self, ctx: &Context, req: &MemoryReadReq) -> Result<Vec<u8>> {
+    async fn tcp_read(&self, ctx: &Context, req: &MemoryReadReq) -> Result<MemoryReadRsp> {
         let data = ctx
             .state
             .devices
@@ -93,7 +115,7 @@ impl MemoryService for () {
             ));
         }
 
-        Ok(data)
+        Ok(MemoryReadRsp { data })
     }
 
     async fn tcp_push(&self, ctx: &Context, req: &MemoryPushReq) -> Result<()> {
@@ -151,5 +173,65 @@ impl MemoryService for () {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bulk fields must go through serde's byte-string channel:
+    /// MessagePack `bin` (length header + memcpy), not a per-element
+    /// integer array. 0xFF bytes would cost 2 bytes each as integers, so a
+    /// compact encoding proves the `bin` path is taken.
+    #[test]
+    fn test_bulk_fields_use_msgpack_bin() {
+        const LEN: usize = 1024;
+        let data = vec![0xFFu8; LEN];
+
+        let req = MemoryPushReq {
+            msgid: 7,
+            data: data.clone(),
+        };
+        let encoded = rmp_serde::to_vec_named(&req).unwrap();
+        assert!(
+            encoded.len() < LEN + 64,
+            "MemoryPushReq must encode data as msgpack bin, got {} bytes for {LEN} data bytes",
+            encoded.len()
+        );
+        let decoded: MemoryPushReq = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.msgid, 7);
+        assert_eq!(decoded.data, data);
+
+        let rsp = MemoryReadRsp { data: data.clone() };
+        let encoded = rmp_serde::to_vec_named(&rsp).unwrap();
+        assert!(
+            encoded.len() < LEN + 32,
+            "MemoryReadRsp must encode data as msgpack bin, got {} bytes for {LEN} data bytes",
+            encoded.len()
+        );
+        let decoded: MemoryReadRsp = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.data, data);
+    }
+
+    /// The JSON fallback (e.g. curl without MessagePack) must still
+    /// roundtrip the byte fields.
+    #[test]
+    fn test_bulk_fields_json_roundtrip() {
+        let req = MemoryPushReq {
+            msgid: 1,
+            data: vec![0, 1, 127, 255],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: MemoryPushReq = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.msgid, 1);
+        assert_eq!(decoded.data, vec![0, 1, 127, 255]);
+
+        let rsp = MemoryReadRsp {
+            data: vec![42, 255],
+        };
+        let json = serde_json::to_string(&rsp).unwrap();
+        let decoded: MemoryReadRsp = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.data, vec![42, 255]);
     }
 }
