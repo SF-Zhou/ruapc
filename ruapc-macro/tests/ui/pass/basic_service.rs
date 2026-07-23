@@ -1,7 +1,6 @@
 //! A well-formed service compiles: the trait keeps its methods, the router
 //! registration and the generated `Client` / `ClientWithBuffer` impls all
 //! type-check.
-#![feature(return_type_notation)]
 
 use std::sync::Arc;
 

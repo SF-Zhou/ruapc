@@ -37,15 +37,11 @@ RDMA support is **not** enabled by default (it requires `libibverbs-dev` at buil
 ruapc = { version = "0.2.0-alpha.1", features = ["rdma"] }
 ```
 
-Note: this crate requires a nightly toolchain (`#![feature(return_type_notation)]`).
-
 ## Example
 
 Define service:
 
 ```rust
-#![feature(return_type_notation)]
-
 use ruapc::{Context, Result};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

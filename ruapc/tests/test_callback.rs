@@ -1,4 +1,3 @@
-#![feature(return_type_notation)]
 use ruapc::*;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

@@ -1,5 +1,13 @@
 #![deny(unsafe_code)]
-#![feature(return_type_notation)]
+// `SocketTrait` / `SocketPoolTrait` / the call-glue traits use `async fn`
+// without `+ Send` in the trait declaration. That is deliberate: per the
+// project's enum-dispatch design these traits are only consumed through the
+// concrete `Socket` / `SocketPool` enums (never as generic bounds), so auto
+// traits like `Send` leak structurally from the concrete impls and the
+// lint's concern does not apply. `#[service]` traits, by contrast, ARE
+// implemented by users and are desugared by the macro to
+// `fn -> impl Future + Send`.
+#![allow(async_fn_in_trait)]
 
 pub use ruapc_macro::service;
 

@@ -48,7 +48,7 @@ jobs:
     - name: Install llvm-tools
       uses: dtolnay/rust-toolchain@stable
       with:
-        toolchain: nightly
+        toolchain: stable
         components: llvm-tools-preview,rustfmt,clippy
 
     - name: Install cargo-llvm-cov

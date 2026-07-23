@@ -11,7 +11,6 @@
 //! without a usable device) are reported as skipped instead of aborting
 //! the whole run.
 
-#![feature(return_type_notation)]
 // `#[service]` request types must be owned deserializable types behind a
 // reference (`&String`), so `&str` is not an option here.
 #![allow(clippy::ptr_arg)]

@@ -14,8 +14,6 @@
 //! cargo run --bin remote_memory --features rdma -- --socket-type rdma
 //! ```
 
-#![feature(return_type_notation)]
-
 use std::str::FromStr;
 use std::sync::Arc;
 

@@ -67,10 +67,26 @@
 //!    one uniform body per method; plain vs. buffer-carrying calls are
 //!    dispatched by return type through `ruapc`'s call glue traits
 //! 3. Proper error handling and message serialization
+//!
+//! Each `async fn` in the trait is desugared to
+//! `fn -> impl Future<Output = ...> + Send` (return-position `impl Trait`
+//! in traits, stable since Rust 1.75), which makes the `Send` requirement
+//! part of every method signature without nightly-only
+//! `return_type_notation` bounds. Implementations keep writing plain
+//! `async fn`; the compiler verifies at the impl site that the returned
+//! future is `Send`.
+//!
+//! The generated `Client` / `ClientWithBuffer` impls also spell out the
+//! `fn -> impl Future + Send` form instead of using `async fn`, so that
+//! resolving a client call only consults signatures and never has to prove
+//! the client bodies' futures `Send`. This keeps the `Send` proof acyclic
+//! for transports whose connection setup recursively performs RPCs through
+//! these client methods (e.g. the RDMA pool's bootstrap `info`/`connect`
+//! calls), which would otherwise be rejected with a query cycle (E0391).
 
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{FnArg, ItemTrait, ReturnType, TraitItem, parse_macro_input};
+use syn::{FnArg, ItemTrait, ReturnType, TraitItem, parse_macro_input, parse_quote};
 
 /// Procedural macro for defining RPC services.
 ///
@@ -99,7 +115,7 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
     let visibility = input.vis;
     let trait_name = trait_ident.to_string();
 
-    let mut send_bounds = vec![];
+    let mut trait_methods = vec![];
     let mut invoke_branchs = vec![];
     let mut client_methods = vec![];
     let mut client_with_buffer_methods = vec![];
@@ -122,8 +138,24 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
             let method_name = format!("{trait_name}/{method_ident}");
 
             let req_type = req_type.ty.clone();
-            let output = &method.sig.output;
-            send_bounds.push(quote! { Self::#method_ident(..): Send, });
+
+            // Desugar `async fn` into `fn -> impl Future + Send` (RPITIT) so
+            // the trait works on stable Rust: the `Send` requirement becomes
+            // part of the method signature instead of a nightly
+            // `Self::method(..): Send` return-type-notation bound on
+            // `ruapc_export`. Implementors still write plain `async fn` —
+            // stable Rust accepts an `async fn` impl for an
+            // `-> impl Future + Send` trait method and checks the returned
+            // future for `Send` at the impl site. RPITIT captures all input
+            // lifetimes automatically, so the reference parameters need no
+            // explicit lifetime plumbing.
+            let mut sig = method.sig.clone();
+            sig.asyncness = None;
+            sig.output = parse_quote! {
+                -> impl ::core::future::Future<Output = #rsp_type> + Send
+            };
+            let attrs = &method.attrs;
+            trait_methods.push(quote! { #(#attrs)* #sig; });
 
             // One uniform client body for every method. Whether the call
             // delivers a server-pushed buffer is decided by the *type
@@ -131,12 +163,27 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
             // `CallWithBuffer` applies iff the return type is
             // `Result<WithBuffer<T>, E>` (through any alias), `CallPlain`
             // otherwise. No name-based type detection is involved.
+            //
+            // Deliberately `fn -> impl Future + Send` (mirroring the trait
+            // declaration) instead of `async fn`. With an `async fn` impl,
+            // resolving a call to a client method runs the impl-vs-trait
+            // signature comparison, which must prove the async body's
+            // future is `Send` — and transports whose connection setup
+            // recursively performs RPCs through these very methods (e.g.
+            // the RDMA pool's info/connect bootstrap) would make that
+            // proof cyclic (E0391). With the explicit signature, callers
+            // discharge `Send` from the declared item bound alone and the
+            // body is only type-checked once, acyclically.
             let client_body = quote! {
-                async fn #method_ident(#receiver, ctx: &#krate::Context, req: #req_type) #output {
-                    use #krate::{CallPlain as _, CallWithBuffer as _};
-                    (&#krate::RpcCall::<#rsp_type>::new())
-                        .ruapc_call(self, ctx, req, #method_name)
-                        .await
+                fn #method_ident(#receiver, ctx: &#krate::Context, req: #req_type)
+                    -> impl ::core::future::Future<Output = #rsp_type> + Send
+                {
+                    async move {
+                        use #krate::{CallPlain as _, CallWithBuffer as _};
+                        (&#krate::RpcCall::<#rsp_type>::new())
+                            .ruapc_call(self, ctx, req, #method_name)
+                            .await
+                    }
                 }
             };
             client_methods.push(client_body.clone());
@@ -182,7 +229,7 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
         #visibility trait #trait_ident {
             const NAME: &'static str = #trait_name;
 
-            #(#input_items)*
+            #(#trait_methods)*
 
             fn ruapc_export(
                 self: ::std::sync::Arc<Self>,
@@ -190,7 +237,6 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
             )
             where
                 Self: 'static + Send + Sync,
-                #(#send_bounds)*
             {
                 #(#invoke_branchs)*
             }
