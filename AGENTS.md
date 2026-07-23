@@ -8,9 +8,12 @@ RuaPC ("Rua! Procedure Call") is a high-performance Rust RPC library supporting 
 
 ### Workspace Structure
 - `ruapc/` — Core library: server, client, router, socket abstractions, message format
+- `ruapc-bufpool/` — Buddy allocator + slab buffer pool with device registration (transport-independent)
 - `ruapc-macro/` — Proc macro `#[service]` for service definition and code generation
-- `ruapc-rdma/` — RDMA transport (optional, behind `rdma` feature flag)
-- `ruapc-demo/` — Example server/client applications
+- `ruapc-rdma/` — Low-level ibverbs FFI bindings (optional, behind `ruapc`'s `rdma` feature flag)
+- `ruapc-demo/` — Example server/client applications (not published)
+
+The `rdma` feature is NOT in `ruapc`'s default features (it requires libibverbs at build time, which e.g. docs.rs doesn't have). `ruapc`'s own tests and benches always enable it via a self dev-dependency (`ruapc = { path = ".", features = ["rdma"] }`), so `cargo test` in this repo requires libibverbs-dev.
 
 ### Transport Protocols
 - **TCP**: Custom binary protocol with magic number `RUA!`, length-prefixed framing
@@ -63,10 +66,12 @@ cargo build --all-features
 cargo test --all-features
 cargo fmt
 cargo clippy --all-features
+cargo bench -p ruapc --bench echo  # end-to-end echo RPC benchmark
 ```
 
 ### CI
-- GitHub Actions: build, test (cargo-nextest with `-j 1`), clippy, rustfmt, CodeQL, codecov
+- `rust.yml`: rustfmt check, clippy (`--all-features -D warnings`), tests with coverage via cargo-llvm-cov (`--all-features`), Codecov upload
+- `release.yml` (on `v*` tags): publishes to crates.io in dependency order (ruapc-bufpool → ruapc-macro → ruapc-rdma → ruapc)
 - RDMA tests use `rxe_0` virtual device in CI (env var `RUAPC_PREFER_RXE=1`)
 
 ### Conventions

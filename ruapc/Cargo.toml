@@ -10,7 +10,7 @@ license.workspace = true
 
 [features]
 rdma = ["ruapc-rdma"]
-default = ["rdma"]
+default = []
 
 [dependencies]
 ruapc-macro ={ version = "0.1.3", path = "../ruapc-macro" }
@@ -49,5 +49,13 @@ libc.workspace = true
 workspace = true
 
 [dev-dependencies]
+# Self dev-dependency: enables the `rdma` feature for this crate's own unit,
+# integration tests, and benches without forcing it on downstream users.
+ruapc = { path = ".", features = ["rdma"] }
+
 metrics-util = "0.20"
 reqwest = { version = "0.12", features = ["json"] }
+
+[[bench]]
+name = "echo"
+harness = false
