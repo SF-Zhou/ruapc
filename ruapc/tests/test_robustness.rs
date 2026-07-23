@@ -3,7 +3,9 @@
 //! handler panic containment, and HTTP body size limits.
 
 #![forbid(unsafe_code)]
-#![feature(return_type_notation)]
+// `#[service]` request types must be owned deserializable types behind a
+// reference (`&String`), so `&str` is not an option here.
+#![allow(clippy::ptr_arg)]
 
 use std::{net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 

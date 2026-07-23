@@ -1,5 +1,3 @@
-#![feature(return_type_notation)]
-
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;

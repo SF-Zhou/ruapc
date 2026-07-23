@@ -3,7 +3,7 @@
 ## Getting Started
 
 1. Fork and clone the repository
-2. Install Rust nightly (required for `#![feature(return_type_notation)]`)
+2. Install stable Rust (via [rustup](https://rustup.rs))
 3. Build: `cargo build --all-features`
 4. Test: `cargo test --all-features`
 

@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
-#![feature(return_type_notation)]
+// `#[service]` request types must be owned deserializable types behind a
+// reference (`&String`), so `&str` is not an option here.
+#![allow(clippy::ptr_arg)]
 #![cfg(feature = "rdma")]
 
 use std::{str::FromStr, sync::Arc};

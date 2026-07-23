@@ -1,5 +1,4 @@
 #![forbid(unsafe_code)]
-#![feature(return_type_notation)]
 
 use std::{str::FromStr, sync::Arc, time::Duration};
 
