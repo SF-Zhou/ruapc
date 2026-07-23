@@ -1,0 +1,7 @@
+error: custom attribute panicked
+ --> tests/ui/fail/reserved_name.rs:3:1
+  |
+3 | #[ruapc::service]
+  | ^^^^^^^^^^^^^^^^^
+  |
+  = help: message: the function cannot be named `ruapc_export` or `ruapc_request`!

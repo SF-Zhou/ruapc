@@ -62,7 +62,7 @@ jobs:
         sudo apt install -y pkg-config libibverbs-dev ibverbs-utils
         ibv_devinfo -d rxe_0 -v
         cargo fmt -- --check
-        cargo clippy --release -- -D warnings
+        cargo clippy --release --all-features -- -D warnings
         cargo llvm-cov --all-features --ignore-filename-regex "ruapc-demo/*|ruapc-macro/*|ruapc/src/bin/*|ruapc-rdma/src/bin/*" --cobertura --output-path cobertura.xml
 
     - name: Upload coverage reports to Codecov

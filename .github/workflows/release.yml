@@ -19,8 +19,10 @@ jobs:
 
     - run: |
         sudo apt install -y pkg-config libibverbs-dev ibverbs-utils
-        cargo publish -p ruapc-macro || echo skip publishing ruapc-macro
-        cargo publish -p ruapc-rdma || echo skip publishing ruapc-rdma
+        # Publish in dependency order. Any failure fails the release.
+        cargo publish -p ruapc-bufpool
+        cargo publish -p ruapc-macro
+        cargo publish -p ruapc-rdma
         cargo publish -p ruapc
       env:
         CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

@@ -14,7 +14,7 @@ bin = ["dep:clap"]
 [dependencies]
 clap = { workspace = true, optional = true }
 libc.workspace = true
-ruapc-bufpool = { path = "../ruapc-bufpool" }
+ruapc-bufpool = { version = "0.1.0", path = "../ruapc-bufpool" }
 schemars.workspace = true
 serde.workspace = true
 

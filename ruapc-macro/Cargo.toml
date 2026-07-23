@@ -16,3 +16,9 @@ proc-macro-crate = "3.3"
 proc-macro2 = "1.0"
 quote = "1.0"
 syn = { version = "2.0", features = ["full"] }
+
+[dev-dependencies]
+# Used by trybuild UI tests to compile expanded code end-to-end.
+ruapc = { path = "../ruapc" }
+tokio.workspace = true
+trybuild = "1.0"

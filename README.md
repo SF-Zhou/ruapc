@@ -14,7 +14,7 @@ A high-performance Rust RPC library that supports multiple transport protocols (
 | Crate | Description |
 |---|---|
 | `ruapc` | Core library: server, client, router, socket abstractions, message format |
-| `ruapc-bufpool` | Generic buffer pool with device registration (transport-independent) |
+| `ruapc-bufpool` | Buddy allocator + slab buffer pool with device registration (transport-independent) |
 | `ruapc-macro` | Proc macro `#[service]` for service definition and code generation |
 | `ruapc-rdma` | Low-level FFI bindings to libibverbs with type-safe RDMA device management |
 | `ruapc-demo` | Example server/client applications |
@@ -27,6 +27,17 @@ A high-performance Rust RPC library that supports multiple transport protocols (
 - **Multiple Serialization Formats**: JSON (default) and MessagePack support
 - **OpenAPI Integration**: Automatic OpenAPI 3.0 specification generation with JSON Schema support
 - **Built-in Documentation**: RapiDoc integration for interactive API documentation
+
+## Cargo Features
+
+RDMA support is **not** enabled by default (it requires `libibverbs-dev` at build time). Enable it explicitly:
+
+```toml
+[dependencies]
+ruapc = { version = "0.1", features = ["rdma"] }
+```
+
+Note: this crate requires a nightly toolchain (`#![feature(return_type_notation)]`).
 
 ## Example
 
@@ -161,6 +172,19 @@ cargo run --release --bin server --features rdma -- --socket-type unified
 # Stress testing with RDMA
 cargo run --release --bin client --features rdma -- --stress --coroutines 128
 ```
+
+### Benchmark
+
+```bash
+# End-to-end echo RPC benchmark: serial latency + concurrent throughput
+# for every transport (TCP / WebSocket / HTTP / RDMA) on a unified server.
+cargo bench -p ruapc --bench echo
+
+# On NUMA machines, pin to the RDMA NIC's node for stable/better numbers:
+numactl -N 1 -m 1 cargo bench -p ruapc --bench echo
+```
+
+See [docs/benchmark.md](docs/benchmark.md) for details and reference results.
 
 ## License
 
