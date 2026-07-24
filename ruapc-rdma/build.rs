@@ -2,9 +2,12 @@
 //!
 //! This script:
 //! 1. Probes for libibverbs using pkg-config
-//! 2. Generates FFI bindings using bindgen
-//! 3. Applies custom type replacements (FwVer, Guid, WRID)
-//! 4. Derives serialization traits for select types
+//! 2. Compiles the C shim (src/shim.c) wrapping all verbs entry points, so
+//!    static inline functions and function-like macros in verbs.h (which
+//!    bindgen cannot handle) are always honored
+//! 3. Generates FFI bindings using bindgen
+//! 4. Applies custom type replacements (FwVer, Guid, WRID)
+//! 5. Derives serialization traits for select types
 
 use std::collections::HashSet;
 use std::env;
@@ -134,10 +137,23 @@ fn main() {
     let mut include_paths = lib.include_paths.into_iter().collect::<HashSet<_>>();
     include_paths.insert(PathBuf::from("/usr/include"));
 
+    // Compile the C shim wrapping all verbs entry points (see src/shim.h for
+    // details). Compiling it against the locally installed header guarantees
+    // the wrappers match the exact semantics of this platform's rdma-core
+    // version, including any macro / static inline compat layers.
+    println!("cargo:rerun-if-changed=src/shim.c");
+    println!("cargo:rerun-if-changed=src/shim.h");
+    let mut shim = cc::Build::new();
+    shim.file("src/shim.c");
+    for path in &include_paths {
+        shim.include(path);
+    }
+    shim.compile("ruapc_rdma_shim");
+
     // Configure bindgen to generate RDMA verb bindings
     let builder = bindgen::Builder::default()
         .clang_args(include_paths.iter().map(|p| format!("-I{p:?}")))
-        .header_contents("header.h", "#include <infiniband/verbs.h>")
+        .header("src/shim.h") // includes <infiniband/verbs.h>
         // Enable common derives for generated types
         .derive_copy(true)
         .derive_debug(true)
@@ -176,31 +192,10 @@ fn main() {
         .allowlist_type("ibv_device_cap_flags")
         .allowlist_type("ibv_port_cap_flags")
         .allowlist_type("ibv_port_cap_flags2")
-        .allowlist_function("ibv_ack_cq_events")
-        .allowlist_function("ibv_alloc_pd")
-        .allowlist_function("ibv_close_device")
-        .allowlist_function("ibv_create_comp_channel")
-        .allowlist_function("ibv_create_cq")
-        .allowlist_function("ibv_create_qp")
-        .allowlist_function("ibv_dealloc_pd")
-        .allowlist_function("ibv_dereg_mr")
-        .allowlist_function("ibv_destroy_comp_channel")
-        .allowlist_function("ibv_destroy_cq")
-        .allowlist_function("ibv_destroy_qp")
-        .allowlist_function("ibv_free_device_list")
-        .allowlist_function("ibv_get_cq_event")
-        .allowlist_function("ibv_get_device_guid")
-        .allowlist_function("ibv_get_device_list")
-        .allowlist_function("ibv_modify_qp")
-        .allowlist_function("ibv_req_notify_cq")
-        .allowlist_function("ibv_poll_cq")
-        .allowlist_function("ibv_post_recv")
-        .allowlist_function("ibv_post_send")
-        .allowlist_function("ibv_query_device")
-        .allowlist_function("ibv_query_gid")
-        .allowlist_function("ibv_query_port")
-        .allowlist_function("ibv_open_device")
-        .allowlist_function("ibv_reg_mr")
+        // All verbs entry points go through the C shim (src/shim.h); Rust
+        // never binds ibv_* symbols directly. This guarantees macro/inline
+        // layers in verbs.h are honored, on any rdma-core version.
+        .allowlist_function("ruapc_ibv_.*")
         .bitfield_enum("ibv_access_flags")
         .bitfield_enum("ibv_send_flags")
         .bitfield_enum("ibv_wc_flags")

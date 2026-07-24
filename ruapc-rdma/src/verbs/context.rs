@@ -27,7 +27,7 @@ impl Context {
     /// `device` must be a valid pointer obtained from `ibv_get_device_list`.
     /// The device list may be freed after this call returns successfully.
     pub(crate) fn open(device: *mut crate::ibv_device) -> Result<Arc<Self>> {
-        let ptr = unsafe { crate::ibv_open_device(device) };
+        let ptr = unsafe { crate::ruapc_ibv_open_device(device) };
         if ptr.is_null() {
             return Err(ErrorKind::IBOpenDeviceFail.with_errno());
         }
@@ -42,7 +42,7 @@ impl Context {
     /// Queries device attributes.
     pub fn query_device(&self) -> Result<crate::ibv_device_attr> {
         let mut attr = crate::ibv_device_attr::default();
-        let ret = unsafe { crate::ibv_query_device(self.ptr, &mut attr) };
+        let ret = unsafe { crate::ruapc_ibv_query_device(self.ptr, &mut attr) };
         if ret != 0 {
             return Err(ErrorKind::IBQueryDeviceFail.with_errno());
         }
@@ -52,7 +52,7 @@ impl Context {
     /// Queries port attributes.
     pub fn query_port(&self, port_num: u8) -> Result<crate::ibv_port_attr> {
         let mut attr = std::mem::MaybeUninit::<crate::ibv_port_attr>::uninit();
-        let ret = unsafe { crate::ibv_query_port(self.ptr, port_num, attr.as_mut_ptr() as _) };
+        let ret = unsafe { crate::ruapc_ibv_query_port(self.ptr, port_num, attr.as_mut_ptr()) };
         if ret != 0 {
             return Err(ErrorKind::IBQueryPortFail.with_errno());
         }
@@ -62,8 +62,9 @@ impl Context {
     /// Queries a GID for the specified port and index.
     pub fn query_gid(&self, port_num: u8, gid_index: u8) -> Result<crate::ibv_gid> {
         let mut gid = crate::ibv_gid::default();
-        let ret =
-            unsafe { crate::ibv_query_gid(self.ptr, port_num as _, gid_index as _, &mut gid) };
+        let ret = unsafe {
+            crate::ruapc_ibv_query_gid(self.ptr, port_num as _, gid_index as _, &mut gid)
+        };
         if ret == 0 && !gid.is_null() {
             Ok(gid)
         } else {
@@ -101,7 +102,7 @@ impl Context {
 
 impl Drop for Context {
     fn drop(&mut self) {
-        let _ = unsafe { crate::ibv_close_device(self.ptr) };
+        let _ = unsafe { crate::ruapc_ibv_close_device(self.ptr) };
     }
 }
 

@@ -16,7 +16,7 @@ pub struct DeviceList {
 impl DeviceList {
     pub fn available() -> Result<Self> {
         let mut num_devices: libc::c_int = 0;
-        let ptr = unsafe { crate::ibv_get_device_list(&mut num_devices) };
+        let ptr = unsafe { crate::ruapc_ibv_get_device_list(&mut num_devices) };
         if ptr.is_null() {
             return Err(ErrorKind::IBGetDeviceListFail.with_errno());
         }
@@ -38,7 +38,7 @@ impl DeviceList {
 
 impl Drop for DeviceList {
     fn drop(&mut self) {
-        unsafe { crate::ibv_free_device_list(self.raw_ptr) };
+        unsafe { crate::ruapc_ibv_free_device_list(self.raw_ptr) };
     }
 }
 

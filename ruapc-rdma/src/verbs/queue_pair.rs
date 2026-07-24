@@ -98,7 +98,7 @@ impl QueuePair {
     ) -> Result<Self> {
         init_attr.send_cq = send_cq.as_ptr();
         init_attr.recv_cq = recv_cq.as_ptr();
-        let ptr = unsafe { crate::ibv_create_qp(pd.as_ptr(), init_attr) };
+        let ptr = unsafe { crate::ruapc_ibv_create_qp(pd.as_ptr(), init_attr) };
         if ptr.is_null() {
             return Err(ErrorKind::IBCreateQueuePairFail.with_errno());
         }
@@ -483,7 +483,7 @@ impl QueuePair {
     }
 
     pub fn modify(&self, attr: &mut crate::ibv_qp_attr, attr_mask: c_int) -> Result<()> {
-        let ret = unsafe { crate::ibv_modify_qp(self.ptr, attr, attr_mask) };
+        let ret = unsafe { crate::ruapc_ibv_modify_qp(self.ptr, attr, attr_mask) };
         if ret != 0 {
             return Err(ErrorKind::IBModifyQueuePairFail.with_errno());
         }
@@ -628,9 +628,7 @@ impl QueuePair {
         wr: *mut crate::ibv_send_wr,
     ) -> std::result::Result<(), (*mut crate::ibv_send_wr, Error)> {
         let mut bad_wr: *mut crate::ibv_send_wr = ptr::null_mut();
-        let ret = unsafe {
-            (*(*self.ptr).context).ops.post_send.unwrap_unchecked()(self.ptr, wr, &mut bad_wr)
-        };
+        let ret = unsafe { crate::ruapc_ibv_post_send(self.ptr, wr, &mut bad_wr) };
         if ret != 0 {
             return Err((bad_wr, ErrorKind::IBPostSendFail.with_errno()));
         }
@@ -642,9 +640,7 @@ impl QueuePair {
         wr: *mut crate::ibv_recv_wr,
     ) -> std::result::Result<(), (*mut crate::ibv_recv_wr, Error)> {
         let mut bad_wr: *mut crate::ibv_recv_wr = ptr::null_mut();
-        let ret = unsafe {
-            (*(*self.ptr).context).ops.post_recv.unwrap_unchecked()(self.ptr, wr, &mut bad_wr)
-        };
+        let ret = unsafe { crate::ruapc_ibv_post_recv(self.ptr, wr, &mut bad_wr) };
         if ret != 0 {
             return Err((bad_wr, ErrorKind::IBPostRecvFail.with_errno()));
         }
@@ -654,7 +650,7 @@ impl QueuePair {
 
 impl Drop for QueuePair {
     fn drop(&mut self) {
-        let _ = unsafe { crate::ibv_destroy_qp(self.ptr) };
+        let _ = unsafe { crate::ruapc_ibv_destroy_qp(self.ptr) };
     }
 }
 impl std::fmt::Debug for QueuePair {

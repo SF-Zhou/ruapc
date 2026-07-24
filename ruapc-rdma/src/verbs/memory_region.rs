@@ -29,7 +29,7 @@ impl MemoryRegion {
         access: c_int,
     ) -> Result<Self> {
         let ptr = unsafe {
-            crate::ibv_reg_mr(pd.as_ptr(), memory.as_mut_ptr() as _, memory.size(), access)
+            crate::ruapc_ibv_reg_mr(pd.as_ptr(), memory.as_mut_ptr() as _, memory.size(), access)
         };
         if ptr.is_null() {
             return Err(ErrorKind::IBRegMemoryRegionFail.with_errno());
@@ -69,7 +69,7 @@ impl MemoryRegion {
 
 impl Drop for MemoryRegion {
     fn drop(&mut self) {
-        let _ = unsafe { crate::ibv_dereg_mr(self.ptr) };
+        let _ = unsafe { crate::ruapc_ibv_dereg_mr(self.ptr) };
     }
 }
 
