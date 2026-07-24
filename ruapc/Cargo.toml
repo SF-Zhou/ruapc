@@ -37,6 +37,7 @@ rmp-serde.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde-inline-default.workspace = true
+serde_bytes.workspace = true
 serde_json.workspace = true
 socket2.workspace = true
 tokio.workspace = true
