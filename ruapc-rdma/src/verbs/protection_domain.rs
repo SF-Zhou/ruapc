@@ -19,7 +19,7 @@ pub struct ProtectionDomain {
 impl ProtectionDomain {
     /// Allocates a new protection domain on the given context.
     pub fn alloc(context: &Arc<Context>) -> Result<Arc<Self>> {
-        let ptr = unsafe { crate::ibv_alloc_pd(context.as_ptr()) };
+        let ptr = unsafe { crate::ruapc_ibv_alloc_pd(context.as_ptr()) };
         if ptr.is_null() {
             return Err(ErrorKind::IBAllocPDFail.with_errno());
         }
@@ -37,7 +37,7 @@ impl ProtectionDomain {
 
 impl Drop for ProtectionDomain {
     fn drop(&mut self) {
-        let _ = unsafe { crate::ibv_dealloc_pd(self.ptr) };
+        let _ = unsafe { crate::ruapc_ibv_dealloc_pd(self.ptr) };
     }
 }
 

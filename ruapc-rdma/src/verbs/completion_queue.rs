@@ -33,7 +33,7 @@ impl CompletionQueue {
     ) -> Result<Arc<Self>> {
         let channel_ptr = channel.map(|c| c.as_ptr()).unwrap_or(ptr::null_mut());
         let ptr = unsafe {
-            crate::ibv_create_cq(
+            crate::ruapc_ibv_create_cq(
                 context.as_ptr(),
                 cq_size,
                 ptr::null_mut(), // cq_context
@@ -58,12 +58,7 @@ impl CompletionQueue {
 
     /// Requests notification for the next completion event.
     pub fn req_notify(&self, solicited_only: bool) -> Result<()> {
-        let ret = unsafe {
-            (*(*self.ptr).context).ops.req_notify_cq.unwrap_unchecked()(
-                self.ptr,
-                solicited_only as c_int,
-            )
-        };
+        let ret = unsafe { crate::ruapc_ibv_req_notify_cq(self.ptr, solicited_only as c_int) };
         if ret != 0 {
             return Err(ErrorKind::IBReqNotifyCompQueueFail.with_errno());
         }
@@ -74,13 +69,7 @@ impl CompletionQueue {
     ///
     /// Returns the number of completions written to the `wc` slice.
     pub fn poll(&self, wc: &mut [ibv_wc]) -> Result<usize> {
-        let ret = unsafe {
-            (*(*self.ptr).context).ops.poll_cq.unwrap_unchecked()(
-                self.ptr,
-                wc.len() as c_int,
-                wc.as_mut_ptr(),
-            )
-        };
+        let ret = unsafe { crate::ruapc_ibv_poll_cq(self.ptr, wc.len() as c_int, wc.as_mut_ptr()) };
         if ret < 0 {
             return Err(ErrorKind::IBPollCompQueueFail.with_errno());
         }
@@ -89,13 +78,13 @@ impl CompletionQueue {
 
     /// Acknowledges CQ events received via [`CompChannel::get_event`].
     pub fn ack_events(&self, nevents: u32) {
-        unsafe { crate::ibv_ack_cq_events(self.ptr, nevents) };
+        unsafe { crate::ruapc_ibv_ack_cq_events(self.ptr, nevents) };
     }
 }
 
 impl Drop for CompletionQueue {
     fn drop(&mut self) {
-        let _ = unsafe { crate::ibv_destroy_cq(self.ptr) };
+        let _ = unsafe { crate::ruapc_ibv_destroy_cq(self.ptr) };
     }
 }
 

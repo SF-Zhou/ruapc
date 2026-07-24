@@ -33,7 +33,7 @@ impl Device {
                 .to_string_lossy()
                 .to_string()
         };
-        let guid = Guid::from_be(unsafe { crate::ibv_get_device_guid(ptr) });
+        let guid = Guid::from_be(unsafe { crate::ruapc_ibv_get_device_guid(ptr) });
         let transport_type = unsafe { (*ptr).transport_type };
         let ibdev_path = unsafe {
             Path::new(std::ffi::OsStr::from_bytes(
