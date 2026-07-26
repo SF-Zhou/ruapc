@@ -296,201 +296,198 @@ pub struct RemoteBufferInfo {
 
 - `key`：目标内存的 MemoryKey，用于远端验证访问权限
 - `addr`：目标内存的起始地址
-- `len`：有效数据的字节数（Buffer 的逻辑长度，而非 capacity）。remote_read 精确传输 `len` 字节；`Buffer::remote_buffer_info` 导出的是 `buffer.len()`，部分填充的 Buffer 需先 `set_len`
-- 需要实现 `Serialize` / `Deserialize` 以便在 RPC 消息中传输（附着在 `MsgMeta::buffer_info` 中随请求发送）
+- `len`：有效数据的字节数（Buffer 的逻辑长度，而非 capacity）
+- 需要实现 `Serialize` / `Deserialize` 以便在 RPC 消息中传输（附着在
+  `MsgMeta::read_regions` / `MsgMeta::write_regions` 中随请求发送，
+  每个字段是 `Vec<RemoteBufferInfo>`）
 
 ## Remote Read/Write API
 
-### Socket 层接口
+### 逻辑连续空间与 CopyOp
 
-`SocketTrait` 提供统一的消息发送接口，并通过反向 RPC 实现 Remote Read/Write 的默认实现（各具体 socket 类型可覆盖）。
+一切远程内存操作都基于**逻辑连续空间**抽象：一组 Buffer / Region 按顺序
+拼接，每段贡献自己的逻辑长度（`Buffer::len()`，不是 capacity），
+`total_len = Σ len_i`。请求两侧各有至多两个空间：
+
+- **read space**（`MsgMeta::read_regions`）：Client 通过
+  `with_read_buffers(&[Buffer])` 附加（借用语义，调用期间由 Client 持有）；
+  Server 用 `ctx.remote_read` 从中读取
+- **write space**（`MsgMeta::write_regions`）：Client 通过
+  `with_write_buffers(Vec<Buffer>)` 附加（**所有权移交**，buffer 被 pin
+  住直到请求结束）；Server 用 `ctx.remote_write` 写入
+
+批量传输由 `CopyOp` 描述：
 
 ```rust
-pub trait SocketTrait {
-    /// 发送消息
-    async fn send<P: Serialize>(
-        &self,
-        meta: &mut MsgMeta,
-        payload: &P,
-        state: &Arc<State>,
-    ) -> Result<()>;
-
-    /// 从远端内存读取数据到本地 buffer（消耗 buffer 所有权，返回填充后的 buffer；
-    /// 精确读取 remote.len 字节，返回的 buffer 逻辑长度等于传输字节数；
-    /// local 容量不足时返回 BufferTooSmall）
-    async fn remote_read(
-        &self,
-        ctx: &Context,
-        local: Buffer,
-        remote: &RemoteBufferInfo,
-        options: &RemoteReadOptions,
-    ) -> Result<Buffer, RemoteIoError>;
-
-    /// 将本地 buffer 的数据（local.len() 字节）推送给 Client
-    /// （消耗 buffer 所有权，返回原 buffer）。写入目标由 Client 端
-    /// 从自己的 BufferPool 分配，不需要 RemoteBufferInfo 参数。
-    async fn remote_write(&self, ctx: &Context, local: Buffer)
-        -> Result<Buffer, RemoteIoError>;
+pub struct CopyOp {
+    pub src_offset: u64,  // 源空间内偏移
+    pub dst_offset: u64,  // 目的空间内偏移
+    pub len: u64,
 }
 ```
 
-**失败路径的 Buffer 回收（RemoteIoError）：** remote_read / remote_write 按值消耗
-本地 Buffer；失败时只要 Buffer 未被在飞硬件操作占用（如 RDMA post 后 completion
-未返回的连接级故障），就会随 `RemoteIoError` 归还给调用方，可通过
-`take_buffer()` 取回复用（例如重试）。`RemoteIoError` 实现 `From` 转换到
-`Error`，handler 中直接 `?` 传播时 Buffer 自动归还内存池，无感知成本。
+read 方向 src = read space、dst = Server 本地空间；write 方向 src = Server
+本地空间、dst = write space——两个方向完全对称，底层共用同一套
+fragmentation 引擎（`core/scatter.rs`）。
 
-`RemoteReadOptions.skip_verify` 为 `pub(crate)`：仅内部 `rdma_pull` 路径可以跳过读后的
-请求存活校验（该路径下 Server 端 future 持有 buffer，生命周期天然安全）。
+**校验（发起端与执行端都做，互不信任）：** offset/len 溢出检查、越界检查、
+op 数量上限（`MAX_COPY_OPS`）、region 数量上限（`MAX_REGIONS`）、目的区间
+互不重叠（并发写同一地址是 data race；跨多次调用的重叠由应用负责）。
+校验失败返回 `InvalidCopyOp`，不触网。
 
 ### Context 层接口
 
-`Context` 提供更方便的封装，自动处理 socket 查找和 buffer 所有权转移。
-
 ```rust
 impl Context {
-    /// 获取 Client 附加在当前请求上的 buffer info；
-    /// 请求未携带时返回 MissingBufferInfo
-    fn request_buffer_info(&self) -> Result<&RemoteBufferInfo>;
+    /// Client 附加的 read/write 空间视图（total_len、regions）；
+    /// 未携带时返回 MissingBufferInfo
+    fn remote_read_space(&self) -> Result<RemoteSpace<'_>>;
+    fn remote_write_space(&self) -> Result<RemoteSpace<'_>>;
 
-    /// 便捷接口：读取 Client 附加在当前请求上的 buffer。
-    /// 自动从本地 BufferPool 分配大小合适的 buffer 并填充，
-    /// 返回的 buffer 逻辑长度等于传输字节数
-    async fn remote_read_request(&self) -> Result<Buffer>;
+    /// 批量读：把 read space 的多个区间读进 local 空间
+    /// （local = Vec<Buffer> 按 len 拼接）。成功返回填充后的 buffers；
+    /// 失败时 buffers 随 RemoteIoError 归还（在飞硬件操作除外）
+    async fn remote_read(&self, ops: &[CopyOp], local: Vec<Buffer>)
+        -> Result<Vec<Buffer>, RemoteIoError>;
 
-    /// 从远端读取数据（消耗 buffer 所有权，返回填充后的 buffer；
-    /// 失败时 buffer 随 RemoteIoError 归还）
-    async fn remote_read(
-        &self,
-        remote: &RemoteBufferInfo,
-        local: Buffer,
-    ) -> Result<Buffer, RemoteIoError>;
+    /// 便捷接口：镜像 Client 的分段分配 buffer，1:1 读回整个 read space
+    async fn remote_read_all(&self) -> Result<Vec<Buffer>>;
 
-    /// 向 Client 推送数据，返回"传输已完成"的见证 SentBuffer；
-    /// push 在 handler 内执行，可测量、失败时 buffer 随 RemoteIoError
-    /// 归还可重试。随后 sent.reply(rsp) 配上响应值构造 WithBuffer<T> —
-    /// T 可以在传输完成后再确定（例如把推送耗时放进响应）。
-    /// 对零长 buffer（Buffer::empty 产生，零内存开销）不执行任何传输，
-    /// 直接返回 SentBuffer 见证
-    async fn remote_write(&self, local: Buffer) -> Result<SentBuffer, RemoteIoError>;
+    /// 批量写：把 local 空间的多个区间写进 write space，
+    /// 返回"传输已完成"的见证 SentBuffers（内含归还的 local buffers，
+    /// 可 take_buffers() 复用；多次写入用 merge() 合并见证）
+    async fn remote_write(&self, ops: &[CopyOp], local: Vec<Buffer>)
+        -> Result<SentBuffers, RemoteIoError>;
+
+    /// 便捷接口：local 全部内容 1:1 写到 write space 开头
+    async fn remote_write_all(&self, local: Vec<Buffer>)
+        -> Result<SentBuffers, RemoteIoError>;
+
+    /// 零传输路径的显式见证（无 payload 的 handler 分支）
+    fn sent_nothing(&self) -> SentBuffers;
 }
 ```
 
-服务端构造 `WithBuffer<T>` 的唯一路径是 `ctx.remote_write(buf).await?` →
-`sent.reply(rsp)`。`Buffer::empty(pool)` 创建一个零内存占用的零长 buffer，
-`remote_write` 对此短路不碰网络。没有 `reply_with_buffer`、`reply_with_empty_buffer`
-等别名——统一一条路径。
+零字节的 op 批量直接短路，不碰网络。在非 Connected endpoint（即非 Server
+端 handler 上下文）调用返回 `NotConnected` 错误。
 
-在非 Connected endpoint（即非 Server 端 handler 上下文）调用 `remote_read` /
-`remote_write` 返回 `NotConnected` 错误。
+### `Result<WithBuffers<T>, E>`：强类型的 remote_write 契约
 
-### `Result<WithBuffer<T>, E>`：强类型的 remote_write 契约
-
-Server 是否会推送 buffer、Client 是否要取 buffer，本质上是服务方法契约的一部分，
-不应只靠调用双方口头约定。把方法返回值声明为 `Result<WithBuffer<T>, E>`
-（`ResultWithBuffer<T>` 是普通别名；任何用户自定义别名、自定义 Error 类型均可），
-契约在两端同时成立：
+把方法返回值声明为 `Result<WithBuffers<T>, E>`（`ResultWithBuffers<T>` 是
+普通别名；任何用户自定义别名、自定义 Error 类型均可），契约在两端同时成立：
 
 ```rust
 #[ruapc::service]
 pub trait BlobService {
-    async fn download(&self, ctx: &Context, req: &DownloadReq) -> Result<WithBuffer<()>>;
+    async fn download(&self, ctx: &Context, req: &DownloadReq) -> Result<WithBuffers<u64>>;
 }
 
-// Server：WithBuffer 只能由完成的传输产生（remote_write 返回的
-// SentBuffer 见证），push 就发生在 handler 内部 — 延迟可测量、失败可
-// 通过 RemoteIoError 拿回 buffer 重试，而"忘记 push"在编译期就不可能
-// （构造不出返回值）。响应值在传输完成后再确定，自由度更大：
-async fn download(&self, ctx: &Context, req: &DownloadReq) -> Result<WithBuffer<u64>> {
-    let mut buf = /* 从 buffer_pool 分配并填充 */;
-    buf.set_len(len);
+// Server：WithBuffers 只能由完成的传输产生（remote_write 返回的
+// SentBuffers 见证），写入就发生在 handler 内部 — 延迟可测量、失败可
+// 通过 RemoteIoError 拿回 buffers 重试，而"忘记写"在编译期就不可能
+// （构造不出返回值）。响应值在传输完成后再确定：
+async fn download(&self, ctx: &Context, req: &DownloadReq) -> Result<WithBuffers<u64>> {
+    let bufs = /* 从 buffer_pool 分配并填充、set_len */;
     let t0 = Instant::now();
-    let sent = ctx.remote_write(buf).await?;          // 传输在此完成
-    Ok(sent.reply(t0.elapsed().as_micros() as u64))   // T 事后决定
+    let sent = ctx.remote_write_all(bufs).await?;      // 传输在此完成
+    Ok(sent.reply(t0.elapsed().as_micros() as u64))    // T 事后决定
 }
 
-// Client：同一个方法、同一个签名，buffer 随响应一起返回 —
-// 客户端不可能"忘记取"
-let (rsp, buffer) = client.download(&ctx, &req).await?.into_parts();
+// Client：预先提供 pinned 目的 buffers，全部随响应一起返回 —
+// 客户端不可能"忘记取"，也不可能提前释放正在被写的内存
+let (rsp, buffers) = client
+    .with_write_buffers(vec![buf_a, buf_b])
+    .download(&ctx, &req)
+    .await?
+    .into_parts();
 ```
 
 **实现机制：**
 
 - **类型驱动而非名字驱动**：宏对所有方法生成同一份客户端代码，走
-  `RpcCall<返回类型>` 分派；`Result<WithBuffer<T>, E>` 命中 `CallWithBuffer`
-  trait 实现（额外交付 buffer），其余命中 `CallPlain`。两组实现靠
-  `WithBuffer: !Deserialize` 的 bounds 天然不相交，编译期唯一解析。
-  类型别名在类型检查时展开，因此任意别名、任意满足 bounds 的自定义
-  Error 类型都能工作 — 宏中没有任何按名识别的逻辑
-- **witness 保证服务端契约**：`WithBuffer` 字段私有，唯一产生路径是
-  `remote_write → SentBuffer::reply`；dispatch 不再隐藏任何 I/O
-- wire 上的响应就是 `T`（`WithBuffer` 透明序列化），buffer 走 out-of-band
-  通道，OpenAPI schema 按 `T` 生成；服务端 dispatch 与普通方法完全一致
-- 响应到达而无推送 buffer = 空回复：由于返回类型已在编译期保证服务端
-  必然构造过 `WithBuffer`，"没有 push"不再是错误状态，Client 侧 glue
-  直接物化一个空 buffer（`Buffer::empty`，零内存）
-- 普通 `Result<T>` 方法不受影响。服务端向客户端推送 buffer 的**唯一**
-  公开途径就是 `Result<WithBuffer<T>, E>` 契约，统一通过 `remote_write`
-  + `SentBuffer::reply` 两步构成。空传输路径由 `Buffer::empty` 产生零长
-  buffer，`remote_write` 检测到 `len == 0` 直接短路，不碰网络
+  `RpcCall<返回类型>` 分派；`Result<WithBuffers<T>, E>` 命中
+  `CallWithBuffer` trait 实现（额外交付 buffers），其余命中 `CallPlain`。
+  两组实现靠 `WithBuffers: !Deserialize` 的 bounds 天然不相交
+- **witness 保证服务端契约**：`WithBuffers` 字段私有，唯一产生路径是
+  `remote_write → SentBuffers::reply`（或显式的 `sent_nothing()`）
+- **WriteTarget pin 保证客户端安全**：`with_write_buffers` 的 buffers
+  移入 `Arc<WriteTarget>`，挂在 waiter entry 上；`push`/`pull` handler
+  执行写入时 clone 这个 Arc——即使原请求超时、entry 被清理，在飞的
+  RDMA READ 仍持有内存，绝不会把 NIC 可能还在写的内存还给 pool。
+  正常路径下全部 buffers 随响应原子交付并从 `WithBuffers` 返回；
+  失败路径可通过 `ClientWithBuffers::take_write_buffers()` 找回
+- wire 上的响应就是 `T`（`WithBuffers` 透明序列化），数据走 out-of-band
+  的 pull/push 协议；未附加 write buffers 的调用得到空 buffer 列表
 
 ## 传输层实现
 
 ### TCP：反向 RPC 模拟
 
-TCP 设备上的 Remote Read/Write 通过反向 RPC 实现：
+**Remote Read 流程（`MemoryService/read`）：**
 
-**Remote Read 流程：**
+1. Server 校验 op 批量后发反向 RPC，携带 read regions 回显 + ops
+2. Client 重新校验（region 注册表存在性、`addr + len` 不越界、op 边界），
+   按 op 顺序把各区间拼成一个内联 blob 返回
+3. Client 读后校验原始请求（msgid）仍在等待——否则数据可能来自已回收
+   复用的内存，丢弃并返回 Timeout
+4. Server 按 ops 把 blob 散射进 local 空间
 
-1. Server 调用 `socket.remote_read(remote_info, local_buffer)`
-2. Server 通过反向 RPC 发送 Remote Read 命令给 Client，包含 `RemoteBufferInfo`
-3. Client 收到命令后，校验 `remote_info`（ID 存在性、offset + len 不越界）
-4. 校验通过后，Client 从本地注册内存中读取数据，通过 RPC 返回
-5. Server 将返回数据写入 `local_buffer`
+**Remote Write 流程（`MemoryService/push`）：**
 
-**Remote Write 流程：**
+1. Server 把各 op 的源区间按顺序拼成内联 blob，随 ops 发反向 RPC
+2. Client 查 waiter 拿到 `Arc<WriteTarget>`（不存在 → Timeout），校验 ops
+   （对 write space 边界）、blob 长度 == Σ op.len
+3. Client 按 ops 把 blob 拷贝进 pinned buffers；响应即完成通知
 
-1. Server 调用 `socket.remote_write(local_buffer)`
-2. Server 通过反向 RPC（`MemoryService/tcp_push`）将数据内联发送给 Client
-3. Client 收到后从自己的 BufferPool 分配 buffer 并拷贝数据
-4. Client 校验原始请求（msgid）仍在等待中，然后把 buffer 存入 Waiter
-5. 原始 RPC 响应到达时，buffer 与响应一并交付，随 `WithBuffer<T>` 返回给调用方
+### RDMA Read：批量单边 RDMA Read
 
-**安全校验：**
-
-TCP Device 内部维护注册表 `DashMap<u32, Arc<AlignedMemory>>`（ID → 注册的内存块），每次 Remote Read 时：
-- 校验 ID 是否存在于注册表中
-- 校验 `addr + len` 是否在注册范围内，防止越界访问
-- 反注册时从注册表中移除条目
-
-### RDMA Read：直接 RDMA Read
-
-RDMA 设备上的 Remote Read 直接使用 RDMA Read verbs 操作：
-
-1. Server 调用 `socket.remote_read(remote_info, local_buffer)`
-2. 提取 `remote_info.key` 中的 rkey，`local_buffer` 的 lkey
-3. 构造 `ibv_send_wr`（opcode = `IBV_WR_RDMA_READ`），设置 remote addr/rkey 和 local addr/lkey
-4. 调用 `ibv_post_send` 发起 RDMA Read
-5. 通过 completion queue 等待操作完成
+1. Server 校验后用 fragmentation 引擎把 ops 切成 work request：
+   **先按 remote region 边界切**（一个 READ WR 的远端必须连续），每个
+   remote 连续块内 local 侧跨段时生成 SG list（上限 = 设备
+   `max_send_sge`，超出再拆 WR）——多 buffer 对上层透明
+2. 并发 post 全部 WR（每连接 `rdma.max_inflight_read_wrs` 信号量限流，
+   permit 由 poll 线程随 completion 归还）；一批 WR 共享一个
+   `ReadBatch`（原子计数），最后一个 WC 到达时唤醒等待方
+3. NIC 层并发度由握手协商的 `max_rd_atomic`/`max_dest_rd_atomic` 决定：
+   双方在 Endpoint 交换中携带设备能力（`rd_atomic_cap`，上限 16），
+   两侧都取 min，天然满足 RC 的 initiator ≤ responder 约束
+4. 读完成后反向 RPC `is_message_waiting` 校验原始请求存活（单边读
+   Client 无感知，超时后内存可能已复用）
 
 ### RDMA Write 模拟：控制消息 + Client-side RDMA Read
 
-RDMA 设备上的 Remote Write 不直接使用 RDMA Write verbs，而是通过控制消息 + Client-side RDMA Read 模拟：
-
-**流程：**
-
-1. Server 调用 `socket.remote_write(local_buffer)`
-2. Server 将 `local_buffer` 的 `RemoteBufferInfo`（包含 Server 端的 rkey、addr、len）附着在反向 RPC（`MemoryService/rdma_pull`）的 MsgMeta 中发送给 Client
-3. Client 收到后从自己的 BufferPool 分配 buffer，执行 RDMA Read 从 Server 的 `local_buffer` 拉取数据
-4. Client 把填充好的 buffer 存入 Waiter（原始请求已超时则丢弃并返回 Timeout）
-5. `rdma_pull` 的响应即完成通知，Server 端 `remote_write` 返回成功
+1. Server 调用 `ctx.remote_write(ops, local)`：把 local buffers 作为反向
+   RPC（`MemoryService/pull`）的 **read regions** 附加（与 Client 附加
+   read buffers 完全同一机制——角色对称），body 携带 ops
+2. Client 查 waiter 拿 `Arc<WriteTarget>`、校验 ops，走**同一套**
+   fragmentation + 批量 READ 引擎，从 Server 内存读进 pinned buffers
+3. `pull` 响应即完成通知；Server 端 `remote_write` 返回 `SentBuffers`
+4. 无需读后存活校验：目的内存由 Arc pin 住（Client 侧），源内存由
+   Server 的 future 跨 await 持有
 
 **设计考量：**
-- 所有数据流动都通过"本地"的 RDMA Read 完成，更易于并发控制
-- 避免 RDMA Write 带来的网络拥塞问题
-- 对称设计：双方都需要注册内存。Server 端注册 `local_buffer` 作为数据源，Client 端注册目标内存用于 RDMA Read
-- `remote_write` 是异步操作，阻塞直到整个流程完成或超时返回错误
-- **Buffer 生命周期安全：** `remote_write` 的 future 必须持有 `local_buffer` 的引用，确保在整个异步流程中 Buffer 不会被 Drop 归还到 free list
+- 所有数据流动都通过"本地发起"的 RDMA Read 完成，更易于并发控制、
+  避免 RDMA Write 的拥塞问题
+- 对称设计：read/write 共用 region 通告、校验、fragmentation、批量
+  completion 全套机制
+
+### RDMA Read 软件超时
+
+QP 硬件重传（timeout 0x12 × retry 6）不足以覆盖所有 NIC 卡死场景，
+RDMA READ 有独立的软件超时（`rdma.read_timeout_ms`，默认 10s，0 禁用）：
+
+- **不用逐操作 timer**：poll 线程的 housekeeping 里每 100ms 扫一次各连接
+  的在飞 `ReadBatch` deadline（map 很小，成本可忽略），避免 tokio timer
+  wheel 在高吞吐下成为瓶颈
+- 超时触发：等待方立即收到 `RdmaReadTimeout` 错误；连接被 `set_error`
+  （QP → ERR），NIC 随后 flush 所有在飞 WR
+- **绝不提前回收内存**：`ReadBatch` 持有的内存 hold（local buffers 或
+  `Arc<WriteTarget>`）只在**全部** WC（含 flush WC）到达后释放；WC 永远
+  不来则宁可滞留，直到 socket 销毁（`ibv_destroy_qp` 返回后保证无在飞
+  DMA，`RdmaSocket` 的字段声明顺序保证 QP 先于 hold 析构）
+- 在飞 READ 未清空的连接不会被 poll 线程 teardown（`ready_to_remove`
+  检查 `rdma_completions` 为空）；poll 线程自身退出时显式 fail 所有
+  batch，防止等待方悬挂
 
 ## BufferPool 内存管理
 

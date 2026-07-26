@@ -326,6 +326,17 @@ fn dispatch_item((state, socket, frames): DispatchItem) {
     });
 }
 
+/// Resolves every outstanding read batch of a socket with
+/// `ConnectionClosed` (without releasing their memory holds).
+fn fail_read_batches(socket: &RdmaSocket) {
+    for entry in socket.rdma_completions.iter() {
+        entry.value().fail(Error::new(
+            ErrorKind::ConnectionClosed,
+            "rdma poll thread shut down with reads in flight".into(),
+        ));
+    }
+}
+
 /// Wakes the poll thread out of its idle `poll(2)` sleep.
 #[derive(Clone, Debug)]
 pub struct PollerWaker(Arc<UnixStream>);
@@ -976,15 +987,22 @@ impl ConnState {
 
     fn handle_send_completion(&mut self, wc: &ibv_wc, buffer: Option<WrBuffers>) -> Result<()> {
         match wc.wr_id.get_type() {
-            // RDMA one-sided operation: hand the buffer back to the
-            // caller. Reads consume no peer receive buffer, so they take
-            // part in no flow control accounting.
+            // RDMA one-sided operation: account the completion on its
+            // batch (the batch owns the memory, not the WR slot table).
+            // Reads consume no peer receive buffer, so they take part in
+            // no flow control accounting.
             WRType::Read => {
-                if let Some((_, sender)) = self.socket.rdma_completions.remove(&wc.wr_id) {
-                    // Read WRs always post a single buffer.
-                    let _ = sender.send((wc.status, buffer.and_then(WrBuffers::into_single)));
+                debug_assert!(buffer.is_none(), "read WRs store no slot buffer");
+                // Return the in-flight-read permit taken at post time.
+                self.socket.read_permits.add_permits(1);
+                if let Some((_, batch)) = self.socket.rdma_completions.remove(&wc.wr_id) {
+                    batch.complete_one(wc.succ());
+                }
+                if wc.succ() {
                     return Ok(());
                 }
+                // Fall through to the error return below (which moves the
+                // connection to the error state).
             }
             // A buffer-less immediate send is a standalone ACK; one with a
             // buffer is a data send with a piggybacked ACK, which lives in
@@ -1281,6 +1299,38 @@ impl ConnState {
         }
     }
 
+    /// Fails read batches that exceeded their deadline; a NIC stuck on an
+    /// RDMA READ must not park the caller forever. Failing the connection
+    /// moves the QP to the error state, so the outstanding reads
+    /// eventually surface as flush completions — which is what releases
+    /// their memory holds safely.
+    fn sweep_read_timeouts(&self, now: Instant) {
+        if self.socket.rdma_completions.is_empty() {
+            return;
+        }
+        let mut fired = false;
+        for entry in self.socket.rdma_completions.iter() {
+            let batch = entry.value();
+            if batch.expired(now)
+                && batch.fail(Error::new(
+                    ErrorKind::RdmaReadTimeout,
+                    "RDMA READ did not complete within rdma.read_timeout_ms; \
+                     failing the connection to flush it"
+                        .into(),
+                ))
+            {
+                fired = true;
+            }
+        }
+        if fired {
+            tracing::error!(
+                "RDMA READ timeout on qp={}, moving connection to error state",
+                self.socket.queue_pair.qp_num()
+            );
+            self.socket.set_error();
+        }
+    }
+
     /// Whether this connection can be torn down.
     ///
     /// Only true after the socket entered the error state (QP moved to ERR):
@@ -1288,11 +1338,14 @@ impl ConnState {
     /// for the ACK and recv counters to settle guarantees the QP finished
     /// flushing. Buffers of successfully-completed unsignaled sends never
     /// produce a CQE and are reclaimed explicitly before removal.
+    /// Outstanding RDMA READ batches also block removal: their memory
+    /// holds may only be released once their (flush) completions arrived.
     fn ready_to_remove(&mut self) -> bool {
         if self.socket.state.is_ok()
             || self.send.ack_submitted != self.send.ack_completed
             || self.recv.submitted != self.recv.completed
             || !self.pending_sends.is_empty()
+            || !self.socket.rdma_completions.is_empty()
         {
             return false;
         }
@@ -1329,11 +1382,18 @@ impl PollLoop {
     /// their clock reads), so it must not run on every spin iteration.
     const HOUSEKEEPING_INTERVAL: Duration = Duration::from_micros(100);
 
+    /// Cadence of the RDMA READ timeout sweep. Coarse on purpose: read
+    /// timeouts are measured in seconds, and per-request timers are
+    /// deliberately avoided (a background scan of the small in-flight
+    /// read maps costs nearly nothing).
+    const READ_SWEEP_INTERVAL: Duration = Duration::from_millis(100);
+
     fn run(mut self) {
         let mut wcs = [ibv_wc::default(); 64];
         let mut batch: DispatchBatch = Vec::new();
         let mut spin_until = Instant::now();
         let mut next_housekeeping = Instant::now();
+        let mut next_read_sweep = Instant::now();
         let mut last_dump = Instant::now();
 
         loop {
@@ -1393,10 +1453,18 @@ impl PollLoop {
                     }
                 }
 
+                let sweep_reads = now >= next_read_sweep;
+                if sweep_reads {
+                    next_read_sweep = now + Self::READ_SWEEP_INTERVAL;
+                }
+
                 for slot in 0..self.conns.len() {
                     let Some(conn) = self.conns[slot].as_mut() else {
                         continue;
                     };
+                    if sweep_reads {
+                        conn.sweep_read_timeouts(now);
+                    }
                     conn.drain_pending();
                     if conn.recv_deficit > 0 {
                         conn.retry_recv_deficit();
@@ -1556,10 +1624,16 @@ impl PollLoop {
         };
         for incoming in &drained {
             incoming.conn.socket.set_error();
+            fail_read_batches(&incoming.conn.socket);
         }
         drop(drained);
         for conn in self.conns.iter().flatten() {
             conn.socket.set_error();
+            // Nobody will poll the flush completions after this thread
+            // exits: resolve the waiting tasks now. The memory holds stay
+            // parked in the batches and are released when the socket (and
+            // its QP, first) is dropped.
+            fail_read_batches(&conn.socket);
         }
         self.conns.clear();
         if self.unack_cq_events > 0 {

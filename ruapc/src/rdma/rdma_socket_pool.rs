@@ -501,6 +501,15 @@ impl RdmaSocketPool {
         let send_window = (config.recv_queue_len / 2).max(1);
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Buffer>(1024);
+        // Software timeout for RDMA READ completions (0 disables) and the
+        // per-connection in-flight READ cap (the SQ is shared with sends,
+        // so leave at least half of it to them).
+        let read_timeout = (self.config.read_timeout_ms > 0)
+            .then(|| Duration::from_millis(self.config.read_timeout_ms));
+        let max_inflight_read_wrs = self
+            .config
+            .max_inflight_read_wrs
+            .clamp(1, (config.qp.max_send_wr / 2).max(1));
         let socket = Arc::new(RdmaSocket::new(
             queue_pair,
             self.buffer_pool.clone(),
@@ -509,6 +518,8 @@ impl RdmaSocketPool {
             config.max_msg_size as usize,
             send_window,
             path,
+            read_timeout,
+            max_inflight_read_wrs,
         ));
 
         // Pre-post receive buffers *before* the remote can send: the
@@ -1212,7 +1223,24 @@ impl RdmaSocketPool {
             link_layer: port.port_attr.link_layer,
             active_mtu: port.port_attr.active_mtu,
             psn: Self::random_psn(qp.qp_num()),
+            rd_atomic_cap: Self::rd_atomic_cap(&info),
         })
+    }
+
+    /// The device cap on concurrent RDMA READs per QP, advertised to the
+    /// peer via the endpoint exchange.
+    ///
+    /// The minimum of the initiator-side and responder-side device limits
+    /// is used for both directions, clamped to a sane ceiling — beyond ~16
+    /// the returns diminish while responder resources grow.
+    fn rd_atomic_cap(info: &DeviceInfo) -> u8 {
+        const RD_ATOMIC_CEILING: i32 = 16;
+        let cap = info
+            .device_attr
+            .max_qp_rd_atom
+            .min(info.device_attr.max_qp_init_rd_atom)
+            .clamp(1, RD_ATOMIC_CEILING);
+        u8::try_from(cap).unwrap_or(1)
     }
 
     /// Generates a pseudo-random 24-bit initial packet sequence number.
@@ -1260,6 +1288,13 @@ impl RdmaSocketPool {
         }
 
         let path_mtu = Self::min_mtu(local.active_mtu, remote.active_mtu);
+        // Both sides advertise their device cap and program the minimum
+        // for both `max_rd_atomic` (outbound reads) and
+        // `max_dest_rd_atomic` (inbound reads): the two ends compute the
+        // same value, which keeps the RC requirement
+        // `initiator.max_rd_atomic <= responder.max_dest_rd_atomic`
+        // trivially satisfied.
+        let rd_atomic = local.rd_atomic_cap.min(remote.rd_atomic_cap).max(1);
         qp.connect(
             local.port_num,
             local.gid_index,
@@ -1271,6 +1306,8 @@ impl RdmaSocketPool {
             remote.lid,
             local.psn,
             remote.psn,
+            rd_atomic,
+            rd_atomic,
         )
         .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))
     }

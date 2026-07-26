@@ -1,13 +1,15 @@
 use foldhash::fast::RandomState;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
-use crate::{Buffer, Error, Message, Receiver};
+use crate::{Error, Message, Receiver, core::WriteTarget};
 
-/// The response sent through the waiter channel, including the RPC response
-/// message and an optional write buffer received from the server.
-pub type WaiterResponse = (Message, Option<Buffer>);
+/// The response sent through the waiter channel: the RPC response message
+/// plus the request's pinned write target (when the client attached write
+/// buffers), delivered atomically.
+pub type WaiterResponse = (Message, Option<Arc<WriteTarget>>);
 
 /// The result delivered through the waiter channel: either a response, or an
 /// eager error (e.g. the connection carrying the request was closed).
@@ -27,9 +29,12 @@ pub(crate) fn next_conn_id() -> u64 {
 struct WaiterEntry {
     /// Channel to send the response through.
     sender: oneshot::Sender<WaiterResult>,
-    /// Write buffer stored by `MemoryService::tcp_push` / `rdma_pull` during
-    /// the request. Sent together with the response when `post` is called.
-    write_buffer: Option<Buffer>,
+    /// The pinned destination buffers of a request sent with
+    /// `with_write_buffers`. `MemoryService::push` / `pull` handlers clone
+    /// the `Arc` while writing, so the memory outlives the entry even if
+    /// the request expires mid-transfer. Delivered together with the
+    /// response when `post` is called.
+    write_target: Option<Arc<WriteTarget>>,
     /// Id of the connection the request was sent on (see
     /// [`Waiter::bind_connection`]); used by [`Waiter::fail_connection`] to
     /// fail pending requests eagerly when the connection dies.
@@ -51,7 +56,7 @@ struct WaiterEntry {
 /// their responses. It assigns unique message IDs to requests and stores
 /// channels that will receive the corresponding responses.
 ///
-/// Write buffers received during a request (via `store_write_buffer`) are
+/// A request's pinned write target (attached via `bind_write_target`) is
 /// stored alongside the channel sender and delivered together with the
 /// response message when `post` is called, ensuring atomicity.
 #[derive(Default)]
@@ -90,14 +95,14 @@ impl Waiter {
     /// Returns a tuple of (message_id, receiver). The receiver will automatically
     /// clean up the waiter entry when dropped. The entry expires `timeout`
     /// after allocation (with up to [`Self::SWEEP_INTERVAL`] of slack).
-    pub fn alloc(&self, timeout: Duration) -> (u64, Receiver<'_>) {
+    pub(crate) fn alloc(&self, timeout: Duration) -> (u64, Receiver<'_>) {
         let msgid = self.index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.id_map.insert(
             msgid,
             WaiterEntry {
                 sender: tx,
-                write_buffer: None,
+                write_target: None,
                 conn_id: None,
                 deadline: Instant::now() + timeout,
             },
@@ -117,12 +122,12 @@ impl Waiter {
     /// Posts a response message to the waiting receiver.
     ///
     /// Removes the entry from the map and sends the response message along
-    /// with any write buffer that was stored during the request.
+    /// with the request's pinned write target, if any.
     ///
     /// If no waiter is found (e.g., because of timeout), a warning is logged.
     pub fn post(&self, msgid: u64, result: Message) {
         if let Some((_, entry)) = self.id_map.remove(&msgid) {
-            let _ = entry.sender.send(Ok((result, entry.write_buffer)));
+            let _ = entry.sender.send(Ok((result, entry.write_target)));
         } else {
             tracing::warn!("Waiter post failed for msgid: {}", msgid);
         }
@@ -169,24 +174,23 @@ impl Waiter {
         self.id_map.len()
     }
 
-    /// Stores a write buffer for a pending request.
-    ///
-    /// Called by `MemoryService` handlers when the server performs a
-    /// `remote_write`. The buffer is stored in the same entry as the
-    /// response channel, ensuring it is delivered atomically with the
-    /// response when `post` is called.
-    ///
-    /// # Returns
-    ///
-    /// Returns `true` if the buffer was stored successfully (msgid still active),
-    /// `false` if the request has already completed or timed out.
-    pub fn store_write_buffer(&self, msgid: u64, buffer: Buffer) -> bool {
+    /// Attaches the pinned write target of a request sent with
+    /// `with_write_buffers`. Called right after the entry is allocated;
+    /// a no-op when the entry no longer exists.
+    pub(crate) fn bind_write_target(&self, msgid: u64, target: Arc<WriteTarget>) {
         if let Some(mut entry) = self.id_map.get_mut(&msgid) {
-            entry.write_buffer = Some(buffer);
-            true
-        } else {
-            false
+            entry.write_target = Some(target);
         }
+    }
+
+    /// Returns a clone of the pending request's pinned write target, or
+    /// `None` when the request completed/expired or attached no write
+    /// buffers. `MemoryService::push` / `pull` handlers hold this clone
+    /// while writing, which keeps the memory alive across the transfer.
+    pub(crate) fn write_target(&self, msgid: u64) -> Option<Arc<WriteTarget>> {
+        self.id_map
+            .get(&msgid)
+            .and_then(|entry| entry.write_target.clone())
     }
 
     fn remove(&self, msgid: u64) {
@@ -269,7 +273,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_waiter_store_write_buffer() {
+    async fn test_waiter_write_target_delivery() {
         use crate::Devices;
 
         let devices = Arc::new(Devices::default());
@@ -278,23 +282,27 @@ mod tests {
         let waiter = Waiter::default();
         let (msgid, rx) = waiter.alloc(std::time::Duration::from_secs(30));
 
-        // Store a write buffer while the request is pending.
+        // Bind a write target while the request is pending.
         let mut buf = pool.allocate(1024 * 1024).unwrap();
-        buf[..5].copy_from_slice(b"hello");
         buf.set_len(5);
-        assert!(waiter.store_write_buffer(msgid, buf));
+        let target = WriteTarget::new(vec![buf]).unwrap();
+        waiter.bind_write_target(msgid, target);
 
-        // Post the response.
+        // A handler-side clone writes into the target.
+        let handler_clone = waiter.write_target(msgid).expect("target must be visible");
+        handler_clone.copy_in(0, b"hello").unwrap();
+        drop(handler_clone);
+
+        // Post the response; the target is delivered atomically with it.
         waiter.post(msgid, Message::default());
-
-        // Receive should include the write buffer.
-        let (_msg, write_buf) = rx.recv().await.unwrap();
-        let write_buf = write_buf.expect("expected write buffer");
-        assert_eq!(&write_buf[..], b"hello");
+        let (_msg, target) = rx.recv().await.unwrap();
+        let buffers =
+            WriteTarget::try_into_buffers(target.expect("expected write target")).unwrap();
+        assert_eq!(&buffers[0][..], b"hello");
     }
 
     #[tokio::test]
-    async fn test_waiter_store_write_buffer_after_timeout() {
+    async fn test_waiter_write_target_after_timeout() {
         use crate::Devices;
 
         let devices = Arc::new(Devices::default());
@@ -302,13 +310,15 @@ mod tests {
 
         let waiter = Waiter::default();
         let (msgid, rx) = waiter.alloc(std::time::Duration::from_secs(30));
+        let mut buf = pool.allocate(1024 * 1024).unwrap();
+        buf.set_len(1);
+        waiter.bind_write_target(msgid, WriteTarget::new(vec![buf]).unwrap());
 
         // Drop receiver (simulates timeout cleanup).
         drop(rx);
 
-        // Store should fail since the entry was removed.
-        let buf = pool.allocate(1024 * 1024).unwrap();
-        assert!(!waiter.store_write_buffer(msgid, buf));
+        // The target is gone together with the entry.
+        assert!(waiter.write_target(msgid).is_none());
     }
 
     #[tokio::test]

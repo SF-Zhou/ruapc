@@ -1,20 +1,26 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+use std::time::{Duration, Instant};
 
 use ruapc_bufpool::RemoteBufferInfo;
-use ruapc_rdma::{QueuePair, WRID, ibv_send_flags, ibv_wc_status};
+use ruapc_rdma::{QueuePair, ReadSge, WRID, ibv_send_flags};
 use serde::Serialize;
 use tokio::sync::mpsc::Sender;
 
 use super::{RdmaPathInfo, RdmaState, SendPermit};
 use crate::{
-    Buffer, BufferPool, Context, Error, RemoteIoError, RemoteReadOptions, SocketTrait, State,
+    Buffer, BufferPool, Context, CopyOp, Error, RemoteIoError, RemoteSpace, SocketTrait, State,
+    core::{
+        WriteTarget,
+        scatter::{self, SpaceLayout},
+    },
     error::{ErrorKind, Result},
     msg::MsgMeta,
     rdma::poller::{FRAME_HEADER, PollerWaker},
     services::{MemoryService, MetaService},
 };
-
-pub(crate) type RdmaCompletion = (ibv_wc_status, Option<Buffer>);
 
 /// Serializes a message as one wire frame: `[4B frame_len][4B meta_len]
 /// [meta][payload]`.
@@ -68,12 +74,198 @@ impl crate::msg::SendMsg for FramedBuffer<'_> {
     }
 }
 
+/// The memory kept alive for one in-flight RDMA READ batch.
+///
+/// Whatever variant it is, the underlying registered memory must stay
+/// owned here until *every* work completion of the batch (success, error
+/// or flush) has been observed — only then is the NIC guaranteed to no
+/// longer DMA into it.
+#[derive(Debug)]
+pub(crate) enum ReadHold {
+    /// Server-side `remote_read`: the local destination buffers.
+    Buffers(Vec<Buffer>),
+    /// Client-side `pull`: the request's pinned write target. Never read
+    /// back — held purely for ownership until the batch settles.
+    Target(#[allow(dead_code)] Arc<WriteTarget>),
+}
+
+/// Shared completion state of one batch of RDMA READ work requests.
+///
+/// Every WR of the batch maps (via `rdma_completions`) to the same
+/// `Arc<ReadBatch>`. The poll thread decrements `remaining` per work
+/// completion; the last one resolves the waiter and releases the hold.
+/// The background timeout sweep can resolve the waiter *early* (with an
+/// error) — the hold then stays inside the batch until the flush
+/// completions arrive, so timed-out reads never recycle memory the NIC
+/// may still write to.
+#[derive(Debug)]
+pub(crate) struct ReadBatch {
+    /// Work completions still outstanding.
+    remaining: AtomicUsize,
+    /// Whether any completion carried an error status (or a post failed).
+    failed: AtomicBool,
+    /// Timeout deadline (`None` when `rdma.read_timeout_ms` is 0).
+    deadline: Option<Instant>,
+    inner: Mutex<ReadBatchInner>,
+}
+
+#[derive(Debug)]
+struct ReadBatchInner {
+    hold: Option<ReadHold>,
+    tx: Option<tokio::sync::oneshot::Sender<std::result::Result<ReadHold, Error>>>,
+}
+
+impl ReadBatch {
+    fn new(
+        count: usize,
+        hold: ReadHold,
+        tx: tokio::sync::oneshot::Sender<std::result::Result<ReadHold, Error>>,
+        deadline: Option<Instant>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            remaining: AtomicUsize::new(count),
+            failed: AtomicBool::new(false),
+            deadline,
+            inner: Mutex::new(ReadBatchInner {
+                hold: Some(hold),
+                tx: Some(tx),
+            }),
+        })
+    }
+
+    /// Records one work completion (called from the poll thread); the
+    /// last one resolves the batch.
+    pub(crate) fn complete_one(&self, ok: bool) {
+        if !ok {
+            self.failed.store(true, Ordering::Release);
+        }
+        if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.finish();
+        }
+    }
+
+    /// Accounts `unposted` work requests that never reached the hardware
+    /// after a mid-batch post failure.
+    fn abort_unposted(&self, unposted: usize) {
+        self.failed.store(true, Ordering::Release);
+        if self.remaining.fetch_sub(unposted, Ordering::AcqRel) == unposted {
+            self.finish();
+        }
+    }
+
+    /// All completions arrived: release the hold and resolve the waiter
+    /// (unless the timeout sweep already did).
+    fn finish(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        // Taking the hold out releases the memory when it drops below —
+        // safe now that no work request references it anymore.
+        let hold = inner.hold.take();
+        let Some(tx) = inner.tx.take() else {
+            return;
+        };
+        let result = if self.failed.load(Ordering::Acquire) {
+            Err(Error::new(
+                ErrorKind::RdmaSendFailed,
+                "RDMA READ failed (work completion error)".into(),
+            ))
+        } else {
+            hold.ok_or_else(|| {
+                Error::new(ErrorKind::RdmaSendFailed, "RDMA READ hold missing".into())
+            })
+        };
+        let _ = tx.send(result);
+    }
+
+    /// Resolves the waiter with `err` without releasing the hold (used by
+    /// the timeout sweep and poller shutdown). Returns whether this call
+    /// resolved it.
+    pub(crate) fn fail(&self, err: Error) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        match inner.tx.take() {
+            Some(tx) => {
+                let _ = tx.send(Err(err));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether the batch exceeded its deadline.
+    pub(crate) fn expired(&self, now: Instant) -> bool {
+        self.deadline.is_some_and(|deadline| deadline <= now)
+    }
+
+    /// Abandons a batch none of whose work requests were posted,
+    /// recovering the hold synchronously.
+    fn cancel(&self) -> Option<ReadHold> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.tx.take();
+        inner.hold.take()
+    }
+}
+
+/// One planned RDMA READ work request: a contiguous remote range
+/// scattered into up to `max_send_sge` local segments.
+#[derive(Debug)]
+struct PlannedRead {
+    remote_addr: u64,
+    rkey: u32,
+    sges: Vec<ReadSge>,
+}
+
+/// Translates the chunk plan of a validated op batch into concrete work
+/// requests, resolving remote regions to `(addr, rkey)` and local
+/// segments (given as per-segment `(base address, lkey)`) to scatter
+/// entries.
+fn build_planned_reads(
+    regions: &[RemoteBufferInfo],
+    src_layout: &SpaceLayout,
+    dst_layout: &SpaceLayout,
+    dst_bases: &[(u64, u32)],
+    ops: &[CopyOp],
+    max_sge: usize,
+) -> Result<Vec<PlannedRead>> {
+    scatter::plan_chunks(src_layout, dst_layout, ops, max_sge.max(1))
+        .into_iter()
+        .map(|chunk| {
+            let region = &regions[chunk.seg];
+            let sges = chunk
+                .dst
+                .iter()
+                .map(|slice| {
+                    let (base, lkey) = dst_bases[slice.seg];
+                    Ok(ReadSge {
+                        addr: base + slice.off,
+                        len: u32::try_from(slice.len).map_err(|_| {
+                            Error::new(
+                                ErrorKind::InvalidCopyOp,
+                                "scatter slice exceeds u32::MAX bytes".into(),
+                            )
+                        })?,
+                        lkey,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(PlannedRead {
+                remote_addr: region.addr + chunk.off,
+                rkey: region.key.rkey,
+                sges,
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug)]
 pub struct RdmaSocket {
-    pub(crate) rdma_completions:
-        dashmap::DashMap<WRID, tokio::sync::oneshot::Sender<RdmaCompletion>>,
-    pub(crate) rdmabuf_pool: Arc<BufferPool>,
+    /// Declared before `rdma_completions` deliberately: fields drop in
+    /// declaration order, and the QP must be destroyed first
+    /// (`ibv_destroy_qp` returning guarantees no further DMA) before any
+    /// [`ReadHold`] parked in `rdma_completions` releases its memory back
+    /// to the pool.
     pub(crate) queue_pair: QueuePair,
+    /// In-flight RDMA READ work requests, each mapping to its batch.
+    pub(crate) rdma_completions: dashmap::DashMap<WRID, Arc<ReadBatch>>,
+    pub(crate) rdmabuf_pool: Arc<BufferPool>,
     pub(crate) state: RdmaState,
     /// Window-blocked framed sends, flushed by the poll thread once
     /// credits free up.
@@ -87,9 +279,18 @@ pub struct RdmaSocket {
     pub(crate) path: RdmaPathInfo,
     /// Process-wide unique connection id (see [`crate::task::next_conn_id`]).
     pub(crate) conn_id: u64,
+    /// Bounds in-flight RDMA READ work requests on this connection (the
+    /// send queue is shared with regular sends). Permits are forgotten on
+    /// post and re-added by the poll thread per completion.
+    pub(crate) read_permits: tokio::sync::Semaphore,
+    /// Software deadline for RDMA READ completions; `None` disables the
+    /// timeout. Enforced by the poll thread's periodic sweep, not by
+    /// per-operation timers.
+    read_timeout: Option<Duration>,
 }
 
 impl RdmaSocket {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         queue_pair: QueuePair,
         rdmabuf_pool: Arc<BufferPool>,
@@ -98,17 +299,21 @@ impl RdmaSocket {
         max_msg_size: usize,
         send_window: u32,
         path: RdmaPathInfo,
+        read_timeout: Option<Duration>,
+        max_inflight_read_wrs: u32,
     ) -> Self {
         Self {
+            queue_pair,
             rdma_completions: dashmap::DashMap::default(),
             rdmabuf_pool,
-            queue_pair,
             state: RdmaState::new(send_window.max(1)),
             pending_sender,
             poller_waker,
             max_msg_size,
             path,
             conn_id: crate::task::next_conn_id(),
+            read_permits: tokio::sync::Semaphore::new(max_inflight_read_wrs.max(1) as usize),
+            read_timeout,
         }
     }
 
@@ -155,81 +360,119 @@ impl RdmaSocket {
         self.poller_waker.wake();
     }
 
-    fn post_rdma_read(
+    /// Posts the planned reads and waits for the batch to complete.
+    ///
+    /// On success the hold is handed back. On failure the second element
+    /// carries the hold only when *nothing* reached the hardware; once a
+    /// work request is in flight the memory stays parked in the batch
+    /// until its (possibly flush) completion arrives.
+    async fn execute_reads(
         &self,
-        buffer: Buffer,
-        remote_addr: u64,
-        rkey: u32,
-    ) -> Result<tokio::sync::oneshot::Receiver<RdmaCompletion>> {
-        let wr_id = self
-            .queue_pair
-            .read(buffer, remote_addr, rkey, ibv_send_flags::IBV_SEND_SIGNALED)
-            .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
-
+        reads: &[PlannedRead],
+        hold: ReadHold,
+    ) -> std::result::Result<ReadHold, (Error, Option<ReadHold>)> {
+        debug_assert!(!reads.is_empty());
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.rdma_completions.insert(wr_id, tx);
-        Ok(rx)
-    }
+        let deadline = self.read_timeout.map(|timeout| Instant::now() + timeout);
+        let batch = ReadBatch::new(reads.len(), hold, tx, deadline);
 
-    async fn await_completion(
-        rx: tokio::sync::oneshot::Receiver<RdmaCompletion>,
-    ) -> std::result::Result<Buffer, RemoteIoError> {
-        // The buffer is only lost when the completion never surfaces
-        // (channel closed / missing buffer); a failed work completion still
-        // hands it back for reuse.
-        let (status, buffer) = rx.await.map_err(|_| {
-            Error::new(
-                ErrorKind::RdmaSendFailed,
-                "RDMA completion channel closed".into(),
-            )
-        })?;
-        let buf = buffer.ok_or_else(|| {
-            Error::new(
-                ErrorKind::RdmaSendFailed,
-                "RDMA completion did not return buffer".into(),
-            )
-        })?;
-        if status != ibv_wc_status::IBV_WC_SUCCESS {
-            return Err(RemoteIoError::new(
+        let mut posted = 0usize;
+        let mut post_err: Option<Error> = None;
+        for read in reads {
+            // Bound in-flight READ work requests; permits come back from
+            // the poll thread as completions arrive.
+            let permit = match self.read_permits.acquire().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    post_err = Some(Error::new(
+                        ErrorKind::RdmaSendFailed,
+                        "RDMA read permits closed".into(),
+                    ));
+                    break;
+                }
+            };
+            let result = self.queue_pair.read_sges(
+                &read.sges,
+                read.remote_addr,
+                read.rkey,
+                // Registered under the SQ post lock *before* the WR is
+                // posted, so its completion can never miss the batch.
+                |wr_id| {
+                    self.rdma_completions.insert(wr_id, batch.clone());
+                },
+                |wr_id| {
+                    self.rdma_completions.remove(&wr_id);
+                },
+            );
+            match result {
+                Ok(_) => {
+                    // Released by the poll thread on completion.
+                    permit.forget();
+                    posted += 1;
+                }
+                Err(e) => {
+                    drop(permit);
+                    post_err = Some(e.into());
+                    break;
+                }
+            }
+        }
+
+        if let Some(err) = post_err {
+            if posted == 0 {
+                // Nothing reached the hardware: recover the hold now.
+                return Err((err, batch.cancel()));
+            }
+            // Some reads are in flight: fail the connection so they flush,
+            // then wait for the batch to settle (flush completions or the
+            // poller's teardown/timeout paths resolve it).
+            batch.abort_unposted(reads.len() - posted);
+            self.set_error();
+            let _ = rx.await;
+            return Err((err, None));
+        }
+
+        match rx.await {
+            Ok(Ok(hold)) => Ok(hold),
+            Ok(Err(e)) => Err((e, None)),
+            Err(_) => Err((
                 Error::new(
                     ErrorKind::RdmaSendFailed,
-                    format!("RDMA operation failed with status {status:?}"),
+                    "RDMA read batch abandoned (connection torn down)".into(),
                 ),
-                Some(buf),
-            ));
+                None,
+            )),
         }
-        Ok(buf)
     }
-}
 
-impl RdmaSocket {
-    async fn remote_read_op(
+    /// Executes the client side of a `MemoryService/pull`: RDMA READs from
+    /// the peer's regions into the pinned write target. The target `Arc`
+    /// keeps the destination memory alive for as long as any read is in
+    /// flight, so no post-transfer liveness verification is needed.
+    pub(crate) async fn pull_into_target(
         &self,
-        mut local: Buffer,
-        remote: &RemoteBufferInfo,
-    ) -> std::result::Result<Buffer, RemoteIoError> {
-        let rkey = remote.key.rkey;
-        // `remote.len` is the number of valid data bytes on the peer; read
-        // exactly that many. The returned buffer's logical length is set to
-        // the transferred size.
-        if remote.len as usize > local.capacity() {
-            return Err(RemoteIoError::new(
-                Error::new(
-                    ErrorKind::BufferTooSmall,
-                    format!(
-                        "remote buffer has {} bytes but local buffer capacity is {}",
-                        remote.len,
-                        local.capacity()
-                    ),
-                ),
-                Some(local),
-            ));
+        regions: &[RemoteBufferInfo],
+        src_layout: &SpaceLayout,
+        ops: &[CopyOp],
+        target: Arc<WriteTarget>,
+    ) -> Result<()> {
+        let device = &self.queue_pair.device_index;
+        let bases = target.export_sge_bases(device)?;
+        let planned = build_planned_reads(
+            regions,
+            src_layout,
+            target.layout(),
+            &bases,
+            ops,
+            self.queue_pair.gather_limit(),
+        )?;
+        if planned.is_empty() {
+            return Ok(());
         }
-        local.set_len(remote.len as usize);
-        // On a post failure the buffer is owned by the in-flight WR table
-        // and cannot be recovered here.
-        let rx = self.post_rdma_read(local, remote.addr, rkey)?;
-        Self::await_completion(rx).await
+        match self.execute_reads(&planned, ReadHold::Target(target)).await {
+            Ok(_) => Ok(()),
+            Err((e, _)) => Err(e),
+        }
     }
 }
 
@@ -286,19 +529,60 @@ impl SocketTrait for RdmaSocket {
     async fn remote_read(
         &self,
         ctx: &Context,
-        local: Buffer,
-        remote: &RemoteBufferInfo,
-        options: &RemoteReadOptions,
-    ) -> std::result::Result<Buffer, RemoteIoError> {
-        let local = self.remote_read_op(local, remote).await?;
-
-        if options.skip_verify {
+        ops: &[CopyOp],
+        local: Vec<Buffer>,
+        remote: &RemoteSpace<'_>,
+    ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
+        let device = &self.queue_pair.device_index;
+        let bases = local
+            .iter()
+            .map(|buf| {
+                let key = buf
+                    .memory_key(device)
+                    .map_err(|e| Error::new(ErrorKind::InvalidArgument, e.to_string()))?;
+                Ok((buf.as_ptr() as u64, key.lkey))
+            })
+            .collect::<Result<Vec<(u64, u32)>>>();
+        let bases = match bases {
+            Ok(bases) => bases,
+            Err(e) => return Err(RemoteIoError::new(e, Some(local))),
+        };
+        let dst_layout = match SpaceLayout::from_lens(local.iter().map(|b| b.len() as u64)) {
+            Ok(layout) => layout,
+            Err(e) => return Err(RemoteIoError::new(e, Some(local))),
+        };
+        let planned = match build_planned_reads(
+            remote.regions(),
+            remote.layout(),
+            &dst_layout,
+            &bases,
+            ops,
+            self.queue_pair.gather_limit(),
+        ) {
+            Ok(planned) => planned,
+            Err(e) => return Err(RemoteIoError::new(e, Some(local))),
+        };
+        if planned.is_empty() {
             return Ok(local);
         }
 
-        // After RDMA Read completes, verify the client's original request is still
-        // alive. If the client has timed out, the buffer may have been reclaimed
-        // and the data read via RDMA could be invalid.
+        let local = match self.execute_reads(&planned, ReadHold::Buffers(local)).await {
+            Ok(ReadHold::Buffers(local)) => local,
+            Ok(ReadHold::Target(_)) => unreachable!("remote_read holds buffers"),
+            Err((e, hold)) => {
+                let buffers = match hold {
+                    Some(ReadHold::Buffers(buffers)) => Some(buffers),
+                    _ => None,
+                };
+                return Err(RemoteIoError::new(e, buffers));
+            }
+        };
+
+        // After the RDMA READs complete, verify the client's original
+        // request is still alive. RDMA READ is one-sided — the client
+        // cannot know its memory was read — and once its request times
+        // out, the read buffers may have been reclaimed and refilled, so
+        // the data would be garbage.
         let msgid = ctx.msg_meta.msgid;
         let client = crate::Client::default();
         let still_waiting: bool = match client.is_message_waiting(ctx, &msgid).await {
@@ -321,19 +605,127 @@ impl SocketTrait for RdmaSocket {
     async fn remote_write(
         &self,
         ctx: &Context,
-        local: Buffer,
-    ) -> std::result::Result<Buffer, RemoteIoError> {
-        // Instead of one-sided RDMA WRITE (unsafe for client buffer lifetime),
-        // send a reverse RPC to the client with our buffer attached. The client
-        // will perform an RDMA READ from our buffer into its own local buffer.
+        ops: &[CopyOp],
+        local: Vec<Buffer>,
+    ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
+        // No one-sided RDMA WRITE (unsafe against client buffer lifetime):
+        // send a reverse `pull` RPC advertising our source buffers as read
+        // regions; the client executes RDMA READs into its pinned write
+        // target. This future holds `local` across the await, so the
+        // advertised regions stay valid for the whole transfer.
         let req = crate::services::MemoryPullReq {
             msgid: ctx.msg_meta.msgid,
-            len: local.len() as u64,
+            ops: ops.to_vec(),
         };
         let client = crate::Client::default();
-        match client.with_read_buffer(&local).rdma_pull(ctx, &req).await {
+        match client.with_read_buffers(&local).pull(ctx, &req).await {
             Ok(()) => Ok(local),
             Err(e) => Err(RemoteIoError::new(e, Some(local))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Devices;
+
+    fn pool() -> Arc<BufferPool> {
+        let devices = Arc::new(Devices::default());
+        ruapc_bufpool::BufferPoolBuilder::new(devices).build()
+    }
+
+    fn make_hold(pool: &Arc<BufferPool>) -> ReadHold {
+        let mut buf = pool.allocate(64 * 1024).unwrap();
+        buf.set_len(16);
+        ReadHold::Buffers(vec![buf])
+    }
+
+    /// The happy path: the last completion resolves the batch with its
+    /// hold.
+    #[tokio::test]
+    async fn test_read_batch_completes_with_hold() {
+        let pool = pool();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let batch = ReadBatch::new(2, make_hold(&pool), tx, None);
+        batch.complete_one(true);
+        batch.complete_one(true);
+        match rx.await.unwrap() {
+            Ok(ReadHold::Buffers(bufs)) => assert_eq!(bufs.len(), 1),
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+
+    /// Any errored completion fails the whole batch; the hold is released
+    /// (not returned) because every WR has settled by then.
+    #[tokio::test]
+    async fn test_read_batch_error_completion_fails_batch() {
+        let pool = pool();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let batch = ReadBatch::new(2, make_hold(&pool), tx, None);
+        batch.complete_one(false);
+        batch.complete_one(true);
+        let err = rx.await.unwrap().unwrap_err();
+        assert_eq!(err.kind, ErrorKind::RdmaSendFailed);
+    }
+
+    /// The timeout sweep resolves the waiter early but must *not* release
+    /// the hold: the NIC may still DMA into the memory until the flush
+    /// completions arrive.
+    #[tokio::test]
+    async fn test_read_batch_timeout_keeps_hold_until_flush() {
+        let pool = pool();
+
+        // Observe the hold's lifetime through a pinned write target.
+        let mut buf = pool.allocate(64 * 1024).unwrap();
+        buf.set_len(16);
+        let target = WriteTarget::new(vec![buf]).unwrap();
+        let observer = target.clone();
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let deadline = Some(Instant::now() - Duration::from_millis(1));
+        let batch = ReadBatch::new(2, ReadHold::Target(target), tx, deadline);
+
+        // The sweep fires: the waiter resolves with RdmaReadTimeout...
+        assert!(batch.expired(Instant::now()));
+        assert!(batch.fail(Error::kind(ErrorKind::RdmaReadTimeout)));
+        // ... only once ...
+        assert!(!batch.fail(Error::kind(ErrorKind::RdmaReadTimeout)));
+        let err = rx.await.unwrap().unwrap_err();
+        assert_eq!(err.kind, ErrorKind::RdmaReadTimeout);
+
+        // ... and the memory stays pinned until the flush completions.
+        assert!(
+            WriteTarget::try_into_buffers(observer.clone()).is_none(),
+            "hold must stay pinned while completions are outstanding"
+        );
+        batch.complete_one(false);
+        batch.complete_one(false);
+        assert!(
+            WriteTarget::try_into_buffers(observer).is_some(),
+            "hold must be released once every completion arrived"
+        );
+    }
+
+    /// A batch without a deadline never expires.
+    #[tokio::test]
+    async fn test_read_batch_no_deadline_never_expires() {
+        let pool = pool();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let batch = ReadBatch::new(1, make_hold(&pool), tx, None);
+        assert!(!batch.expired(Instant::now() + Duration::from_secs(3600)));
+        batch.complete_one(true);
+    }
+
+    /// `cancel` recovers the hold synchronously (used when no WR was
+    /// posted at all).
+    #[tokio::test]
+    async fn test_read_batch_cancel_recovers_hold() {
+        let pool = pool();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let batch = ReadBatch::new(1, make_hold(&pool), tx, None);
+        assert!(matches!(batch.cancel(), Some(ReadHold::Buffers(_))));
+        // The waiter observes a closed channel, not a stray result.
+        assert!(rx.await.is_err());
     }
 }

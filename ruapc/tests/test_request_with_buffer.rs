@@ -30,15 +30,17 @@ struct UploadServiceImpl;
 
 impl UploadService for UploadServiceImpl {
     async fn upload(&self, ctx: &Context, _req: &UploadReq) -> Result<UploadRsp> {
-        // Allocates a right-sized local buffer and reads exactly the
-        // client's logical data length. Returns MissingBufferInfo if the
-        // client did not attach a buffer.
-        let local_buf = ctx.remote_read_request().await?;
+        // Allocates right-sized local buffers and reads exactly the
+        // client's logical data. Returns MissingBufferInfo if the client
+        // did not attach buffers.
+        let local = ctx.remote_read_all().await?;
 
-        // Return the data read from the client's buffer.
-        Ok(UploadRsp {
-            data: local_buf[..].to_vec(),
-        })
+        // Return the data read from the client's buffers.
+        let mut data = Vec::new();
+        for buf in &local {
+            data.extend_from_slice(&buf[..]);
+        }
+        Ok(UploadRsp { data })
     }
 }
 
@@ -55,10 +57,10 @@ struct PingServiceImpl;
 
 impl PingService for PingServiceImpl {
     async fn ping(&self, ctx: &Context, _req: &String) -> Result<String> {
-        // Normal requests should NOT have buffer_info.
+        // Normal requests should NOT carry memory regions.
         assert!(
-            ctx.msg_meta.buffer_info.is_none(),
-            "buffer_info should be None for normal requests"
+            ctx.msg_meta.read_regions.is_empty() && ctx.msg_meta.write_regions.is_empty(),
+            "regions should be empty for normal requests"
         );
         Ok("pong".to_string())
     }

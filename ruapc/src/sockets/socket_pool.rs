@@ -188,6 +188,20 @@ pub struct RdmaSocketPoolConfig {
     /// after leaving the rotation, so its in-flight responses can arrive.
     #[serde(default = "default_drain_timeout_ms")]
     pub drain_timeout_ms: u64,
+    /// Software timeout (milliseconds) for RDMA READ completions,
+    /// enforced by the poll thread's periodic sweep (no per-operation
+    /// timers). A read exceeding it fails its caller and moves the
+    /// connection to the error state, so the NIC flushes the outstanding
+    /// work requests and their buffers are reclaimed safely. `0`
+    /// disables the timeout. Default is 10s.
+    #[serde(default = "default_read_timeout_ms")]
+    pub read_timeout_ms: u64,
+    /// Maximum in-flight RDMA READ work requests per connection (the send
+    /// queue is shared with regular sends; clamped to `qp.max_send_wr /
+    /// 2` at connection setup). Excess reads of a batch queue in
+    /// software. Default is 16.
+    #[serde(default = "default_max_inflight_read_wrs")]
+    pub max_inflight_read_wrs: u32,
 }
 
 #[cfg(feature = "rdma")]
@@ -246,6 +260,16 @@ fn default_drain_timeout_ms() -> u64 {
 }
 
 #[cfg(feature = "rdma")]
+fn default_read_timeout_ms() -> u64 {
+    10_000
+}
+
+#[cfg(feature = "rdma")]
+fn default_max_inflight_read_wrs() -> u32 {
+    16
+}
+
+#[cfg(feature = "rdma")]
 impl Default for RdmaSocketPoolConfig {
     fn default() -> Self {
         Self {
@@ -266,6 +290,8 @@ impl Default for RdmaSocketPoolConfig {
             maintenance_interval_ms: default_maintenance_interval_ms(),
             rebalance_threshold: default_rebalance_threshold(),
             drain_timeout_ms: default_drain_timeout_ms(),
+            read_timeout_ms: default_read_timeout_ms(),
+            max_inflight_read_wrs: default_max_inflight_read_wrs(),
         }
     }
 }
@@ -703,6 +729,7 @@ mod tests {
                 link_layer: ruapc_rdma::LinkLayer::Ethernet,
                 active_mtu: ruapc_rdma::ibv_mtu::IBV_MTU_512,
                 psn: 0,
+                rd_atomic_cap: 1,
             },
             config: crate::rdma::RdmaConnectionConfig {
                 qp: RdmaQueuePairConfig::default(),

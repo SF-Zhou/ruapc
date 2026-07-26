@@ -23,7 +23,7 @@ A high-performance Rust RPC library that supports multiple transport protocols (
 
 - **Multiple Transport Protocols**: TCP, WebSocket, HTTP/1.1 and HTTP/2 (h2c), RDMA (optional), and a unified protocol that supports all simultaneously
 - **Reverse RPC**: Server can call back into client services over established HTTP/2 or WebSocket connections
-- **Remote Read/Write**: Server-side access to client memory via registered buffer pool ([ruapc-bufpool](ruapc-bufpool/)). `remote_read` / `remote_read_request` let the server read a client-provided buffer; `ctx.remote_write(buf)` returns a `SentBuffer` witness, then `sent.reply(rsp)` builds the `WithBuffer<T>` return value — the push is observable (measurable latency, retryable errors), and `Buffer::empty` creates a zero-cost no-payload sentinel. Transfers use data-copy over TCP or zero-copy RDMA READ, with runtime request-liveness (msgid) validation ensuring buffer lifetime safety
+- **Remote Read/Write**: Server-side access to client memory via registered buffer pool ([ruapc-bufpool](ruapc-bufpool/)). Multiple buffers form one *logical contiguous space* on each side: clients attach a read space (`with_read_buffers`) and/or a pinned write space (`with_write_buffers`); servers issue vectored `CopyOp` batches through `ctx.remote_read` / `ctx.remote_write` (fragmented into concurrent one-sided RDMA READs with scatter-gather lists, or reverse-RPC copies over TCP). `ctx.remote_write` returns a `SentBuffers` witness, then `sent.reply(rsp)` builds the `WithBuffers<T>` return value carrying every client buffer back — the transfer is observable (measurable latency, retryable errors) and buffer lifetime is anchored by client-side pinning, request-liveness (msgid) validation, and a software RDMA READ timeout (default 10s) that flushes stuck NICs without ever recycling in-flight memory
 - **Multiple Serialization Formats**: JSON (default) and MessagePack support
 - **OpenAPI Integration**: Automatic OpenAPI 3.0 specification generation with JSON Schema support
 - **Built-in Documentation**: RapiDoc integration for interactive API documentation
@@ -149,9 +149,9 @@ open http://0.0.0.0:8000/rapidoc
 ### Remote Read/Write
 
 ```bash
-# Self-contained demo: client uploads a registered buffer (server pulls it
-# via remote_read_request) and downloads a server-pushed buffer (typed
-# Result<WithBuffer<T>> contract). Works over any transport.
+# Self-contained demo: client uploads registered buffers (server pulls them
+# via remote_read_all) and downloads into pre-pinned buffers (typed
+# Result<WithBuffers<T>> contract). Works over any transport.
 cargo run --bin remote_memory -- --socket-type tcp
 cargo run --bin remote_memory --features rdma -- --socket-type rdma
 ```

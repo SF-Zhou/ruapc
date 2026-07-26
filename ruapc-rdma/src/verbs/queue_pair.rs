@@ -48,6 +48,20 @@ pub struct Completion {
     pub buffer: Option<WrBuffers>,
 }
 
+/// One local scatter segment of an RDMA READ posted via
+/// [`QueuePair::read_sges`]: a raw (address, length, lkey) triple. The
+/// caller owns the memory and must keep it alive until the read's
+/// completion is observed.
+#[derive(Debug, Clone, Copy)]
+pub struct ReadSge {
+    /// Local destination address.
+    pub addr: u64,
+    /// Segment length in bytes.
+    pub len: u32,
+    /// Local memory key covering the segment on this QP's device.
+    pub lkey: u32,
+}
+
 pub struct QueuePair {
     ptr: *mut crate::ibv_qp,
     _pd: Arc<ProtectionDomain>,
@@ -208,7 +222,6 @@ impl QueuePair {
             lkey,
             crate::ibv_wr_opcode::IBV_WR_SEND,
             flags.0,
-            None,
         )
         .inspect_err(|_e| {
             self.send_wrs.take(id);
@@ -345,32 +358,64 @@ impl QueuePair {
         Ok(())
     }
 
-    pub fn read(
+    /// Posts one RDMA READ from a contiguous remote region into the local
+    /// scatter list `sges`, always signaled.
+    ///
+    /// Unlike sends, no buffer ownership is stored in the WR slot table:
+    /// the caller guarantees the memory behind `sges` stays alive (and is
+    /// not recycled) until the read's work completion — success, error or
+    /// flush — has been observed. `register` runs with the allocated
+    /// [`WRID`] *before* the work request is posted (under the SQ post
+    /// lock), so a completion can never race the caller's bookkeeping; on
+    /// post failure `unregister` undoes it.
+    pub fn read_sges(
         &self,
-        buffer: Buffer,
+        sges: &[ReadSge],
         remote_addr: u64,
         rkey: u32,
-        flags: crate::ibv_send_flags,
+        register: impl FnOnce(WRID),
+        unregister: impl FnOnce(WRID),
     ) -> Result<WRID> {
-        let addr = buffer.as_ptr() as u64;
-        let len = buffer.len() as u32;
-        let lkey = self.lkey(&buffer)?;
+        if sges.is_empty() || sges.len() > self.gather_limit() {
+            return Err(Error::new(
+                ErrorKind::IBPostSendFail,
+                format!(
+                    "invalid read scatter list length {} (limit {})",
+                    sges.len(),
+                    self.gather_limit()
+                ),
+            ));
+        }
+        let mut raw = [crate::ibv_sge::default(); MAX_GATHER_SGE];
+        for (dst, sge) in raw.iter_mut().zip(sges.iter()) {
+            *dst = crate::ibv_sge {
+                addr: sge.addr,
+                length: sge.len,
+                lkey: sge.lkey,
+            };
+        }
+        let num_sge = sges.len() as c_int;
+
         let _guard = self.sq_post_lock.lock().unwrap();
         let id = self.send_wrs.alloc_id();
         let wr_id = WRID::read(self.wr_tag, id);
-        self.send_wrs.insert(id, buffer.into());
-        self.post_send_verb(
+        register(wr_id);
+        let mut wr = crate::ibv_send_wr {
             wr_id,
-            addr,
-            len,
-            lkey,
-            crate::ibv_wr_opcode::IBV_WR_RDMA_READ,
-            flags.0,
-            Some((remote_addr, rkey)),
-        )
-        .inspect_err(|_e| {
-            self.send_wrs.take(id);
-        })?;
+            sg_list: raw.as_mut_ptr(),
+            num_sge,
+            opcode: crate::ibv_wr_opcode::IBV_WR_RDMA_READ,
+            send_flags: crate::ibv_send_flags::IBV_SEND_SIGNALED.0,
+            wr: crate::ibv_send_wr__bindgen_ty_2 {
+                rdma: crate::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 { remote_addr, rkey },
+            },
+            ..Default::default()
+        };
+        let result = unsafe { self.post_send(&mut wr) };
+        if let Err((_, err)) = result {
+            unregister(wr_id);
+            return Err(err);
+        }
         Ok(wr_id)
     }
 
@@ -382,7 +427,6 @@ impl QueuePair {
         lkey: u32,
         opcode: crate::ibv_wr_opcode,
         send_flags: u32,
-        remote: Option<(u64, u32)>,
     ) -> Result<()> {
         let mut sge = crate::ibv_sge {
             addr,
@@ -397,11 +441,6 @@ impl QueuePair {
             send_flags,
             ..Default::default()
         };
-        if let Some((remote_addr, rkey)) = remote {
-            wr.wr = crate::ibv_send_wr__bindgen_ty_2 {
-                rdma: crate::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 { remote_addr, rkey },
-            };
-        }
         let result = unsafe { self.post_send(&mut wr) };
         if let Err((_, err)) = result {
             return Err(err);
@@ -510,6 +549,7 @@ impl QueuePair {
         self.modify(&mut attr, mask.0 as _)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn ready_to_recv(
         &self,
         remote_qp_num: u32,
@@ -520,6 +560,7 @@ impl QueuePair {
         link_layer: LinkLayer,
         path_mtu: ibv_mtu,
         rq_psn: u32,
+        max_dest_rd_atomic: u8,
     ) -> Result<()> {
         let mut ah_attr = crate::ibv_ah_attr {
             sl: 0,
@@ -557,7 +598,9 @@ impl QueuePair {
             path_mtu,
             dest_qp_num: remote_qp_num,
             rq_psn: rq_psn & 0xFF_FFFF,
-            max_dest_rd_atomic: 1,
+            // Concurrency of inbound RDMA READs (peer as initiator);
+            // negotiated by the caller from both sides' device caps.
+            max_dest_rd_atomic: max_dest_rd_atomic.max(1),
             // 0.01ms (encoding 1): an RNR NAK costs ~10µs instead of the
             // common-default 1.28ms (0x12). The receive ring is normally
             // pre-posted ahead of the peer's send window, so RNR is a rare
@@ -577,14 +620,16 @@ impl QueuePair {
         self.modify(&mut attr, mask.0 as _)
     }
 
-    pub fn ready_to_send(&self, sq_psn: u32) -> Result<()> {
+    pub fn ready_to_send(&self, sq_psn: u32, max_rd_atomic: u8) -> Result<()> {
         let mut attr = ibv_qp_attr {
             qp_state: ibv_qp_state::IBV_QPS_RTS,
             timeout: 0x12,
             retry_cnt: 6,
             rnr_retry: 6,
             sq_psn: sq_psn & 0xFF_FFFF,
-            max_rd_atomic: 1,
+            // Concurrency of outbound RDMA READs (this side as initiator);
+            // must not exceed the peer's `max_dest_rd_atomic`.
+            max_rd_atomic: max_rd_atomic.max(1),
             ..Default::default()
         };
         let mask = ibv_qp_attr_mask::IBV_QP_STATE
@@ -596,6 +641,7 @@ impl QueuePair {
         self.modify(&mut attr, mask.0 as _)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn connect(
         &self,
         local_port_num: u8,
@@ -608,6 +654,8 @@ impl QueuePair {
         remote_lid: u16,
         local_psn: u32,
         remote_psn: u32,
+        max_rd_atomic: u8,
+        max_dest_rd_atomic: u8,
     ) -> Result<()> {
         self.init(local_port_num, pkey_index)?;
         self.ready_to_recv(
@@ -619,8 +667,9 @@ impl QueuePair {
             link_layer,
             path_mtu,
             remote_psn,
+            max_dest_rd_atomic,
         )?;
-        self.ready_to_send(local_psn)
+        self.ready_to_send(local_psn, max_rd_atomic)
     }
 
     pub(crate) unsafe fn post_send(

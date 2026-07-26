@@ -19,8 +19,9 @@ pub use msg::{Message, MsgFlags, MsgMeta, Payload};
 
 mod core;
 pub use core::{
-    AddrSet, Client, ClientWithBuffer, Context, Listener, MethodInfo, ResultWithBuffer, Router,
-    SentBuffer, Server, SocketEndpoint, State, WithBuffer,
+    AddrSet, Client, ClientWithBuffers, Context, CopyOp, Listener, MAX_COPY_OPS, MAX_REGIONS,
+    MethodInfo, RemoteSpace, ResultWithBuffers, Router, SentBuffers, Server, SocketEndpoint, State,
+    WithBuffers,
 };
 #[doc(hidden)]
 pub use core::{CallPlain, CallWithBuffer, RawCall, RpcCall, catch_handler_panic, spawn_handler};

@@ -1,115 +1,134 @@
-//! Typed response-with-buffer contract for `remote_write`.
+//! Typed response-with-buffers contract for `remote_write`.
 
 use crate::Buffer;
 
-/// Witness that a buffer has been transferred to the client.
+/// Witness that data has been transferred into the client's pre-pinned
+/// write buffers (or that there was provably nothing to transfer).
 ///
-/// Returned by [`Context::remote_write`](crate::Context::remote_write) after
-/// the push completed; the pushed buffer stays inside. Pair it with a
-/// response value via [`reply`](Self::reply) to build the [`WithBuffer`]
-/// return value — the response can thus be computed *after* the transfer
-/// (e.g. include the observed push latency):
+/// Returned by [`Context::remote_write`](crate::Context::remote_write)
+/// after the transfer completed; the server-side source buffers ride
+/// inside and can be reclaimed for reuse via
+/// [`take_buffers`](Self::take_buffers). Pair the witness with a response
+/// value via [`reply`](Self::reply) to build the [`WithBuffers`] return
+/// value — the response can thus be computed *after* the transfer (e.g.
+/// include the observed push latency):
 ///
 /// ```rust,ignore
 /// let t0 = std::time::Instant::now();
-/// let sent = ctx.remote_write(buf).await?;      // transfer completes here
+/// let sent = ctx.remote_write_all(bufs).await?;   // transfer completes here
 /// let rsp = Stats { push_micros: t0.elapsed().as_micros() as u64 };
 /// Ok(sent.reply(rsp))
 /// ```
+///
+/// Several writes within one handler combine with [`merge`](Self::merge).
 #[derive(Debug)]
-pub struct SentBuffer {
-    buffer: Buffer,
+pub struct SentBuffers {
+    buffers: Vec<Buffer>,
 }
 
-impl SentBuffer {
-    /// Crate-internal: only a completed `remote_write` produces a witness.
-    pub(crate) fn new(buffer: Buffer) -> Self {
-        Self { buffer }
+impl SentBuffers {
+    /// Crate-internal: only a completed `remote_write` (or the explicit
+    /// no-op [`Context::sent_nothing`](crate::Context::sent_nothing))
+    /// produces a witness.
+    pub(crate) fn new(buffers: Vec<Buffer>) -> Self {
+        Self { buffers }
     }
 
-    /// Returns a reference to the buffer that was pushed.
+    /// The local source buffers of the completed transfer(s).
     #[must_use]
-    pub fn buffer(&self) -> &Buffer {
-        &self.buffer
+    pub fn buffers(&self) -> &[Buffer] {
+        &self.buffers
     }
 
-    /// Pairs the completed transfer with a response value.
+    /// Reclaims the local source buffers for reuse; the witness itself
+    /// stays valid for [`reply`](Self::reply).
+    pub fn take_buffers(&mut self) -> Vec<Buffer> {
+        std::mem::take(&mut self.buffers)
+    }
+
+    /// Combines the witness of another completed write into this one.
+    pub fn merge(&mut self, mut other: SentBuffers) {
+        self.buffers.append(&mut other.buffers);
+    }
+
+    /// Pairs the completed transfer(s) with a response value.
     #[must_use]
-    pub fn reply<T>(self, rsp: T) -> WithBuffer<T> {
-        WithBuffer::assemble(rsp, self.buffer)
+    pub fn reply<T>(self, rsp: T) -> WithBuffers<T> {
+        // The server-side source buffers are released here (the transfer
+        // already completed); only the response value goes on the wire.
+        drop(self.buffers);
+        WithBuffers::assemble(rsp, Vec::new())
     }
 }
 
-/// A response value paired with a buffer transferred via `remote_write`.
+/// A response value paired with the buffers transferred out-of-band.
 ///
 /// Declaring a `#[service]` method with the return type
-/// `Result<WithBuffer<T>, E>` (any alias of it, e.g. [`ResultWithBuffer`],
-/// works — detection is by type, not by name) makes the buffer transfer part
-/// of the method's contract on both sides:
+/// `Result<WithBuffers<T>, E>` (any alias of it, e.g. [`ResultWithBuffers`],
+/// works — detection is by type, not by name) makes the buffer transfer
+/// part of the method's contract on both sides:
 ///
-/// - **Server**: `WithBuffer` can only be produced by a completed
-///   [`Context::remote_write`] + [`SentBuffer::reply`]. The push happens
-///   inside the handler — measurable, retryable, impossible to forget. For
-///   code paths with no payload, use [`Buffer::empty`] to create a
-///   zero-length buffer: `remote_write` short-circuits without touching
-///   the network.
-/// - **Client**: the generated client method returns
-///   `Result<WithBuffer<T>, E>`, so the transferred buffer arrives together
-///   with the response and cannot be forgotten either. When the server
-///   replied without a payload, the buffer is empty (`len() == 0`).
+/// - **Server**: `WithBuffers` can only be produced by a completed
+///   [`Context::remote_write`] + [`SentBuffers::reply`] (or the explicit
+///   [`Context::sent_nothing`](crate::Context::sent_nothing) for paths
+///   with no payload). The transfer happens inside the handler —
+///   measurable, retryable, impossible to forget.
+/// - **Client**: the caller pre-provides the destination buffers with
+///   [`Client::with_write_buffers`](crate::Client::with_write_buffers);
+///   the generated method returns `Result<WithBuffers<T>, E>` carrying
+///   *all* of those buffers back, whether or not the server wrote into
+///   them. A call made without attached write buffers yields an empty
+///   buffer list.
 ///
-/// On the wire the response is just `T` (`WithBuffer` serializes
-/// transparently); the buffer travels out-of-band, and an empty reply
-/// involves no transfer at all.
+/// On the wire the response is just `T` (`WithBuffers` serializes
+/// transparently); the data travels out-of-band through the pull/push
+/// protocol into the client's pinned buffers.
 ///
 /// # Examples
 ///
 /// ```rust,ignore
 /// #[ruapc::service]
 /// trait BlobService {
-///     async fn download(&self, ctx: &Context, req: &DownloadReq) -> Result<WithBuffer<u64>>;
+///     async fn download(&self, ctx: &Context, req: &DownloadReq)
+///         -> Result<WithBuffers<u64>>;
 /// }
 ///
-/// // Server handler: push first, decide the response afterwards.
-/// async fn download(&self, ctx: &Context, req: &DownloadReq) -> Result<WithBuffer<u64>> {
+/// // Server handler: write first, decide the response afterwards.
+/// async fn download(&self, ctx: &Context, req: &DownloadReq) -> Result<WithBuffers<u64>> {
 ///     let mut buf = ctx.state.buffer_pool.allocate(req.len)?;
-///     // ... fill buf ...
-///     buf.set_len(req.len);
-///     let t0 = std::time::Instant::now();
-///     let sent = ctx.remote_write(buf).await?;
-///     Ok(sent.reply(t0.elapsed().as_micros() as u64))
+///     // ... fill buf, set_len ...
+///     let sent = ctx.remote_write_all(vec![buf]).await?;
+///     Ok(sent.reply(req.len as u64))
 /// }
 ///
-/// // Empty payload: Buffer::empty costs no memory.
-/// async fn metadata_only(&self, ctx: &Context, _req: &()) -> Result<WithBuffer<Meta>> {
-///     let sent = ctx.remote_write(Buffer::empty(&ctx.state.buffer_pool)).await?;
-///     Ok(sent.reply(Meta { version: 1 }))
-/// }
-///
-/// // Client:
-/// let (push_micros, buffer) = client.download(&ctx, &req).await?.into_parts();
+/// // Client: provide the destination buffers, get them all back.
+/// let (len, bufs) = client
+///     .with_write_buffers(vec![buf_a, buf_b])
+///     .download(&ctx, &req)
+///     .await?
+///     .into_parts();
 /// ```
 ///
 /// [`Context::remote_write`]: crate::Context::remote_write
-/// [`Buffer::empty`]: ruapc_bufpool::Buffer::empty
 #[derive(Debug)]
-pub struct WithBuffer<T> {
+pub struct WithBuffers<T> {
     /// The response payload carried on the wire.
     rsp: T,
-    /// Server side: the pushed buffer (kept alive until the response is
-    /// sent). Client side: the received buffer.
-    buffer: Buffer,
+    /// Client side: every buffer the caller attached via
+    /// `with_write_buffers`, returned after the call. Server side: empty
+    /// (the source buffers were released by `reply`).
+    buffers: Vec<Buffer>,
 }
 
-impl<T> WithBuffer<T> {
+impl<T> WithBuffers<T> {
     /// Crate-internal constructor.
     ///
     /// Deliberately not public: on the server it is only reachable through
-    /// a completed push (`SentBuffer::reply`), and on the client through
-    /// the generated call glue — which is what makes the value a witness
-    /// of the contract being fulfilled.
-    pub(crate) fn assemble(rsp: T, buffer: Buffer) -> Self {
-        Self { rsp, buffer }
+    /// a completed transfer (`SentBuffers::reply`), and on the client
+    /// through the generated call glue — which is what makes the value a
+    /// witness of the contract being fulfilled.
+    pub(crate) fn assemble(rsp: T, buffers: Vec<Buffer>) -> Self {
+        Self { rsp, buffers }
     }
 
     /// Returns a reference to the response value.
@@ -118,35 +137,35 @@ impl<T> WithBuffer<T> {
         &self.rsp
     }
 
-    /// Returns a reference to the transferred buffer.
+    /// Returns the returned buffers.
     #[must_use]
-    pub fn buffer(&self) -> &Buffer {
-        &self.buffer
+    pub fn buffers(&self) -> &[Buffer] {
+        &self.buffers
     }
 
-    /// Decomposes into the response value and the transferred buffer.
+    /// Decomposes into the response value and the returned buffers.
     #[must_use]
-    pub fn into_parts(self) -> (T, Buffer) {
-        (self.rsp, self.buffer)
+    pub fn into_parts(self) -> (T, Vec<Buffer>) {
+        (self.rsp, self.buffers)
     }
 
-    /// Consumes the pair, returning only the transferred buffer.
+    /// Consumes the pair, returning only the buffers.
     #[must_use]
-    pub fn into_buffer(self) -> Buffer {
-        self.buffer
+    pub fn into_buffers(self) -> Vec<Buffer> {
+        self.buffers
     }
 }
 
-/// Serializes transparently as the inner response value; the buffer never
-/// travels inline (it is transferred out-of-band via `remote_write`).
-impl<T: serde::Serialize> serde::Serialize for WithBuffer<T> {
+/// Serializes transparently as the inner response value; the buffers never
+/// travel inline (data is transferred out-of-band via `remote_write`).
+impl<T: serde::Serialize> serde::Serialize for WithBuffers<T> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.rsp.serialize(serializer)
     }
 }
 
 /// Schema-transparent: the wire response schema is the inner `T`'s.
-impl<T: schemars::JsonSchema> schemars::JsonSchema for WithBuffer<T> {
+impl<T: schemars::JsonSchema> schemars::JsonSchema for WithBuffers<T> {
     fn schema_name() -> std::borrow::Cow<'static, str> {
         T::schema_name()
     }
@@ -164,10 +183,10 @@ impl<T: schemars::JsonSchema> schemars::JsonSchema for WithBuffer<T> {
     }
 }
 
-/// Convenience alias for `#[service]` methods that push a buffer to the
-/// client; see [`WithBuffer`].
+/// Convenience alias for `#[service]` methods whose response carries
+/// buffers transferred via `remote_write`; see [`WithBuffers`].
 ///
 /// This is an ordinary type alias — the contract is recognized by the
 /// underlying type, so custom aliases (including ones fixing a custom error
 /// type) work just as well.
-pub type ResultWithBuffer<T, E = crate::Error> = std::result::Result<WithBuffer<T>, E>;
+pub type ResultWithBuffers<T, E = crate::Error> = std::result::Result<WithBuffers<T>, E>;

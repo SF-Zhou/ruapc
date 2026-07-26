@@ -9,9 +9,7 @@ use crate::{
 ///
 /// The receiver is used internally to wait for responses from remote services.
 /// It wraps a oneshot channel and handles automatic cleanup of waiter entries.
-pub enum Receiver<'a> {
-    /// No receiver (placeholder state).
-    None,
+pub(crate) enum Receiver<'a> {
     /// Active oneshot receiver with cleanup guard.
     OneShotRx(oneshot::Receiver<WaiterResult>, WaiterCleaner<'a>),
 }
@@ -25,11 +23,11 @@ impl Receiver<'_> {
     ///
     /// # Returns
     ///
-    /// A tuple of (Message, Option<Buffer>). The buffer is present if the
-    /// server stored one via `store_write_buffer` during the request.
-    pub async fn recv(self) -> Result<WaiterResponse> {
+    /// A tuple of (Message, Option<Arc<WriteTarget>>). The target is
+    /// present if the request attached write buffers; the server may have
+    /// written into it during the request.
+    pub(crate) async fn recv(self) -> Result<WaiterResponse> {
         match self {
-            Receiver::None => Err(Error::kind(ErrorKind::InvalidArgument)),
             Receiver::OneShotRx(rx, cleaner) => {
                 // A dropped sender means the waiter entry vanished without a
                 // response — most commonly the coarse expiry sweep. An
@@ -48,16 +46,7 @@ impl Receiver<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::{Message, Waiter};
-
-    #[tokio::test]
-    async fn test_receiver_none_returns_error() {
-        let result = Receiver::None.recv().await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert_eq!(err.kind, ErrorKind::InvalidArgument);
-    }
 
     #[tokio::test]
     async fn test_receiver_receives_message() {
