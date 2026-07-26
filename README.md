@@ -34,7 +34,7 @@ RDMA support is **not** enabled by default (it requires `libibverbs-dev` at buil
 
 ```toml
 [dependencies]
-ruapc = { version = "0.2.0-alpha.1", features = ["rdma"] }
+ruapc = { version = "0.2.0-alpha.2", features = ["rdma"] }
 ```
 
 ## Example

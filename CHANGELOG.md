@@ -4,6 +4,47 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.0-alpha.2] - 2026-07-26
+
+### Changed
+- **BREAKING**: remote read/write redesigned around vectored, multi-buffer
+  *logical contiguous spaces* (#85). Clients attach a read space
+  (`with_read_buffers`, borrowed) and/or a write space (`with_write_buffers`,
+  ownership moved and pinned until the call resolves); the regions travel in
+  `MsgMeta.read_regions` / `write_regions` (replacing `buffer_info`). Servers
+  issue validated `CopyOp` batches with explicit offsets through
+  `Context::remote_read` / `remote_write` (`remote_read_all` /
+  `remote_write_all` for whole-space transfers); on RDMA the ops fragment into
+  concurrent one-sided READ work requests with scatter-gather lists, on
+  TCP/WS/HTTP into reverse-RPC copies. `WithBuffer` / `SentBuffer` /
+  `ClientWithBuffer` / `ResultWithBuffer` become plural (`WithBuffers` etc.)
+  and carry every attached buffer back; `remote_read_request` /
+  `request_buffer_info` are replaced by `remote_read_all` /
+  `remote_read_space`
+- **BREAKING**: `remote_write` requires the client to pre-provide pinned
+  destination buffers; the transfer runs as client-initiated RDMA READs
+  (reverse `pull`), with an `Arc`-pinned write target guaranteeing the NIC
+  can never DMA into recycled memory even across request timeouts (#85)
+- RDMA config structs use inline serde defaults throughout; partial `rdma`
+  config objects now deserialize with documented defaults for the omitted
+  fields (#87)
+
+### Added
+- Software timeout for RDMA READ completions (`rdma.read_timeout_ms`,
+  default 10s, `0` disables), enforced by a poll-thread sweep instead of
+  per-operation timers; timed-out connections are flushed via QP error state
+  and read-held memory is only released once every completion arrived (#85)
+- Per-NIC in-flight RDMA READ budget (`rdma.max_inflight_read_wrs`, default
+  32): all connections on a device — server-side `remote_read` and
+  client-side `pull` alike — share one FIFO semaphore, giving a single
+  congestion-control knob for read traffic; a derived per-connection
+  `qp.max_send_wr / 2` guard protects individual send queues (#86)
+- `max_rd_atomic` / `max_dest_rd_atomic` negotiation via the endpoint
+  exchange (`Endpoint.rd_atomic_cap`, min of both device caps, up to 16), so
+  batched reads actually proceed in parallel inside the NIC (#85)
+- Multi-SGE RDMA READ posting (`QueuePair::read_sges`) with race-free
+  completion registration in `ruapc-rdma` (#85)
+
 ## [0.2.0-alpha.1] - 2026-07-23
 
 ### Added
