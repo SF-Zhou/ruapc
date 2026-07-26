@@ -25,45 +25,46 @@
 //! - Three parameters: `&self`, `&Context`, and a request reference
 //! - Return type must be `Result<T>` where T is the response type
 //!
-//! ### `Result<WithBuffer<T>, E>` Return Type
+//! ### `Result<WithBuffers<T>, E>` Return Type
 //!
-//! Declaring a method whose return type is `Result<WithBuffer<T>, E>` makes
-//! the buffer transfer part of the method's contract on both sides. The
-//! contract is recognized by the *type system* (trait dispatch inside
-//! `ruapc`), not by this macro, so any type alias (e.g.
-//! `ruapc::ResultWithBuffer<T>` or a user-defined alias fixing a custom
+//! Declaring a method whose return type is `Result<WithBuffers<T>, E>`
+//! makes the out-of-band buffer transfer part of the method's contract on
+//! both sides. The contract is recognized by the *type system* (trait
+//! dispatch inside `ruapc`), not by this macro, so any type alias (e.g.
+//! `ruapc::ResultWithBuffers<T>` or a user-defined alias fixing a custom
 //! error type) works:
 //!
 //! ```rust,ignore
 //! #[ruapc::service]
 //! pub trait BlobService {
-//!     async fn download(&self, ctx: &Context, req: &DownloadReq) -> Result<WithBuffer<()>>;
+//!     async fn download(&self, ctx: &Context, req: &DownloadReq) -> Result<WithBuffers<()>>;
 //! }
 //!
-//! // Server handler: `WithBuffer` can only be produced by a completed
-//! // `ctx.remote_write` (via the returned `SentBuffer` witness). The push
-//! // happens inside the handler — observable, impossible to forget. For
-//! // code paths with no payload, `Buffer::empty` costs no memory:
-//! async fn download(&self, ctx: &Context, req: &DownloadReq) -> Result<WithBuffer<()>> {
-//!     let buf = /* fill a pool buffer, set_len, or Buffer::empty(...) */;
-//!     let sent = ctx.remote_write(buf).await?;
+//! // Server handler: `WithBuffers` can only be produced by a completed
+//! // `ctx.remote_write` (via the returned `SentBuffers` witness). The
+//! // transfer happens inside the handler — observable, impossible to
+//! // forget. For code paths with no payload, `ctx.sent_nothing()` costs
+//! // nothing:
+//! async fn download(&self, ctx: &Context, req: &DownloadReq) -> Result<WithBuffers<()>> {
+//!     let bufs = /* fill pool buffers, set_len */;
+//!     let sent = ctx.remote_write_all(bufs).await?;
 //!     Ok(sent.reply(()))
 //! }
 //!
-//! // Client receives the buffer as part of the same signature:
-//! let (rsp, buffer) = client.download(&ctx, &req).await?.into_parts();
+//! // Client provides the destination buffers and receives them all back
+//! // as part of the same signature:
+//! let (rsp, buffers) = client
+//!     .with_write_buffers(bufs)
+//!     .download(&ctx, &req)
+//!     .await?
+//!     .into_parts();
 //! ```
-//!
-//! The response arrives without a pushed buffer → the client-side glue
-//! materializes an empty buffer locally (the server must have used
-//! `Buffer::empty` which causes `remote_write` to short-circuit without
-//! touching the network).
 //!
 //! ### Generated Code
 //!
 //! The macro generates:
 //! 1. A `ruapc_export` method for registering the service with a router
-//! 2. Client trait implementations on `Client` and `ClientWithBuffer`, with
+//! 2. Client trait implementations on `Client` and `ClientWithBuffers`, with
 //!    one uniform body per method; plain vs. buffer-carrying calls are
 //!    dispatched by return type through `ruapc`'s call glue traits
 //! 3. Proper error handling and message serialization
@@ -76,7 +77,7 @@
 //! `async fn`; the compiler verifies at the impl site that the returned
 //! future is `Send`.
 //!
-//! The generated `Client` / `ClientWithBuffer` impls also spell out the
+//! The generated `Client` / `ClientWithBuffers` impls also spell out the
 //! `fn -> impl Future + Send` form instead of using `async fn`, so that
 //! resolving a client call only consults signatures and never has to prove
 //! the client bodies' futures `Send`. This keeps the `Send` proof acyclic
@@ -158,10 +159,10 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
             trait_methods.push(quote! { #(#attrs)* #sig; });
 
             // One uniform client body for every method. Whether the call
-            // delivers a server-pushed buffer is decided by the *type
-            // system* (see `ruapc::core::contract`), not by this macro:
+            // carries out-of-band buffers is decided by the *type system*
+            // (see `ruapc::core::contract`), not by this macro:
             // `CallWithBuffer` applies iff the return type is
-            // `Result<WithBuffer<T>, E>` (through any alias), `CallPlain`
+            // `Result<WithBuffers<T>, E>` (through any alias), `CallPlain`
             // otherwise. No name-based type detection is involved.
             //
             // Deliberately `fn -> impl Future + Send` (mirroring the trait
@@ -189,10 +190,11 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
             client_methods.push(client_body.clone());
             client_with_buffer_methods.push(client_body);
 
-            // Server dispatch is uniform as well: `WithBuffer<T>` serializes
-            // transparently as `T`, and the push already happened inside the
-            // handler (the only way to construct a `WithBuffer` is through
-            // a completed `Context::remote_write` + `SentBuffer::reply`).
+            // Server dispatch is uniform as well: `WithBuffers<T>`
+            // serializes transparently as `T`, and the transfer already
+            // happened inside the handler (the only way to construct a
+            // `WithBuffers` is through a completed `Context::remote_write`
+            // + `SentBuffers::reply`).
             invoke_branchs.push(quote! {
                 let this = self.clone();
                 router.add_method::<#req_type, #rsp_type>(#method_name, Box::new(move |ctx, payload| {
@@ -246,7 +248,7 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
             #(#client_methods)*
         }
 
-        impl #trait_ident for #krate::ClientWithBuffer<'_> {
+        impl #trait_ident for #krate::ClientWithBuffers<'_> {
             #(#client_with_buffer_methods)*
         }
     }

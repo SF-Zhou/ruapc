@@ -16,9 +16,17 @@ pub enum ErrorKind {
     NotConnected,
     /// Local buffer capacity is too small for the requested transfer.
     BufferTooSmall,
-    /// The request carries no `buffer_info` (client did not attach a read
-    /// buffer via `with_read_buffer`).
+    /// The request carries no memory regions for the attempted operation
+    /// (client did not attach buffers via `with_read_buffers` /
+    /// `with_write_buffers`).
     MissingBufferInfo,
+    /// A `CopyOp` batch failed validation: out of bounds, arithmetic
+    /// overflow, overlapping destination ranges, or too many ops/regions.
+    InvalidCopyOp,
+    /// An RDMA READ did not complete within `rdma.read_timeout_ms`; the
+    /// connection is moved to the error state so the NIC flushes the
+    /// outstanding work requests (releasing their buffers safely).
+    RdmaReadTimeout,
     /// Failed to serialize data.
     SerializeFailed,
     /// Failed to deserialize data.
@@ -200,46 +208,46 @@ impl std::fmt::Display for Error {
 
 /// Error from a remote read/write operation.
 ///
-/// Remote read/write consume the local [`Buffer`](crate::Buffer) by value;
-/// on failure the buffer is handed back here whenever it survived the
-/// operation, so callers can reuse it (e.g. to retry) instead of losing it
-/// to the pool.
+/// Remote read/write consume the local buffers by value; on failure they
+/// are handed back here whenever they survived the operation, so callers
+/// can reuse them (e.g. to retry) instead of losing them to the pool.
 ///
-/// The buffer is `None` only for connection-fatal failures where the buffer
-/// is still referenced by in-flight hardware work (e.g. an RDMA post whose
-/// completion never arrived); in that case it is returned to the pool once
-/// the underlying work request is flushed.
+/// The buffers are `None` only for connection-fatal failures where they
+/// are still referenced by in-flight hardware work (e.g. RDMA READs whose
+/// completions have not arrived); in that case they are returned to the
+/// pool once the underlying work requests have been flushed.
 ///
-/// Converting into [`Error`] (e.g. via the `?` operator) drops the buffer
-/// back to the pool.
+/// Converting into [`Error`] (e.g. via the `?` operator) drops any
+/// recovered buffers back to the pool.
 pub struct RemoteIoError {
     /// The underlying error.
     pub error: Error,
-    buffer: Option<crate::Buffer>,
+    buffers: Option<Vec<crate::Buffer>>,
 }
 
 impl RemoteIoError {
-    /// Creates a new remote I/O error, optionally carrying the local buffer.
+    /// Creates a new remote I/O error, optionally carrying the local
+    /// buffers.
     #[must_use]
-    pub(crate) fn new(error: Error, buffer: Option<crate::Buffer>) -> Self {
-        Self { error, buffer }
+    pub(crate) fn new(error: Error, buffers: Option<Vec<crate::Buffer>>) -> Self {
+        Self { error, buffers }
     }
 
-    /// Returns a reference to the recovered local buffer, if any.
+    /// Returns the recovered local buffers, if any.
     #[must_use]
-    pub fn buffer(&self) -> Option<&crate::Buffer> {
-        self.buffer.as_ref()
+    pub fn buffers(&self) -> Option<&[crate::Buffer]> {
+        self.buffers.as_deref()
     }
 
-    /// Takes the recovered local buffer, if any.
-    pub fn take_buffer(&mut self) -> Option<crate::Buffer> {
-        self.buffer.take()
+    /// Takes the recovered local buffers, if any.
+    pub fn take_buffers(&mut self) -> Option<Vec<crate::Buffer>> {
+        self.buffers.take()
     }
 
-    /// Decomposes into the underlying error and the recovered buffer.
+    /// Decomposes into the underlying error and the recovered buffers.
     #[must_use]
-    pub fn into_parts(self) -> (Error, Option<crate::Buffer>) {
-        (self.error, self.buffer)
+    pub fn into_parts(self) -> (Error, Option<Vec<crate::Buffer>>) {
+        (self.error, self.buffers)
     }
 }
 
@@ -253,7 +261,7 @@ impl From<Error> for RemoteIoError {
     fn from(error: Error) -> Self {
         Self {
             error,
-            buffer: None,
+            buffers: None,
         }
     }
 }
@@ -262,7 +270,7 @@ impl std::fmt::Debug for RemoteIoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RemoteIoError")
             .field("error", &self.error)
-            .field("buffer_recovered", &self.buffer.is_some())
+            .field("buffers_recovered", &self.buffers.is_some())
             .finish()
     }
 }

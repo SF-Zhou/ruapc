@@ -1,30 +1,16 @@
 use std::sync::Arc;
 
-use ruapc_bufpool::{DeviceIndex, RemoteBufferInfo};
+use ruapc_bufpool::DeviceIndex;
 use serde::Serialize;
 
 use crate::{
-    Buffer, Context, MsgMeta, RemoteIoError, Result, State,
+    Buffer, Context, CopyOp, MsgMeta, RemoteIoError, RemoteSpace, Result, State,
+    core::scatter::SpaceLayout,
     http::HttpSocket,
     services::{MemoryPushReq, MemoryReadReq, MemoryService},
     tcp::TcpSocket,
     ws::WebSocket,
 };
-
-/// Options controlling `remote_read` behavior.
-///
-/// The `skip_verify` field is `pub(crate)` to prevent external code from
-/// bypassing the UUID liveness check.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RemoteReadOptions {
-    /// When true, skips the post-read UUID liveness verification.
-    ///
-    /// Only safe when the remote buffer's lifetime is guaranteed by the
-    /// calling context (e.g., the server holds `&buf` across `.await`).
-    /// Only used by the RDMA path; the TCP path always verifies inline.
-    #[cfg_attr(not(feature = "rdma"), allow(dead_code))]
-    pub(crate) skip_verify: bool,
-}
 
 /// Socket abstraction supporting multiple transport protocols.
 ///
@@ -58,76 +44,105 @@ pub trait SocketTrait {
         state: &Arc<State>,
     ) -> Result<()>;
 
-    /// Reads `remote.len` bytes from the peer's registered memory into
-    /// `local`. On failure the buffer is handed back inside
-    /// [`RemoteIoError`] whenever it survived the operation.
+    /// Executes a validated batch of reads from the peer's read space into
+    /// the `local` buffers (see [`Context::remote_read`] for the space and
+    /// op semantics; validation already happened there).
+    ///
+    /// Default implementation (TCP/WS/HTTP): a reverse `MemoryService/read`
+    /// RPC returns the requested byte ranges inline, which are then
+    /// scattered into `local` according to the ops.
     async fn remote_read(
         &self,
         ctx: &Context,
-        mut local: Buffer,
-        remote: &RemoteBufferInfo,
-        _options: &RemoteReadOptions,
-    ) -> std::result::Result<Buffer, RemoteIoError> {
-        // `remote.len` is the number of valid data bytes; refuse early if the
-        // local buffer cannot hold them, before any data is transferred.
-        if remote.len as usize > local.capacity() {
-            return Err(RemoteIoError::new(
-                crate::Error::new(
-                    crate::ErrorKind::BufferTooSmall,
-                    format!(
-                        "remote buffer has {} bytes but local buffer capacity is {}",
-                        remote.len,
-                        local.capacity()
-                    ),
-                ),
-                Some(local),
-            ));
-        }
-        // Pass msgid so that tcp_read on the client side verifies
-        // the original request is still alive after reading the buffer.
+        ops: &[CopyOp],
+        mut local: Vec<Buffer>,
+        remote: &RemoteSpace<'_>,
+    ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
+        // Pass msgid so that the client verifies the original request is
+        // still alive after reading its buffers.
         let req = MemoryReadReq {
-            key: remote.key,
-            addr: remote.addr,
-            len: remote.len,
+            regions: remote.regions().to_vec(),
+            ops: ops.to_vec(),
             msgid: ctx.msg_meta.msgid,
         };
         let client = crate::Client::default();
-        let data: Vec<u8> = match client.tcp_read(ctx, &req).await {
+        let data: Vec<u8> = match client.read(ctx, &req).await {
             Ok(rsp) => rsp.data,
             Err(e) => return Err(RemoteIoError::new(e, Some(local))),
         };
-        if data.len() > local.capacity() {
+        let expected: u64 = ops.iter().map(|op| op.len).sum();
+        if data.len() as u64 != expected {
             return Err(RemoteIoError::new(
                 crate::Error::new(
-                    crate::ErrorKind::BufferTooSmall,
+                    crate::ErrorKind::InvalidCopyOp,
                     format!(
-                        "remote read returned {} bytes but local buffer capacity is {}",
-                        data.len(),
-                        local.capacity()
+                        "remote read returned {} bytes but the ops requested {expected}",
+                        data.len()
                     ),
                 ),
                 Some(local),
             ));
         }
-        local.set_len(data.len());
-        local[..].copy_from_slice(&data);
+        // Scatter the inline blob (op payloads concatenated in op order)
+        // into the local space.
+        let layout = match SpaceLayout::from_lens(local.iter().map(|b| b.len() as u64)) {
+            Ok(layout) => layout,
+            Err(e) => return Err(RemoteIoError::new(e, Some(local))),
+        };
+        let mut cursor = 0usize;
+        for op in ops {
+            let _ = layout.for_each_slice::<std::convert::Infallible>(
+                op.dst_offset,
+                op.len,
+                |seg, off, len| {
+                    let (off, len) = (off as usize, len as usize);
+                    local[seg][off..off + len].copy_from_slice(&data[cursor..cursor + len]);
+                    cursor += len;
+                    Ok(())
+                },
+            );
+        }
         Ok(local)
     }
 
-    /// Pushes `local`'s data to the client. On failure the buffer is handed
-    /// back inside [`RemoteIoError`].
+    /// Executes a validated batch of writes from the `local` buffers into
+    /// the peer's write space (see [`Context::remote_write`]; validation
+    /// already happened there).
+    ///
+    /// Default implementation (TCP/WS/HTTP): the op payloads travel inline
+    /// in a reverse `MemoryService/push` RPC and the client copies them
+    /// into its pinned write buffers.
     async fn remote_write(
         &self,
         ctx: &Context,
-        local: Buffer,
-    ) -> std::result::Result<Buffer, RemoteIoError> {
-        // Push data to the client via tcp_push.
+        ops: &[CopyOp],
+        local: Vec<Buffer>,
+    ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
+        // Gather the op payloads (in op order) into one inline blob.
+        let layout = match SpaceLayout::from_lens(local.iter().map(|b| b.len() as u64)) {
+            Ok(layout) => layout,
+            Err(e) => return Err(RemoteIoError::new(e, Some(local))),
+        };
+        let total: u64 = ops.iter().map(|op| op.len).sum();
+        let mut data = Vec::with_capacity(total as usize);
+        for op in ops {
+            let _ = layout.for_each_slice::<std::convert::Infallible>(
+                op.src_offset,
+                op.len,
+                |seg, off, len| {
+                    let (off, len) = (off as usize, len as usize);
+                    data.extend_from_slice(&local[seg][off..off + len]);
+                    Ok(())
+                },
+            );
+        }
         let req = MemoryPushReq {
             msgid: ctx.msg_meta.msgid,
-            data: local[..].to_vec(),
+            ops: ops.to_vec(),
+            data,
         };
         let client = crate::Client::default();
-        match client.tcp_push(ctx, &req).await {
+        match client.push(ctx, &req).await {
             Ok(()) => Ok(local),
             Err(e) => Err(RemoteIoError::new(e, Some(local))),
         }
@@ -143,6 +158,31 @@ impl Socket {
             }
             #[cfg(feature = "rdma")]
             Socket::RDMA(rdma_socket) => rdma_socket.queue_pair.device_index,
+        }
+    }
+
+    /// Executes the client side of a `MemoryService/pull` request: RDMA
+    /// READs from the peer's advertised regions into the request's pinned
+    /// write target. Only meaningful on RDMA connections.
+    #[allow(unused_variables)]
+    pub(crate) async fn pull_into_target(
+        &self,
+        regions: &[ruapc_bufpool::RemoteBufferInfo],
+        src_layout: &SpaceLayout,
+        ops: &[CopyOp],
+        target: std::sync::Arc<crate::core::WriteTarget>,
+    ) -> Result<()> {
+        match self {
+            #[cfg(feature = "rdma")]
+            Socket::RDMA(rdma_socket) => {
+                rdma_socket
+                    .pull_into_target(regions, src_layout, ops, target)
+                    .await
+            }
+            _ => Err(crate::Error::new(
+                crate::ErrorKind::InvalidArgument,
+                "pull requires an RDMA connection (non-RDMA transports use push)".into(),
+            )),
         }
     }
 }
@@ -166,30 +206,31 @@ impl SocketTrait for Socket {
     async fn remote_read(
         &self,
         ctx: &Context,
-        local: Buffer,
-        remote: &RemoteBufferInfo,
-        options: &RemoteReadOptions,
-    ) -> std::result::Result<Buffer, RemoteIoError> {
+        ops: &[CopyOp],
+        local: Vec<Buffer>,
+        remote: &RemoteSpace<'_>,
+    ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
         match self {
-            Socket::TCP(tcp_socket) => tcp_socket.remote_read(ctx, local, remote, options).await,
-            Socket::WS(web_socket) => web_socket.remote_read(ctx, local, remote, options).await,
-            Socket::HTTP(http_socket) => http_socket.remote_read(ctx, local, remote, options).await,
+            Socket::TCP(tcp_socket) => tcp_socket.remote_read(ctx, ops, local, remote).await,
+            Socket::WS(web_socket) => web_socket.remote_read(ctx, ops, local, remote).await,
+            Socket::HTTP(http_socket) => http_socket.remote_read(ctx, ops, local, remote).await,
             #[cfg(feature = "rdma")]
-            Socket::RDMA(rdma_socket) => rdma_socket.remote_read(ctx, local, remote, options).await,
+            Socket::RDMA(rdma_socket) => rdma_socket.remote_read(ctx, ops, local, remote).await,
         }
     }
 
     async fn remote_write(
         &self,
         ctx: &Context,
-        local: Buffer,
-    ) -> std::result::Result<Buffer, RemoteIoError> {
+        ops: &[CopyOp],
+        local: Vec<Buffer>,
+    ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
         match self {
-            Socket::TCP(tcp_socket) => tcp_socket.remote_write(ctx, local).await,
-            Socket::WS(web_socket) => web_socket.remote_write(ctx, local).await,
-            Socket::HTTP(http_socket) => http_socket.remote_write(ctx, local).await,
+            Socket::TCP(tcp_socket) => tcp_socket.remote_write(ctx, ops, local).await,
+            Socket::WS(web_socket) => web_socket.remote_write(ctx, ops, local).await,
+            Socket::HTTP(http_socket) => http_socket.remote_write(ctx, ops, local).await,
             #[cfg(feature = "rdma")]
-            Socket::RDMA(rdma_socket) => rdma_socket.remote_write(ctx, local).await,
+            Socket::RDMA(rdma_socket) => rdma_socket.remote_write(ctx, ops, local).await,
         }
     }
 }

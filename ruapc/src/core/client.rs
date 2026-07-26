@@ -1,11 +1,12 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_inline_default::serde_inline_default;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::{
     Buffer, Context, SocketEndpoint, SocketTrait, SocketType,
+    core::{WriteTarget, scatter::MAX_REGIONS},
     error::{Error, ErrorKind},
     msg::{MsgFlags, MsgMeta},
 };
@@ -62,29 +63,69 @@ impl Default for Client {
 }
 
 impl Client {
-    /// Creates a [`ClientWithBuffer`] that attaches a read buffer to requests.
+    /// Creates a [`ClientWithBuffers`] wrapper attaching one *read* buffer
+    /// to requests; see [`with_read_buffers`](Self::with_read_buffers).
+    pub fn with_read_buffer<'a>(&'a self, buffer: &'a Buffer) -> ClientWithBuffers<'a> {
+        self.buffers().with_read_buffer(buffer)
+    }
+
+    /// Creates a [`ClientWithBuffers`] wrapper attaching *read* buffers to
+    /// requests.
     ///
-    /// The returned wrapper implements the same service traits as `Client`, but
-    /// includes the buffer's `RemoteBufferInfo` in each request's metadata,
-    /// allowing the server to `remote_read` the client's registered memory.
+    /// The buffers' `RemoteBufferInfo` (one region per buffer, in order)
+    /// is included in each request's metadata as the request's *read
+    /// space*: a logically contiguous concatenation the server can read
+    /// from with [`Context::remote_read`](crate::Context::remote_read).
     ///
-    /// The advertised length is the buffer's logical length (`buffer.len()`):
-    /// call `set_len` after filling the buffer so the server transfers exactly
-    /// the valid data bytes.
+    /// Each buffer contributes its logical length (`Buffer::len()`): call
+    /// `set_len` after filling so the space covers exactly the valid data
+    /// bytes. The buffers stay borrowed by the caller for the duration of
+    /// the call.
     ///
     /// # Examples
     ///
     /// ```rust,ignore
-    /// let mut buf = pool.allocate(1024 * 1024)?;
-    /// buf[..data.len()].copy_from_slice(data);
-    /// buf.set_len(data.len());
-    /// let rsp = client.with_read_buffer(&buf).upload(&ctx, &req).await?;
+    /// let rsp = client.with_read_buffers(&bufs).upload(&ctx, &req).await?;
     /// ```
-    pub fn with_read_buffer<'a>(&'a self, buffer: &'a Buffer) -> ClientWithBuffer<'a> {
-        ClientWithBuffer {
+    pub fn with_read_buffers<'a>(&'a self, buffers: &'a [Buffer]) -> ClientWithBuffers<'a> {
+        self.buffers().with_read_buffers(buffers)
+    }
+
+    /// Creates a [`ClientWithBuffers`] wrapper attaching *write* buffers
+    /// to requests.
+    ///
+    /// Ownership of the buffers moves into the request: they are pinned
+    /// (registered memory held alive) until the call resolves, forming the
+    /// request's *write space* — a logically contiguous concatenation the
+    /// server can write into with
+    /// [`Context::remote_write`](crate::Context::remote_write). Each
+    /// buffer contributes its logical length (`Buffer::len()`); set it to
+    /// the receivable size before attaching.
+    ///
+    /// All buffers come back through the call's return value when the
+    /// method's return type is `Result<WithBuffers<T>, E>`; after a failed
+    /// call they can be recovered with
+    /// [`ClientWithBuffers::take_write_buffers`].
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let (rsp, bufs) = client
+    ///     .with_write_buffers(vec![buf_a, buf_b])
+    ///     .download(&ctx, &req)
+    ///     .await?
+    ///     .into_parts();
+    /// ```
+    pub fn with_write_buffers(&self, buffers: Vec<Buffer>) -> ClientWithBuffers<'_> {
+        self.buffers().with_write_buffers(buffers)
+    }
+
+    /// Creates an empty [`ClientWithBuffers`] wrapper.
+    fn buffers(&self) -> ClientWithBuffers<'_> {
+        ClientWithBuffers {
             client: self,
-            read_buffer: Some(buffer),
-            write_buffer: Mutex::new(None),
+            read_buffers: Vec::new(),
+            write_buffers: Mutex::new(None),
         }
     }
 
@@ -94,17 +135,20 @@ impl Client {
     ///
     /// * `ctx` - The RPC context containing connection information
     /// * `req` - The request payload to send
-    /// * `read_buffer` - Optional registered memory buffer for the server to read.
-    /// * `write_buffer_slot` - Optional slot to receive a buffer written by the server.
-    ///   If the server performs a `remote_write` during handling, the received buffer
-    ///   will be placed here after the response arrives.
+    /// * `read_buffers` - Registered buffers forming the request's read
+    ///   space (borrowed for the call).
+    /// * `write_target` - Pinned destination buffers forming the request's
+    ///   write space; taken (and consumed) on success.
+    /// * `write_buffers_slot` - Optional slot receiving all write buffers
+    ///   back once the response arrived.
     /// * `method_name` - The name of the RPC method to invoke
-    pub async fn ruapc_request<Req, Rsp, E>(
+    pub(crate) async fn ruapc_request<Req, Rsp, E>(
         &self,
         ctx: &Context,
         req: &Req,
-        read_buffer: Option<&Buffer>,
-        write_buffer_slot: Option<&mut Option<Buffer>>,
+        read_buffers: &[&Buffer],
+        write_target: &mut Option<Arc<WriteTarget>>,
+        write_buffers_slot: Option<&mut Vec<Buffer>>,
         method_name: &str,
     ) -> std::result::Result<Rsp, E>
     where
@@ -117,7 +161,14 @@ impl Client {
         metrics.inflight.increment(1.0);
         let start = std::time::Instant::now();
         let result = self
-            .request_inner(ctx, req, read_buffer, write_buffer_slot, method_name)
+            .request_inner(
+                ctx,
+                req,
+                read_buffers,
+                write_target,
+                write_buffers_slot,
+                method_name,
+            )
             .await;
         metrics.latency.record(start.elapsed().as_secs_f64());
         metrics.inflight.decrement(1.0);
@@ -131,8 +182,9 @@ impl Client {
         &self,
         ctx: &Context,
         req: &Req,
-        read_buffer: Option<&Buffer>,
-        write_buffer_slot: Option<&mut Option<Buffer>>,
+        read_buffers: &[&Buffer],
+        write_target: &mut Option<Arc<WriteTarget>>,
+        write_buffers_slot: Option<&mut Vec<Buffer>>,
         method_name: &str,
     ) -> std::result::Result<Rsp, E>
     where
@@ -156,6 +208,17 @@ impl Client {
             None => self.timeout,
         };
 
+        if read_buffers.len() > MAX_REGIONS {
+            return Err(Error::new(
+                ErrorKind::InvalidCopyOp,
+                format!(
+                    "too many read buffers: {} (limit {MAX_REGIONS})",
+                    read_buffers.len()
+                ),
+            )
+            .into());
+        }
+
         let mut flags = MsgFlags::IsReq;
         if self.use_msgpack {
             flags |= MsgFlags::UseMessagePack;
@@ -166,7 +229,9 @@ impl Client {
         // attempt allocates its waiter entry *after* the connection is
         // established, so connection setup (which can be slow, e.g. RDMA QP
         // negotiation with path failover) does not consume the budget. A
-        // failed attempt drops its receiver, cleaning the entry up.
+        // failed attempt drops its receiver, cleaning the entry up (and,
+        // with it, the entry's write-target pin — the caller-held clone in
+        // `write_target` keeps the buffers available for the next attempt).
         let addr_base = match &ctx.endpoint {
             SocketEndpoint::Addresses(set) => set.next_base(),
             _ => 0,
@@ -175,7 +240,16 @@ impl Client {
         let receiver = loop {
             let addr = attempt_addr(ctx, addr_base, attempt)?;
             let result = self
-                .try_send(ctx, req, read_buffer, method_name, flags, timeout, addr)
+                .try_send(
+                    ctx,
+                    req,
+                    read_buffers,
+                    write_target.as_ref(),
+                    method_name,
+                    flags,
+                    timeout,
+                    addr,
+                )
                 .await;
             match result {
                 Ok(receiver) => break receiver,
@@ -190,10 +264,17 @@ impl Client {
         };
 
         // 3. recv response (fails with Timeout once the entry expires).
-        let (response, write_buffer) = receiver.recv().await?;
-        // Pass the write buffer to the caller if a slot was provided.
-        if let Some(slot) = write_buffer_slot {
-            *slot = write_buffer;
+        let (response, returned_target) = receiver.recv().await?;
+        // Hand every attached write buffer back to the caller. Dropping
+        // our own clone first makes the returned target unique in the
+        // normal case; a pull/push handler racing the response keeps the
+        // buffers alive until it finishes, after which they fall back to
+        // the pool.
+        drop(write_target.take());
+        if let Some(slot) = write_buffers_slot {
+            *slot = returned_target
+                .and_then(WriteTarget::try_into_buffers)
+                .unwrap_or_default();
         }
         response.payload.deserialize(&response.meta)?
     }
@@ -211,7 +292,8 @@ impl Client {
         &self,
         ctx: &'a Context,
         req: &Req,
-        read_buffer: Option<&Buffer>,
+        read_buffers: &[&Buffer],
+        write_target: Option<&Arc<WriteTarget>>,
         method_name: &str,
         flags: MsgFlags,
         timeout: Duration,
@@ -252,25 +334,38 @@ impl Client {
             _ => unreachable!("attempt_addr rejects endpoints without an address"),
         };
 
-        // Extract buffer info if a read buffer is provided.
-        let buffer_info = if let Some(buf) = read_buffer {
+        // Export the attached buffers as regions for the device the
+        // connection actually runs on (TCP device, or the specific RDMA
+        // NIC of this connection).
+        let mut read_regions = Vec::new();
+        let mut write_regions = Vec::new();
+        if !read_buffers.is_empty() || write_target.is_some() {
             let device_index = socket.device_index(&ctx.state);
-            Some(
-                buf.remote_buffer_info(&device_index)
-                    .map_err(|e| Error::new(ErrorKind::InvalidArgument, e.to_string()))?,
-            )
-        } else {
-            None
-        };
+            for buf in read_buffers {
+                read_regions.push(
+                    buf.remote_buffer_info(&device_index)
+                        .map_err(|e| Error::new(ErrorKind::InvalidArgument, e.to_string()))?,
+                );
+            }
+            if let Some(target) = write_target {
+                write_regions = target.export_regions(&device_index)?;
+            }
+        }
 
         // The waiter entry expires after `timeout` (coarse, swept
         // periodically); no per-request timer is registered.
         let (msgid, receiver) = ctx.state.waiter.alloc(timeout);
+        if let Some(target) = write_target {
+            // Pin the write buffers to the pending request so push/pull
+            // handlers can reach (and keep alive) the destination memory.
+            ctx.state.waiter.bind_write_target(msgid, target.clone());
+        }
         let mut meta = MsgMeta {
             method: method_name.into(),
             flags,
             msgid,
-            buffer_info,
+            read_regions,
+            write_regions,
             // Ship the *effective* budget so the whole downstream call
             // tree inherits the shrunk deadline.
             timeout_ms: Some(u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX)),
@@ -303,61 +398,86 @@ fn attempt_addr(
     }
 }
 
-/// A client wrapper that attaches a read buffer to RPC calls.
+/// A client wrapper that attaches registered buffers to RPC calls.
 ///
-/// Created via [`Client::with_read_buffer`]. Implements the same service
-/// traits as `Client` (generated by the `#[service]` macro).
+/// Created via [`Client::with_read_buffers`] /
+/// [`Client::with_write_buffers`]. Implements the same service traits as
+/// `Client` (generated by the `#[service]` macro).
 ///
-/// # Read buffer
+/// # Read buffers
 ///
-/// The attached buffer's `RemoteBufferInfo` is included in every request's
-/// metadata, allowing the server to `remote_read` the client's memory.
+/// The attached read buffers form the request's *read space*, advertised
+/// in the request metadata; the server reads from it via
+/// [`Context::remote_read`](crate::Context::remote_read). They remain
+/// borrowed by the caller.
 ///
-/// # Write buffer
+/// # Write buffers
 ///
-/// A buffer pushed by the server (via a `Result<WithBuffer<T>, E>` service
-/// method) is delivered through the return value of the call itself; no
-/// manual retrieval is involved.
+/// The attached write buffers form the request's *write space*; ownership
+/// moves into the call, the memory stays pinned until the call resolves,
+/// and the server writes into it via
+/// [`Context::remote_write`](crate::Context::remote_write). Methods
+/// returning `Result<WithBuffers<T>, E>` deliver all of them back through
+/// the return value; after a failed call, recover them with
+/// [`take_write_buffers`](Self::take_write_buffers).
 ///
 /// # Examples
 ///
 /// ```rust,ignore
-/// // Server reads from the client's buffer:
-/// let rsp = client.with_read_buffer(&buf).upload(&ctx, &req).await?;
+/// // Server reads from the client's buffers:
+/// let rsp = client.with_read_buffers(&bufs).upload(&ctx, &req).await?;
 ///
-/// // Read buffer attached and a server-pushed buffer received, in one call:
-/// let (rsp, out) = client.with_read_buffer(&buf).transform(&ctx, &req).await?.into_parts();
+/// // Upload and download in a single call:
+/// let (rsp, out) = client
+///     .with_read_buffers(&src_bufs)
+///     .with_write_buffers(dst_bufs)
+///     .transform(&ctx, &req)
+///     .await?
+///     .into_parts();
 /// ```
-pub struct ClientWithBuffer<'a> {
+pub struct ClientWithBuffers<'a> {
     client: &'a Client,
-    read_buffer: Option<&'a Buffer>,
-    write_buffer: Mutex<Option<Buffer>>,
+    read_buffers: Vec<&'a Buffer>,
+    write_buffers: Mutex<Option<Vec<Buffer>>>,
 }
 
-impl<'a> ClientWithBuffer<'a> {
-    /// Attaches a read buffer to this wrapper.
-    ///
-    /// The buffer's `RemoteBufferInfo` will be included in request metadata,
-    /// allowing the server to `remote_read` the client's memory.
+impl<'a> ClientWithBuffers<'a> {
+    /// Appends one buffer to the request's read space.
+    #[must_use]
     pub fn with_read_buffer(mut self, buffer: &'a Buffer) -> Self {
-        self.read_buffer = Some(buffer);
+        self.read_buffers.push(buffer);
         self
     }
 
-    /// Takes the write buffer received from the server, if any.
-    ///
-    /// Crate-internal: buffers pushed by the server are surfaced to users
-    /// through `Result<WithBuffer<T>, E>` return values (see
-    /// `core::contract`), never via manual retrieval.
-    pub(crate) fn take_write_buffer(&self) -> Option<Buffer> {
-        self.write_buffer.lock().unwrap().take()
+    /// Appends buffers to the request's read space.
+    #[must_use]
+    pub fn with_read_buffers(mut self, buffers: &'a [Buffer]) -> Self {
+        self.read_buffers.extend(buffers.iter());
+        self
+    }
+
+    /// Attaches the request's write buffers (replacing any previous set).
+    #[must_use]
+    pub fn with_write_buffers(self, buffers: Vec<Buffer>) -> Self {
+        *self.write_buffers.lock().unwrap() = Some(buffers);
+        self
+    }
+
+    /// Recovers the attached write buffers after a *failed* call (they are
+    /// consumed by a successful one and returned through its
+    /// `WithBuffers` result instead). Returns `None` when nothing is
+    /// recoverable — e.g. a transfer is still in flight; the buffers then
+    /// drop back to the pool once it finishes.
+    pub fn take_write_buffers(&self) -> Option<Vec<Buffer>> {
+        self.write_buffers.lock().unwrap().take()
     }
 
     /// Makes an RPC request with the configured buffers.
-    pub async fn ruapc_request<Req, Rsp, E>(
+    pub(crate) async fn ruapc_request<Req, Rsp, E>(
         &self,
         ctx: &Context,
         req: &Req,
+        write_buffers_slot: Option<&mut Vec<Buffer>>,
         method_name: &str,
     ) -> std::result::Result<Rsp, E>
     where
@@ -365,12 +485,40 @@ impl<'a> ClientWithBuffer<'a> {
         Rsp: for<'c> Deserialize<'c> + JsonSchema,
         E: std::error::Error + From<crate::Error> + for<'c> Deserialize<'c>,
     {
-        let mut slot = self.write_buffer.lock().unwrap().take();
+        let mut target = match self.write_buffers.lock().unwrap().take() {
+            Some(buffers) => Some(WriteTarget::new(buffers)?),
+            None => None,
+        };
+        let mut returned: Vec<Buffer> = Vec::new();
         let result = self
             .client
-            .ruapc_request(ctx, req, self.read_buffer, Some(&mut slot), method_name)
+            .ruapc_request(
+                ctx,
+                req,
+                &self.read_buffers,
+                &mut target,
+                Some(&mut returned),
+                method_name,
+            )
             .await;
-        *self.write_buffer.lock().unwrap() = slot;
+        if result.is_ok() {
+            if let Some(slot) = write_buffers_slot {
+                *slot = returned;
+            }
+        } else {
+            // On failure, make the write buffers recoverable through
+            // `take_write_buffers` whenever nothing keeps them pinned:
+            // either the request never consumed the target (pre-wire
+            // failure) or an error *response* handed the buffers back.
+            let recovered = match target.take() {
+                Some(arc) => WriteTarget::try_into_buffers(arc),
+                None if !returned.is_empty() => Some(returned),
+                None => None,
+            };
+            if let Some(buffers) = recovered {
+                *self.write_buffers.lock().unwrap() = Some(buffers);
+            }
+        }
         result
     }
 }
@@ -425,5 +573,21 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.kind, crate::ErrorKind::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_write_buffers_recoverable_after_failed_call() {
+        use crate::{SocketPoolConfig, services::MetaService as _};
+        let ctx = crate::Context::create(&SocketPoolConfig::default()).unwrap();
+        let client = Client::default();
+        let mut buf = ctx.state.buffer_pool.allocate(64 * 1024).unwrap();
+        buf.set_len(16);
+        let wrapper = client.with_write_buffers(vec![buf]);
+        // Invalid endpoint: the call fails before reaching the wire.
+        let result = wrapper.list_methods(&ctx, &()).await;
+        assert!(result.is_err());
+        let recovered = wrapper.take_write_buffers().expect("buffers recoverable");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].len(), 16);
     }
 }

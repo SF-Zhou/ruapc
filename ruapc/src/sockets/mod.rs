@@ -1,6 +1,6 @@
 /// Socket abstraction layer.
 mod socket;
-pub use socket::{RemoteReadOptions, Socket, SocketTrait};
+pub use socket::{Socket, SocketTrait};
 
 /// Socket pool management and configuration.
 mod socket_pool;

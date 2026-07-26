@@ -37,6 +37,6 @@ mod protection_domain;
 pub use protection_domain::ProtectionDomain;
 
 mod queue_pair;
-pub use queue_pair::{Completion, MAX_GATHER_SGE, QueuePair, WrBuffers};
+pub use queue_pair::{Completion, MAX_GATHER_SGE, QueuePair, ReadSge, WrBuffers};
 
 mod wr_slots;

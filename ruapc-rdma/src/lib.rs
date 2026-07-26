@@ -55,7 +55,7 @@ pub use types::{DeviceInfo, FwVer, Gid, GidType, Guid, LinkLayer, Port, RdmaBuff
 mod verbs;
 pub use verbs::{
     ActiveDevice, CompChannel, Completion, CompletionQueue, Context, Device, DeviceList,
-    MAX_GATHER_SGE, MemoryRegion, ProtectionDomain, QueuePair, WrBuffers,
+    MAX_GATHER_SGE, MemoryRegion, ProtectionDomain, QueuePair, ReadSge, WrBuffers,
 };
 
 #[cfg(test)]

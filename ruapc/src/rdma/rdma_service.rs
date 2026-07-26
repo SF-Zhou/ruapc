@@ -180,6 +180,7 @@ mod tests {
             link_layer: ruapc_rdma::LinkLayer::Ethernet,
             active_mtu: ruapc_rdma::ibv_mtu::IBV_MTU_512,
             psn: 0,
+            rd_atomic_cap: 1,
         };
         let request = rdma::ConnectRequest {
             endpoint,

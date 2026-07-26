@@ -61,11 +61,19 @@ pub struct MsgMeta {
     /// Message ID for correlating requests and responses.
     #[serde(default)]
     pub msgid: u64,
-    /// Optional remote buffer information for server-side reading.
-    /// Present when the client uses `_with_read_buffer` methods, allowing the
-    /// server to perform `remote_read` on the client's registered memory.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub buffer_info: Option<RemoteBufferInfo>,
+    /// Regions of the sender's registered memory the receiver may *read*
+    /// (RDMA READ or reverse-RPC copy). In order, they form one logical
+    /// contiguous space. Attached by `Client::with_read_buffers`; also
+    /// used by the reverse `MemoryService/pull` request to advertise the
+    /// server's source buffers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_regions: Vec<RemoteBufferInfo>,
+    /// Regions of the sender's registered memory the receiver may *write*
+    /// (through the pull/push protocol). In order, they form one logical
+    /// contiguous space. Attached by `Client::with_write_buffers`; the
+    /// buffers stay pinned client-side until the request resolves.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub write_regions: Vec<RemoteBufferInfo>,
     /// Remaining time budget of the request in milliseconds, set by the
     /// client. The server derives a deadline from it on arrival (relative
     /// budgets avoid clock-skew issues of absolute timestamps), drops the
@@ -392,7 +400,8 @@ mod tests {
             method: method.to_string(),
             flags,
             msgid: 42,
-            buffer_info: None,
+            read_regions: Vec::new(),
+            write_regions: Vec::new(),
             timeout_ms: None,
         }
     }
@@ -420,19 +429,21 @@ mod tests {
     }
 
     #[test]
-    fn test_meta_roundtrip_with_buffer_info() {
+    fn test_meta_roundtrip_with_regions() {
+        let region = ruapc_bufpool::RemoteBufferInfo {
+            key: ruapc_bufpool::MemoryKey {
+                lkey: 0x1122_3344,
+                rkey: 0x5566_7788,
+            },
+            addr: 0xdead_beef_cafe_f00d,
+            len: 1 << 40,
+        };
         let meta = MsgMeta {
-            method: "MemoryService/rdma_pull".into(),
+            method: "MemoryService/pull".into(),
             flags: MsgFlags::IsReq | MsgFlags::UseMessagePack,
             msgid: u64::MAX - 1,
-            buffer_info: Some(ruapc_bufpool::RemoteBufferInfo {
-                key: ruapc_bufpool::MemoryKey {
-                    lkey: 0x1122_3344,
-                    rkey: 0x5566_7788,
-                },
-                addr: 0xdead_beef_cafe_f00d,
-                len: 1 << 40,
-            }),
+            read_regions: vec![region, region],
+            write_regions: vec![region],
             timeout_ms: Some(1500),
         };
         let buf = serialize_to_bytes(&meta, &serde_json::json!({"x": 1}));
@@ -452,13 +463,14 @@ mod tests {
 
     #[test]
     fn test_minimal_response_meta_roundtrip() {
-        // Response metas skip `method`/`buffer_info`/`timeout_ms`; only
-        // flags and msgid travel, and absent fields decode to defaults.
+        // Response metas skip `method`/regions/`timeout_ms`; only flags
+        // and msgid travel, and absent fields decode to defaults.
         let meta = MsgMeta {
             method: String::new(),
             flags: MsgFlags::IsRsp,
             msgid: 42,
-            buffer_info: None,
+            read_regions: Vec::new(),
+            write_regions: Vec::new(),
             timeout_ms: None,
         };
         let buf = serialize_to_bytes(&meta, &serde_json::json!({"ok": true}));
@@ -550,7 +562,8 @@ mod tests {
             method: "Svc/method".into(),
             flags: MsgFlags::IsRsp,
             msgid: 7,
-            buffer_info: None,
+            read_regions: Vec::new(),
+            write_regions: Vec::new(),
             timeout_ms: None,
         };
         let payload = crate::Payload::from(bytes::Bytes::from_static(b"data"));

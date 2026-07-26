@@ -200,7 +200,8 @@ impl HttpSocketPool {
             method: req.uri().path().trim_start_matches('/').to_string(),
             flags: MsgFlags::IsReq,
             msgid,
-            buffer_info: None,
+            read_regions: Vec::new(),
+            write_regions: Vec::new(),
             timeout_ms: Some(u32::try_from(UNARY_TIMEOUT.as_millis()).unwrap_or(u32::MAX)),
         };
         // Cap the request body at the wire-format message limit; an

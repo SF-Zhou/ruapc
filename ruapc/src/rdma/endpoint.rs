@@ -30,6 +30,18 @@ pub struct Endpoint {
     /// QP reusing the (qp_num, GID) pair of a recently destroyed one with a
     /// predictable PSN can silently blackhole against stale peer state.
     pub psn: u32,
+    /// Device cap on concurrent RDMA READs per QP, advertised so both
+    /// sides can program `max_rd_atomic` / `max_dest_rd_atomic` as the
+    /// minimum of the two caps (they compute identical values, which the
+    /// RC protocol requires). Higher values let batched `remote_read`
+    /// work requests proceed in parallel inside the NIC.
+    #[serde(default = "default_rd_atomic")]
+    pub rd_atomic_cap: u8,
+}
+
+/// Conservative fallback used when a peer does not advertise a cap.
+pub(crate) fn default_rd_atomic() -> u8 {
+    1
 }
 
 /// Server-side RDMA device/port/GID selected by the client.

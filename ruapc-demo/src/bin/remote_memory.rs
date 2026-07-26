@@ -1,11 +1,17 @@
 //! Self-contained demo of the remote read/write API.
 //!
 //! Starts a server in-process, then demonstrates:
-//! - **Upload**: the client attaches a registered buffer via
-//!   `with_read_buffer`; the server pulls it with `remote_read_request`.
-//! - **Download**: the service method returns `ResultWithBuffer<T>`; the
-//!   server hands the buffer over in its return value and the client
-//!   receives it as `WithBuffer<T>` from the same method call.
+//! - **Upload**: the client attaches registered buffers via
+//!   `with_read_buffers`; the server pulls them with `remote_read_all`.
+//! - **Download**: the client pre-provides pinned destination buffers via
+//!   `with_write_buffers`; the service method returns
+//!   `ResultWithBuffers<T>`, the server writes into the client's buffers
+//!   with `remote_write_all`, and every buffer comes back through the
+//!   method's return value.
+//!
+//! Both directions treat multiple buffers as one logical contiguous
+//! space; servers can also issue vectored transfers with explicit
+//! offsets (`Context::remote_read` / `remote_write` with `CopyOp`s).
 //!
 //! Works identically over TCP / WS / HTTP / RDMA:
 //!
@@ -46,33 +52,35 @@ struct DownloadReq {
 
 #[ruapc::service]
 trait BlobService {
-    /// Client attaches a buffer; server reads it and reports its size.
+    /// Client attaches buffers; server reads them and reports their size.
     async fn upload(&self, ctx: &Context, req: &UploadReq) -> Result<usize>;
 
-    /// Server pushes a buffer to the client and reports the push latency
-    /// (in microseconds) as the response — computed *after* the transfer,
-    /// which the `remote_write` + `SentBuffer::reply` two-step allows.
-    async fn download(&self, ctx: &Context, req: &DownloadReq) -> Result<WithBuffer<u64>>;
+    /// Server fills the client's pinned write buffers and reports the
+    /// write latency (in microseconds) as the response — computed *after*
+    /// the transfer, which the `remote_write` + `SentBuffers::reply`
+    /// two-step allows.
+    async fn download(&self, ctx: &Context, req: &DownloadReq) -> Result<WithBuffers<u64>>;
 }
 
 struct BlobServiceImpl;
 
 impl BlobService for BlobServiceImpl {
     async fn upload(&self, ctx: &Context, req: &UploadReq) -> Result<usize> {
-        // One call: allocates a right-sized local buffer and transfers
-        // exactly the client's logical data length (TCP: reverse RPC copy,
-        // RDMA: one-sided RDMA READ).
-        let data = ctx.remote_read_request().await?;
+        // One call: allocates right-sized local buffers and transfers
+        // exactly the client's logical data (TCP: reverse RPC copy,
+        // RDMA: batched one-sided RDMA READs).
+        let data = ctx.remote_read_all().await?;
+        let total: usize = data.iter().map(|b| b.len()).sum();
         tracing::info!(
-            "server: received upload '{}' ({} bytes): {:?}...",
+            "server: received upload '{}' ({total} bytes in {} buffer(s)): {:?}...",
             req.name,
             data.len(),
-            &data[..data.len().min(16)]
+            &data[0][..data[0].len().min(16)]
         );
-        Ok(data.len())
+        Ok(total)
     }
 
-    async fn download(&self, ctx: &Context, req: &DownloadReq) -> Result<WithBuffer<u64>> {
+    async fn download(&self, ctx: &Context, req: &DownloadReq) -> Result<WithBuffers<u64>> {
         // Fill a pool buffer and set its logical length.
         let mut buf = ctx
             .state
@@ -84,11 +92,12 @@ impl BlobService for BlobServiceImpl {
         }
         buf.set_len(req.len);
 
-        // Transfer first: the push happens right here in the handler.
+        // Transfer first: the write happens right here in the handler,
+        // into the buffers the client pinned for this request.
         let t0 = std::time::Instant::now();
-        let sent = ctx.remote_write(buf).await?;
+        let sent = ctx.remote_write_all(vec![buf]).await?;
         // The response value is decided after the transfer completed —
-        // here it carries the observed push latency back to the client.
+        // here it carries the observed write latency back to the client.
         let push_micros = t0.elapsed().as_micros() as u64;
         Ok(sent.reply(push_micros))
     }
@@ -127,39 +136,50 @@ async fn main() {
         ..Default::default()
     };
 
-    // Upload: fill a registered buffer, mark the valid length, attach it.
+    // Upload: fill two registered buffers, mark the valid lengths, attach
+    // them — together they form one logical read space.
     let payload = b"hello remote memory!";
-    let mut buf = ctx.state.buffer_pool.allocate(1 << 20).unwrap();
-    buf[..payload.len()].copy_from_slice(payload);
-    buf.set_len(payload.len());
+    let (a, b) = payload.split_at(8);
+    let mut buf_a = ctx.state.buffer_pool.allocate(1 << 20).unwrap();
+    buf_a[..a.len()].copy_from_slice(a);
+    buf_a.set_len(a.len());
+    let mut buf_b = ctx.state.buffer_pool.allocate(1 << 20).unwrap();
+    buf_b[..b.len()].copy_from_slice(b);
+    buf_b.set_len(b.len());
+    let read_bufs = [buf_a, buf_b];
 
     let req = UploadReq {
         name: "greeting".into(),
     };
     let uploaded = client
-        .with_read_buffer(&buf)
+        .with_read_buffers(&read_bufs)
         .upload(&ctx, &req)
         .await
         .unwrap();
-    tracing::info!("client: server read {uploaded} bytes from our buffer");
+    tracing::info!("client: server read {uploaded} bytes from our buffers");
     assert_eq!(uploaded, payload.len());
 
-    // Download: the ResultWithBuffer return type means the buffer arrives
-    // as part of the method's return value — together with a response
-    // computed after the transfer (the server-side push latency).
+    // Download: pre-provide the pinned destination buffer; the
+    // ResultWithBuffers return type means every attached buffer comes
+    // back through the method's return value — together with a response
+    // computed after the transfer (the server-side write latency).
     let want = 4096;
+    let mut dst = ctx.state.buffer_pool.allocate(want).unwrap();
+    dst.set_len(want);
     let (push_micros, received) = client
+        .with_write_buffers(vec![dst])
         .download(&ctx, &DownloadReq { len: want })
         .await
         .unwrap()
         .into_parts();
+    let received_len: usize = received.iter().map(|b| b.len()).sum();
     tracing::info!(
-        "client: received {} bytes from server (server-side push took {push_micros}µs)",
-        received.len()
+        "client: received {received_len} bytes from server \
+         (server-side write took {push_micros}µs)"
     );
-    assert_eq!(received.len(), want);
+    assert_eq!(received_len, want);
     assert!(
-        received
+        received[0]
             .iter()
             .enumerate()
             .all(|(i, &b)| b == (i % 251) as u8)
