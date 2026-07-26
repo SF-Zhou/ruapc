@@ -279,10 +279,18 @@ pub struct RdmaSocket {
     pub(crate) path: RdmaPathInfo,
     /// Process-wide unique connection id (see [`crate::task::next_conn_id`]).
     pub(crate) conn_id: u64,
-    /// Bounds in-flight RDMA READ work requests on this connection (the
-    /// send queue is shared with regular sends). Permits are forgotten on
-    /// post and re-added by the poll thread per completion.
-    pub(crate) read_permits: tokio::sync::Semaphore,
+    /// Bounds in-flight RDMA READ work requests per *local NIC*: shared
+    /// by every connection of the pool on this device
+    /// (`rdma.max_inflight_read_wrs`) — the congestion control knob for
+    /// read traffic, covering both server-side `remote_read` and
+    /// client-side `pull`. Permits are forgotten on post and re-added by
+    /// the poll thread per completion.
+    pub(crate) read_permits: Arc<tokio::sync::Semaphore>,
+    /// Per-connection safety cap (`qp.max_send_wr / 2`, not a policy
+    /// knob): the send queue is shared with regular sends, and the
+    /// device-wide read budget landing on a single QP must not overflow
+    /// it. Accounted exactly like `read_permits`.
+    pub(crate) sq_read_permits: tokio::sync::Semaphore,
     /// Software deadline for RDMA READ completions; `None` disables the
     /// timeout. Enforced by the poll thread's periodic sweep, not by
     /// per-operation timers.
@@ -300,7 +308,8 @@ impl RdmaSocket {
         send_window: u32,
         path: RdmaPathInfo,
         read_timeout: Option<Duration>,
-        max_inflight_read_wrs: u32,
+        read_permits: Arc<tokio::sync::Semaphore>,
+        sq_read_cap: u32,
     ) -> Self {
         Self {
             queue_pair,
@@ -312,7 +321,8 @@ impl RdmaSocket {
             max_msg_size,
             path,
             conn_id: crate::task::next_conn_id(),
-            read_permits: tokio::sync::Semaphore::new(max_inflight_read_wrs.max(1) as usize),
+            read_permits,
+            sq_read_permits: tokio::sync::Semaphore::new(sq_read_cap.max(1) as usize),
             read_timeout,
         }
     }
@@ -380,8 +390,20 @@ impl RdmaSocket {
         let mut post_err: Option<Error> = None;
         for read in reads {
             // Bound in-flight READ work requests; permits come back from
-            // the poll thread as completions arrive.
-            let permit = match self.read_permits.acquire().await {
+            // the poll thread as completions arrive. The per-connection
+            // SQ guard is taken first so a batch never sits on scarce
+            // per-NIC permits while blocked on its own send queue.
+            let sq_permit = match self.sq_read_permits.acquire().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    post_err = Some(Error::new(
+                        ErrorKind::RdmaSendFailed,
+                        "RDMA read permits closed".into(),
+                    ));
+                    break;
+                }
+            };
+            let device_permit = match self.read_permits.acquire().await {
                 Ok(permit) => permit,
                 Err(_) => {
                     post_err = Some(Error::new(
@@ -406,12 +428,14 @@ impl RdmaSocket {
             );
             match result {
                 Ok(_) => {
-                    // Released by the poll thread on completion.
-                    permit.forget();
+                    // Both released by the poll thread on completion.
+                    sq_permit.forget();
+                    device_permit.forget();
                     posted += 1;
                 }
                 Err(e) => {
-                    drop(permit);
+                    drop(device_permit);
+                    drop(sq_permit);
                     post_err = Some(e.into());
                     break;
                 }

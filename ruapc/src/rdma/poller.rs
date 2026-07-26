@@ -993,8 +993,10 @@ impl ConnState {
             // no flow control accounting.
             WRType::Read => {
                 debug_assert!(buffer.is_none(), "read WRs store no slot buffer");
-                // Return the in-flight-read permit taken at post time.
+                // Return the in-flight-read permits (per-NIC + per-SQ)
+                // taken at post time.
                 self.socket.read_permits.add_permits(1);
+                self.socket.sq_read_permits.add_permits(1);
                 if let Some((_, batch)) = self.socket.rdma_completions.remove(&wc.wr_id) {
                     batch.complete_one(wc.succ());
                 }
