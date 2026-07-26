@@ -87,11 +87,14 @@ pub struct SocketPoolConfig {
 
 /// RDMA socket pool configuration.
 #[cfg(feature = "rdma")]
+#[serde_inline_default]
 #[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone)]
 pub struct RdmaSocketPoolConfig {
     /// Requested Queue Pair capabilities for newly created RDMA connections.
+    #[serde(default)]
     pub qp: RdmaQueuePairConfig,
     /// Completion Queue length requested for each RDMA connection.
+    #[serde_inline_default(128u32)]
     pub cq_len: u32,
     /// Number of receive buffers to pre-post for each RDMA connection
     /// (negotiated to the minimum of both sides). The send window is half
@@ -105,32 +108,34 @@ pub struct RdmaSocketPoolConfig {
     /// beyond `recv_queue_len / 2` in-flight sends). Raise it for
     /// pipelines of large unaggregatable messages (up to `max_msg_size`
     /// each), where more in-flight WRs are needed to fill the wire.
+    #[serde_inline_default(8u32)]
     pub recv_queue_len: u32,
     /// P_Key table index used when moving the Queue Pair to INIT.
+    #[serde_inline_default(0u16)]
     pub pkey_index: u16,
     /// Selective signaling interval for data sends (local behavior, not
     /// negotiated). With interval `N > 1` only every Nth data send requests
     /// a completion; buffers of unsignaled sends are reclaimed when a later
     /// signaled completion arrives (RC SQs complete in order). `1` signals
     /// every send. Clamped to `max_send_wr / 2`.
-    #[serde(default = "default_send_signal_interval")]
+    #[serde_inline_default(8u32)]
     pub send_signal_interval: u32,
     /// Capacity (entries) of the per-device shared completion queue used by
     /// the dedicated poll thread. Bounds the number of concurrent
     /// connections per device: the sum of every connection's queue depths
     /// must fit.
-    #[serde(default = "default_device_cq_len")]
+    #[serde_inline_default(65536u32)]
     pub device_cq_len: u32,
     /// Busy-poll window of the per-device poll thread, in microseconds:
     /// after the last completion the thread keeps polling for this long
     /// before arming the CQ interrupt and sleeping. `0` disables spinning
     /// (pure event-driven mode).
-    #[serde(default = "default_poll_spin_us")]
+    #[serde_inline_default(50u64)]
     pub poll_spin_us: u64,
     /// Maximum serialized message size for RDMA sends; also the size of
     /// each pre-posted receive buffer (negotiated to the minimum of both
     /// sides). Larger payloads must use the remote read/write paths.
-    #[serde(default = "default_max_msg_size")]
+    #[serde_inline_default(256 * 1024u32)]
     pub max_msg_size: u32,
     /// Whether to aggregate sends: under backlog, multiple small
     /// window-blocked sends are packed into a single RDMA send, which
@@ -138,13 +143,13 @@ pub struct RdmaSocketPoolConfig {
     /// on the peer. Send-side toggle only; every RDMA send is a sequence
     /// of length-prefixed frames, so receivers walk the same parse loop
     /// either way.
-    #[serde(default = "default_msg_aggregation")]
+    #[serde_inline_default(true)]
     pub msg_aggregation: bool,
     /// Number of (shared CQ + poll thread) shards per RDMA device.
     /// Connections are assigned round-robin, spreading completion
     /// processing across cores. Each shard burns up to one core while
     /// spinning.
-    #[serde(default = "default_poll_threads_per_device")]
+    #[serde_inline_default(1u32)]
     pub poll_threads_per_device: u32,
     /// Number of long-lived dispatch worker tasks shared by all RDMA poll
     /// threads of this pool, each owning one SPSC queue. Received buffers
@@ -154,13 +159,13 @@ pub struct RdmaSocketPoolConfig {
     /// each to the router (requests) or waiter (responses). When every
     /// worker is saturated the poll thread falls back to spawning a
     /// one-shot task per batch, so it never blocks.
-    #[serde(default = "default_dispatch_workers")]
+    #[serde_inline_default(32u32)]
     pub dispatch_workers: u32,
     /// Number of RDMA connections (QPs) to establish per peer. Requests
     /// are striped round-robin across them; combined with poll thread
     /// shards this scales single-peer throughput across cores. RPC
     /// messages carry no cross-message ordering guarantees.
-    #[serde(default = "default_connections_per_peer")]
+    #[serde_inline_default(1u32)]
     pub connections_per_peer: u32,
     /// If non-empty, only RDMA devices whose name is listed are used.
     /// Useful when a host has NICs without connectivity to the target
@@ -177,16 +182,16 @@ pub struct RdmaSocketPoolConfig {
     /// and migrates at most one connection per tick towards less loaded
     /// NIC pairs (make-before-break). The interval is jittered by ±50%
     /// per process. `0` disables maintenance entirely.
-    #[serde(default = "default_maintenance_interval_ms")]
+    #[serde_inline_default(5000u64)]
     pub maintenance_interval_ms: u64,
     /// Minimum connection-count improvement required before a connection
     /// is migrated to another NIC pair; provides hysteresis on top of the
     /// self-excluding score model. Values below 1 are treated as 1.
-    #[serde(default = "default_rebalance_threshold")]
+    #[serde_inline_default(2u32)]
     pub rebalance_threshold: u32,
     /// Grace period (milliseconds) a migrated-away connection stays alive
     /// after leaving the rotation, so its in-flight responses can arrive.
-    #[serde(default = "default_drain_timeout_ms")]
+    #[serde_inline_default(10_000u64)]
     pub drain_timeout_ms: u64,
     /// Software timeout (milliseconds) for RDMA READ completions,
     /// enforced by the poll thread's periodic sweep (no per-operation
@@ -194,7 +199,7 @@ pub struct RdmaSocketPoolConfig {
     /// connection to the error state, so the NIC flushes the outstanding
     /// work requests and their buffers are reclaimed safely. `0`
     /// disables the timeout. Default is 10s.
-    #[serde(default = "default_read_timeout_ms")]
+    #[serde_inline_default(10_000u64)]
     pub read_timeout_ms: u64,
     /// Maximum in-flight RDMA READ work requests per *local NIC*
     /// (device), shared by every connection on it — the primary
@@ -207,99 +212,16 @@ pub struct RdmaSocketPoolConfig {
     /// `qp.max_send_wr / 2` (not configurable): the send queue is shared
     /// with regular sends, and a device-wide budget landing on a single
     /// QP must not overflow it.
-    #[serde(default = "default_max_inflight_read_wrs")]
+    #[serde_inline_default(32u32)]
     pub max_inflight_read_wrs: u32,
-}
-
-#[cfg(feature = "rdma")]
-fn default_send_signal_interval() -> u32 {
-    8
-}
-
-#[cfg(feature = "rdma")]
-fn default_device_cq_len() -> u32 {
-    65536
-}
-
-#[cfg(feature = "rdma")]
-fn default_poll_spin_us() -> u64 {
-    50
-}
-
-#[cfg(feature = "rdma")]
-fn default_max_msg_size() -> u32 {
-    256 * 1024
-}
-
-#[cfg(feature = "rdma")]
-fn default_msg_aggregation() -> bool {
-    true
-}
-
-#[cfg(feature = "rdma")]
-fn default_poll_threads_per_device() -> u32 {
-    1
-}
-
-#[cfg(feature = "rdma")]
-fn default_dispatch_workers() -> u32 {
-    32
-}
-
-#[cfg(feature = "rdma")]
-fn default_connections_per_peer() -> u32 {
-    1
-}
-
-#[cfg(feature = "rdma")]
-fn default_maintenance_interval_ms() -> u64 {
-    5000
-}
-
-#[cfg(feature = "rdma")]
-fn default_rebalance_threshold() -> u32 {
-    2
-}
-
-#[cfg(feature = "rdma")]
-fn default_drain_timeout_ms() -> u64 {
-    10_000
-}
-
-#[cfg(feature = "rdma")]
-fn default_read_timeout_ms() -> u64 {
-    10_000
-}
-
-#[cfg(feature = "rdma")]
-fn default_max_inflight_read_wrs() -> u32 {
-    32
 }
 
 #[cfg(feature = "rdma")]
 impl Default for RdmaSocketPoolConfig {
     fn default() -> Self {
-        Self {
-            qp: RdmaQueuePairConfig::default(),
-            cq_len: 128,
-            recv_queue_len: 8,
-            pkey_index: 0,
-            send_signal_interval: default_send_signal_interval(),
-            device_cq_len: default_device_cq_len(),
-            poll_spin_us: default_poll_spin_us(),
-            max_msg_size: default_max_msg_size(),
-            msg_aggregation: default_msg_aggregation(),
-            poll_threads_per_device: default_poll_threads_per_device(),
-            dispatch_workers: default_dispatch_workers(),
-            connections_per_peer: default_connections_per_peer(),
-            device_filter: Vec::new(),
-            remote_device_filter: Vec::new(),
-            maintenance_interval_ms: default_maintenance_interval_ms(),
-            rebalance_threshold: default_rebalance_threshold(),
-            drain_timeout_ms: default_drain_timeout_ms(),
-            read_timeout_ms: default_read_timeout_ms(),
-            max_inflight_read_wrs: default_max_inflight_read_wrs(),
-        }
+        // Every field carries an inline serde default, so the canonical
+        // default is "deserialize an empty object" — one source of truth.
+        serde_json::from_value(serde_json::Value::Object(serde_json::Map::default())).unwrap()
     }
 }
 
@@ -604,6 +526,27 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let recovered: SocketPoolConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(recovered, config);
+    }
+
+    /// Every RDMA config field carries an inline serde default, so a
+    /// partial `rdma` object deserializes with the remaining fields at
+    /// their documented defaults (also the source of `Default`).
+    #[cfg(feature = "rdma")]
+    #[test]
+    fn test_rdma_config_partial_object_fills_defaults() {
+        let config: SocketPoolConfig =
+            serde_json::from_str(r#"{"socket_type":"RDMA","rdma":{"recv_queue_len":16}}"#).unwrap();
+        assert_eq!(config.rdma.recv_queue_len, 16);
+        assert_eq!(config.rdma.qp, RdmaQueuePairConfig::default());
+        assert_eq!(config.rdma.cq_len, 128);
+        assert_eq!(config.rdma.pkey_index, 0);
+        assert_eq!(config.rdma.max_msg_size, 256 * 1024);
+        assert_eq!(config.rdma.dispatch_workers, 32);
+        assert_eq!(config.rdma.read_timeout_ms, 10_000);
+        assert_eq!(config.rdma.max_inflight_read_wrs, 32);
+        // `Default` is exactly the all-defaults deserialization.
+        let default: RdmaSocketPoolConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(default, RdmaSocketPoolConfig::default());
     }
 
     #[test]

@@ -23,7 +23,7 @@ A high-performance Rust RPC library that supports multiple transport protocols (
 
 - **Multiple Transport Protocols**: TCP, WebSocket, HTTP/1.1 and HTTP/2 (h2c), RDMA (optional), and a unified protocol that supports all simultaneously
 - **Reverse RPC**: Server can call back into client services over established HTTP/2 or WebSocket connections
-- **Remote Read/Write**: Server-side access to client memory via registered buffer pool ([ruapc-bufpool](ruapc-bufpool/)). Multiple buffers form one *logical contiguous space* on each side: clients attach a read space (`with_read_buffers`) and/or a pinned write space (`with_write_buffers`); servers issue vectored `CopyOp` batches through `ctx.remote_read` / `ctx.remote_write` (fragmented into concurrent one-sided RDMA READs with scatter-gather lists, or reverse-RPC copies over TCP). `ctx.remote_write` returns a `SentBuffers` witness, then `sent.reply(rsp)` builds the `WithBuffers<T>` return value carrying every client buffer back — the transfer is observable (measurable latency, retryable errors) and buffer lifetime is anchored by client-side pinning, request-liveness (msgid) validation, and a software RDMA READ timeout (default 10s) that flushes stuck NICs without ever recycling in-flight memory
+- **Remote Read/Write**: Bulk data moves out-of-band through registered buffers ([ruapc-bufpool](ruapc-bufpool/)) instead of inline RPC payloads — one-sided RDMA READs on RDMA, transparent reverse-RPC copies on TCP/WS/HTTP. Clients attach buffers as logical contiguous spaces; servers transfer whole spaces or vectored `CopyOp` batches with offsets. The typed `Result<WithBuffers<T>, E>` contract and client-side buffer pinning make transfers impossible to forget and memory-safe even across timeouts
 - **Multiple Serialization Formats**: JSON (default) and MessagePack support
 - **OpenAPI Integration**: Automatic OpenAPI 3.0 specification generation with JSON Schema support
 - **Built-in Documentation**: RapiDoc integration for interactive API documentation
@@ -148,10 +148,49 @@ open http://0.0.0.0:8000/rapidoc
 
 ### Remote Read/Write
 
+Bulk data travels out-of-band through registered buffers, in both
+directions and over any transport. The client attaches buffers to a call;
+the server reads or writes them by offset:
+
+```rust
+use ruapc::*;
+
+#[ruapc::service]
+trait BlobService {
+    /// Reads the client's buffers, writes the result back into the
+    /// client's pre-pinned buffers, and replies with the byte count.
+    async fn transform(&self, ctx: &Context, req: &()) -> Result<WithBuffers<u64>>;
+}
+
+// ---- Server handler -----------------------------------------------------
+impl BlobService for BlobImpl {
+    async fn transform(&self, ctx: &Context, _req: &()) -> Result<WithBuffers<u64>> {
+        // Pull the client's read space (RDMA READ, or reverse-RPC on TCP).
+        let data = ctx.remote_read_all().await?;
+        let out = process(data, &ctx.state.buffer_pool);
+
+        // Write into the client's pinned buffers; vectored ops with
+        // explicit offsets are available via ctx.remote_write(&ops, bufs).
+        let total: u64 = out.iter().map(|b| b.len() as u64).sum();
+        let sent = ctx.remote_write_all(out).await?;
+        Ok(sent.reply(total)) // response is built *after* the transfer
+    }
+}
+
+// ---- Client --------------------------------------------------------------
+let src = [buf_a, buf_b];              // read space: borrowed for the call
+let dst = vec![out_buf];               // write space: pinned until it resolves
+let (total, buffers) = client
+    .with_read_buffers(&src)
+    .with_write_buffers(dst)
+    .transform(&ctx, &())
+    .await?
+    .into_parts();                     // every attached write buffer returns
+```
+
+Run the self-contained demo over any transport:
+
 ```bash
-# Self-contained demo: client uploads registered buffers (server pulls them
-# via remote_read_all) and downloads into pre-pinned buffers (typed
-# Result<WithBuffers<T>> contract). Works over any transport.
 cargo run --bin remote_memory -- --socket-type tcp
 cargo run --bin remote_memory --features rdma -- --socket-type rdma
 ```
