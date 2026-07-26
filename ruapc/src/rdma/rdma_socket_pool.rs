@@ -107,6 +107,12 @@ pub struct RdmaSocketPool {
     /// indexed like `devices.rdma_devices()`. Drives least-connections
     /// placement and is advertised to peers via `RdmaInfo`.
     conn_counts: Arc<Vec<AtomicUsize>>,
+    /// Per local RDMA device budget of in-flight RDMA READ work requests
+    /// (`rdma.max_inflight_read_wrs`), indexed like
+    /// `devices.rdma_devices()` and shared by every connection on the
+    /// device — the congestion control for read traffic (server-side
+    /// `remote_read` and client-side `pull` alike).
+    read_permits: Vec<Arc<tokio::sync::Semaphore>>,
     /// Inbound (accepted) connections, for path reporting and the
     /// port-down watchdog; dead entries are pruned opportunistically.
     inbound: std::sync::Mutex<Vec<Weak<RdmaSocket>>>,
@@ -295,6 +301,13 @@ impl RdmaSocketPool {
                     .map(|_| AtomicUsize::new(0))
                     .collect(),
             ),
+            read_permits: (0..devices.rdma_devices().len())
+                .map(|_| {
+                    Arc::new(tokio::sync::Semaphore::new(
+                        config.max_inflight_read_wrs.max(1) as usize,
+                    ))
+                })
+                .collect(),
             inbound: std::sync::Mutex::new(Vec::new()),
             path_blacklist: std::sync::Mutex::new(HashMap::default()),
             buffer_pool,
@@ -501,15 +514,22 @@ impl RdmaSocketPool {
         let send_window = (config.recv_queue_len / 2).max(1);
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Buffer>(1024);
-        // Software timeout for RDMA READ completions (0 disables) and the
-        // per-connection in-flight READ cap (the SQ is shared with sends,
-        // so leave at least half of it to them).
+        // Software timeout for RDMA READ completions (0 disables).
         let read_timeout = (self.config.read_timeout_ms > 0)
             .then(|| Duration::from_millis(self.config.read_timeout_ms));
-        let max_inflight_read_wrs = self
-            .config
-            .max_inflight_read_wrs
-            .clamp(1, (config.qp.max_send_wr / 2).max(1));
+        // In-flight READ budget: shared per local NIC (congestion
+        // control), plus a per-connection SQ-overflow guard (the send
+        // queue is shared with regular sends, so leave half to them).
+        let read_permits = self
+            .read_permits
+            .get(device_index)
+            .cloned()
+            .unwrap_or_else(|| {
+                Arc::new(tokio::sync::Semaphore::new(
+                    self.config.max_inflight_read_wrs.max(1) as usize,
+                ))
+            });
+        let sq_read_cap = (config.qp.max_send_wr / 2).max(1);
         let socket = Arc::new(RdmaSocket::new(
             queue_pair,
             self.buffer_pool.clone(),
@@ -519,7 +539,8 @@ impl RdmaSocketPool {
             send_window,
             path,
             read_timeout,
-            max_inflight_read_wrs,
+            read_permits,
+            sq_read_cap,
         ));
 
         // Pre-post receive buffers *before* the remote can send: the

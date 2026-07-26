@@ -196,10 +196,17 @@ pub struct RdmaSocketPoolConfig {
     /// disables the timeout. Default is 10s.
     #[serde(default = "default_read_timeout_ms")]
     pub read_timeout_ms: u64,
-    /// Maximum in-flight RDMA READ work requests per connection (the send
-    /// queue is shared with regular sends; clamped to `qp.max_send_wr /
-    /// 2` at connection setup). Excess reads of a batch queue in
-    /// software. Default is 16.
+    /// Maximum in-flight RDMA READ work requests per *local NIC*
+    /// (device), shared by every connection on it — the primary
+    /// congestion control for read-heavy traffic. Both server-side
+    /// `remote_read` and client-side `pull` (the read half of
+    /// `remote_write`) draw from the same per-device budget; excess
+    /// reads queue in software (FIFO). Default is 32.
+    ///
+    /// Independently, each connection caps its own in-flight reads at
+    /// `qp.max_send_wr / 2` (not configurable): the send queue is shared
+    /// with regular sends, and a device-wide budget landing on a single
+    /// QP must not overflow it.
     #[serde(default = "default_max_inflight_read_wrs")]
     pub max_inflight_read_wrs: u32,
 }
@@ -266,7 +273,7 @@ fn default_read_timeout_ms() -> u64 {
 
 #[cfg(feature = "rdma")]
 fn default_max_inflight_read_wrs() -> u32 {
-    16
+    32
 }
 
 #[cfg(feature = "rdma")]

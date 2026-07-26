@@ -445,9 +445,13 @@ let (rsp, buffers) = client
    **先按 remote region 边界切**（一个 READ WR 的远端必须连续），每个
    remote 连续块内 local 侧跨段时生成 SG list（上限 = 设备
    `max_send_sge`，超出再拆 WR）——多 buffer 对上层透明
-2. 并发 post 全部 WR（每连接 `rdma.max_inflight_read_wrs` 信号量限流，
-   permit 由 poll 线程随 completion 归还）；一批 WR 共享一个
-   `ReadBatch`（原子计数），最后一个 WC 到达时唤醒等待方
+2. 并发 post 全部 WR。在飞 READ 数由**网卡（本地设备）级**信号量统一
+   限流（`rdma.max_inflight_read_wrs`，默认 32）：同一 NIC 上所有连接、
+   Server 侧 `remote_read` 与 Client 侧 `pull` 共享同一预算，这是读
+   流量的拥塞控制主旋钮；permit 由 poll 线程随 completion 归还（FIFO
+   公平）。此外每连接还有 `qp.max_send_wr / 2` 的内部上限（非策略配置，
+   仅防止设备级预算集中到单个 QP 时打爆其 send queue）。一批 WR 共享
+   一个 `ReadBatch`（原子计数），最后一个 WC 到达时唤醒等待方
 3. NIC 层并发度由握手协商的 `max_rd_atomic`/`max_dest_rd_atomic` 决定：
    双方在 Endpoint 交换中携带设备能力（`rd_atomic_cap`，上限 16），
    两侧都取 min，天然满足 RC 的 initiator ≤ responder 约束

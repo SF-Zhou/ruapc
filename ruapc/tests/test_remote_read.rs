@@ -366,6 +366,25 @@ async fn test_rdma_read_vectored_ops() {
     .await;
 }
 
+/// More work requests than the per-NIC in-flight READ budget
+/// (`rdma.max_inflight_read_wrs`, default 32): 48 regions produce 48 READ
+/// WRs, so the batch must queue on the device semaphore and complete as
+/// permits cycle back through the poll thread.
+#[cfg(feature = "rdma")]
+#[tokio::test]
+async fn test_rdma_read_exceeds_device_read_budget() {
+    run_test(TestCase {
+        data: &[0x7e; 48 * 1024],
+        splits: &[1024; 48],
+        delay_ms: 0,
+        client_timeout: Duration::from_secs(5),
+        socket_type: SocketType::RDMA,
+        method: Method::All,
+        expect: Expected::Ok,
+    })
+    .await;
+}
+
 #[cfg(feature = "rdma")]
 #[tokio::test]
 async fn test_rdma_read_liveness_timeout() {
