@@ -1,12 +1,14 @@
 use ruapc_rdma::{LinkLayer, ibv_gid, ibv_mtu};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_inline_default::serde_inline_default;
 
 use crate::RdmaQueuePairConfig;
 
 /// RDMA connection endpoint information.
 ///
 /// Contains the QP and address metadata needed to move a queue pair to RTR/RTS.
+#[serde_inline_default]
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy)]
 pub struct Endpoint {
     /// Queue pair number.
@@ -34,14 +36,10 @@ pub struct Endpoint {
     /// sides can program `max_rd_atomic` / `max_dest_rd_atomic` as the
     /// minimum of the two caps (they compute identical values, which the
     /// RC protocol requires). Higher values let batched `remote_read`
-    /// work requests proceed in parallel inside the NIC.
-    #[serde(default = "default_rd_atomic")]
+    /// work requests proceed in parallel inside the NIC. Peers that do
+    /// not advertise a cap default to the conservative 1.
+    #[serde_inline_default(1u8)]
     pub rd_atomic_cap: u8,
-}
-
-/// Conservative fallback used when a peer does not advertise a cap.
-pub(crate) fn default_rd_atomic() -> u8 {
-    1
 }
 
 /// Server-side RDMA device/port/GID selected by the client.
