@@ -1,6 +1,9 @@
 use clap::Parser;
 use ruapc::*;
-use ruapc_demo::{EchoService, GreetService, Request};
+use ruapc_demo::{
+    EchoService, GreetService, MemBenchService, ReadCrcReq, Request, WriteCrcReq, crc32c_of,
+    fill_pattern,
+};
 use std::{
     sync::{
         Arc,
@@ -8,6 +11,17 @@ use std::{
     },
     time::Duration,
 };
+
+/// Which RPC to exercise (single-shot, stress, and bench modes).
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rpc {
+    /// Plain payload echo.
+    Echo,
+    /// Server remote-reads the client's buffer and returns its CRC32C.
+    Read,
+    /// Server remote-writes into the client's buffer and returns the CRC32C.
+    Write,
+}
 
 #[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
@@ -48,6 +62,16 @@ pub struct Args {
     /// Request payload size in bytes (bench mode).
     #[arg(long, default_value = "1024")]
     pub payload_size: usize,
+
+    /// RPC to exercise: echo, read (server remote-reads our buffer and
+    /// returns its CRC32C), write (server remote-writes our buffer and
+    /// returns the CRC32C). read/write verify the checksum on every call.
+    #[arg(long, value_enum, default_value_t = Rpc::Echo)]
+    pub rpc: Rpc,
+
+    /// Buffer length in bytes for --rpc read/write (per coroutine, max 64 MiB).
+    #[arg(long, default_value = "1048576")]
+    pub buffer_size: usize,
 
     /// Warmup duration in seconds before recording latency (bench mode).
     #[arg(long, default_value = "3")]
@@ -113,6 +137,120 @@ fn socket_pool_config(args: &Args) -> SocketPoolConfig {
     config
 }
 
+/// Per-coroutine benchmark operation: owns the buffers it needs and issues
+/// one verified RPC per `call`.
+enum BenchOp {
+    Echo(Request),
+    Read {
+        bufs: Vec<Buffer>,
+        expected_crc: u32,
+    },
+    Write {
+        bufs: Option<Vec<Buffer>>,
+        len: usize,
+    },
+}
+
+impl BenchOp {
+    /// Allocates and fills the buffers up front (outside the timed loop) so
+    /// pool growth / device registration doesn't pollute latency numbers.
+    async fn create(args: &Args, ctx: &Context, payload: Request, seed: u64) -> Self {
+        match args.rpc {
+            Rpc::Echo => BenchOp::Echo(payload),
+            Rpc::Read => {
+                let len = args.buffer_size;
+                let mut buf = ctx
+                    .state
+                    .buffer_pool
+                    .async_allocate(len)
+                    .await
+                    .expect("failed to allocate read buffer");
+                fill_pattern(&mut buf[..len], seed);
+                buf.set_len(len);
+                let expected_crc = crc32c_of([&buf]);
+                BenchOp::Read {
+                    bufs: vec![buf],
+                    expected_crc,
+                }
+            }
+            Rpc::Write => {
+                let len = args.buffer_size;
+                let mut buf = ctx
+                    .state
+                    .buffer_pool
+                    .async_allocate(len)
+                    .await
+                    .expect("failed to allocate write buffer");
+                buf.set_len(len);
+                BenchOp::Write {
+                    bufs: Some(vec![buf]),
+                    len,
+                }
+            }
+        }
+    }
+
+    async fn call(&mut self, client: &Client, ctx: &Context) -> Result<()> {
+        match self {
+            BenchOp::Echo(payload) => {
+                client.echo(ctx, payload).await?;
+                Ok(())
+            }
+            BenchOp::Read { bufs, expected_crc } => {
+                let crc = client
+                    .with_read_buffers(bufs)
+                    .read_crc(ctx, &ReadCrcReq {})
+                    .await?;
+                if crc != *expected_crc {
+                    return Err(Error::new(
+                        ErrorKind::InvalidArgument,
+                        format!("crc32c mismatch: got {crc:#010x}, expect {expected_crc:#010x}"),
+                    ));
+                }
+                Ok(())
+            }
+            BenchOp::Write { bufs, len } => {
+                // Replace the buffers if a previous failed call could not
+                // recover them (its transfer may still be in flight).
+                let dst = match bufs.take() {
+                    Some(b) => b,
+                    None => {
+                        let mut b = ctx
+                            .state
+                            .buffer_pool
+                            .async_allocate(*len)
+                            .await
+                            .map_err(|e| Error::new(ErrorKind::InvalidArgument, e.to_string()))?;
+                        b.set_len(*len);
+                        vec![b]
+                    }
+                };
+                let wrapper = client.with_write_buffers(dst);
+                match wrapper.write_crc(ctx, &WriteCrcReq { len: *len }).await {
+                    Ok(rsp) => {
+                        let (expected_crc, returned) = rsp.into_parts();
+                        let crc = crc32c_of(&returned);
+                        *bufs = Some(returned);
+                        if crc != expected_crc {
+                            return Err(Error::new(
+                                ErrorKind::InvalidArgument,
+                                format!(
+                                    "crc32c mismatch: got {crc:#010x}, expect {expected_crc:#010x}"
+                                ),
+                            ));
+                        }
+                        Ok(())
+                    }
+                    Err(e) => {
+                        *bufs = wrapper.take_write_buffers();
+                        Err(e)
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct State {
     total: AtomicUsize,
@@ -126,20 +264,21 @@ async fn stress_test(args: Args) {
     let ctx = Context::create(&socket_pool_config(&args))
         .unwrap()
         .with_addr(args.addr);
-    for _ in 0..args.coroutines {
-        let value = Request(args.value.clone());
+    for i in 0..args.coroutines {
         let state = state.clone();
         let ctx = ctx.clone();
+        let args = args.clone();
         tasks.push(tokio::spawn(async move {
+            let client = Client {
+                timeout: Duration::from_secs(5),
+                use_msgpack: args.use_msgpack,
+                socket_type: Some(args.socket_type),
+                ..Default::default()
+            };
+            let mut op = BenchOp::create(&args, &ctx, Request(args.value.clone()), i as u64).await;
             while start_time.elapsed().as_secs() < args.secs {
-                let client = Client {
-                    timeout: Duration::from_secs(5),
-                    use_msgpack: args.use_msgpack,
-                    socket_type: Some(args.socket_type),
-                    ..Default::default()
-                };
                 for _ in 0..256 {
-                    let result = client.echo(&ctx, &value).await;
+                    let result = op.call(&client, &ctx).await;
                     state.total.fetch_add(1, Ordering::AcqRel);
                     if result.is_err() {
                         state.fails.fetch_add(1, Ordering::AcqRel);
@@ -180,7 +319,7 @@ async fn bench_test(args: Args) {
     let start = std::time::Instant::now();
 
     let mut tasks = Vec::with_capacity(args.coroutines);
-    for _ in 0..args.coroutines {
+    for i in 0..args.coroutines {
         let ctx = ctx.clone();
         let payload = payload.clone();
         let args = args.clone();
@@ -194,6 +333,7 @@ async fn bench_test(args: Args) {
                 socket_type: Some(args.socket_type),
                 ..Default::default()
             };
+            let mut op = BenchOp::create(&args, &ctx, payload, i as u64).await;
             let mut fails = 0u64;
             loop {
                 let elapsed = start.elapsed();
@@ -201,7 +341,7 @@ async fn bench_test(args: Args) {
                     break;
                 }
                 let t = std::time::Instant::now();
-                let result = client.echo(&ctx, &payload).await;
+                let result = op.call(&client, &ctx).await;
                 let nanos = t.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
                 if result.is_err() {
                     fails += 1;
@@ -227,19 +367,31 @@ async fn bench_test(args: Args) {
     let measured_secs = (args.secs - args.warmup_secs) as f64;
     let p = |q: f64| merged.value_at_quantile(q) as f64 / 1_000.0;
     tracing::info!(
-        "bench: socket_type={:?} payload={}B coroutines={} duration={}s (warmup {}s)",
+        "bench: socket_type={:?} rpc={:?} payload={}B buffer={}B coroutines={} duration={}s (warmup {}s)",
         args.socket_type,
+        args.rpc,
         args.payload_size,
+        args.buffer_size,
         args.coroutines,
         args.secs,
         args.warmup_secs,
     );
-    tracing::info!(
-        "requests: {} ok, {} fails, {:.0} req/s",
-        merged.len(),
-        fails,
-        merged.len() as f64 / measured_secs,
-    );
+    let req_per_sec = merged.len() as f64 / measured_secs;
+    match args.rpc {
+        Rpc::Echo => tracing::info!(
+            "requests: {} ok, {} fails, {:.0} req/s",
+            merged.len(),
+            fails,
+            req_per_sec,
+        ),
+        Rpc::Read | Rpc::Write => tracing::info!(
+            "requests: {} ok, {} fails, {:.0} req/s, {:.1} MiB/s",
+            merged.len(),
+            fails,
+            req_per_sec,
+            req_per_sec * args.buffer_size as f64 / (1024.0 * 1024.0),
+        ),
+    }
     tracing::info!(
         "latency(µs): mean={:.1} min={:.1} p50={:.1} p90={:.1} p99={:.1} p99.9={:.1} p99.99={:.1} max={:.1}",
         merged.mean() / 1_000.0,
@@ -289,10 +441,25 @@ async fn async_main(args: Args) {
             socket_type: Some(args.socket_type),
             ..Default::default()
         };
-        let rsp = client.echo(&ctx, &Request(args.value.clone())).await;
-        tracing::info!("echo rsp: {:?}", rsp);
+        match args.rpc {
+            Rpc::Echo => {
+                let rsp = client.echo(&ctx, &Request(args.value.clone())).await;
+                tracing::info!("echo rsp: {:?}", rsp);
 
-        let rsp = client.greet(&ctx, &Request(args.value.clone())).await;
-        tracing::info!("greet rsp: {:?}", rsp);
+                let rsp = client.greet(&ctx, &Request(args.value.clone())).await;
+                tracing::info!("greet rsp: {:?}", rsp);
+            }
+            Rpc::Read | Rpc::Write => {
+                let mut op = BenchOp::create(&args, &ctx, Request(args.value.clone()), 0).await;
+                match op.call(&client, &ctx).await {
+                    Ok(()) => tracing::info!(
+                        "{:?} of {} bytes: crc32c verified",
+                        args.rpc,
+                        args.buffer_size
+                    ),
+                    Err(e) => tracing::error!("{:?} failed: {e:?}", args.rpc),
+                }
+            }
+        }
     }
 }

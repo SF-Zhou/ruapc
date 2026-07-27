@@ -1,6 +1,11 @@
 use clap::Parser;
-use ruapc::{Context, Result, Router, Server, SocketPoolConfig, SocketType};
-use ruapc_demo::{EchoService, GreetService, Request};
+use ruapc::{
+    Context, Error, ErrorKind, Result, Router, Server, SocketPoolConfig, SocketType, WithBuffers,
+};
+use ruapc_demo::{
+    EchoService, GreetService, MemBenchService, ReadCrcReq, Request, WriteCrcReq, crc32c_of,
+    fill_pattern,
+};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -66,6 +71,31 @@ impl GreetService for DemoImpl {
     }
 }
 
+impl MemBenchService for DemoImpl {
+    async fn read_crc(&self, ctx: &Context, _r: &ReadCrcReq) -> Result<u32> {
+        let data = ctx.remote_read_all().await?;
+        Ok(crc32c_of(&data))
+    }
+
+    async fn write_crc(&self, ctx: &Context, r: &WriteCrcReq) -> Result<WithBuffers<u32>> {
+        if r.len == 0 {
+            return Ok(ctx.sent_nothing().reply(crc32c_of([b"".as_slice()])));
+        }
+        let mut buf = ctx
+            .state
+            .buffer_pool
+            .async_allocate(r.len)
+            .await
+            .map_err(|e| Error::new(ErrorKind::InvalidArgument, e.to_string()))?;
+        let seed = self.idx.fetch_add(1, Ordering::AcqRel);
+        fill_pattern(&mut buf[..r.len], seed);
+        buf.set_len(r.len);
+        let crc = crc32c_of([&buf]);
+        let sent = ctx.remote_write_all(vec![buf]).await?;
+        Ok(sent.reply(crc))
+    }
+}
+
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -93,6 +123,7 @@ async fn async_main(args: Args) {
     let mut router = Router::default();
     EchoService::ruapc_export(demo.clone(), &mut router);
     GreetService::ruapc_export(demo.clone(), &mut router);
+    MemBenchService::ruapc_export(demo.clone(), &mut router);
     #[allow(unused_mut)]
     let mut config = SocketPoolConfig {
         socket_type: args.socket_type,
@@ -115,7 +146,8 @@ async fn async_main(args: Args) {
         "Serving {:?} on {}...",
         [
             <DemoImpl as EchoService>::NAME,
-            <DemoImpl as GreetService>::NAME
+            <DemoImpl as GreetService>::NAME,
+            <DemoImpl as MemBenchService>::NAME
         ],
         addr.to_string()
     );
