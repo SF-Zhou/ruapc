@@ -221,6 +221,7 @@ mod tests {
                 cq_len: 128,
                 recv_queue_len: 64,
                 max_msg_size: 1024 * 1024,
+                traffic_class: 0,
             },
         };
         assert!(pool.rdma_accept(&request, &state).is_err());

@@ -214,6 +214,15 @@ pub struct RdmaSocketPoolConfig {
     /// QP must not overflow it.
     #[serde_inline_default(32u32)]
     pub max_inflight_read_wrs: u32,
+    /// GRH traffic class (RoCE: the DSCP/ECN byte of outgoing RDMA
+    /// packets) for connections *initiated by this pool*. The client
+    /// decides: the value travels in the connect request and the server
+    /// programs the same value into its own address handle, so both
+    /// directions of a connection share one traffic class. Inbound
+    /// connections ignore the local setting. No effect on InfiniBand
+    /// link layers (no GRH). Default is 0.
+    #[serde_inline_default(0u8)]
+    pub traffic_class: u8,
 }
 
 #[cfg(feature = "rdma")]
@@ -544,6 +553,7 @@ mod tests {
         assert_eq!(config.rdma.dispatch_workers, 32);
         assert_eq!(config.rdma.read_timeout_ms, 10_000);
         assert_eq!(config.rdma.max_inflight_read_wrs, 32);
+        assert_eq!(config.rdma.traffic_class, 0);
         // `Default` is exactly the all-defaults deserialization.
         let default: RdmaSocketPoolConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(default, RdmaSocketPoolConfig::default());
@@ -686,6 +696,7 @@ mod tests {
                 cq_len: 128,
                 recv_queue_len: 64,
                 max_msg_size: 1024 * 1024,
+                traffic_class: 0,
             },
         };
         assert!(pool.rdma_accept(&request, &state).is_err());

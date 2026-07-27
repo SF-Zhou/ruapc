@@ -197,6 +197,7 @@ impl SocketPoolTrait for RdmaSocketPool {
             &local_endpoint,
             &request.endpoint,
             self.config.pkey_index,
+            connection_config.traffic_class,
         )?;
 
         let info = device.info();
@@ -801,6 +802,7 @@ impl RdmaSocketPool {
             &local_endpoint,
             &remote_endpoint,
             self.config.pkey_index,
+            connection_config.traffic_class,
         ) {
             // QP setup failures are typically path problems (no route
             // between the selected NIC pair): penalize the pair so
@@ -1149,6 +1151,9 @@ impl RdmaSocketPool {
             cq_len: local.cq_len.min(remote.cq_len),
             recv_queue_len: local.recv_queue_len.min(remote.recv_queue_len),
             max_msg_size: local.max_msg_size.min(remote.max_msg_size),
+            // The connecting side dictates the traffic class; the remote
+            // advertisement is irrelevant here.
+            traffic_class: self.config.traffic_class,
         }
     }
 
@@ -1171,6 +1176,9 @@ impl RdmaSocketPool {
             cq_len: requested.cq_len.min(local.cq_len),
             recv_queue_len: requested.recv_queue_len.min(local.recv_queue_len),
             max_msg_size: requested.max_msg_size.min(local.max_msg_size),
+            // Client-chosen: applied verbatim so both directions of the
+            // connection share one traffic class.
+            traffic_class: requested.traffic_class,
         }
     }
 
@@ -1204,6 +1212,7 @@ impl RdmaSocketPool {
             // Enforce a small floor so a tiny misconfiguration cannot break
             // the RPC control plane.
             max_msg_size: self.config.max_msg_size.max(16 * 1024),
+            traffic_class: self.config.traffic_class,
         }
     }
 
@@ -1297,6 +1306,7 @@ impl RdmaSocketPool {
         local: &Endpoint,
         remote: &Endpoint,
         pkey_index: u16,
+        traffic_class: u8,
     ) -> Result<()> {
         if local.link_layer != remote.link_layer {
             return Err(Error::new(
@@ -1329,6 +1339,7 @@ impl RdmaSocketPool {
             remote.psn,
             rd_atomic,
             rd_atomic,
+            traffic_class,
         )
         .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))
     }
@@ -1807,6 +1818,7 @@ mod path_selection_tests {
             cq_len: 128,
             recv_queue_len: 8,
             max_msg_size: 64 * 1024,
+            traffic_class: 0,
         }
     }
 
@@ -1886,6 +1898,54 @@ mod path_selection_tests {
             .select_candidate(&addr(), &candidates, Some(&missing), &info, &[])
             .unwrap_err();
         assert_eq!(err.kind, ErrorKind::InvalidArgument);
+    }
+
+    /// The connecting client dictates the traffic class (its own config,
+    /// not min'd with the remote advertisement); the accepting server
+    /// applies the client's requested value verbatim.
+    #[tokio::test]
+    async fn test_traffic_class_client_decides_server_obeys() {
+        let devices = crate::rdma::test_utils::make_rdma_devices();
+        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+        let config = RdmaSocketPoolConfig {
+            traffic_class: 96,
+            ..Default::default()
+        };
+        let pool = RdmaSocketPool::new(devices, buffer_pool, config).unwrap();
+        let rdma_devices = pool.devices.rdma_devices();
+        let device = &rdma_devices[0];
+
+        // Client path: local config wins over the remote advertisement.
+        let mut advertised = connection_limits();
+        advertised.traffic_class = 7;
+        let negotiated = pool.negotiate_connection_config(device, &advertised);
+        assert_eq!(negotiated.traffic_class, 96);
+
+        // Server path: the requested (client-chosen) value passes through.
+        let mut requested = connection_limits();
+        requested.traffic_class = 42;
+        let clamped = pool.clamp_connection_config(device, requested);
+        assert_eq!(clamped.traffic_class, 42);
+    }
+
+    /// Old peers omit `traffic_class` from the handshake payload; it must
+    /// deserialize to 0.
+    #[test]
+    fn test_connection_config_traffic_class_serde_default() {
+        let encoded = rmp_serde::to_vec_named(&serde_json::json!({
+            "qp": {
+                "max_send_wr": 64,
+                "max_recv_wr": 64,
+                "max_send_sge": 16,
+                "max_recv_sge": 1,
+            },
+            "cq_len": 128,
+            "recv_queue_len": 8,
+            "max_msg_size": 65536,
+        }))
+        .unwrap();
+        let config: RdmaConnectionConfig = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(config.traffic_class, 0);
     }
 
     #[tokio::test]

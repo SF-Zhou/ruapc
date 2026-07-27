@@ -66,6 +66,12 @@ pub struct RdmaConnectionConfig {
     /// receive buffers are sized accordingly. Negotiated as the minimum of
     /// both sides.
     pub max_msg_size: u32,
+    /// GRH traffic class (RoCE: DSCP/ECN byte) programmed into both sides'
+    /// address handles. Chosen by the connecting client; the server applies
+    /// the client's value verbatim. Peers that do not send it use 0.
+    /// Ignored on InfiniBand link layers (no GRH).
+    #[serde(default)]
+    pub traffic_class: u8,
 }
 
 /// RDMA connection request sent after the client has selected a server port.
