@@ -86,6 +86,11 @@ pub struct Args {
     /// aggregation under load; raise for large-message pipelines.
     #[arg(long, default_value = "8")]
     pub recv_queue_len: u32,
+
+    /// RDMA: GRH traffic class (RoCE DSCP/ECN byte) for the connections
+    /// this client creates; the server applies the same value on its side.
+    #[arg(long, default_value = "0")]
+    pub traffic_class: u8,
 }
 
 fn socket_pool_config(args: &Args) -> SocketPoolConfig {
@@ -103,6 +108,7 @@ fn socket_pool_config(args: &Args) -> SocketPoolConfig {
         config.rdma.poll_spin_us = args.poll_spin_us;
         config.rdma.dispatch_workers = args.dispatch_workers;
         config.rdma.recv_queue_len = args.recv_queue_len;
+        config.rdma.traffic_class = args.traffic_class;
     }
     config
 }

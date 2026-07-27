@@ -561,6 +561,7 @@ impl QueuePair {
         path_mtu: ibv_mtu,
         rq_psn: u32,
         max_dest_rd_atomic: u8,
+        traffic_class: u8,
     ) -> Result<()> {
         let mut ah_attr = crate::ibv_ah_attr {
             sl: 0,
@@ -581,7 +582,7 @@ impl QueuePair {
                     flow_label: 0,
                     sgid_index: local_gid_index,
                     hop_limit: 0xff,
-                    traffic_class: 0,
+                    traffic_class,
                 };
                 ah_attr.is_global = 1;
             }
@@ -656,6 +657,7 @@ impl QueuePair {
         remote_psn: u32,
         max_rd_atomic: u8,
         max_dest_rd_atomic: u8,
+        traffic_class: u8,
     ) -> Result<()> {
         self.init(local_port_num, pkey_index)?;
         self.ready_to_recv(
@@ -668,6 +670,7 @@ impl QueuePair {
             path_mtu,
             remote_psn,
             max_dest_rd_atomic,
+            traffic_class,
         )?;
         self.ready_to_send(local_psn, max_rd_atomic)
     }

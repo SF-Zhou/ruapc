@@ -93,6 +93,9 @@ impl RdmaInfo {
                             cq_len: config.cq_len.min(info.device_attr.max_cqe as u32),
                             recv_queue_len: config.recv_queue_len,
                             max_msg_size: config.max_msg_size.max(16 * 1024),
+                            // Advisory only: connecting clients dictate the
+                            // traffic class of the connections they create.
+                            traffic_class: config.traffic_class,
                         },
                         ports: info
                             .ports
@@ -195,6 +198,7 @@ mod tests {
                 cq_len: 128,
                 recv_queue_len: 64,
                 max_msg_size: 1024 * 1024,
+                traffic_class: 0,
             },
         };
         let result = ().connect(&ctx, &request).await;
