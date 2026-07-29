@@ -127,9 +127,12 @@ fn replace_custom_types(input: &str) -> String {
 }
 
 fn main() {
-    // Probe for libibverbs installation
-    let lib = pkg_config::Config::new()
+    // Probe without emitting link metadata yet. libibverbs must appear after
+    // the static shim on the linker command line when --as-needed is enabled.
+    let mut pkg_config = pkg_config::Config::new();
+    let lib = pkg_config
         .statik(false)
+        .cargo_metadata(false)
         .probe("libibverbs")
         .unwrap_or_else(|_| panic!("please install libibverbs-dev and pkg-config"));
 
@@ -149,6 +152,12 @@ fn main() {
         shim.include(path);
     }
     shim.compile("ruapc_rdma_shim");
+
+    // Emit libibverbs after cc has emitted the static shim link directive.
+    pkg_config::Config::new()
+        .statik(false)
+        .probe("libibverbs")
+        .unwrap_or_else(|_| panic!("please install libibverbs-dev and pkg-config"));
 
     // Configure bindgen to generate RDMA verb bindings
     let builder = bindgen::Builder::default()
