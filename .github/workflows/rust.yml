@@ -14,7 +14,11 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    name: Build and test (${{ matrix.runner }})
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
 
     steps:
     - uses: actions/checkout@v6
@@ -29,20 +33,24 @@ jobs:
 
     - name: Setup Soft-RoCE
       run: |
-        KERNEL_VERSION=$(uname -r | cut -d '-' -f 1)
-        KERNEL_NAME="linux-${KERNEL_VERSION%'.0'}"
-        DOWNLOAD_LINK="https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_VERSION%%.*}.x/${KERNEL_NAME}.tar.xz"
         ETHERNET_CARD=$(ip link | awk -F ": " '$0 !~ "lo|vir|wl|^[^0-9]"{print $2;getline}' | head -1)
-        echo "kernel version is ${KERNEL_VERSION}, download link is ${DOWNLOAD_LINK}, ethernet card is ${ETHERNET_CARD}"
-        wget -q $DOWNLOAD_LINK -O /tmp/$KERNEL_NAME.tar.xz
-        tar xf /tmp/$KERNEL_NAME.tar.xz --directory=/tmp
-        RXE_PATH="/tmp/$KERNEL_NAME/drivers/infiniband/sw/rxe"
-        sed 's/$(CONFIG_RDMA_RXE)/m/g' $RXE_PATH/Makefile > $RXE_PATH/Kbuild
-        make -C /lib/modules/$(uname -r)/build M=$RXE_PATH modules -j
-        sudo modprobe ib_core
-        sudo modprobe rdma_ucm
-        sudo insmod $RXE_PATH/rdma_rxe.ko
-        sudo rdma link add rxe_0 type rxe netdev $ETHERNET_CARD
+
+        if ! sudo modprobe rdma_rxe; then
+          KERNEL_VERSION=$(uname -r | cut -d '-' -f 1)
+          KERNEL_NAME="linux-${KERNEL_VERSION%'.0'}"
+          DOWNLOAD_LINK="https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_VERSION%%.*}.x/${KERNEL_NAME}.tar.xz"
+          echo "kernel version is ${KERNEL_VERSION}, download link is ${DOWNLOAD_LINK}, ethernet card is ${ETHERNET_CARD}"
+          wget -q "$DOWNLOAD_LINK" -O "/tmp/$KERNEL_NAME.tar.xz"
+          tar xf "/tmp/$KERNEL_NAME.tar.xz" --directory=/tmp
+          RXE_PATH="/tmp/$KERNEL_NAME/drivers/infiniband/sw/rxe"
+          sed 's/$(CONFIG_RDMA_RXE)/m/g' "$RXE_PATH/Makefile" > "$RXE_PATH/Kbuild"
+          make -C "/lib/modules/$(uname -r)/build" M="$RXE_PATH" modules -j
+          sudo install -D -m 0644 "$RXE_PATH/rdma_rxe.ko" "/lib/modules/$(uname -r)/updates/rdma_rxe.ko"
+          sudo depmod -a
+          sudo modprobe rdma_rxe
+        fi
+
+        sudo rdma link add rxe_0 type rxe netdev "$ETHERNET_CARD"
         rdma link
 
     - name: Install llvm-tools
@@ -56,10 +64,12 @@ jobs:
       with:
         tool: cargo-llvm-cov
 
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y pkg-config libibverbs-dev ibverbs-utils
+
     - name: Run tests
       run: |
         sudo prlimit --pid $$ -l=unlimited && ulimit -a
-        sudo apt install -y pkg-config libibverbs-dev ibverbs-utils
         ibv_devinfo -d rxe_0 -v
         cargo fmt -- --check
         cargo clippy --release --all-features -- -D warnings
