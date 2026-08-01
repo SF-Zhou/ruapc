@@ -7,15 +7,22 @@
 //!
 //! - **RAII wrappers**: All libibverbs resources (context, PD, CQ, QP, MR,
 //!   completion channel) are wrapped in types that automatically clean up on drop.
-//! - **QueuePair\<B\>**: Generic over a user-provided [`RdmaBuffer`] type.
-//!   High-level [`send`](QueuePair::send) / [`recv`](QueuePair::recv) /
-//!   [`read`](QueuePair::read) take ownership of the buffer and return it via
-//!   [`Completion`] when the work request completes.  Low-level
-//!   [`post_send`](QueuePair::post_send) / [`post_recv`](QueuePair::post_recv)
-//!   accept raw work request pointers for advanced use cases.
+//! - **QueuePair**: High-level [`send`](QueuePair::send) / [`recv`](QueuePair::recv)
+//!   take ownership of a [`ruapc_bufpool::Buffer`] and return it via
+//!   [`Completion`] when the work request completes; [`read_sges`](QueuePair::read_sges)
+//!   posts vectored RDMA READs from caller-managed memory.
 //! - **Type-safe bindings**: Generated FFI types have custom Rust wrappers
 //!   (`FwVer`, `Guid`, `WRID`, `LinkLayer`) substituted at build time.
-//!   Raw C functions are hidden behind a private `ffi` module.
+//!   Every verbs entry point is routed through a C shim compiled against the
+//!   installed header (see `src/shim.h`), never bound directly.
+//!
+//! ## Module Organization
+//!
+//! - `ffi` (private): generated bindings plus extensions on generated
+//!   types (flag names, `ibv_gid` / `ibv_wc` helpers); selected types are
+//!   re-exported at the crate root
+//! - `types`: crate-defined value types ([`DeviceInfo`], [`Guid`], [`WRID`], ...)
+//! - `verbs`: RAII resource wrappers ([`Context`], [`QueuePair`], ...)
 //!
 //! ## Quick Start
 //!
@@ -26,10 +33,6 @@
 //! }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
-
-#![allow(dead_code)]
-#![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
-#![allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
 
 mod ffi;
 pub(crate) use ffi::*;
@@ -50,7 +53,7 @@ mod fd_poll;
 pub use fd_poll::poll_readable2;
 
 mod types;
-pub use types::{DeviceInfo, FwVer, Gid, GidType, Guid, LinkLayer, Port, RdmaBuffer, WRID, WRType};
+pub use types::{DeviceInfo, FwVer, Gid, GidType, Guid, LinkLayer, Port, WRID, WRType};
 
 mod verbs;
 pub use verbs::{

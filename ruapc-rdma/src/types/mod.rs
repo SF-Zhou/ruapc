@@ -1,17 +1,17 @@
 //! # Custom RDMA types
 //!
-//! This module provides type-safe wrappers for RDMA-related data structures
-//! with enhanced serialization and formatting support.
+//! Crate-defined, type-safe data structures. Several of them (`FwVer`,
+//! `Guid`, `LinkLayer`, `WRID`) are substituted into the generated FFI
+//! bindings at build time; the rest are plain value types used across the
+//! public API.
 //!
 //! ## Module Organization
 //!
-//! - [`fw_ver`]: Firmware version wrapper for null-terminated strings
-//! - [`gid`]: Global Identifier (GID) with IPv6 conversion
+//! - [`device_info`]: serializable device/port/GID snapshots
+//! - [`fw_ver`]: firmware version wrapper for null-terminated strings
 //! - [`guid`]: Globally Unique Identifier with colon-separated formatting
-//! - [`link_layer`]: Link layer type (InfiniBand/Ethernet)
-//! - [`wrid`]: Work Request ID with type encoding
-//! - [`wc`]: Work completion helper methods
-//! - [`pthread`]: pthread wrapper types for RDMA bindings
+//! - [`link_layer`]: link layer type (InfiniBand/Ethernet)
+//! - [`wrid`]: work request ID with type encoding
 //!
 //! ## Features
 //!
@@ -20,11 +20,11 @@
 //! - JSON Schema generation via schemars
 //! - Custom display and debug formatting
 
+mod device_info;
+pub use device_info::{DeviceInfo, Gid, GidType, Port};
+
 mod fw_ver;
 pub use fw_ver::FwVer;
-
-mod gid;
-mod wc;
 
 mod guid;
 pub use guid::Guid;
@@ -32,20 +32,5 @@ pub use guid::Guid;
 mod link_layer;
 pub use link_layer::LinkLayer;
 
-mod pthread;
-pub use pthread::{pthread_cond_t, pthread_mutex_t};
-
 mod wrid;
 pub use wrid::{WRID, WRType};
-
-mod buffer;
-pub use buffer::RdmaBuffer;
-
-mod device_info;
-pub use device_info::{DeviceInfo, Gid, GidType, Port};
-
-mod device_cap_flags;
-
-mod port_cap_flags;
-
-mod port_cap_flags2;

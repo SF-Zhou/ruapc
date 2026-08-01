@@ -164,8 +164,8 @@ impl ActiveDevice {
     /// information (attributes, ports, and usable GIDs).
     ///
     /// Unusable GIDs (e.g. RoCE v2 GIDs derived from loopback or link-local
-    /// addresses, see [`crate::is_gid_usable`]) are filtered out at
-    /// collection time and never appear in the returned snapshot.
+    /// addresses, see [`Gid::usable`]) are filtered out at collection time
+    /// and never appear in the returned snapshot.
     pub fn query_device_info(&self) -> Result<DeviceInfo> {
         let device_attr = self.context.query_device()?;
 

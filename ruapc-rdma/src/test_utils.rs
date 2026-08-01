@@ -1,9 +1,11 @@
-use std::sync::Arc;
+//! Shared helpers for this crate's hardware-backed tests.
 
-use ruapc_bufpool::AlignedMemory;
+use crate::ActiveDevice;
 
-use crate::{ActiveDevice, MemoryRegion, ProtectionDomain, RdmaBuffer, ibv_access_flags};
-
+/// Opens the first available RDMA device.
+///
+/// When `RUAPC_PREFER_RXE` is set (e.g. in CI with a Soft-RoCE `rxe_0`
+/// device), only devices whose name starts with `rxe` are considered.
 pub fn open_device() -> ActiveDevice {
     let devices = ActiveDevice::available().expect("no RDMA devices");
     let prefer_rxe = std::env::var("RUAPC_PREFER_RXE").is_ok();
@@ -13,63 +15,11 @@ pub fn open_device() -> ActiveDevice {
         .expect("no matching RDMA device")
 }
 
-/// A minimal buffer type for test purposes.
-pub struct TestBuffer {
-    _mr: MemoryRegion,
-    _data: Arc<AlignedMemory>,
-}
-
-impl TestBuffer {
-    pub fn as_slice(&self) -> &[u8] {
-        self._data.as_slice()
-    }
-
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        self._data.as_mut_slice()
-    }
-}
-
-impl RdmaBuffer for TestBuffer {
-    fn addr(&self) -> *mut std::ffi::c_void {
-        self._mr.addr()
-    }
-    fn len(&self) -> usize {
-        self._mr.length()
-    }
-    fn lkey(&self) -> u32 {
-        self._mr.lkey()
-    }
-    fn rkey(&self) -> u32 {
-        self._mr.rkey()
-    }
-}
-
-pub fn test_buffer(pd: &Arc<ProtectionDomain>) -> TestBuffer {
-    test_buffer_with(
-        pd,
-        64,
-        ibv_access_flags::IBV_ACCESS_LOCAL_WRITE | ibv_access_flags::IBV_ACCESS_REMOTE_READ,
-    )
-}
-
-pub fn test_buffer_with(
-    pd: &Arc<ProtectionDomain>,
-    size: usize,
-    access: ibv_access_flags,
-) -> TestBuffer {
-    let mem = Arc::new(AlignedMemory::new(size).unwrap());
-    let mr = MemoryRegion::register(pd, &mem, access.0 as _).unwrap();
-    TestBuffer {
-        _mr: mr,
-        _data: mem,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use crate::test_utils::open_device;
+    use super::open_device;
     use crate::*;
 
     /// Drop only the parent context while children are still alive.
