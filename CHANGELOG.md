@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- `ruapc-rdma`: `ibv_port_cap_flags2` now uses the bound struct field's `u16`
+  width, so reading `ibv_port_attr.port_cap_flags2` no longer includes adjacent
+  padding. `query_port` now uses a zeroed `MaybeUninit` out buffer and constructs
+  `ibv_port_attr` only after a successful FFI call, avoiding invalid zero
+  discriminants in Rust enum fields such as `ibv_mtu`
+
+### Changed
+- **BREAKING** (`ruapc-rdma`): removed the unused `RdmaBuffer` trait, a
+  leftover from before `QueuePair` took `ruapc_bufpool::Buffer` directly
+- **BREAKING** (`ruapc-rdma`): `ibv_device_cap_flags`, `ibv_port_cap_flags`,
+  and `ibv_port_cap_flags2` are generated as `enumflags2` enums instead of
+  integer newtypes. Combining variants yields a serializable `BitFlags` value,
+  which is also used directly by capability fields in device/port attributes
+- `ruapc-rdma`: extensions on generated FFI types moved into `src/ffi/`
+  (`gid`, `wc`, `flags`, `pthread`); lint allowances are now scoped to the
+  generated bindings instead of crate-wide; the build script reruns when the
+  bound C headers change
+
+### Added
+- `ruapc-rdma`: README with feature overview, C-shim rationale, and layout of
+  the crate
+
 ## [0.2.0-alpha.2] - 2026-07-26
 
 ### Changed

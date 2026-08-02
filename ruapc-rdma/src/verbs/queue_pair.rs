@@ -293,11 +293,10 @@ impl QueuePair {
             __bindgen_anon_1: crate::ibv_send_wr__bindgen_ty_1 { imm_data },
             ..Default::default()
         };
-        let result = unsafe { self.post_send(&mut wr) };
-        if let Err((_, err)) = result {
+        unsafe { self.post_send(&mut wr) }.map_err(|(_, err)| {
             self.send_wrs.take(id);
-            return Err(err);
-        }
+            err
+        })?;
         Ok(id)
     }
 
@@ -326,11 +325,10 @@ impl QueuePair {
             },
             ..Default::default()
         };
-        let result = unsafe { self.post_send(&mut wr) };
-        if let Err((_, err)) = result {
+        unsafe { self.post_send(&mut wr) }.map_err(|(_, err)| {
             self.send_wrs.take(id);
-            return Err(err);
-        }
+            err
+        })?;
         Ok(id)
     }
 
@@ -351,11 +349,7 @@ impl QueuePair {
             },
             ..Default::default()
         };
-        let result = unsafe { self.post_send(&mut wr) };
-        if let Err((_, err)) = result {
-            return Err(err);
-        }
-        Ok(())
+        unsafe { self.post_send(&mut wr) }.map_err(|(_, err)| err)
     }
 
     /// Posts one RDMA READ from a contiguous remote region into the local
@@ -411,11 +405,10 @@ impl QueuePair {
             },
             ..Default::default()
         };
-        let result = unsafe { self.post_send(&mut wr) };
-        if let Err((_, err)) = result {
+        unsafe { self.post_send(&mut wr) }.map_err(|(_, err)| {
             unregister(wr_id);
-            return Err(err);
-        }
+            err
+        })?;
         Ok(wr_id)
     }
 
@@ -441,11 +434,7 @@ impl QueuePair {
             send_flags,
             ..Default::default()
         };
-        let result = unsafe { self.post_send(&mut wr) };
-        if let Err((_, err)) = result {
-            return Err(err);
-        }
-        Ok(())
+        unsafe { self.post_send(&mut wr) }.map_err(|(_, err)| err)
     }
 
     pub fn recv(&self, buffer: Buffer) -> Result<()> {
@@ -466,12 +455,10 @@ impl QueuePair {
             num_sge: 1,
             ..Default::default()
         };
-        let result = unsafe { self.post_recv(&mut wr) };
-        if let Err((_, err)) = result {
+        unsafe { self.post_recv(&mut wr) }.map_err(|(_, err)| {
             self.recv_wrs.take(id);
-            return Err(err);
-        }
-        Ok(())
+            err
+        })
     }
 
     pub fn poll_send(&self, wc: &mut [ibv_wc]) -> Result<Vec<Completion>> {
@@ -675,6 +662,16 @@ impl QueuePair {
         self.ready_to_send(local_psn, max_rd_atomic)
     }
 
+    /// Posts a raw send work request chain.
+    ///
+    /// On failure returns the offending work request (`bad_wr`) alongside
+    /// the error.
+    ///
+    /// # Safety
+    ///
+    /// `wr` must point to a valid, properly linked `ibv_send_wr` chain
+    /// whose SG lists reference registered memory that stays alive until
+    /// the corresponding completions are observed.
     pub(crate) unsafe fn post_send(
         &self,
         wr: *mut crate::ibv_send_wr,
@@ -687,6 +684,16 @@ impl QueuePair {
         Ok(())
     }
 
+    /// Posts a raw receive work request chain.
+    ///
+    /// On failure returns the offending work request (`bad_wr`) alongside
+    /// the error.
+    ///
+    /// # Safety
+    ///
+    /// `wr` must point to a valid, properly linked `ibv_recv_wr` chain
+    /// whose SG lists reference registered memory that stays alive until
+    /// the corresponding completions are observed.
     pub(crate) unsafe fn post_recv(
         &self,
         wr: *mut crate::ibv_recv_wr,

@@ -10,6 +10,7 @@
 ///
 /// Transparent wrapper around `libc::pthread_mutex_t` that implements
 /// Debug for use in generated RDMA bindings.
+#[allow(non_camel_case_types)]
 #[repr(transparent)]
 pub struct pthread_mutex_t(pub libc::pthread_mutex_t);
 
@@ -20,6 +21,7 @@ impl std::fmt::Debug for pthread_mutex_t {
 }
 
 /// Wrapper for pthread condition variable
+#[allow(non_camel_case_types)]
 #[repr(transparent)]
 pub struct pthread_cond_t(pub libc::pthread_cond_t);
 

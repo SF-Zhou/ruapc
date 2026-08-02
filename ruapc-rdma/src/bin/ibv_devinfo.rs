@@ -190,21 +190,15 @@ fn print_device(dev: &ActiveDevice, verbose: bool, port_filter: Option<u8>) {
 }
 
 fn print_verbose_device_attrs(attr: &ruapc_rdma::ibv_device_attr) {
-    use ruapc_rdma::ibv_device_cap_flags;
-
     println!("\tmax_mr_size:\t\t\t0x{:x}", attr.max_mr_size);
     println!("\tpage_size_cap:\t\t\t0x{:x}", attr.page_size_cap);
     println!("\tmax_qp:\t\t\t\t{}", attr.max_qp);
     println!("\tmax_qp_wr:\t\t\t{}", attr.max_qp_wr);
 
     let dev_flags = attr.device_cap_flags;
-    println!("\tdevice_cap_flags:\t\t{dev_flags}");
-    for bit in (0..32).map(|i| 1u32.wrapping_shl(i as u32)) {
-        if dev_flags.0 & bit != 0
-            && let Some(name) = ibv_device_cap_flags::flag_name(bit)
-        {
-            println!("\t\t\t\t\t{name}");
-        }
+    println!("\tdevice_cap_flags:\t\t0x{:08x}", dev_flags.bits());
+    for flag in dev_flags {
+        println!("\t\t\t\t\t{}", flag.name());
     }
 
     println!("\tmax_sge:\t\t\t{}", attr.max_sge);
@@ -265,8 +259,14 @@ fn print_port(port: &Port, verbose: bool) {
 
     if verbose {
         println!("\t\t\tmax_msg_sz:\t\t0x{:x}", pa.max_msg_sz);
-        println!("\t\t\tport_cap_flags:\t\t{}", pa.port_cap_flags);
-        println!("\t\t\tport_cap_flags2:\t{}", pa.port_cap_flags2);
+        println!(
+            "\t\t\tport_cap_flags:\t\t0x{:08x}",
+            pa.port_cap_flags.bits()
+        );
+        println!(
+            "\t\t\tport_cap_flags2:\t0x{:04x}",
+            pa.port_cap_flags2.bits()
+        );
 
         if pa.max_vl_num == 0 {
             println!("\t\t\tmax_vl_num:\t\tinvalid value (0)");

@@ -51,6 +51,8 @@ impl Context {
 
     /// Queries port attributes.
     pub fn query_port(&self, port_num: u8) -> Result<crate::ibv_port_attr> {
+        // Keep the out buffer zeroed without constructing a Rust value first:
+        // zero is not a valid discriminant for fields such as `ibv_mtu`.
         let mut attr = std::mem::MaybeUninit::<crate::ibv_port_attr>::uninit();
         let ret = unsafe { crate::ruapc_ibv_query_port(self.ptr, port_num, attr.as_mut_ptr()) };
         if ret != 0 {

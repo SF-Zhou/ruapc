@@ -2,21 +2,26 @@
 name = "ruapc-rdma"
 version.workspace = true
 description = "Low-level FFI bindings to libibverbs with type-safe device management for RDMA operations"
+readme = "README.md"
 authors.workspace = true
 edition.workspace = true
 homepage.workspace = true
 repository.workspace = true
 license.workspace = true
+keywords = ["rdma", "ibverbs", "infiniband", "roce", "ffi"]
+categories = ["network-programming", "external-ffi-bindings"]
 
 [features]
 bin = ["dep:clap"]
 
 [dependencies]
 clap = { workspace = true, optional = true }
+enumflags2 = { version = "0.7", features = ["serde"] }
 libc.workspace = true
 ruapc-bufpool = { version = "0.2.0-alpha.2", path = "../ruapc-bufpool" }
 schemars.workspace = true
 serde.workspace = true
+strum = { version = "0.28", features = ["derive"] }
 
 [[bin]]
 name = "ibv_devinfo"

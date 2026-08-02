@@ -8,12 +8,19 @@
 //! 3. Generates FFI bindings using bindgen
 //! 4. Applies custom type replacements (FwVer, Guid, WRID)
 //! 5. Derives serialization traits for select types
+//! 6. Annotates capability flag enums for `enumflags2` and `strum`
 
 use std::collections::HashSet;
 use std::env;
 use std::path::PathBuf;
 
-use bindgen::callbacks::{DeriveInfo, ParseCallbacks};
+use bindgen::callbacks::{AttributeInfo, DeriveInfo, ParseCallbacks};
+
+const FLAG_ENUMS: &[&str] = &[
+    "ibv_device_cap_flags",
+    "ibv_port_cap_flags",
+    "ibv_port_cap_flags2",
+];
 
 /// Custom callback to add serde and schemars derives to specific ibverbs types
 #[derive(Debug)]
@@ -24,7 +31,7 @@ impl ParseCallbacks for CustomDerive {
     ///
     /// These types need JSON serialization support for the ruapc project
     fn add_derives(&self, info: &DeriveInfo<'_>) -> Vec<String> {
-        match info.name {
+        let mut derives = match info.name {
             "ibv_device_attr"
             | "ibv_atomic_cap"
             | "ibv_port_state"
@@ -41,23 +48,46 @@ impl ParseCallbacks for CustomDerive {
                 ]
             }
             _ => vec![],
+        };
+        if FLAG_ENUMS.contains(&info.name) {
+            derives.push("strum::IntoStaticStr".to_string());
         }
+        derives
+    }
+
+    fn add_attributes(&self, info: &AttributeInfo<'_>) -> Vec<String> {
+        FLAG_ENUMS
+            .contains(&info.name)
+            .then(|| "#[enumflags2::bitflags]".to_string())
+            .into_iter()
+            .collect()
     }
 }
 
 /// Replaces C types with custom Rust wrapper types in generated bindings
 ///
-/// This function post-processes the bindgen output to:
+/// This function post-processes the bindgen AST to:
 /// - Replace `fw_ver` field type with `FwVer` wrapper
 /// - Replace `node_guid` and `sys_image_guid` field types with `Guid` wrapper
 /// - Replace `wr_id` field type with `WRID` wrapper
 /// - Replace `link_layer` field type with `LinkLayer` wrapper
+/// - Replace capability-mask integer fields with typed `BitFlags`
+/// - Represent `ibv_port_cap_flags2` as `u16`, matching its struct field
 ///
 /// These wrappers provide safer, more idiomatic Rust interfaces
-fn replace_custom_types(input: &str) -> String {
-    let mut ast = syn::parse_file(input).expect("Failed to parse generated bindings");
-
+fn replace_custom_types(ast: &mut syn::File) {
     for item in &mut ast.items {
+        if let syn::Item::Enum(enum_item) = item
+            && enum_item.ident == "ibv_port_cap_flags2"
+        {
+            let repr = enum_item
+                .attrs
+                .iter_mut()
+                .find(|attr| attr.path().is_ident("repr"))
+                .expect("ibv_port_cap_flags2 is missing repr");
+            *repr = syn::parse_quote!(#[repr(u16)]);
+        }
+
         if let syn::Item::Struct(struct_item) = item {
             match struct_item.ident.to_string().as_str() {
                 "ibv_device_attr" => {
@@ -74,8 +104,11 @@ fn replace_custom_types(input: &str) -> String {
                                             .expect("Failed to parse Guid type");
                                     }
                                     "device_cap_flags" => {
-                                        field.ty = syn::parse_str("ibv_device_cap_flags")
-                                            .expect("Failed to parse ibv_device_cap_flags type");
+                                        field.ty = syn::parse_str("BitFlags<ibv_device_cap_flags>")
+                                            .expect("Failed to parse device capability flags type");
+                                        field
+                                            .attrs
+                                            .push(syn::parse_quote!(#[schemars(with = "u32")]));
                                     }
                                     _ => {}
                                 }
@@ -93,12 +126,18 @@ fn replace_custom_types(input: &str) -> String {
                                             .expect("Failed to parse LinkLayer type");
                                     }
                                     "port_cap_flags" => {
-                                        field.ty = syn::parse_str("ibv_port_cap_flags")
-                                            .expect("Failed to parse ibv_port_cap_flags type");
+                                        field.ty = syn::parse_str("BitFlags<ibv_port_cap_flags>")
+                                            .expect("Failed to parse port capability flags type");
+                                        field
+                                            .attrs
+                                            .push(syn::parse_quote!(#[schemars(with = "u32")]));
                                     }
                                     "port_cap_flags2" => {
-                                        field.ty = syn::parse_str("ibv_port_cap_flags2")
-                                            .expect("Failed to parse ibv_port_cap_flags2 type");
+                                        field.ty = syn::parse_str("BitFlags<ibv_port_cap_flags2>")
+                                            .expect("Failed to parse secondary port flags type");
+                                        field
+                                            .attrs
+                                            .push(syn::parse_quote!(#[schemars(with = "u16")]));
                                     }
                                     _ => {}
                                 }
@@ -122,8 +161,6 @@ fn replace_custom_types(input: &str) -> String {
             }
         }
     }
-
-    prettyplease::unparse(&ast)
 }
 
 fn main() {
@@ -209,9 +246,10 @@ fn main() {
         .bitfield_enum("ibv_send_flags")
         .bitfield_enum("ibv_wc_flags")
         .bitfield_enum("ibv_qp_attr_mask")
-        .bitfield_enum("ibv_device_cap_flags")
-        .bitfield_enum("ibv_port_cap_flags")
-        .bitfield_enum("ibv_port_cap_flags2")
+        // Rebuild when the C headers change.
+        .parse_callbacks(Box::new(
+            bindgen::CargoCallbacks::new().rerun_on_header_files(true),
+        ))
         .parse_callbacks(Box::new(CustomDerive))
         // Types with function pointers shouldn't implement Copy
         .no_copy("ibv_context")
@@ -220,16 +258,15 @@ fn main() {
         .no_copy("ibv_srq")
         .no_debug("ibv_device");
 
-    // Generate the FFI bindings
+    // Generate the FFI bindings.
     let bindings = builder.generate().expect("Unable to generate bindings");
 
     // Post-process to apply custom type replacements
     let bindings_str = bindings.to_string();
-    let modified_bindings = replace_custom_types(&bindings_str);
+    let mut ast = syn::parse_file(&bindings_str).expect("Failed to parse generated bindings");
+    replace_custom_types(&mut ast);
 
-    std::fs::write(
-        PathBuf::from(env::var("OUT_DIR").unwrap()).join("bindings.rs"),
-        modified_bindings,
-    )
-    .expect("Couldn't write bindings!");
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    std::fs::write(out_dir.join("bindings.rs"), prettyplease::unparse(&ast))
+        .expect("Couldn't write bindings!");
 }
