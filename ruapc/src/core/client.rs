@@ -232,13 +232,19 @@ impl Client {
         // failed attempt drops its receiver, cleaning the entry up (and,
         // with it, the entry's write-target pin — the caller-held clone in
         // `write_target` keeps the buffers available for the next attempt).
-        let addr_base = match &ctx.endpoint {
-            SocketEndpoint::Addresses(set) => set.next_base(),
-            _ => 0,
+        //
+        // With a multi-address context, the request walks the set's
+        // health-aware attempt plan (quarantined addresses last) and
+        // reports its observations back: an address-indicting failure
+        // quarantines the address, a successful send reinstates it.
+        let addr_set = match &ctx.endpoint {
+            SocketEndpoint::Addresses(set) => Some(set.clone()),
+            _ => None,
         };
+        let plan = addr_set.as_ref().map(|set| set.plan());
         let mut attempt = 0usize;
-        let receiver = loop {
-            let addr = attempt_addr(ctx, addr_base, attempt)?;
+        let (receiver, bound_addr) = loop {
+            let (addr, health_version) = attempt_addr(ctx, plan.as_deref(), attempt)?;
             let result = self
                 .try_send(
                     ctx,
@@ -252,8 +258,20 @@ impl Client {
                 )
                 .await;
             match result {
-                Ok(receiver) => break receiver,
+                Ok(receiver) => {
+                    let health_version = match (&addr_set, addr, health_version) {
+                        (Some(set), Some(addr), Some(version)) => Some(set.mark_ok(addr, version)),
+                        _ => None,
+                    };
+                    break (receiver, addr.zip(health_version));
+                }
                 Err(err) => {
+                    if let (Some(set), Some(addr), Some(version)) =
+                        (&addr_set, addr, health_version)
+                        && indicts_address(&err)
+                    {
+                        set.mark_failed(addr, version);
+                    }
                     if attempt >= self.max_retries as usize {
                         return Err(err.into());
                     }
@@ -263,8 +281,16 @@ impl Client {
             }
         };
 
-        // 3. recv response (fails with Timeout once the entry expires).
-        let (response, returned_target) = receiver.recv().await?;
+        // 3. recv response (fails with Timeout once the entry expires). A
+        // connection dying mid-flight indicts the address it ran on.
+        let result = receiver.recv().await;
+        if let Err(err) = &result
+            && err.kind == ErrorKind::ConnectionClosed
+            && let (Some(set), Some((addr, version))) = (&addr_set, bound_addr)
+        {
+            set.mark_failed(addr, version);
+        }
+        let (response, returned_target) = result?;
         // Hand every attached write buffer back to the caller. Dropping
         // our own clone first makes the returned target unique in the
         // normal case; a pull/push handler racing the response keeps the
@@ -376,26 +402,51 @@ impl Client {
 }
 
 /// Resolves the target address for the `attempt`-th try, or `None` for an
-/// already-connected endpoint.
+/// already-connected endpoint. Multi-address endpoints walk the request's
+/// health-aware attempt `plan` (wrapping around when retries outnumber
+/// addresses).
 fn attempt_addr(
     ctx: &Context,
-    base: usize,
+    plan: Option<&[(std::net::SocketAddr, u64)]>,
     attempt: usize,
-) -> std::result::Result<Option<std::net::SocketAddr>, Error> {
+) -> std::result::Result<(Option<std::net::SocketAddr>, Option<u64>), Error> {
     match &ctx.endpoint {
         SocketEndpoint::Invalid => Err(Error::new(
             ErrorKind::InvalidArgument,
             "client context without address".to_string(),
         )),
-        SocketEndpoint::Connected(_) => Ok(None),
-        SocketEndpoint::Address(addr) => Ok(Some(*addr)),
-        SocketEndpoint::Addresses(set) => set.pick(base, attempt).map(Some).ok_or_else(|| {
-            Error::new(
-                ErrorKind::InvalidArgument,
-                "client context with empty address set".to_string(),
-            )
-        }),
+        SocketEndpoint::Connected(_) => Ok((None, None)),
+        SocketEndpoint::Address(addr) => Ok((Some(*addr), None)),
+        SocketEndpoint::Addresses(_) => {
+            let plan = plan.unwrap_or_default();
+            match plan.len() {
+                0 => Err(Error::new(
+                    ErrorKind::InvalidArgument,
+                    "client context with empty address set".to_string(),
+                )),
+                len => {
+                    let (addr, version) = plan[attempt % len];
+                    Ok((Some(addr), Some(version)))
+                }
+            }
+        }
     }
+}
+
+/// Whether a pre-wire failure indicts the *address* it was attempted
+/// against (and should quarantine it in the context's [`AddrSet`]
+/// (crate::AddrSet)), as opposed to indicting the request itself — a
+/// request-shaped error would fail identically on every address.
+fn indicts_address(err: &Error) -> bool {
+    !matches!(
+        err.kind,
+        ErrorKind::SerializeFailed
+            | ErrorKind::SerdeJsonError
+            | ErrorKind::InvalidArgument
+            | ErrorKind::InvalidCopyOp
+            // Oversized-message rejection (see `TcpSocket::send`).
+            | ErrorKind::TcpParseMsgFailed
+    )
 }
 
 /// A client wrapper that attaches registered buffers to RPC calls.
@@ -562,6 +613,31 @@ mod tests {
         let client = Client::default();
         let debug = format!("{:?}", client);
         assert!(debug.contains("Client"));
+    }
+
+    #[test]
+    fn test_indicts_address() {
+        // Connect/send failures indict the address…
+        assert!(indicts_address(&Error::kind(ErrorKind::TcpConnectFailed)));
+        assert!(indicts_address(&Error::kind(ErrorKind::TcpSendMsgFailed)));
+        assert!(indicts_address(&Error::kind(ErrorKind::Timeout)));
+        // …request-shaped failures do not (they would fail everywhere).
+        assert!(!indicts_address(&Error::kind(ErrorKind::SerializeFailed)));
+        assert!(!indicts_address(&Error::kind(ErrorKind::SerdeJsonError)));
+        assert!(!indicts_address(&Error::kind(ErrorKind::InvalidArgument)));
+        assert!(!indicts_address(&Error::kind(ErrorKind::InvalidCopyOp)));
+        assert!(!indicts_address(&Error::kind(ErrorKind::TcpParseMsgFailed)));
+    }
+
+    #[tokio::test]
+    async fn test_ruapc_request_empty_addr_set_returns_err() {
+        use crate::{SocketPoolConfig, services::MetaService as _};
+        let ctx = crate::Context::create(&SocketPoolConfig::default())
+            .unwrap()
+            .with_addrs(Vec::new());
+        let client = Client::default();
+        let err = client.list_methods(&ctx, &()).await.unwrap_err();
+        assert_eq!(err.kind, crate::ErrorKind::InvalidArgument);
     }
 
     #[tokio::test]

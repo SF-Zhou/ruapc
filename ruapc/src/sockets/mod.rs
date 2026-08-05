@@ -2,6 +2,10 @@
 mod socket;
 pub use socket::{Socket, SocketTrait};
 
+/// Per-address connect serialization and timeout.
+mod connect_gate;
+pub(crate) use connect_gate::ConnectGate;
+
 /// Socket pool management and configuration.
 mod socket_pool;
 pub use socket_pool::{RawStream, SocketPool, SocketPoolConfig, SocketPoolTrait, SocketType};

@@ -12,7 +12,8 @@ use tokio_util::sync::DropGuard;
 use super::http_socket::{ChannelBody, HttpSocket, StreamSocket};
 use crate::{
     Error, ErrorKind, Message, MsgFlags, MsgMeta, RawStream, Result, Socket, SocketPoolConfig,
-    SocketPoolTrait, SocketType, State, TaskSupervisor, sockets::tcp,
+    SocketPoolTrait, SocketType, State, TaskSupervisor,
+    sockets::{ConnectGate, tcp},
 };
 
 type HttpSocketMap = Arc<RwLock<HashMap<SocketAddr, HttpSocket, RandomState>>>;
@@ -20,12 +21,13 @@ type HttpSocketMap = Arc<RwLock<HashMap<SocketAddr, HttpSocket, RandomState>>>;
 pub struct HttpSocketPool {
     socket_map: HttpSocketMap,
     http: Builder<TokioExecutor>,
+    connect_gate: ConnectGate,
     task_supervisor: TaskSupervisor,
 }
 
 impl SocketPoolTrait for HttpSocketPool {
     fn create(
-        _config: &SocketPoolConfig,
+        config: &SocketPoolConfig,
         _devices: &std::sync::Arc<crate::Devices>,
         _buffer_pool: &std::sync::Arc<crate::BufferPool>,
     ) -> Result<Self> {
@@ -34,6 +36,7 @@ impl SocketPoolTrait for HttpSocketPool {
         Ok(Self {
             socket_map: Arc::default(),
             http,
+            connect_gate: ConnectGate::new(config.connect_timeout_ms),
             task_supervisor: TaskSupervisor::create(),
         })
     }
@@ -79,14 +82,38 @@ impl SocketPoolTrait for HttpSocketPool {
             return Ok(socket.into());
         }
 
-        // If not, establish an HTTP/2 streaming connection.
-        let mut socket_map = self.socket_map.write().await;
-        if let Some(socket) = socket_map.get(addr) {
+        // Serialize connects per address (never pool-wide): concurrent
+        // acquires for one address dial once, while a stalled connect to a
+        // dead peer cannot block acquires for other addresses.
+        let permit = self.connect_gate.lock(addr).await;
+        if let Some(socket) = self.socket_map.read().await.get(addr) {
             return Ok(socket.into());
         }
 
-        let socket = Self::connect_stream(addr, state, &self.socket_map).await?;
-        socket_map.insert(*addr, socket.clone());
+        // Establish an HTTP/2 streaming connection.
+        let (socket, stream_socket, rsp_body) = self
+            .connect_gate
+            .with_timeout(
+                addr,
+                ErrorKind::TcpConnectFailed,
+                Self::connect_stream(addr),
+            )
+            .await?;
+        state.metrics.connection_opened("HTTP");
+
+        // Insert into the map *before* spawning the recv loop: eviction
+        // (identity-checked) must always observe the entry, otherwise an
+        // instantly failing connection could leave a dead socket mapped.
+        self.socket_map.write().await.insert(*addr, socket.clone());
+        Self::spawn_client_recv_loop(
+            &self.socket_map,
+            *addr,
+            socket.clone(),
+            stream_socket,
+            rsp_body,
+            state,
+        );
+        drop(permit);
         Ok(socket.into())
     }
 }
@@ -315,13 +342,11 @@ impl HttpSocketPool {
 
     /// Client-side: establish an HTTP/2 streaming connection to `/_rpc`.
     ///
-    /// Sends a POST request with a streaming body and starts a recv loop
-    /// on the response body. Returns an `HttpSocket::Stream` for sending.
-    async fn connect_stream(
-        addr: &SocketAddr,
-        state: &Arc<State>,
-        socket_map: &HttpSocketMap,
-    ) -> Result<HttpSocket> {
+    /// Sends a POST request with a streaming body and returns an
+    /// `HttpSocket::Stream` for sending together with the response body;
+    /// the caller inserts the socket into the pool and then starts the
+    /// recv loop via [`spawn_client_recv_loop`](Self::spawn_client_recv_loop).
+    async fn connect_stream(addr: &SocketAddr) -> Result<(HttpSocket, StreamSocket, Incoming)> {
         use hyper::client::conn::http2;
 
         let stream = tokio::net::TcpStream::connect(addr)
@@ -351,17 +376,26 @@ impl HttpSocketPool {
         // Create the socket for sending messages.
         let stream_socket = StreamSocket::new(req_tx);
         let socket = HttpSocket::Stream(stream_socket.clone());
-        state.metrics.connection_opened("HTTP");
+        Ok((socket, stream_socket, rsp.into_body()))
+    }
 
-        // Spawn recv loop on the response body. When it exits — error or
-        // clean end of stream — evict the socket from the pool and eagerly
-        // fail every request still pending on the connection.
-        let socket_for_recv = Socket::HTTP(socket.clone());
+    /// Spawns the recv loop on the response body of a client-side stream.
+    /// When it exits — error or clean end of stream — evicts the socket
+    /// from the pool and eagerly fails every request still pending on the
+    /// connection.
+    fn spawn_client_recv_loop(
+        socket_map: &HttpSocketMap,
+        addr: SocketAddr,
+        socket: HttpSocket,
+        stream_socket: StreamSocket,
+        rsp_body: Incoming,
+        state: &Arc<State>,
+    ) {
+        let socket_for_recv = Socket::HTTP(socket);
         let state = state.clone();
         let socket_map = socket_map.clone();
-        let addr = *addr;
         tokio::spawn(async move {
-            let r = Self::recv_loop(rsp.into_body(), &socket_for_recv, &state).await;
+            let r = Self::recv_loop(rsp_body, &socket_for_recv, &state).await;
             if let Err(e) = &r {
                 tracing::error!("http rpc client recv loop for {addr} failed: {e}");
             }
@@ -384,8 +418,6 @@ impl HttpSocketPool {
             );
             state.connection_closed(stream_socket.conn_id(), &err);
         });
-
-        Ok(socket)
     }
 }
 

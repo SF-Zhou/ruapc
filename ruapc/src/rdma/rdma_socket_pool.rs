@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-    sync::{Arc, Weak},
+    sync::{Arc, LazyLock, Weak},
     time::{Duration, Instant},
 };
 
@@ -29,6 +29,13 @@ use crate::{
     RdmaSocketPoolConfig, Result, Socket, SocketPoolConfig, SocketPoolTrait, SocketType, State,
     TaskSupervisor,
 };
+
+type RdmaConnectLocks = dashmap::DashMap<SocketAddr, Arc<tokio::sync::Mutex<()>>, RandomState>;
+
+/// Separate from the wire-connect gate because an RDMA handshake issues
+/// bootstrap RPCs to the same address. Keeping this registry RDMA-specific
+/// avoids recursive locking while still serializing QP setup across pools.
+static RDMA_CONNECT_LOCKS: LazyLock<RdmaConnectLocks> = LazyLock::new(RdmaConnectLocks::default);
 
 /// One RDMA connection towards a peer, tagged with bookkeeping metadata.
 ///
@@ -95,8 +102,6 @@ pub struct RdmaSocketPool {
     pollers: DevicePollers,
     /// Background port/GID cache refresher. Dropped before RDMA devices.
     _port_refresher: RdmaDeviceRefresher,
-    /// Per-peer connection locks prevent duplicate in-flight RDMA handshakes.
-    connect_locks: dashmap::DashMap<SocketAddr, Arc<tokio::sync::Mutex<()>>, RandomState>,
     /// Short-lived cache for the first-stage server RDMA device query.
     device_list_cache: RwLock<HashMap<SocketAddr, CachedRdmaInfo, RandomState>>,
     /// Thread-safe map of active RDMA connection stripes indexed by peer
@@ -294,7 +299,6 @@ impl RdmaSocketPool {
             task_supervisor,
             pollers: DevicePollers::default(),
             _port_refresher: port_refresher,
-            connect_locks: dashmap::DashMap::default(),
             device_list_cache: RwLock::default(),
             socket_map: RwLock::default(),
             conn_counts: Arc::new(
@@ -350,7 +354,7 @@ impl RdmaSocketPool {
 
     /// Returns (creating if necessary) the per-peer connect lock.
     fn peer_lock(&self, addr: &SocketAddr) -> Arc<tokio::sync::Mutex<()>> {
-        self.connect_locks
+        RDMA_CONNECT_LOCKS
             .entry(*addr)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
@@ -358,7 +362,7 @@ impl RdmaSocketPool {
 
     /// Drops the per-peer connect lock entry once no other task holds it.
     fn release_peer_lock(&self, addr: &SocketAddr, lock: &Arc<tokio::sync::Mutex<()>>) {
-        self.connect_locks.remove_if(addr, |_, value| {
+        RDMA_CONNECT_LOCKS.remove_if(addr, |_, value| {
             Arc::ptr_eq(value, lock) && Arc::strong_count(value) == 2
         });
     }

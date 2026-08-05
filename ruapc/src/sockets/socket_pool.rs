@@ -48,6 +48,9 @@ impl std::fmt::Display for SocketType {
     }
 }
 
+/// Default connect timeout applied to new outgoing connections.
+pub(crate) const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 5_000;
+
 /// Socket pool configuration.
 ///
 /// Specifies which transport protocol to use for the socket pool.
@@ -79,6 +82,15 @@ pub struct SocketPoolConfig {
     /// response (load shedding). `0` disables the cap.
     #[serde_inline_default(0usize)]
     pub max_inflight_requests: usize,
+    /// Time budget in milliseconds for establishing one outgoing
+    /// connection (TCP connect plus protocol handshake, where the
+    /// transport has one). Without a cap, dialing an unreachable address
+    /// (e.g. a downed server NIC, where SYNs are silently dropped) blocks
+    /// for the OS retransmission limit — minutes — before failing;
+    /// bounding it lets multi-address clients fail over quickly. `0`
+    /// disables the cap. Default is 5000.
+    #[serde_inline_default(DEFAULT_CONNECT_TIMEOUT_MS)]
+    pub connect_timeout_ms: u64,
     /// RDMA-specific connection and Queue Pair settings.
     #[cfg(feature = "rdma")]
     #[serde(default)]

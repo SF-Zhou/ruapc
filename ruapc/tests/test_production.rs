@@ -327,3 +327,95 @@ async fn test_multi_address_failover() {
     server.stop();
     server.join().await;
 }
+
+/// A failed address must be quarantined after the first failure: later
+/// requests go straight to the healthy address instead of paying the
+/// connect timeout on every round-robin pick of the dead one.
+#[tokio::test]
+async fn test_multi_address_quarantine_after_failure() {
+    let _ = tracing_subscriber::fmt().try_init();
+    let config = SocketPoolConfig {
+        socket_type: SocketType::TCP,
+        // Small connect budget so probing the dead address is cheap and
+        // observable (203.0.113.0/24 is reserved, typically blackholed;
+        // environments that reject instantly only make the test faster).
+        connect_timeout_ms: 500,
+        ..Default::default()
+    };
+    let (_service, server, addr) = start(&config).await;
+
+    let dead = SocketAddr::from_str("203.0.113.1:9").unwrap();
+    let ctx = ruapc::Context::create(&config)
+        .unwrap()
+        .with_addrs(vec![dead, addr]);
+    let client = ruapc::Client {
+        timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
+
+    // The first request may probe the dead address (up to the connect
+    // timeout) before failing over.
+    let rsp = client.echo(&ctx, &"warmup".to_string()).await.unwrap();
+    assert_eq!(rsp, "warmup");
+
+    // The dead address is now quarantined (cooldown 30s >> test): every
+    // follow-up request must go straight to the live server. Without the
+    // quarantine, half of these picks would start at the dead address and
+    // burn ~500ms each in connect timeouts.
+    let started = std::time::Instant::now();
+    for i in 0..6 {
+        let rsp = client.echo(&ctx, &format!("fast{i}")).await.unwrap();
+        assert_eq!(rsp, format!("fast{i}"));
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "quarantine must keep requests off the dead address, took {:?}",
+        started.elapsed()
+    );
+
+    server.stop();
+    server.join().await;
+}
+
+/// A connection dying mid-flight fails the request with
+/// `ConnectionClosed` (never auto-retried) and quarantines the address;
+/// follow-up requests flow to the surviving address.
+#[tokio::test]
+async fn test_multi_address_connection_closed_switches_over() {
+    let _ = tracing_subscriber::fmt().try_init();
+    let config = SocketPoolConfig {
+        socket_type: SocketType::TCP,
+        ..Default::default()
+    };
+    let (_service_a, server_a, addr_a) = start(&config).await;
+    let (_service_b, server_b, addr_b) = start(&config).await;
+
+    let ctx = ruapc::Context::create(&config)
+        .unwrap()
+        .with_addrs(vec![addr_a, addr_b]);
+    let client = ruapc::Client {
+        timeout: Duration::from_secs(10),
+        ..Default::default()
+    };
+
+    // First request goes to A (round-robin base 0); kill A mid-flight.
+    let inflight = tokio::spawn({
+        let (client, ctx) = (client.clone(), ctx.clone());
+        async move { client.sleepy(&ctx, &5_000).await }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    server_a.stop();
+    server_a.join().await;
+
+    let err = inflight.await.unwrap().unwrap_err();
+    assert_eq!(err.kind, ErrorKind::ConnectionClosed, "err={err:?}");
+
+    // A is quarantined: every follow-up request must succeed via B.
+    for i in 0..4 {
+        let rsp = client.echo(&ctx, &format!("b{i}")).await.unwrap();
+        assert_eq!(rsp, format!("b{i}"));
+    }
+
+    server_b.stop();
+    server_b.join().await;
+}

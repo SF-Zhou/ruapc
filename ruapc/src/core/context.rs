@@ -85,42 +85,136 @@ pub enum SocketEndpoint {
     /// A socket address to establish a connection to.
     Address(SocketAddr),
     /// Several equivalent server addresses; requests pick one round-robin
-    /// and connect-phase retries fail over to the next.
+    /// (quarantined addresses last) and connect-phase retries fail over
+    /// to the next. See [`AddrSet`].
     Addresses(Arc<AddrSet>),
 }
 
-/// A set of equivalent server addresses with a round-robin cursor.
+/// A set of equivalent server addresses (e.g. one per server NIC) with a
+/// round-robin cursor and per-address failure cooldown.
+///
+/// Requests through a multi-address context spread over the addresses
+/// round-robin. When an attempt fails in a way that indicts the address
+/// (connect failure, send failure, or the connection dying while the
+/// request was in flight), the address is quarantined for the cooldown
+/// period: new requests prefer the remaining addresses, so one downed
+/// server NIC costs at most one failed/slow request per cooldown window
+/// instead of degrading `1/N` of the traffic. The quarantine is *soft* —
+/// when every address is cooling down, requests proceed anyway (the fault
+/// may have cleared, and failing fast helps nobody) — and a quarantined
+/// address that works again is reinstated immediately.
+///
+/// The health state lives inside the set: share one `Arc<AddrSet>` across
+/// contexts (see [`Context::with_addr_set`]) so all of them benefit from
+/// the same observations.
 #[derive(Debug)]
 pub struct AddrSet {
     addrs: Vec<SocketAddr>,
     cursor: std::sync::atomic::AtomicUsize,
+    cooldown: std::time::Duration,
+    /// Per-address health state, index-aligned with `addrs`.
+    health: std::sync::Mutex<Vec<AddrHealth>>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AddrHealth {
+    down_until: Option<std::time::Instant>,
+    version: u64,
 }
 
 impl AddrSet {
-    /// Creates an address set. Empty sets are permitted but every request
-    /// through them fails with `InvalidArgument`.
+    /// Default quarantine period for a failed address.
+    pub const DEFAULT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Creates an address set with the default failure cooldown. Empty
+    /// sets are permitted but every request through them fails with
+    /// `InvalidArgument`.
     #[must_use]
     pub fn new(addrs: Vec<SocketAddr>) -> Self {
+        Self::with_cooldown(addrs, Self::DEFAULT_COOLDOWN)
+    }
+
+    /// Creates an address set with a custom failure cooldown: how long a
+    /// failed address is avoided before a request probes it again.
+    #[must_use]
+    pub fn with_cooldown(addrs: Vec<SocketAddr>, cooldown: std::time::Duration) -> Self {
+        let health = std::sync::Mutex::new(vec![AddrHealth::default(); addrs.len()]);
         Self {
             addrs,
             cursor: std::sync::atomic::AtomicUsize::new(0),
+            cooldown,
+            health,
         }
     }
 
-    /// Address for the `attempt`-th try of one request: the first attempt
-    /// advances the round-robin cursor, retries move to subsequent
-    /// addresses.
-    pub(crate) fn pick(&self, base: usize, attempt: usize) -> Option<SocketAddr> {
-        if self.addrs.is_empty() {
-            return None;
-        }
-        Some(self.addrs[(base + attempt) % self.addrs.len()])
+    /// The addresses in the set, in construction order.
+    #[must_use]
+    pub fn addrs(&self) -> &[SocketAddr] {
+        &self.addrs
     }
 
-    /// Reserves a starting position for a new request.
-    pub(crate) fn next_base(&self) -> usize {
-        self.cursor
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    /// Builds the attempt order for one request: available addresses
+    /// first (rotated by the round-robin cursor), quarantined ones last
+    /// (same rotation) as a soft fallback. Successive retry attempts of
+    /// the request walk this plan, so they always move to a different
+    /// address.
+    pub(crate) fn plan(&self) -> Vec<(SocketAddr, u64)> {
+        let len = self.addrs.len();
+        if len == 0 {
+            return Vec::new();
+        }
+        let base = self
+            .cursor
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let now = std::time::Instant::now();
+        let mut health = self.health.lock().unwrap();
+        let mut plan = Vec::with_capacity(len);
+        let mut cooling = Vec::new();
+        for i in 0..len {
+            let idx = (base + i) % len;
+            match health[idx].down_until {
+                Some(deadline) if deadline > now => {
+                    cooling.push((self.addrs[idx], health[idx].version));
+                }
+                _ => {
+                    if health[idx].down_until.take().is_some() {
+                        health[idx].version = health[idx].version.wrapping_add(1);
+                    }
+                    plan.push((self.addrs[idx], health[idx].version));
+                }
+            }
+        }
+        plan.append(&mut cooling);
+        plan
+    }
+
+    /// Quarantines `addr` for the cooldown period.
+    pub(crate) fn mark_failed(&self, addr: SocketAddr, observed_version: u64) {
+        let deadline = std::time::Instant::now().checked_add(self.cooldown);
+        let mut health = self.health.lock().unwrap();
+        for (i, a) in self.addrs.iter().enumerate() {
+            if *a == addr && health[i].version == observed_version {
+                health[i].down_until = deadline;
+                health[i].version = health[i].version.wrapping_add(1);
+            }
+        }
+    }
+
+    /// Reinstates `addr` immediately (it demonstrably works again).
+    pub(crate) fn mark_ok(&self, addr: SocketAddr, observed_version: u64) -> u64 {
+        let mut health = self.health.lock().unwrap();
+        for (i, a) in self.addrs.iter().enumerate() {
+            if *a == addr
+                && health[i].version == observed_version
+                && health[i].down_until.take().is_some()
+            {
+                health[i].version = health[i].version.wrapping_add(1);
+            }
+        }
+        self.addrs
+            .iter()
+            .position(|candidate| *candidate == addr)
+            .map_or(observed_version, |i| health[i].version)
     }
 }
 
@@ -212,17 +306,33 @@ impl Context {
         }
     }
 
-    /// Creates a new context that load-balances across several addresses.
+    /// Creates a new context that load-balances across several equivalent
+    /// addresses of the *same* server (e.g. one per NIC).
     ///
     /// Each request picks the next address round-robin; when an attempt
     /// fails before the request reaches the wire (connect or send failure),
     /// the retry moves on to the following address (see
-    /// [`Client::max_retries`](crate::Client::max_retries)).
+    /// [`Client::max_retries`](crate::Client::max_retries)). Failed
+    /// addresses are quarantined for [`AddrSet::DEFAULT_COOLDOWN`] so
+    /// subsequent requests avoid them while healthy alternatives exist —
+    /// see [`AddrSet`] for the exact semantics.
+    ///
+    /// The health state is scoped to this context (and its clones). To
+    /// share it across several contexts — or to tune the cooldown — build
+    /// the [`AddrSet`] yourself and use [`with_addr_set`](Self::with_addr_set).
     #[must_use]
     pub fn with_addrs(&self, addrs: Vec<SocketAddr>) -> Self {
+        self.with_addr_set(Arc::new(AddrSet::new(addrs)))
+    }
+
+    /// Creates a new context that load-balances across the addresses of
+    /// `addr_set`, like [`with_addrs`](Self::with_addrs), but with a
+    /// caller-provided (possibly shared) [`AddrSet`].
+    #[must_use]
+    pub fn with_addr_set(&self, addr_set: Arc<AddrSet>) -> Self {
         Self {
             state: self.state.clone(),
-            endpoint: SocketEndpoint::Addresses(Arc::new(AddrSet::new(addrs))),
+            endpoint: SocketEndpoint::Addresses(addr_set),
             drop_guard: self.drop_guard.clone(),
             msg_meta: MsgMeta::default(),
             deadline: self.deadline,
@@ -575,6 +685,90 @@ impl Context {
 mod tests {
     use super::*;
     use crate::{Error, ErrorKind, SocketPoolConfig};
+
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    fn plan_addrs(set: &AddrSet) -> Vec<SocketAddr> {
+        set.plan().into_iter().map(|(addr, _)| addr).collect()
+    }
+
+    #[test]
+    fn test_addr_set_plan_rotates_round_robin() {
+        let set = AddrSet::new(vec![addr(1), addr(2), addr(3)]);
+        assert_eq!(set.addrs().len(), 3);
+        assert_eq!(plan_addrs(&set), vec![addr(1), addr(2), addr(3)]);
+        assert_eq!(plan_addrs(&set), vec![addr(2), addr(3), addr(1)]);
+        assert_eq!(plan_addrs(&set), vec![addr(3), addr(1), addr(2)]);
+        // Empty sets yield empty plans.
+        assert!(AddrSet::new(Vec::new()).plan().is_empty());
+    }
+
+    #[test]
+    fn test_addr_set_quarantines_failed_addr_softly() {
+        let set = AddrSet::new(vec![addr(1), addr(2)]);
+        set.mark_failed(addr(1), 0);
+        // The quarantined address moves to the back of every plan…
+        assert_eq!(plan_addrs(&set), vec![addr(2), addr(1)]);
+        assert_eq!(plan_addrs(&set), vec![addr(2), addr(1)]);
+        // …and is reinstated once it demonstrably works again.
+        set.mark_ok(addr(1), 1);
+        assert_eq!(plan_addrs(&set), vec![addr(1), addr(2)]);
+
+        // Soft semantics: with every address down, plans still cover all
+        // of them (rotation preserved).
+        set.mark_failed(addr(1), 2);
+        set.mark_failed(addr(2), 0);
+        assert_eq!(set.plan().len(), 2);
+    }
+
+    #[test]
+    fn test_addr_set_cooldown_expires() {
+        let set =
+            AddrSet::with_cooldown(vec![addr(1), addr(2)], std::time::Duration::from_millis(1));
+        set.mark_failed(addr(1), 0);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        // The cooldown elapsed: the address is available again.
+        let plan = set.plan();
+        assert!(plan.iter().any(|(a, _)| *a == addr(1)));
+        assert!(plan.iter().any(|(a, _)| *a == addr(2)));
+        assert_eq!(plan_addrs(&set), vec![addr(2), addr(1)]);
+    }
+
+    #[test]
+    fn test_addr_set_marks_duplicate_addrs() {
+        let set = AddrSet::new(vec![addr(1), addr(2), addr(1)]);
+        set.mark_failed(addr(1), 0);
+        // Both copies of the failed address are quarantined.
+        assert_eq!(plan_addrs(&set), vec![addr(2), addr(1), addr(1)]);
+    }
+
+    #[test]
+    fn test_addr_set_ignores_stale_health_observations() {
+        let set = AddrSet::new(vec![addr(1), addr(2)]);
+        set.mark_failed(addr(1), 0);
+
+        // A success observed before the failure must not clear it.
+        assert_eq!(set.mark_ok(addr(1), 0), 1);
+        assert!(set.health.lock().unwrap()[0].down_until.is_some());
+
+        // A current success reinstates the address and advances its version.
+        assert_eq!(set.mark_ok(addr(1), 1), 2);
+        assert!(set.health.lock().unwrap()[0].down_until.is_none());
+
+        // A delayed failure from the original version cannot quarantine the
+        // recovered address.
+        set.mark_failed(addr(1), 0);
+        assert!(set.health.lock().unwrap()[0].down_until.is_none());
+    }
+
+    #[test]
+    fn test_addr_set_extreme_cooldown_does_not_panic() {
+        let set = AddrSet::with_cooldown(vec![addr(1)], std::time::Duration::MAX);
+        set.mark_failed(addr(1), 0);
+        assert_eq!(plan_addrs(&set), vec![addr(1)]);
+    }
 
     #[tokio::test]
     async fn test_send_rsp_invalid_endpoint_logs_and_does_not_panic() {
