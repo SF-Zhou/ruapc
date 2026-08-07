@@ -338,17 +338,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_dispatch_found_method_calls_func() {
-        use crate::{SocketPoolConfig, SocketType};
+        use crate::{Endpoint, SocketPoolConfig};
         let mut router = Router::default();
         router.add_method::<DummyReq, DummyRsp>("TestSvc/noop", Box::new(noop_func));
 
         // Build a context so dispatch has something to work with.
-        let ctx = crate::Context::create(&SocketPoolConfig {
-            socket_type: SocketType::TCP,
-            ..Default::default()
-        })
-        .unwrap();
-        let mut ctx = ctx.with_addr("127.0.0.1:9999".parse().unwrap());
+        let ctx = crate::Context::create(&SocketPoolConfig::default()).unwrap();
+        let mut ctx = ctx.with_endpoint(Endpoint::tcp("127.0.0.1:9999".parse().unwrap()));
         ctx.msg_meta.method = "TestSvc/noop".to_string();
 
         // dispatch() calls the func synchronously when the method is found.
@@ -357,15 +353,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_dispatch_method_not_found_spawns_error_response() {
-        use crate::{SocketPoolConfig, SocketType};
+        use crate::{Endpoint, SocketPoolConfig};
         let router = Router::default();
 
-        let ctx = crate::Context::create(&SocketPoolConfig {
-            socket_type: SocketType::TCP,
-            ..Default::default()
-        })
-        .unwrap();
-        let mut ctx = ctx.with_addr("127.0.0.1:9999".parse().unwrap());
+        let ctx = crate::Context::create(&SocketPoolConfig::default()).unwrap();
+        let mut ctx = ctx.with_endpoint(Endpoint::tcp("127.0.0.1:9999".parse().unwrap()));
         ctx.msg_meta.method = "UnknownSvc/missing".to_string();
 
         // dispatch() spawns a tokio task that tries to send an error response for unknown

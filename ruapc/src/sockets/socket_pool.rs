@@ -12,62 +12,33 @@ use tokio_util::sync::DropGuard;
 
 #[cfg(feature = "rdma")]
 use crate::rdma::{ConnectRequest, Endpoint, RdmaSocketPool};
-#[cfg(feature = "rdma")]
-use crate::{Error, ErrorKind};
 use crate::{
-    Result, Socket, State, http::HttpSocketPool, tcp::TcpSocketPool, unified::UnifiedSocketPool,
-    ws::WebSocketPool,
+    Endpoint as RpcEndpoint, Error, ErrorKind, ListenMode, Result, Socket, State, TaskSupervisor,
+    Transport, http::HttpSocketPool, tcp::TcpSocketPool, ws::WebSocketPool,
 };
-
-/// Transport protocol types supported by RuaPC.
-///
-/// Each socket type represents a different transport protocol with its own characteristics:
-/// - **TCP**: Raw TCP sockets with custom protocol
-/// - **WS**: WebSocket over HTTP
-/// - **HTTP**: HTTP/1.1 and HTTP/2 (h2c), supports bidirectional streaming for reverse RPC
-/// - **UNIFIED**: Accepts all protocol types on the same port
-/// - **RDMA**: High-performance RDMA (requires "rdma" feature)
-#[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone, Copy, clap::ValueEnum)]
-pub enum SocketType {
-    /// Raw TCP transport.
-    TCP,
-    /// WebSocket transport.
-    WS,
-    /// HTTP transport.
-    HTTP,
-    /// Unified transport supporting multiple protocols.
-    UNIFIED,
-    /// RDMA transport (requires "rdma" feature).
-    #[cfg(feature = "rdma")]
-    RDMA,
-}
-
-impl std::fmt::Display for SocketType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(self, f)
-    }
-}
 
 /// Socket pool configuration.
 ///
-/// Specifies which transport protocol to use for the socket pool.
+/// Configures listener behavior and transport resources.
 ///
 /// # Examples
 ///
 /// ```rust
-/// use ruapc::{SocketPoolConfig, SocketType};
+/// use ruapc::{ListenMode, SocketPoolConfig};
 ///
 /// let config = SocketPoolConfig {
-///     socket_type: SocketType::TCP,
+///     listen_mode: ListenMode::TCP,
 ///     ..Default::default()
 /// };
 /// ```
 #[serde_inline_default]
 #[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SocketPoolConfig {
-    /// The transport protocol type to use. Default is TCP.
-    #[serde_inline_default(SocketType::TCP)]
-    pub socket_type: SocketType,
+    /// How accepted TCP streams are interpreted. Outbound transport is part
+    /// of each [`Endpoint`](crate::Endpoint), not this configuration.
+    #[serde_inline_default(ListenMode::TCP)]
+    pub listen_mode: ListenMode,
     /// Maximum memory of the shared buffer pool in bytes (0 = library
     /// default, currently 256 MiB). Size it for the workload: every RDMA
     /// connection pre-posts `recv_queue_len x max_msg_size` receive
@@ -79,10 +50,11 @@ pub struct SocketPoolConfig {
     /// response (load shedding). `0` disables the cap.
     #[serde_inline_default(0usize)]
     pub max_inflight_requests: usize,
-    /// RDMA-specific connection and Queue Pair settings.
+    /// RDMA-specific settings. `None` disables RDMA device discovery,
+    /// memory registration, and connection resources.
     #[cfg(feature = "rdma")]
     #[serde(default)]
-    pub rdma: RdmaSocketPoolConfig,
+    pub rdma: Option<RdmaSocketPoolConfig>,
 }
 
 /// RDMA socket pool configuration.
@@ -266,21 +238,17 @@ impl Default for SocketPoolConfig {
     }
 }
 
-/// Socket pool managing connections for different transport protocols.
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug)]
-pub enum SocketPool {
-    /// TCP socket pool.
-    TCP(TcpSocketPool),
-    /// WebSocket pool.
-    WS(WebSocketPool),
-    /// HTTP socket pool.
-    HTTP(HttpSocketPool),
-    /// Unified socket pool supporting multiple protocols.
-    UNIFIED(UnifiedSocketPool),
-    /// RDMA socket pool (requires "rdma" feature).
+/// Composite transport pool. Outbound requests select a child by
+/// [`Endpoint::transport`](crate::Endpoint::transport); `listen_mode` only
+/// controls how accepted streams are decoded.
+pub struct SocketPool {
+    tcp: TcpSocketPool,
+    ws: WebSocketPool,
+    http: HttpSocketPool,
     #[cfg(feature = "rdma")]
-    RDMA(RdmaSocketPool),
+    rdma: Option<RdmaSocketPool>,
+    listen_mode: ListenMode,
+    task_supervisor: TaskSupervisor,
 }
 
 /// Raw network stream types.
@@ -302,12 +270,7 @@ pub trait SocketPoolTrait: Sized {
         buffer_pool: &Arc<crate::BufferPool>,
     ) -> Result<Self>;
 
-    async fn acquire(
-        &self,
-        addr: &SocketAddr,
-        socket_type: SocketType,
-        state: &Arc<State>,
-    ) -> Result<Socket>;
+    async fn acquire(&self, addr: &SocketAddr, state: &Arc<State>) -> Result<Socket>;
 
     async fn handle_new_stream(
         &self,
@@ -321,90 +284,72 @@ pub trait SocketPoolTrait: Sized {
     fn drop_guard(&self) -> DropGuard;
 
     async fn join(&self);
-
-    #[cfg(feature = "rdma")]
-    fn rdma_device_list(&self) -> Result<crate::rdma::RdmaInfo> {
-        Err(Error::new(
-            ErrorKind::InvalidArgument,
-            "RDMA is not supported: invalid socket type".into(),
-        ))
-    }
-
-    #[cfg(feature = "rdma")]
-    #[allow(unused_variables)]
-    fn rdma_accept(&self, request: &ConnectRequest, state: &Arc<State>) -> Result<Endpoint> {
-        Err(Error::new(
-            ErrorKind::InvalidArgument,
-            "RDMA is not supported: invalid socket type".into(),
-        ))
-    }
 }
 
 impl SocketPool {
-    /// Returns the socket type of this pool.
-    #[must_use]
-    pub fn socket_type(&self) -> SocketType {
-        match self {
-            SocketPool::TCP(_) => SocketType::TCP,
-            SocketPool::WS(_) => SocketType::WS,
-            SocketPool::HTTP(_) => SocketType::HTTP,
-            SocketPool::UNIFIED(_) => SocketType::UNIFIED,
-            #[cfg(feature = "rdma")]
-            SocketPool::RDMA(_) => SocketType::RDMA,
-        }
-    }
-
-    /// Creates a socket pool with the given configuration, devices, and buffer pool.
+    /// Creates all lightweight stream pools and, when explicitly enabled,
+    /// the RDMA pool.
     pub fn create(
         config: &SocketPoolConfig,
         devices: &Arc<crate::Devices>,
         buffer_pool: &Arc<crate::BufferPool>,
     ) -> Result<Self> {
-        match config.socket_type {
-            SocketType::TCP => Ok(SocketPool::TCP(TcpSocketPool::create(
-                config,
-                devices,
-                buffer_pool,
-            )?)),
-            SocketType::WS => Ok(SocketPool::WS(WebSocketPool::create(
-                config,
-                devices,
-                buffer_pool,
-            )?)),
-            SocketType::HTTP => Ok(SocketPool::HTTP(HttpSocketPool::create(
-                config,
-                devices,
-                buffer_pool,
-            )?)),
-            SocketType::UNIFIED => Ok(SocketPool::UNIFIED(UnifiedSocketPool::create(
-                config,
-                devices,
-                buffer_pool,
-            )?)),
+        let task_supervisor = TaskSupervisor::create();
+        let tcp = TcpSocketPool::create(config, devices, buffer_pool)?;
+        let ws = WebSocketPool::create(config, devices, buffer_pool)?;
+        let http = HttpSocketPool::create(config, devices, buffer_pool)?;
+        #[cfg(feature = "rdma")]
+        let rdma = config
+            .rdma
+            .as_ref()
+            .map(|_| RdmaSocketPool::create(config, devices, buffer_pool))
+            .transpose()?;
+
+        let task = task_supervisor.start_async_task();
+        let tcp_guard = tcp.drop_guard();
+        let ws_guard = ws.drop_guard();
+        let http_guard = http.drop_guard();
+        #[cfg(feature = "rdma")]
+        let rdma_guard = rdma.as_ref().map(SocketPoolTrait::drop_guard);
+        tokio::spawn(async move {
+            task.stopped().await;
+            drop(http_guard);
+            drop(ws_guard);
+            drop(tcp_guard);
             #[cfg(feature = "rdma")]
-            SocketType::RDMA => Ok(SocketPool::RDMA(RdmaSocketPool::create(
-                config,
-                devices,
-                buffer_pool,
-            )?)),
+            drop(rdma_guard);
+        });
+
+        Ok(Self {
+            tcp,
+            ws,
+            http,
+            #[cfg(feature = "rdma")]
+            rdma,
+            listen_mode: config.listen_mode,
+            task_supervisor,
+        })
+    }
+
+    /// Acquires a socket using the transport carried by `endpoint`.
+    pub async fn acquire(&self, endpoint: RpcEndpoint, state: &Arc<State>) -> Result<Socket> {
+        match endpoint.transport() {
+            Transport::TCP => self.tcp.acquire(&endpoint.addr(), state).await,
+            Transport::WS => self.ws.acquire(&endpoint.addr(), state).await,
+            Transport::HTTP => self.http.acquire(&endpoint.addr(), state).await,
+            #[cfg(feature = "rdma")]
+            Transport::RDMA => match &self.rdma {
+                Some(pool) => pool.acquire(&endpoint.addr(), state).await,
+                None => Err(Error::new(
+                    ErrorKind::InvalidArgument,
+                    "RDMA endpoint requires SocketPoolConfig.rdma = Some(...)".into(),
+                )),
+            },
         }
     }
 
-    /// Acquires a socket connection to the specified address.
-    pub async fn acquire(
-        &self,
-        addr: &SocketAddr,
-        socket_type: SocketType,
-        state: &Arc<State>,
-    ) -> Result<Socket> {
-        match self {
-            SocketPool::TCP(p) => p.acquire(addr, socket_type, state).await,
-            SocketPool::WS(p) => p.acquire(addr, socket_type, state).await,
-            SocketPool::HTTP(p) => p.acquire(addr, socket_type, state).await,
-            SocketPool::UNIFIED(p) => p.acquire(addr, socket_type, state).await,
-            #[cfg(feature = "rdma")]
-            SocketPool::RDMA(p) => p.acquire(addr, socket_type, state).await,
-        }
+    pub(crate) fn task_supervisor_handle(&self) -> crate::TaskSupervisorHandle {
+        self.task_supervisor.handle()
     }
 
     /// Handles a new incoming connection stream.
@@ -414,27 +359,76 @@ impl SocketPool {
         stream: RawStream,
         addr: SocketAddr,
     ) -> Result<()> {
-        match self {
-            SocketPool::TCP(p) => p.handle_new_stream(state, stream, addr).await,
-            SocketPool::WS(p) => p.handle_new_stream(state, stream, addr).await,
-            SocketPool::HTTP(p) => p.handle_new_stream(state, stream, addr).await,
-            SocketPool::UNIFIED(p) => p.handle_new_stream(state, stream, addr).await,
-            #[cfg(feature = "rdma")]
-            SocketPool::RDMA(_) => Err(Error::new(
-                ErrorKind::InvalidArgument,
-                "invalid socket type".into(),
-            )),
+        let RawStream::TCP(stream) = stream else {
+            return self.ws.handle_new_stream(state, stream, addr).await;
+        };
+        match self.listen_mode {
+            ListenMode::TCP => {
+                self.tcp
+                    .handle_new_stream(state, RawStream::TCP(stream), addr)
+                    .await
+            }
+            ListenMode::WS => {
+                self.ws
+                    .handle_new_stream(state, RawStream::TCP(stream), addr)
+                    .await
+            }
+            ListenMode::HTTP => {
+                self.http
+                    .handle_new_stream(state, RawStream::TCP(stream), addr)
+                    .await
+            }
+            ListenMode::UNIFIED => {
+                if Self::peek_is_tcp_magic(&stream).await? {
+                    self.tcp
+                        .handle_new_stream(state, RawStream::TCP(stream), addr)
+                        .await
+                } else {
+                    self.http
+                        .handle_new_stream(state, RawStream::TCP(stream), addr)
+                        .await
+                }
+            }
+        }
+    }
+
+    /// Decides whether an accepted stream speaks the RuaPC TCP protocol by
+    /// peeking at its first bytes.
+    ///
+    /// `peek` returns whatever is buffered, which can be a strict prefix of
+    /// the magic (e.g. the lone `R` of a fragmented HTTP `REPORT` request).
+    /// Committing on a prefix would misroute, so wait until the full magic
+    /// arrived or a byte diverged. Peeking cannot block on "more than N
+    /// bytes", hence the short sleep between polls; the deadline bounds a
+    /// peer that stalls mid-prefix (then only a genuine — if broken — RuaPC
+    /// client is plausible, so fall back to TCP).
+    async fn peek_is_tcp_magic(stream: &tokio::net::TcpStream) -> Result<bool> {
+        let magic = crate::sockets::tcp::MAGIC_NUM.to_be_bytes();
+        let mut buf = [0u8; std::mem::size_of::<u32>()];
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            let n = stream
+                .peek(&mut buf)
+                .await
+                .map_err(|e| Error::new(ErrorKind::TcpRecvMsgFailed, e.to_string()))?;
+            if n == 0 {
+                // EOF before any data: hand to HTTP for a graceful close.
+                return Ok(false);
+            }
+            if buf[..n] != magic[..n] {
+                return Ok(false);
+            }
+            if n >= magic.len() || tokio::time::Instant::now() >= deadline {
+                return Ok(true);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
     }
 
     /// Returns the underlying RDMA socket pool, if this pool has one.
     #[cfg(feature = "rdma")]
     pub(crate) fn rdma_pool(&self) -> Option<&RdmaSocketPool> {
-        match self {
-            SocketPool::RDMA(p) => Some(p),
-            SocketPool::UNIFIED(p) => Some(&p.rdma_socket_pool),
-            _ => None,
-        }
+        self.rdma.as_ref()
     }
 
     /// Acquires an RDMA socket to `addr` whose path (NIC pair) matches
@@ -450,69 +444,61 @@ impl SocketPool {
             Some(pool) => pool.acquire_path(addr, Some(selector), state).await,
             None => Err(Error::new(
                 ErrorKind::InvalidArgument,
-                "RDMA is not supported: invalid socket type".into(),
+                "RDMA is not enabled".into(),
             )),
         }
     }
 
     #[cfg(feature = "rdma")]
     pub fn rdma_device_list(&self) -> Result<crate::rdma::RdmaInfo> {
-        match self {
-            SocketPool::RDMA(p) => p.rdma_device_list(),
-            SocketPool::UNIFIED(p) => p.rdma_device_list(),
-            _ => Err(Error::new(
+        match &self.rdma {
+            Some(pool) => pool.rdma_device_list(),
+            None => Err(Error::new(
                 ErrorKind::InvalidArgument,
-                "RDMA is not supported: invalid socket type".into(),
+                "RDMA is not enabled".into(),
             )),
         }
     }
 
     #[cfg(feature = "rdma")]
     pub fn rdma_accept(&self, request: &ConnectRequest, state: &Arc<State>) -> Result<Endpoint> {
-        match self {
-            SocketPool::RDMA(p) => p.rdma_accept(request, state),
-            SocketPool::UNIFIED(p) => p.rdma_accept(request, state),
-            _ => Err(Error::new(
+        match &self.rdma {
+            Some(pool) => pool.rdma_accept(request, state),
+            None => Err(Error::new(
                 ErrorKind::InvalidArgument,
-                "RDMA is not supported: invalid socket type".into(),
+                "RDMA is not enabled".into(),
             )),
         }
     }
 
     /// Stops the socket pool and initiates connection cleanup.
     pub fn stop(&self) {
-        match self {
-            SocketPool::TCP(p) => p.stop(),
-            SocketPool::WS(p) => p.stop(),
-            SocketPool::HTTP(p) => p.stop(),
-            SocketPool::UNIFIED(p) => p.stop(),
-            #[cfg(feature = "rdma")]
-            SocketPool::RDMA(p) => p.stop(),
-        }
+        self.task_supervisor.stop();
     }
 
     /// Creates a drop guard for this socket pool.
     pub fn drop_guard(&self) -> DropGuard {
-        match self {
-            SocketPool::TCP(p) => p.drop_guard(),
-            SocketPool::WS(p) => p.drop_guard(),
-            SocketPool::HTTP(p) => p.drop_guard(),
-            SocketPool::UNIFIED(p) => p.drop_guard(),
-            #[cfg(feature = "rdma")]
-            SocketPool::RDMA(p) => p.drop_guard(),
-        }
+        self.task_supervisor.drop_guard()
     }
 
     /// Waits for all connections in the pool to close.
     pub async fn join(&self) {
-        match self {
-            SocketPool::TCP(p) => p.join().await,
-            SocketPool::WS(p) => p.join().await,
-            SocketPool::HTTP(p) => p.join().await,
-            SocketPool::UNIFIED(p) => p.join().await,
-            #[cfg(feature = "rdma")]
-            SocketPool::RDMA(p) => p.join().await,
+        self.task_supervisor.all_stopped().await;
+        self.tcp.join().await;
+        self.ws.join().await;
+        self.http.join().await;
+        #[cfg(feature = "rdma")]
+        if let Some(pool) = &self.rdma {
+            pool.join().await;
         }
+    }
+}
+
+impl std::fmt::Debug for SocketPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SocketPool")
+            .field("listen_mode", &self.listen_mode)
+            .finish_non_exhaustive()
     }
 }
 
@@ -521,20 +507,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_socket_pool_config_default_is_tcp() {
+    fn config_defaults_to_tcp_without_rdma() {
         let config = SocketPoolConfig::default();
-        assert_eq!(config.socket_type, SocketType::TCP);
+        assert_eq!(config.listen_mode, ListenMode::TCP);
+        #[cfg(feature = "rdma")]
+        assert!(config.rdma.is_none());
     }
 
     #[test]
-    fn test_socket_pool_config_serde_roundtrip() {
+    fn config_serde_roundtrip() {
         let config = SocketPoolConfig {
-            socket_type: SocketType::WS,
+            listen_mode: ListenMode::UNIFIED,
             ..Default::default()
         };
         let json = serde_json::to_string(&config).unwrap();
         let recovered: SocketPoolConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(recovered, config);
+        assert!(serde_json::from_str::<SocketPoolConfig>(r#"{"socket_type":"UNIFIED"}"#).is_err());
     }
 
     /// Every RDMA config field carries an inline serde default, so a
@@ -542,98 +531,30 @@ mod tests {
     /// their documented defaults (also the source of `Default`).
     #[cfg(feature = "rdma")]
     #[test]
-    fn test_rdma_config_partial_object_fills_defaults() {
+    fn rdma_config_partial_object_fills_defaults() {
         let config: SocketPoolConfig =
-            serde_json::from_str(r#"{"socket_type":"RDMA","rdma":{"recv_queue_len":16}}"#).unwrap();
-        assert_eq!(config.rdma.recv_queue_len, 16);
-        assert_eq!(config.rdma.qp, RdmaQueuePairConfig::default());
-        assert_eq!(config.rdma.cq_len, 128);
-        assert_eq!(config.rdma.pkey_index, 0);
-        assert_eq!(config.rdma.max_msg_size, 256 * 1024);
-        assert_eq!(config.rdma.dispatch_workers, 32);
-        assert_eq!(config.rdma.read_timeout_ms, 10_000);
-        assert_eq!(config.rdma.max_inflight_read_wrs, 32);
-        assert_eq!(config.rdma.traffic_class, 0);
+            serde_json::from_str(r#"{"rdma":{"recv_queue_len":16}}"#).unwrap();
+        let rdma = config.rdma.unwrap();
+        assert_eq!(rdma.recv_queue_len, 16);
+        assert_eq!(rdma.qp, RdmaQueuePairConfig::default());
+        assert_eq!(rdma.cq_len, 128);
+        assert_eq!(rdma.pkey_index, 0);
+        assert_eq!(rdma.max_msg_size, 256 * 1024);
+        assert_eq!(rdma.dispatch_workers, 32);
+        assert_eq!(rdma.read_timeout_ms, 10_000);
+        assert_eq!(rdma.max_inflight_read_wrs, 32);
+        assert_eq!(rdma.traffic_class, 0);
         // `Default` is exactly the all-defaults deserialization.
         let default: RdmaSocketPoolConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(default, RdmaSocketPoolConfig::default());
     }
 
-    #[test]
-    fn test_socket_type_display() {
-        assert_eq!(SocketType::TCP.to_string(), "TCP");
-        assert_eq!(SocketType::WS.to_string(), "WS");
-        assert_eq!(SocketType::HTTP.to_string(), "HTTP");
-        assert_eq!(SocketType::UNIFIED.to_string(), "UNIFIED");
-    }
-
     #[tokio::test]
-    async fn test_socket_pool_tcp_socket_type() {
+    async fn composite_pool_lifecycle() {
         let config = SocketPoolConfig::default();
         let devices = std::sync::Arc::new(crate::Devices::default());
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
-        assert_eq!(pool.socket_type(), SocketType::TCP);
-        pool.stop();
-        drop(pool.drop_guard());
-        pool.join().await;
-    }
-
-    #[tokio::test]
-    async fn test_socket_pool_ws_socket_type() {
-        let config = SocketPoolConfig {
-            socket_type: SocketType::WS,
-            ..Default::default()
-        };
-        let devices = std::sync::Arc::new(crate::Devices::default());
-        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
-        let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
-        assert_eq!(pool.socket_type(), SocketType::WS);
-        pool.stop();
-        drop(pool.drop_guard());
-        pool.join().await;
-    }
-
-    #[tokio::test]
-    async fn test_socket_pool_http_socket_type() {
-        let config = SocketPoolConfig {
-            socket_type: SocketType::HTTP,
-            ..Default::default()
-        };
-        let devices = std::sync::Arc::new(crate::Devices::default());
-        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
-        let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
-        assert_eq!(pool.socket_type(), SocketType::HTTP);
-        // Verify stop/drop_guard/join can be called without panicking.
-        pool.stop();
-        drop(pool.drop_guard());
-        pool.join().await;
-    }
-
-    #[tokio::test]
-    async fn test_socket_pool_unified_socket_type() {
-        let config = SocketPoolConfig {
-            socket_type: SocketType::UNIFIED,
-            ..Default::default()
-        };
-        let devices = std::sync::Arc::new(crate::Devices::default());
-        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
-        let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
-        assert_eq!(pool.socket_type(), SocketType::UNIFIED);
-        pool.stop();
-    }
-
-    #[cfg(feature = "rdma")]
-    #[tokio::test]
-    async fn test_socket_pool_rdma_socket_type() {
-        let devices = crate::rdma::test_utils::make_rdma_devices();
-        let config = SocketPoolConfig {
-            socket_type: SocketType::RDMA,
-            ..Default::default()
-        };
-        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
-        let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
-        assert_eq!(pool.socket_type(), SocketType::RDMA);
         pool.stop();
         drop(pool.drop_guard());
         pool.join().await;
@@ -641,90 +562,22 @@ mod tests {
 
     #[cfg(feature = "rdma")]
     #[tokio::test]
-    async fn test_socket_pool_rdma_device_list_from_rdma_pool() {
+    async fn rdma_capability_is_explicit() {
         let devices = crate::rdma::test_utils::make_rdma_devices();
         let config = SocketPoolConfig {
-            socket_type: SocketType::RDMA,
+            rdma: Some(RdmaSocketPoolConfig::default()),
             ..Default::default()
         };
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
         let info = pool.rdma_device_list().unwrap();
         assert!(!info.devices.is_empty());
-    }
-
-    #[cfg(feature = "rdma")]
-    #[tokio::test]
-    async fn test_socket_pool_rdma_device_list_from_non_rdma_returns_err() {
-        let config = SocketPoolConfig::default(); // TCP pool
-        let devices = std::sync::Arc::new(crate::Devices::default());
-        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
-        let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
-        assert!(pool.rdma_device_list().is_err());
-        pool.stop();
-        pool.join().await;
-    }
-
-    #[cfg(feature = "rdma")]
-    #[tokio::test]
-    async fn test_socket_pool_rdma_accept_non_rdma_returns_err() {
-        let config = SocketPoolConfig::default(); // TCP pool
-        let devices = std::sync::Arc::new(crate::Devices::default());
-        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
-        let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
-        let (state, _guard) = crate::State::create(crate::Router::default(), &config).unwrap();
-        let request = crate::rdma::ConnectRequest {
-            source_device: "test".into(),
-            target: crate::rdma::DeviceSelection {
-                device_name: "missing".into(),
-                port_num: 1,
-                gid_index: 0,
-            },
-            endpoint: crate::rdma::Endpoint {
-                qp_num: 0,
-                port_num: 1,
-                gid_index: 0,
-                gid: ruapc_rdma::ibv_gid::default(),
-                lid: 0,
-                link_layer: ruapc_rdma::LinkLayer::Ethernet,
-                active_mtu: ruapc_rdma::ibv_mtu::IBV_MTU_512,
-                psn: 0,
-                rd_atomic_cap: 1,
-            },
-            config: crate::rdma::RdmaConnectionConfig {
-                qp: RdmaQueuePairConfig::default(),
-                cq_len: 128,
-                recv_queue_len: 64,
-                max_msg_size: 1024 * 1024,
-                traffic_class: 0,
-            },
-        };
-        assert!(pool.rdma_accept(&request, &state).is_err());
-        pool.stop();
-        pool.join().await;
-    }
-
-    #[cfg(feature = "rdma")]
-    #[tokio::test]
-    async fn test_socket_pool_handle_new_stream_rdma_returns_err() {
-        use tokio::net::TcpListener;
-        let devices = crate::rdma::test_utils::make_rdma_devices();
-        let config = SocketPoolConfig {
-            socket_type: SocketType::RDMA,
-            ..Default::default()
-        };
-        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
-        let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
-        let (state, _guard) = crate::State::create(crate::Router::default(), &config).unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        // Connect a client to get a stream.
-        let client_task = tokio::spawn(tokio::net::TcpStream::connect(addr));
-        let (server_stream, _) = listener.accept().await.unwrap();
-        let _ = client_task.await;
-        let result = pool
-            .handle_new_stream(&state, RawStream::TCP(server_stream), addr)
-            .await;
-        assert!(result.is_err());
+        let disabled = SocketPoolConfig::default();
+        let disabled_devices = std::sync::Arc::new(crate::Devices::default());
+        let disabled_buffers =
+            ruapc_bufpool::BufferPoolBuilder::new(disabled_devices.clone()).build();
+        let disabled_pool =
+            SocketPool::create(&disabled, &disabled_devices, &disabled_buffers).unwrap();
+        assert!(disabled_pool.rdma_device_list().is_err());
     }
 }

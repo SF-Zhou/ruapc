@@ -20,33 +20,77 @@ pub enum HttpSocket {
 /// Sender half of an HTTP/2 `/_rpc` bidirectional stream.
 #[derive(Clone, Debug)]
 pub struct StreamSocket {
+    inner: Arc<StreamSocketInner>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StreamSocketInner {
     sender: mpsc::Sender<Bytes>,
-    conn_id: u64,
-    closed: Arc<std::sync::atomic::AtomicBool>,
+    lifecycle: crate::sockets::ConnectionLifecycle,
+}
+
+impl StreamSocketInner {
+    pub(crate) fn is_closed(&self) -> bool {
+        self.lifecycle.is_closed() || self.sender.is_closed()
+    }
 }
 
 impl StreamSocket {
     pub(crate) fn new(sender: mpsc::Sender<Bytes>) -> Self {
         Self {
-            sender,
-            conn_id: crate::task::next_conn_id(),
-            closed: Arc::default(),
+            inner: Arc::new(StreamSocketInner {
+                sender,
+                lifecycle: crate::sockets::ConnectionLifecycle::new(),
+            }),
         }
     }
 
     /// Unique id of the underlying connection.
     pub(crate) fn conn_id(&self) -> u64 {
-        self.conn_id
+        self.inner.lifecycle.conn_id()
     }
 
     /// Whether `other` refers to the same underlying connection.
     pub(crate) fn same_socket(&self, other: &Self) -> bool {
-        self.conn_id == other.conn_id
+        self.conn_id() == other.conn_id()
     }
 
     /// Marks the connection closed; returns `true` exactly once.
     pub(crate) fn mark_closed(&self) -> bool {
-        !self.closed.swap(true, std::sync::atomic::Ordering::SeqCst)
+        self.inner.lifecycle.close_once()
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+}
+
+impl crate::sockets::PoolConnection for HttpSocket {
+    fn is_closed(&self) -> bool {
+        self.is_closed()
+    }
+
+    fn same_connection(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Stream(left), Self::Stream(right)) => left.same_socket(right),
+            _ => false,
+        }
+    }
+}
+
+impl HttpSocket {
+    pub(crate) fn is_closed(&self) -> bool {
+        match self {
+            Self::ForResponse(_) => false,
+            Self::Stream(socket) => socket.is_closed(),
+        }
+    }
+
+    pub(crate) fn health(&self) -> Option<std::sync::Weak<StreamSocketInner>> {
+        match self {
+            Self::ForResponse(_) => None,
+            Self::Stream(socket) => Some(Arc::downgrade(&socket.inner)),
+        }
     }
 }
 
@@ -152,10 +196,18 @@ impl SocketTrait for HttpSocket {
                 if meta.is_req() {
                     state
                         .waiter
-                        .bind_connection(meta.msgid, stream_socket.conn_id);
+                        .bind_connection(meta.msgid, stream_socket.conn_id());
+                }
+
+                if stream_socket.is_closed() {
+                    return Err(Error::new(
+                        ErrorKind::ConnectionClosed,
+                        "HTTP connection is closed".into(),
+                    ));
                 }
 
                 stream_socket
+                    .inner
                     .sender
                     .send(bytes.0.into())
                     .await

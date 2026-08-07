@@ -16,8 +16,8 @@
 //! Works identically over TCP / WS / HTTP / RDMA:
 //!
 //! ```sh
-//! cargo run --bin remote_memory -- --socket-type tcp
-//! cargo run --bin remote_memory --features rdma -- --socket-type rdma
+//! cargo run --bin remote_memory -- --transport tcp
+//! cargo run --bin remote_memory --features rdma -- --transport rdma
 //! ```
 
 use std::str::FromStr;
@@ -31,9 +31,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
 pub struct Args {
-    /// Socket type used by the client.
+    /// Transport used by the in-process client.
     #[arg(long, default_value = "tcp")]
-    pub socket_type: SocketType,
+    pub transport: Transport,
 }
 
 // ==========================================================================
@@ -119,7 +119,9 @@ async fn main() {
 
     // ---- Server ----------------------------------------------------------
     let config = SocketPoolConfig {
-        socket_type: SocketType::UNIFIED,
+        listen_mode: ListenMode::UNIFIED,
+        #[cfg(feature = "rdma")]
+        rdma: (args.transport == Transport::RDMA).then(Default::default),
         ..Default::default()
     };
     let mut router = Router::default();
@@ -130,11 +132,10 @@ async fn main() {
     tracing::info!("server listening on {addr}");
 
     // ---- Client ----------------------------------------------------------
-    let ctx = Context::create(&config).unwrap().with_addr(addr);
-    let client = Client {
-        socket_type: Some(args.socket_type),
-        ..Default::default()
-    };
+    let ctx = Context::create(&config)
+        .unwrap()
+        .with_endpoint(Endpoint::new(args.transport, addr));
+    let client = Client::default();
 
     // Upload: fill two registered buffers, mark the valid lengths, attach
     // them — together they form one logical read space.

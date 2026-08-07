@@ -17,7 +17,7 @@
 
 use std::{str::FromStr, sync::Arc, time::Instant};
 
-use ruapc::{Client, Context, Router, Server, SocketPoolConfig, SocketType};
+use ruapc::{Client, Context, Endpoint, ListenMode, Router, Server, SocketPoolConfig, Transport};
 
 const WARMUP_ITERS: usize = 1_000;
 const SERIAL_ITERS: usize = 5_000;
@@ -26,13 +26,6 @@ const CONCURRENT_TASKS: [usize; 2] = [64, 1024];
 /// Total number of requests per concurrent run, split evenly across tasks
 /// so every concurrency level issues the same amount of work.
 const CONCURRENT_TOTAL_OPS: usize = 256_000;
-
-fn bench_client(socket_type: SocketType) -> Client {
-    Client {
-        socket_type: Some(socket_type),
-        ..Default::default()
-    }
-}
 
 #[ruapc::service]
 trait EchoService {
@@ -48,8 +41,8 @@ impl EchoService for EchoImpl {
 }
 
 /// Serial round-trip latency: one request in flight at a time.
-async fn bench_serial(ctx: &Context, socket_type: SocketType, payload_size: usize) {
-    let client = bench_client(socket_type);
+async fn bench_serial(ctx: &Context, payload_size: usize) {
+    let client = Client::default();
     let req = "x".repeat(payload_size);
 
     for _ in 0..WARMUP_ITERS {
@@ -68,12 +61,7 @@ async fn bench_serial(ctx: &Context, socket_type: SocketType, payload_size: usiz
 }
 
 /// Concurrent closed-loop throughput at the given concurrency level.
-async fn bench_concurrent(
-    ctx: &Context,
-    socket_type: SocketType,
-    payload_size: usize,
-    num_tasks: usize,
-) {
+async fn bench_concurrent(ctx: &Context, payload_size: usize, num_tasks: usize) {
     let req = Arc::new("x".repeat(payload_size));
     let iters_per_task = CONCURRENT_TOTAL_OPS / num_tasks;
 
@@ -83,7 +71,7 @@ async fn bench_concurrent(
         let ctx = ctx.clone();
         let req = req.clone();
         tasks.push(tokio::spawn(async move {
-            let client = bench_client(socket_type);
+            let client = Client::default();
             for _ in 0..iters_per_task {
                 std::hint::black_box(client.echo(&ctx, &req).await.unwrap());
             }
@@ -111,7 +99,9 @@ async fn run() {
     echo.ruapc_export(&mut router);
 
     let config = SocketPoolConfig {
-        socket_type: SocketType::UNIFIED,
+        listen_mode: ListenMode::UNIFIED,
+        #[cfg(feature = "rdma")]
+        rdma: Some(Default::default()),
         // The default pool (256 MiB) is sized for regular workloads; at
         // 1024 closed-loop tasks the per-request send buffers exhaust it
         // and allocation waits show up as artificial latency/timeouts.
@@ -121,25 +111,25 @@ async fn run() {
     let server = Server::create(router, &config).unwrap();
     let addr = std::net::SocketAddr::from_str("127.0.0.1:0").unwrap();
     let addr = server.listen(addr).await.unwrap();
+    #[cfg(feature = "rdma")]
+    let second_addr = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
 
-    let ctx = Context::create(&config).unwrap().with_addr(addr);
+    let base_ctx = Context::create(&config).unwrap();
 
-    let socket_types = [
-        SocketType::TCP,
-        SocketType::WS,
-        SocketType::HTTP,
+    let transports = [
+        Transport::TCP,
+        Transport::WS,
+        Transport::HTTP,
         #[cfg(feature = "rdma")]
-        SocketType::RDMA,
+        Transport::RDMA,
     ];
-    for socket_type in socket_types {
-        println!("{socket_type:?}");
+    for transport in transports {
+        println!("{transport:?}");
+        let ctx = base_ctx.with_endpoint(Endpoint::new(transport, addr));
 
         // Probe the transport once: environments without e.g. a usable RDMA
         // device should skip instead of failing the whole benchmark.
-        let probe_client = Client {
-            socket_type: Some(socket_type),
-            ..Default::default()
-        };
+        let probe_client = Client::default();
         if let Err(err) = probe_client.echo(&ctx, &"probe".to_string()).await {
             println!("  skipped: {err}");
             println!();
@@ -147,10 +137,28 @@ async fn run() {
         }
 
         for payload_size in [16, 4096] {
-            bench_serial(&ctx, socket_type, payload_size).await;
+            bench_serial(&ctx, payload_size).await;
         }
         for num_tasks in CONCURRENT_TASKS {
-            bench_concurrent(&ctx, socket_type, 16, num_tasks).await;
+            bench_concurrent(&ctx, 16, num_tasks).await;
+        }
+        println!();
+    }
+
+    #[cfg(feature = "rdma")]
+    {
+        println!("RDMA (2 endpoints)");
+        let ctx = base_ctx.with_endpoints(vec![
+            Endpoint::new(Transport::RDMA, addr),
+            Endpoint::new(Transport::RDMA, second_addr),
+        ]);
+        let probe_client = Client::default();
+        if let Err(err) = probe_client.echo(&ctx, &"probe".to_string()).await {
+            println!("  skipped: {err}");
+        } else {
+            for num_tasks in CONCURRENT_TASKS {
+                bench_concurrent(&ctx, 16, num_tasks).await;
+            }
         }
         println!();
     }

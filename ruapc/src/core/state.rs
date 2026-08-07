@@ -3,9 +3,11 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio_util::sync::DropGuard;
 
 use crate::{
-    BufferPool, Context, Devices, Message, Metrics, RawStream, Result, Router, Socket, SocketPool,
-    SocketPoolConfig, Waiter,
+    BufferPool, Context, Devices, Endpoint, Message, Metrics, RawStream, Result, Router, Socket,
+    SocketPool, SocketPoolConfig, Waiter,
 };
+
+use super::EndpointState;
 
 /// Shared state for the RPC system.
 ///
@@ -33,6 +35,7 @@ pub struct State {
     /// Server-side in-flight request cap (0 = unlimited); excess requests
     /// are rejected with [`ErrorKind::Overloaded`](crate::ErrorKind).
     pub(crate) max_inflight_requests: usize,
+    pub(crate) endpoint_states: dashmap::DashMap<Endpoint, Arc<EndpointState>>,
 }
 
 impl State {
@@ -77,27 +80,34 @@ impl State {
             buffer_pool,
             metrics: Arc::default(),
             max_inflight_requests: config.max_inflight_requests,
+            endpoint_states: dashmap::DashMap::new(),
         };
         let state = Arc::new(state);
         let drop_guard = state.drop_guard();
         Ok((state, drop_guard))
     }
 
+    pub(crate) fn endpoint_state(&self, endpoint: Endpoint) -> Arc<EndpointState> {
+        self.endpoint_states
+            .entry(endpoint)
+            .or_insert_with(|| Arc::new(EndpointState::new(endpoint)))
+            .clone()
+    }
+
     /// Discovers and creates devices based on the socket pool configuration.
     ///
-    /// Always adds a TCP device. When the `rdma` feature is enabled and the
-    /// socket type is RDMA or UNIFIED, automatically discovers available
-    /// RDMA devices.
+    /// Always adds a TCP device. When the `rdma` feature and
+    /// `SocketPoolConfig::rdma` is `Some`, discovers available RDMA devices
+    /// before constructing the shared buffer pool.
     fn discover_devices(config: &SocketPoolConfig) -> Devices {
         #[cfg(feature = "rdma")]
         {
             let mut devices = Devices::default();
-            use crate::SocketType;
-            if matches!(config.socket_type, SocketType::RDMA | SocketType::UNIFIED)
+            if let Some(rdma) = &config.rdma
                 && let Ok(active_devices) = ruapc_rdma::ActiveDevice::available()
             {
                 let prefer_rxe = std::env::var("RUAPC_PREFER_RXE").is_ok();
-                let filter = &config.rdma.device_filter;
+                let filter = &rdma.device_filter;
                 for dev in active_devices {
                     if prefer_rxe && !dev.info().name.starts_with("rxe") {
                         continue;
@@ -160,7 +170,7 @@ impl State {
     /// # Errors
     ///
     /// Returns [`ErrorKind::InvalidArgument`](crate::ErrorKind::InvalidArgument)
-    /// when the socket pool has no RDMA support (not an RDMA/UNIFIED pool).
+    /// when RDMA resources were not enabled in `SocketPoolConfig`.
     #[cfg(feature = "rdma")]
     pub async fn rdma_path_report(&self) -> Result<crate::RdmaPathReport> {
         match self.socket_pool.rdma_pool() {
@@ -182,16 +192,11 @@ impl std::fmt::Debug for State {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        Message, MsgFlags, MsgMeta, Payload, SocketPoolConfig, SocketType, sockets::tcp::TcpSocket,
-    };
+    use crate::{Message, MsgFlags, MsgMeta, Payload, SocketPoolConfig, sockets::tcp::TcpSocket};
 
     #[tokio::test]
     async fn test_handle_recv_invalid_msg_type_warns_and_ok() {
-        let config = SocketPoolConfig {
-            socket_type: SocketType::TCP,
-            ..Default::default()
-        };
+        let config = SocketPoolConfig::default();
         let router = crate::Router::default();
         let (state, _guard) = State::create(router, &config).unwrap();
 

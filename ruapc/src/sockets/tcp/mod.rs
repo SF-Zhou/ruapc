@@ -27,7 +27,7 @@ pub(crate) fn configure_stream(stream: &tokio::net::TcpStream) {
 }
 
 mod tcp_socket;
-pub(crate) use tcp_socket::TcpSocket;
+pub(crate) use tcp_socket::{TcpSocket, TcpSocketInner};
 
 mod tcp_socket_pool;
 pub(crate) use tcp_socket_pool::TcpSocketPool;

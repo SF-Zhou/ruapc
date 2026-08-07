@@ -26,13 +26,9 @@ pub enum Rpc {
 #[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
 pub struct Args {
-    /// Listen address.
-    #[arg(default_value = "127.0.0.1:8000")]
-    pub addr: std::net::SocketAddr,
-
-    /// Socket type.
-    #[arg(long, default_value = "tcp")]
-    pub socket_type: SocketType,
+    /// RPC endpoint.
+    #[arg(default_value = "tcp://127.0.0.1:8000")]
+    pub endpoint: Endpoint,
 
     /// Request value.
     #[arg(short, long, default_value = "alice")]
@@ -120,19 +116,21 @@ pub struct Args {
 fn socket_pool_config(args: &Args) -> SocketPoolConfig {
     #[allow(unused_mut)]
     let mut config = SocketPoolConfig {
-        socket_type: SocketType::UNIFIED,
         buffer_pool_memory: args.pool_mem_mb * 1024 * 1024,
         ..Default::default()
     };
     #[cfg(feature = "rdma")]
-    {
-        config.rdma.poll_threads_per_device = args.poll_threads;
-        config.rdma.connections_per_peer = args.conns_per_peer;
-        config.rdma.device_filter = args.rdma_devices.clone();
-        config.rdma.poll_spin_us = args.poll_spin_us;
-        config.rdma.dispatch_workers = args.dispatch_workers;
-        config.rdma.recv_queue_len = args.recv_queue_len;
-        config.rdma.traffic_class = args.traffic_class;
+    if args.endpoint.transport() == Transport::RDMA {
+        config.rdma = Some(RdmaSocketPoolConfig {
+            poll_threads_per_device: args.poll_threads,
+            connections_per_peer: args.conns_per_peer,
+            device_filter: args.rdma_devices.clone(),
+            poll_spin_us: args.poll_spin_us,
+            dispatch_workers: args.dispatch_workers,
+            recv_queue_len: args.recv_queue_len,
+            traffic_class: args.traffic_class,
+            ..Default::default()
+        });
     }
     config
 }
@@ -263,7 +261,7 @@ async fn stress_test(args: Args) {
     let mut tasks = vec![];
     let ctx = Context::create(&socket_pool_config(&args))
         .unwrap()
-        .with_addr(args.addr);
+        .with_endpoint(args.endpoint);
     for i in 0..args.coroutines {
         let state = state.clone();
         let ctx = ctx.clone();
@@ -272,7 +270,6 @@ async fn stress_test(args: Args) {
             let client = Client {
                 timeout: Duration::from_secs(5),
                 use_msgpack: args.use_msgpack,
-                socket_type: Some(args.socket_type),
                 ..Default::default()
             };
             let mut op = BenchOp::create(&args, &ctx, Request(args.value.clone()), i as u64).await;
@@ -310,7 +307,7 @@ async fn stress_test(args: Args) {
 async fn bench_test(args: Args) {
     let ctx = Context::create(&socket_pool_config(&args))
         .unwrap()
-        .with_addr(args.addr);
+        .with_endpoint(args.endpoint);
 
     let payload = Request("x".repeat(args.payload_size));
     let warmup = Duration::from_secs(args.warmup_secs);
@@ -330,7 +327,6 @@ async fn bench_test(args: Args) {
             let client = Client {
                 timeout: Duration::from_secs(5),
                 use_msgpack: args.use_msgpack,
-                socket_type: Some(args.socket_type),
                 ..Default::default()
             };
             let mut op = BenchOp::create(&args, &ctx, payload, i as u64).await;
@@ -367,8 +363,8 @@ async fn bench_test(args: Args) {
     let measured_secs = (args.secs - args.warmup_secs) as f64;
     let p = |q: f64| merged.value_at_quantile(q) as f64 / 1_000.0;
     tracing::info!(
-        "bench: socket_type={:?} rpc={:?} payload={}B buffer={}B coroutines={} duration={}s (warmup {}s)",
-        args.socket_type,
+        "bench: endpoint={} rpc={:?} payload={}B buffer={}B coroutines={} duration={}s (warmup {}s)",
+        args.endpoint,
         args.rpc,
         args.payload_size,
         args.buffer_size,
@@ -435,10 +431,9 @@ async fn async_main(args: Args) {
     } else {
         let ctx = Context::create(&socket_pool_config(&args))
             .unwrap()
-            .with_addr(args.addr);
+            .with_endpoint(args.endpoint);
         let client = Client {
             use_msgpack: args.use_msgpack,
-            socket_type: Some(args.socket_type),
             ..Default::default()
         };
         match args.rpc {

@@ -11,13 +11,13 @@ use std::{
     str::FromStr,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
-use ruapc::{ErrorKind, SocketPoolConfig, SocketType};
+use ruapc::{Endpoint, ErrorKind, ListenMode, SocketPoolConfig};
 
 /// Installs a process-wide debugging recorder (once) and returns its
 /// snapshotter. Must be called before the traffic whose metrics are
@@ -111,7 +111,7 @@ impl Prod for ProdImpl {
 
 fn unified_config() -> SocketPoolConfig {
     SocketPoolConfig {
-        socket_type: SocketType::UNIFIED,
+        listen_mode: ListenMode::UNIFIED,
         ..Default::default()
     }
 }
@@ -142,7 +142,9 @@ async fn test_metrics_emission() {
     let (_service, server, addr) = start(&config).await;
 
     let client = ruapc::Client::default();
-    let ctx = ruapc::Context::create(&config).unwrap().with_addr(addr);
+    let ctx = ruapc::Context::create(&config)
+        .unwrap()
+        .with_endpoint(Endpoint::tcp(addr));
     for _ in 0..3 {
         client.metered(&ctx, &"x".to_string()).await.unwrap();
     }
@@ -198,7 +200,9 @@ async fn test_deadline_propagation() {
         timeout: Duration::from_secs(5),
         ..Default::default()
     };
-    let ctx = ruapc::Context::create(&config).unwrap().with_addr(addr);
+    let ctx = ruapc::Context::create(&config)
+        .unwrap()
+        .with_endpoint(Endpoint::tcp(addr));
     let remaining_ms = client.budget(&ctx, &()).await.unwrap();
     assert!(
         remaining_ms > 0 && remaining_ms <= 5000,
@@ -219,10 +223,11 @@ async fn test_handler_runs_to_completion_after_client_timeout() {
 
     let client = ruapc::Client {
         timeout: Duration::from_millis(300),
-        socket_type: Some(SocketType::TCP),
         ..Default::default()
     };
-    let ctx = ruapc::Context::create(&config).unwrap().with_addr(addr);
+    let ctx = ruapc::Context::create(&config)
+        .unwrap()
+        .with_endpoint(Endpoint::tcp(addr));
 
     // 1s of work against a 300ms budget: the client times out...
     let err = client.sleepy(&ctx, &1_000).await.unwrap_err();
@@ -251,7 +256,7 @@ async fn test_handler_runs_to_completion_after_client_timeout() {
 async fn test_load_shedding() {
     let _ = tracing_subscriber::fmt().try_init();
     let config = SocketPoolConfig {
-        socket_type: SocketType::UNIFIED,
+        listen_mode: ListenMode::UNIFIED,
         max_inflight_requests: 2,
         ..Default::default()
     };
@@ -260,7 +265,7 @@ async fn test_load_shedding() {
     let client_config = unified_config();
     let ctx = ruapc::Context::create(&client_config)
         .unwrap()
-        .with_addr(addr);
+        .with_endpoint(Endpoint::tcp(addr));
 
     // Fill the two slots, then hit the cap.
     let occupants: Vec<_> = (0..2)
@@ -299,8 +304,8 @@ async fn test_load_shedding() {
     server.join().await;
 }
 
-/// With a multi-address context, connect failures must fail over to the
-/// next address transparently.
+/// Equivalent endpoints may use different transports; a connect failure
+/// must transparently fail over to the next endpoint.
 #[tokio::test]
 async fn test_multi_address_failover() {
     let _ = tracing_subscriber::fmt().try_init();
@@ -311,10 +316,12 @@ async fn test_multi_address_failover() {
     let dead = SocketAddr::from_str("127.0.0.1:1").unwrap();
     let ctx = ruapc::Context::create(&config)
         .unwrap()
-        .with_addrs(vec![dead, addr]);
+        .with_endpoints(vec![
+            Endpoint::tcp(dead),
+            Endpoint::new(ruapc::Transport::HTTP, addr),
+        ]);
 
     let client = ruapc::Client {
-        socket_type: Some(SocketType::TCP),
         ..Default::default()
     };
     // Round-robin alternates the starting address; every request must
@@ -322,6 +329,78 @@ async fn test_multi_address_failover() {
     for i in 0..4 {
         let rsp = client.echo(&ctx, &format!("try{i}")).await.unwrap();
         assert_eq!(rsp, format!("try{i}"));
+    }
+
+    server.stop();
+    server.join().await;
+}
+
+/// `max_retries` applies in full to a single-endpoint context, cycling
+/// back to the same endpoint (regression: attempts used to be capped by
+/// the endpoint count, silently disabling retries for the common
+/// single-endpoint case).
+#[tokio::test]
+async fn test_single_endpoint_uses_full_retry_budget() {
+    let _ = tracing_subscriber::fmt().try_init();
+
+    // A raw TCP listener that accepts and immediately closes: the WS
+    // handshake fails before the request reaches the wire, so every
+    // attempt is a safe, countable connect failure.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let accept_task = tokio::spawn({
+        let attempts = attempts.clone();
+        async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        }
+    });
+
+    let config = unified_config();
+    let ctx = ruapc::Context::create(&config)
+        .unwrap()
+        .with_endpoint(Endpoint::new(ruapc::Transport::WS, addr));
+    let client = ruapc::Client {
+        max_retries: 3,
+        ..Default::default()
+    };
+    let err = client.echo(&ctx, &"nope".to_string()).await.unwrap_err();
+    assert_eq!(err.kind, ErrorKind::WebSocketConnectFailed);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        4,
+        "one initial attempt plus max_retries against the same endpoint"
+    );
+    accept_task.abort();
+}
+
+/// A failed address is cooled down and a connection opened in the
+/// background becomes the preferred path even when later calls disable
+/// connect-phase retries.
+#[tokio::test]
+async fn test_multi_address_health_and_preconnect() {
+    let config = unified_config();
+    let (_service, server, addr) = start(&config).await;
+    let dead = SocketAddr::from_str("127.0.0.1:1").unwrap();
+    let ctx = ruapc::Context::create(&config)
+        .unwrap()
+        .with_endpoints(vec![Endpoint::tcp(dead), Endpoint::tcp(addr)]);
+    let client = ruapc::Client {
+        max_retries: 0,
+        ..Default::default()
+    };
+
+    // The first round starts on the dead address and also preconnects the
+    // live one. It may fail, but it must establish both pieces of state.
+    let _ = client.echo(&ctx, &"probe".to_string()).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    for i in 0..4 {
+        let value = format!("healthy-{i}");
+        assert_eq!(client.echo(&ctx, &value).await.unwrap(), value);
     }
 
     server.stop();

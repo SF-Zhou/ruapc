@@ -5,7 +5,7 @@
 
 use std::{str::FromStr, sync::Arc};
 
-use ruapc::{Router, SocketPoolConfig, SocketType};
+use ruapc::{ListenMode, Router, SocketPoolConfig};
 
 #[ruapc::service]
 trait TestService {
@@ -27,7 +27,7 @@ async fn test_http_openapi_json_endpoint() {
     test_service.ruapc_export(&mut router);
 
     let config = SocketPoolConfig {
-        socket_type: SocketType::UNIFIED,
+        listen_mode: ListenMode::UNIFIED,
         ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();
@@ -64,7 +64,7 @@ async fn test_http_rapidoc_js_endpoint() {
     test_service.ruapc_export(&mut router);
 
     let config = SocketPoolConfig {
-        socket_type: SocketType::UNIFIED,
+        listen_mode: ListenMode::UNIFIED,
         ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();
@@ -100,7 +100,7 @@ async fn test_http_rapidoc_html_endpoints() {
     test_service.ruapc_export(&mut router);
 
     let config = SocketPoolConfig {
-        socket_type: SocketType::UNIFIED,
+        listen_mode: ListenMode::UNIFIED,
         ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();
@@ -139,7 +139,7 @@ async fn test_http_not_found_endpoint() {
     test_service.ruapc_export(&mut router);
 
     let config = SocketPoolConfig {
-        socket_type: SocketType::UNIFIED,
+        listen_mode: ListenMode::UNIFIED,
         ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();
@@ -163,6 +163,49 @@ async fn test_http_not_found_endpoint() {
     server.join().await;
 }
 
+/// A fragmented HTTP request whose first byte matches the start of the
+/// TCP magic (`R` of `REPORT` vs `RUA!`) must still be routed to the HTTP
+/// handler once the bytes diverge (regression: the unified listener used
+/// to commit to TCP on any partial magic prefix).
+#[tokio::test]
+async fn test_unified_fragmented_http_request_not_misrouted() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let test_service = Arc::new(TestServiceImpl);
+    let mut router = Router::default();
+    test_service.ruapc_export(&mut router);
+
+    let config = SocketPoolConfig {
+        listen_mode: ListenMode::UNIFIED,
+        ..Default::default()
+    };
+    let server = ruapc::Server::create(router, &config).unwrap();
+    let addr = std::net::SocketAddr::from_str("127.0.0.1:0").unwrap();
+    let addr = server.listen(addr).await.unwrap();
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream.write_all(b"R").await.unwrap();
+    stream.flush().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    stream
+        .write_all(
+            b"EPORT /nonexistent HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.starts_with("HTTP/1.1"),
+        "expected an HTTP response, got: {response:?}"
+    );
+
+    server.stop();
+    server.join().await;
+}
+
 #[tokio::test]
 async fn test_http_post_request_processing() {
     let test_service = Arc::new(TestServiceImpl);
@@ -170,7 +213,7 @@ async fn test_http_post_request_processing() {
     test_service.ruapc_export(&mut router);
 
     let config = SocketPoolConfig {
-        socket_type: SocketType::UNIFIED,
+        listen_mode: ListenMode::UNIFIED,
         ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();
@@ -203,7 +246,7 @@ async fn test_http_websocket_upgrade() {
     test_service.ruapc_export(&mut router);
 
     let config = SocketPoolConfig {
-        socket_type: SocketType::UNIFIED,
+        listen_mode: ListenMode::UNIFIED,
         ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();
@@ -237,7 +280,7 @@ async fn test_http_concurrent_requests() {
     test_service.ruapc_export(&mut router);
 
     let config = SocketPoolConfig {
-        socket_type: SocketType::UNIFIED,
+        listen_mode: ListenMode::UNIFIED,
         ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();
@@ -293,7 +336,7 @@ async fn test_http_malformed_request_body() {
     test_service.ruapc_export(&mut router);
 
     let config = SocketPoolConfig {
-        socket_type: SocketType::UNIFIED,
+        listen_mode: ListenMode::UNIFIED,
         ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();
@@ -325,7 +368,7 @@ async fn test_http_large_request_body() {
     test_service.ruapc_export(&mut router);
 
     let config = SocketPoolConfig {
-        socket_type: SocketType::UNIFIED,
+        listen_mode: ListenMode::UNIFIED,
         ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();
@@ -359,7 +402,7 @@ async fn test_http_method_variants() {
     test_service.ruapc_export(&mut router);
 
     let config = SocketPoolConfig {
-        socket_type: SocketType::UNIFIED,
+        listen_mode: ListenMode::UNIFIED,
         ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();
@@ -403,7 +446,7 @@ async fn test_http_edge_case_paths() {
     test_service.ruapc_export(&mut router);
 
     let config = SocketPoolConfig {
-        socket_type: SocketType::UNIFIED,
+        listen_mode: ListenMode::UNIFIED,
         ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();

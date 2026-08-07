@@ -2,7 +2,11 @@ mod client;
 pub use client::{Client, ClientWithBuffers};
 
 mod context;
-pub use context::{AddrSet, Context, RemoteSpace, SocketEndpoint};
+pub(crate) use context::ContextEndpoint;
+pub use context::{Context, RemoteSpace};
+
+mod endpoint_state;
+pub(crate) use endpoint_state::EndpointState;
 
 mod server;
 pub use server::Server;

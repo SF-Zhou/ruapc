@@ -105,7 +105,7 @@ impl Drop for InflightGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Context, MsgFlags, MsgMeta, SocketPoolConfig, SocketType};
+    use crate::{Context, MsgFlags, MsgMeta, SocketPoolConfig};
 
     fn make_ctx(config: &SocketPoolConfig, timeout_ms: Option<u32>) -> Context {
         let base = Context::create(config).unwrap();
@@ -123,10 +123,7 @@ mod tests {
     }
 
     fn tcp_config() -> SocketPoolConfig {
-        SocketPoolConfig {
-            socket_type: SocketType::TCP,
-            ..Default::default()
-        }
+        SocketPoolConfig::default()
     }
 
     #[tokio::test]
@@ -149,7 +146,6 @@ mod tests {
     #[tokio::test]
     async fn test_load_shedding_rejects_over_cap() {
         let config = SocketPoolConfig {
-            socket_type: SocketType::TCP,
             max_inflight_requests: 1,
             ..Default::default()
         };

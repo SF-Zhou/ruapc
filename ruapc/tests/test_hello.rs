@@ -5,7 +5,7 @@
 
 use std::{str::FromStr, sync::Arc};
 
-use ruapc::{SocketPoolConfig, SocketType};
+use ruapc::{Endpoint, ListenMode, SocketPoolConfig, Transport};
 
 #[ruapc::service]
 trait Foo {
@@ -24,31 +24,31 @@ impl Foo for FooImpl {
 async fn test_hello() {
     tracing_subscriber::fmt().init();
 
-    for socket_type in [
-        SocketType::TCP,
-        SocketType::WS,
-        SocketType::HTTP,
-        SocketType::UNIFIED,
+    for transport in [
+        Transport::TCP,
+        Transport::WS,
+        Transport::HTTP,
         #[cfg(feature = "rdma")]
-        SocketType::RDMA,
+        Transport::RDMA,
     ] {
         let foo = Arc::new(FooImpl);
         let mut router = ruapc::Router::default();
         foo.ruapc_export(&mut router);
 
         let config = SocketPoolConfig {
-            socket_type: SocketType::UNIFIED,
+            listen_mode: ListenMode::UNIFIED,
+            #[cfg(feature = "rdma")]
+            rdma: Some(Default::default()),
             ..Default::default()
         };
         let server = ruapc::Server::create(router, &config).unwrap();
         let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
         let addr = server.listen(addr).await.unwrap();
 
-        let client = ruapc::Client {
-            socket_type: Some(socket_type),
-            ..Default::default()
-        };
-        let ctx = ruapc::Context::create(&config).unwrap().with_addr(addr);
+        let client = ruapc::Client::default();
+        let ctx = ruapc::Context::create(&config)
+            .unwrap()
+            .with_endpoint(Endpoint::new(transport, addr));
         let rsp = client.hello(&ctx, &"ruapc".to_string()).await.unwrap();
         assert_eq!(rsp, "hello ruapc!");
 
@@ -68,7 +68,7 @@ async fn test_http() {
     foo.ruapc_export(&mut router);
 
     let config = SocketPoolConfig {
-        socket_type: SocketType::UNIFIED,
+        listen_mode: ListenMode::UNIFIED,
         ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();
@@ -107,22 +107,22 @@ async fn test_rdma_concurrent() {
     foo.ruapc_export(&mut router);
 
     let config = SocketPoolConfig {
-        socket_type: SocketType::UNIFIED,
+        listen_mode: ListenMode::UNIFIED,
+        rdma: Some(Default::default()),
         ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
     let addr = server.listen(addr).await.unwrap();
 
-    let ctx = ruapc::Context::create(&config).unwrap().with_addr(addr);
+    let ctx = ruapc::Context::create(&config)
+        .unwrap()
+        .with_endpoint(Endpoint::new(Transport::RDMA, addr));
     let mut tasks = Vec::new();
     for task_id in 0..128 {
         let ctx = ctx.clone();
         tasks.push(tokio::spawn(async move {
-            let client = ruapc::Client {
-                socket_type: Some(SocketType::RDMA),
-                ..Default::default()
-            };
+            let client = ruapc::Client::default();
             for round in 0..8 {
                 let name = format!("task{task_id}-round{round}");
                 let rsp = client.hello(&ctx, &name).await.unwrap();
@@ -150,23 +150,21 @@ async fn test_rdma() {
     foo.ruapc_export(&mut router);
 
     let config = SocketPoolConfig {
-        socket_type: SocketType::UNIFIED,
+        listen_mode: ListenMode::UNIFIED,
+        rdma: Some(Default::default()),
         ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
     let addr = server.listen(addr).await.unwrap();
 
-    let client = ruapc::Client {
-        socket_type: Some(SocketType::RDMA),
-        ..Default::default()
-    };
+    let client = ruapc::Client::default();
 
     let mut ctx = ruapc::Context::create(&config).unwrap();
     client.hello(&ctx, &"ruapc".to_string()).await.unwrap_err();
     ctx.send_rsp(Result::Ok(())).await;
 
-    let ctx = ctx.with_addr(addr);
+    let ctx = ctx.with_endpoint(Endpoint::new(Transport::RDMA, addr));
     for _ in 0..256 {
         let rsp = client.hello(&ctx, &"ruapc".to_string()).await.unwrap();
         assert_eq!(rsp, "hello ruapc!");

@@ -1,5 +1,5 @@
 mod supervisor;
-pub use supervisor::TaskSupervisor;
+pub use supervisor::{TaskSupervisor, TaskSupervisorHandle};
 // Only the RDMA transport holds guards outside this module; without it the
 // re-export would trip `unused_imports` (`mod task` is crate-private).
 #[cfg(feature = "rdma")]

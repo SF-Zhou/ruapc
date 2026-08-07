@@ -1,12 +1,15 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_inline_default::serde_inline_default;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex},
+};
 
 use crate::{
-    Buffer, Context, SocketEndpoint, SocketTrait, SocketType,
-    core::{WriteTarget, scatter::MAX_REGIONS},
+    Buffer, Context, Socket, SocketTrait, State,
+    core::{EndpointState, WriteTarget, context::ContextEndpoint, scatter::MAX_REGIONS},
     error::{Error, ErrorKind},
     msg::{MsgFlags, MsgMeta},
 };
@@ -21,8 +24,8 @@ use crate::{
 ///
 /// ```rust,ignore
 /// let client = Client::default();
-/// let addr = SocketAddr::from_str("127.0.0.1:8000").unwrap();
-/// let ctx = Context::create(&SocketPoolConfig::default()).unwrap().with_addr(addr);
+/// let endpoint = "tcp://127.0.0.1:8000".parse().unwrap();
+/// let ctx = Context::create(&SocketPoolConfig::default()).unwrap().with_endpoint(endpoint);
 ///
 /// let rsp = client.echo(&ctx, &"hello".into()).await;
 /// ```
@@ -42,16 +45,14 @@ pub struct Client {
     /// When false, JSON serialization is used.
     #[serde_inline_default(true)]
     pub use_msgpack: bool,
-    /// Optional socket type to override the default from context.
-    /// If None, uses the socket type from the context's socket pool.
-    #[serde_inline_default(None)]
-    pub socket_type: Option<SocketType>,
     /// Maximum number of retries for failures that occur *before the
     /// request reaches the wire* (connection acquire or send-queue
     /// failures) — always safe, even for non-idempotent methods. With a
-    /// multi-address context (`Context::with_addrs`) each retry moves to
-    /// the next address. Waiting-phase failures (timeout, connection
-    /// closed mid-flight) are never retried automatically. Default is 2.
+    /// multi-endpoint context (`Context::with_endpoints`) each retry moves
+    /// to the next endpoint, cycling back to the first when the retry
+    /// budget exceeds the endpoint count. Waiting-phase failures (timeout,
+    /// connection closed mid-flight) are never retried automatically.
+    /// Default is 2.
     #[serde_inline_default(2u32)]
     pub max_retries: u32,
 }
@@ -232,13 +233,54 @@ impl Client {
         // failed attempt drops its receiver, cleaning the entry up (and,
         // with it, the entry's write-target pin — the caller-held clone in
         // `write_target` keeps the buffers available for the next attempt).
-        let addr_base = match &ctx.endpoint {
-            SocketEndpoint::Addresses(set) => set.next_base(),
-            _ => 0,
+        let mut direct_endpoint = None;
+        let mut candidates = match &ctx.endpoint {
+            ContextEndpoint::Invalid => {
+                return Err(Error::new(
+                    ErrorKind::InvalidArgument,
+                    "client context without address".to_string(),
+                )
+                .into());
+            }
+            ContextEndpoint::Connected(_) => Vec::new(),
+            ContextEndpoint::Endpoints(set) => {
+                if let Some(endpoint) = set.singleton() {
+                    direct_endpoint = Some(endpoint);
+                    Vec::new()
+                } else {
+                    let candidates = set.candidates(&ctx.state);
+                    if candidates.is_empty() {
+                        return Err(Error::new(
+                            ErrorKind::InvalidArgument,
+                            "client context with empty endpoint set".to_string(),
+                        )
+                        .into());
+                    }
+                    self.preconnect(ctx, &candidates[1..]);
+                    candidates
+                }
+            }
         };
+        let max_attempts = self.max_retries as usize + 1;
         let mut attempt = 0usize;
-        let receiver = loop {
-            let addr = attempt_addr(ctx, addr_base, attempt)?;
+        let mut tried = HashSet::new();
+        let (receiver, endpoint_state, conn_id) = loop {
+            let endpoint_state = if candidates.is_empty() {
+                None
+            } else {
+                if attempt != 0 {
+                    candidates.sort_by_key(|candidate| candidate.selection_rank());
+                }
+                if tried.len() == candidates.len() {
+                    tried.clear();
+                }
+                let candidate = candidates
+                    .iter()
+                    .find(|candidate| !tried.contains(&candidate.endpoint()))
+                    .expect("a non-empty candidate cycle has an untried endpoint")
+                    .clone();
+                Some(candidate)
+            };
             let result = self
                 .try_send(
                     ctx,
@@ -248,23 +290,52 @@ impl Client {
                     method_name,
                     flags,
                     timeout,
-                    addr,
+                    direct_endpoint,
+                    endpoint_state.clone(),
                 )
                 .await;
             match result {
-                Ok(receiver) => break receiver,
-                Err(err) => {
-                    if attempt >= self.max_retries as usize {
-                        return Err(err.into());
+                Ok((receiver, conn_id)) => break (receiver, endpoint_state, conn_id),
+                Err(failure) => {
+                    if let Some(endpoint_state) = &endpoint_state {
+                        tried.insert(endpoint_state.endpoint());
                     }
-                    tracing::warn!("attempt {attempt} for {method_name} failed, retrying: {err}");
+                    let has_untried_endpoint = tried.len() < candidates.len();
+                    let retry = should_retry_attempt(
+                        failure.disposition,
+                        attempt,
+                        max_attempts,
+                        has_untried_endpoint,
+                    );
+                    if !retry {
+                        return Err(failure.error.into());
+                    }
+                    tracing::warn!(
+                        "attempt {attempt} for {method_name} failed, retrying: {}",
+                        failure.error
+                    );
                     attempt += 1;
                 }
             }
         };
-
         // 3. recv response (fails with Timeout once the entry expires).
-        let (response, returned_target) = receiver.recv().await?;
+        let (response, returned_target) = match receiver.recv().await {
+            Ok(response) => response,
+            Err(err) => {
+                if matches!(err.kind, ErrorKind::ConnectionClosed)
+                    && let Some(state) = &endpoint_state
+                    && let Some(conn_id) = conn_id
+                {
+                    state.record_connection_failure(conn_id);
+                }
+                return Err(err.into());
+            }
+        };
+        if let Some(state) = &endpoint_state
+            && let Some(conn_id) = conn_id
+        {
+            state.record_request_success(conn_id);
+        }
         // Hand every attached write buffer back to the caller. Dropping
         // our own clone first makes the returned target unique in the
         // normal case; a pull/push handler racing the response keeps the
@@ -297,41 +368,35 @@ impl Client {
         method_name: &str,
         flags: MsgFlags,
         timeout: Duration,
-        addr: Option<std::net::SocketAddr>,
-    ) -> std::result::Result<crate::Receiver<'a>, Error>
+        direct_endpoint: Option<crate::Endpoint>,
+        endpoint_state: Option<Arc<EndpointState>>,
+    ) -> std::result::Result<(crate::Receiver<'a>, Option<u64>), AttemptFailure>
     where
         Req: Serialize + JsonSchema,
     {
-        let socket = match (&ctx.endpoint, addr) {
-            (SocketEndpoint::Connected(socket), _) => socket.clone(),
-            (_, Some(socket_addr)) => {
-                let socket_type = self
-                    .socket_type
-                    .unwrap_or(ctx.state.socket_pool.socket_type());
+        let socket = match (&ctx.endpoint, &endpoint_state) {
+            (ContextEndpoint::Connected(socket), _) => socket.clone(),
+            (ContextEndpoint::Endpoints(_), Some(endpoint_state)) => acquire_endpoint(
+                &ctx.state,
+                endpoint_state,
                 #[cfg(feature = "rdma")]
-                let socket = match &ctx.rdma_path {
-                    Some(selector) if socket_type == SocketType::RDMA => {
-                        ctx.state
-                            .socket_pool
-                            .acquire_rdma_path(&socket_addr, selector, &ctx.state)
-                            .await?
-                    }
-                    _ => {
-                        ctx.state
-                            .socket_pool
-                            .acquire(&socket_addr, socket_type, &ctx.state)
-                            .await?
-                    }
-                };
-                #[cfg(not(feature = "rdma"))]
-                let socket = ctx
-                    .state
-                    .socket_pool
-                    .acquire(&socket_addr, socket_type, &ctx.state)
-                    .await?;
-                socket
+                ctx.rdma_path.as_ref(),
+            )
+            .await
+            .map_err(AttemptFailure::acquire)?,
+            (ContextEndpoint::Endpoints(_), None) => {
+                let endpoint =
+                    direct_endpoint.expect("a singleton endpoint was resolved before try_send");
+                acquire_direct(
+                    &ctx.state,
+                    endpoint,
+                    #[cfg(feature = "rdma")]
+                    ctx.rdma_path.as_ref(),
+                )
+                .await
+                .map_err(AttemptFailure::acquire)?
             }
-            _ => unreachable!("attempt_addr rejects endpoints without an address"),
+            _ => unreachable!("request endpoint was validated before try_send"),
         };
 
         // Export the attached buffers as regions for the device the
@@ -344,11 +409,14 @@ impl Client {
             for buf in read_buffers {
                 read_regions.push(
                     buf.remote_buffer_info(&device_index)
-                        .map_err(|e| Error::new(ErrorKind::InvalidArgument, e.to_string()))?,
+                        .map_err(|e| Error::new(ErrorKind::InvalidArgument, e.to_string()))
+                        .map_err(AttemptFailure::failover)?,
                 );
             }
             if let Some(target) = write_target {
-                write_regions = target.export_regions(&device_index)?;
+                write_regions = target
+                    .export_regions(&device_index)
+                    .map_err(AttemptFailure::failover)?;
             }
         }
 
@@ -370,32 +438,183 @@ impl Client {
             // tree inherits the shrunk deadline.
             timeout_ms: Some(u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX)),
         };
-        socket.send(&mut meta, req, &ctx.state).await?;
-        Ok(receiver)
+        if let Err(err) = socket.send(&mut meta, req, &ctx.state).await {
+            if is_connection_failure(&err)
+                && let Some(state) = &endpoint_state
+                && let Some(conn_id) = socket.conn_id()
+            {
+                state.record_connection_failure(conn_id);
+            }
+            return Err(AttemptFailure {
+                disposition: if is_connection_failure(&err) {
+                    AttemptDisposition::Retryable
+                } else {
+                    AttemptDisposition::Terminal
+                },
+                error: err,
+            });
+        }
+        Ok((receiver, socket.conn_id()))
+    }
+
+    fn preconnect(&self, ctx: &Context, candidates: &[Arc<EndpointState>]) {
+        let supervisor = ctx.state.socket_pool.task_supervisor_handle();
+        for endpoint_state in candidates {
+            let Some(activity) = endpoint_state.try_begin_preconnect() else {
+                continue;
+            };
+            let state = ctx.state.clone();
+            let endpoint_state = endpoint_state.clone();
+            #[cfg(feature = "rdma")]
+            let selector = ctx.rdma_path.clone();
+            let _ = supervisor.try_spawn(async move {
+                let result = acquire_direct(
+                    &state,
+                    endpoint_state.endpoint(),
+                    #[cfg(feature = "rdma")]
+                    selector.as_ref(),
+                )
+                .await;
+                match &result {
+                    Ok(socket) => activity.record_connection(socket),
+                    Err(err) if is_connection_failure(err) => activity.record_failure(),
+                    Err(_) => {}
+                }
+                if let Err(err) = result {
+                    tracing::debug!(
+                        endpoint = %endpoint_state.endpoint(),
+                        %err,
+                        "background connection failed"
+                    );
+                }
+            });
+        }
     }
 }
 
-/// Resolves the target address for the `attempt`-th try, or `None` for an
-/// already-connected endpoint.
-fn attempt_addr(
-    ctx: &Context,
-    base: usize,
-    attempt: usize,
-) -> std::result::Result<Option<std::net::SocketAddr>, Error> {
-    match &ctx.endpoint {
-        SocketEndpoint::Invalid => Err(Error::new(
-            ErrorKind::InvalidArgument,
-            "client context without address".to_string(),
-        )),
-        SocketEndpoint::Connected(_) => Ok(None),
-        SocketEndpoint::Address(addr) => Ok(Some(*addr)),
-        SocketEndpoint::Addresses(set) => set.pick(base, attempt).map(Some).ok_or_else(|| {
-            Error::new(
-                ErrorKind::InvalidArgument,
-                "client context with empty address set".to_string(),
-            )
-        }),
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttemptDisposition {
+    Retryable,
+    FailoverOnly,
+    Terminal,
+}
+
+struct AttemptFailure {
+    disposition: AttemptDisposition,
+    error: Error,
+}
+
+impl AttemptFailure {
+    fn acquire(error: Error) -> Self {
+        Self {
+            disposition: if is_connection_failure(&error) {
+                AttemptDisposition::Retryable
+            } else {
+                AttemptDisposition::FailoverOnly
+            },
+            error,
+        }
     }
+
+    fn failover(error: Error) -> Self {
+        Self {
+            disposition: AttemptDisposition::FailoverOnly,
+            error,
+        }
+    }
+}
+
+impl From<Error> for AttemptFailure {
+    fn from(error: Error) -> Self {
+        Self {
+            disposition: AttemptDisposition::Terminal,
+            error,
+        }
+    }
+}
+
+fn should_retry_attempt(
+    disposition: AttemptDisposition,
+    attempt: usize,
+    max_attempts: usize,
+    has_untried_endpoint: bool,
+) -> bool {
+    if attempt + 1 >= max_attempts {
+        return false;
+    }
+    match disposition {
+        AttemptDisposition::Retryable => true,
+        AttemptDisposition::FailoverOnly => has_untried_endpoint,
+        AttemptDisposition::Terminal => false,
+    }
+}
+
+async fn acquire_endpoint(
+    state: &Arc<State>,
+    endpoint_state: &Arc<EndpointState>,
+    #[cfg(feature = "rdma")] selector: Option<&crate::rdma::RdmaPathSelector>,
+) -> std::result::Result<Socket, Error> {
+    let endpoint = endpoint_state.endpoint();
+    let result = acquire_direct(
+        state,
+        endpoint,
+        #[cfg(feature = "rdma")]
+        selector,
+    )
+    .await;
+
+    match &result {
+        Ok(socket) if !endpoint_state.is_current(socket) => {
+            endpoint_state.begin_connect().record_connection(socket);
+        }
+        Err(err) if is_connection_failure(err) => {
+            endpoint_state.begin_connect().record_failure();
+        }
+        Err(_) => {}
+        Ok(_) => {}
+    }
+    result
+}
+
+async fn acquire_direct(
+    state: &Arc<State>,
+    endpoint: crate::Endpoint,
+    #[cfg(feature = "rdma")] selector: Option<&crate::rdma::RdmaPathSelector>,
+) -> std::result::Result<Socket, Error> {
+    #[cfg(feature = "rdma")]
+    if let Some(selector) = selector
+        && endpoint.transport() == crate::Transport::RDMA
+    {
+        return state
+            .socket_pool
+            .acquire_rdma_path(&endpoint.addr(), selector, state)
+            .await;
+    }
+    state.socket_pool.acquire(endpoint, state).await
+}
+
+fn is_connection_failure(err: &Error) -> bool {
+    let common = matches!(
+        err.kind,
+        ErrorKind::TcpConnectFailed
+            | ErrorKind::TcpSendMsgFailed
+            | ErrorKind::TcpRecvMsgFailed
+            | ErrorKind::WebSocketConnectFailed
+            | ErrorKind::WebSocketSendFailed
+            | ErrorKind::WebSocketRecvFailed
+            | ErrorKind::WebSocketClosed
+            | ErrorKind::HttpWaitRspFailed
+            | ErrorKind::HttpSendReqFailed
+            | ErrorKind::ConnectionClosed
+            | ErrorKind::RdmaSendFailed
+            | ErrorKind::RdmaRecvFailed
+            | ErrorKind::RdmaReadTimeout
+    );
+    #[cfg(feature = "rdma")]
+    let rdma = matches!(err.kind, ErrorKind::RdmaError(_));
+    #[cfg(not(feature = "rdma"))]
+    let rdma = false;
+    common || rdma
 }
 
 /// A client wrapper that attaches registered buffers to RPC calls.
@@ -532,7 +751,6 @@ mod tests {
         let client = Client::default();
         assert_eq!(client.timeout, Duration::from_secs(1));
         assert!(client.use_msgpack);
-        assert!(client.socket_type.is_none());
     }
 
     #[test]
@@ -540,7 +758,6 @@ mod tests {
         let client = Client {
             timeout: Duration::from_millis(500),
             use_msgpack: false,
-            socket_type: Some(SocketType::TCP),
             max_retries: 4,
         };
         let json = serde_json::to_string(&client).unwrap();
@@ -554,7 +771,6 @@ mod tests {
             serde_json::from_value(serde_json::Value::Object(serde_json::Map::default())).unwrap();
         assert_eq!(client.timeout, Duration::from_secs(1));
         assert!(client.use_msgpack);
-        assert!(client.socket_type.is_none());
     }
 
     #[test]
@@ -562,6 +778,53 @@ mod tests {
         let client = Client::default();
         let debug = format!("{:?}", client);
         assert!(debug.contains("Client"));
+    }
+
+    #[test]
+    fn unknown_errors_do_not_penalize_endpoints() {
+        assert!(!is_connection_failure(&Error::new(
+            ErrorKind::Unknown("other".into()),
+            "unclassified".into(),
+        )));
+        assert!(is_connection_failure(&Error::kind(
+            ErrorKind::TcpConnectFailed
+        )));
+    }
+
+    #[test]
+    fn retry_disposition_respects_failure_scope() {
+        assert!(should_retry_attempt(
+            AttemptDisposition::Retryable,
+            0,
+            3,
+            false,
+        ));
+        assert!(should_retry_attempt(
+            AttemptDisposition::FailoverOnly,
+            0,
+            3,
+            true,
+        ));
+        assert!(!should_retry_attempt(
+            AttemptDisposition::FailoverOnly,
+            0,
+            3,
+            false,
+        ));
+        assert!(!should_retry_attempt(
+            AttemptDisposition::Terminal,
+            0,
+            3,
+            true,
+        ));
+    }
+
+    #[test]
+    fn invalid_acquire_error_only_fails_over() {
+        let failure = AttemptFailure::acquire(Error::kind(ErrorKind::InvalidArgument));
+        assert_eq!(failure.disposition, AttemptDisposition::FailoverOnly);
+        let failure = AttemptFailure::failover(Error::kind(ErrorKind::InvalidArgument));
+        assert_eq!(failure.disposition, AttemptDisposition::FailoverOnly);
     }
 
     #[tokio::test]

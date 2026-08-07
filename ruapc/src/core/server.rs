@@ -53,6 +53,18 @@ impl Server {
     /// let server = Server::create(router, &SocketPoolConfig::default()).unwrap();
     /// ```
     pub fn create(router: Router, config: &SocketPoolConfig) -> Result<Self> {
+        #[cfg(feature = "rdma")]
+        if config.rdma.is_some()
+            && !matches!(
+                config.listen_mode,
+                crate::ListenMode::TCP | crate::ListenMode::UNIFIED
+            )
+        {
+            return Err(crate::Error::new(
+                crate::ErrorKind::InvalidArgument,
+                "an RDMA-capable server requires TCP or UNIFIED listen mode for bootstrap".into(),
+            ));
+        }
         let (state, drop_guard) = State::create(router, config)?;
 
         Ok(Self {

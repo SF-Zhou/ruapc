@@ -1,24 +1,24 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc};
 
 use bytes::{Bytes, BytesMut};
-use foldhash::fast::RandomState;
 use http_body_util::{BodyExt, Either, Full};
 use hyper::{Request, Response, body::Incoming};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
 use tokio_util::sync::DropGuard;
 
 use super::http_socket::{ChannelBody, HttpSocket, StreamSocket};
 use crate::{
-    Error, ErrorKind, Message, MsgFlags, MsgMeta, RawStream, Result, Socket, SocketPoolConfig,
-    SocketPoolTrait, SocketType, State, TaskSupervisor, sockets::tcp,
+    ConnectionMap, Error, ErrorKind, Message, MsgFlags, MsgMeta, RawStream, Result, Socket,
+    SocketPoolConfig, SocketPoolTrait, State, TaskSupervisor, TaskSupervisorHandle, sockets::tcp,
 };
 
-type HttpSocketMap = Arc<RwLock<HashMap<SocketAddr, HttpSocket, RandomState>>>;
+type HttpSocketMap = ConnectionMap<HttpSocket>;
 
 pub struct HttpSocketPool {
     socket_map: HttpSocketMap,
+    connect_locks: crate::sockets::connect::ConnectLocks,
     http: Builder<TokioExecutor>,
     task_supervisor: TaskSupervisor,
 }
@@ -32,7 +32,8 @@ impl SocketPoolTrait for HttpSocketPool {
         let mut http = Builder::new(TokioExecutor::new());
         http.http1().keep_alive(true);
         Ok(Self {
-            socket_map: Arc::default(),
+            socket_map: ConnectionMap::default(),
+            connect_locks: Default::default(),
             http,
             task_supervisor: TaskSupervisor::create(),
         })
@@ -59,34 +60,19 @@ impl SocketPoolTrait for HttpSocketPool {
         self.task_supervisor.all_stopped().await;
     }
 
-    async fn acquire(
-        &self,
-        addr: &SocketAddr,
-        socket_type: SocketType,
-        state: &Arc<State>,
-    ) -> Result<Socket> {
-        if socket_type != SocketType::HTTP {
-            return Err(Error::new(
-                ErrorKind::InvalidArgument,
-                format!("invalid socket type {socket_type} for HttpSocketPool"),
-            ));
-        }
-
+    async fn acquire(&self, addr: &SocketAddr, state: &Arc<State>) -> Result<Socket> {
         // Check if the socket is already in the socket map.
-        if let Ok(socket_map) = self.socket_map.try_read()
-            && let Some(socket) = socket_map.get(addr)
-        {
+        if let Some(socket) = self.socket_map.try_get_live(addr) {
             return Ok(socket.into());
         }
 
-        // If not, establish an HTTP/2 streaming connection.
-        let mut socket_map = self.socket_map.write().await;
-        if let Some(socket) = socket_map.get(addr) {
+        let _connect = self.connect_locks.lock(*addr).await;
+        if let Some(socket) = self.socket_map.get_live(addr).await {
             return Ok(socket.into());
         }
 
-        let socket = Self::connect_stream(addr, state, &self.socket_map).await?;
-        socket_map.insert(*addr, socket.clone());
+        let supervisor = self.task_supervisor.handle();
+        let socket = Self::connect_stream(addr, state, &self.socket_map, &supervisor).await?;
         Ok(socket.into())
     }
 }
@@ -107,13 +93,17 @@ impl HttpSocketPool {
 
         let state = state.clone();
         let http = self.http.clone();
+        let supervisor = self.task_supervisor.handle();
 
-        let task_supervisor = self.task_supervisor.start_async_task();
+        let task_supervisor = self
+            .task_supervisor
+            .try_start_async_task()
+            .ok_or_else(|| Error::new(ErrorKind::ConnectionClosed, "HTTP pool stopped".into()))?;
         tokio::spawn(async move {
             let connection = http.serve_connection_with_upgrades(
                 TokioIo::new(tcp_stream),
                 hyper::service::service_fn(move |req: Request<Incoming>| {
-                    Self::handle_request(req, state.clone(), addr)
+                    Self::handle_request(req, state.clone(), addr, supervisor.clone())
                 }),
             );
             tokio::select! {
@@ -133,6 +123,7 @@ impl HttpSocketPool {
         mut req: Request<Incoming>,
         state: Arc<State>,
         addr: SocketAddr,
+        supervisor: TaskSupervisorHandle,
     ) -> Result<Response<Either<Full<Bytes>, ChannelBody>>> {
         if hyper_tungstenite::is_upgrade_request(&req) {
             let ws_config = crate::sockets::ws::web_socket_config();
@@ -140,17 +131,15 @@ impl HttpSocketPool {
                 .map_err(|e| Error::new(ErrorKind::HttpUpgradeFailed, e.to_string()))?;
 
             let state = state.clone();
-            tokio::spawn(async move {
-                let websocket = match websocket.await {
-                    Ok(socket) => socket,
-                    Err(err) => {
-                        tracing::error!("upgrade HTTP to WebSocket failed: {err}");
-                        return;
+            let _ = supervisor.try_spawn(async move {
+                match websocket.await {
+                    Ok(socket) => {
+                        state
+                            .handle_new_stream(RawStream::WS(Box::new(socket)), addr)
+                            .await;
                     }
-                };
-                state
-                    .handle_new_stream(RawStream::WS(Box::new(websocket)), addr)
-                    .await;
+                    Err(err) => tracing::error!("upgrade HTTP to WebSocket failed: {err}"),
+                }
             });
 
             return Ok(response.map(Either::Left));
@@ -158,7 +147,7 @@ impl HttpSocketPool {
 
         // Handle /_rpc: bidirectional streaming for reverse RPC.
         if req.method() == hyper::Method::POST && req.uri().path() == "/_rpc" {
-            return Self::handle_rpc_stream(req, state, addr).await;
+            return Self::handle_rpc_stream(req, state, addr, &supervisor).await;
         }
 
         if req.method() == hyper::Method::GET {
@@ -249,19 +238,29 @@ impl HttpSocketPool {
         req: Request<Incoming>,
         state: Arc<State>,
         addr: SocketAddr,
+        supervisor: &TaskSupervisorHandle,
     ) -> Result<Response<Either<Full<Bytes>, ChannelBody>>> {
         // Create the send channel for server → client messages.
         let (tx, rx) = mpsc::channel::<Bytes>(1024);
         let stream_socket = StreamSocket::new(tx);
         let socket_for_recv = Socket::HTTP(HttpSocket::Stream(stream_socket.clone()));
-        state.metrics.connection_opened("HTTP");
 
         // Spawn recv loop: read framed messages from the request body.
+        let task = supervisor
+            .try_start_async_task()
+            .ok_or_else(|| Error::new(ErrorKind::ConnectionClosed, "HTTP pool stopped".into()))?;
+        state.metrics.connection_opened("HTTP");
         tokio::spawn({
             let state = state.clone();
             let socket_for_recv = socket_for_recv.clone();
             async move {
-                let r = Self::recv_loop(req.into_body(), &socket_for_recv, &state).await;
+                let r = tokio::select! {
+                    () = task.stopped() => Err(Error::new(
+                        ErrorKind::ConnectionClosed,
+                        "HTTP pool stopped".into(),
+                    )),
+                    r = Self::recv_loop(req.into_body(), &socket_for_recv, &state) => r,
+                };
                 if let Err(e) = &r {
                     tracing::error!("http rpc recv loop for {addr} failed: {e}");
                 }
@@ -321,6 +320,7 @@ impl HttpSocketPool {
         addr: &SocketAddr,
         state: &Arc<State>,
         socket_map: &HttpSocketMap,
+        supervisor: &TaskSupervisorHandle,
     ) -> Result<HttpSocket> {
         use hyper::client::conn::http2;
 
@@ -332,7 +332,19 @@ impl HttpSocketPool {
         let (mut sender, conn) = http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
             .await
             .map_err(|e| Error::new(ErrorKind::HttpWaitRspFailed, e.to_string()))?;
-        tokio::spawn(conn);
+        let conn_task = supervisor
+            .try_start_async_task()
+            .ok_or_else(|| Error::new(ErrorKind::ConnectionClosed, "HTTP pool stopped".into()))?;
+        tokio::spawn(async move {
+            tokio::select! {
+                () = conn_task.stopped() => {}
+                result = conn => {
+                    if let Err(err) = result {
+                        tracing::debug!("HTTP/2 client connection ended: {err}");
+                    }
+                }
+            }
+        });
 
         // Create send channel for client → server messages (request body).
         let (req_tx, req_rx) = mpsc::channel::<Bytes>(1024);
@@ -351,17 +363,31 @@ impl HttpSocketPool {
         // Create the socket for sending messages.
         let stream_socket = StreamSocket::new(req_tx);
         let socket = HttpSocket::Stream(stream_socket.clone());
+
+        let recv_task = supervisor
+            .try_start_async_task()
+            .ok_or_else(|| Error::new(ErrorKind::ConnectionClosed, "HTTP pool stopped".into()))?;
         state.metrics.connection_opened("HTTP");
+
+        // Publish before the receive task can observe EOF and evict it.
+        socket_map.publish(*addr, socket.clone()).await;
 
         // Spawn recv loop on the response body. When it exits — error or
         // clean end of stream — evict the socket from the pool and eagerly
         // fail every request still pending on the connection.
         let socket_for_recv = Socket::HTTP(socket.clone());
+        let socket_for_map = socket.clone();
         let state = state.clone();
         let socket_map = socket_map.clone();
         let addr = *addr;
         tokio::spawn(async move {
-            let r = Self::recv_loop(rsp.into_body(), &socket_for_recv, &state).await;
+            let r = tokio::select! {
+                () = recv_task.stopped() => Err(Error::new(
+                    ErrorKind::ConnectionClosed,
+                    "HTTP pool stopped".into(),
+                )),
+                r = Self::recv_loop(rsp.into_body(), &socket_for_recv, &state) => r,
+            };
             if let Err(e) = &r {
                 tracing::error!("http rpc client recv loop for {addr} failed: {e}");
             }
@@ -369,15 +395,7 @@ impl HttpSocketPool {
                 return;
             }
             state.metrics.connection_closed("HTTP");
-            {
-                let mut socket_map = socket_map.write().await;
-                // Identity check: don't evict a replacement connection.
-                if let Some(HttpSocket::Stream(existing)) = socket_map.get(&addr)
-                    && existing.same_socket(&stream_socket)
-                {
-                    socket_map.remove(&addr);
-                }
-            }
+            socket_map.evict_if_current(&addr, &socket_for_map).await;
             let err = Error::new(
                 ErrorKind::ConnectionClosed,
                 format!("http connection to {addr} closed: {:?}", r.err()),

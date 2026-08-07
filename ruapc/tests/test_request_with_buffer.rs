@@ -85,7 +85,7 @@ async fn test_upload_with_read_buffer_tcp() {
     let addr = server.clone().listen(addr).await.unwrap();
 
     let ctx = Context::create(&config).unwrap();
-    let ctx = ctx.with_addr(addr);
+    let ctx = ctx.with_endpoint(ruapc::Endpoint::tcp(addr));
 
     // 1. Test normal request (no buffer) — backwards compatibility.
     let client = Client::default();
@@ -135,7 +135,7 @@ async fn test_upload_with_read_buffer_websocket() {
     upload_svc.ruapc_export(&mut router);
 
     let config = SocketPoolConfig {
-        socket_type: SocketType::UNIFIED,
+        listen_mode: ruapc::ListenMode::UNIFIED,
         ..Default::default()
     };
     let server = Server::create(router, &config).unwrap();
@@ -144,17 +144,14 @@ async fn test_upload_with_read_buffer_websocket() {
     let addr = server.clone().listen(addr).await.unwrap();
 
     let ctx = Context::create(&config).unwrap();
-    let ctx = ctx.with_addr(addr);
+    let ctx = ctx.with_endpoint(ruapc::Endpoint::new(ruapc::Transport::WS, addr));
 
     let test_data = b"WebSocket buffer test!";
     let mut buf = ctx.state.buffer_pool.allocate(1024 * 1024).unwrap();
     buf[..test_data.len()].copy_from_slice(test_data);
     buf.set_len(test_data.len());
 
-    let client = Client {
-        socket_type: Some(SocketType::WS),
-        ..Default::default()
-    };
+    let client = Client::default();
     let req = UploadReq {};
 
     let rsp: UploadRsp = client
@@ -175,7 +172,7 @@ async fn test_upload_with_read_buffer_http() {
     upload_svc.ruapc_export(&mut router);
 
     let config = SocketPoolConfig {
-        socket_type: SocketType::UNIFIED,
+        listen_mode: ruapc::ListenMode::UNIFIED,
         ..Default::default()
     };
     let server = Server::create(router, &config).unwrap();
@@ -184,17 +181,14 @@ async fn test_upload_with_read_buffer_http() {
     let addr = server.clone().listen(addr).await.unwrap();
 
     let ctx = Context::create(&config).unwrap();
-    let ctx = ctx.with_addr(addr);
+    let ctx = ctx.with_endpoint(ruapc::Endpoint::new(ruapc::Transport::HTTP, addr));
 
     let test_data = b"HTTP buffer test!";
     let mut buf = ctx.state.buffer_pool.allocate(1024 * 1024).unwrap();
     buf[..test_data.len()].copy_from_slice(test_data);
     buf.set_len(test_data.len());
 
-    let client = Client {
-        socket_type: Some(SocketType::HTTP),
-        ..Default::default()
-    };
+    let client = Client::default();
     let req = UploadReq {};
 
     let rsp: UploadRsp = client

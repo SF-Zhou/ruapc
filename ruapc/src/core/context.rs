@@ -1,13 +1,24 @@
-use std::{net::SocketAddr, sync::Arc};
+#[cfg(feature = "rdma")]
+use std::net::SocketAddr;
+use std::{
+    collections::HashSet,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use ruapc_bufpool::RemoteBufferInfo;
 use serde::Serialize;
 use tokio_util::sync::DropGuard;
 
 use crate::{
-    Buffer, CopyOp, Error, RemoteIoError, Result, Router, Socket, SocketPoolConfig, SocketTrait,
-    State,
-    core::scatter::{self, SpaceLayout},
+    Buffer, CopyOp, Endpoint, Error, RemoteIoError, Result, Router, Socket, SocketPoolConfig,
+    SocketTrait, State,
+    core::{
+        EndpointState,
+        scatter::{self, SpaceLayout},
+    },
     msg::{MsgFlags, MsgMeta},
 };
 
@@ -74,53 +85,78 @@ fn local_layout(buffers: &[Buffer]) -> Result<SpaceLayout> {
 /// Represents the connection endpoint for an RPC operation, which can be:
 /// - Invalid: No endpoint specified
 /// - Connected: An existing socket connection
-/// - Address: A socket address to connect to
+/// - Endpoints: One or more equivalent transport-bearing destinations
 #[derive(Clone, Debug, Default)]
-pub enum SocketEndpoint {
+pub(crate) enum ContextEndpoint {
     /// No valid endpoint (default state).
     #[default]
     Invalid,
     /// An established socket connection.
     Connected(Socket),
-    /// A socket address to establish a connection to.
-    Address(SocketAddr),
-    /// Several equivalent server addresses; requests pick one round-robin
-    /// and connect-phase retries fail over to the next.
-    Addresses(Arc<AddrSet>),
+    /// Several equivalent server endpoints with shared connection health.
+    Endpoints(Arc<EndpointSet>),
 }
 
-/// A set of equivalent server addresses with a round-robin cursor.
+/// A set of equivalent server endpoints with shared selection state.
 #[derive(Debug)]
-pub struct AddrSet {
-    addrs: Vec<SocketAddr>,
-    cursor: std::sync::atomic::AtomicUsize,
+pub(crate) struct EndpointSet {
+    endpoints: Vec<Endpoint>,
+    states: OnceLock<Vec<Arc<EndpointState>>>,
+    cursor: AtomicUsize,
 }
 
-impl AddrSet {
-    /// Creates an address set. Empty sets are permitted but every request
+impl EndpointSet {
+    /// Creates an endpoint set. Empty sets are permitted but every request
     /// through them fails with `InvalidArgument`.
     #[must_use]
-    pub fn new(addrs: Vec<SocketAddr>) -> Self {
+    pub(crate) fn new(endpoints: Vec<Endpoint>) -> Self {
+        let mut seen = HashSet::with_capacity(endpoints.len());
+        let endpoints = endpoints
+            .into_iter()
+            .filter(|endpoint| seen.insert(*endpoint))
+            .collect();
         Self {
-            addrs,
-            cursor: std::sync::atomic::AtomicUsize::new(0),
+            endpoints,
+            states: OnceLock::new(),
+            cursor: AtomicUsize::new(0),
         }
     }
 
-    /// Address for the `attempt`-th try of one request: the first attempt
-    /// advances the round-robin cursor, retries move to subsequent
-    /// addresses.
-    pub(crate) fn pick(&self, base: usize, attempt: usize) -> Option<SocketAddr> {
-        if self.addrs.is_empty() {
-            return None;
-        }
-        Some(self.addrs[(base + attempt) % self.addrs.len()])
+    /// Returns the endpoint when this set does not need failover selection.
+    pub(crate) fn singleton(&self) -> Option<Endpoint> {
+        (self.endpoints.len() == 1).then(|| self.endpoints[0])
     }
 
-    /// Reserves a starting position for a new request.
-    pub(crate) fn next_base(&self) -> usize {
-        self.cursor
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    /// Returns all endpoints ordered by current usability. Existing healthy
+    /// connections win, then connectable endpoints with fewer failures;
+    /// round-robin order breaks ties. Cooling addresses remain at the end so
+    /// a fully degraded set can still be probed.
+    pub(crate) fn candidates(&self, state: &State) -> Vec<Arc<EndpointState>> {
+        let base = self.cursor.fetch_add(1, Ordering::Relaxed);
+        let states = self.states.get_or_init(|| {
+            self.endpoints
+                .iter()
+                .map(|endpoint| state.endpoint_state(*endpoint))
+                .collect()
+        });
+        let mut candidates: Vec<_> = states
+            .iter()
+            .enumerate()
+            .map(|(index, endpoint_state)| {
+                let selection_rank = endpoint_state.selection_rank();
+                let rank = (
+                    selection_rank.0,
+                    selection_rank.1,
+                    selection_rank.2,
+                    selection_rank.3,
+                    (index + self.endpoints.len() - base % self.endpoints.len().max(1))
+                        % self.endpoints.len().max(1),
+                );
+                (rank, endpoint_state.clone())
+            })
+            .collect();
+        candidates.sort_unstable_by_key(|(rank, _)| *rank);
+        candidates.into_iter().map(|(_, state)| state).collect()
     }
 }
 
@@ -136,18 +172,17 @@ impl AddrSet {
 /// Creating a client context:
 ///
 /// ```rust,no_run
-/// # use ruapc::{Context, SocketPoolConfig};
-/// # use std::{net::SocketAddr, str::FromStr};
+/// # use ruapc::{Context, Endpoint, SocketPoolConfig};
 /// let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
-/// let addr = SocketAddr::from_str("127.0.0.1:8000").unwrap();
-/// let ctx = ctx.with_addr(addr);
+/// let endpoint: Endpoint = "tcp://127.0.0.1:8000".parse().unwrap();
+/// let ctx = ctx.with_endpoint(endpoint);
 /// ```
 #[derive(Clone)]
 pub struct Context {
     pub(crate) drop_guard: Option<Arc<DropGuard>>,
     /// Shared state containing router and socket pool.
     pub state: Arc<State>,
-    pub(crate) endpoint: SocketEndpoint,
+    pub(crate) endpoint: ContextEndpoint,
     /// Message metadata for the current RPC operation.
     pub msg_meta: MsgMeta,
     /// Deadline of the request being handled, derived from the client's
@@ -171,7 +206,7 @@ impl Context {
         let (state, drop_guard) = State::create(router, config)?;
         Ok(Self {
             state,
-            endpoint: SocketEndpoint::Invalid,
+            endpoint: ContextEndpoint::Invalid,
             drop_guard: Some(Arc::new(drop_guard)),
             msg_meta: MsgMeta::default(),
             deadline: None,
@@ -187,7 +222,9 @@ impl Context {
     pub(crate) fn create_with_state_and_addr(state: &Arc<State>, addr: &SocketAddr) -> Self {
         Self {
             state: state.clone(),
-            endpoint: SocketEndpoint::Address(*addr),
+            endpoint: ContextEndpoint::Endpoints(Arc::new(EndpointSet::new(vec![Endpoint::tcp(
+                *addr,
+            )]))),
             drop_guard: None,
             msg_meta: MsgMeta::default(),
             deadline: None,
@@ -195,15 +232,15 @@ impl Context {
         }
     }
 
-    /// Creates a new context with the specified target address.
+    /// Creates a new context with the specified target endpoint.
     ///
     /// The deadline (if any) is inherited: nested RPCs issued while handling
     /// a request keep the caller's remaining time budget.
     #[must_use]
-    pub fn with_addr(&self, addr: SocketAddr) -> Self {
+    pub fn with_endpoint(&self, endpoint: Endpoint) -> Self {
         Self {
             state: self.state.clone(),
-            endpoint: SocketEndpoint::Address(addr),
+            endpoint: ContextEndpoint::Endpoints(Arc::new(EndpointSet::new(vec![endpoint]))),
             drop_guard: self.drop_guard.clone(),
             msg_meta: MsgMeta::default(),
             deadline: self.deadline,
@@ -212,17 +249,20 @@ impl Context {
         }
     }
 
-    /// Creates a new context that load-balances across several addresses.
+    /// Creates a new context that load-balances across equivalent endpoints.
     ///
-    /// Each request picks the next address round-robin; when an attempt
-    /// fails before the request reaches the wire (connect or send failure),
-    /// the retry moves on to the following address (see
+    /// Healthy established connections are preferred, ties are distributed
+    /// round-robin, and the remaining addresses are connected in the
+    /// background. Connect/send failures apply exponential cooldown to that
+    /// transport/address pair; connect-phase retries re-rank and use an
+    /// untried candidate first. Cooldown does not sleep a foreground request
+    /// when no alternative exists (see
     /// [`Client::max_retries`](crate::Client::max_retries)).
     #[must_use]
-    pub fn with_addrs(&self, addrs: Vec<SocketAddr>) -> Self {
+    pub fn with_endpoints(&self, endpoints: Vec<Endpoint>) -> Self {
         Self {
             state: self.state.clone(),
-            endpoint: SocketEndpoint::Addresses(Arc::new(AddrSet::new(addrs))),
+            endpoint: ContextEndpoint::Endpoints(Arc::new(EndpointSet::new(endpoints))),
             drop_guard: self.drop_guard.clone(),
             msg_meta: MsgMeta::default(),
             deadline: self.deadline,
@@ -259,16 +299,15 @@ impl Context {
     /// a matching connection is established on demand (and kept pinned:
     /// it is exempt from automatic rebalancing).
     ///
-    /// Only affects requests using [`SocketType::RDMA`](crate::SocketType);
+    /// Only affects requests using [`Transport::RDMA`](crate::Transport);
     /// other transports ignore the selector.
     ///
     /// ```rust,no_run
-    /// # use ruapc::{Context, RdmaPathSelector, SocketPoolConfig};
-    /// # use std::{net::SocketAddr, str::FromStr};
+    /// # use ruapc::{Context, Endpoint, RdmaPathSelector, SocketPoolConfig};
     /// let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
-    /// let addr = SocketAddr::from_str("127.0.0.1:8000").unwrap();
+    /// let endpoint: Endpoint = "rdma://127.0.0.1:8000".parse().unwrap();
     /// let ctx = ctx
-    ///     .with_addr(addr)
+    ///     .with_endpoint(endpoint)
     ///     .with_rdma_path(RdmaPathSelector::local_device("mlx5_0"));
     /// ```
     #[cfg(feature = "rdma")]
@@ -290,7 +329,7 @@ impl Context {
             .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(u64::from(ms)));
         Self {
             state: state.clone(),
-            endpoint: SocketEndpoint::Connected(socket),
+            endpoint: ContextEndpoint::Connected(socket),
             drop_guard: None,
             msg_meta,
             deadline,
@@ -328,7 +367,7 @@ impl Context {
         meta.flags.remove(MsgFlags::IsReq);
         meta.flags.insert(MsgFlags::IsRsp);
         match &mut self.endpoint {
-            SocketEndpoint::Connected(socket) => {
+            ContextEndpoint::Connected(socket) => {
                 let _ = socket.send(&mut meta, &rsp, &self.state).await;
             }
             _ => {
@@ -423,7 +462,7 @@ impl Context {
             return Err(RemoteIoError::new(e, Some(local)));
         }
         let socket = match &self.endpoint {
-            SocketEndpoint::Connected(s) => s,
+            ContextEndpoint::Connected(s) => s,
             _ => {
                 return Err(RemoteIoError::new(
                     Error::new(
@@ -527,7 +566,7 @@ impl Context {
             return Err(RemoteIoError::new(e, Some(local)));
         }
         let socket = match &self.endpoint {
-            SocketEndpoint::Connected(s) => s,
+            ContextEndpoint::Connected(s) => s,
             _ => {
                 return Err(RemoteIoError::new(
                     Error::new(
@@ -577,8 +616,109 @@ mod tests {
     use crate::{Error, ErrorKind, SocketPoolConfig};
 
     #[tokio::test]
+    async fn endpoint_set_deduplicates_and_tracks_transports_separately() {
+        let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
+        let first: SocketAddr = "127.0.0.1:10001".parse().unwrap();
+        let set = EndpointSet::new(vec![
+            Endpoint::new(crate::Transport::TCP, first),
+            Endpoint::new(crate::Transport::TCP, first),
+            Endpoint::new(crate::Transport::WS, first),
+        ]);
+        let endpoints = set.candidates(&ctx.state);
+        assert_eq!(endpoints.len(), 2);
+        assert_ne!(
+            endpoints[0].endpoint().transport(),
+            endpoints[1].endpoint().transport()
+        );
+    }
+
+    #[test]
+    fn endpoint_set_exposes_singleton_fast_path_after_deduplication() {
+        let endpoint = Endpoint::tcp("127.0.0.1:10001".parse().unwrap());
+        let set = EndpointSet::new(vec![endpoint, endpoint]);
+
+        assert_eq!(set.singleton(), Some(endpoint));
+    }
+
+    #[tokio::test]
+    async fn endpoint_health_is_shared_across_sets() {
+        let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
+        let first: SocketAddr = "127.0.0.1:10001".parse().unwrap();
+        let second: SocketAddr = "127.0.0.1:10002".parse().unwrap();
+        let set = EndpointSet::new(vec![Endpoint::tcp(first), Endpoint::tcp(second)]);
+        let candidates = set.candidates(&ctx.state);
+        let failed = candidates[0].endpoint();
+        candidates[0].begin_connect().record_failure();
+
+        let other_set = EndpointSet::new(vec![Endpoint::tcp(first), Endpoint::tcp(second)]);
+        let reordered = other_set.candidates(&ctx.state);
+        assert_ne!(reordered[0].endpoint(), failed);
+        assert!(Arc::ptr_eq(
+            &candidates[0],
+            &ctx.state.endpoint_state(failed)
+        ));
+    }
+
+    #[test]
+    fn foreground_connection_suppresses_preconnect() {
+        let state = Arc::new(EndpointState::new(Endpoint::tcp(
+            "127.0.0.1:10001".parse().unwrap(),
+        )));
+        let foreground = state.begin_connect();
+        assert!(state.try_begin_preconnect().is_none());
+        drop(foreground);
+        assert!(state.try_begin_preconnect().is_some());
+    }
+
+    #[test]
+    fn endpoint_health_observes_closed_send_channel() {
+        let endpoint = Endpoint::tcp("127.0.0.1:10001".parse().unwrap());
+        let state = Arc::new(EndpointState::new(endpoint));
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let socket = Socket::TCP(crate::tcp::TcpSocket::new(sender));
+        state.begin_connect().record_connection(&socket);
+        assert!(state.snapshot().connected);
+        drop(receiver);
+        assert!(!state.snapshot().connected);
+    }
+
+    #[test]
+    fn connection_failure_is_counted_once_per_connection() {
+        let endpoint = Endpoint::tcp("127.0.0.1:10001".parse().unwrap());
+        let state = Arc::new(EndpointState::new(endpoint));
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let socket = Socket::TCP(crate::tcp::TcpSocket::new(sender));
+        let conn_id = socket.conn_id().unwrap();
+        state.begin_connect().record_connection(&socket);
+
+        state.record_connection_failure(conn_id);
+        state.record_connection_failure(conn_id);
+
+        assert_eq!(state.snapshot().failures, 1);
+    }
+
+    #[test]
+    fn stale_failure_does_not_clear_replacement_connection() {
+        let endpoint = Endpoint::tcp("127.0.0.1:10001".parse().unwrap());
+        let state = Arc::new(EndpointState::new(endpoint));
+        let (old_sender, _old_receiver) = tokio::sync::mpsc::channel(1);
+        let old_socket = Socket::TCP(crate::tcp::TcpSocket::new(old_sender));
+        let old_conn_id = old_socket.conn_id().unwrap();
+        state.begin_connect().record_connection(&old_socket);
+
+        let (new_sender, _new_receiver) = tokio::sync::mpsc::channel(1);
+        let new_socket = Socket::TCP(crate::tcp::TcpSocket::new(new_sender));
+        state.begin_connect().record_connection(&new_socket);
+        state.record_connection_failure(old_conn_id);
+
+        let snapshot = state.snapshot();
+        assert!(snapshot.connected);
+        assert_eq!(snapshot.failures, 0);
+    }
+
+    #[tokio::test]
     async fn test_send_rsp_invalid_endpoint_logs_and_does_not_panic() {
-        // Context starts with SocketEndpoint::Invalid by default.
+        // Context starts without a destination by default.
         let mut ctx = Context::create(&SocketPoolConfig::default()).unwrap();
         // This should log an error and silently return (no panic).
         ctx.send_err_rsp(Error::kind(ErrorKind::Timeout)).await;

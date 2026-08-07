@@ -9,7 +9,7 @@
 
 use std::{net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
-use ruapc::{ErrorKind, SocketPoolConfig, SocketType};
+use ruapc::{Endpoint, ErrorKind, ListenMode, SocketPoolConfig, Transport};
 
 #[ruapc::service]
 trait Robust {
@@ -44,7 +44,7 @@ fn make_server(config: &SocketPoolConfig) -> ruapc::Server {
 
 fn unified_config() -> SocketPoolConfig {
     SocketPoolConfig {
-        socket_type: SocketType::UNIFIED,
+        listen_mode: ListenMode::UNIFIED,
         ..Default::default()
     }
 }
@@ -55,7 +55,7 @@ fn unified_config() -> SocketPoolConfig {
 async fn test_inflight_request_fails_fast_on_disconnect() {
     let _ = tracing_subscriber::fmt().try_init();
 
-    for socket_type in [SocketType::TCP, SocketType::WS, SocketType::HTTP] {
+    for transport in [Transport::TCP, Transport::WS, Transport::HTTP] {
         let config = unified_config();
         let server = make_server(&config);
         let addr = SocketAddr::from_str("127.0.0.1:0").unwrap();
@@ -64,11 +64,12 @@ async fn test_inflight_request_fails_fast_on_disconnect() {
         // Long client timeout: if the eager failure path doesn't work, the
         // elapsed-time assertion below fails long before this timeout.
         let client = ruapc::Client {
-            socket_type: Some(socket_type),
             timeout: Duration::from_secs(30),
             ..Default::default()
         };
-        let ctx = ruapc::Context::create(&config).unwrap().with_addr(addr);
+        let ctx = ruapc::Context::create(&config)
+            .unwrap()
+            .with_endpoint(Endpoint::new(transport, addr));
 
         let request = {
             let client = client.clone();
@@ -87,11 +88,11 @@ async fn test_inflight_request_fails_fast_on_disconnect() {
         assert_eq!(
             err.kind,
             ErrorKind::ConnectionClosed,
-            "socket_type={socket_type:?}, err={err:?}"
+            "transport={transport:?}, err={err:?}"
         );
         assert!(
             started.elapsed() < Duration::from_secs(5),
-            "eager failure took too long for {socket_type:?}"
+            "eager failure took too long for {transport:?}"
         );
     }
 }
@@ -103,17 +104,16 @@ async fn test_inflight_request_fails_fast_on_disconnect() {
 async fn test_pool_reconnects_after_server_restart() {
     let _ = tracing_subscriber::fmt().try_init();
 
-    for socket_type in [SocketType::TCP, SocketType::WS, SocketType::HTTP] {
+    for transport in [Transport::TCP, Transport::WS, Transport::HTTP] {
         let config = unified_config();
         let server = make_server(&config);
         let addr = SocketAddr::from_str("127.0.0.1:0").unwrap();
         let addr = server.listen(addr).await.unwrap();
 
-        let client = ruapc::Client {
-            socket_type: Some(socket_type),
-            ..Default::default()
-        };
-        let ctx = ruapc::Context::create(&config).unwrap().with_addr(addr);
+        let client = ruapc::Client::default();
+        let ctx = ruapc::Context::create(&config)
+            .unwrap()
+            .with_endpoint(Endpoint::new(transport, addr));
         let rsp = client.echo(&ctx, &"one".to_string()).await.unwrap();
         assert_eq!(rsp, "one");
 
@@ -125,7 +125,7 @@ async fn test_pool_reconnects_after_server_restart() {
         // need a moment to rebind.
         let server = make_server(&config);
         let addr = server.listen(addr).await.unwrap();
-        let ctx = ctx.with_addr(addr);
+        let ctx = ctx.with_endpoint(Endpoint::new(transport, addr));
 
         let mut recovered = false;
         for _ in 0..50 {
@@ -136,7 +136,7 @@ async fn test_pool_reconnects_after_server_restart() {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        assert!(recovered, "client never recovered for {socket_type:?}");
+        assert!(recovered, "client never recovered for {transport:?}");
 
         server.stop();
         server.join().await;
@@ -149,7 +149,7 @@ async fn test_pool_reconnects_after_server_restart() {
 async fn test_handler_panic_returns_error() {
     let _ = tracing_subscriber::fmt().try_init();
 
-    for socket_type in [SocketType::TCP, SocketType::HTTP] {
+    for transport in [Transport::TCP, Transport::HTTP] {
         let config = unified_config();
         let server = make_server(&config);
         let addr = SocketAddr::from_str("127.0.0.1:0").unwrap();
@@ -158,11 +158,12 @@ async fn test_handler_panic_returns_error() {
         // Long timeout: proves the error response arrives eagerly rather
         // than the client timing out.
         let client = ruapc::Client {
-            socket_type: Some(socket_type),
             timeout: Duration::from_secs(30),
             ..Default::default()
         };
-        let ctx = ruapc::Context::create(&config).unwrap().with_addr(addr);
+        let ctx = ruapc::Context::create(&config)
+            .unwrap()
+            .with_endpoint(Endpoint::new(transport, addr));
 
         let started = std::time::Instant::now();
         let err = client.panicky(&ctx, &"boom".to_string()).await.unwrap_err();

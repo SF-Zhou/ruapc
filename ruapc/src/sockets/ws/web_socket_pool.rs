@@ -1,14 +1,13 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc};
 
 use bytes::Bytes;
-use foldhash::fast::RandomState;
 use futures_util::{
     SinkExt, StreamExt,
     stream::{SplitSink, SplitStream},
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::{RwLock, mpsc},
+    sync::mpsc,
 };
 use tokio_tungstenite::{
     WebSocketStream, accept_async_with_config, client_async_with_config, tungstenite,
@@ -17,7 +16,7 @@ use tokio_util::sync::DropGuard;
 
 use super::WebSocket;
 use crate::{
-    Message, RawStream, Socket, SocketPoolConfig, SocketPoolTrait, SocketType, State,
+    ConnectionMap, Message, RawStream, Socket, SocketPoolConfig, SocketPoolTrait, State,
     TaskSupervisor,
     error::{Error, ErrorKind, Result},
     sockets::tcp,
@@ -32,7 +31,8 @@ pub(crate) fn web_socket_config() -> tungstenite::protocol::WebSocketConfig {
 }
 
 pub struct WebSocketPool {
-    socket_map: Arc<RwLock<HashMap<SocketAddr, WebSocket, RandomState>>>,
+    socket_map: ConnectionMap<WebSocket>,
+    connect_locks: crate::sockets::connect::ConnectLocks,
     task_supervisor: TaskSupervisor,
 }
 
@@ -43,7 +43,8 @@ impl SocketPoolTrait for WebSocketPool {
         _buffer_pool: &Arc<crate::BufferPool>,
     ) -> Result<Self> {
         Ok(Self {
-            socket_map: Arc::default(),
+            socket_map: ConnectionMap::default(),
+            connect_locks: Default::default(),
             task_supervisor: TaskSupervisor::create(),
         })
     }
@@ -59,10 +60,10 @@ impl SocketPoolTrait for WebSocketPool {
                 let stream = accept_async_with_config(tcp_stream, Some(web_socket_config()))
                     .await
                     .map_err(|e| Error::new(ErrorKind::WebSocketAcceptFailed, e.to_string()))?;
-                self.add_socket(addr, stream, state);
+                self.add_socket(addr, stream, state)?;
             }
             RawStream::WS(web_socket_stream) => {
-                self.add_socket(addr, *web_socket_stream, state);
+                self.add_socket(addr, *web_socket_stream, state)?;
             }
         }
         Ok(())
@@ -80,29 +81,14 @@ impl SocketPoolTrait for WebSocketPool {
         self.task_supervisor.all_stopped().await;
     }
 
-    async fn acquire(
-        &self,
-        addr: &SocketAddr,
-        socket_type: SocketType,
-        state: &Arc<State>,
-    ) -> Result<Socket> {
-        if socket_type != SocketType::WS {
-            return Err(Error::new(
-                ErrorKind::InvalidArgument,
-                format!("invalid socket type {socket_type} for WebSocketPool"),
-            ));
-        }
-
+    async fn acquire(&self, addr: &SocketAddr, state: &Arc<State>) -> Result<Socket> {
         // Check if the socket is already in the socket map.
-        if let Ok(socket_map) = self.socket_map.try_read()
-            && let Some(socket) = socket_map.get(addr)
-        {
+        if let Some(socket) = self.socket_map.try_get_live(addr) {
             return Ok(socket.into());
         }
 
-        // If not, create a new socket and insert it into the socket map.
-        let mut socket_map = self.socket_map.write().await;
-        if let Some(socket) = socket_map.get(addr) {
+        let _connect = self.connect_locks.lock(*addr).await;
+        if let Some(socket) = self.socket_map.get_live(addr).await {
             return Ok(socket.into());
         }
 
@@ -120,8 +106,10 @@ impl SocketPoolTrait for WebSocketPool {
         .await
         .map_err(|e| Error::new(ErrorKind::WebSocketConnectFailed, e.to_string()))?;
 
-        let send_socket = self.add_socket(*addr, stream, state);
-        socket_map.insert(*addr, send_socket.clone());
+        let send_socket = self
+            .socket_map
+            .try_publish_with(*addr, || self.add_socket(*addr, stream, state))
+            .await?;
         Ok(send_socket.into())
     }
 }
@@ -132,58 +120,67 @@ impl WebSocketPool {
         addr: SocketAddr,
         stream: WebSocketStream<S>,
         state: &Arc<State>,
-    ) -> WebSocket
+    ) -> Result<WebSocket>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let (send_stream, recv_stream) = stream.split();
         let (sender, receiver) = mpsc::channel(1024);
         let web_socket = WebSocket::new(sender);
+        let task_supervisor = self.task_supervisor.try_start_async_task().ok_or_else(|| {
+            Error::new(ErrorKind::ConnectionClosed, "WebSocket pool stopped".into())
+        })?;
+        let recv_task = self.task_supervisor.try_start_async_task().ok_or_else(|| {
+            Error::new(ErrorKind::ConnectionClosed, "WebSocket pool stopped".into())
+        })?;
         state.metrics.connection_opened("WS");
 
-        let task_supervisor = self.task_supervisor.start_async_task();
         tokio::spawn({
             let socket_map = self.socket_map.clone();
             let web_socket = web_socket.clone();
             let state = state.clone();
             async move {
-                tokio::select! {
-                    () = task_supervisor.stopped() => {},
-                    r = Self::start_send_loop(send_stream, receiver) => {
-                        if let Err(e) = r {
-                            tracing::error!("send loop for {addr} failed: {e}");
-                            Self::evict_socket(&socket_map, &addr, &web_socket, &state, &e).await;
-                        }
+                let error = tokio::select! {
+                    () = task_supervisor.stopped() => {
+                        Error::new(ErrorKind::ConnectionClosed, "WebSocket pool stopped".into())
                     }
-                }
+                    result = Self::start_send_loop(send_stream, receiver) => result.err()
+                        .unwrap_or_else(|| Error::new(
+                            ErrorKind::ConnectionClosed,
+                            "WebSocket send loop ended".into(),
+                        )),
+                };
+                tracing::debug!("send loop for {addr} ended: {error}");
+                Self::evict_socket(&socket_map, &addr, &web_socket, &state, &error).await;
             }
         });
 
-        let task_supervisor = self.task_supervisor.start_async_task();
         tokio::spawn({
             let socket_map = self.socket_map.clone();
             let web_socket = web_socket.clone();
             let state = state.clone();
             async move {
-                tokio::select! {
-                    () = task_supervisor.stopped() => {},
-                    r = Self::start_recv_loop(recv_stream, web_socket.clone(), &state) => {
-                        let e = r.err().unwrap_or_else(|| {
-                            Error::new(ErrorKind::ConnectionClosed, "connection closed".into())
-                        });
-                        tracing::error!("recv loop for {addr} failed: {e}");
-                        Self::evict_socket(&socket_map, &addr, &web_socket, &state, &e).await;
+                let error = tokio::select! {
+                    () = recv_task.stopped() => {
+                        Error::new(ErrorKind::ConnectionClosed, "WebSocket pool stopped".into())
                     }
-                }
+                    result = Self::start_recv_loop(recv_stream, web_socket.clone(), &state) =>
+                        result.err().unwrap_or_else(|| Error::new(
+                            ErrorKind::ConnectionClosed,
+                            "WebSocket receive loop ended".into(),
+                        )),
+                };
+                tracing::debug!("receive loop for {addr} ended: {error}");
+                Self::evict_socket(&socket_map, &addr, &web_socket, &state, &error).await;
             }
         });
-        web_socket
+        Ok(web_socket)
     }
 
     /// Removes a dead socket from the map (if it is still the mapped one)
     /// and eagerly fails every request pending on the connection.
     async fn evict_socket(
-        socket_map: &Arc<RwLock<HashMap<SocketAddr, WebSocket, RandomState>>>,
+        socket_map: &ConnectionMap<WebSocket>,
         addr: &SocketAddr,
         socket: &WebSocket,
         state: &Arc<State>,
@@ -194,15 +191,7 @@ impl WebSocketPool {
             return;
         }
         state.metrics.connection_closed("WS");
-        {
-            let mut socket_map = socket_map.write().await;
-            // Identity check: don't evict a replacement connection.
-            if let Some(existing) = socket_map.get(addr)
-                && existing.same_socket(socket)
-            {
-                socket_map.remove(addr);
-            }
-        }
+        socket_map.evict_if_current(addr, socket).await;
         let err = Error::new(
             ErrorKind::ConnectionClosed,
             format!("connection to {addr} closed: {err}"),
@@ -264,10 +253,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_web_socket_pool_debug_format() {
-        let config = crate::SocketPoolConfig {
-            socket_type: crate::SocketType::WS,
-            ..Default::default()
-        };
+        let config = crate::SocketPoolConfig::default();
         let devices = Arc::new(crate::Devices::default());
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = WebSocketPool::create(&config, &devices, &buffer_pool).unwrap();
@@ -277,32 +263,5 @@ mod tests {
         pool.stop();
         drop(pool.drop_guard());
         pool.join().await;
-    }
-
-    #[tokio::test]
-    async fn test_web_socket_pool_acquire_wrong_type_returns_err() {
-        let config = crate::SocketPoolConfig {
-            socket_type: crate::SocketType::WS,
-            ..Default::default()
-        };
-        let devices = Arc::new(crate::Devices::default());
-        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
-        let pool = WebSocketPool::create(&config, &devices, &buffer_pool).unwrap();
-
-        let (state, _guard) = crate::State::create(
-            crate::Router::default(),
-            &crate::SocketPoolConfig {
-                socket_type: crate::SocketType::TCP,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let addr = "127.0.0.1:9999".parse().unwrap();
-        let result = pool.acquire(&addr, crate::SocketType::TCP, &state).await;
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err().kind,
-            crate::error::ErrorKind::InvalidArgument
-        ));
     }
 }

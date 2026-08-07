@@ -155,12 +155,12 @@ impl RdmaService for () {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SocketPoolConfig, SocketType};
+    use crate::SocketPoolConfig;
 
     #[tokio::test]
     async fn test_rdma_service_info_returns_devices() {
         let config = SocketPoolConfig {
-            socket_type: SocketType::RDMA,
+            rdma: Some(Default::default()),
             ..Default::default()
         };
         let ctx = Context::create(&config).expect("failed to create RDMA context");

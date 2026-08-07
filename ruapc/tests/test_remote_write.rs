@@ -179,8 +179,8 @@ struct TestCase {
     delay_ms: u64,
     /// Client timeout duration.
     client_timeout: Duration,
-    /// Client socket type.
-    socket_type: SocketType,
+    /// Client transport.
+    transport: Transport,
     /// Which method to call.
     method: Method,
     /// Expected outcome.
@@ -204,7 +204,8 @@ enum Expected {
 
 async fn run_test(tc: TestCase) {
     let config = SocketPoolConfig {
-        socket_type: SocketType::UNIFIED,
+        listen_mode: ListenMode::UNIFIED,
+        rdma: Some(Default::default()),
         ..Default::default()
     };
     let mut router = Router::default();
@@ -213,10 +214,11 @@ async fn run_test(tc: TestCase) {
     let server = Arc::new(server);
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
     let addr = server.clone().listen(addr).await.unwrap();
-    let ctx = Context::create(&config).unwrap().with_addr(addr);
+    let ctx = Context::create(&config)
+        .unwrap()
+        .with_endpoint(Endpoint::new(tc.transport, addr));
 
     let client = Client {
-        socket_type: Some(tc.socket_type),
         timeout: tc.client_timeout,
         ..Default::default()
     };
@@ -286,7 +288,7 @@ async fn test_tcp_remote_write() {
         write_splits: &[1024],
         delay_ms: 0,
         client_timeout: Duration::from_secs(5),
-        socket_type: SocketType::TCP,
+        transport: Transport::TCP,
         method: Method::PushData,
         expect: Expected::Ok,
     })
@@ -300,7 +302,7 @@ async fn test_tcp_remote_write_multi_buffer() {
         write_splits: &[10, 0, 25, 100],
         delay_ms: 0,
         client_timeout: Duration::from_secs(5),
-        socket_type: SocketType::TCP,
+        transport: Transport::TCP,
         method: Method::PushData,
         expect: Expected::Ok,
     })
@@ -314,7 +316,7 @@ async fn test_tcp_remote_write_vectored() {
         write_splits: &[7, 13],
         delay_ms: 0,
         client_timeout: Duration::from_secs(5),
-        socket_type: SocketType::TCP,
+        transport: Transport::TCP,
         method: Method::PushSwapped,
         expect: Expected::OkSwapped,
     })
@@ -328,7 +330,7 @@ async fn test_tcp_remote_write_timeout() {
         write_splits: &[64],
         delay_ms: 200,
         client_timeout: Duration::from_millis(100),
-        socket_type: SocketType::TCP,
+        transport: Transport::TCP,
         method: Method::PushData,
         expect: Expected::Err(ErrorKind::Timeout),
     })
@@ -343,7 +345,7 @@ async fn test_rdma_remote_write() {
         write_splits: &[1024],
         delay_ms: 0,
         client_timeout: Duration::from_secs(5),
-        socket_type: SocketType::RDMA,
+        transport: Transport::RDMA,
         method: Method::PushData,
         expect: Expected::Ok,
     })
@@ -358,7 +360,7 @@ async fn test_rdma_remote_write_multi_buffer() {
         write_splits: &[64 * 1024, 96 * 1024, 64 * 1024],
         delay_ms: 0,
         client_timeout: Duration::from_secs(5),
-        socket_type: SocketType::RDMA,
+        transport: Transport::RDMA,
         method: Method::PushData,
         expect: Expected::Ok,
     })
@@ -373,7 +375,7 @@ async fn test_rdma_remote_write_vectored() {
         write_splits: &[11, 21],
         delay_ms: 0,
         client_timeout: Duration::from_secs(5),
-        socket_type: SocketType::RDMA,
+        transport: Transport::RDMA,
         method: Method::PushSwapped,
         expect: Expected::OkSwapped,
     })
@@ -388,7 +390,7 @@ async fn test_rdma_remote_write_timeout() {
         write_splits: &[64],
         delay_ms: 200,
         client_timeout: Duration::from_millis(100),
-        socket_type: SocketType::RDMA,
+        transport: Transport::RDMA,
         method: Method::PushData,
         expect: Expected::Err(ErrorKind::Timeout),
     })
@@ -396,9 +398,10 @@ async fn test_rdma_remote_write_timeout() {
 }
 
 /// Spawns a server and returns (server, client ctx).
-async fn setup() -> (Arc<Server>, Context) {
+async fn setup(transport: Transport) -> (Arc<Server>, Context) {
     let config = SocketPoolConfig {
-        socket_type: SocketType::UNIFIED,
+        listen_mode: ListenMode::UNIFIED,
+        rdma: Some(Default::default()),
         ..Default::default()
     };
     let mut router = Router::default();
@@ -407,7 +410,9 @@ async fn setup() -> (Arc<Server>, Context) {
     let server = Arc::new(Server::create(router, &config).unwrap());
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
     let addr = server.clone().listen(addr).await.unwrap();
-    let ctx = Context::create(&config).unwrap().with_addr(addr);
+    let ctx = Context::create(&config)
+        .unwrap()
+        .with_endpoint(Endpoint::new(transport, addr));
     (server, ctx)
 }
 
@@ -415,21 +420,18 @@ async fn setup() -> (Arc<Server>, Context) {
 /// takes place, and the client's buffers come back untouched.
 #[tokio::test]
 async fn test_tcp_reply_without_transfer() {
-    run_empty_test(SocketType::TCP).await;
+    run_empty_test(Transport::TCP).await;
 }
 
 #[cfg(feature = "rdma")]
 #[tokio::test]
 async fn test_rdma_reply_without_transfer() {
-    run_empty_test(SocketType::RDMA).await;
+    run_empty_test(Transport::RDMA).await;
 }
 
-async fn run_empty_test(socket_type: SocketType) {
-    let (server, ctx) = setup().await;
-    let client = Client {
-        socket_type: Some(socket_type),
-        ..Default::default()
-    };
+async fn run_empty_test(transport: Transport) {
+    let (server, ctx) = setup(transport).await;
+    let client = Client::default();
     let req = WriteReq {
         data: vec![],
         delay_ms: 0,
@@ -462,7 +464,7 @@ async fn run_empty_test(socket_type: SocketType) {
 /// `MissingBufferInfo` (surfaced through the RPC response).
 #[tokio::test]
 async fn test_tcp_write_without_attached_buffers_fails() {
-    let (server, ctx) = setup().await;
+    let (server, ctx) = setup(Transport::TCP).await;
     let client = Client::default();
     let req = WriteReq {
         data: b"data".to_vec(),
@@ -478,7 +480,7 @@ async fn test_tcp_write_without_attached_buffers_fails() {
 /// `InvalidCopyOp`.
 #[tokio::test]
 async fn test_tcp_write_space_too_small_fails() {
-    let (server, ctx) = setup().await;
+    let (server, ctx) = setup(Transport::TCP).await;
     let client = Client::default();
     let req = WriteReq {
         data: vec![0x77; 256],
@@ -500,7 +502,7 @@ async fn test_tcp_write_space_too_small_fails() {
 /// wrote nothing: the client simply gets its buffers back untouched.
 #[tokio::test]
 async fn test_tcp_no_write_returns_buffers_untouched() {
-    let (server, ctx) = setup().await;
+    let (server, ctx) = setup(Transport::TCP).await;
     let client = Client::default();
     let req = WriteReq {
         data: vec![],
@@ -524,7 +526,7 @@ async fn test_tcp_no_write_returns_buffers_untouched() {
 /// types: recognition is by type identity, not by name.
 #[tokio::test]
 async fn test_custom_alias_and_error_type() {
-    let (server, ctx) = setup().await;
+    let (server, ctx) = setup(Transport::TCP).await;
     let client = Client::default();
     let req = WriteReq {
         data: b"alias + custom error".to_vec(),
@@ -550,13 +552,13 @@ async fn test_custom_alias_and_error_type() {
 /// attached to the same request.
 #[tokio::test]
 async fn test_tcp_read_and_write_in_one_call() {
-    run_roundtrip_test(SocketType::TCP).await;
+    run_roundtrip_test(Transport::TCP).await;
 }
 
 #[cfg(feature = "rdma")]
 #[tokio::test]
 async fn test_rdma_read_and_write_in_one_call() {
-    run_roundtrip_test(SocketType::RDMA).await;
+    run_roundtrip_test(Transport::RDMA).await;
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -589,9 +591,10 @@ impl EchoBufService for EchoBufImpl {
     }
 }
 
-async fn run_roundtrip_test(socket_type: SocketType) {
+async fn run_roundtrip_test(transport: Transport) {
     let config = SocketPoolConfig {
-        socket_type: SocketType::UNIFIED,
+        listen_mode: ListenMode::UNIFIED,
+        rdma: Some(Default::default()),
         ..Default::default()
     };
     let mut router = Router::default();
@@ -599,11 +602,10 @@ async fn run_roundtrip_test(socket_type: SocketType) {
     let server = Arc::new(Server::create(router, &config).unwrap());
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
     let addr = server.clone().listen(addr).await.unwrap();
-    let ctx = Context::create(&config).unwrap().with_addr(addr);
-    let client = Client {
-        socket_type: Some(socket_type),
-        ..Default::default()
-    };
+    let ctx = Context::create(&config)
+        .unwrap()
+        .with_endpoint(Endpoint::new(transport, addr));
+    let client = Client::default();
 
     let payload = b"palindrome-me";
     let mut src = ctx.state.buffer_pool.allocate(64 * 1024).unwrap();
