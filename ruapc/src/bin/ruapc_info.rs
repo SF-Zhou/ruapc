@@ -1,16 +1,12 @@
 use clap::Parser;
-use ruapc::{Client, Context, SocketPoolConfig, SocketType, services::MetaService};
+use ruapc::{Client, Context, Endpoint, SocketPoolConfig, services::MetaService};
 
 #[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
 pub struct Args {
-    /// Listen address.
-    #[arg(default_value = "127.0.0.1:8000")]
-    pub addr: std::net::SocketAddr,
-
-    /// Socket type.
-    #[arg(long, default_value = "tcp")]
-    pub socket_type: SocketType,
+    /// RPC endpoint.
+    #[arg(default_value = "tcp://127.0.0.1:8000")]
+    pub endpoint: Endpoint,
 
     /// Use `MessagePack`.
     #[arg(long, default_value_t = false)]
@@ -25,12 +21,15 @@ pub struct Args {
 async fn main() {
     let args = Args::parse();
 
-    let ctx = Context::create(&SocketPoolConfig {
-        socket_type: args.socket_type,
-        ..Default::default()
-    })
-    .unwrap()
-    .with_addr(args.addr);
+    #[allow(unused_mut)]
+    let mut config = SocketPoolConfig::default();
+    #[cfg(feature = "rdma")]
+    if args.endpoint.transport() == ruapc::Transport::RDMA {
+        config.rdma = Some(Default::default());
+    }
+    let ctx = Context::create(&config)
+        .unwrap()
+        .with_endpoint(args.endpoint);
     let client = Client {
         use_msgpack: args.use_msgpack,
         ..Default::default()

@@ -2,7 +2,7 @@
 
 use std::{str::FromStr, sync::Arc, time::Duration};
 
-use ruapc::{Client, SocketPoolConfig, SocketType, services::MetaService};
+use ruapc::{Client, Endpoint, ListenMode, SocketPoolConfig, Transport, services::MetaService};
 
 const CLIENT_TIMEOUT: Duration = Duration::from_millis(200);
 
@@ -33,27 +33,30 @@ impl Foo for FooImpl {
 async fn test_verify_message_id() {
     tracing_subscriber::fmt().init();
 
-    for socket_type in [
-        SocketType::TCP,
-        SocketType::WS,
+    for transport in [
+        Transport::TCP,
+        Transport::WS,
         #[cfg(feature = "rdma")]
-        SocketType::RDMA,
+        Transport::RDMA,
     ] {
         let foo = Arc::new(FooImpl);
         let mut router = ruapc::Router::default();
         foo.ruapc_export(&mut router);
 
         let config = SocketPoolConfig {
-            socket_type: SocketType::UNIFIED,
+            listen_mode: ListenMode::UNIFIED,
+            #[cfg(feature = "rdma")]
+            rdma: Some(Default::default()),
             ..Default::default()
         };
         let server = ruapc::Server::create(router, &config).unwrap();
         let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
         let addr = server.listen(addr).await.unwrap();
-        let ctx = ruapc::Context::create(&config).unwrap().with_addr(addr);
+        let ctx = ruapc::Context::create(&config)
+            .unwrap()
+            .with_endpoint(Endpoint::new(transport, addr));
 
         let client = ruapc::Client {
-            socket_type: Some(socket_type),
             timeout: CLIENT_TIMEOUT,
             ..Default::default()
         };

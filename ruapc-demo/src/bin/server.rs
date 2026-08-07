@@ -1,6 +1,8 @@
 use clap::Parser;
+#[cfg(feature = "rdma")]
+use ruapc::RdmaSocketPoolConfig;
 use ruapc::{
-    Context, Error, ErrorKind, Result, Router, Server, SocketPoolConfig, SocketType, WithBuffers,
+    Context, Error, ErrorKind, ListenMode, Result, Router, Server, SocketPoolConfig, WithBuffers,
 };
 use ruapc_demo::{
     EchoService, GreetService, MemBenchService, ReadCrcReq, Request, WriteCrcReq, crc32c_of,
@@ -18,9 +20,9 @@ pub struct Args {
     #[arg(default_value = "0.0.0.0:8000")]
     pub addr: std::net::SocketAddr,
 
-    /// Socket type.
+    /// Listener protocol mode.
     #[arg(long, default_value = "unified")]
-    pub socket_type: SocketType,
+    pub listen_mode: ListenMode,
 
     /// RDMA: number of (CQ + poll thread) shards per device.
     #[arg(long, default_value = "1")]
@@ -126,17 +128,20 @@ async fn async_main(args: Args) {
     MemBenchService::ruapc_export(demo.clone(), &mut router);
     #[allow(unused_mut)]
     let mut config = SocketPoolConfig {
-        socket_type: args.socket_type,
+        listen_mode: args.listen_mode,
         buffer_pool_memory: args.pool_mem_mb * 1024 * 1024,
         ..Default::default()
     };
     #[cfg(feature = "rdma")]
     {
-        config.rdma.poll_threads_per_device = args.poll_threads;
-        config.rdma.device_filter = args.rdma_devices.clone();
-        config.rdma.poll_spin_us = args.poll_spin_us;
-        config.rdma.dispatch_workers = args.dispatch_workers;
-        config.rdma.recv_queue_len = args.recv_queue_len;
+        config.rdma = Some(RdmaSocketPoolConfig {
+            poll_threads_per_device: args.poll_threads,
+            device_filter: args.rdma_devices.clone(),
+            poll_spin_us: args.poll_spin_us,
+            dispatch_workers: args.dispatch_workers,
+            recv_queue_len: args.recv_queue_len,
+            ..Default::default()
+        });
     }
     let server = Server::create(router, &config).unwrap();
 

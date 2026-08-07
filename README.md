@@ -90,12 +90,13 @@ Make a request:
 ```rust
 use ruapc::*;
 use ruapc_demo::{EchoService, Request};
-use std::{net::SocketAddr, str::FromStr};
 
 #[tokio::main]
 async fn main() {
-    let addr = SocketAddr::from_str("127.0.0.1:8000").unwrap();
-    let ctx = Context::create(&SocketPoolConfig::default()).unwrap().with_addr(addr);
+    let endpoint: Endpoint = "tcp://127.0.0.1:8000".parse().unwrap();
+    let ctx = Context::create(&SocketPoolConfig::default())
+        .unwrap()
+        .with_endpoint(endpoint);
     let client = Client::default();
 
     let rsp = client.echo(&ctx, &Request("Rua!".into())).await;
@@ -111,21 +112,21 @@ You can directly execute the demo programs provided in ruapc-demo:
 
 ```bash
 # Start the server with unified protocol (supports TCP, WebSocket, and HTTP simultaneously)
-cargo run --release --bin server -- --socket-type unified
+cargo run --release --bin server -- --listen-mode unified
 
 # Or start with specific protocol
-cargo run --release --bin server -- --socket-type tcp
-cargo run --release --bin server -- --socket-type ws
-cargo run --release --bin server -- --socket-type http
+cargo run --release --bin server -- --listen-mode tcp
+cargo run --release --bin server -- --listen-mode ws
+cargo run --release --bin server -- --listen-mode http
 ```
 
 ### Client
 
 ```bash
 # Stress testing with different protocols
-cargo run --release --bin client -- --stress --coroutines 128 --secs 10 --socket-type tcp
-cargo run --release --bin client -- --stress --coroutines 128 --secs 10 --socket-type ws
-cargo run --release --bin client -- --stress --coroutines 128 --secs 10 --socket-type http
+cargo run --release --bin client -- tcp://127.0.0.1:8000 --stress --coroutines 128 --secs 10
+cargo run --release --bin client -- ws://127.0.0.1:8000 --stress --coroutines 128 --secs 10
+cargo run --release --bin client -- http://127.0.0.1:8000 --stress --coroutines 128 --secs 10
 
 # Or use curl to send HTTP requests.
 curl -s -X POST -d '"hello HTTP"' http://0.0.0.0:8000/EchoService/echo | json_pp
@@ -191,8 +192,8 @@ let (total, buffers) = client
 Run the self-contained demo over any transport:
 
 ```bash
-cargo run --bin remote_memory -- --socket-type tcp
-cargo run --bin remote_memory --features rdma -- --socket-type rdma
+cargo run --bin remote_memory -- --transport tcp
+cargo run --bin remote_memory --features rdma -- --transport rdma
 ```
 
 ### RDMA Support
@@ -202,10 +203,10 @@ cargo run --bin remote_memory --features rdma -- --socket-type rdma
 sudo prlimit --pid $$ -l=unlimited
 
 # Start the server with RDMA
-cargo run --release --bin server --features rdma -- --socket-type unified
+cargo run --release --bin server --features rdma -- --listen-mode unified
 
 # Stress testing with RDMA
-cargo run --release --bin client --features rdma -- --stress --coroutines 128
+cargo run --release --bin client --features rdma -- rdma://127.0.0.1:8000 --stress --coroutines 128
 ```
 
 ### Benchmark

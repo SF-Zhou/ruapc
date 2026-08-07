@@ -3,7 +3,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Context, CopyOp, Result, SocketEndpoint,
+    Context, CopyOp, Result,
+    core::ContextEndpoint,
     core::scatter::{self, MAX_REGIONS, SpaceLayout},
 };
 
@@ -225,7 +226,7 @@ impl MemoryService for () {
         // mid-flight — no post-transfer liveness check is needed on this
         // side (and the server holds its source buffers across the await).
         match &ctx.endpoint {
-            SocketEndpoint::Connected(socket) => {
+            ContextEndpoint::Connected(socket) => {
                 socket
                     .pull_into_target(regions, &src_layout, &req.ops, target)
                     .await

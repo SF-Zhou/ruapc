@@ -279,6 +279,8 @@ pub struct RdmaSocket {
     pub(crate) path: RdmaPathInfo,
     /// Process-wide unique connection id (see [`crate::task::next_conn_id`]).
     pub(crate) conn_id: u64,
+    /// Aggregate health of the outbound peer this stripe belongs to.
+    peer_health: std::sync::OnceLock<std::sync::Weak<super::RdmaPeerHealth>>,
     /// Bounds in-flight RDMA READ work requests per *local NIC*: shared
     /// by every connection of the pool on this device
     /// (`rdma.max_inflight_read_wrs`) — the congestion control knob for
@@ -321,10 +323,19 @@ impl RdmaSocket {
             max_msg_size,
             path,
             conn_id: crate::task::next_conn_id(),
+            peer_health: std::sync::OnceLock::new(),
             read_permits,
             sq_read_permits: tokio::sync::Semaphore::new(sq_read_cap.max(1) as usize),
             read_timeout,
         }
+    }
+
+    pub(crate) fn set_peer_health(&self, health: &Arc<super::RdmaPeerHealth>) {
+        let _ = self.peer_health.set(Arc::downgrade(health));
+    }
+
+    pub(crate) fn peer_health(&self) -> Option<std::sync::Weak<super::RdmaPeerHealth>> {
+        self.peer_health.get().cloned()
     }
 
     /// Serializes a message into a right-sized framed buffer.
@@ -348,7 +359,7 @@ impl RdmaSocket {
         }
         Err(last_err.unwrap_or_else(|| {
             Error::new(
-                ErrorKind::RdmaSendFailed,
+                ErrorKind::SerializeFailed,
                 format!(
                     "message exceeds negotiated max_msg_size ({}); use remote read/write for large payloads",
                     self.max_msg_size

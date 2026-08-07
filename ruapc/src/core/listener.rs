@@ -53,8 +53,12 @@ impl Listener {
             .local_addr()
             .map_err(|e| Error::new(ErrorKind::TcpBindFailed, e.to_string()))?;
         let state = state.clone();
+        let supervisor = self.task_supervisor.handle();
 
-        let task_supervisor = self.task_supervisor.start_async_task();
+        let task_supervisor = self
+            .task_supervisor
+            .try_start_async_task()
+            .ok_or_else(|| Error::new(ErrorKind::ConnectionClosed, "listener stopped".into()))?;
         tokio::spawn(async move {
             tokio::select! {
                 () = task_supervisor.stopped() => {
@@ -64,7 +68,10 @@ impl Listener {
                     tracing::info!("start listening: {listener_addr}");
                     while let Ok((stream, addr)) = listener.accept().await {
                         crate::sockets::tcp::configure_stream(&stream);
-                        tokio::spawn(state.clone().handle_new_stream(RawStream::TCP(stream), addr));
+                        let state = state.clone();
+                        let _ = supervisor.try_spawn(async move {
+                            state.handle_new_stream(RawStream::TCP(stream), addr).await;
+                        });
                     }
                 } => {}
             }

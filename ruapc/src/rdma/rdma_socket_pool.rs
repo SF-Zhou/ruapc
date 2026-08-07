@@ -26,8 +26,7 @@ use super::{
 };
 use crate::{
     Buffer, BufferPool, Client, Context, Devices, Error, ErrorKind, RdmaQueuePairConfig,
-    RdmaSocketPoolConfig, Result, Socket, SocketPoolConfig, SocketPoolTrait, SocketType, State,
-    TaskSupervisor,
+    RdmaSocketPoolConfig, Result, Socket, SocketPoolConfig, SocketPoolTrait, State, TaskSupervisor,
 };
 
 /// One RDMA connection towards a peer, tagged with bookkeeping metadata.
@@ -40,6 +39,29 @@ pub(crate) struct Stripe {
     /// Created for an explicit path selector; exempt from replenishment
     /// accounting and rebalancing.
     pub(crate) pinned: bool,
+}
+
+/// Aggregate health for all outbound stripes to one peer.
+#[derive(Debug, Default)]
+pub(crate) struct RdmaPeerHealth {
+    sockets: std::sync::Mutex<Vec<Weak<RdmaSocket>>>,
+}
+
+impl RdmaPeerHealth {
+    fn track(&self, socket: &Arc<RdmaSocket>) {
+        let mut sockets = self.sockets.lock().unwrap();
+        sockets.retain(|socket| socket.strong_count() > 0);
+        sockets.push(Arc::downgrade(socket));
+    }
+
+    pub(crate) fn is_connected(&self) -> bool {
+        let mut sockets = self.sockets.lock().unwrap();
+        sockets.retain(|socket| socket.strong_count() > 0);
+        sockets
+            .iter()
+            .filter_map(Weak::upgrade)
+            .any(|socket| socket.state.is_ok())
+    }
 }
 
 /// RAII increment of one device's live-connection counter; decremented
@@ -103,6 +125,8 @@ pub struct RdmaSocketPool {
     /// address; requests are spread round-robin across the stripes.
     /// Dropped after tasks stop → destroys QPs.
     pub(crate) socket_map: RwLock<HashMap<SocketAddr, Vec<Stripe>, RandomState>>,
+    /// Stable aggregate health handles for outbound peers.
+    peer_health: dashmap::DashMap<SocketAddr, Arc<RdmaPeerHealth>, RandomState>,
     /// Live connection count per local RDMA device (outbound + inbound),
     /// indexed like `devices.rdma_devices()`. Drives least-connections
     /// placement and is advertised to peers via `RdmaInfo`.
@@ -149,7 +173,13 @@ impl SocketPoolTrait for RdmaSocketPool {
         devices: &Arc<Devices>,
         buffer_pool: &Arc<BufferPool>,
     ) -> Result<Self> {
-        Self::new(devices.clone(), buffer_pool.clone(), config.rdma.clone())
+        let rdma = config.rdma.clone().ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidArgument,
+                "RDMA socket pool requires RDMA configuration".into(),
+            )
+        })?;
+        Self::new(devices.clone(), buffer_pool.clone(), rdma)
     }
 
     /// Stops all tasks managed by the socket pool.
@@ -167,8 +197,26 @@ impl SocketPoolTrait for RdmaSocketPool {
         self.task_supervisor.all_stopped().await;
     }
 
-    /// Returns information about the available RDMA devices.
-    fn rdma_device_list(&self) -> Result<RdmaInfo> {
+    /// Acquires or creates an RDMA socket for the specified address.
+    async fn acquire(&self, addr: &SocketAddr, state: &Arc<State>) -> Result<Socket> {
+        self.acquire_path(addr, None, state).await
+    }
+
+    async fn handle_new_stream(
+        &self,
+        _state: &Arc<State>,
+        _stream: crate::RawStream,
+        _addr: SocketAddr,
+    ) -> Result<()> {
+        Err(Error::new(
+            ErrorKind::InvalidArgument,
+            "invalid socket type".into(),
+        ))
+    }
+}
+
+impl RdmaSocketPool {
+    pub(crate) fn rdma_device_list(&self) -> Result<RdmaInfo> {
         Ok(RdmaInfo::from_devices(
             self.devices.rdma_devices(),
             &self.config,
@@ -176,8 +224,11 @@ impl SocketPoolTrait for RdmaSocketPool {
         ))
     }
 
-    /// Establishes a new RDMA connection with the specified endpoint.
-    fn rdma_accept(&self, request: &ConnectRequest, state: &Arc<State>) -> Result<Endpoint> {
+    pub(crate) fn rdma_accept(
+        &self,
+        request: &ConnectRequest,
+        state: &Arc<State>,
+    ) -> Result<Endpoint> {
         let (device_index, device) = self.find_device_by_name(&request.target)?;
         let connection_config = self.clamp_connection_config(device, request.config);
         let poller = self.pollers.get_or_start(
@@ -242,36 +293,6 @@ impl SocketPoolTrait for RdmaSocketPool {
         Ok(local_endpoint)
     }
 
-    /// Acquires or creates an RDMA socket for the specified address.
-    async fn acquire(
-        &self,
-        addr: &SocketAddr,
-        socket_type: SocketType,
-        state: &Arc<State>,
-    ) -> Result<Socket> {
-        if socket_type != SocketType::RDMA {
-            return Err(Error::new(
-                ErrorKind::InvalidArgument,
-                format!("invalid socket type {socket_type} for RdmaSocketPool"),
-            ));
-        }
-        self.acquire_path(addr, None, state).await
-    }
-
-    async fn handle_new_stream(
-        &self,
-        _state: &Arc<State>,
-        _stream: crate::RawStream,
-        _addr: SocketAddr,
-    ) -> Result<()> {
-        Err(Error::new(
-            ErrorKind::InvalidArgument,
-            "invalid socket type".into(),
-        ))
-    }
-}
-
-impl RdmaSocketPool {
     const DEVICE_LIST_CACHE_TTL: Duration = Duration::from_secs(5);
     /// How long a NIC pair stays penalized after its QP setup failed.
     const PATH_BLACKLIST_TTL: Duration = Duration::from_secs(30);
@@ -288,7 +309,6 @@ impl RdmaSocketPool {
             acquire_client: Client {
                 timeout: std::time::Duration::from_secs(5),
                 use_msgpack: true,
-                socket_type: Some(SocketType::TCP),
                 max_retries: 2,
             },
             task_supervisor,
@@ -297,6 +317,7 @@ impl RdmaSocketPool {
             connect_locks: dashmap::DashMap::default(),
             device_list_cache: RwLock::default(),
             socket_map: RwLock::default(),
+            peer_health: dashmap::DashMap::default(),
             conn_counts: Arc::new(
                 (0..devices.rdma_devices().len())
                     .map(|_| AtomicUsize::new(0))
@@ -361,6 +382,16 @@ impl RdmaSocketPool {
         self.connect_locks.remove_if(addr, |_, value| {
             Arc::ptr_eq(value, lock) && Arc::strong_count(value) == 2
         });
+    }
+
+    fn track_peer_socket(&self, addr: &SocketAddr, socket: &Arc<RdmaSocket>) {
+        let health = self
+            .peer_health
+            .entry(*addr)
+            .or_insert_with(|| Arc::new(RdmaPeerHealth::default()))
+            .clone();
+        health.track(socket);
+        socket.set_peer_health(&health);
     }
 
     /// Picks one healthy connection stripe round-robin, skipping stripes
@@ -633,6 +664,7 @@ impl RdmaSocketPool {
             let socket = self
                 .connect_with_failover(addr, state, &plan, selector, &existing)
                 .await?;
+            self.track_peer_socket(addr, &socket);
             let result = Socket::from(&socket);
             self.socket_map
                 .write()
@@ -658,10 +690,13 @@ impl RdmaSocketPool {
                 .connect_with_failover(addr, state, &plan, None, &stripes)
                 .await
             {
-                Ok(socket) => stripes.push(Stripe {
-                    socket,
-                    pinned: false,
-                }),
+                Ok(socket) => {
+                    self.track_peer_socket(addr, &socket);
+                    stripes.push(Stripe {
+                        socket,
+                        pinned: false,
+                    });
+                }
                 Err(err) => {
                     // Don't leak the stripes established so far: mark them
                     // failed so the poll thread tears them down.
@@ -1509,6 +1544,7 @@ impl RdmaSocketPool {
                 let socket = self
                     .connect_with_failover(addr, state, &plan, None, &existing)
                     .await?;
+                self.track_peer_socket(addr, &socket);
                 self.socket_map
                     .write()
                     .await
@@ -1649,6 +1685,7 @@ impl RdmaSocketPool {
             .await
         {
             Ok(socket) => {
+                self.track_peer_socket(addr, &socket);
                 let mut socket_map = self.socket_map.write().await;
                 if let Some(stripes) = socket_map.get_mut(addr) {
                     stripes.push(Stripe {

@@ -6,7 +6,9 @@
 
 use std::{str::FromStr, sync::Arc};
 
-use ruapc::{RdmaConnDirection, RdmaPathSelector, SocketPoolConfig, SocketType};
+use ruapc::{
+    Endpoint, ListenMode, RdmaConnDirection, RdmaPathSelector, SocketPoolConfig, Transport,
+};
 
 #[ruapc::service]
 trait Foo {
@@ -33,18 +35,18 @@ async fn test_rdma_path_report_and_selector() {
     foo.ruapc_export(&mut router);
 
     let config = SocketPoolConfig {
-        socket_type: SocketType::UNIFIED,
+        listen_mode: ListenMode::UNIFIED,
+        rdma: Some(Default::default()),
         ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
     let addr = server.listen(addr).await.unwrap();
 
-    let client = ruapc::Client {
-        socket_type: Some(SocketType::RDMA),
-        ..Default::default()
-    };
-    let ctx = ruapc::Context::create(&config).unwrap().with_addr(addr);
+    let client = ruapc::Client::default();
+    let ctx = ruapc::Context::create(&config)
+        .unwrap()
+        .with_endpoint(Endpoint::new(Transport::RDMA, addr));
     let rsp = client.hello(&ctx, &"ruapc".to_string()).await.unwrap();
     assert_eq!(rsp, "hello ruapc!");
 
@@ -76,7 +78,11 @@ async fn test_rdma_path_report_and_selector() {
     let inbound = server_report
         .paths
         .iter()
-        .find(|p| p.direction == RdmaConnDirection::Inbound)
+        .find(|p| {
+            p.direction == RdmaConnDirection::Inbound
+                && p.path.local.device == path.remote.device
+                && p.path.remote.device == path.local.device
+        })
         .unwrap();
     assert_eq!(inbound.peer, None);
     assert_eq!(inbound.path.local.device, path.remote.device);
@@ -97,11 +103,10 @@ async fn test_rdma_path_report_and_selector() {
     client.hello(&bad, &"nope".to_string()).await.unwrap_err();
 
     // Non-RDMA requests ignore the selector.
-    let tcp_client = ruapc::Client {
-        socket_type: Some(SocketType::TCP),
-        ..Default::default()
-    };
-    let hinted = ctx.with_rdma_path(RdmaPathSelector::remote_device("nonexistent"));
+    let tcp_client = ruapc::Client::default();
+    let hinted = ctx
+        .with_endpoint(Endpoint::tcp(addr))
+        .with_rdma_path(RdmaPathSelector::remote_device("nonexistent"));
     let rsp = tcp_client.hello(&hinted, &"tcp".to_string()).await.unwrap();
     assert_eq!(rsp, "hello tcp!");
 

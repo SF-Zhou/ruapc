@@ -34,6 +34,68 @@ pub enum Socket {
     RDMA(std::sync::Arc<crate::rdma::RdmaSocket>),
 }
 
+#[derive(Debug)]
+pub(crate) enum SocketHealth {
+    Tcp(std::sync::Weak<crate::tcp::TcpSocketInner>),
+    Ws(std::sync::Weak<crate::ws::WebSocketInner>),
+    Http(std::sync::Weak<crate::http::StreamSocketInner>),
+    #[cfg(feature = "rdma")]
+    RdmaPeer(std::sync::Weak<crate::rdma::RdmaPeerHealth>),
+    #[cfg(feature = "rdma")]
+    RdmaSocket(std::sync::Weak<crate::rdma::RdmaSocket>),
+}
+
+impl SocketHealth {
+    pub(crate) fn is_connected(&self) -> bool {
+        match self {
+            Self::Tcp(socket) => socket.upgrade().is_some_and(|socket| !socket.is_closed()),
+            Self::Ws(socket) => socket.upgrade().is_some_and(|socket| !socket.is_closed()),
+            Self::Http(socket) => socket.upgrade().is_some_and(|socket| !socket.is_closed()),
+            #[cfg(feature = "rdma")]
+            Self::RdmaPeer(peer) => peer.upgrade().is_some_and(|peer| peer.is_connected()),
+            #[cfg(feature = "rdma")]
+            Self::RdmaSocket(socket) => socket.upgrade().is_some_and(|socket| socket.state.is_ok()),
+        }
+    }
+
+    pub(crate) fn is_aggregate(&self) -> bool {
+        #[cfg(feature = "rdma")]
+        {
+            matches!(self, Self::RdmaPeer(_))
+        }
+        #[cfg(not(feature = "rdma"))]
+        {
+            false
+        }
+    }
+
+    pub(crate) fn same_scope(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Tcp(left), Self::Tcp(right)) => left.ptr_eq(right),
+            (Self::Ws(left), Self::Ws(right)) => left.ptr_eq(right),
+            (Self::Http(left), Self::Http(right)) => left.ptr_eq(right),
+            #[cfg(feature = "rdma")]
+            (Self::RdmaPeer(left), Self::RdmaPeer(right)) => left.ptr_eq(right),
+            #[cfg(feature = "rdma")]
+            (Self::RdmaSocket(left), Self::RdmaSocket(right)) => left.ptr_eq(right),
+            _ => false,
+        }
+    }
+}
+
+impl Socket {
+    pub(crate) fn conn_id(&self) -> Option<u64> {
+        match self {
+            Self::TCP(socket) => Some(socket.conn_id()),
+            Self::WS(socket) => Some(socket.conn_id()),
+            Self::HTTP(crate::http::HttpSocket::Stream(socket)) => Some(socket.conn_id()),
+            Self::HTTP(crate::http::HttpSocket::ForResponse(_)) => None,
+            #[cfg(feature = "rdma")]
+            Self::RDMA(socket) => Some(socket.conn_id),
+        }
+    }
+}
+
 /// Trait defining the interface for sending messages through different socket types.
 pub trait SocketTrait {
     /// Sends a message through this socket.
@@ -150,6 +212,19 @@ pub trait SocketTrait {
 }
 
 impl Socket {
+    pub(crate) fn health(&self) -> Option<SocketHealth> {
+        match self {
+            Socket::TCP(socket) => Some(SocketHealth::Tcp(socket.health())),
+            Socket::WS(socket) => Some(SocketHealth::Ws(socket.health())),
+            Socket::HTTP(socket) => socket.health().map(SocketHealth::Http),
+            #[cfg(feature = "rdma")]
+            Socket::RDMA(socket) => Some(match socket.peer_health() {
+                Some(peer) => SocketHealth::RdmaPeer(peer),
+                None => SocketHealth::RdmaSocket(Arc::downgrade(socket)),
+            }),
+        }
+    }
+
     /// Returns the device index associated with this socket.
     pub fn device_index(&self, state: &State) -> DeviceIndex {
         match self {

@@ -57,7 +57,7 @@ async fn test_callback() {
     let mut router = Router::default();
     bar.clone().ruapc_export(&mut router);
     let ctx = Context::create_with_router(router, &SocketPoolConfig::default()).unwrap();
-    let ctx = ctx.with_addr(addr);
+    let ctx = ctx.with_endpoint(ruapc::Endpoint::tcp(addr));
 
     let client = Client::default();
     assert_eq!(client.foo(&ctx, &FooReq(0)).await, Ok(FooRsp(1)));
@@ -75,7 +75,7 @@ async fn test_callback_http() {
     let mut router = Router::default();
     foo.clone().ruapc_export(&mut router);
     let config = SocketPoolConfig {
-        socket_type: SocketType::HTTP,
+        listen_mode: ruapc::ListenMode::HTTP,
         ..Default::default()
     };
     let server = Server::create(router, &config).unwrap();
@@ -87,12 +87,9 @@ async fn test_callback_http() {
     let mut router = Router::default();
     bar.clone().ruapc_export(&mut router);
     let ctx = Context::create_with_router(router, &config).unwrap();
-    let ctx = ctx.with_addr(addr);
+    let ctx = ctx.with_endpoint(ruapc::Endpoint::new(ruapc::Transport::HTTP, addr));
 
-    let client = Client {
-        socket_type: Some(SocketType::HTTP),
-        ..Default::default()
-    };
+    let client = Client::default();
     assert_eq!(client.foo(&ctx, &FooReq(0)).await, Ok(FooRsp(1)));
     assert_eq!(client.foo(&ctx, &FooReq(1)).await, Ok(FooRsp(3)));
 
