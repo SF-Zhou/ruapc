@@ -189,10 +189,6 @@ pub struct Context {
     /// `timeout_ms` budget on arrival. `None` when the request carries no
     /// budget (or for client-created contexts).
     pub(crate) deadline: Option<std::time::Instant>,
-    /// Optional constraint on the RDMA path (NIC pair) used by requests
-    /// issued through this context. See [`Context::with_rdma_path`].
-    #[cfg(feature = "rdma")]
-    pub(crate) rdma_path: Option<crate::rdma::RdmaPathSelector>,
 }
 
 impl Context {
@@ -210,8 +206,6 @@ impl Context {
             drop_guard: Some(Arc::new(drop_guard)),
             msg_meta: MsgMeta::default(),
             deadline: None,
-            #[cfg(feature = "rdma")]
-            rdma_path: None,
         })
     }
 
@@ -228,7 +222,6 @@ impl Context {
             drop_guard: None,
             msg_meta: MsgMeta::default(),
             deadline: None,
-            rdma_path: None,
         }
     }
 
@@ -244,8 +237,6 @@ impl Context {
             drop_guard: self.drop_guard.clone(),
             msg_meta: MsgMeta::default(),
             deadline: self.deadline,
-            #[cfg(feature = "rdma")]
-            rdma_path: self.rdma_path.clone(),
         }
     }
 
@@ -266,8 +257,6 @@ impl Context {
             drop_guard: self.drop_guard.clone(),
             msg_meta: MsgMeta::default(),
             deadline: self.deadline,
-            #[cfg(feature = "rdma")]
-            rdma_path: self.rdma_path.clone(),
         }
     }
 
@@ -294,30 +283,6 @@ impl Context {
         self.remaining_time() == Some(std::time::Duration::ZERO)
     }
 
-    /// Constrains RDMA requests issued through this context to
-    /// connections whose path (local NIC, remote NIC) matches `selector`;
-    /// a matching connection is established on demand (and kept pinned:
-    /// it is exempt from automatic rebalancing).
-    ///
-    /// Only affects requests using [`Transport::RDMA`](crate::Transport);
-    /// other transports ignore the selector.
-    ///
-    /// ```rust,no_run
-    /// # use ruapc::{Context, Endpoint, RdmaPathSelector, SocketPoolConfig};
-    /// let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
-    /// let endpoint: Endpoint = "rdma://127.0.0.1:8000".parse().unwrap();
-    /// let ctx = ctx
-    ///     .with_endpoint(endpoint)
-    ///     .with_rdma_path(RdmaPathSelector::local_device("mlx5_0"));
-    /// ```
-    #[cfg(feature = "rdma")]
-    #[must_use]
-    pub fn with_rdma_path(&self, selector: crate::rdma::RdmaPathSelector) -> Self {
-        let mut ctx = self.clone();
-        ctx.rdma_path = Some(selector);
-        ctx
-    }
-
     /// Creates a server-side context with an established socket connection.
     ///
     /// Derives the request deadline from the client-provided `timeout_ms`
@@ -333,8 +298,6 @@ impl Context {
             drop_guard: None,
             msg_meta,
             deadline,
-            #[cfg(feature = "rdma")]
-            rdma_path: None,
         }
     }
 

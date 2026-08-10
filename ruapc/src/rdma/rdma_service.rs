@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use ruapc_rdma::{Gid, LinkLayer};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -19,6 +21,8 @@ pub struct RdmaPortInfo {
     pub link_layer: LinkLayer,
     /// Usable GIDs of this port (filtered at collection time).
     pub gids: Vec<Gid>,
+    /// Virtual zone names indexed by GID index.
+    pub gid_zones: HashMap<u8, Vec<String>>,
 }
 
 /// RDMA device information for connection negotiation.
@@ -62,7 +66,7 @@ impl RdmaInfo {
                 .iter()
                 .enumerate()
                 .map(|(index, d)| {
-                    let info = d.info();
+                    let (info, gid_zones) = d.info_with_zones();
                     RdmaDeviceInfo {
                         name: info.name.clone(),
                         active_connections: conn_counts
@@ -105,6 +109,16 @@ impl RdmaInfo {
                                 port_num: port.port_num,
                                 link_layer: port.port_attr.link_layer,
                                 gids: port.gids.clone(),
+                                gid_zones: port
+                                    .gids
+                                    .iter()
+                                    .filter_map(|gid| {
+                                        gid_zones
+                                            .get(&(port.port_num, gid.index))
+                                            .cloned()
+                                            .map(|zones| (gid.index, zones))
+                                    })
+                                    .collect(),
                             })
                             .collect(),
                     }
@@ -130,6 +144,16 @@ pub trait RdmaService {
         ctx: &Context,
         request: &rdma::ConnectRequest,
     ) -> Result<rdma::Endpoint>;
+
+    /// Confirms that the initiator received the endpoint and retained its
+    /// local QP. Unconfirmed accepts expire after the configured lease.
+    /// The bootstrap service assumes a trusted control plane; the token
+    /// correlates lifecycle state but does not authenticate the caller.
+    async fn confirm(&self, ctx: &Context, control: &rdma::ConnectionControl) -> Result<()>;
+
+    /// Best-effort idempotent cleanup when the initiator cannot complete the
+    /// confirmation exchange.
+    async fn abort(&self, ctx: &Context, control: &rdma::ConnectionControl) -> Result<()>;
 }
 
 /// Default implementation of `RdmaService` for the unit type.
@@ -150,6 +174,14 @@ impl RdmaService for () {
     ) -> Result<rdma::Endpoint> {
         ctx.state.socket_pool.rdma_accept(request, &ctx.state)
     }
+
+    async fn confirm(&self, ctx: &Context, control: &rdma::ConnectionControl) -> Result<()> {
+        ctx.state.socket_pool.rdma_confirm(control)
+    }
+
+    async fn abort(&self, ctx: &Context, control: &rdma::ConnectionControl) -> Result<()> {
+        ctx.state.socket_pool.rdma_abort(control)
+    }
 }
 
 #[cfg(test)]
@@ -168,6 +200,13 @@ mod tests {
         assert!(result.is_ok());
         let info = result.unwrap();
         assert!(!info.devices.is_empty());
+        let control = rdma::ConnectionControl {
+            connection_id: u64::MAX,
+            server_connection_cookie: u64::MAX,
+        };
+        let err = ().confirm(&ctx, &control).await.unwrap_err();
+        assert_eq!(err.kind, crate::ErrorKind::InvalidArgument);
+        ().abort(&ctx, &control).await.unwrap();
     }
 
     #[tokio::test]
@@ -175,6 +214,7 @@ mod tests {
         // With a TCP pool, `connect` should propagate the error from rdma_accept.
         let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
         let endpoint = rdma::Endpoint {
+            connection_cookie: 0,
             qp_num: 0,
             port_num: 1,
             gid_index: 0,
@@ -186,8 +226,10 @@ mod tests {
             rd_atomic_cap: 1,
         };
         let request = rdma::ConnectRequest {
+            connection_id: 1,
             endpoint,
             source_device: "test".into(),
+            source_zones: Vec::new(),
             target: rdma::DeviceSelection {
                 device_name: "missing".into(),
                 port_num: 1,

@@ -115,6 +115,14 @@ impl SocketPoolTrait for WebSocketPool {
 }
 
 impl WebSocketPool {
+    pub(crate) fn try_acquire(&self, addr: &SocketAddr) -> Option<Socket> {
+        self.socket_map.try_get_live(addr).map(Into::into)
+    }
+
+    pub(crate) async fn acquire_existing(&self, addr: &SocketAddr) -> Option<Socket> {
+        self.socket_map.get_live(addr).await.map(Into::into)
+    }
+
     pub fn add_socket<S>(
         &self,
         addr: SocketAddr,

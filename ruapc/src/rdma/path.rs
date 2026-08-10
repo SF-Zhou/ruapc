@@ -1,9 +1,9 @@
-//! RDMA path awareness: NIC identities, path selectors and path reports.
+//! RDMA path awareness: NIC identities and path reports.
 //!
 //! A *path* is the pair of NICs an RDMA connection runs on. Peers are still
 //! identified by their bootstrap TCP address; the path is a property of
-//! each individual connection (stripe), giving full NIC visibility and
-//! control without changing the peer identity.
+//! each individual connection (stripe), giving full NIC visibility without
+//! changing the peer identity.
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -38,6 +38,8 @@ pub struct RdmaNicInfo {
     pub gid_index: u8,
     /// IP address carried by the GID (RoCE v2 only; `None` for IB/RoCE v1).
     pub ip: Option<IpAddr>,
+    /// Virtual zone names assigned from the selected GID's netdev address.
+    pub zones: Vec<String>,
 }
 
 /// The pair of NICs an RDMA connection runs on.
@@ -49,87 +51,6 @@ pub struct RdmaPathInfo {
     pub remote: RdmaNicInfo,
 }
 
-/// Selects a NIC either by device name or by the IP its GID is derived
-/// from (RoCE v2). IP selectors never match IB / RoCE v1 NICs, whose GIDs
-/// carry no IP.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub enum NicSelector {
-    /// Match by RDMA device name (e.g. `mlx5_0`).
-    Device(String),
-    /// Match by the IP address embedded in the NIC's RoCE v2 GID.
-    Ip(IpAddr),
-}
-
-impl NicSelector {
-    /// Whether `nic` satisfies this selector.
-    #[must_use]
-    pub fn matches(&self, nic: &RdmaNicInfo) -> bool {
-        match self {
-            NicSelector::Device(name) => nic.device == *name,
-            NicSelector::Ip(ip) => nic.ip == Some(*ip),
-        }
-    }
-}
-
-/// Constrains which (local NIC, remote NIC) pair an RDMA connection may
-/// use. `None` on a side leaves that side unconstrained.
-///
-/// Attached to a [`Context`](crate::Context) via
-/// [`with_rdma_path`](crate::Context::with_rdma_path): the request then
-/// only uses (or establishes) connections whose path matches.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct RdmaPathSelector {
-    /// Constraint on the local NIC.
-    pub local: Option<NicSelector>,
-    /// Constraint on the remote NIC.
-    pub remote: Option<NicSelector>,
-}
-
-impl RdmaPathSelector {
-    /// Selects a specific local NIC by device name.
-    #[must_use]
-    pub fn local_device(name: impl Into<String>) -> Self {
-        Self {
-            local: Some(NicSelector::Device(name.into())),
-            remote: None,
-        }
-    }
-
-    /// Selects a specific remote NIC by device name.
-    #[must_use]
-    pub fn remote_device(name: impl Into<String>) -> Self {
-        Self {
-            local: None,
-            remote: Some(NicSelector::Device(name.into())),
-        }
-    }
-
-    /// Selects a specific local NIC by GID-embedded IP (RoCE v2).
-    #[must_use]
-    pub fn local_ip(ip: IpAddr) -> Self {
-        Self {
-            local: Some(NicSelector::Ip(ip)),
-            remote: None,
-        }
-    }
-
-    /// Selects a specific remote NIC by GID-embedded IP (RoCE v2).
-    #[must_use]
-    pub fn remote_ip(ip: IpAddr) -> Self {
-        Self {
-            local: None,
-            remote: Some(NicSelector::Ip(ip)),
-        }
-    }
-
-    /// Whether `path` satisfies both sides of this selector.
-    #[must_use]
-    pub fn matches(&self, path: &RdmaPathInfo) -> bool {
-        self.local.as_ref().is_none_or(|s| s.matches(&path.local))
-            && self.remote.as_ref().is_none_or(|s| s.matches(&path.remote))
-    }
-}
-
 /// Direction of an RDMA connection relative to this process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum RdmaConnDirection {
@@ -137,6 +58,14 @@ pub enum RdmaConnDirection {
     Outbound,
     /// Accepted from a peer (server role).
     Inbound,
+}
+
+/// Lifecycle phase of an outbound RDMA stripe.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum StripePhase {
+    #[default]
+    Active,
+    Draining,
 }
 
 /// One RDMA connection and the path it runs on.
@@ -152,9 +81,10 @@ pub struct RdmaPathEntry {
     pub qp_num: u32,
     /// Whether the connection is usable (not in the error state).
     pub healthy: bool,
-    /// Whether the connection was created for an explicit path selector;
-    /// pinned connections are exempt from rebalancing.
-    pub pinned: bool,
+    /// Active connections are selectable; draining connections only finish
+    /// requests that were already in flight.
+    #[serde(default)]
+    pub phase: StripePhase,
 }
 
 /// Live connection count of one local RDMA device.
@@ -187,15 +117,6 @@ mod tests {
         gid
     }
 
-    fn nic(device: &str, ip: Option<&str>) -> RdmaNicInfo {
-        RdmaNicInfo {
-            device: device.into(),
-            port_num: 1,
-            gid_index: 0,
-            ip: ip.map(|s| s.parse().unwrap()),
-        }
-    }
-
     #[test]
     fn test_gid_ip_v4_mapped() {
         assert_eq!(
@@ -217,46 +138,5 @@ mod tests {
         // IB / RoCE v1 style link-local GIDs carry no IP.
         assert_eq!(gid_ip(&make_gid("fe80::a288:c2ff:fe32:1a74")), None);
         assert_eq!(gid_ip(&ibv_gid::default()), None);
-    }
-
-    #[test]
-    fn test_nic_selector_matches() {
-        let n = nic("mlx5_0", Some("10.0.0.1"));
-        assert!(NicSelector::Device("mlx5_0".into()).matches(&n));
-        assert!(!NicSelector::Device("mlx5_1".into()).matches(&n));
-        assert!(NicSelector::Ip("10.0.0.1".parse().unwrap()).matches(&n));
-        assert!(!NicSelector::Ip("10.0.0.2".parse().unwrap()).matches(&n));
-        // IP selectors never match NICs without a GID-embedded IP.
-        assert!(!NicSelector::Ip("10.0.0.1".parse().unwrap()).matches(&nic("mlx5_0", None)));
-    }
-
-    #[test]
-    fn test_path_selector_matches() {
-        let path = RdmaPathInfo {
-            local: nic("mlx5_0", Some("10.0.0.1")),
-            remote: nic("mlx5_1", Some("10.0.0.2")),
-        };
-        assert!(RdmaPathSelector::default().matches(&path));
-        assert!(RdmaPathSelector::local_device("mlx5_0").matches(&path));
-        assert!(!RdmaPathSelector::local_device("mlx5_1").matches(&path));
-        assert!(RdmaPathSelector::remote_device("mlx5_1").matches(&path));
-        assert!(RdmaPathSelector::remote_ip("10.0.0.2".parse().unwrap()).matches(&path));
-        assert!(!RdmaPathSelector::remote_ip("10.0.0.9".parse().unwrap()).matches(&path));
-        let both = RdmaPathSelector {
-            local: Some(NicSelector::Device("mlx5_0".into())),
-            remote: Some(NicSelector::Ip("10.0.0.9".parse().unwrap())),
-        };
-        assert!(!both.matches(&path));
-    }
-
-    #[test]
-    fn test_selector_serde_roundtrip() {
-        let selector = RdmaPathSelector {
-            local: Some(NicSelector::Device("mlx5_0".into())),
-            remote: Some(NicSelector::Ip("10.0.0.2".parse().unwrap())),
-        };
-        let json = serde_json::to_string(&selector).unwrap();
-        let recovered: RdmaPathSelector = serde_json::from_str(&json).unwrap();
-        assert_eq!(recovered, selector);
     }
 }

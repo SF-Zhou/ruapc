@@ -94,6 +94,16 @@ impl Socket {
             Self::RDMA(socket) => Some(socket.conn_id),
         }
     }
+
+    /// Remote RDMA device of this connection; `None` for every other
+    /// transport (and in builds without the `rdma` feature).
+    pub(crate) fn rdma_remote_device(&self) -> Option<&str> {
+        match self {
+            #[cfg(feature = "rdma")]
+            Self::RDMA(socket) => Some(&socket.path.remote.device),
+            _ => None,
+        }
+    }
 }
 
 /// Trait defining the interface for sending messages through different socket types.

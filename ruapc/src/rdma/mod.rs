@@ -1,10 +1,12 @@
 mod endpoint;
-pub(crate) use endpoint::{ConnectRequest, DeviceSelection, Endpoint, RdmaConnectionConfig};
+pub(crate) use endpoint::{
+    ConnectRequest, ConnectionControl, DeviceSelection, Endpoint, RdmaConnectionConfig,
+};
 
 mod path;
 pub use path::{
-    NicSelector, RdmaConnDirection, RdmaDeviceLoad, RdmaNicInfo, RdmaPathEntry, RdmaPathInfo,
-    RdmaPathReport, RdmaPathSelector,
+    RdmaConnDirection, RdmaDeviceLoad, RdmaNicInfo, RdmaPathEntry, RdmaPathInfo, RdmaPathReport,
+    StripePhase,
 };
 
 mod rdma_device;

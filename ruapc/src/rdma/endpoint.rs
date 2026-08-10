@@ -11,6 +11,10 @@ use crate::RdmaQueuePairConfig;
 #[serde_inline_default]
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy)]
 pub struct Endpoint {
+    /// Process-unique identity of the accepted connection. Set by the
+    /// accepting peer and used only for lifecycle control.
+    #[serde_inline_default(0u64)]
+    pub connection_cookie: u64,
     /// Queue pair number.
     pub qp_num: u32,
     /// Local port number used by this QP.
@@ -77,13 +81,25 @@ pub struct RdmaConnectionConfig {
 /// RDMA connection request sent after the client has selected a server port.
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
 pub struct ConnectRequest {
+    /// Random initiator token used to confirm or expire this accept. It is a
+    /// lifecycle correlation ID, not an authentication credential.
+    pub connection_id: u64,
     /// Client endpoint to connect with.
     pub endpoint: Endpoint,
     /// Name of the client-side RDMA device this connection originates
     /// from; gives the server full path (NIC pair) visibility.
     pub source_device: String,
+    /// Virtual zone names assigned to the selected client GID.
+    pub source_zones: Vec<String>,
     /// Server device/port/GID that should accept this connection.
     pub target: DeviceSelection,
     /// Queue Pair settings negotiated by the client for this connection.
     pub config: RdmaConnectionConfig,
+}
+
+/// Identifies one accepted connection for lifecycle control RPCs.
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy)]
+pub struct ConnectionControl {
+    pub connection_id: u64,
+    pub server_connection_cookie: u64,
 }

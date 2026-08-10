@@ -47,6 +47,6 @@ pub use ruapc_bufpool::Devices as _;
 mod rdma;
 #[cfg(feature = "rdma")]
 pub use rdma::{
-    NicSelector, RdmaConnDirection, RdmaDeviceLoad, RdmaNicInfo, RdmaPathEntry, RdmaPathInfo,
-    RdmaPathReport, RdmaPathSelector,
+    RdmaConnDirection, RdmaDeviceLoad, RdmaNicInfo, RdmaPathEntry, RdmaPathInfo, RdmaPathReport,
+    StripePhase,
 };

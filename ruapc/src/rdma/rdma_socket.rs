@@ -1,6 +1,6 @@
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -281,6 +281,11 @@ pub struct RdmaSocket {
     pub(crate) conn_id: u64,
     /// Aggregate health of the outbound peer this stripe belongs to.
     peer_health: std::sync::OnceLock<std::sync::Weak<super::RdmaPeerHealth>>,
+    /// Initiator asks the poll thread to send one accounted immediate-only
+    /// SEND after control-plane confirmation.
+    activation_requested: AtomicBool,
+    /// Server-side accept lease notified by the first successful receive.
+    accept_lease_id: AtomicU64,
     /// Bounds in-flight RDMA READ work requests per *local NIC*: shared
     /// by every connection of the pool on this device
     /// (`rdma.max_inflight_read_wrs`) — the congestion control knob for
@@ -324,6 +329,8 @@ impl RdmaSocket {
             path,
             conn_id: crate::task::next_conn_id(),
             peer_health: std::sync::OnceLock::new(),
+            activation_requested: AtomicBool::new(false),
+            accept_lease_id: AtomicU64::new(0),
             read_permits,
             sq_read_permits: tokio::sync::Semaphore::new(sq_read_cap.max(1) as usize),
             read_timeout,
@@ -336,6 +343,30 @@ impl RdmaSocket {
 
     pub(crate) fn peer_health(&self) -> Option<std::sync::Weak<super::RdmaPeerHealth>> {
         self.peer_health.get().cloned()
+    }
+
+    pub(crate) fn request_activation(&self) {
+        self.activation_requested.store(true, Ordering::Release);
+        self.poller_waker.wake();
+    }
+
+    pub(crate) fn take_activation_request(&self) -> bool {
+        self.activation_requested.swap(false, Ordering::AcqRel)
+    }
+
+    pub(crate) fn set_accept_lease(&self, connection_id: u64) {
+        debug_assert_ne!(connection_id, 0);
+        self.accept_lease_id.store(connection_id, Ordering::Release);
+    }
+
+    pub(crate) fn take_accept_lease(&self) -> Option<u64> {
+        if self.accept_lease_id.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        match self.accept_lease_id.swap(0, Ordering::AcqRel) {
+            0 => None,
+            connection_id => Some(connection_id),
+        }
     }
 
     /// Serializes a message into a right-sized framed buffer.

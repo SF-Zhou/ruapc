@@ -6,9 +6,7 @@
 
 use std::{str::FromStr, sync::Arc};
 
-use ruapc::{
-    Endpoint, ListenMode, RdmaConnDirection, RdmaPathSelector, SocketPoolConfig, Transport,
-};
+use ruapc::{Endpoint, ListenMode, RdmaConnDirection, SocketPoolConfig, Transport};
 
 #[ruapc::service]
 trait Foo {
@@ -24,10 +22,9 @@ impl Foo for FooImpl {
 }
 
 /// End-to-end NIC awareness: after an RDMA call, both sides report the
-/// connection with its full path (NIC pair), the per-device connection
-/// counters are populated, and explicit path selectors are honored.
+/// connection with its full path and per-device connection counters.
 #[tokio::test]
-async fn test_rdma_path_report_and_selector() {
+async fn test_rdma_path_report() {
     let _ = tracing_subscriber::fmt().try_init();
 
     let foo = Arc::new(FooImpl);
@@ -61,7 +58,6 @@ async fn test_rdma_path_report_and_selector() {
     let path = &outbound[0].path;
     assert_eq!(outbound[0].peer, Some(addr));
     assert!(outbound[0].healthy);
-    assert!(!outbound[0].pinned);
     assert!(!path.local.device.is_empty());
     assert!(!path.remote.device.is_empty());
     // The local NIC's live connection counter accounts this connection.
@@ -87,28 +83,6 @@ async fn test_rdma_path_report_and_selector() {
     assert_eq!(inbound.peer, None);
     assert_eq!(inbound.path.local.device, path.remote.device);
     assert_eq!(inbound.path.remote.device, path.local.device);
-
-    // Explicit selectors matching the established path are honored.
-    for selector in [
-        RdmaPathSelector::local_device(path.local.device.clone()),
-        RdmaPathSelector::remote_device(path.remote.device.clone()),
-    ] {
-        let hinted = ctx.with_rdma_path(selector);
-        let rsp = client.hello(&hinted, &"path".to_string()).await.unwrap();
-        assert_eq!(rsp, "hello path!");
-    }
-
-    // A selector no NIC can satisfy fails the request.
-    let bad = ctx.with_rdma_path(RdmaPathSelector::remote_device("nonexistent"));
-    client.hello(&bad, &"nope".to_string()).await.unwrap_err();
-
-    // Non-RDMA requests ignore the selector.
-    let tcp_client = ruapc::Client::default();
-    let hinted = ctx
-        .with_endpoint(Endpoint::tcp(addr))
-        .with_rdma_path(RdmaPathSelector::remote_device("nonexistent"));
-    let rsp = tcp_client.hello(&hinted, &"tcp".to_string()).await.unwrap();
-    assert_eq!(rsp, "hello tcp!");
 
     server.stop();
     tokio::time::timeout(std::time::Duration::from_secs(30), server.join())

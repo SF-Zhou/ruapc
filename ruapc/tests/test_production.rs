@@ -78,12 +78,15 @@ trait Prod {
     /// (`u64::MAX` when the request carries none).
     async fn budget(&self, _: &ruapc::Context, req: &()) -> ruapc::Result<u64>;
     async fn sleepy(&self, _: &ruapc::Context, req: &u64) -> ruapc::Result<()>;
+    /// Slow on the first call, fast afterwards; returns the call ordinal.
+    async fn flaky(&self, _: &ruapc::Context, req: &()) -> ruapc::Result<u64>;
 }
 
 #[derive(Default)]
 struct ProdImpl {
     sleepy_started: AtomicU64,
     sleepy_finished: AtomicU64,
+    flaky_calls: AtomicU64,
 }
 
 impl Prod for ProdImpl {
@@ -106,6 +109,14 @@ impl Prod for ProdImpl {
         tokio::time::sleep(Duration::from_millis(*req)).await;
         self.sleepy_finished.fetch_add(1, Ordering::SeqCst);
         Ok(())
+    }
+
+    async fn flaky(&self, _: &ruapc::Context, (): &()) -> ruapc::Result<u64> {
+        let call = self.flaky_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == 1 {
+            tokio::time::sleep(Duration::from_millis(700)).await;
+        }
+        Ok(call)
     }
 }
 
@@ -245,6 +256,146 @@ async fn test_handler_runs_to_completion_after_client_timeout() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(finished, "handler should have run to completion");
+
+    server.stop();
+    server.join().await;
+}
+
+/// Response timeouts are surfaced to the caller instead of being retried:
+/// whether re-issuing an ambiguously-failed request is safe is application
+/// knowledge. The application-level retry (a fresh call) then succeeds on
+/// the same context.
+#[tokio::test]
+async fn test_response_timeout_surfaces_and_application_retry_succeeds() {
+    let config = unified_config();
+    let (service, server, addr) = start(&config).await;
+    let client = ruapc::Client {
+        timeout: Duration::from_millis(300),
+        ..Default::default()
+    };
+    let ctx = ruapc::Context::create(&config)
+        .unwrap()
+        .with_endpoint(Endpoint::tcp(addr));
+
+    let err = client.flaky(&ctx, &()).await.unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Timeout);
+    assert_eq!(service.flaky_calls.load(Ordering::SeqCst), 1);
+
+    // The caller decided the request is safe to re-issue.
+    assert_eq!(client.flaky(&ctx, &()).await.unwrap(), 2);
+    assert_eq!(service.flaky_calls.load(Ordering::SeqCst), 2);
+
+    server.stop();
+    server.join().await;
+}
+
+#[tokio::test]
+async fn test_connection_acquire_obeys_total_deadline() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accept_task = tokio::spawn(async move {
+        let (_stream, _) = listener.accept().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    });
+    let config = unified_config();
+    let ctx = ruapc::Context::create(&config)
+        .unwrap()
+        .with_endpoint(Endpoint::new(ruapc::Transport::WS, addr));
+    let client = ruapc::Client {
+        timeout: Duration::from_millis(100),
+        connect_timeout: Duration::from_millis(100),
+        max_retries: 0,
+        ..Default::default()
+    };
+
+    let started = std::time::Instant::now();
+    let err = client.echo(&ctx, &"deadline".to_owned()).await.unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Timeout);
+    assert!(started.elapsed() < Duration::from_millis(500));
+    accept_task.abort();
+}
+
+#[tokio::test]
+async fn test_connection_acquire_timeout_fails_over() {
+    let hanging = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hanging_addr = hanging.local_addr().unwrap();
+    let accept_task = tokio::spawn(async move {
+        let (_stream, _) = hanging.accept().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    });
+    let config = unified_config();
+    let (_service, server, live_addr) = start(&config).await;
+    let ctx = ruapc::Context::create(&config)
+        .unwrap()
+        .with_endpoints(vec![
+            Endpoint::new(ruapc::Transport::WS, hanging_addr),
+            Endpoint::tcp(live_addr),
+        ]);
+    let client = ruapc::Client {
+        timeout: Duration::from_secs(1),
+        connect_timeout: Duration::from_secs(1),
+        max_retries: 1,
+        ..Default::default()
+    };
+
+    assert_eq!(
+        client.echo(&ctx, &"failover".to_owned()).await.unwrap(),
+        "failover"
+    );
+
+    accept_task.abort();
+    server.stop();
+    server.join().await;
+}
+
+#[tokio::test]
+async fn test_zero_connect_timeout_reuses_existing_connection() {
+    let config = unified_config();
+    let (_service, server, addr) = start(&config).await;
+    let ctx = ruapc::Context::create(&config)
+        .unwrap()
+        .with_endpoint(Endpoint::tcp(addr));
+    let request = "existing".to_owned();
+    assert_eq!(
+        ruapc::Client::default().echo(&ctx, &request).await.unwrap(),
+        request
+    );
+
+    let client = ruapc::Client {
+        connect_timeout: Duration::ZERO,
+        ..Default::default()
+    };
+    assert_eq!(client.echo(&ctx, &request).await.unwrap(), request);
+
+    server.stop();
+    server.join().await;
+}
+
+#[tokio::test]
+async fn test_zero_connect_timeout_fails_over_to_existing_endpoint() {
+    let config = unified_config();
+    let (_service, server, addr) = start(&config).await;
+    let base = ruapc::Context::create(&config).unwrap();
+    let request = "existing-failover".to_owned();
+    let live_ctx = base.with_endpoint(Endpoint::tcp(addr));
+    assert_eq!(
+        ruapc::Client::default()
+            .echo(&live_ctx, &request)
+            .await
+            .unwrap(),
+        request
+    );
+
+    let unused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unavailable = unused.local_addr().unwrap();
+    drop(unused);
+    let ctx = base.with_endpoints(vec![Endpoint::tcp(unavailable), Endpoint::tcp(addr)]);
+    let client = ruapc::Client {
+        connect_timeout: Duration::ZERO,
+        max_retries: 1,
+        ..Default::default()
+    };
+    assert_eq!(client.echo(&ctx, &request).await.unwrap(), request);
 
     server.stop();
     server.join().await;

@@ -14,6 +14,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   discriminants in Rust enum fields such as `ibv_mtu`
 
 ### Changed
+- **BREAKING**: RDMA NIC policy is now static per `Context`. Removed request-level
+  path selectors/modes and remote-name filters. `rdma.device_filter` and
+  CIDR-backed virtual zones now define path policy at initialization; automatic
+  failure avoidance, NIC coverage, and connection rebalancing remain internal
 - **BREAKING** (`ruapc-rdma`): removed the unused `RdmaBuffer` trait, a
   leftover from before `QueuePair` took `ruapc_bufpool::Buffer` directly
 - **BREAKING** (`ruapc-rdma`): `ibv_device_cap_flags`, `ibv_port_cap_flags`,

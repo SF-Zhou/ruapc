@@ -31,6 +31,7 @@ hyper = { version = "1.6", features = ["client", "server", "http1", "http2"] }
 hyper-tungstenite = "0.18"
 hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "server-auto"] }
 indexmap = "2.11"
+ipnet = { version = "2.11", features = ["serde"] }
 libc = "0.2"
 openapiv3 = "2.2"
 metrics = "0.24"

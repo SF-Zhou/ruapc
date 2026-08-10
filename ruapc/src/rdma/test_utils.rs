@@ -23,7 +23,7 @@ pub(crate) fn make_rdma_devices() -> Arc<crate::Devices> {
         if prefer_rxe && !dev.info().name.starts_with("rxe") {
             continue;
         }
-        devices.add_rdma_device(dev);
+        devices.add_rdma_device(dev, &[]);
     }
     assert!(!devices.rdma_devices().is_empty(), "no RDMA device found");
     Arc::new(devices)
