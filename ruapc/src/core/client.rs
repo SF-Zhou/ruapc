@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_inline_default::serde_inline_default;
 use std::time::Duration;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
     sync::{Arc, Mutex},
 };
 
@@ -12,6 +13,7 @@ use crate::{
     core::{EndpointState, WriteTarget, context::ContextEndpoint, scatter::MAX_REGIONS},
     error::{Error, ErrorKind},
     msg::{MsgFlags, MsgMeta},
+    sockets::AcquireOptions,
 };
 
 /// RPC client configuration and request handler.
@@ -32,15 +34,21 @@ use crate::{
 #[serde_inline_default]
 #[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone)]
 pub struct Client {
-    /// Timeout duration for RPC requests. Default is 1 second.
+    /// Response timeout after a connection is available. Default is 1 second.
     ///
-    /// The effective per-request budget is the minimum of this value and
+    /// The effective response budget is the minimum of this value and
     /// the remaining deadline of the context (for nested RPCs issued while
     /// handling a request). The budget travels with the request so the
     /// server can drop work the client no longer waits for.
     #[serde_inline_default(Duration::from_secs(1))]
     #[serde(with = "humantime_serde")]
     pub timeout: Duration,
+    /// Total budget for connection establishment and endpoint failover.
+    /// Connection setup does not consume the response timeout; nested calls
+    /// still cap both budgets at the parent context's remaining deadline.
+    #[serde_inline_default(Duration::from_secs(5))]
+    #[serde(with = "humantime_serde")]
+    pub connect_timeout: Duration,
     /// Whether to use MessagePack serialization. Default is true.
     /// When false, JSON serialization is used.
     #[serde_inline_default(true)]
@@ -51,7 +59,9 @@ pub struct Client {
     /// multi-endpoint context (`Context::with_endpoints`) each retry moves
     /// to the next endpoint, cycling back to the first when the retry
     /// budget exceeds the endpoint count. Waiting-phase failures (timeout,
-    /// connection closed mid-flight) are never retried automatically.
+    /// connection closed mid-flight) are never retried automatically:
+    /// whether a request is safe to re-issue after an ambiguous outcome is
+    /// application knowledge, so that retry loop belongs to the caller.
     /// Default is 2.
     #[serde_inline_default(2u32)]
     pub max_retries: u32,
@@ -261,10 +271,20 @@ impl Client {
                 }
             }
         };
-        let max_attempts = self.max_retries as usize + 1;
-        let mut attempt = 0usize;
+        let connect_timeout = ctx
+            .remaining_time()
+            .map_or(self.connect_timeout, |remaining| {
+                self.connect_timeout.min(remaining)
+            });
+        let connect_deadline = std::time::Instant::now() + connect_timeout;
+        let max_attempts = u64::from(self.max_retries) + 1;
+        let mut attempt = 0u64;
+        // Remote RDMA NICs to steer away from, learned from send failures
+        // during the pre-wire retry cycle; empty (and never fed) on other
+        // transports.
+        let mut avoided_remote_nics: HashMap<SocketAddr, HashSet<String>> = HashMap::new();
         let mut tried = HashSet::new();
-        let (receiver, endpoint_state, conn_id) = loop {
+        let (sent, endpoint_state) = loop {
             let endpoint_state = if candidates.is_empty() {
                 None
             } else {
@@ -281,6 +301,12 @@ impl Client {
                     .clone();
                 Some(candidate)
             };
+            let attempted_addr = endpoint_state
+                .as_ref()
+                .map(|state| state.endpoint().addr())
+                .or_else(|| direct_endpoint.map(|endpoint| endpoint.addr()));
+            let peer_avoided_remote_nics =
+                attempted_addr.and_then(|addr| avoided_remote_nics.get(&addr));
             let result = self
                 .try_send(
                     ctx,
@@ -289,14 +315,24 @@ impl Client {
                     write_target.as_ref(),
                     method_name,
                     flags,
+                    connect_deadline,
                     timeout,
+                    max_attempts - attempt,
                     direct_endpoint,
                     endpoint_state.clone(),
+                    peer_avoided_remote_nics,
                 )
                 .await;
             match result {
-                Ok((receiver, conn_id)) => break (receiver, endpoint_state, conn_id),
+                Ok(sent) => break (sent, endpoint_state),
                 Err(failure) => {
+                    if let (Some(addr), Some(remote)) = (attempted_addr, &failure.failed_remote_nic)
+                    {
+                        avoided_remote_nics
+                            .entry(addr)
+                            .or_default()
+                            .insert(remote.clone());
+                    }
                     if let Some(endpoint_state) = &endpoint_state {
                         tried.insert(endpoint_state.endpoint());
                     }
@@ -318,13 +354,17 @@ impl Client {
                 }
             }
         };
-        // 3. recv response (fails with Timeout once the entry expires).
-        let (response, returned_target) = match receiver.recv().await {
+        // 3. recv the single response (fails with Timeout once the waiter
+        // entry expires). Ambiguous waiting-phase failures are surfaced to
+        // the caller instead of being retried: the request may have
+        // executed, and only the application knows whether re-issuing it
+        // is safe.
+        let (response, returned_target) = match sent.receiver.recv().await {
             Ok(response) => response,
             Err(err) => {
                 if matches!(err.kind, ErrorKind::ConnectionClosed)
                     && let Some(state) = &endpoint_state
-                    && let Some(conn_id) = conn_id
+                    && let Some(conn_id) = sent.conn_id
                 {
                     state.record_connection_failure(conn_id);
                 }
@@ -332,7 +372,7 @@ impl Client {
             }
         };
         if let Some(state) = &endpoint_state
-            && let Some(conn_id) = conn_id
+            && let Some(conn_id) = sent.conn_id
         {
             state.record_request_success(conn_id);
         }
@@ -367,37 +407,113 @@ impl Client {
         write_target: Option<&Arc<WriteTarget>>,
         method_name: &str,
         flags: MsgFlags,
-        timeout: Duration,
+        connect_deadline: std::time::Instant,
+        response_budget: Duration,
+        remaining_acquire_attempts: u64,
         direct_endpoint: Option<crate::Endpoint>,
         endpoint_state: Option<Arc<EndpointState>>,
-    ) -> std::result::Result<(crate::Receiver<'a>, Option<u64>), AttemptFailure>
+        avoided_remote_nics: Option<&HashSet<String>>,
+    ) -> std::result::Result<SentRequest<'a>, AttemptFailure>
     where
         Req: Serialize + JsonSchema,
     {
         let socket = match (&ctx.endpoint, &endpoint_state) {
             (ContextEndpoint::Connected(socket), _) => socket.clone(),
-            (ContextEndpoint::Endpoints(_), Some(endpoint_state)) => acquire_endpoint(
-                &ctx.state,
-                endpoint_state,
-                #[cfg(feature = "rdma")]
-                ctx.rdma_path.as_ref(),
-            )
-            .await
-            .map_err(AttemptFailure::acquire)?,
-            (ContextEndpoint::Endpoints(_), None) => {
-                let endpoint =
-                    direct_endpoint.expect("a singleton endpoint was resolved before try_send");
-                acquire_direct(
-                    &ctx.state,
-                    endpoint,
-                    #[cfg(feature = "rdma")]
-                    ctx.rdma_path.as_ref(),
-                )
-                .await
-                .map_err(AttemptFailure::acquire)?
+            (ContextEndpoint::Endpoints(_), _) => {
+                let endpoint = endpoint_state
+                    .as_ref()
+                    .map(|state| state.endpoint())
+                    .or(direct_endpoint)
+                    .expect("an endpoint was resolved before try_send");
+                if let Some(result) = try_acquire_direct(&ctx.state, endpoint, avoided_remote_nics)
+                {
+                    let socket = result.map_err(AttemptFailure::acquire)?;
+                    if let Some(endpoint_state) = &endpoint_state
+                        && !endpoint_state.is_current(&socket)
+                    {
+                        endpoint_state.begin_connect().record_connection(&socket);
+                    }
+                    socket
+                } else {
+                    'acquire: {
+                        let now = std::time::Instant::now();
+                        let Some(acquire_deadline) = split_connection_deadline(
+                            now,
+                            connect_deadline,
+                            remaining_acquire_attempts,
+                        ) else {
+                            let socket =
+                                acquire_existing_direct(&ctx.state, endpoint, avoided_remote_nics)
+                                    .await
+                                    .ok_or_else(AttemptFailure::acquire_deadline)?
+                                    .map_err(AttemptFailure::acquire)?;
+                            if let Some(endpoint_state) = &endpoint_state
+                                && !endpoint_state.is_current(&socket)
+                            {
+                                endpoint_state.begin_connect().record_connection(&socket);
+                            }
+                            break 'acquire socket;
+                        };
+                        let options = AcquireOptions {
+                            avoided_remote_nics,
+                            deadline: Some(acquire_deadline),
+                        };
+                        let state = ctx.state.clone();
+                        let timeout_endpoint_state = endpoint_state.clone();
+                        let failure_endpoint_state = endpoint_state.clone();
+                        let endpoint_state = endpoint_state.clone();
+                        let acquire = async move {
+                            match endpoint_state {
+                                Some(endpoint_state) => {
+                                    acquire_endpoint(&state, &endpoint_state, options).await
+                                }
+                                None => {
+                                    let endpoint = direct_endpoint.expect(
+                                        "a singleton endpoint was resolved before try_send",
+                                    );
+                                    acquire_direct(&state, endpoint, options).await
+                                }
+                            }
+                        };
+                        let result = match tokio::time::timeout_at(
+                            tokio::time::Instant::from_std(acquire_deadline),
+                            acquire,
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => {
+                                if let Some(endpoint_state) = timeout_endpoint_state {
+                                    endpoint_state.begin_connect().record_failure();
+                                }
+                                return Err(AttemptFailure::acquire_deadline());
+                            }
+                        };
+                        result.map_err(|error| {
+                            if matches!(error.kind, ErrorKind::Timeout) {
+                                if let Some(endpoint_state) = &failure_endpoint_state {
+                                    endpoint_state.begin_connect().record_failure();
+                                }
+                                AttemptFailure::acquire_deadline()
+                            } else {
+                                AttemptFailure::acquire(error)
+                            }
+                        })?
+                    }
+                }
             }
             _ => unreachable!("request endpoint was validated before try_send"),
         };
+        // The response budget starts once a connection is available, still
+        // capped by the parent context's remaining deadline (nested RPCs).
+        let response_deadline = {
+            let deadline = std::time::Instant::now() + response_budget;
+            ctx.deadline.map_or(deadline, |parent| deadline.min(parent))
+        };
+        let timeout = response_deadline.saturating_duration_since(std::time::Instant::now());
+        if timeout.is_zero() {
+            return Err(AttemptFailure::deadline());
+        }
 
         // Export the attached buffers as regions for the device the
         // connection actually runs on (TCP device, or the specific RDMA
@@ -436,7 +552,7 @@ impl Client {
             write_regions,
             // Ship the *effective* budget so the whole downstream call
             // tree inherits the shrunk deadline.
-            timeout_ms: Some(u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX)),
+            timeout_ms: Some(wire_timeout_ms(timeout)),
         };
         if let Err(err) = socket.send(&mut meta, req, &ctx.state).await {
             if is_connection_failure(&err)
@@ -452,9 +568,13 @@ impl Client {
                     AttemptDisposition::Terminal
                 },
                 error: err,
+                failed_remote_nic: socket.rdma_remote_device().map(str::to_owned),
             });
         }
-        Ok((receiver, socket.conn_id()))
+        Ok(SentRequest {
+            receiver,
+            conn_id: socket.conn_id(),
+        })
     }
 
     fn preconnect(&self, ctx: &Context, candidates: &[Arc<EndpointState>]) {
@@ -465,16 +585,10 @@ impl Client {
             };
             let state = ctx.state.clone();
             let endpoint_state = endpoint_state.clone();
-            #[cfg(feature = "rdma")]
-            let selector = ctx.rdma_path.clone();
             let _ = supervisor.try_spawn(async move {
-                let result = acquire_direct(
-                    &state,
-                    endpoint_state.endpoint(),
-                    #[cfg(feature = "rdma")]
-                    selector.as_ref(),
-                )
-                .await;
+                let result =
+                    acquire_direct(&state, endpoint_state.endpoint(), AcquireOptions::default())
+                        .await;
                 match &result {
                     Ok(socket) => activity.record_connection(socket),
                     Err(err) if is_connection_failure(err) => activity.record_failure(),
@@ -492,6 +606,12 @@ impl Client {
     }
 }
 
+/// A successfully sent request attempt, waiting for its response.
+struct SentRequest<'a> {
+    receiver: crate::Receiver<'a>,
+    conn_id: Option<u64>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AttemptDisposition {
     Retryable,
@@ -502,9 +622,31 @@ enum AttemptDisposition {
 struct AttemptFailure {
     disposition: AttemptDisposition,
     error: Error,
+    /// Remote RDMA NIC of the connection the attempt failed on, if any;
+    /// steers the retry's placement away from it.
+    failed_remote_nic: Option<String>,
 }
 
 impl AttemptFailure {
+    fn deadline() -> Self {
+        Self {
+            disposition: AttemptDisposition::Terminal,
+            error: Error::new(ErrorKind::Timeout, "request deadline expired".into()),
+            failed_remote_nic: None,
+        }
+    }
+
+    fn acquire_deadline() -> Self {
+        Self {
+            disposition: AttemptDisposition::Retryable,
+            error: Error::new(
+                ErrorKind::Timeout,
+                "connection attempt deadline expired".into(),
+            ),
+            failed_remote_nic: None,
+        }
+    }
+
     fn acquire(error: Error) -> Self {
         Self {
             disposition: if is_connection_failure(&error) {
@@ -513,6 +655,7 @@ impl AttemptFailure {
                 AttemptDisposition::FailoverOnly
             },
             error,
+            failed_remote_nic: None,
         }
     }
 
@@ -520,6 +663,7 @@ impl AttemptFailure {
         Self {
             disposition: AttemptDisposition::FailoverOnly,
             error,
+            failed_remote_nic: None,
         }
     }
 }
@@ -529,14 +673,15 @@ impl From<Error> for AttemptFailure {
         Self {
             disposition: AttemptDisposition::Terminal,
             error,
+            failed_remote_nic: None,
         }
     }
 }
 
 fn should_retry_attempt(
     disposition: AttemptDisposition,
-    attempt: usize,
-    max_attempts: usize,
+    attempt: u64,
+    max_attempts: u64,
     has_untried_endpoint: bool,
 ) -> bool {
     if attempt + 1 >= max_attempts {
@@ -549,19 +694,32 @@ fn should_retry_attempt(
     }
 }
 
+fn split_connection_deadline(
+    now: std::time::Instant,
+    deadline: std::time::Instant,
+    remaining_attempts: u64,
+) -> Option<std::time::Instant> {
+    let remaining = deadline.saturating_duration_since(now);
+    if remaining.is_zero() {
+        return None;
+    }
+    let attempts = u32::try_from(remaining_attempts.max(1)).unwrap_or(u32::MAX);
+    let slice = remaining / attempts;
+    (!slice.is_zero()).then_some(now + slice)
+}
+
+fn wire_timeout_ms(timeout: Duration) -> u32 {
+    let millis = timeout.as_nanos().div_ceil(1_000_000);
+    u32::try_from(millis).unwrap_or(u32::MAX)
+}
+
 async fn acquire_endpoint(
     state: &Arc<State>,
     endpoint_state: &Arc<EndpointState>,
-    #[cfg(feature = "rdma")] selector: Option<&crate::rdma::RdmaPathSelector>,
+    options: AcquireOptions<'_>,
 ) -> std::result::Result<Socket, Error> {
     let endpoint = endpoint_state.endpoint();
-    let result = acquire_direct(
-        state,
-        endpoint,
-        #[cfg(feature = "rdma")]
-        selector,
-    )
-    .await;
+    let result = acquire_direct(state, endpoint, options).await;
 
     match &result {
         Ok(socket) if !endpoint_state.is_current(socket) => {
@@ -579,18 +737,43 @@ async fn acquire_endpoint(
 async fn acquire_direct(
     state: &Arc<State>,
     endpoint: crate::Endpoint,
-    #[cfg(feature = "rdma")] selector: Option<&crate::rdma::RdmaPathSelector>,
+    options: AcquireOptions<'_>,
 ) -> std::result::Result<Socket, Error> {
-    #[cfg(feature = "rdma")]
-    if let Some(selector) = selector
-        && endpoint.transport() == crate::Transport::RDMA
-    {
-        return state
-            .socket_pool
-            .acquire_rdma_path(&endpoint.addr(), selector, state)
-            .await;
-    }
-    state.socket_pool.acquire(endpoint, state).await
+    state
+        .socket_pool
+        .acquire_with_options(endpoint, options, state)
+        .await
+}
+
+fn try_acquire_direct(
+    state: &Arc<State>,
+    endpoint: crate::Endpoint,
+    avoided_remote_nics: Option<&HashSet<String>>,
+) -> Option<std::result::Result<Socket, Error>> {
+    state.socket_pool.try_acquire(
+        endpoint,
+        AcquireOptions {
+            avoided_remote_nics,
+            deadline: None,
+        },
+    )
+}
+
+async fn acquire_existing_direct(
+    state: &Arc<State>,
+    endpoint: crate::Endpoint,
+    avoided_remote_nics: Option<&HashSet<String>>,
+) -> Option<std::result::Result<Socket, Error>> {
+    state
+        .socket_pool
+        .acquire_existing(
+            endpoint,
+            AcquireOptions {
+                avoided_remote_nics,
+                deadline: None,
+            },
+        )
+        .await
 }
 
 fn is_connection_failure(err: &Error) -> bool {
@@ -750,13 +933,38 @@ mod tests {
     fn test_default_config() {
         let client = Client::default();
         assert_eq!(client.timeout, Duration::from_secs(1));
+        assert_eq!(client.connect_timeout, Duration::from_secs(5));
         assert!(client.use_msgpack);
+        assert_eq!(client.max_retries, 2);
+    }
+
+    #[test]
+    fn connection_deadlines_use_their_own_budget_domain() {
+        let now = std::time::Instant::now();
+        let connect_deadline = now + Duration::from_secs(6);
+
+        assert_eq!(
+            split_connection_deadline(now, connect_deadline, 1),
+            Some(connect_deadline)
+        );
+        assert_eq!(
+            split_connection_deadline(now, connect_deadline, 3),
+            Some(now + Duration::from_secs(2))
+        );
+        assert_eq!(
+            split_connection_deadline(now, now + Duration::from_nanos(1), u64::from(u32::MAX),),
+            None
+        );
+        assert_eq!(wire_timeout_ms(Duration::from_nanos(1)), 1);
+        assert_eq!(wire_timeout_ms(Duration::from_micros(999)), 1);
+        assert_eq!(wire_timeout_ms(Duration::from_millis(1)), 1);
     }
 
     #[test]
     fn test_client_serde_roundtrip() {
         let client = Client {
             timeout: Duration::from_millis(500),
+            connect_timeout: Duration::from_secs(2),
             use_msgpack: false,
             max_retries: 4,
         };
@@ -770,6 +978,7 @@ mod tests {
         let client: Client =
             serde_json::from_value(serde_json::Value::Object(serde_json::Map::default())).unwrap();
         assert_eq!(client.timeout, Duration::from_secs(1));
+        assert_eq!(client.connect_timeout, Duration::from_secs(5));
         assert!(client.use_msgpack);
     }
 

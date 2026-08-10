@@ -46,9 +46,13 @@ impl Devices {
     }
 
     #[cfg(feature = "rdma")]
-    pub fn add_rdma_device(&mut self, inner_dev: ruapc_rdma::ActiveDevice) {
+    pub fn add_rdma_device(
+        &mut self,
+        inner_dev: ruapc_rdma::ActiveDevice,
+        zones: &[crate::RdmaZoneConfig],
+    ) {
         let index = (1 + self.rdma_devices.len()) as u32;
-        let mut dev = RdmaDevice::new(inner_dev);
+        let mut dev = RdmaDevice::new(inner_dev, zones.to_vec());
         dev.set_index(DeviceIndex {
             magic: self.magic,
             index,

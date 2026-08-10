@@ -17,6 +17,34 @@ use crate::{
     Transport, http::HttpSocketPool, tcp::TcpSocketPool, ws::WebSocketPool,
 };
 
+/// Constraints and budget applied when acquiring a connection.
+///
+/// The fields are plain std types, so the struct exists in every build and
+/// callers need no `rdma` feature gates: this is the single choke point
+/// where transport-specific capabilities meet the generic acquire path.
+/// Transports that cannot honor a field ignore it.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct AcquireOptions<'a> {
+    /// Remote RDMA NICs to avoid when picking or establishing a
+    /// connection (soft constraint; only the RDMA pool reads it).
+    #[cfg_attr(not(feature = "rdma"), expect(dead_code))]
+    pub(crate) avoided_remote_nics: Option<&'a std::collections::HashSet<String>>,
+    /// Deadline for establishing a new connection. All transports honor
+    /// it; the RDMA pool additionally threads it through its multi-step
+    /// bootstrap handshake.
+    pub(crate) deadline: Option<std::time::Instant>,
+}
+
+#[cfg(feature = "rdma")]
+impl AcquireOptions<'_> {
+    /// The avoided-NIC set, normalized to a (possibly empty) set.
+    fn avoided_nics(&self) -> &std::collections::HashSet<String> {
+        static EMPTY: std::sync::LazyLock<std::collections::HashSet<String>> =
+            std::sync::LazyLock::new(std::collections::HashSet::new);
+        self.avoided_remote_nics.unwrap_or(&EMPTY)
+    }
+}
+
 /// Socket pool configuration.
 ///
 /// Configures listener behavior and transport resources.
@@ -61,6 +89,7 @@ pub struct SocketPoolConfig {
 #[cfg(feature = "rdma")]
 #[serde_inline_default]
 #[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RdmaSocketPoolConfig {
     /// Requested Queue Pair capabilities for newly created RDMA connections.
     #[serde(default)]
@@ -139,30 +168,37 @@ pub struct RdmaSocketPoolConfig {
     /// messages carry no cross-message ordering guarantees.
     #[serde_inline_default(1u32)]
     pub connections_per_peer: u32,
+    /// Minimum healthy connections maintained to every discovered remote
+    /// RDMA device. Coverage is automatic and does not affect request APIs.
+    #[serde_inline_default(1u32)]
+    pub min_connections_per_remote_nic: u32,
+    /// Hard cap on healthy outbound connections maintained for one peer.
+    #[serde_inline_default(16u32)]
+    pub preconnect_max_per_peer: u32,
+    /// Maximum time an accepted RDMA connection may wait for confirmation
+    /// or data-plane activation. Expired leases reclaim their QP and receive
+    /// ring. This must be at least 15s; default is 30s.
+    #[serde_inline_default(30_000u64)]
+    pub connect_lease_ms: u64,
     /// If non-empty, only RDMA devices whose name is listed are used.
     /// Useful when a host has NICs without connectivity to the target
     /// fabric (device matching cannot verify reachability).
     #[serde(default)]
     pub device_filter: Vec<String>,
-    /// If non-empty, only remote RDMA devices whose name is listed are
-    /// considered when selecting a path. Per-request selection is also
-    /// available via `Context::with_rdma_path`.
+    /// Virtual zones defined by stable names and IP subnets. Ports whose
+    /// addresses match the same zone name are preferred during path selection.
     #[serde(default)]
-    pub remote_device_filter: Vec<String>,
+    pub zones: Vec<RdmaZoneConfig>,
     /// Interval (milliseconds) of the background maintenance task, which
-    /// fails connections on downed local ports, replaces dead stripes,
-    /// and migrates at most one connection per tick towards less loaded
-    /// NIC pairs (make-before-break). The interval is jittered by ±50%
-    /// per process. `0` disables maintenance entirely.
+    /// fails connections on downed local ports and replaces dead stripes.
+    /// The interval is jittered by ±50% per process. `0` disables
+    /// maintenance entirely.
     #[serde_inline_default(5000u64)]
     pub maintenance_interval_ms: u64,
-    /// Minimum connection-count improvement required before a connection
-    /// is migrated to another NIC pair; provides hysteresis on top of the
-    /// self-excluding score model. Values below 1 are treated as 1.
+    /// Minimum load improvement required before migrating a connection.
     #[serde_inline_default(2u32)]
     pub rebalance_threshold: u32,
-    /// Grace period (milliseconds) a migrated-away connection stays alive
-    /// after leaving the rotation, so its in-flight responses can arrive.
+    /// Grace period for a migrated connection to finish in-flight responses.
     #[serde_inline_default(10_000u64)]
     pub drain_timeout_ms: u64,
     /// Software timeout (milliseconds) for RDMA READ completions,
@@ -195,6 +231,17 @@ pub struct RdmaSocketPoolConfig {
     /// link layers (no GRH). Default is 0.
     #[serde_inline_default(0u8)]
     pub traffic_class: u8,
+}
+
+/// A virtual RDMA zone assigned from the IP addresses of an RDMA netdev.
+#[cfg(feature = "rdma")]
+#[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct RdmaZoneConfig {
+    /// Stable name exchanged with peers, for example `storage-a`.
+    pub name: String,
+    /// IP networks whose local interface addresses belong to this subnet.
+    pub cidrs: Vec<ipnet::IpNet>,
 }
 
 #[cfg(feature = "rdma")]
@@ -348,6 +395,96 @@ impl SocketPool {
         }
     }
 
+    /// Like [`SocketPool::acquire`], applying the constraints and budget in
+    /// `options`. This is the single point where [`AcquireOptions`] meets
+    /// transport-specific behavior.
+    pub(crate) async fn acquire_with_options(
+        &self,
+        endpoint: RpcEndpoint,
+        options: AcquireOptions<'_>,
+        state: &Arc<State>,
+    ) -> Result<Socket> {
+        #[cfg(feature = "rdma")]
+        if endpoint.transport() == Transport::RDMA {
+            return match self.rdma_pool() {
+                Some(pool) => {
+                    pool.acquire_with_deadline(
+                        &endpoint.addr(),
+                        options.avoided_nics(),
+                        options.deadline,
+                        state,
+                    )
+                    .await
+                }
+                None => Err(Error::new(
+                    ErrorKind::InvalidArgument,
+                    "RDMA endpoint requires SocketPoolConfig.rdma = Some(...)".into(),
+                )),
+            };
+        }
+        match options.deadline {
+            Some(deadline) => {
+                tokio::time::timeout_at(deadline.into(), self.acquire(endpoint, state))
+                    .await
+                    .map_err(|_| {
+                        Error::new(ErrorKind::Timeout, "connection deadline expired".into())
+                    })?
+            }
+            None => self.acquire(endpoint, state).await,
+        }
+    }
+
+    /// Non-blocking fast path: an already-established live connection, or
+    /// `None` when a new one would have to be created.
+    #[cfg_attr(not(feature = "rdma"), expect(unused_variables))]
+    pub(crate) fn try_acquire(
+        &self,
+        endpoint: RpcEndpoint,
+        options: AcquireOptions<'_>,
+    ) -> Option<Result<Socket>> {
+        match endpoint.transport() {
+            Transport::TCP => self.tcp.try_acquire(&endpoint.addr()).map(Ok),
+            Transport::WS => self.ws.try_acquire(&endpoint.addr()).map(Ok),
+            Transport::HTTP => self.http.try_acquire(&endpoint.addr()).map(Ok),
+            #[cfg(feature = "rdma")]
+            Transport::RDMA => match &self.rdma {
+                Some(pool) => pool
+                    .try_acquire(&endpoint.addr(), options.avoided_nics())
+                    .map(Ok),
+                None => Some(Err(Error::new(
+                    ErrorKind::InvalidArgument,
+                    "RDMA endpoint requires SocketPoolConfig.rdma = Some(...)".into(),
+                ))),
+            },
+        }
+    }
+
+    /// Awaiting variant of [`SocketPool::try_acquire`]: still never creates
+    /// a connection, but may briefly wait on pool locks.
+    #[cfg_attr(not(feature = "rdma"), expect(unused_variables))]
+    pub(crate) async fn acquire_existing(
+        &self,
+        endpoint: RpcEndpoint,
+        options: AcquireOptions<'_>,
+    ) -> Option<Result<Socket>> {
+        match endpoint.transport() {
+            Transport::TCP => self.tcp.acquire_existing(&endpoint.addr()).await.map(Ok),
+            Transport::WS => self.ws.acquire_existing(&endpoint.addr()).await.map(Ok),
+            Transport::HTTP => self.http.acquire_existing(&endpoint.addr()).await.map(Ok),
+            #[cfg(feature = "rdma")]
+            Transport::RDMA => match &self.rdma {
+                Some(pool) => pool
+                    .acquire_existing(&endpoint.addr(), options.avoided_nics())
+                    .await
+                    .map(Ok),
+                None => Some(Err(Error::new(
+                    ErrorKind::InvalidArgument,
+                    "RDMA endpoint requires SocketPoolConfig.rdma = Some(...)".into(),
+                ))),
+            },
+        }
+    }
+
     pub(crate) fn task_supervisor_handle(&self) -> crate::TaskSupervisorHandle {
         self.task_supervisor.handle()
     }
@@ -431,24 +568,6 @@ impl SocketPool {
         self.rdma.as_ref()
     }
 
-    /// Acquires an RDMA socket to `addr` whose path (NIC pair) matches
-    /// `selector`, establishing one when none exists.
-    #[cfg(feature = "rdma")]
-    pub(crate) async fn acquire_rdma_path(
-        &self,
-        addr: &SocketAddr,
-        selector: &crate::rdma::RdmaPathSelector,
-        state: &Arc<State>,
-    ) -> Result<Socket> {
-        match self.rdma_pool() {
-            Some(pool) => pool.acquire_path(addr, Some(selector), state).await,
-            None => Err(Error::new(
-                ErrorKind::InvalidArgument,
-                "RDMA is not enabled".into(),
-            )),
-        }
-    }
-
     #[cfg(feature = "rdma")]
     pub fn rdma_device_list(&self) -> Result<crate::rdma::RdmaInfo> {
         match &self.rdma {
@@ -464,6 +583,49 @@ impl SocketPool {
     pub fn rdma_accept(&self, request: &ConnectRequest, state: &Arc<State>) -> Result<Endpoint> {
         match &self.rdma {
             Some(pool) => pool.rdma_accept(request, state),
+            None => Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "RDMA is not enabled".into(),
+            )),
+        }
+    }
+
+    #[cfg(feature = "rdma")]
+    pub fn rdma_confirm(&self, control: &crate::rdma::ConnectionControl) -> Result<()> {
+        match &self.rdma {
+            Some(pool) => pool.rdma_confirm(control),
+            None => Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "RDMA is not enabled".into(),
+            )),
+        }
+    }
+
+    #[cfg(feature = "rdma")]
+    pub fn rdma_abort(&self, control: &crate::rdma::ConnectionControl) -> Result<()> {
+        match &self.rdma {
+            Some(pool) => {
+                pool.rdma_abort(control);
+                Ok(())
+            }
+            None => Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "RDMA is not enabled".into(),
+            )),
+        }
+    }
+
+    #[cfg(feature = "rdma")]
+    pub fn rdma_receive_observed(
+        &self,
+        connection_id: u64,
+        socket: &std::sync::Arc<crate::rdma::RdmaSocket>,
+    ) -> Result<()> {
+        match &self.rdma {
+            Some(pool) => {
+                pool.rdma_receive_observed(connection_id, socket);
+                Ok(())
+            }
             None => Err(Error::new(
                 ErrorKind::InvalidArgument,
                 "RDMA is not enabled".into(),
@@ -540,6 +702,11 @@ mod tests {
         assert_eq!(rdma.cq_len, 128);
         assert_eq!(rdma.pkey_index, 0);
         assert_eq!(rdma.max_msg_size, 256 * 1024);
+        assert_eq!(rdma.min_connections_per_remote_nic, 1);
+        assert_eq!(rdma.preconnect_max_per_peer, 16);
+        assert_eq!(rdma.connect_lease_ms, 30_000);
+        assert_eq!(rdma.rebalance_threshold, 2);
+        assert_eq!(rdma.drain_timeout_ms, 10_000);
         assert_eq!(rdma.dispatch_workers, 32);
         assert_eq!(rdma.read_timeout_ms, 10_000);
         assert_eq!(rdma.max_inflight_read_wrs, 32);
@@ -547,6 +714,10 @@ mod tests {
         // `Default` is exactly the all-defaults deserialization.
         let default: RdmaSocketPoolConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(default, RdmaSocketPoolConfig::default());
+        assert!(serde_json::from_str::<RdmaSocketPoolConfig>(r#"{"path_modes":[]}"#).is_err());
+        assert!(
+            serde_json::from_str::<RdmaSocketPoolConfig>(r#"{"remote_device_filter":[]}"#).is_err()
+        );
     }
 
     #[tokio::test]

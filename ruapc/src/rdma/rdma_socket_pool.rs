@@ -1,8 +1,8 @@
 use std::{
-    collections::HashMap,
+    collections::HashSet,
     net::SocketAddr,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-    sync::{Arc, Weak},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    sync::{Arc, OnceLock, Weak},
     time::{Duration, Instant},
 };
 
@@ -12,22 +12,34 @@ use ruapc_rdma::{
     DeviceInfo, Gid, GidType, LinkLayer, Port, QueuePair, ibv_mtu, ibv_qp_cap, ibv_qp_init_attr,
     ibv_qp_type,
 };
-use tokio::sync::RwLock;
 use tokio_util::sync::DropGuard;
 
-use super::path::{
-    RdmaConnDirection, RdmaDeviceLoad, RdmaNicInfo, RdmaPathEntry, RdmaPathInfo, RdmaPathReport,
-    RdmaPathSelector, gid_ip,
-};
+use super::path::{RdmaNicInfo, RdmaPathInfo, gid_ip};
 use super::rdma_service::RdmaPortInfo;
 use super::{
-    ConnectRequest, DevicePollers, DeviceSelection, Endpoint, PollerConfig, RdmaConnectionConfig,
-    RdmaDevice, RdmaDeviceRefresher, RdmaInfo, RdmaService, RdmaSocket, RegisterConn,
+    ConnectRequest, ConnectionControl, DevicePollers, DeviceSelection, Endpoint, PollerConfig,
+    RdmaConnectionConfig, RdmaDevice, RdmaDeviceRefresher, RdmaInfo, RdmaService, RdmaSocket,
+    RegisterConn,
 };
 use crate::{
     Buffer, BufferPool, Client, Context, Devices, Error, ErrorKind, RdmaQueuePairConfig,
     RdmaSocketPoolConfig, Result, Socket, SocketPoolConfig, SocketPoolTrait, State, TaskSupervisor,
 };
+
+mod peer;
+pub(crate) use peer::PeerState;
+mod accept;
+use accept::{AcceptLease, AcceptLeaseEvent, AcceptLeaseState, advance_accept_lease};
+mod connect;
+use connect::{EstablishedSocket, SocketRegistrationGuard};
+mod placement;
+use placement::{PathClass, ReconcileAction};
+mod maintenance;
+mod report;
+use maintenance::{RetryBackoff, preconnect_backoff_delay};
+
+type PathKey = (String, u8, u8, String, u8, u8);
+type PeerMap = dashmap::DashMap<SocketAddr, Arc<PeerState>, RandomState>;
 
 /// One RDMA connection towards a peer, tagged with bookkeeping metadata.
 ///
@@ -36,33 +48,9 @@ use crate::{
 #[derive(Clone)]
 pub(crate) struct Stripe {
     pub(crate) socket: Arc<RdmaSocket>,
-    /// Created for an explicit path selector; exempt from replenishment
-    /// accounting and rebalancing.
-    pub(crate) pinned: bool,
 }
 
-/// Aggregate health for all outbound stripes to one peer.
-#[derive(Debug, Default)]
-pub(crate) struct RdmaPeerHealth {
-    sockets: std::sync::Mutex<Vec<Weak<RdmaSocket>>>,
-}
-
-impl RdmaPeerHealth {
-    fn track(&self, socket: &Arc<RdmaSocket>) {
-        let mut sockets = self.sockets.lock().unwrap();
-        sockets.retain(|socket| socket.strong_count() > 0);
-        sockets.push(Arc::downgrade(socket));
-    }
-
-    pub(crate) fn is_connected(&self) -> bool {
-        let mut sockets = self.sockets.lock().unwrap();
-        sockets.retain(|socket| socket.strong_count() > 0);
-        sockets
-            .iter()
-            .filter_map(Weak::upgrade)
-            .any(|socket| socket.state.is_ok())
-    }
-}
+pub(crate) type RdmaPeerHealth = PeerState;
 
 /// RAII increment of one device's live-connection counter; decremented
 /// when the poll thread tears the connection down (the guard travels
@@ -99,7 +87,7 @@ impl Drop for ConnCountGuard {
 /// RDMA resources **must** be destroyed in this order:
 ///   1. Stop all async tasks and join the device poll threads (so all
 ///      per-connection state drops its `Arc<RdmaSocket>`)
-///   2. Destroy QPs (`socket_map`) — the shared CQs are destroyed via their
+///   2. Destroy QPs (`peers`) — the shared CQs are destroyed via their
 ///      `Arc` chain once the last QP referencing them is gone
 ///   3. Deregister MRs (`buffer_pool`)
 ///   4. Destroy PD / close device context (`devices`)
@@ -112,21 +100,14 @@ pub struct RdmaSocketPool {
     /// Supervisor for managing asynchronous tasks — dropped first so that
     /// watcher tasks finish and connections are marked for teardown.
     pub task_supervisor: TaskSupervisor,
-    /// Per-device completion poll threads. Dropped before `socket_map` so
+    /// Per-device completion poll threads. Dropped before `peers` so
     /// the threads are joined and release their `Arc<RdmaSocket>` clones.
     pollers: DevicePollers,
     /// Background port/GID cache refresher. Dropped before RDMA devices.
     _port_refresher: RdmaDeviceRefresher,
-    /// Per-peer connection locks prevent duplicate in-flight RDMA handshakes.
-    connect_locks: dashmap::DashMap<SocketAddr, Arc<tokio::sync::Mutex<()>>, RandomState>,
-    /// Short-lived cache for the first-stage server RDMA device query.
-    device_list_cache: RwLock<HashMap<SocketAddr, CachedRdmaInfo, RandomState>>,
-    /// Thread-safe map of active RDMA connection stripes indexed by peer
-    /// address; requests are spread round-robin across the stripes.
-    /// Dropped after tasks stop → destroys QPs.
-    pub(crate) socket_map: RwLock<HashMap<SocketAddr, Vec<Stripe>, RandomState>>,
-    /// Stable aggregate health handles for outbound peers.
-    peer_health: dashmap::DashMap<SocketAddr, Arc<RdmaPeerHealth>, RandomState>,
+    /// Per-peer connection state. Dropped after tasks stop, before memory
+    /// registration and device resources.
+    peers: PeerMap,
     /// Live connection count per local RDMA device (outbound + inbound),
     /// indexed like `devices.rdma_devices()`. Drives least-connections
     /// placement and is advertised to peers via `RdmaInfo`.
@@ -140,11 +121,11 @@ pub struct RdmaSocketPool {
     /// Inbound (accepted) connections, for path reporting and the
     /// port-down watchdog; dead entries are pruned opportunistically.
     inbound: std::sync::Mutex<Vec<Weak<RdmaSocket>>>,
-    /// NIC pairs whose QP setup towards a peer recently failed (e.g. no
-    /// route between the two subnets), with their retry deadline. Device
-    /// matching cannot verify reachability, so failed pairs are penalized
-    /// and placement falls over to the remaining candidates.
-    path_blacklist: std::sync::Mutex<HashMap<(SocketAddr, String, String), Instant, RandomState>>,
+    /// Accepted connections remain leased until confirmation and a data-plane
+    /// receive have both occurred. Active entries remain briefly as tombstones
+    /// so a lost confirmation response can be retried idempotently.
+    accept_leases: dashmap::DashMap<u64, AcceptLease, RandomState>,
+    lease_sweeper_started: AtomicBool,
     /// Shared buffer pool (owned by State, kept alive via Arc).
     /// Dropped after QPs → deregisters MRs.
     pub buffer_pool: Arc<BufferPool>,
@@ -159,7 +140,7 @@ pub struct RdmaSocketPool {
     rng_seq: AtomicUsize,
     /// Whether the background maintenance task has been started.
     maintenance_started: AtomicBool,
-    /// Round-robin cursor selecting the rebalance target peer.
+    /// Round-robin cursor selecting the next peer to rebalance.
     rebalance_cursor: AtomicUsize,
     /// Buffer pool bytes pinned by the receive rings of live connections.
     ring_bytes: Arc<AtomicUsize>,
@@ -199,7 +180,8 @@ impl SocketPoolTrait for RdmaSocketPool {
 
     /// Acquires or creates an RDMA socket for the specified address.
     async fn acquire(&self, addr: &SocketAddr, state: &Arc<State>) -> Result<Socket> {
-        self.acquire_path(addr, None, state).await
+        self.acquire_with_deadline(addr, &HashSet::new(), None, state)
+            .await
     }
 
     async fn handle_new_stream(
@@ -229,6 +211,26 @@ impl RdmaSocketPool {
         request: &ConnectRequest,
         state: &Arc<State>,
     ) -> Result<Endpoint> {
+        if request.connection_id == 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "RDMA connection id must be non-zero".into(),
+            ));
+        }
+        if let dashmap::mapref::entry::Entry::Occupied(entry) =
+            self.accept_leases.entry(request.connection_id)
+        {
+            if entry.get().expires_at > Instant::now() && entry.get().socket.strong_count() > 0 {
+                return Err(Error::new(
+                    ErrorKind::InvalidArgument,
+                    format!("duplicate RDMA connection id {}", request.connection_id),
+                ));
+            }
+            let (_, expired) = entry.remove_entry();
+            if let Some(socket) = expired.socket.upgrade() {
+                socket.set_error();
+            }
+        }
         let (device_index, device) = self.find_device_by_name(&request.target)?;
         let connection_config = self.clamp_connection_config(device, request.config);
         let poller = self.pollers.get_or_start(
@@ -237,7 +239,7 @@ impl RdmaSocketPool {
             self.config.poll_threads_per_device,
         )?;
         let queue_pair = self.create_queue_pair(device, &connection_config, &poller)?;
-        let local_endpoint = self.build_endpoint(
+        let mut local_endpoint = self.build_endpoint(
             &queue_pair,
             device,
             request.target.port_num,
@@ -251,7 +253,7 @@ impl RdmaSocketPool {
             connection_config.traffic_class,
         )?;
 
-        let info = device.info();
+        let (info, gid_zones) = device.info_with_zones();
         let local_ip = Self::find_port(&info, request.target.port_num)
             .ok()
             .and_then(|port| port.find_gid(request.target.gid_index))
@@ -262,12 +264,17 @@ impl RdmaSocketPool {
                 port_num: request.target.port_num,
                 gid_index: request.target.gid_index,
                 ip: local_ip,
+                zones: gid_zones
+                    .get(&(request.target.port_num, request.target.gid_index))
+                    .cloned()
+                    .unwrap_or_default(),
             },
             remote: RdmaNicInfo {
                 device: request.source_device.clone(),
                 port_num: request.endpoint.port_num,
                 gid_index: request.endpoint.gid_index,
                 ip: gid_ip(&request.endpoint.gid),
+                zones: request.source_zones.clone(),
             },
         };
 
@@ -279,11 +286,32 @@ impl RdmaSocketPool {
             path,
             device_index,
         )?;
+        local_endpoint.connection_cookie = socket.conn_id;
         {
             let mut inbound = self.inbound.lock().unwrap();
             inbound.retain(|conn| conn.strong_count() > 0);
             inbound.push(Arc::downgrade(&socket));
         }
+        match self.accept_leases.entry(request.connection_id) {
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(AcceptLease {
+                    socket: Arc::downgrade(&socket),
+                    server_connection_cookie: socket.conn_id,
+                    state: AcceptLeaseState::Pending,
+                    expires_at: Instant::now()
+                        + Duration::from_millis(self.config.connect_lease_ms),
+                });
+            }
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                socket.set_error();
+                return Err(Error::new(
+                    ErrorKind::InvalidArgument,
+                    format!("duplicate RDMA connection id {}", request.connection_id),
+                ));
+            }
+        }
+        socket.set_accept_lease(request.connection_id);
+        self.ensure_accept_lease_sweeper(state);
         self.ensure_maintenance_task(state);
         tracing::debug!(
             local_qp = socket.queue_pair.qp_num(),
@@ -293,7 +321,98 @@ impl RdmaSocketPool {
         Ok(local_endpoint)
     }
 
-    const DEVICE_LIST_CACHE_TTL: Duration = Duration::from_secs(5);
+    pub(crate) fn rdma_confirm(&self, control: &ConnectionControl) -> Result<()> {
+        match self.accept_leases.entry(control.connection_id) {
+            dashmap::mapref::entry::Entry::Vacant(_) => Err(Error::new(
+                ErrorKind::InvalidArgument,
+                format!(
+                    "unknown or expired RDMA connection id {}",
+                    control.connection_id
+                ),
+            )),
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                if !Self::lease_matches_control(entry.get(), control) {
+                    return Err(Error::new(
+                        ErrorKind::InvalidArgument,
+                        format!(
+                            "RDMA connection {} identity mismatch",
+                            control.connection_id
+                        ),
+                    ));
+                }
+                if entry.get().expires_at <= Instant::now() {
+                    let (_, expired) = entry.remove_entry();
+                    if let Some(socket) = expired.socket.upgrade() {
+                        socket.set_error();
+                    }
+                    return Err(Error::new(
+                        ErrorKind::InvalidArgument,
+                        format!("expired RDMA connection id {}", control.connection_id),
+                    ));
+                }
+                if !entry
+                    .get()
+                    .socket
+                    .upgrade()
+                    .is_some_and(|socket| socket.state.is_ok())
+                {
+                    entry.remove();
+                    return Err(Error::new(
+                        ErrorKind::ConnectionClosed,
+                        format!("RDMA connection {} already closed", control.connection_id),
+                    ));
+                }
+                entry.get_mut().state =
+                    advance_accept_lease(entry.get().state, AcceptLeaseEvent::Confirm);
+                entry.get_mut().expires_at =
+                    Instant::now() + Duration::from_millis(self.config.connect_lease_ms);
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn rdma_abort(&self, control: &ConnectionControl) {
+        if let Some((_, lease)) = self
+            .accept_leases
+            .remove_if(&control.connection_id, |_, lease| {
+                Self::lease_matches_control(lease, control)
+            })
+            && let Some(socket) = lease.socket.upgrade()
+        {
+            socket.set_error();
+        }
+    }
+
+    pub(crate) fn rdma_receive_observed(&self, connection_id: u64, socket: &Arc<RdmaSocket>) {
+        let weak_socket = Arc::downgrade(socket);
+        self.observe_accept_receive(connection_id, &weak_socket);
+    }
+
+    fn observe_accept_receive(&self, connection_id: u64, socket: &Weak<RdmaSocket>) {
+        let dashmap::mapref::entry::Entry::Occupied(mut entry) =
+            self.accept_leases.entry(connection_id)
+        else {
+            return;
+        };
+        if !entry.get().socket.ptr_eq(socket) {
+            return;
+        }
+        if entry.get().expires_at <= Instant::now() {
+            let (_, expired) = entry.remove_entry();
+            if let Some(socket) = expired.socket.upgrade() {
+                socket.set_error();
+            }
+            return;
+        }
+        entry.get_mut().state = advance_accept_lease(entry.get().state, AcceptLeaseEvent::Receive);
+    }
+
+    fn lease_matches_control(lease: &AcceptLease, control: &ConnectionControl) -> bool {
+        lease.server_connection_cookie == control.server_connection_cookie
+    }
+
+    const DEVICE_LIST_CACHE_TTL: Duration = Duration::from_secs(30);
+    const DESIRED_PEER_IDLE_TTL: Duration = Duration::from_secs(60);
     /// How long a NIC pair stays penalized after its QP setup failed.
     const PATH_BLACKLIST_TTL: Duration = Duration::from_secs(30);
 
@@ -303,21 +422,46 @@ impl RdmaSocketPool {
         buffer_pool: Arc<BufferPool>,
         config: RdmaSocketPoolConfig,
     ) -> Result<Self> {
+        for (index, zone) in config.zones.iter().enumerate() {
+            if zone.name.is_empty()
+                || config.zones[..index]
+                    .iter()
+                    .any(|existing| existing.name == zone.name)
+            {
+                return Err(Error::new(
+                    ErrorKind::InvalidArgument,
+                    format!(
+                        "RDMA zone names must be non-empty and unique: {:?}",
+                        zone.name
+                    ),
+                ));
+            }
+        }
+        if config.connect_lease_ms < 15_000 {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "rdma.connect_lease_ms must be at least 15000".into(),
+            ));
+        }
+        if config.preconnect_max_per_peer.max(1) < config.connections_per_peer.max(1) {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "rdma.preconnect_max_per_peer must cover connections_per_peer".into(),
+            ));
+        }
         let task_supervisor = TaskSupervisor::create();
         let port_refresher = RdmaDeviceRefresher::start(devices.clone(), &task_supervisor);
         Ok(Self {
             acquire_client: Client {
                 timeout: std::time::Duration::from_secs(5),
+                connect_timeout: std::time::Duration::from_secs(5),
                 use_msgpack: true,
                 max_retries: 2,
             },
             task_supervisor,
             pollers: DevicePollers::default(),
             _port_refresher: port_refresher,
-            connect_locks: dashmap::DashMap::default(),
-            device_list_cache: RwLock::default(),
-            socket_map: RwLock::default(),
-            peer_health: dashmap::DashMap::default(),
+            peers: PeerMap::default(),
             conn_counts: Arc::new(
                 (0..devices.rdma_devices().len())
                     .map(|_| AtomicUsize::new(0))
@@ -331,7 +475,8 @@ impl RdmaSocketPool {
                 })
                 .collect(),
             inbound: std::sync::Mutex::new(Vec::new()),
-            path_blacklist: std::sync::Mutex::new(HashMap::default()),
+            accept_leases: dashmap::DashMap::default(),
+            lease_sweeper_started: AtomicBool::new(false),
             buffer_pool,
             devices,
             config,
@@ -344,62 +489,83 @@ impl RdmaSocketPool {
         })
     }
 
-    /// Acquires a healthy connection to `addr`, optionally constrained to
-    /// paths matching `selector`; establishes one when none exists.
-    pub(crate) async fn acquire_path(
+    pub(crate) async fn acquire_with_deadline(
         &self,
         addr: &SocketAddr,
-        selector: Option<&RdmaPathSelector>,
+        avoided_remote_nics: &HashSet<String>,
+        deadline: Option<Instant>,
         state: &Arc<State>,
     ) -> Result<Socket> {
-        // Check if a matching socket is already in the socket map.
-        if let Ok(socket_map) = self.socket_map.try_read()
-            && let Some(socket) = socket_map
-                .get(addr)
-                .and_then(|s| self.pick_stripe(s, selector))
-        {
+        if let Some(socket) = self.try_acquire(addr, avoided_remote_nics) {
             return Ok(socket);
         }
 
-        let connect_lock = self.peer_lock(addr);
-        let guard = connect_lock.lock().await;
-        let result = self.handshake(addr, state, selector).await;
-        self.release_peer_lock(addr, &connect_lock);
+        let peer = self.peer(*addr);
+        let guard = match deadline {
+            Some(deadline) => tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                peer.connect.lock(),
+            )
+            .await
+            .map_err(|_| Error::new(ErrorKind::Timeout, "request deadline expired".into())),
+            None => Ok(peer.connect.lock().await),
+        };
+        let guard = guard?;
+        let result = self
+            .handshake(&peer, state, avoided_remote_nics, deadline)
+            .await;
         drop(guard);
+        if result.is_ok() {
+            peer.touch(Instant::now());
+        }
         result
     }
 
-    /// Returns (creating if necessary) the per-peer connect lock.
-    fn peer_lock(&self, addr: &SocketAddr) -> Arc<tokio::sync::Mutex<()>> {
-        self.connect_locks
-            .entry(*addr)
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+    pub(crate) fn try_acquire(
+        &self,
+        addr: &SocketAddr,
+        avoided_remote_nics: &HashSet<String>,
+    ) -> Option<Socket> {
+        let peer = self.existing_peer(addr)?;
+        // The fast path must never block: a writer in the way means
+        // connection churn, which the slow path handles anyway. A
+        // poisoned lock likewise falls through to the slow path.
+        let stripes = peer.stripes.try_read().ok()?;
+        let socket = self.pick_stripe(&stripes.active, avoided_remote_nics)?;
+        drop(stripes);
+        peer.touch(Instant::now());
+        Some(socket)
+    }
+
+    pub(crate) async fn acquire_existing(
+        &self,
+        addr: &SocketAddr,
+        avoided_remote_nics: &HashSet<String>,
+    ) -> Option<Socket> {
+        let peer = self.existing_peer(addr)?;
+        let stripes = peer.stripes.read().unwrap();
+        let socket = self.pick_stripe(&stripes.active, avoided_remote_nics)?;
+        drop(stripes);
+        peer.touch(Instant::now());
+        Some(socket)
+    }
+
+    fn peer(&self, addr: SocketAddr) -> Arc<PeerState> {
+        self.peers
+            .entry(addr)
+            .or_insert_with(|| Arc::new(PeerState::new(addr)))
             .clone()
     }
 
-    /// Drops the per-peer connect lock entry once no other task holds it.
-    fn release_peer_lock(&self, addr: &SocketAddr, lock: &Arc<tokio::sync::Mutex<()>>) {
-        self.connect_locks.remove_if(addr, |_, value| {
-            Arc::ptr_eq(value, lock) && Arc::strong_count(value) == 2
-        });
+    fn existing_peer(&self, addr: &SocketAddr) -> Option<Arc<PeerState>> {
+        self.peers.get(addr).map(|peer| peer.clone())
     }
 
-    fn track_peer_socket(&self, addr: &SocketAddr, socket: &Arc<RdmaSocket>) {
-        let health = self
-            .peer_health
-            .entry(*addr)
-            .or_insert_with(|| Arc::new(RdmaPeerHealth::default()))
-            .clone();
-        health.track(socket);
-        socket.set_peer_health(&health);
-    }
-
-    /// Picks one healthy connection stripe round-robin, skipping stripes
-    /// that entered the error state or do not match `selector`.
+    /// Picks one healthy connection stripe round-robin.
     fn pick_stripe(
         &self,
         stripes: &[Stripe],
-        selector: Option<&RdmaPathSelector>,
+        avoided_remote_nics: &HashSet<String>,
     ) -> Option<Socket> {
         if stripes.is_empty() {
             return None;
@@ -408,7 +574,8 @@ impl RdmaSocketPool {
         (0..stripes.len())
             .map(|i| &stripes[(start + i) % stripes.len()])
             .find(|s| {
-                s.socket.state.is_ok() && selector.is_none_or(|sel| sel.matches(&s.socket.path))
+                s.socket.state.is_ok()
+                    && !avoided_remote_nics.contains(&s.socket.path.remote.device)
             })
             .map(|s| (&s.socket).into())
     }
@@ -435,24 +602,32 @@ impl RdmaSocketPool {
     }
 
     /// Penalizes a NIC pair towards `addr` after its QP setup failed.
-    fn blacklist_path(&self, addr: &SocketAddr, path: &RdmaPathInfo) {
-        self.path_blacklist.lock().unwrap().insert(
-            (*addr, path.local.device.clone(), path.remote.device.clone()),
+    fn blacklist_path(&self, peer: &PeerState, path: &RdmaPathInfo) {
+        peer.meta.lock().unwrap().blacklist.insert(
+            Self::path_key(path),
             Instant::now() + Self::PATH_BLACKLIST_TTL,
         );
     }
 
+    fn path_key(path: &RdmaPathInfo) -> PathKey {
+        (
+            path.local.device.clone(),
+            path.local.port_num,
+            path.local.gid_index,
+            path.remote.device.clone(),
+            path.remote.port_num,
+            path.remote.gid_index,
+        )
+    }
+
     /// Whether the candidate's NIC pair towards `addr` is currently
     /// penalized; expired entries are pruned on the way.
-    fn is_blacklisted(&self, addr: &SocketAddr, candidate: &PathCandidate) -> bool {
-        let mut blacklist = self.path_blacklist.lock().unwrap();
+    fn is_blacklisted(&self, peer: &PeerState, candidate: &PathCandidate) -> bool {
+        let mut meta = peer.meta.lock().unwrap();
         let now = Instant::now();
-        blacklist.retain(|_, until| *until > now);
-        blacklist.contains_key(&(
-            *addr,
-            candidate.path.local.device.clone(),
-            candidate.path.remote.device.clone(),
-        ))
+        meta.blacklist.retain(|_, until| *until > now);
+        meta.blacklist
+            .contains_key(&Self::path_key(&candidate.path))
     }
 
     /// Poll thread tunables derived from the pool configuration.
@@ -619,63 +794,84 @@ impl RdmaSocketPool {
 
     async fn handshake(
         &self,
-        addr: &SocketAddr,
+        peer: &Arc<PeerState>,
         state: &Arc<State>,
-        selector: Option<&RdmaPathSelector>,
+        avoided_remote_nics: &HashSet<String>,
+        deadline: Option<Instant>,
     ) -> Result<Socket> {
+        let addr = &peer.addr;
         self.ensure_maintenance_task(state);
-
         // Re-check under the connect lock: another task may have connected,
-        // or every stripe may have failed and must be replaced. `add_one`
-        // covers the selector case: the peer may already have healthy
-        // stripes, just none on the requested path.
-        let mut add_one = selector.is_some();
-        {
-            let mut socket_map = self.socket_map.write().await;
-            if let Some(stripes) = socket_map.get(addr) {
-                if let Some(socket) = self.pick_stripe(stripes, selector) {
-                    return Ok(socket);
-                }
-                if !stripes.iter().any(|s| s.socket.state.is_ok()) {
-                    // All stripes are dead: drop them and reconnect. The
-                    // poll thread reclaims the connections independently.
-                    tracing::info!("all RDMA stripes to {addr} failed, reconnecting");
-                    socket_map.remove(addr);
-                    add_one = selector.is_some();
-                } else {
-                    debug_assert!(selector.is_some());
-                    add_one = true;
-                }
+        // or every stripe may have failed and must be replaced.
+        let existing = {
+            let mut stripes = peer.stripes.write().unwrap();
+            if let Some(socket) = self.pick_stripe(&stripes.active, avoided_remote_nics) {
+                return Ok(socket);
             }
+            if stripes
+                .active
+                .iter()
+                .any(|stripe| stripe.socket.state.is_ok())
+            {
+                stripes.active.clone()
+            } else {
+                if !stripes.active.is_empty() {
+                    tracing::info!("all RDMA stripes to {addr} failed, reconnecting");
+                    stripes.active.clear();
+                }
+                Vec::new()
+            }
+        };
+
+        let fallback = (!avoided_remote_nics.is_empty())
+            .then(|| self.pick_stripe(&existing, &HashSet::new()))
+            .flatten();
+        let plan = match self.prepare_connect_plan(peer, state, deadline).await {
+            Ok(plan) => plan,
+            Err(_) if fallback.is_some() => return Ok(fallback.expect("checked above")),
+            Err(err) => return Err(err),
+        };
+        if !avoided_remote_nics.is_empty()
+            && !plan
+                .candidates
+                .iter()
+                .any(|candidate| !avoided_remote_nics.contains(&candidate.path.remote.device))
+            && let Some(socket) = fallback
+        {
+            return Ok(socket);
         }
+        let preference = PathPreference {
+            remote_device: None,
+            avoided_remote_nics,
+        };
 
-        let plan = self.prepare_connect_plan(addr, state).await?;
-
-        if add_one {
-            // Append a single (possibly pinned) stripe on the requested
-            // path to whatever the peer already has.
-            let existing = self
-                .socket_map
-                .read()
-                .await
-                .get(addr)
-                .cloned()
-                .unwrap_or_default();
-            let socket = self
-                .connect_with_failover(addr, state, &plan, selector, &existing)
-                .await?;
-            self.track_peer_socket(addr, &socket);
-            let result = Socket::from(&socket);
-            self.socket_map
-                .write()
-                .await
-                .entry(*addr)
-                .or_default()
-                .push(Stripe {
-                    socket,
-                    pinned: selector.is_some(),
+        if !existing.is_empty() {
+            let max_connections = self.config.preconnect_max_per_peer.max(1) as usize;
+            if existing
+                .iter()
+                .filter(|stripe| stripe.socket.state.is_ok())
+                .count()
+                >= max_connections
+            {
+                return fallback.ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::Overloaded,
+                        format!(
+                            "RDMA peer {addr} reached preconnect_max_per_peer ({max_connections})"
+                        ),
+                    )
                 });
-            return Ok(result);
+            }
+            let established = match self
+                .connect_with_failover(peer, state, &plan, preference, &existing)
+                .await
+            {
+                Ok(established) => established,
+                Err(_) if fallback.is_some() => return Ok(fallback.expect("checked above")),
+                Err(err) => return Err(err),
+            };
+            let stripe = self.admit_established(peer, established);
+            return Ok(Socket::from(&stripe.socket));
         }
 
         // Establish `connections_per_peer` stripes towards this peer;
@@ -685,33 +881,32 @@ impl RdmaSocketPool {
         // power-of-two-choices over the peer's advertised per-NIC load.
         let stripe_count = self.config.connections_per_peer.max(1);
         let mut stripes: Vec<Stripe> = Vec::with_capacity(stripe_count as usize);
+        let mut established_sockets = Vec::with_capacity(stripe_count as usize);
         for _ in 0..stripe_count {
             match self
-                .connect_with_failover(addr, state, &plan, None, &stripes)
+                .connect_with_failover(peer, state, &plan, preference, &stripes)
                 .await
             {
-                Ok(socket) => {
-                    self.track_peer_socket(addr, &socket);
+                Ok(established) => {
                     stripes.push(Stripe {
-                        socket,
-                        pinned: false,
+                        socket: established.socket.clone(),
                     });
+                    established_sockets.push(established);
                 }
-                Err(err) => {
-                    // Don't leak the stripes established so far: mark them
-                    // failed so the poll thread tears them down.
-                    for stripe in &stripes {
-                        stripe.socket.set_error();
-                    }
-                    return Err(err);
-                }
+                Err(err) => return Err(err),
             }
         }
 
         let socket = self
-            .pick_stripe(&stripes, None)
-            .expect("stripe count is at least 1");
-        self.socket_map.write().await.insert(*addr, stripes);
+            .pick_stripe(&stripes, avoided_remote_nics)
+            .or_else(|| self.pick_stripe(&stripes, &HashSet::new()))
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::ConnectionClosed,
+                    format!("all freshly established RDMA stripes to {addr} failed"),
+                )
+            })?;
+        self.admit_initial(peer, established_sockets);
         Ok(socket)
     }
 
@@ -719,15 +914,23 @@ impl RdmaSocketPool {
     /// candidates: everything a placement decision towards `addr` needs.
     async fn prepare_connect_plan(
         &self,
-        addr: &SocketAddr,
+        peer: &Arc<PeerState>,
         state: &Arc<State>,
+        deadline: Option<Instant>,
     ) -> Result<ConnectPlan> {
-        let acquire_ctx = Context::create_with_state_and_addr(state, addr);
-        let remote_info = self.fetch_remote_device_list(addr, &acquire_ctx).await?;
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(Error::new(
+                ErrorKind::Timeout,
+                "request deadline expired".into(),
+            ));
+        }
+        let mut acquire_ctx = Context::create_with_state_and_addr(state, &peer.addr);
+        acquire_ctx.deadline = deadline;
+        let remote_info = self.fetch_remote_device_list(peer, &acquire_ctx).await?;
         let candidates = match self.enumerate_path_candidates(&remote_info) {
             Ok(candidates) => candidates,
             Err(err) => {
-                self.invalidate_device_list_cache(addr).await;
+                self.invalidate_device_list_cache(peer);
                 return Err(err);
             }
         };
@@ -735,6 +938,7 @@ impl RdmaSocketPool {
             acquire_ctx,
             remote_info,
             candidates,
+            deadline,
         })
     }
 
@@ -744,31 +948,37 @@ impl RdmaSocketPool {
     /// blacklisted by `connect_stripe`, so later placements avoid it too.
     async fn connect_with_failover(
         &self,
-        addr: &SocketAddr,
+        peer: &Arc<PeerState>,
         state: &Arc<State>,
         plan: &ConnectPlan,
-        selector: Option<&RdmaPathSelector>,
+        preference: PathPreference<'_>,
         existing: &[Stripe],
-    ) -> Result<Arc<RdmaSocket>> {
+    ) -> Result<EstablishedSocket> {
         let mut remaining: Vec<PathCandidate> = plan.candidates.clone();
         loop {
+            if plan
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                return Err(Error::new(
+                    ErrorKind::Timeout,
+                    "request deadline expired".into(),
+                ));
+            }
             let candidate =
-                self.select_candidate(addr, &remaining, selector, &plan.remote_info, existing)?;
+                self.select_candidate(peer, &remaining, preference, &plan.remote_info, existing)?;
             match self
-                .connect_stripe(addr, state, &plan.acquire_ctx, &candidate)
+                .connect_stripe(peer, state, &plan.acquire_ctx, &candidate)
                 .await
             {
                 Ok(socket) => return Ok(socket),
                 Err(err) => {
-                    remaining.retain(|c| {
-                        c.path.local.device != candidate.path.local.device
-                            || c.path.remote.device != candidate.path.remote.device
-                    });
+                    remaining.retain(|remaining| remaining.path != candidate.path);
                     if remaining.is_empty() {
                         return Err(err);
                     }
                     tracing::warn!(
-                        peer = %addr,
+                        peer = %peer.addr,
                         local = %candidate.path.local.device,
                         remote = %candidate.path.remote.device,
                         "RDMA path failed ({err}); trying another NIC pair"
@@ -782,11 +992,11 @@ impl RdmaSocketPool {
     /// given path candidate.
     async fn connect_stripe(
         &self,
-        addr: &SocketAddr,
+        peer: &Arc<PeerState>,
         state: &Arc<State>,
         acquire_ctx: &Context,
         candidate: &PathCandidate,
-    ) -> Result<Arc<RdmaSocket>> {
+    ) -> Result<EstablishedSocket> {
         let device = self
             .devices
             .rdma_devices()
@@ -811,9 +1021,12 @@ impl RdmaSocketPool {
             candidate.path.local.gid_index,
         )?;
 
+        let connection_id = next_connection_id();
         let connect_request = ConnectRequest {
+            connection_id,
             endpoint: local_endpoint,
             source_device: candidate.path.local.device.clone(),
+            source_zones: candidate.path.local.zones.clone(),
             target: candidate.remote.clone(),
             config: connection_config,
         };
@@ -828,10 +1041,14 @@ impl RdmaSocketPool {
             match Box::pin(self.acquire_client.connect(acquire_ctx, &connect_request)).await {
                 Ok(endpoint) => endpoint,
                 Err(err) => {
-                    self.invalidate_device_list_cache(addr).await;
+                    self.invalidate_device_list_cache(peer);
                     return Err(err);
                 }
             };
+        let control = ConnectionControl {
+            connection_id,
+            server_connection_cookie: remote_endpoint.connection_cookie,
+        };
         if let Err(err) = self.bring_qp_to_rts(
             &queue_pair,
             &local_endpoint,
@@ -842,18 +1059,45 @@ impl RdmaSocketPool {
             // QP setup failures are typically path problems (no route
             // between the selected NIC pair): penalize the pair so
             // placement falls over to other candidates.
-            self.blacklist_path(addr, &candidate.path);
+            self.blacklist_path(peer, &candidate.path);
+            self.schedule_abort_connection(&peer.addr, state, control);
             return Err(err);
         }
 
-        let socket = self.register_socket(
+        let socket = match self.register_socket(
             queue_pair,
             state,
             &poller,
             &connection_config,
             candidate.path.clone(),
             candidate.local_device_index,
-        )?;
+        ) {
+            Ok(socket) => socket,
+            Err(err) => {
+                self.schedule_abort_connection(&peer.addr, state, control);
+                return Err(err);
+            }
+        };
+        let registration = SocketRegistrationGuard::new(
+            &socket,
+            self.task_supervisor.handle(),
+            self.acquire_client.clone(),
+            Context::create_with_state_and_addr(state, &peer.addr),
+            control,
+        );
+        if acquire_ctx.is_expired() {
+            return Err(Error::new(
+                ErrorKind::Timeout,
+                "RDMA acquire deadline expired before confirmation".into(),
+            ));
+        }
+        self.confirm_connection(acquire_ctx, &control).await?;
+        if acquire_ctx.is_expired() {
+            return Err(Error::new(
+                ErrorKind::Timeout,
+                "RDMA acquire deadline expired after confirmation".into(),
+            ));
+        }
         tracing::info!(
             local_device = %candidate.path.local.device,
             local_port = candidate.path.local.port_num,
@@ -865,30 +1109,142 @@ impl RdmaSocketPool {
             remote_qp = remote_endpoint.qp_num,
             "acquired RDMA socket"
         );
-        Ok(socket)
+        Ok(EstablishedSocket {
+            socket,
+            registration,
+        })
     }
 
-    async fn fetch_remote_device_list(&self, addr: &SocketAddr, ctx: &Context) -> Result<RdmaInfo> {
-        if let Some(info) = self.get_cached_device_list(addr).await {
+    /// Runs the confirmation RPC, retrying once after an ambiguous
+    /// response timeout. `confirm` is idempotent on the server (the lease
+    /// state machine absorbs duplicates), so this local retry rescues an
+    /// otherwise healthy QP from a lost response on the bootstrap
+    /// connection instead of tearing it down and failing over paths. The
+    /// generic client deliberately never retries after send — idempotency
+    /// is knowledge only this call site has.
+    async fn confirm_connection(&self, ctx: &Context, control: &ConnectionControl) -> Result<()> {
+        match Box::pin(self.acquire_client.confirm(ctx, control)).await {
+            Err(err) if matches!(err.kind, ErrorKind::Timeout) && !ctx.is_expired() => {
+                tracing::debug!(
+                    connection_id = control.connection_id,
+                    "RDMA confirm timed out, retrying once"
+                );
+                Box::pin(self.acquire_client.confirm(ctx, control)).await
+            }
+            result => result,
+        }
+    }
+
+    /// Admits one confirmed connection into request rotation.
+    /// Ordering is always track -> commit -> publish -> activate.
+    fn admit_established(&self, peer: &Arc<PeerState>, established: EstablishedSocket) -> Stripe {
+        let EstablishedSocket {
+            socket,
+            mut registration,
+        } = established;
+        let stripe = Stripe { socket };
+        stripe.socket.set_peer_health(peer);
+        registration.commit();
+        peer.stripes.write().unwrap().active.push(stripe.clone());
+        stripe.socket.request_activation();
+        stripe
+    }
+
+    /// Atomically publishes an initial stripe set after every handshake
+    /// succeeded. Dropping before commit aborts every unadmitted connection.
+    fn admit_initial(&self, peer: &Arc<PeerState>, established: Vec<EstablishedSocket>) {
+        let mut registrations = Vec::with_capacity(established.len());
+        let stripes: Vec<Stripe> = established
+            .into_iter()
+            .map(|established| {
+                let EstablishedSocket {
+                    socket,
+                    registration,
+                } = established;
+                socket.set_peer_health(peer);
+                registrations.push(registration);
+                Stripe { socket }
+            })
+            .collect();
+        for registration in &mut registrations {
+            registration.commit();
+        }
+        peer.stripes.write().unwrap().active = stripes.clone();
+        for stripe in &stripes {
+            stripe.socket.request_activation();
+        }
+    }
+
+    /// Replaces `victim` only if it is still in rotation. The replacement is
+    /// never visible unless its registration can be committed.
+    fn admit_replacing(
+        &self,
+        peer: &Arc<PeerState>,
+        victim: &Arc<RdmaSocket>,
+        established: EstablishedSocket,
+    ) -> bool {
+        let EstablishedSocket {
+            socket,
+            mut registration,
+        } = established;
+        let mut stripes = peer.stripes.write().unwrap();
+        let Some(position) = stripes
+            .active
+            .iter()
+            .position(|stripe| Arc::ptr_eq(&stripe.socket, victim))
+        else {
+            return false;
+        };
+        socket.set_peer_health(peer);
+        registration.commit();
+        stripes.active.push(Stripe {
+            socket: socket.clone(),
+        });
+        let victim = stripes.active.remove(position);
+        stripes.draining.push(victim.clone());
+        drop(stripes);
+        socket.request_activation();
+        self.drain_then_close(peer, victim.socket);
+        true
+    }
+
+    fn schedule_abort_connection(
+        &self,
+        addr: &SocketAddr,
+        state: &Arc<State>,
+        control: ConnectionControl,
+    ) {
+        let abort_ctx = Context::create_with_state_and_addr(state, addr);
+        let abort_client = self.acquire_client.clone();
+        let _ = self.task_supervisor.handle().try_spawn(async move {
+            if let Err(err) = abort_client.abort(&abort_ctx, &control).await {
+                tracing::debug!(connection_id = control.connection_id, %err, "RDMA abort cleanup failed");
+            }
+        });
+    }
+
+    async fn fetch_remote_device_list(
+        &self,
+        peer: &Arc<PeerState>,
+        ctx: &Context,
+    ) -> Result<RdmaInfo> {
+        if let Some(info) = self.get_cached_device_list(peer) {
             return Ok(info);
         }
 
         // Boxed for the same reason as the `connect` call in
         // `connect_stripe`: keeps this coroutine's type finite.
         let info = Box::pin(self.acquire_client.info(ctx, &())).await?;
-        self.device_list_cache.write().await.insert(
-            *addr,
-            CachedRdmaInfo {
-                info: info.clone(),
-                cached_at: Instant::now(),
-            },
-        );
+        peer.meta.lock().unwrap().device_cache = Some(CachedRdmaInfo {
+            info: info.clone(),
+            cached_at: Instant::now(),
+        });
         Ok(info)
     }
 
-    async fn get_cached_device_list(&self, addr: &SocketAddr) -> Option<RdmaInfo> {
-        let cache = self.device_list_cache.read().await;
-        let cached = cache.get(addr)?;
+    fn get_cached_device_list(&self, peer: &PeerState) -> Option<RdmaInfo> {
+        let meta = peer.meta.lock().unwrap();
+        let cached = meta.device_cache.as_ref()?;
         if cached.cached_at.elapsed() < Self::DEVICE_LIST_CACHE_TTL {
             Some(cached.info.clone())
         } else {
@@ -896,16 +1252,16 @@ impl RdmaSocketPool {
         }
     }
 
-    async fn invalidate_device_list_cache(&self, addr: &SocketAddr) {
-        self.device_list_cache.write().await.remove(addr);
+    fn invalidate_device_list_cache(&self, peer: &PeerState) {
+        peer.meta.lock().unwrap().device_cache = None;
     }
 
     /// Enumerates every compatible (local NIC, remote NIC) pair.
     ///
     /// One candidate is produced per compatible port pair (the GID within
-    /// a port pair is chosen by the existing preference logic). Candidates
-    /// are pre-filtered to the best available class: InfiniBand matches
-    /// win over RoCE v2 matches, which win over other RoCE matches.
+    /// a port pair is chosen by the existing preference logic). Link class
+    /// preference is applied after request constraints and reachability
+    /// filters, keeping lower classes available as fallbacks.
     fn enumerate_path_candidates(&self, remote_info: &RdmaInfo) -> Result<Vec<PathCandidate>> {
         let local_devices = self.devices.rdma_devices();
         if local_devices.is_empty() {
@@ -915,24 +1271,18 @@ impl RdmaSocketPool {
             ));
         }
 
-        let remote_filter = &self.config.remote_device_filter;
-        let mut ib_matches = Vec::new();
-        let mut roce_v2_matches = Vec::new();
-        let mut roce_other_matches = Vec::new();
+        let mut matches = Vec::new();
         let mut remote_ports = 0usize;
         let mut local_usable_ports = 0usize;
         let mut link_layer_matches = 0usize;
 
         // Remote ports are pre-filtered: peers only advertise usable ports.
         for remote_device in &remote_info.devices {
-            if !remote_filter.is_empty() && !remote_filter.contains(&remote_device.name) {
-                continue;
-            }
             for remote_port in &remote_device.ports {
                 remote_ports += 1;
 
                 for (local_device_index, local_device) in local_devices.iter().enumerate() {
-                    let local_info = local_device.info();
+                    let (local_info, gid_zones) = local_device.info_with_zones();
                     for local_port in &local_info.ports {
                         if !local_port.is_usable() {
                             continue;
@@ -943,68 +1293,72 @@ impl RdmaSocketPool {
                         }
                         link_layer_matches += 1;
 
-                        let Some((local_gid_index, remote_gid_index)) =
-                            Self::match_gid_pair(local_port, remote_port)
-                        else {
-                            continue;
+                        let gid_pairs = Self::match_gid_pairs(local_port, remote_port);
+                        let pair_limit = if self.config.zones.is_empty() {
+                            1
+                        } else {
+                            gid_pairs.len()
                         };
-
-                        let local_ip = local_port
-                            .find_gid(local_gid_index)
-                            .and_then(|gid| gid_ip(&gid.gid));
-                        let remote_ip = remote_port
-                            .gids
-                            .iter()
-                            .find(|gid| gid.index == remote_gid_index)
-                            .and_then(|gid| gid_ip(&gid.gid));
-                        let selected = PathCandidate {
-                            local_device_index,
-                            remote: DeviceSelection {
-                                device_name: remote_device.name.clone(),
-                                port_num: remote_port.port_num,
-                                gid_index: remote_gid_index,
-                            },
-                            remote_limits: remote_device.connection,
-                            path: RdmaPathInfo {
-                                local: RdmaNicInfo {
-                                    device: local_info.name.clone(),
-                                    port_num: local_port.port_num,
-                                    gid_index: local_gid_index,
-                                    ip: local_ip,
-                                },
-                                remote: RdmaNicInfo {
-                                    device: remote_device.name.clone(),
+                        for (local_gid_index, remote_gid_index) in
+                            gid_pairs.into_iter().take(pair_limit)
+                        {
+                            let local_ip = local_port
+                                .find_gid(local_gid_index)
+                                .and_then(|gid| gid_ip(&gid.gid));
+                            let remote_ip = remote_port
+                                .gids
+                                .iter()
+                                .find(|gid| gid.index == remote_gid_index)
+                                .and_then(|gid| gid_ip(&gid.gid));
+                            let class = match local_port.port_attr.link_layer {
+                                LinkLayer::InfiniBand => PathClass::InfiniBand,
+                                LinkLayer::Ethernet
+                                    if Self::gid_index_is_rocev2(local_port, local_gid_index) =>
+                                {
+                                    PathClass::RoceV2
+                                }
+                                LinkLayer::Ethernet => PathClass::RoceOther,
+                                LinkLayer::Unspecified => continue,
+                            };
+                            matches.push(PathCandidate {
+                                local_device_index,
+                                remote: DeviceSelection {
+                                    device_name: remote_device.name.clone(),
                                     port_num: remote_port.port_num,
                                     gid_index: remote_gid_index,
-                                    ip: remote_ip,
                                 },
-                            },
-                        };
-
-                        match local_port.port_attr.link_layer {
-                            LinkLayer::InfiniBand => ib_matches.push(selected),
-                            LinkLayer::Ethernet => {
-                                // Prefer RoCE v2 matches whenever one exists.
-                                if Self::gid_index_is_rocev2(local_port, local_gid_index) {
-                                    roce_v2_matches.push(selected);
-                                } else {
-                                    roce_other_matches.push(selected);
-                                }
-                            }
-                            LinkLayer::Unspecified => {}
+                                remote_limits: remote_device.connection,
+                                class,
+                                path: RdmaPathInfo {
+                                    local: RdmaNicInfo {
+                                        device: local_info.name.clone(),
+                                        port_num: local_port.port_num,
+                                        gid_index: local_gid_index,
+                                        ip: local_ip,
+                                        zones: gid_zones
+                                            .get(&(local_port.port_num, local_gid_index))
+                                            .cloned()
+                                            .unwrap_or_default(),
+                                    },
+                                    remote: RdmaNicInfo {
+                                        device: remote_device.name.clone(),
+                                        port_num: remote_port.port_num,
+                                        gid_index: remote_gid_index,
+                                        ip: remote_ip,
+                                        zones: remote_port
+                                            .gid_zones
+                                            .get(&remote_gid_index)
+                                            .cloned()
+                                            .unwrap_or_default(),
+                                    },
+                                },
+                            });
                         }
                     }
                 }
             }
         }
 
-        let matches = if !ib_matches.is_empty() {
-            ib_matches
-        } else if !roce_v2_matches.is_empty() {
-            roce_v2_matches
-        } else {
-            roce_other_matches
-        };
         if matches.is_empty() {
             return Err(Error::new(
                 ErrorKind::InvalidArgument,
@@ -1034,81 +1388,61 @@ impl RdmaSocketPool {
     /// every placement increments the chosen device's counter.
     fn select_candidate(
         &self,
-        addr: &SocketAddr,
+        peer: &PeerState,
         candidates: &[PathCandidate],
-        selector: Option<&RdmaPathSelector>,
+        preference: PathPreference<'_>,
         remote_info: &RdmaInfo,
         peer_stripes: &[Stripe],
     ) -> Result<PathCandidate> {
-        let mut filtered: Vec<&PathCandidate> = candidates
+        let views: Vec<placement::Candidate<'_>> = candidates
             .iter()
-            .filter(|c| selector.is_none_or(|sel| sel.matches(&c.path)))
+            .enumerate()
+            .map(|(index, candidate)| {
+                let advertised = remote_info
+                    .devices
+                    .iter()
+                    .find(|device| device.name == candidate.path.remote.device)
+                    .map_or(0, |device| u64::from(device.active_connections));
+                let ours = peer_stripes
+                    .iter()
+                    .filter(|stripe| {
+                        stripe.socket.state.is_ok()
+                            && stripe.socket.path.remote.device == candidate.path.remote.device
+                    })
+                    .count() as u64;
+                placement::Candidate {
+                    index,
+                    local_index: candidate.local_device_index,
+                    remote: &candidate.path.remote.device,
+                    same_zone: candidate.has_same_zone(),
+                    class: candidate.class,
+                    blacklisted: self.is_blacklisted(peer, candidate),
+                    local_load: self
+                        .conn_counts
+                        .get(candidate.local_device_index)
+                        .map_or(0, |count| count.load(Ordering::Acquire) as u64),
+                    remote_load: advertised + ours,
+                }
+            })
             .collect();
-        if filtered.is_empty() {
-            return Err(Error::new(
+        let index = placement::choose_path(
+            &views,
+            placement::Selection {
+                required_remote: preference.remote_device,
+                avoided_remotes: preference.avoided_remote_nics,
+            },
+            [self.pseudo_random(), self.pseudo_random()],
+        )
+        .ok_or_else(|| {
+            Error::new(
                 ErrorKind::InvalidArgument,
-                format!("no compatible RDMA path matches selector {selector:?}"),
-            ));
-        }
-        // Soft blacklist: skip recently failed pairs, but when every
-        // remaining candidate is penalized, try them anyway — the fault
-        // may have cleared, and failing fast helps nobody.
-        let usable: Vec<&PathCandidate> = filtered
-            .iter()
-            .copied()
-            .filter(|c| !self.is_blacklisted(addr, c))
-            .collect();
-        if !usable.is_empty() {
-            filtered = usable;
-        }
-
-        let remote_score = |name: &str| -> u64 {
-            let advertised = remote_info
-                .devices
-                .iter()
-                .find(|d| d.name == name)
-                .map_or(0, |d| u64::from(d.active_connections));
-            let ours = peer_stripes
-                .iter()
-                .filter(|s| s.socket.state.is_ok() && s.socket.path.remote.device == name)
-                .count() as u64;
-            advertised + ours
-        };
-
-        let mut remote_names: Vec<&str> = Vec::new();
-        for candidate in &filtered {
-            if !remote_names.contains(&candidate.path.remote.device.as_str()) {
-                remote_names.push(candidate.path.remote.device.as_str());
-            }
-        }
-        let chosen_remote = if remote_names.len() == 1 {
-            remote_names[0]
-        } else {
-            let n = remote_names.len();
-            let a = self.pseudo_random() as usize % n;
-            let mut b = self.pseudo_random() as usize % (n - 1);
-            if b >= a {
-                b += 1;
-            }
-            if remote_score(remote_names[b]) < remote_score(remote_names[a]) {
-                remote_names[b]
-            } else {
-                remote_names[a]
-            }
-        };
-
-        let local_count = |c: &PathCandidate| -> usize {
-            self.conn_counts
-                .get(c.local_device_index)
-                .map_or(0, |count| count.load(Ordering::Acquire))
-        };
-        Ok(filtered
-            .iter()
-            .filter(|c| c.path.remote.device == chosen_remote)
-            .min_by_key(|c| local_count(c))
-            .copied()
-            .expect("chosen remote device came from the filtered candidates")
-            .clone())
+                format!(
+                    "no compatible RDMA path matches remote device {:?}",
+                    preference.remote_device
+                ),
+            )
+        })?;
+        Ok(candidates[index].clone())
     }
 
     fn gid_index_is_rocev2(port: &Port, gid_index: u8) -> bool {
@@ -1121,43 +1455,54 @@ impl RdmaSocketPool {
     /// Both GID tables only contain usable GIDs — unusable ones (RoCE v2
     /// loopback / link-local) are filtered out at collection time on each
     /// side (see `query_device_info`).
-    fn match_gid_pair(local_port: &Port, remote_port: &RdmaPortInfo) -> Option<(u8, u8)> {
+    fn match_gid_pairs(local_port: &Port, remote_port: &RdmaPortInfo) -> Vec<(u8, u8)> {
         let (local_gids, remote_gids) = (&local_port.gids[..], &remote_port.gids[..]);
         match local_port.port_attr.link_layer {
-            LinkLayer::InfiniBand => Some((
+            LinkLayer::InfiniBand => vec![(
                 Self::first_gid(local_gids, |_| true).unwrap_or(0),
                 Self::first_gid(remote_gids, |_| true).unwrap_or(0),
-            )),
-            LinkLayer::Ethernet => Self::match_roce_gid_pair(local_gids, remote_gids),
-            LinkLayer::Unspecified => None,
+            )],
+            LinkLayer::Ethernet => Self::match_roce_gid_pairs(local_gids, remote_gids),
+            LinkLayer::Unspecified => Vec::new(),
         }
     }
 
-    fn match_roce_gid_pair(local_gids: &[Gid], remote_gids: &[Gid]) -> Option<(u8, u8)> {
-        // Prefer RoCE v2 pairs, then RoCE v1 pairs.
+    fn match_roce_gid_pairs(local_gids: &[Gid], remote_gids: &[Gid]) -> Vec<(u8, u8)> {
+        let mut pairs = Vec::new();
+        // Prefer RoCE v2 pairs, then RoCE v1 pairs, while retaining every
+        // compatible pair so zone preference can select the right GID.
         for wanted in [GidType::RoCEv2, GidType::RoCEv1] {
-            let local = Self::first_gid(local_gids, |gid| gid.gid_type == wanted);
-            let remote = Self::first_gid(remote_gids, |gid| gid.gid_type == wanted);
-            if let (Some(local), Some(remote)) = (local, remote) {
-                return Some((local, remote));
+            for local in local_gids.iter().filter(|gid| gid.gid_type == wanted) {
+                for remote in remote_gids.iter().filter(|gid| gid.gid_type == wanted) {
+                    pairs.push((local.index, remote.index));
+                }
             }
         }
 
-        // Then any pair with matching GID types.
-        for local_gid in local_gids {
-            let remote = Self::first_gid(remote_gids, |remote_gid| {
-                remote_gid.gid_type == local_gid.gid_type
-            });
-            if let Some(remote) = remote {
-                return Some((local_gid.index, remote));
+        // Then every other pair with matching GID types.
+        for local in local_gids
+            .iter()
+            .filter(|gid| !matches!(gid.gid_type, GidType::RoCEv2 | GidType::RoCEv1))
+        {
+            for remote in remote_gids
+                .iter()
+                .filter(|remote| remote.gid_type == local.gid_type)
+            {
+                pairs.push((local.index, remote.index));
             }
         }
 
-        // Finally, fall back to the first GID on each side.
-        Some((
-            Self::first_gid(local_gids, |_| true)?,
-            Self::first_gid(remote_gids, |_| true)?,
-        ))
+        // Preserve the previous best-effort fallback for unusual providers
+        // whose two sides report different GID type names.
+        if pairs.is_empty()
+            && let (Some(local), Some(remote)) = (
+                Self::first_gid(local_gids, |_| true),
+                Self::first_gid(remote_gids, |_| true),
+            )
+        {
+            pairs.push((local, remote));
+        }
+        pairs
     }
 
     /// Returns the index of the first GID matching `predicate`.
@@ -1280,6 +1625,7 @@ impl RdmaSocketPool {
         }
 
         Ok(Endpoint {
+            connection_cookie: 0,
             qp_num: qp.qp_num(),
             port_num,
             gid_index,
@@ -1416,21 +1762,99 @@ impl RdmaSocketPool {
         });
     }
 
+    fn ensure_accept_lease_sweeper(&self, state: &Arc<State>) {
+        if self.lease_sweeper_started.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let interval = Duration::from_millis((self.config.connect_lease_ms / 4).clamp(100, 1_000));
+        let weak_state = Arc::downgrade(state);
+        if self
+            .task_supervisor
+            .handle()
+            .try_spawn(async move {
+                loop {
+                    tokio::time::sleep(interval).await;
+                    let Some(state) = weak_state.upgrade() else {
+                        break;
+                    };
+                    let Some(pool) = state.socket_pool.rdma_pool() else {
+                        break;
+                    };
+                    let now = Instant::now();
+                    pool.accept_leases.retain(|connection_id, lease| {
+                        let Some(socket) = lease.socket.upgrade() else {
+                            return false;
+                        };
+                        if lease.expires_at > now {
+                            return true;
+                        }
+                        if lease.state == AcceptLeaseState::Active {
+                            tracing::debug!(
+                                connection_id,
+                                qp = socket.queue_pair.qp_num(),
+                                "RDMA active lease tombstone expired"
+                            );
+                        } else {
+                            tracing::warn!(
+                                connection_id,
+                                qp = socket.queue_pair.qp_num(),
+                                state = ?lease.state,
+                                "RDMA accept lease expired"
+                            );
+                            socket.set_error();
+                        }
+                        false
+                    });
+                }
+            })
+            .is_none()
+        {
+            self.lease_sweeper_started.store(false, Ordering::Relaxed);
+        }
+    }
+
     /// One maintenance tick: fail connections on dead local ports, prune
-    /// dead stripes, replenish peers below `connections_per_peer`, and
-    /// rebalance at most one connection of one peer (rate-limited by the
-    /// tick interval, so recovered NICs regain traffic gradually).
+    /// dead stripes, and replenish peers below `connections_per_peer`.
     pub(crate) async fn run_maintenance(&self, state: &Arc<State>) {
         self.fail_paths_on_dead_ports().await;
         self.prune_dead().await;
-        let peers: Vec<SocketAddr> = self.socket_map.read().await.keys().copied().collect();
+        let now = Instant::now();
+        let snapshot: Vec<Arc<PeerState>> =
+            self.peers.iter().map(|peer| peer.value().clone()).collect();
+        let mut peers = Vec::new();
+        for peer in snapshot {
+            let has_stripes = !peer.stripes.read().unwrap().active.is_empty();
+            let recently_used = peer
+                .meta
+                .lock()
+                .unwrap()
+                .last_used
+                .is_some_and(|last_used| {
+                    now.saturating_duration_since(last_used) < Self::DESIRED_PEER_IDLE_TTL
+                });
+            if has_stripes || recently_used {
+                peers.push(peer);
+                continue;
+            }
+            let Ok(_connect) = peer.connect.try_lock() else {
+                continue;
+            };
+            if Arc::strong_count(&peer) == 2 {
+                self.peers.remove_if(&peer.addr, |_, current| {
+                    Arc::ptr_eq(current, &peer)
+                        && Arc::strong_count(current) == 2
+                        && current.stripes.read().unwrap().active.is_empty()
+                });
+            }
+        }
         if peers.is_empty() {
             return;
         }
-        for addr in &peers {
-            self.replenish_peer(addr, state).await;
+        for peer in &peers {
+            self.replenish_peer(peer, state).await;
         }
-        let target = peers[self.rebalance_cursor.fetch_add(1, Ordering::Relaxed) % peers.len()];
+        let target =
+            peers[self.rebalance_cursor.fetch_add(1, Ordering::Relaxed) % peers.len()].clone();
         self.rebalance_peer(&target, state).await;
     }
 
@@ -1466,12 +1890,9 @@ impl RdmaSocketPool {
                 socket.set_error();
             }
         };
-        {
-            let socket_map = self.socket_map.read().await;
-            for stripes in socket_map.values() {
-                for stripe in stripes {
-                    fail_if_dead(&stripe.socket);
-                }
+        for peer in self.peers.iter() {
+            for socket in peer.value().all_sockets() {
+                fail_if_dead(&socket);
             }
         }
         let inbound: Vec<Arc<RdmaSocket>> = self
@@ -1489,309 +1910,326 @@ impl RdmaSocketPool {
     /// Removes dead stripes (and fully dead peers) from the socket map and
     /// prunes released inbound connections.
     async fn prune_dead(&self) {
-        let mut socket_map = self.socket_map.write().await;
-        socket_map.retain(|_, stripes| {
-            stripes.retain(|s| s.socket.state.is_ok());
-            !stripes.is_empty()
-        });
-        drop(socket_map);
+        for peer in self.peers.iter() {
+            let mut stripes = peer.value().stripes.write().unwrap();
+            stripes.active.retain(|s| s.socket.state.is_ok());
+            stripes.draining.retain(|s| s.socket.state.is_ok());
+        }
         self.inbound
             .lock()
             .unwrap()
             .retain(|conn| conn.strong_count() > 0);
     }
 
-    /// Tops a peer with surviving stripes back up to
-    /// `connections_per_peer` unpinned stripes (each independently
-    /// placed, so replacements land on the currently least-loaded NICs).
-    /// Fully dead peers are left to the on-demand reconnect in `acquire`.
-    async fn replenish_peer(&self, addr: &SocketAddr, state: &Arc<State>) {
-        let target = self.config.connections_per_peer.max(1) as usize;
-        let needed = {
-            let socket_map = self.socket_map.read().await;
-            let Some(stripes) = socket_map.get(addr) else {
-                return;
-            };
-            if !stripes.iter().any(|s| s.socket.state.is_ok()) {
-                return;
-            }
-            let healthy_unpinned = stripes
-                .iter()
-                .filter(|s| s.socket.state.is_ok() && !s.pinned)
-                .count();
-            target.saturating_sub(healthy_unpinned)
-        };
-        if needed == 0 {
+    /// Tops a desired peer up to `connections_per_peer` healthy stripes.
+    async fn replenish_peer(&self, peer: &Arc<PeerState>, state: &Arc<State>) {
+        let addr = &peer.addr;
+        const PEER_BACKOFF_KEY: &str = "";
+        if !self.preconnect_ready(peer, PEER_BACKOFF_KEY) {
             return;
         }
-
-        let lock = self.peer_lock(addr);
-        let Ok(guard) = lock.try_lock() else {
+        let Ok(guard) = peer.connect.try_lock() else {
             // An acquire is already connecting to this peer; retry next tick.
-            self.release_peer_lock(addr, &lock);
             return;
         };
         let result: Result<()> = async {
-            let plan = self.prepare_connect_plan(addr, state).await?;
-            for _ in 0..needed {
-                let existing = self
-                    .socket_map
-                    .read()
-                    .await
-                    .get(addr)
-                    .cloned()
-                    .unwrap_or_default();
-                let socket = self
-                    .connect_with_failover(addr, state, &plan, None, &existing)
+            let plan = self.prepare_connect_plan(peer, state, None).await?;
+            let mut existing = peer.active_snapshot();
+            let max_connections = self.config.preconnect_max_per_peer.max(1) as usize;
+            let min_per_remote = self.config.min_connections_per_remote_nic as usize;
+            let avoided_remote_nics = HashSet::new();
+            let mut remote_names = Vec::new();
+            for candidate in &plan.candidates {
+                if !remote_names.contains(&candidate.path.remote.device) {
+                    remote_names.push(candidate.path.remote.device.clone());
+                }
+            }
+            let healthy_remotes: Vec<String> = existing
+                .iter()
+                .filter(|stripe| stripe.socket.state.is_ok())
+                .map(|stripe| stripe.socket.path.remote.device.clone())
+                .collect();
+            let coverage_blocked: HashSet<String> = remote_names
+                .iter()
+                .filter(|remote| !self.preconnect_ready(peer, remote))
+                .cloned()
+                .collect();
+            let actions = placement::plan_connections(
+                &remote_names,
+                &healthy_remotes,
+                &coverage_blocked,
+                min_per_remote,
+                self.config.connections_per_peer.max(1) as usize,
+                max_connections,
+            );
+            for action in actions {
+                match action {
+                    ReconcileAction::ConnectCoverage(remote) => {
+                    if !self.preconnect_ready(peer, &remote) {
+                            continue;
+                    }
+                    let preference = PathPreference {
+                        remote_device: Some(&remote),
+                        avoided_remote_nics: &avoided_remote_nics,
+                    };
+                    match self
+                        .connect_with_failover(peer, state, &plan, preference, &existing)
+                        .await
+                    {
+                        Ok(established) => {
+                            self.clear_preconnect_failure(peer, &remote);
+                            let stripe = self.admit_established(peer, established);
+                            existing.push(stripe);
+                        }
+                        Err(err) => {
+                            self.record_preconnect_failure(peer, &remote);
+                            tracing::debug!(peer = %addr, remote_device = %remote, %err, "RDMA coverage connection failed");
+                        }
+                    }
+                    }
+                    ReconcileAction::ConnectTarget => {
+                        let established = self
+                            .connect_with_failover(
+                                peer,
+                                state,
+                                &plan,
+                                PathPreference {
+                                    remote_device: None,
+                                    avoided_remote_nics: &avoided_remote_nics,
+                                },
+                                &existing,
+                            )
+                            .await?;
+                        let stripe = self.admit_established(peer, established);
+                        existing.push(stripe);
+                    }
+                }
+            }
+            // Coverage actions may fail after the pure plan is built. Fill
+            // the normal target from the resulting actual state rather than
+            // assuming every planned action succeeded. The iteration bound
+            // is computed upfront so connections that die right after
+            // admission cannot keep this loop alive; the next maintenance
+            // tick retries them (under backoff).
+            let healthy_count = |stripes: &[Stripe]| {
+                stripes
+                    .iter()
+                    .filter(|stripe| stripe.socket.state.is_ok())
+                    .count()
+            };
+            let target = self.config.connections_per_peer.max(1) as usize;
+            for _ in 0..target.saturating_sub(healthy_count(&existing)) {
+                if healthy_count(&existing) >= max_connections {
+                    break;
+                }
+                let established = self
+                    .connect_with_failover(
+                        peer,
+                        state,
+                        &plan,
+                        PathPreference {
+                            remote_device: None,
+                            avoided_remote_nics: &avoided_remote_nics,
+                        },
+                        &existing,
+                    )
                     .await?;
-                self.track_peer_socket(addr, &socket);
-                self.socket_map
-                    .write()
-                    .await
-                    .entry(*addr)
-                    .or_default()
-                    .push(Stripe {
-                        socket,
-                        pinned: false,
-                    });
+                let stripe = self.admit_established(peer, established);
+                existing.push(stripe);
             }
             Ok(())
         }
         .await;
         if let Err(err) = result {
+            self.record_preconnect_failure(peer, PEER_BACKOFF_KEY);
             tracing::debug!("replenishing RDMA stripes to {addr} failed: {err}");
+        } else {
+            self.clear_preconnect_failure(peer, PEER_BACKOFF_KEY);
         }
         drop(guard);
-        self.release_peer_lock(addr, &lock);
     }
 
-    /// Migrates at most one connection of `addr` onto a strictly less
-    /// loaded path (make-before-break: the replacement is established and
-    /// enters the rotation before the victim is drained and closed).
-    ///
-    /// Scores are connection counts with the victim's own contribution
-    /// excluded on both sides — i.e. the world as it would look with the
-    /// victim removed: `stay = victim's pair load`, `move = candidate
-    /// pair load`. Migration requires `move + rebalance_threshold <=
-    /// stay`; the victim's own pair scores exactly `stay`, so a balanced
-    /// pool never oscillates and the threshold adds hysteresis on top.
-    async fn rebalance_peer(&self, addr: &SocketAddr, state: &Arc<State>) {
-        let threshold = u64::from(self.config.rebalance_threshold.max(1));
-        let stripes: Vec<Stripe> = {
-            let socket_map = self.socket_map.read().await;
-            match socket_map.get(addr) {
-                Some(stripes) => stripes
-                    .iter()
-                    .filter(|s| s.socket.state.is_ok() && !s.pinned)
-                    .cloned()
-                    .collect(),
-                None => return,
-            }
+    fn preconnect_ready(&self, peer: &PeerState, remote: &str) -> bool {
+        peer.meta
+            .lock()
+            .unwrap()
+            .backoff
+            .get(remote)
+            .is_none_or(|state| Instant::now() >= state.retry_at)
+    }
+
+    fn record_preconnect_failure(&self, peer: &PeerState, remote: &str) {
+        let mut meta = peer.meta.lock().unwrap();
+        let failures = meta
+            .backoff
+            .get(remote)
+            .map_or(1, |state| state.failures.saturating_add(1));
+        let base = preconnect_backoff_delay(failures);
+        let jitter =
+            Duration::from_millis(self.pseudo_random() % (base.as_millis() as u64 / 2 + 1));
+        meta.backoff.insert(
+            remote.to_owned(),
+            RetryBackoff {
+                failures,
+                retry_at: Instant::now() + base + jitter,
+            },
+        );
+    }
+
+    fn clear_preconnect_failure(&self, peer: &PeerState, remote: &str) {
+        peer.meta.lock().unwrap().backoff.remove(remote);
+    }
+
+    async fn rebalance_peer(&self, peer: &Arc<PeerState>, state: &Arc<State>) {
+        let Ok(plan) = self.prepare_connect_plan(peer, state, None).await else {
+            return;
         };
+        let advertised_remotes: HashSet<&str> = plan
+            .remote_info
+            .devices
+            .iter()
+            .map(|device| device.name.as_str())
+            .collect();
+        let stripes: Vec<Stripe> = peer
+            .active_snapshot()
+            .into_iter()
+            .filter(|stripe| stripe.socket.state.is_ok())
+            .collect();
         if stripes.is_empty() {
             return;
         }
 
-        let Ok(plan) = self.prepare_connect_plan(addr, state).await else {
-            return;
-        };
         let remote_info = &plan.remote_info;
-        // Never migrate onto a recently failed pair; unlike placement
-        // (which may have no alternative), skipping a rebalance is free.
-        let candidates: Vec<PathCandidate> = plan
+        let views: Vec<placement::Candidate<'_>> = plan
             .candidates
             .iter()
-            .filter(|c| !self.is_blacklisted(addr, c))
-            .cloned()
+            .enumerate()
+            .map(|(index, candidate)| placement::Candidate {
+                index,
+                local_index: candidate.local_device_index,
+                remote: &candidate.path.remote.device,
+                same_zone: candidate.has_same_zone(),
+                class: candidate.class,
+                blacklisted: self.is_blacklisted(peer, candidate),
+                local_load: 0,
+                remote_load: 0,
+            })
             .collect();
-        if candidates.is_empty() {
+        let indices = placement::eligible_paths(
+            &views,
+            &placement::Selection {
+                required_remote: None,
+                avoided_remotes: &HashSet::new(),
+            },
+            false,
+        );
+        if indices.is_empty() {
             return;
         }
 
-        // A NIC that is no longer advertised/present scores prohibitively
-        // high, so its connections migrate away as soon as any healthy
-        // alternative exists.
         const GONE: u64 = u64::MAX / 4;
         let remote_count = |name: &str| -> u64 {
             remote_info
                 .devices
                 .iter()
-                .find(|d| d.name == name)
-                .map_or(GONE, |d| u64::from(d.active_connections))
+                .find(|device| device.name == name)
+                .map_or(GONE, |device| u64::from(device.active_connections))
         };
         let local_count_by_index = |index: usize| -> u64 {
             self.conn_counts
                 .get(index)
-                .map_or(0, |c| c.load(Ordering::Acquire) as u64)
+                .map_or(0, |count| count.load(Ordering::Acquire) as u64)
         };
         let local_count = |name: &str| -> u64 {
             self.devices
                 .rdma_devices()
                 .iter()
                 .enumerate()
-                .find(|(_, d)| d.info().name == name)
+                .find(|(_, device)| device.info().name == name)
                 .map_or(GONE, |(index, _)| local_count_by_index(index))
         };
-
-        // A stripe's "stay" score: the load on its pair with itself
-        // removed from both sides.
-        let stripe_score = |s: &Stripe| -> u64 {
-            local_count(&s.socket.path.local.device).saturating_sub(1)
-                + remote_count(&s.socket.path.remote.device).saturating_sub(1)
-        };
-        let Some(victim) = stripes.iter().max_by_key(|s| stripe_score(s)) else {
-            return;
-        };
-        let victim_score = stripe_score(victim);
-        // A candidate's "move" score: the load the victim would join,
-        // likewise with the victim's own contribution excluded (it still
-        // occupies its current pair while we measure).
-        let candidate_score = |c: &PathCandidate| -> u64 {
-            let mut local = local_count_by_index(c.local_device_index);
-            if c.path.local.device == victim.socket.path.local.device {
-                local = local.saturating_sub(1);
-            }
-            let mut remote = remote_count(&c.path.remote.device);
-            if c.path.remote.device == victim.socket.path.remote.device {
-                remote = remote.saturating_sub(1);
-            }
-            local + remote
-        };
-        let Some((best_score, best)) = candidates
+        let stripe_views: Vec<placement::ExistingStripe<'_>> = stripes
             .iter()
-            .map(|c| (candidate_score(c), c))
-            .min_by_key(|(score, _)| *score)
-        else {
+            .enumerate()
+            .map(|(index, stripe)| placement::ExistingStripe {
+                index,
+                local: &stripe.socket.path.local.device,
+                remote: &stripe.socket.path.remote.device,
+                local_load: local_count(&stripe.socket.path.local.device),
+                remote_load: remote_count(&stripe.socket.path.remote.device),
+                remote_healthy: stripes
+                    .iter()
+                    .filter(|other| {
+                        other.socket.path.remote.device == stripe.socket.path.remote.device
+                    })
+                    .count(),
+                remote_advertised: advertised_remotes
+                    .contains(stripe.socket.path.remote.device.as_str()),
+            })
+            .collect();
+        let replacements: Vec<placement::Replacement<'_>> = indices
+            .iter()
+            .map(|&index| {
+                let candidate = &plan.candidates[index];
+                placement::Replacement {
+                    index,
+                    local: &candidate.path.local.device,
+                    remote: &candidate.path.remote.device,
+                    local_load: local_count_by_index(candidate.local_device_index),
+                    remote_load: remote_count(&candidate.path.remote.device),
+                }
+            })
+            .collect();
+        let Some((victim_index, best_index)) = placement::choose_rebalance(
+            &stripe_views,
+            &replacements,
+            self.config.min_connections_per_remote_nic as usize,
+            u64::from(self.config.rebalance_threshold.max(1)),
+            !self.pseudo_random().is_multiple_of(2),
+        ) else {
             return;
         };
-        if best_score.saturating_add(threshold) > victim_score {
-            return;
-        }
-        // Herd damping: many clients may decide to move against the same
-        // stale load snapshot in the same tick; a coin flip (on top of the
-        // jittered tick) halves the worst-case simultaneous moves, and the
-        // threshold hysteresis absorbs the overshoot that remains.
-        if self.pseudo_random().is_multiple_of(2) {
-            return;
-        }
+        let victim = &stripes[victim_index];
+        let best = &plan.candidates[best_index];
 
-        let lock = self.peer_lock(addr);
-        let Ok(guard) = lock.try_lock() else {
-            self.release_peer_lock(addr, &lock);
+        let Ok(guard) = peer.connect.try_lock() else {
             return;
         };
         match self
-            .connect_stripe(addr, state, &plan.acquire_ctx, best)
+            .connect_stripe(peer, state, &plan.acquire_ctx, best)
             .await
         {
-            Ok(socket) => {
-                self.track_peer_socket(addr, &socket);
-                let mut socket_map = self.socket_map.write().await;
-                if let Some(stripes) = socket_map.get_mut(addr) {
-                    stripes.push(Stripe {
-                        socket: socket.clone(),
-                        pinned: false,
-                    });
-                    if let Some(pos) = stripes
-                        .iter()
-                        .position(|s| Arc::ptr_eq(&s.socket, &victim.socket))
-                    {
-                        stripes.remove(pos);
-                        drop(socket_map);
-                        tracing::info!(
-                            peer = %addr,
-                            from_local = %victim.socket.path.local.device,
-                            from_remote = %victim.socket.path.remote.device,
-                            to_local = %socket.path.local.device,
-                            to_remote = %socket.path.remote.device,
-                            "rebalancing RDMA connection"
-                        );
-                        // The victim already left the rotation; give its
-                        // in-flight responses time to arrive, then close.
-                        self.drain_then_close(victim.socket.clone());
-                    }
-                } else {
-                    socket.set_error();
-                }
+            Ok(established) => {
+                self.admit_replacing(peer, &victim.socket, established);
             }
-            Err(err) => tracing::debug!("rebalance connect to {addr} failed: {err}"),
+            Err(err) => tracing::debug!(peer = %peer.addr, %err, "RDMA rebalance failed"),
         }
         drop(guard);
-        self.release_peer_lock(addr, &lock);
     }
 
-    /// Closes `socket` after the drain timeout; used for stripes removed
-    /// from the rotation whose in-flight responses must still arrive.
-    fn drain_then_close(&self, socket: Arc<RdmaSocket>) {
+    fn drain_then_close(&self, peer: &Arc<PeerState>, socket: Arc<RdmaSocket>) {
         let drain = Duration::from_millis(self.config.drain_timeout_ms);
         let guard = self.task_supervisor.start_async_task();
+        let peer = peer.clone();
         tokio::spawn(async move {
             tokio::select! {
                 () = guard.stopped() => {}
                 () = tokio::time::sleep(drain) => {}
             }
             socket.set_error();
+            peer.stripes
+                .write()
+                .unwrap()
+                .draining
+                .retain(|stripe| !Arc::ptr_eq(&stripe.socket, &socket));
         });
-    }
-
-    /// Snapshot of every live connection with its NIC pair, plus
-    /// per-device connection counts.
-    pub(crate) async fn path_report(&self) -> RdmaPathReport {
-        let devices = self
-            .devices
-            .rdma_devices()
-            .iter()
-            .enumerate()
-            .map(|(index, device)| RdmaDeviceLoad {
-                device: device.info().name.clone(),
-                connections: self
-                    .conn_counts
-                    .get(index)
-                    .map_or(0, |c| c.load(Ordering::Acquire)),
-            })
-            .collect();
-
-        let mut paths = Vec::new();
-        {
-            let socket_map = self.socket_map.read().await;
-            for (addr, stripes) in socket_map.iter() {
-                for stripe in stripes {
-                    paths.push(RdmaPathEntry {
-                        peer: Some(*addr),
-                        direction: RdmaConnDirection::Outbound,
-                        path: stripe.socket.path.clone(),
-                        qp_num: stripe.socket.queue_pair.qp_num(),
-                        healthy: stripe.socket.state.is_ok(),
-                        pinned: stripe.pinned,
-                    });
-                }
-            }
-        }
-        let inbound: Vec<Arc<RdmaSocket>> = self
-            .inbound
-            .lock()
-            .unwrap()
-            .iter()
-            .filter_map(Weak::upgrade)
-            .collect();
-        for socket in inbound {
-            paths.push(RdmaPathEntry {
-                peer: None,
-                direction: RdmaConnDirection::Inbound,
-                path: socket.path.clone(),
-                qp_num: socket.queue_pair.qp_num(),
-                healthy: socket.state.is_ok(),
-                pinned: false,
-            });
-        }
-        RdmaPathReport { devices, paths }
     }
 }
 
 impl Drop for RdmaSocketPool {
     fn drop(&mut self) {
         self.task_supervisor.stop();
-        self.socket_map.get_mut().clear();
+        self.peers.clear();
     }
 }
 
@@ -1808,6 +2246,13 @@ struct ConnectPlan {
     acquire_ctx: Context,
     remote_info: RdmaInfo,
     candidates: Vec<PathCandidate>,
+    deadline: Option<Instant>,
+}
+
+#[derive(Clone, Copy)]
+struct PathPreference<'a> {
+    remote_device: Option<&'a str>,
+    avoided_remote_nics: &'a HashSet<String>,
 }
 
 /// One compatible (local NIC, remote NIC) pair a new connection could use.
@@ -1819,8 +2264,23 @@ struct PathCandidate {
     remote: DeviceSelection,
     /// Remote per-connection resource limits advertised for that device.
     remote_limits: RdmaConnectionConfig,
+    /// Preferred transport class, considered after hard constraints and
+    /// reachability filters so lower classes remain valid fallbacks.
+    class: PathClass,
     /// Full NIC-pair identity of this candidate.
     path: RdmaPathInfo,
+}
+
+impl PathCandidate {
+    fn has_same_zone(&self) -> bool {
+        !self.path.local.zones.is_empty()
+            && self
+                .path
+                .local
+                .zones
+                .iter()
+                .any(|zone| self.path.remote.zones.contains(zone))
+    }
 }
 
 struct CachedRdmaInfo {
@@ -1836,6 +2296,18 @@ fn pseudo_random(seq: usize) -> u64 {
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
     RandomState::default().hash_one((seq, nanos))
+}
+
+fn next_connection_id() -> u64 {
+    static BASE: OnceLock<u64> = OnceLock::new();
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let base = *BASE.get_or_init(|| pseudo_random(0));
+    loop {
+        let id = base.wrapping_add(NEXT.fetch_add(1, Ordering::Relaxed));
+        if id != 0 {
+            return id;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1868,18 +2340,21 @@ mod path_selection_tests {
                 gid_index: 0,
             },
             remote_limits: connection_limits(),
+            class: PathClass::InfiniBand,
             path: RdmaPathInfo {
                 local: RdmaNicInfo {
                     device: format!("local{local_index}"),
                     port_num: 1,
                     gid_index: 0,
                     ip: None,
+                    zones: Vec::new(),
                 },
                 remote: RdmaNicInfo {
                     device: remote_dev.into(),
                     port_num: 1,
                     gid_index: 0,
                     ip: None,
+                    zones: Vec::new(),
                 },
             },
         }
@@ -1903,6 +2378,20 @@ mod path_selection_tests {
         "127.0.0.1:9999".parse().unwrap()
     }
 
+    fn peer() -> PeerState {
+        PeerState::new(addr())
+    }
+
+    fn preference<'a>(
+        remote_device: Option<&'a str>,
+        avoided_remote_nics: &'a HashSet<String>,
+    ) -> PathPreference<'a> {
+        PathPreference {
+            remote_device,
+            avoided_remote_nics,
+        }
+    }
+
     #[tokio::test]
     async fn test_select_prefers_less_loaded_remote() {
         let pool = make_pool();
@@ -1912,29 +2401,246 @@ mod path_selection_tests {
         // time, so the choice is deterministic.
         for _ in 0..8 {
             let chosen = pool
-                .select_candidate(&addr(), &candidates, None, &info, &[])
+                .select_candidate(
+                    &peer(),
+                    &candidates,
+                    preference(None, &HashSet::new()),
+                    &info,
+                    &[],
+                )
                 .unwrap();
             assert_eq!(chosen.path.remote.device, "remoteB");
         }
     }
 
     #[tokio::test]
-    async fn test_select_respects_selector() {
+    async fn test_select_avoids_remote_nic_before_fallback() {
         let pool = make_pool();
         let candidates = [candidate(0, "remoteA"), candidate(0, "remoteB")];
         let info = remote_info(&[("remoteA", 5), ("remoteB", 0)]);
 
-        let selector = RdmaPathSelector::remote_device("remoteA");
-        let chosen = pool
-            .select_candidate(&addr(), &candidates, Some(&selector), &info, &[])
+        let avoided = HashSet::from(["remoteB".to_owned()]);
+        let selected = pool
+            .select_candidate(&peer(), &candidates, preference(None, &avoided), &info, &[])
             .unwrap();
-        assert_eq!(chosen.path.remote.device, "remoteA");
+        assert_eq!(selected.path.remote.device, "remoteA");
 
-        let missing = RdmaPathSelector::remote_device("nonexistent");
-        let err = pool
-            .select_candidate(&addr(), &candidates, Some(&missing), &info, &[])
-            .unwrap_err();
+        let all_avoided = HashSet::from(["remoteA".to_owned(), "remoteB".to_owned()]);
+        let selected = pool
+            .select_candidate(
+                &peer(),
+                &candidates,
+                preference(None, &all_avoided),
+                &info,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(selected.path.remote.device, "remoteB");
+    }
+
+    #[tokio::test]
+    async fn test_select_respects_internal_remote_constraint() {
+        let pool = make_pool();
+        let candidates = [candidate(0, "remoteA"), candidate(0, "remoteB")];
+        let info = remote_info(&[("remoteA", 5), ("remoteB", 0)]);
+        let selected = pool
+            .select_candidate(
+                &peer(),
+                &candidates,
+                preference(Some("remoteA"), &HashSet::new()),
+                &info,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(selected.path.remote.device, "remoteA");
+    }
+
+    #[tokio::test]
+    async fn test_rejects_too_short_connect_lease() {
+        let devices = crate::rdma::test_utils::make_rdma_devices();
+        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+        let config = RdmaSocketPoolConfig {
+            connect_lease_ms: 14_999,
+            ..Default::default()
+        };
+        let err = RdmaSocketPool::new(devices, buffer_pool, config).unwrap_err();
         assert_eq!(err.kind, ErrorKind::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_rejects_invalid_zone_names() {
+        for zones in [
+            vec![crate::RdmaZoneConfig {
+                name: String::new(),
+                cidrs: Vec::new(),
+            }],
+            vec![
+                crate::RdmaZoneConfig {
+                    name: "storage".into(),
+                    cidrs: Vec::new(),
+                },
+                crate::RdmaZoneConfig {
+                    name: "storage".into(),
+                    cidrs: Vec::new(),
+                },
+            ],
+        ] {
+            let devices = crate::rdma::test_utils::make_rdma_devices();
+            let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+            let config = RdmaSocketPoolConfig {
+                zones,
+                ..Default::default()
+            };
+            let err = RdmaSocketPool::new(devices, buffer_pool, config).unwrap_err();
+            assert_eq!(err.kind, ErrorKind::InvalidArgument);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_accept_lease_transitions_are_state_checked() {
+        let pool = make_pool();
+        let connection_id = 42;
+        let socket = Weak::new();
+        pool.accept_leases.insert(
+            connection_id,
+            AcceptLease {
+                socket: socket.clone(),
+                server_connection_cookie: 7,
+                state: AcceptLeaseState::Pending,
+                expires_at: Instant::now() + Duration::from_secs(1),
+            },
+        );
+        pool.observe_accept_receive(connection_id, &socket);
+        assert!(pool.accept_leases.contains_key(&connection_id));
+        assert_eq!(
+            pool.accept_leases.get(&connection_id).unwrap().state,
+            AcceptLeaseState::ReceiveObserved
+        );
+
+        pool.accept_leases.get_mut(&connection_id).unwrap().state = AcceptLeaseState::Confirmed;
+        pool.observe_accept_receive(connection_id, &socket);
+        assert_eq!(
+            pool.accept_leases.get(&connection_id).unwrap().state,
+            AcceptLeaseState::Active
+        );
+        pool.accept_leases.remove(&connection_id);
+
+        pool.accept_leases.insert(
+            connection_id,
+            AcceptLease {
+                socket: Weak::new(),
+                server_connection_cookie: 7,
+                state: AcceptLeaseState::Pending,
+                expires_at: Instant::now() + Duration::from_secs(1),
+            },
+        );
+        let mismatched = ConnectionControl {
+            connection_id,
+            server_connection_cookie: 8,
+        };
+        assert_eq!(
+            pool.rdma_confirm(&mismatched).unwrap_err().kind,
+            ErrorKind::InvalidArgument
+        );
+        pool.rdma_abort(&mismatched);
+        assert!(pool.accept_leases.contains_key(&connection_id));
+        pool.accept_leases.remove(&connection_id);
+
+        pool.accept_leases.insert(
+            connection_id,
+            AcceptLease {
+                socket: Weak::new(),
+                server_connection_cookie: 7,
+                state: AcceptLeaseState::Pending,
+                expires_at: Instant::now() - Duration::from_millis(1),
+            },
+        );
+        let control = ConnectionControl {
+            connection_id,
+            server_connection_cookie: 7,
+        };
+        let err = pool.rdma_confirm(&control).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::InvalidArgument);
+        assert!(!pool.accept_leases.contains_key(&connection_id));
+    }
+
+    #[test]
+    fn test_accept_lease_events_commit_in_either_order() {
+        assert_eq!(
+            advance_accept_lease(AcceptLeaseState::Pending, AcceptLeaseEvent::Confirm),
+            AcceptLeaseState::Confirmed
+        );
+        assert_eq!(
+            advance_accept_lease(AcceptLeaseState::Confirmed, AcceptLeaseEvent::Receive),
+            AcceptLeaseState::Active
+        );
+        assert_eq!(
+            advance_accept_lease(AcceptLeaseState::Pending, AcceptLeaseEvent::Receive),
+            AcceptLeaseState::ReceiveObserved
+        );
+        assert_eq!(
+            advance_accept_lease(AcceptLeaseState::ReceiveObserved, AcceptLeaseEvent::Confirm),
+            AcceptLeaseState::Active
+        );
+        assert_eq!(
+            advance_accept_lease(AcceptLeaseState::Confirmed, AcceptLeaseEvent::Confirm),
+            AcceptLeaseState::Confirmed
+        );
+        assert_eq!(
+            advance_accept_lease(AcceptLeaseState::Active, AcceptLeaseEvent::Confirm),
+            AcceptLeaseState::Active
+        );
+    }
+
+    #[test]
+    fn test_candidate_detects_shared_zone() {
+        let mut candidate = candidate(0, "remoteA");
+        assert!(!candidate.has_same_zone());
+
+        candidate.path.local.zones = vec!["storage-a".into(), "storage-b".into()];
+        candidate.path.remote.zones = vec!["storage-b".into()];
+        assert!(candidate.has_same_zone());
+
+        candidate.path.remote.zones = vec!["frontend".into()];
+        assert!(!candidate.has_same_zone());
+    }
+
+    #[tokio::test]
+    async fn test_same_zone_is_preferred() {
+        let pool = make_pool();
+        let mut same_subnet = candidate(0, "remoteA");
+        same_subnet.path.local.zones = vec!["storage".into()];
+        same_subnet.path.remote.zones = vec!["storage".into()];
+        let other = candidate(0, "remoteB");
+        let candidates = [same_subnet, other];
+        let info = remote_info(&[("remoteA", 10), ("remoteB", 0)]);
+
+        let selected = pool
+            .select_candidate(
+                &peer(),
+                &candidates,
+                preference(None, &HashSet::new()),
+                &info,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(selected.path.remote.device, "remoteA");
+    }
+
+    #[test]
+    fn test_preconnect_backoff_is_bounded() {
+        assert_eq!(preconnect_backoff_delay(1), Duration::from_millis(100));
+        assert_eq!(preconnect_backoff_delay(4), Duration::from_millis(800));
+        assert!(preconnect_backoff_delay(100) <= Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_connection_ids_are_nonzero_and_unique() {
+        let first = next_connection_id();
+        let second = next_connection_id();
+        assert_ne!(first, 0);
+        assert_ne!(second, 0);
+        assert_ne!(first, second);
     }
 
     /// The connecting client dictates the traffic class (its own config,
@@ -1994,7 +2700,13 @@ mod path_selection_tests {
         let candidates = [candidate(0, "remoteA"), candidate(1, "remoteA")];
         let info = remote_info(&[("remoteA", 0)]);
         let chosen = pool
-            .select_candidate(&addr(), &candidates, None, &info, &[])
+            .select_candidate(
+                &peer(),
+                &candidates,
+                preference(None, &HashSet::new()),
+                &info,
+                &[],
+            )
             .unwrap();
         assert_eq!(chosen.local_device_index, 1);
     }
@@ -2005,24 +2717,36 @@ mod path_selection_tests {
         let candidates = [candidate(0, "remoteA"), candidate(0, "remoteB")];
         let info = remote_info(&[("remoteA", 0), ("remoteB", 0)]);
 
-        pool.blacklist_path(&addr(), &candidates[0].path);
+        let peer = peer();
+        pool.blacklist_path(&peer, &candidates[0].path);
         for _ in 0..8 {
             let chosen = pool
-                .select_candidate(&addr(), &candidates, None, &info, &[])
+                .select_candidate(
+                    &peer,
+                    &candidates,
+                    preference(None, &HashSet::new()),
+                    &info,
+                    &[],
+                )
                 .unwrap();
             assert_eq!(chosen.path.remote.device, "remoteB");
         }
         // The blacklist is per peer: another address is unaffected.
-        let other: SocketAddr = "127.0.0.1:9998".parse().unwrap();
+        let other = PeerState::new("127.0.0.1:9998".parse().unwrap());
         assert!(!pool.is_blacklisted(&other, &candidates[0]));
 
         // Soft fallback: with every candidate blacklisted, selection still
         // returns one instead of failing.
-        pool.blacklist_path(&addr(), &candidates[1].path);
-        assert!(
-            pool.select_candidate(&addr(), &candidates, None, &info, &[])
-                .is_ok()
-        );
+        pool.blacklist_path(&peer, &candidates[1].path);
+        let _ = pool
+            .select_candidate(
+                &peer,
+                &candidates,
+                preference(None, &HashSet::new()),
+                &info,
+                &[],
+            )
+            .unwrap();
     }
 
     #[tokio::test]
@@ -2051,6 +2775,7 @@ mod path_selection_tests {
 #[cfg(test)]
 mod gid_match_tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn make_gid(addr: &str) -> ruapc_rdma::ibv_gid {
         let bits = addr.parse::<std::net::Ipv6Addr>().unwrap().to_bits();
@@ -2087,8 +2812,26 @@ mod gid_match_tests {
             gid(5, "::ffff:10.0.0.2", GidType::RoCEv2),
         ];
         assert_eq!(
-            RdmaSocketPool::match_roce_gid_pair(&local, &remote),
+            RdmaSocketPool::match_roce_gid_pairs(&local, &remote)
+                .first()
+                .copied(),
             Some((3, 5))
+        );
+    }
+
+    #[test]
+    fn test_retains_all_compatible_gid_pairs_for_zone_selection() {
+        let local = [
+            gid(1, "::ffff:10.0.0.1", GidType::RoCEv2),
+            gid(2, "::ffff:10.1.0.1", GidType::RoCEv2),
+        ];
+        let remote = [
+            gid(3, "::ffff:10.0.0.2", GidType::RoCEv2),
+            gid(4, "::ffff:10.1.0.2", GidType::RoCEv2),
+        ];
+        assert_eq!(
+            RdmaSocketPool::match_roce_gid_pairs(&local, &remote),
+            [(1, 3), (1, 4), (2, 3), (2, 4)]
         );
     }
 
@@ -2100,7 +2843,9 @@ mod gid_match_tests {
         ];
         let remote = [gid(0, "fe80::2", GidType::RoCEv1)];
         assert_eq!(
-            RdmaSocketPool::match_roce_gid_pair(&local, &remote),
+            RdmaSocketPool::match_roce_gid_pairs(&local, &remote)
+                .first()
+                .copied(),
             Some((0, 0))
         );
     }
@@ -2113,7 +2858,9 @@ mod gid_match_tests {
             gid(2, "fe80::2", GidType::Other("custom".into())),
         ];
         assert_eq!(
-            RdmaSocketPool::match_roce_gid_pair(&local, &remote),
+            RdmaSocketPool::match_roce_gid_pairs(&local, &remote)
+                .first()
+                .copied(),
             Some((0, 2))
         );
     }
@@ -2121,7 +2868,12 @@ mod gid_match_tests {
     #[test]
     fn test_empty_remote_gid_table_returns_none() {
         let local = [gid(3, "::ffff:10.0.0.1", GidType::RoCEv2)];
-        assert_eq!(RdmaSocketPool::match_roce_gid_pair(&local, &[]), None);
+        assert_eq!(
+            RdmaSocketPool::match_roce_gid_pairs(&local, &[])
+                .first()
+                .copied(),
+            None
+        );
     }
 
     #[test]
@@ -2132,9 +2884,12 @@ mod gid_match_tests {
             port_num: 1,
             link_layer: LinkLayer::Ethernet,
             gids: vec![gid(2, "::ffff:10.0.0.2", GidType::RoCEv2)],
+            gid_zones: HashMap::new(),
         };
         assert_eq!(
-            RdmaSocketPool::match_gid_pair(&local, &remote),
+            RdmaSocketPool::match_gid_pairs(&local, &remote)
+                .first()
+                .copied(),
             Some((0, 2))
         );
     }

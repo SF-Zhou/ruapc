@@ -53,10 +53,11 @@ The `rdma` feature is NOT in `ruapc`'s default features (it requires libibverbs 
 ### RDMA Multi-NIC Path Awareness
 
 - **Peer identity vs path**: peers are identified by their bootstrap TCP address (the socket_map key); the *path* — the (local NIC, remote NIC) pair, `RdmaPathInfo` — is a per-connection property carried on every `RdmaSocket`. Each stripe of a peer picks its own path.
-- **Placement**: local NIC by least-connections over live per-device counters (`ConnCountGuard`, outbound + inbound); remote NIC by power-of-two-choices over the peer's advertised per-NIC load (`RdmaDeviceInfo.active_connections` in the `info` RPC) — P2C avoids client herding on stale snapshots.
+- **Static policy**: `rdma.device_filter` defines the allowed local NICs when a context is created. `rdma.zones` maps interface CIDRs to virtual zone names; paths sharing a zone are preferred before link class and load. Applications needing different policies create independent contexts.
+- **Placement**: within the statically allowed, preferred-zone candidates, local NIC is selected by least-connections over live per-device counters (`ConnCountGuard`, outbound + inbound); remote NIC uses power-of-two-choices over the peer's advertised per-NIC load (`RdmaDeviceInfo.active_connections` in the `info` RPC).
 - **Reachability**: device matching cannot verify routability; QP setup failures (e.g. no route between subnets) blacklist the NIC pair per peer for 30s and placement falls over to the next candidate (`connect_with_failover`).
-- **Maintenance task** (per pool, jittered `rdma.maintenance_interval_ms`, default 5s): fails connections on downed local ports (via the 15s device refresher), prunes dead stripes, replenishes peers up to `connections_per_peer`, and migrates at most one connection per tick to a less-loaded pair (make-before-break with a `drain_timeout_ms` grace; `rebalance_threshold` gives hysteresis, scores exclude the victim's own contribution). Rate-limited migration is what makes traffic return gradually to recovered NICs.
-- **Explicit control**: `Context::with_rdma_path(RdmaPathSelector)` pins requests to matching paths (creating pinned, rebalance-exempt connections on demand); `rdma.device_filter` / `rdma.remote_device_filter` for config-level constraints; `State::rdma_path_report()` / `Server::state()` for introspection (paths, direction, health, per-device load).
+- **Maintenance task** (per pool, jittered `rdma.maintenance_interval_ms`, default 5s): fails connections on downed local ports, prunes dead stripes, maintains `min_connections_per_remote_nic` coverage, replenishes desired peers, and gradually rebalances connections with make-before-break migration.
+- **Introspection**: `State::rdma_path_report()` / `Server::state()` report paths, direction, health, and per-device load.
 
 ### Wire Format
 - TCP / HTTP-2 stream: `[4B magic "RUA!"][4B total_len][4B meta_len][meta bytes][payload bytes]`

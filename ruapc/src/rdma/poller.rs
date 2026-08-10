@@ -889,6 +889,12 @@ impl ConnState {
                 ),
             ));
         }
+        if let Some(connection_id) = self.socket.take_accept_lease() {
+            let _ = self
+                .state
+                .socket_pool
+                .rdma_receive_observed(connection_id, &self.socket);
+        }
 
         // Immediate data (ACK credit counters) can arrive standalone or
         // piggybacked on a data send.
@@ -1038,6 +1044,12 @@ impl ConnState {
             // Pending sends never acquired a credit; just drop them.
             self.pending_sends.clear();
             return Ok(());
+        }
+        if self.socket.take_activation_request()
+            && let Err(err) = self.submit_ack(0)
+        {
+            self.socket.request_activation();
+            return Err(err);
         }
 
         // One credit per data WR, returned once the WR completed locally
