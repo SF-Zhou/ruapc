@@ -24,6 +24,10 @@ pub struct Args {
     #[arg(long, default_value = "unified")]
     pub listen_mode: ListenMode,
 
+    /// Base path for HTTP RPC and documentation endpoints.
+    #[arg(long, default_value = "")]
+    pub http_base_path: String,
+
     /// RDMA: number of (CQ + poll thread) shards per device.
     #[arg(long, default_value = "1")]
     pub poll_threads: u32,
@@ -130,6 +134,7 @@ async fn async_main(args: Args) {
     let mut config = SocketPoolConfig {
         listen_mode: args.listen_mode,
         buffer_pool_memory: args.pool_mem_mb * 1024 * 1024,
+        http_base_path: args.http_base_path,
         ..Default::default()
     };
     #[cfg(feature = "rdma")]

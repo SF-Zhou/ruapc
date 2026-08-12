@@ -240,6 +240,75 @@ async fn test_http_post_request_processing() {
 }
 
 #[tokio::test]
+async fn test_http_base_path_routes() {
+    let test_service = Arc::new(TestServiceImpl);
+    let mut router = Router::default();
+    test_service.ruapc_export(&mut router);
+
+    let config = SocketPoolConfig {
+        listen_mode: ListenMode::UNIFIED,
+        http_base_path: "/api/v1/".to_string(),
+        ..Default::default()
+    };
+    let server = ruapc::Server::create(router, &config).unwrap();
+    let addr = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!(
+            "http://{addr}/api/v1/TestService/test_method?trace=1"
+        ))
+        .json(&"test input")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let result: ruapc::Result<String> = response.json().await.unwrap();
+    assert_eq!(result.unwrap(), "test response: test input");
+
+    for path in [
+        "/TestService/test_method",
+        "/api/v10/TestService/test_method",
+        "/openapi.json",
+    ] {
+        let response = client
+            .get(format!("http://{addr}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404, "path should not match: {path}");
+    }
+
+    let openapi: serde_json::Value = client
+        .get(format!("http://{addr}/api/v1/openapi.json"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(openapi["servers"][0]["url"], "/api/v1");
+
+    let rapidoc = client
+        .get(format!("http://{addr}/api/v1/rapidoc"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(rapidoc.contains("src=\"/api/v1/rapidoc/rapidoc-min.js\""));
+    assert!(rapidoc.contains("spec-url=\"/api/v1/openapi.json\""));
+
+    server.stop();
+    server.join().await;
+}
+
+#[tokio::test]
 async fn test_http_websocket_upgrade() {
     let test_service = Arc::new(TestServiceImpl);
     let mut router = Router::default();
