@@ -1,12 +1,6 @@
 #[cfg(feature = "rdma")]
 use std::net::SocketAddr;
-use std::{
-    collections::HashSet,
-    sync::{
-        Arc, OnceLock,
-        atomic::{AtomicUsize, Ordering},
-    },
-};
+use std::sync::Arc;
 
 use ruapc_bufpool::RemoteBufferInfo;
 use serde::Serialize;
@@ -16,7 +10,7 @@ use crate::{
     Buffer, CopyOp, Endpoint, Error, RemoteIoError, Result, Router, Socket, SocketPoolConfig,
     SocketTrait, State,
     core::{
-        EndpointState,
+        EndpointSet,
         scatter::{self, SpaceLayout},
     },
     msg::{MsgFlags, MsgMeta},
@@ -97,69 +91,6 @@ pub(crate) enum ContextEndpoint {
     Endpoints(Arc<EndpointSet>),
 }
 
-/// A set of equivalent server endpoints with shared selection state.
-#[derive(Debug)]
-pub(crate) struct EndpointSet {
-    endpoints: Vec<Endpoint>,
-    states: OnceLock<Vec<Arc<EndpointState>>>,
-    cursor: AtomicUsize,
-}
-
-impl EndpointSet {
-    /// Creates an endpoint set. Empty sets are permitted but every request
-    /// through them fails with `InvalidArgument`.
-    #[must_use]
-    pub(crate) fn new(endpoints: Vec<Endpoint>) -> Self {
-        let mut seen = HashSet::with_capacity(endpoints.len());
-        let endpoints = endpoints
-            .into_iter()
-            .filter(|endpoint| seen.insert(*endpoint))
-            .collect();
-        Self {
-            endpoints,
-            states: OnceLock::new(),
-            cursor: AtomicUsize::new(0),
-        }
-    }
-
-    /// Returns the endpoint when this set does not need failover selection.
-    pub(crate) fn singleton(&self) -> Option<Endpoint> {
-        (self.endpoints.len() == 1).then(|| self.endpoints[0])
-    }
-
-    /// Returns all endpoints ordered by current usability. Existing healthy
-    /// connections win, then connectable endpoints with fewer failures;
-    /// round-robin order breaks ties. Cooling addresses remain at the end so
-    /// a fully degraded set can still be probed.
-    pub(crate) fn candidates(&self, state: &State) -> Vec<Arc<EndpointState>> {
-        let base = self.cursor.fetch_add(1, Ordering::Relaxed);
-        let states = self.states.get_or_init(|| {
-            self.endpoints
-                .iter()
-                .map(|endpoint| state.endpoint_state(*endpoint))
-                .collect()
-        });
-        let mut candidates: Vec<_> = states
-            .iter()
-            .enumerate()
-            .map(|(index, endpoint_state)| {
-                let selection_rank = endpoint_state.selection_rank();
-                let rank = (
-                    selection_rank.0,
-                    selection_rank.1,
-                    selection_rank.2,
-                    selection_rank.3,
-                    (index + self.endpoints.len() - base % self.endpoints.len().max(1))
-                        % self.endpoints.len().max(1),
-                );
-                (rank, endpoint_state.clone())
-            })
-            .collect();
-        candidates.sort_unstable_by_key(|(rank, _)| *rank);
-        candidates.into_iter().map(|(_, state)| state).collect()
-    }
-}
-
 /// RPC context carrying request metadata and connection information.
 ///
 /// The `Context` is passed to all RPC service methods and contains:
@@ -186,8 +117,7 @@ pub struct Context {
     /// Message metadata for the current RPC operation.
     pub msg_meta: MsgMeta,
     /// Deadline of the request being handled, derived from the client's
-    /// `timeout_ms` budget on arrival. `None` when the request carries no
-    /// budget (or for client-created contexts).
+    /// `timeout_ms` budget on arrival. `None` for client-created contexts.
     pub(crate) deadline: Option<std::time::Instant>,
 }
 
@@ -289,9 +219,10 @@ impl Context {
     /// budget, anchored at arrival time.
     #[must_use]
     pub(crate) fn server_ctx(state: &Arc<State>, socket: Socket, msg_meta: MsgMeta) -> Self {
-        let deadline = msg_meta
-            .timeout_ms
-            .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(u64::from(ms)));
+        let deadline = Some(
+            std::time::Instant::now()
+                + std::time::Duration::from_millis(u64::from(msg_meta.timeout_ms)),
+        );
         Self {
             state: state.clone(),
             endpoint: ContextEndpoint::Connected(socket),
@@ -325,7 +256,7 @@ impl Context {
             msgid: self.msg_meta.msgid,
             read_regions: Vec::new(),
             write_regions: Vec::new(),
-            timeout_ms: None,
+            timeout_ms: 0,
         };
         meta.flags.remove(MsgFlags::IsReq);
         meta.flags.insert(MsgFlags::IsRsp);
@@ -577,107 +508,6 @@ impl Context {
 mod tests {
     use super::*;
     use crate::{Error, ErrorKind, SocketPoolConfig};
-
-    #[tokio::test]
-    async fn endpoint_set_deduplicates_and_tracks_transports_separately() {
-        let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
-        let first: SocketAddr = "127.0.0.1:10001".parse().unwrap();
-        let set = EndpointSet::new(vec![
-            Endpoint::new(crate::Transport::TCP, first),
-            Endpoint::new(crate::Transport::TCP, first),
-            Endpoint::new(crate::Transport::WS, first),
-        ]);
-        let endpoints = set.candidates(&ctx.state);
-        assert_eq!(endpoints.len(), 2);
-        assert_ne!(
-            endpoints[0].endpoint().transport(),
-            endpoints[1].endpoint().transport()
-        );
-    }
-
-    #[test]
-    fn endpoint_set_exposes_singleton_fast_path_after_deduplication() {
-        let endpoint = Endpoint::tcp("127.0.0.1:10001".parse().unwrap());
-        let set = EndpointSet::new(vec![endpoint, endpoint]);
-
-        assert_eq!(set.singleton(), Some(endpoint));
-    }
-
-    #[tokio::test]
-    async fn endpoint_health_is_shared_across_sets() {
-        let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
-        let first: SocketAddr = "127.0.0.1:10001".parse().unwrap();
-        let second: SocketAddr = "127.0.0.1:10002".parse().unwrap();
-        let set = EndpointSet::new(vec![Endpoint::tcp(first), Endpoint::tcp(second)]);
-        let candidates = set.candidates(&ctx.state);
-        let failed = candidates[0].endpoint();
-        candidates[0].begin_connect().record_failure();
-
-        let other_set = EndpointSet::new(vec![Endpoint::tcp(first), Endpoint::tcp(second)]);
-        let reordered = other_set.candidates(&ctx.state);
-        assert_ne!(reordered[0].endpoint(), failed);
-        assert!(Arc::ptr_eq(
-            &candidates[0],
-            &ctx.state.endpoint_state(failed)
-        ));
-    }
-
-    #[test]
-    fn foreground_connection_suppresses_preconnect() {
-        let state = Arc::new(EndpointState::new(Endpoint::tcp(
-            "127.0.0.1:10001".parse().unwrap(),
-        )));
-        let foreground = state.begin_connect();
-        assert!(state.try_begin_preconnect().is_none());
-        drop(foreground);
-        assert!(state.try_begin_preconnect().is_some());
-    }
-
-    #[test]
-    fn endpoint_health_observes_closed_send_channel() {
-        let endpoint = Endpoint::tcp("127.0.0.1:10001".parse().unwrap());
-        let state = Arc::new(EndpointState::new(endpoint));
-        let (sender, receiver) = tokio::sync::mpsc::channel(1);
-        let socket = Socket::TCP(crate::tcp::TcpSocket::new(sender));
-        state.begin_connect().record_connection(&socket);
-        assert!(state.snapshot().connected);
-        drop(receiver);
-        assert!(!state.snapshot().connected);
-    }
-
-    #[test]
-    fn connection_failure_is_counted_once_per_connection() {
-        let endpoint = Endpoint::tcp("127.0.0.1:10001".parse().unwrap());
-        let state = Arc::new(EndpointState::new(endpoint));
-        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
-        let socket = Socket::TCP(crate::tcp::TcpSocket::new(sender));
-        let conn_id = socket.conn_id().unwrap();
-        state.begin_connect().record_connection(&socket);
-
-        state.record_connection_failure(conn_id);
-        state.record_connection_failure(conn_id);
-
-        assert_eq!(state.snapshot().failures, 1);
-    }
-
-    #[test]
-    fn stale_failure_does_not_clear_replacement_connection() {
-        let endpoint = Endpoint::tcp("127.0.0.1:10001".parse().unwrap());
-        let state = Arc::new(EndpointState::new(endpoint));
-        let (old_sender, _old_receiver) = tokio::sync::mpsc::channel(1);
-        let old_socket = Socket::TCP(crate::tcp::TcpSocket::new(old_sender));
-        let old_conn_id = old_socket.conn_id().unwrap();
-        state.begin_connect().record_connection(&old_socket);
-
-        let (new_sender, _new_receiver) = tokio::sync::mpsc::channel(1);
-        let new_socket = Socket::TCP(crate::tcp::TcpSocket::new(new_sender));
-        state.begin_connect().record_connection(&new_socket);
-        state.record_connection_failure(old_conn_id);
-
-        let snapshot = state.snapshot();
-        assert!(snapshot.connected);
-        assert_eq!(snapshot.failures, 0);
-    }
 
     #[tokio::test]
     async fn test_send_rsp_invalid_endpoint_logs_and_does_not_panic() {

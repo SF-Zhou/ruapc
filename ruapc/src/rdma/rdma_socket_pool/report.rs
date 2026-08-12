@@ -1,3 +1,5 @@
+//! Path/connection introspection: the RDMA path report.
+
 use std::{
     sync::atomic::Ordering,
     sync::{Arc, Weak},

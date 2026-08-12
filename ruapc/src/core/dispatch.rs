@@ -107,7 +107,7 @@ mod tests {
     use super::*;
     use crate::{Context, MsgFlags, MsgMeta, SocketPoolConfig};
 
-    fn make_ctx(config: &SocketPoolConfig, timeout_ms: Option<u32>) -> Context {
+    fn make_ctx(config: &SocketPoolConfig, timeout_ms: u32) -> Context {
         let base = Context::create(config).unwrap();
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let socket = crate::Socket::TCP(crate::sockets::tcp::TcpSocket::new(tx));
@@ -128,7 +128,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_expired_request_is_dropped() {
-        let ctx = make_ctx(&tcp_config(), Some(0));
+        let ctx = make_ctx(&tcp_config(), 0);
         // The zero budget expired on arrival.
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let state = ctx.state.clone();
@@ -149,7 +149,7 @@ mod tests {
             max_inflight_requests: 1,
             ..Default::default()
         };
-        let ctx = make_ctx(&config, None);
+        let ctx = make_ctx(&config, 30_000);
         let state = ctx.state.clone();
         // Simulate one request already in flight.
         state
@@ -170,7 +170,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handler_runs_and_metrics_settle() {
-        let ctx = make_ctx(&tcp_config(), Some(30_000));
+        let ctx = make_ctx(&tcp_config(), 30_000);
         let state = ctx.state.clone();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         spawn_handler(ctx, "TestSvc/x", crate::Payload::Empty, move |_, _| async {
