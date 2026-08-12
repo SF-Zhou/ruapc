@@ -118,6 +118,7 @@ cargo run --release --bin server -- --listen-mode unified
 cargo run --release --bin server -- --listen-mode tcp
 cargo run --release --bin server -- --listen-mode ws
 cargo run --release --bin server -- --listen-mode http
+cargo run --release --bin server -- --listen-mode http --http-base-path /api/v1
 ```
 
 ### Client
@@ -146,6 +147,20 @@ curl -s -X POST http://0.0.0.0:8000/MetaService/list_methods | json_pp
 # Access interactive API documentation
 open http://0.0.0.0:8000/rapidoc
 ```
+
+HTTP endpoints can be mounted under a base path on both the server and typed
+HTTP clients by using the same socket pool configuration:
+
+```rust
+let config = SocketPoolConfig {
+    listen_mode: ListenMode::HTTP,
+    http_base_path: "/api/v1".into(),
+    ..Default::default()
+};
+```
+
+This exposes RPC methods at `/api/v1/ServiceName/method`, the HTTP/2 RPC
+stream at `/api/v1/_rpc`, and API documentation at `/api/v1/rapidoc`.
 
 ### Remote Read/Write
 

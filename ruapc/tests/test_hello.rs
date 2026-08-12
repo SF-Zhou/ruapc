@@ -96,6 +96,31 @@ async fn test_http() {
     server.join().await;
 }
 
+#[tokio::test]
+async fn test_typed_http_with_base_path() {
+    let foo = Arc::new(FooImpl);
+    let mut router = ruapc::Router::default();
+    foo.ruapc_export(&mut router);
+
+    let config = SocketPoolConfig {
+        listen_mode: ListenMode::HTTP,
+        http_base_path: "/rpc".to_string(),
+        ..Default::default()
+    };
+    let server = ruapc::Server::create(router, &config).unwrap();
+    let addr = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+
+    let client = ruapc::Client::default();
+    let ctx = ruapc::Context::create(&config)
+        .unwrap()
+        .with_endpoint(Endpoint::new(Transport::HTTP, addr));
+    let rsp = client.hello(&ctx, &"ruapc".to_string()).await.unwrap();
+    assert_eq!(rsp, "hello ruapc!");
+
+    server.stop();
+    server.join().await;
+}
+
 /// Drives many concurrent requests over one RDMA connection so the send
 /// window (32) overflows: exercises the pending-send path and opportunistic
 /// aggregation, and validates every response.

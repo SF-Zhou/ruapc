@@ -42,6 +42,10 @@ pub struct SocketPoolConfig {
     /// response (load shedding). `0` disables the cap.
     #[serde_inline_default(0usize)]
     pub max_inflight_requests: usize,
+    /// Base path for HTTP RPC, streaming, and documentation endpoints.
+    /// Empty or `/` serves HTTP endpoints at the root.
+    #[serde_inline_default(String::new())]
+    pub http_base_path: String,
     /// RDMA-specific settings. `None` disables RDMA device discovery,
     /// memory registration, and connection resources.
     #[cfg(feature = "rdma")]
@@ -52,6 +56,33 @@ pub struct SocketPoolConfig {
 impl Default for SocketPoolConfig {
     fn default() -> Self {
         serde_json::from_value(serde_json::Value::Object(serde_json::Map::default())).unwrap()
+    }
+}
+
+impl SocketPoolConfig {
+    pub(crate) fn normalized_http_base_path(&self) -> crate::Result<String> {
+        if self.http_base_path.contains(['?', '#']) {
+            return Err(crate::Error::new(
+                crate::ErrorKind::InvalidArgument,
+                "http_base_path must not contain a query or fragment".into(),
+            ));
+        }
+
+        let path = self.http_base_path.trim_matches('/');
+        if path.is_empty() {
+            return Ok(String::new());
+        }
+
+        let path = format!("/{path}");
+        format!("http://localhost{path}/_rpc")
+            .parse::<hyper::Uri>()
+            .map_err(|e| {
+                crate::Error::new(
+                    crate::ErrorKind::InvalidArgument,
+                    format!("invalid http_base_path: {e}"),
+                )
+            })?;
+        Ok(path)
     }
 }
 
@@ -257,8 +288,28 @@ mod tests {
     fn config_defaults_to_tcp_without_rdma() {
         let config = SocketPoolConfig::default();
         assert_eq!(config.listen_mode, ListenMode::TCP);
+        assert!(config.http_base_path.is_empty());
         #[cfg(feature = "rdma")]
         assert!(config.rdma.is_none());
+    }
+
+    #[test]
+    fn normalizes_http_base_path() {
+        for (input, expected) in [("", ""), ("/", ""), ("api", "/api"), ("/api/", "/api")] {
+            let config = SocketPoolConfig {
+                http_base_path: input.to_string(),
+                ..Default::default()
+            };
+            assert_eq!(config.normalized_http_base_path().unwrap(), expected);
+        }
+
+        for input in ["/api?version=1", "/api#docs", "/not valid"] {
+            let config = SocketPoolConfig {
+                http_base_path: input.to_string(),
+                ..Default::default()
+            };
+            assert!(config.normalized_http_base_path().is_err());
+        }
     }
 
     #[test]

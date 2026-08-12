@@ -19,13 +19,14 @@ type HttpSocketMap = ConnectionMap<HttpSocket>;
 pub struct HttpSocketPool {
     socket_map: HttpSocketMap,
     connect_locks: crate::sockets::connect::ConnectLocks,
+    base_path: Arc<str>,
     http: Builder<TokioExecutor>,
     task_supervisor: TaskSupervisor,
 }
 
 impl SocketPoolTrait for HttpSocketPool {
     fn create(
-        _config: &SocketPoolConfig,
+        config: &SocketPoolConfig,
         _devices: &std::sync::Arc<crate::Devices>,
         _buffer_pool: &std::sync::Arc<crate::BufferPool>,
     ) -> Result<Self> {
@@ -34,6 +35,7 @@ impl SocketPoolTrait for HttpSocketPool {
         Ok(Self {
             socket_map: ConnectionMap::default(),
             connect_locks: Default::default(),
+            base_path: Arc::from(config.normalized_http_base_path()?),
             http,
             task_supervisor: TaskSupervisor::create(),
         })
@@ -72,7 +74,9 @@ impl SocketPoolTrait for HttpSocketPool {
         }
 
         let supervisor = self.task_supervisor.handle();
-        let socket = Self::connect_stream(addr, state, &self.socket_map, &supervisor).await?;
+        let socket =
+            Self::connect_stream(addr, state, &self.socket_map, &supervisor, &self.base_path)
+                .await?;
         Ok(socket.into())
     }
 }
@@ -101,6 +105,7 @@ impl HttpSocketPool {
 
         let state = state.clone();
         let http = self.http.clone();
+        let base_path = self.base_path.clone();
         let supervisor = self.task_supervisor.handle();
 
         let task_supervisor = self
@@ -111,7 +116,13 @@ impl HttpSocketPool {
             let connection = http.serve_connection_with_upgrades(
                 TokioIo::new(tcp_stream),
                 hyper::service::service_fn(move |req: Request<Incoming>| {
-                    Self::handle_request(req, state.clone(), addr, supervisor.clone())
+                    Self::handle_request(
+                        req,
+                        state.clone(),
+                        addr,
+                        supervisor.clone(),
+                        base_path.clone(),
+                    )
                 }),
             );
             tokio::select! {
@@ -132,6 +143,7 @@ impl HttpSocketPool {
         state: Arc<State>,
         addr: SocketAddr,
         supervisor: TaskSupervisorHandle,
+        base_path: Arc<str>,
     ) -> Result<Response<Either<Full<Bytes>, ChannelBody>>> {
         if hyper_tungstenite::is_upgrade_request(&req) {
             let ws_config = crate::sockets::ws::web_socket_config();
@@ -153,13 +165,17 @@ impl HttpSocketPool {
             return Ok(response.map(Either::Left));
         }
 
+        let Some(path) = Self::strip_base_path(&base_path, req.uri().path()) else {
+            return Ok(Self::not_found());
+        };
+
         // Handle /_rpc: bidirectional streaming for reverse RPC.
-        if req.method() == hyper::Method::POST && req.uri().path() == "/_rpc" {
+        if req.method() == hyper::Method::POST && path == "/_rpc" {
             return Self::handle_rpc_stream(req, state, addr, &supervisor).await;
         }
 
         if req.method() == hyper::Method::GET {
-            match req.uri().path() {
+            match path {
                 "/openapi.json" => {
                     let openapi_json = serde_json::to_string_pretty(&state.router.openapi)?;
                     return Ok(Response::builder()
@@ -176,17 +192,15 @@ impl HttpSocketPool {
                         .unwrap());
                 }
                 "/rapidoc" | "/rapidoc/" | "/rapidoc/index.html" => {
-                    let html = include_str!("rapidoc/index.html");
+                    let html =
+                        include_str!("rapidoc/index.html").replace("{{BASE_PATH}}", &base_path);
                     return Ok(Response::builder()
                         .header("Content-Type", "text/html; charset=utf-8")
                         .body(Either::Left(Full::new(Bytes::from(html))))
                         .unwrap());
                 }
                 _ => {
-                    return Ok(Response::builder()
-                        .status(404)
-                        .body(Either::Left(Full::new(Bytes::from("Not Found"))))
-                        .unwrap());
+                    return Ok(Self::not_found());
                 }
             }
         }
@@ -194,7 +208,7 @@ impl HttpSocketPool {
         const UNARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
         let (msgid, rx) = state.waiter.alloc(UNARY_TIMEOUT);
         let meta = MsgMeta {
-            method: req.uri().path().trim_start_matches('/').to_string(),
+            method: path.trim_start_matches('/').to_string(),
             flags: MsgFlags::IsReq,
             msgid,
             read_regions: Vec::new(),
@@ -235,6 +249,28 @@ impl HttpSocketPool {
             .header("Content-Type", "application/json")
             .body(Either::Left(Full::new(msg.payload.into())))
             .unwrap())
+    }
+
+    fn strip_base_path<'a>(base_path: &str, path: &'a str) -> Option<&'a str> {
+        if base_path.is_empty() {
+            return Some(path);
+        }
+
+        let rest = path.strip_prefix(base_path)?;
+        if rest.is_empty() {
+            Some("/")
+        } else if rest.starts_with('/') {
+            Some(rest)
+        } else {
+            None
+        }
+    }
+
+    fn not_found() -> Response<Either<Full<Bytes>, ChannelBody>> {
+        Response::builder()
+            .status(404)
+            .body(Either::Left(Full::new(Bytes::from("Not Found"))))
+            .unwrap()
     }
 
     /// Handle a `POST /_rpc` request for bidirectional streaming.
@@ -329,6 +365,7 @@ impl HttpSocketPool {
         state: &Arc<State>,
         socket_map: &HttpSocketMap,
         supervisor: &TaskSupervisorHandle,
+        base_path: &str,
     ) -> Result<HttpSocket> {
         use hyper::client::conn::http2;
 
@@ -358,7 +395,7 @@ impl HttpSocketPool {
         let (req_tx, req_rx) = mpsc::channel::<Bytes>(1024);
 
         let req = Request::builder()
-            .uri(format!("http://{addr}/_rpc"))
+            .uri(format!("http://{addr}{base_path}/_rpc"))
             .method(hyper::Method::POST)
             .body(ChannelBody::new(req_rx))
             .map_err(|e| Error::new(ErrorKind::HttpBuildReqFailed, e.to_string()))?;
@@ -367,6 +404,12 @@ impl HttpSocketPool {
             .send_request(req)
             .await
             .map_err(|e| Error::new(ErrorKind::HttpSendReqFailed, e.to_string()))?;
+        if !rsp.status().is_success() {
+            return Err(Error::new(
+                ErrorKind::HttpWaitRspFailed,
+                format!("HTTP RPC stream returned {}", rsp.status()),
+            ));
+        }
 
         // Create the socket for sending messages.
         let stream_socket = StreamSocket::new(req_tx);

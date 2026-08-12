@@ -66,6 +66,13 @@ impl State {
         let buffer_pool = pool_builder.build();
 
         router.build_open_api()?;
+        let http_base_path = config.normalized_http_base_path()?;
+        if !http_base_path.is_empty() {
+            router.openapi.servers.push(openapiv3::Server {
+                url: http_base_path,
+                ..Default::default()
+            });
+        }
         let socket_pool = SocketPool::create(config, &devices, &buffer_pool)?;
 
         let waiter: Arc<Waiter> = Arc::default();
