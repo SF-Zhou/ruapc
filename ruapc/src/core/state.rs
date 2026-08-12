@@ -213,7 +213,7 @@ mod tests {
                 msgid: 0,
                 read_regions: Vec::new(),
                 write_regions: Vec::new(),
-                timeout_ms: None,
+                timeout_ms: 0,
             },
             payload: Payload::Empty,
         };

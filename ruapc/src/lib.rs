@@ -17,12 +17,15 @@ pub use error::{Error, ErrorKind, RemoteIoError, Result};
 mod msg;
 pub use msg::{Message, MsgFlags, MsgMeta, Payload};
 
+mod client;
+pub use client::{Client, ClientWithBuffers};
+
 mod core;
 #[doc(hidden)]
 pub use core::{CallPlain, CallWithBuffer, RawCall, RpcCall, catch_handler_panic, spawn_handler};
 pub use core::{
-    Client, ClientWithBuffers, Context, CopyOp, Listener, MAX_COPY_OPS, MAX_REGIONS, MethodInfo,
-    RemoteSpace, ResultWithBuffers, Router, SentBuffers, Server, State, WithBuffers,
+    Context, CopyOp, Listener, MAX_COPY_OPS, MAX_REGIONS, MethodInfo, RemoteSpace,
+    ResultWithBuffers, Router, SentBuffers, Server, State, WithBuffers,
 };
 
 mod metrics;

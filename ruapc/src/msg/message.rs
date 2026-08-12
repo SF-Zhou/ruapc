@@ -78,9 +78,14 @@ pub struct MsgMeta {
     /// client. The server derives a deadline from it on arrival (relative
     /// budgets avoid clock-skew issues of absolute timestamps), drops the
     /// request if it expires before execution, and shrinks the budget of
-    /// nested RPCs issued while handling it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_ms: Option<u32>,
+    /// nested RPCs issued while handling it. Zero means the request is
+    /// already expired; messages without timeout semantics also use zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub timeout_ms: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 impl MsgMeta {
@@ -402,7 +407,7 @@ mod tests {
             msgid: 42,
             read_regions: Vec::new(),
             write_regions: Vec::new(),
-            timeout_ms: None,
+            timeout_ms: 0,
         }
     }
 
@@ -444,7 +449,7 @@ mod tests {
             msgid: u64::MAX - 1,
             read_regions: vec![region, region],
             write_regions: vec![region],
-            timeout_ms: Some(1500),
+            timeout_ms: 1500,
         };
         let buf = serialize_to_bytes(&meta, &serde_json::json!({"x": 1}));
         let msg = Message::parse(Bytes::from(buf)).unwrap();
@@ -462,16 +467,33 @@ mod tests {
     }
 
     #[test]
+    fn test_meta_decode_defaults_missing_timeout_to_zero() {
+        #[derive(Serialize)]
+        struct MetaWithoutTimeout {
+            method: String,
+            flags: MsgFlags,
+            msgid: u64,
+        }
+
+        let encoded = rmp_serde::to_vec_named(&MetaWithoutTimeout {
+            method: "Svc/m".into(),
+            flags: MsgFlags::IsReq,
+            msgid: 1,
+        })
+        .unwrap();
+        assert_eq!(MsgMeta::decode(&encoded).unwrap().timeout_ms, 0);
+    }
+
+    #[test]
     fn test_minimal_response_meta_roundtrip() {
-        // Response metas skip `method`/regions/`timeout_ms`; only flags
-        // and msgid travel, and absent fields decode to defaults.
+        // Response metas use zero, so timeout_ms is omitted on the wire.
         let meta = MsgMeta {
             method: String::new(),
             flags: MsgFlags::IsRsp,
             msgid: 42,
             read_regions: Vec::new(),
             write_regions: Vec::new(),
-            timeout_ms: None,
+            timeout_ms: 0,
         };
         let buf = serialize_to_bytes(&meta, &serde_json::json!({"ok": true}));
         let msg = Message::parse(Bytes::from(buf)).unwrap();
@@ -564,7 +586,7 @@ mod tests {
             msgid: 7,
             read_regions: Vec::new(),
             write_regions: Vec::new(),
-            timeout_ms: None,
+            timeout_ms: 0,
         };
         let payload = crate::Payload::from(bytes::Bytes::from_static(b"data"));
         let msg2 = Message::new(meta, payload);
@@ -578,6 +600,7 @@ mod tests {
         assert!(meta.method.is_empty());
         assert_eq!(meta.flags, MsgFlags::default());
         assert_eq!(meta.msgid, 0);
+        assert_eq!(meta.timeout_ms, 0);
     }
 
     #[test]

@@ -1,3 +1,5 @@
+//! Per-peer connection state: stripes, metadata and health.
+
 use std::{
     collections::HashMap,
     net::SocketAddr,
@@ -7,7 +9,9 @@ use std::{
 
 use foldhash::fast::RandomState;
 
-use super::{CachedRdmaInfo, PathKey, RetryBackoff, Stripe};
+use super::connect::CachedRdmaInfo;
+use super::maintenance::RetryBackoff;
+use super::{PathKey, Stripe};
 
 /// Connection stripes of one peer, guarded by a *synchronous* lock:
 /// critical sections must stay short and must never await. Structural
