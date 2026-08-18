@@ -10,7 +10,7 @@ use std::{
 use super::super::path::{RdmaNicInfo, RdmaPathInfo, gid_ip};
 use super::super::{ConnectRequest, ConnectionControl, Endpoint, RdmaInfo};
 use super::{RdmaSocket, RdmaSocketPool};
-use crate::{Error, ErrorKind, Result, State};
+use crate::{Error, ErrorKind, RdmaZonePolicy, Result, State};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum AcceptLeaseState {
@@ -88,6 +88,21 @@ impl RdmaSocketPool {
             }
         }
         let (device_index, device) = self.find_device_by_name(&request.target)?;
+        let (info, gid_zones) = device.info_with_zones();
+        let local_zones = gid_zones
+            .get(&(request.target.port_num, request.target.gid_index))
+            .cloned()
+            .unwrap_or_default();
+        if self.config.zone_policy == RdmaZonePolicy::Require
+            && !local_zones
+                .iter()
+                .any(|zone| request.source_zones.contains(zone))
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "RDMA zone policy requires a shared zone".into(),
+            ));
+        }
         let connection_config = self.clamp_connection_config(device, request.config);
         let poller = self.pollers.get_or_start(
             device,
@@ -109,7 +124,6 @@ impl RdmaSocketPool {
             connection_config.traffic_class,
         )?;
 
-        let (info, gid_zones) = device.info_with_zones();
         let local_ip = Self::find_port(&info, request.target.port_num)
             .ok()
             .and_then(|port| port.find_gid(request.target.gid_index))
@@ -120,10 +134,7 @@ impl RdmaSocketPool {
                 port_num: request.target.port_num,
                 gid_index: request.target.gid_index,
                 ip: local_ip,
-                zones: gid_zones
-                    .get(&(request.target.port_num, request.target.gid_index))
-                    .cloned()
-                    .unwrap_or_default(),
+                zones: local_zones,
             },
             remote: RdmaNicInfo {
                 device: request.source_device.clone(),

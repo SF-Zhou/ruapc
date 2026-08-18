@@ -186,10 +186,13 @@ pub struct RdmaSocketPoolConfig {
     /// fabric (device matching cannot verify reachability).
     #[serde(default)]
     pub device_filter: Vec<String>,
-    /// Virtual zones defined by stable names and IP subnets. Ports whose
-    /// addresses match the same zone name are preferred during path selection.
+    /// Virtual zones defined by stable names and IP subnets. Path selection
+    /// uses these labels according to [`RdmaZonePolicy`].
     #[serde(default)]
     pub zones: Vec<RdmaZoneConfig>,
+    /// Controls whether shared-zone paths are preferred or required.
+    #[serde(default)]
+    pub zone_policy: RdmaZonePolicy,
     /// Interval (milliseconds) of the background maintenance task, which
     /// fails connections on downed local ports and replaces dead stripes.
     /// The interval is jittered by ±50% per process. `0` disables
@@ -241,6 +244,18 @@ impl Default for RdmaSocketPoolConfig {
         // default is "deserialize an empty object" — one source of truth.
         serde_json::from_value(serde_json::Value::Object(serde_json::Map::default())).unwrap()
     }
+}
+
+/// Policy for selecting paths based on configured RDMA zones.
+#[cfg(feature = "rdma")]
+#[derive(Deserialize, Serialize, Debug, Default, PartialEq, Eq, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum RdmaZonePolicy {
+    /// Prefer a shared-zone path, falling back to other compatible paths.
+    #[default]
+    Prefer,
+    /// Only establish connections whose local and remote paths share a zone.
+    Require,
 }
 
 /// A virtual RDMA zone assigned from the IP addresses of an RDMA netdev.
@@ -347,6 +362,10 @@ mod tests {
         assert_eq!(rdma.read_timeout_ms, 10_000);
         assert_eq!(rdma.max_inflight_read_wrs, 32);
         assert_eq!(rdma.traffic_class, 0);
+        assert_eq!(rdma.zone_policy, RdmaZonePolicy::Prefer);
+        let require: RdmaSocketPoolConfig =
+            serde_json::from_str(r#"{"zone_policy":"require"}"#).unwrap();
+        assert_eq!(require.zone_policy, RdmaZonePolicy::Require);
         // `Default` is exactly the all-defaults deserialization.
         let default: RdmaSocketPoolConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(default, RdmaSocketPoolConfig::default());

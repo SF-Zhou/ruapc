@@ -368,6 +368,7 @@ impl RdmaSocketPool {
             &placement::Selection {
                 required_remote: None,
                 avoided_remotes: &HashSet::new(),
+                zone_policy: self.config.zone_policy,
             },
             false,
         );
