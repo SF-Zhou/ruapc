@@ -15,9 +15,9 @@ default = []
 [dependencies]
 # The macro generates code against ruapc's internal glue API, so the two
 # crates must be paired exactly (same reason serde pins serde_derive).
-ruapc-macro = { version = "=0.2.0-alpha.2", path = "../ruapc-macro" }
-ruapc-bufpool = { version = "0.2.0-alpha.2", path = "../ruapc-bufpool" }
-ruapc-rdma = { version = "0.2.0-alpha.2", path = "../ruapc-rdma", optional = true }
+ruapc-macro = { version = "=0.2.0-alpha.3", path = "../ruapc-macro" }
+ruapc-bufpool = { version = "0.2.0-alpha.3", path = "../ruapc-bufpool" }
+ruapc-rdma = { version = "0.2.0-alpha.3", path = "../ruapc-rdma", optional = true }
 
 arc-swap.workspace = true
 bitflags.workspace = true
