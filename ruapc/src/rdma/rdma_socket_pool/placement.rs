@@ -11,7 +11,7 @@ use super::super::path::{RdmaNicInfo, RdmaPathInfo, gid_ip};
 use super::super::rdma_service::RdmaPortInfo;
 use super::super::{DeviceSelection, Endpoint, RdmaConnectionConfig, RdmaDevice, RdmaInfo};
 use super::{PeerState, RdmaSocketPool, Stripe, placement};
-use crate::{Error, ErrorKind, RdmaQueuePairConfig, Result};
+use crate::{Error, ErrorKind, RdmaQueuePairConfig, RdmaZonePolicy, Result};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum PathClass {
@@ -34,6 +34,7 @@ pub(super) struct Candidate<'a> {
 pub(super) struct Selection<'a> {
     pub(super) required_remote: Option<&'a str>,
     pub(super) avoided_remotes: &'a HashSet<String>,
+    pub(super) zone_policy: RdmaZonePolicy,
 }
 
 pub(super) fn choose_path(
@@ -101,7 +102,10 @@ pub(super) fn eligible_paths(
     } else {
         eligible.retain(|candidate| !candidate.blacklisted);
     }
-    retain_if_any(&mut eligible, |candidate| candidate.same_zone);
+    match selection.zone_policy {
+        RdmaZonePolicy::Prefer => retain_if_any(&mut eligible, |candidate| candidate.same_zone),
+        RdmaZonePolicy::Require => eligible.retain(|candidate| candidate.same_zone),
+    }
     if let Some(best_class) = eligible.iter().map(|candidate| candidate.class).min() {
         eligible.retain(|candidate| candidate.class == best_class);
     }
@@ -230,6 +234,7 @@ mod tests {
                 Selection {
                     required_remote: Some("missing"),
                     avoided_remotes: &avoided,
+                    zone_policy: RdmaZonePolicy::Prefer,
                 },
                 [0, 1],
             )
@@ -241,6 +246,7 @@ mod tests {
                 Selection {
                     required_remote: None,
                     avoided_remotes: &avoided,
+                    zone_policy: RdmaZonePolicy::Prefer,
                 },
                 [0, 1],
             )
@@ -260,10 +266,28 @@ mod tests {
                 Selection {
                     required_remote: None,
                     avoided_remotes: &HashSet::new(),
+                    zone_policy: RdmaZonePolicy::Prefer,
                 },
                 [0, 1],
             ),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn required_zone_does_not_fall_back() {
+        let candidates = [candidate(0, "a", false), candidate(1, "b", false)];
+        assert!(
+            choose_path(
+                &candidates,
+                Selection {
+                    required_remote: None,
+                    avoided_remotes: &HashSet::new(),
+                    zone_policy: RdmaZonePolicy::Require,
+                },
+                [0, 1],
+            )
+            .is_none()
         );
     }
 
@@ -535,6 +559,7 @@ impl RdmaSocketPool {
             placement::Selection {
                 required_remote: preference.remote_device,
                 avoided_remotes: preference.avoided_remote_nics,
+                zone_policy: self.config.zone_policy,
             },
             [self.pseudo_random(), self.pseudo_random()],
         )

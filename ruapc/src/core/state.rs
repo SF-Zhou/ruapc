@@ -116,6 +116,9 @@ impl State {
                 let prefer_rxe = std::env::var("RUAPC_PREFER_RXE").is_ok();
                 let filter = &rdma.device_filter;
                 for dev in active_devices {
+                    if !dev.info().ports.iter().any(|port| port.is_usable()) {
+                        continue;
+                    }
                     if prefer_rxe && !dev.info().name.starts_with("rxe") {
                         continue;
                     }
