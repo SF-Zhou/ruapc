@@ -6,18 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
-### Fixed
-- `ruapc-rdma`: `ibv_port_cap_flags2` now uses the bound struct field's `u16`
-  width, so reading `ibv_port_attr.port_cap_flags2` no longer includes adjacent
-  padding. `query_port` now uses a zeroed `MaybeUninit` out buffer and constructs
-  `ibv_port_attr` only after a successful FFI call, avoiding invalid zero
-  discriminants in Rust enum fields such as `ibv_mtu`
+## [0.2.0-alpha.3] - 2026-08-19
+
+### Added
+- Transport-aware endpoint failover across equivalent addresses and protocols,
+  with healthy established connections preferred and alternatives preconnected
+  (#96)
+- HTTP base path support for serving RPC, OpenAPI, and RapiDoc endpoints below a
+  configurable URL prefix (#99)
+- Client-selected RDMA GRH traffic class configuration for RoCE connections
+  (`rdma.traffic_class`) (#89)
+- CRC32C-verified remote read/write throughput benchmarks in `ruapc-demo` (#90)
+- `ruapc-rdma` README with feature overview, C-shim rationale, and crate layout
 
 ### Changed
 - **BREAKING**: RDMA NIC policy is now static per `Context`. Removed request-level
   path selectors/modes and remote-name filters. `rdma.device_filter` and
   CIDR-backed virtual zones now define path policy at initialization; automatic
   failure avoidance, NIC coverage, and connection rebalancing remain internal
+  (#97, #100)
 - **BREAKING** (`ruapc-rdma`): removed the unused `RdmaBuffer` trait, a
   leftover from before `QueuePair` took `ruapc_bufpool::Buffer` directly
 - **BREAKING** (`ruapc-rdma`): `ibv_device_cap_flags`, `ibv_port_cap_flags`,
@@ -27,11 +34,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - `ruapc-rdma`: extensions on generated FFI types moved into `src/ffi/`
   (`gid`, `wc`, `flags`, `pthread`); lint allowances are now scoped to the
   generated bindings instead of crate-wide; the build script reruns when the
-  bound C headers change
+  bound C headers change (#94)
+- Client, socket, RDMA poller, and RDMA socket pool internals were split into
+  focused modules without changing their public API (#98)
 
-### Added
-- `ruapc-rdma`: README with feature overview, C-shim rationale, and layout of
-  the crate
+### Fixed
+- `ruapc-rdma`: `ibv_port_cap_flags2` now uses the bound struct field's `u16`
+  width, so reading `ibv_port_attr.port_cap_flags2` no longer includes adjacent
+  padding. `query_port` now uses a zeroed `MaybeUninit` out buffer and constructs
+  `ibv_port_attr` only after a successful FFI call, avoiding invalid zero
+  discriminants in Rust enum fields such as `ibv_mtu` (#94)
+- Link `libibverbs` after the C shim so static-link symbol resolution succeeds
+  (#91)
 
 ## [0.2.0-alpha.2] - 2026-07-26
 
