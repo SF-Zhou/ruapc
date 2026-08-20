@@ -38,8 +38,6 @@ pub struct RdmaNicInfo {
     pub gid_index: u8,
     /// IP address carried by the GID (RoCE v2 only; `None` for IB/RoCE v1).
     pub ip: Option<IpAddr>,
-    /// Virtual zone names assigned from the selected GID's netdev address.
-    pub zones: Vec<String>,
 }
 
 /// The pair of NICs an RDMA connection runs on.
@@ -49,6 +47,8 @@ pub struct RdmaPathInfo {
     pub local: RdmaNicInfo,
     /// NIC on the peer side of the connection.
     pub remote: RdmaNicInfo,
+    /// Whether both NIC addresses belong to a client-configured subnet.
+    pub same_subnet: bool,
 }
 
 /// Direction of an RDMA connection relative to this process.

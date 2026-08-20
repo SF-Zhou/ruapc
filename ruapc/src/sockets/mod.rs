@@ -14,7 +14,7 @@ pub use endpoint::{Endpoint, ListenMode, Transport};
 mod config;
 pub use config::SocketPoolConfig;
 #[cfg(feature = "rdma")]
-pub use config::{RdmaQueuePairConfig, RdmaSocketPoolConfig, RdmaZoneConfig, RdmaZonePolicy};
+pub use config::{RdmaQueuePairConfig, RdmaSocketPoolConfig, RdmaSubnetPolicy};
 
 /// Socket pool management.
 mod socket_pool;

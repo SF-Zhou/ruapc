@@ -195,21 +195,6 @@ impl RdmaSocketPool {
         buffer_pool: Arc<BufferPool>,
         config: RdmaSocketPoolConfig,
     ) -> Result<Self> {
-        for (index, zone) in config.zones.iter().enumerate() {
-            if zone.name.is_empty()
-                || config.zones[..index]
-                    .iter()
-                    .any(|existing| existing.name == zone.name)
-            {
-                return Err(Error::new(
-                    ErrorKind::InvalidArgument,
-                    format!(
-                        "RDMA zone names must be non-empty and unique: {:?}",
-                        zone.name
-                    ),
-                ));
-            }
-        }
         if config.connect_lease_ms < 15_000 {
             return Err(Error::new(
                 ErrorKind::InvalidArgument,

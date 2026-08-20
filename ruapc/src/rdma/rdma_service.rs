@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use ruapc_rdma::{Gid, LinkLayer};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -21,8 +19,6 @@ pub struct RdmaPortInfo {
     pub link_layer: LinkLayer,
     /// Usable GIDs of this port (filtered at collection time).
     pub gids: Vec<Gid>,
-    /// Virtual zone names indexed by GID index.
-    pub gid_zones: HashMap<u8, Vec<String>>,
 }
 
 /// RDMA device information for connection negotiation.
@@ -66,7 +62,7 @@ impl RdmaInfo {
                 .iter()
                 .enumerate()
                 .map(|(index, d)| {
-                    let (info, gid_zones) = d.info_with_zones();
+                    let info = d.info();
                     RdmaDeviceInfo {
                         name: info.name.clone(),
                         active_connections: conn_counts
@@ -109,16 +105,6 @@ impl RdmaInfo {
                                 port_num: port.port_num,
                                 link_layer: port.port_attr.link_layer,
                                 gids: port.gids.clone(),
-                                gid_zones: port
-                                    .gids
-                                    .iter()
-                                    .filter_map(|gid| {
-                                        gid_zones
-                                            .get(&(port.port_num, gid.index))
-                                            .cloned()
-                                            .map(|zones| (gid.index, zones))
-                                    })
-                                    .collect(),
                             })
                             .collect(),
                     }
@@ -229,7 +215,7 @@ mod tests {
             connection_id: 1,
             endpoint,
             source_device: "test".into(),
-            source_zones: Vec::new(),
+            same_subnet: false,
             target: rdma::DeviceSelection {
                 device_name: "missing".into(),
                 port_num: 1,

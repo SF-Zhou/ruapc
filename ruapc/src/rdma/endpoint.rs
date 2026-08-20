@@ -89,8 +89,8 @@ pub struct ConnectRequest {
     /// Name of the client-side RDMA device this connection originates
     /// from; gives the server full path (NIC pair) visibility.
     pub source_device: String,
-    /// Virtual zone names assigned to the selected client GID.
-    pub source_zones: Vec<String>,
+    /// Whether the client matched both NIC addresses to one configured subnet.
+    pub same_subnet: bool,
     /// Server device/port/GID that should accept this connection.
     pub target: DeviceSelection,
     /// Queue Pair settings negotiated by the client for this connection.

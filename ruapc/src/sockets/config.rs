@@ -186,13 +186,13 @@ pub struct RdmaSocketPoolConfig {
     /// fabric (device matching cannot verify reachability).
     #[serde(default)]
     pub device_filter: Vec<String>,
-    /// Virtual zones defined by stable names and IP subnets. Path selection
-    /// uses these labels according to [`RdmaZonePolicy`].
+    /// IP subnets used by clients to match local and remote NIC addresses.
+    /// A path matches when both addresses belong to any one subnet.
     #[serde(default)]
-    pub zones: Vec<RdmaZoneConfig>,
-    /// Controls whether shared-zone paths are preferred or required.
+    pub subnets: Vec<ipnet::IpNet>,
+    /// Controls whether same-subnet paths are preferred or required.
     #[serde(default)]
-    pub zone_policy: RdmaZonePolicy,
+    pub subnet_policy: RdmaSubnetPolicy,
     /// Interval (milliseconds) of the background maintenance task, which
     /// fails connections on downed local ports and replaces dead stripes.
     /// The interval is jittered by ±50% per process. `0` disables
@@ -246,27 +246,16 @@ impl Default for RdmaSocketPoolConfig {
     }
 }
 
-/// Policy for selecting paths based on configured RDMA zones.
+/// Policy for selecting paths based on configured RDMA subnets.
 #[cfg(feature = "rdma")]
 #[derive(Deserialize, Serialize, Debug, Default, PartialEq, Eq, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
-pub enum RdmaZonePolicy {
-    /// Prefer a shared-zone path, falling back to other compatible paths.
+pub enum RdmaSubnetPolicy {
+    /// Prefer a same-subnet path, falling back to other compatible paths.
     #[default]
     Prefer,
-    /// Only establish connections whose local and remote paths share a zone.
+    /// Only establish connections whose local and remote addresses share a subnet.
     Require,
-}
-
-/// A virtual RDMA zone assigned from the IP addresses of an RDMA netdev.
-#[cfg(feature = "rdma")]
-#[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone)]
-#[serde(deny_unknown_fields)]
-pub struct RdmaZoneConfig {
-    /// Stable name exchanged with peers, for example `storage-a`.
-    pub name: String,
-    /// IP networks whose local interface addresses belong to this subnet.
-    pub cidrs: Vec<ipnet::IpNet>,
 }
 
 /// Queue Pair capabilities requested or negotiated for an RDMA connection.
@@ -362,10 +351,13 @@ mod tests {
         assert_eq!(rdma.read_timeout_ms, 10_000);
         assert_eq!(rdma.max_inflight_read_wrs, 32);
         assert_eq!(rdma.traffic_class, 0);
-        assert_eq!(rdma.zone_policy, RdmaZonePolicy::Prefer);
+        assert!(rdma.subnets.is_empty());
+        assert_eq!(rdma.subnet_policy, RdmaSubnetPolicy::Prefer);
         let require: RdmaSocketPoolConfig =
-            serde_json::from_str(r#"{"zone_policy":"require"}"#).unwrap();
-        assert_eq!(require.zone_policy, RdmaZonePolicy::Require);
+            serde_json::from_str(r#"{"subnets":["10.11.0.0/16"],"subnet_policy":"require"}"#)
+                .unwrap();
+        assert_eq!(require.subnets, ["10.11.0.0/16".parse().unwrap()]);
+        assert_eq!(require.subnet_policy, RdmaSubnetPolicy::Require);
         // `Default` is exactly the all-defaults deserialization.
         let default: RdmaSocketPoolConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(default, RdmaSocketPoolConfig::default());

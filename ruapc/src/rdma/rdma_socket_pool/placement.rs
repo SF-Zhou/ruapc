@@ -2,6 +2,7 @@
 //! scoring, GID matching and endpoint construction.
 
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::sync::atomic::Ordering;
 
 use foldhash::fast::RandomState;
@@ -11,7 +12,7 @@ use super::super::path::{RdmaNicInfo, RdmaPathInfo, gid_ip};
 use super::super::rdma_service::RdmaPortInfo;
 use super::super::{DeviceSelection, Endpoint, RdmaConnectionConfig, RdmaDevice, RdmaInfo};
 use super::{PeerState, RdmaSocketPool, Stripe, placement};
-use crate::{Error, ErrorKind, RdmaQueuePairConfig, RdmaZonePolicy, Result};
+use crate::{Error, ErrorKind, RdmaQueuePairConfig, RdmaSubnetPolicy, Result};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum PathClass {
@@ -24,7 +25,7 @@ pub(super) struct Candidate<'a> {
     pub(super) index: usize,
     pub(super) local_index: usize,
     pub(super) remote: &'a str,
-    pub(super) same_zone: bool,
+    pub(super) same_subnet: bool,
     pub(super) class: PathClass,
     pub(super) blacklisted: bool,
     pub(super) local_load: u64,
@@ -34,7 +35,7 @@ pub(super) struct Candidate<'a> {
 pub(super) struct Selection<'a> {
     pub(super) required_remote: Option<&'a str>,
     pub(super) avoided_remotes: &'a HashSet<String>,
-    pub(super) zone_policy: RdmaZonePolicy,
+    pub(super) subnet_policy: RdmaSubnetPolicy,
 }
 
 pub(super) fn choose_path(
@@ -102,9 +103,9 @@ pub(super) fn eligible_paths(
     } else {
         eligible.retain(|candidate| !candidate.blacklisted);
     }
-    match selection.zone_policy {
-        RdmaZonePolicy::Prefer => retain_if_any(&mut eligible, |candidate| candidate.same_zone),
-        RdmaZonePolicy::Require => eligible.retain(|candidate| candidate.same_zone),
+    match selection.subnet_policy {
+        RdmaSubnetPolicy::Prefer => retain_if_any(&mut eligible, |candidate| candidate.same_subnet),
+        RdmaSubnetPolicy::Require => eligible.retain(|candidate| candidate.same_subnet),
     }
     if let Some(best_class) = eligible.iter().map(|candidate| candidate.class).min() {
         eligible.retain(|candidate| candidate.class == best_class);
@@ -113,6 +114,18 @@ pub(super) fn eligible_paths(
         .into_iter()
         .map(|candidate| candidate.index)
         .collect()
+}
+
+fn addresses_share_subnet(
+    local: Option<IpAddr>,
+    remote: Option<IpAddr>,
+    subnets: &[ipnet::IpNet],
+) -> bool {
+    local.zip(remote).is_some_and(|(local, remote)| {
+        subnets
+            .iter()
+            .any(|subnet| subnet.contains(&local) && subnet.contains(&remote))
+    })
 }
 
 fn retain_if_any<T>(items: &mut Vec<T>, predicate: impl Fn(&T) -> bool) {
@@ -234,7 +247,7 @@ mod tests {
                 Selection {
                     required_remote: Some("missing"),
                     avoided_remotes: &avoided,
-                    zone_policy: RdmaZonePolicy::Prefer,
+                    subnet_policy: RdmaSubnetPolicy::Prefer,
                 },
                 [0, 1],
             )
@@ -246,7 +259,7 @@ mod tests {
                 Selection {
                     required_remote: None,
                     avoided_remotes: &avoided,
-                    zone_policy: RdmaZonePolicy::Prefer,
+                    subnet_policy: RdmaSubnetPolicy::Prefer,
                 },
                 [0, 1],
             )
@@ -255,18 +268,18 @@ mod tests {
     }
 
     #[test]
-    fn zone_precedes_link_class() {
+    fn subnet_precedes_link_class() {
         let mut ib = candidate(0, "ib", false);
         ib.class = PathClass::InfiniBand;
         let mut roce = candidate(1, "roce", false);
-        roce.same_zone = true;
+        roce.same_subnet = true;
         assert_eq!(
             choose_path(
                 &[ib, roce],
                 Selection {
                     required_remote: None,
                     avoided_remotes: &HashSet::new(),
-                    zone_policy: RdmaZonePolicy::Prefer,
+                    subnet_policy: RdmaSubnetPolicy::Prefer,
                 },
                 [0, 1],
             ),
@@ -275,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn required_zone_does_not_fall_back() {
+    fn required_subnet_does_not_fall_back() {
         let candidates = [candidate(0, "a", false), candidate(1, "b", false)];
         assert!(
             choose_path(
@@ -283,7 +296,7 @@ mod tests {
                 Selection {
                     required_remote: None,
                     avoided_remotes: &HashSet::new(),
-                    zone_policy: RdmaZonePolicy::Require,
+                    subnet_policy: RdmaSubnetPolicy::Require,
                 },
                 [0, 1],
             )
@@ -355,7 +368,7 @@ mod tests {
             index,
             local_index: 0,
             remote,
-            same_zone: false,
+            same_subnet: false,
             class: PathClass::RoceV2,
             blacklisted,
             local_load: 0,
@@ -411,7 +424,7 @@ impl RdmaSocketPool {
                 remote_ports += 1;
 
                 for (local_device_index, local_device) in local_devices.iter().enumerate() {
-                    let (local_info, gid_zones) = local_device.info_with_zones();
+                    let local_info = local_device.info();
                     for local_port in &local_info.ports {
                         if !local_port.is_usable() {
                             continue;
@@ -423,7 +436,7 @@ impl RdmaSocketPool {
                         link_layer_matches += 1;
 
                         let gid_pairs = Self::match_gid_pairs(local_port, remote_port);
-                        let pair_limit = if self.config.zones.is_empty() {
+                        let pair_limit = if self.config.subnets.is_empty() {
                             1
                         } else {
                             gid_pairs.len()
@@ -439,6 +452,8 @@ impl RdmaSocketPool {
                                 .iter()
                                 .find(|gid| gid.index == remote_gid_index)
                                 .and_then(|gid| gid_ip(&gid.gid));
+                            let same_subnet =
+                                addresses_share_subnet(local_ip, remote_ip, &self.config.subnets);
                             let class = match local_port.port_attr.link_layer {
                                 LinkLayer::InfiniBand => PathClass::InfiniBand,
                                 LinkLayer::Ethernet
@@ -464,22 +479,14 @@ impl RdmaSocketPool {
                                         port_num: local_port.port_num,
                                         gid_index: local_gid_index,
                                         ip: local_ip,
-                                        zones: gid_zones
-                                            .get(&(local_port.port_num, local_gid_index))
-                                            .cloned()
-                                            .unwrap_or_default(),
                                     },
                                     remote: RdmaNicInfo {
                                         device: remote_device.name.clone(),
                                         port_num: remote_port.port_num,
                                         gid_index: remote_gid_index,
                                         ip: remote_ip,
-                                        zones: remote_port
-                                            .gid_zones
-                                            .get(&remote_gid_index)
-                                            .cloned()
-                                            .unwrap_or_default(),
                                     },
+                                    same_subnet,
                                 },
                             });
                         }
@@ -543,7 +550,7 @@ impl RdmaSocketPool {
                     index,
                     local_index: candidate.local_device_index,
                     remote: &candidate.path.remote.device,
-                    same_zone: candidate.has_same_zone(),
+                    same_subnet: candidate.path.same_subnet,
                     class: candidate.class,
                     blacklisted: self.is_blacklisted(peer, candidate),
                     local_load: self
@@ -559,7 +566,7 @@ impl RdmaSocketPool {
             placement::Selection {
                 required_remote: preference.remote_device,
                 avoided_remotes: preference.avoided_remote_nics,
-                zone_policy: self.config.zone_policy,
+                subnet_policy: self.config.subnet_policy,
             },
             [self.pseudo_random(), self.pseudo_random()],
         )
@@ -600,7 +607,7 @@ impl RdmaSocketPool {
     fn match_roce_gid_pairs(local_gids: &[Gid], remote_gids: &[Gid]) -> Vec<(u8, u8)> {
         let mut pairs = Vec::new();
         // Prefer RoCE v2 pairs, then RoCE v1 pairs, while retaining every
-        // compatible pair so zone preference can select the right GID.
+        // compatible pair so subnet preference can select the right GID.
         for wanted in [GidType::RoCEv2, GidType::RoCEv1] {
             for local in local_gids.iter().filter(|gid| gid.gid_type == wanted) {
                 for remote in remote_gids.iter().filter(|gid| gid.gid_type == wanted) {
@@ -882,18 +889,6 @@ pub(super) struct PathCandidate {
     pub(super) path: RdmaPathInfo,
 }
 
-impl PathCandidate {
-    pub(super) fn has_same_zone(&self) -> bool {
-        !self.path.local.zones.is_empty()
-            && self
-                .path
-                .local
-                .zones
-                .iter()
-                .any(|zone| self.path.remote.zones.contains(zone))
-    }
-}
-
 #[cfg(test)]
 mod path_selection_tests {
     use std::net::SocketAddr;
@@ -943,15 +938,14 @@ mod path_selection_tests {
                     port_num: 1,
                     gid_index: 0,
                     ip: None,
-                    zones: Vec::new(),
                 },
                 remote: RdmaNicInfo {
                     device: remote_dev.into(),
                     port_num: 1,
                     gid_index: 0,
                     ip: None,
-                    zones: Vec::new(),
                 },
+                same_subnet: false,
             },
         }
     }
@@ -1064,35 +1058,6 @@ mod path_selection_tests {
     }
 
     #[tokio::test]
-    async fn test_rejects_invalid_zone_names() {
-        for zones in [
-            vec![crate::RdmaZoneConfig {
-                name: String::new(),
-                cidrs: Vec::new(),
-            }],
-            vec![
-                crate::RdmaZoneConfig {
-                    name: "storage".into(),
-                    cidrs: Vec::new(),
-                },
-                crate::RdmaZoneConfig {
-                    name: "storage".into(),
-                    cidrs: Vec::new(),
-                },
-            ],
-        ] {
-            let devices = crate::rdma::test_utils::make_rdma_devices();
-            let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
-            let config = RdmaSocketPoolConfig {
-                zones,
-                ..Default::default()
-            };
-            let err = RdmaSocketPool::new(devices, buffer_pool, config).unwrap_err();
-            assert_eq!(err.kind, ErrorKind::InvalidArgument);
-        }
-    }
-
-    #[tokio::test]
     async fn test_accept_lease_transitions_are_state_checked() {
         let pool = make_pool();
         let connection_id = 42;
@@ -1189,24 +1154,25 @@ mod path_selection_tests {
     }
 
     #[test]
-    fn test_candidate_detects_shared_zone() {
-        let mut candidate = candidate(0, "remoteA");
-        assert!(!candidate.has_same_zone());
-
-        candidate.path.local.zones = vec!["storage-a".into(), "storage-b".into()];
-        candidate.path.remote.zones = vec!["storage-b".into()];
-        assert!(candidate.has_same_zone());
-
-        candidate.path.remote.zones = vec!["frontend".into()];
-        assert!(!candidate.has_same_zone());
+    fn test_addresses_share_client_subnet() {
+        let subnets = ["10.11.0.0/16".parse().unwrap()];
+        assert!(addresses_share_subnet(
+            Some("10.11.1.2".parse().unwrap()),
+            Some("10.11.200.3".parse().unwrap()),
+            &subnets,
+        ));
+        assert!(!addresses_share_subnet(
+            Some("10.11.1.2".parse().unwrap()),
+            Some("10.12.1.2".parse().unwrap()),
+            &subnets,
+        ));
     }
 
     #[tokio::test]
-    async fn test_same_zone_is_preferred() {
+    async fn test_same_subnet_is_preferred() {
         let pool = make_pool();
         let mut same_subnet = candidate(0, "remoteA");
-        same_subnet.path.local.zones = vec!["storage".into()];
-        same_subnet.path.remote.zones = vec!["storage".into()];
+        same_subnet.path.same_subnet = true;
         let other = candidate(0, "remoteB");
         let candidates = [same_subnet, other];
         let info = remote_info(&[("remoteA", 10), ("remoteB", 0)]);
@@ -1371,7 +1337,6 @@ mod path_selection_tests {
 #[cfg(test)]
 mod gid_match_tests {
     use super::*;
-    use std::collections::HashMap;
 
     fn make_gid(addr: &str) -> ruapc_rdma::ibv_gid {
         let bits = addr.parse::<std::net::Ipv6Addr>().unwrap().to_bits();
@@ -1416,7 +1381,7 @@ mod gid_match_tests {
     }
 
     #[test]
-    fn test_retains_all_compatible_gid_pairs_for_zone_selection() {
+    fn test_retains_all_compatible_gid_pairs_for_subnet_selection() {
         let local = [
             gid(1, "::ffff:10.0.0.1", GidType::RoCEv2),
             gid(2, "::ffff:10.1.0.1", GidType::RoCEv2),
@@ -1480,7 +1445,6 @@ mod gid_match_tests {
             port_num: 1,
             link_layer: LinkLayer::Ethernet,
             gids: vec![gid(2, "::ffff:10.0.0.2", GidType::RoCEv2)],
-            gid_zones: HashMap::new(),
         };
         assert_eq!(
             RdmaSocketPool::match_gid_pairs(&local, &remote)

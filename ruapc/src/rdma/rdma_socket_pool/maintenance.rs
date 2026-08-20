@@ -356,7 +356,7 @@ impl RdmaSocketPool {
                 index,
                 local_index: candidate.local_device_index,
                 remote: &candidate.path.remote.device,
-                same_zone: candidate.has_same_zone(),
+                same_subnet: candidate.path.same_subnet,
                 class: candidate.class,
                 blacklisted: self.is_blacklisted(peer, candidate),
                 local_load: 0,
@@ -368,7 +368,7 @@ impl RdmaSocketPool {
             &placement::Selection {
                 required_remote: None,
                 avoided_remotes: &HashSet::new(),
-                zone_policy: self.config.zone_policy,
+                subnet_policy: self.config.subnet_policy,
             },
             false,
         );

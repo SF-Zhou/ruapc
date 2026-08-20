@@ -463,7 +463,7 @@ impl RdmaSocketPool {
             connection_id,
             endpoint: local_endpoint,
             source_device: candidate.path.local.device.clone(),
-            source_zones: candidate.path.local.zones.clone(),
+            same_subnet: candidate.path.same_subnet,
             target: candidate.remote.clone(),
             config: connection_config,
         };

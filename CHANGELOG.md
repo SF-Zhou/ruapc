@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+### Changed
+- **BREAKING**: RDMA subnet matching is now client-only. `rdma.subnets` is a
+  plain CIDR list and `rdma.subnet_policy` prefers or requires paths whose two
+  NIC addresses belong to the same configured CIDR; named virtual zones and
+  server-side zone matching were removed.
+
 ## [0.2.0-alpha.3] - 2026-08-19
 
 ### Added
