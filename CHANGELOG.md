@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.2.0-alpha.4] - 2026-08-20
+
 ### Changed
 - **BREAKING**: RDMA subnet matching is now client-only. `rdma.subnets` is a
   plain CIDR list and `rdma.subnet_policy` prefers or requires paths whose two
