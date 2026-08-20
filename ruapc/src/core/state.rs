@@ -125,7 +125,7 @@ impl State {
                     if !filter.is_empty() && !filter.iter().any(|f| f == dev.info().name.as_str()) {
                         continue;
                     }
-                    devices.add_rdma_device(dev, &rdma.zones);
+                    devices.add_rdma_device(dev);
                 }
             }
             devices
