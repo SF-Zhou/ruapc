@@ -111,18 +111,18 @@ impl State {
         {
             let mut devices = Devices::default();
             if let Some(rdma) = &config.rdma
-                && let Ok(active_devices) = ruapc_rdma::ActiveDevice::available()
+                && let Ok(mut active_devices) = ruapc_rdma::ActiveDevice::available()
             {
+                sort_rdma_devices(&mut active_devices);
                 let prefer_rxe = std::env::var("RUAPC_PREFER_RXE").is_ok();
-                let filter = &rdma.device_filter;
                 for dev in active_devices {
-                    if !dev.info().ports.iter().any(|port| port.is_usable()) {
-                        continue;
-                    }
-                    if prefer_rxe && !dev.info().name.starts_with("rxe") {
-                        continue;
-                    }
-                    if !filter.is_empty() && !filter.iter().any(|f| f == dev.info().name.as_str()) {
+                    if !rdma_device_allowed(
+                        &dev.info().name,
+                        dev.info().ports.iter().any(|port| port.is_usable()),
+                        prefer_rxe,
+                        &rdma.device_filter,
+                        &rdma.device_exclude,
+                    ) {
                         continue;
                     }
                     devices.add_rdma_device(dev);
@@ -193,6 +193,25 @@ impl State {
     }
 }
 
+#[cfg(feature = "rdma")]
+fn sort_rdma_devices(devices: &mut [ruapc_rdma::ActiveDevice]) {
+    devices.sort_by(|left, right| left.info().name.cmp(&right.info().name));
+}
+
+#[cfg(feature = "rdma")]
+fn rdma_device_allowed(
+    name: &str,
+    usable: bool,
+    prefer_rxe: bool,
+    filter: &[String],
+    exclude: &[String],
+) -> bool {
+    usable
+        && (!prefer_rxe || name.starts_with("rxe"))
+        && (filter.is_empty() || filter.iter().any(|item| item == name))
+        && !exclude.iter().any(|item| item == name)
+}
+
 impl std::fmt::Debug for State {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("State").finish()
@@ -203,6 +222,40 @@ impl std::fmt::Debug for State {
 mod tests {
     use super::*;
     use crate::{Message, MsgFlags, MsgMeta, Payload, SocketPoolConfig, sockets::tcp::TcpSocket};
+
+    #[cfg(feature = "rdma")]
+    #[test]
+    fn rdma_devices_are_sorted_by_name() {
+        let mut devices = ruapc_rdma::ActiveDevice::available().expect("no RDMA devices");
+        devices.reverse();
+        sort_rdma_devices(&mut devices);
+
+        assert!(devices.is_sorted_by(|left, right| left.info().name <= right.info().name));
+    }
+
+    #[cfg(feature = "rdma")]
+    #[test]
+    fn rdma_device_exclude_takes_precedence() {
+        let filter = vec!["mlx5_0".to_owned(), "mlx5_1".to_owned()];
+        let exclude = vec!["mlx5_1".to_owned()];
+
+        assert!(rdma_device_allowed(
+            "mlx5_0", true, false, &filter, &exclude
+        ));
+        assert!(!rdma_device_allowed(
+            "mlx5_1", true, false, &filter, &exclude
+        ));
+        assert!(!rdma_device_allowed(
+            "mlx5_2", true, false, &filter, &exclude
+        ));
+        assert!(!rdma_device_allowed(
+            "mlx5_0", false, false, &filter, &exclude
+        ));
+        assert!(!rdma_device_allowed(
+            "mlx5_0", true, true, &filter, &exclude
+        ));
+        assert!(!rdma_device_allowed("mlx5_1", true, false, &[], &exclude));
+    }
 
     #[tokio::test]
     async fn test_handle_recv_invalid_msg_type_warns_and_ok() {
