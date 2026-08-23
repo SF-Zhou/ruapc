@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.2.0-alpha.5] - 2026-08-23
+
 ### Changed
 - RDMA device discovery is sorted by device name and supports an explicit
   `rdma.device_exclude` list. `rdma.subnets` now groups CIDRs into multiple
