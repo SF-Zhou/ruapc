@@ -12,7 +12,7 @@ use super::super::path::{RdmaNicInfo, RdmaPathInfo, gid_ip};
 use super::super::rdma_service::RdmaPortInfo;
 use super::super::{DeviceSelection, Endpoint, RdmaConnectionConfig, RdmaDevice, RdmaInfo};
 use super::{PeerState, RdmaSocketPool, Stripe, placement};
-use crate::{Error, ErrorKind, RdmaQueuePairConfig, RdmaSubnetPolicy, Result};
+use crate::{Error, ErrorKind, RdmaQueuePairConfig, RdmaSubnetDomains, RdmaSubnetPolicy, Result};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum PathClass {
@@ -119,12 +119,13 @@ pub(super) fn eligible_paths(
 fn addresses_share_subnet(
     local: Option<IpAddr>,
     remote: Option<IpAddr>,
-    subnets: &[ipnet::IpNet],
+    subnet_domains: &RdmaSubnetDomains,
 ) -> bool {
     local.zip(remote).is_some_and(|(local, remote)| {
-        subnets
-            .iter()
-            .any(|subnet| subnet.contains(&local) && subnet.contains(&remote))
+        subnet_domains.domains().iter().any(|domain| {
+            domain.iter().any(|subnet| subnet.contains(&local))
+                && domain.iter().any(|subnet| subnet.contains(&remote))
+        })
     })
 }
 
@@ -1154,16 +1155,27 @@ mod path_selection_tests {
     }
 
     #[test]
-    fn test_addresses_share_client_subnet() {
-        let subnets = ["10.11.0.0/16".parse().unwrap()];
+    fn test_addresses_share_connectivity_domain() {
+        let subnets = RdmaSubnetDomains::new(vec![
+            vec![
+                "10.11.0.0/16".parse().unwrap(),
+                "10.12.0.0/16".parse().unwrap(),
+            ],
+            vec!["192.168.1.0/24".parse().unwrap()],
+        ]);
         assert!(addresses_share_subnet(
             Some("10.11.1.2".parse().unwrap()),
-            Some("10.11.200.3".parse().unwrap()),
+            Some("10.12.200.3".parse().unwrap()),
             &subnets,
         ));
         assert!(!addresses_share_subnet(
             Some("10.11.1.2".parse().unwrap()),
-            Some("10.12.1.2".parse().unwrap()),
+            Some("192.168.1.2".parse().unwrap()),
+            &subnets,
+        ));
+        assert!(!addresses_share_subnet(
+            Some("10.11.1.2".parse().unwrap()),
+            None,
             &subnets,
         ));
     }

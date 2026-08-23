@@ -186,11 +186,16 @@ pub struct RdmaSocketPoolConfig {
     /// fabric (device matching cannot verify reachability).
     #[serde(default)]
     pub device_filter: Vec<String>,
-    /// IP subnets used by clients to match local and remote NIC addresses.
-    /// A path matches when both addresses belong to any one subnet.
+    /// RDMA devices that must not be used. Exclusion takes precedence over
+    /// `device_filter` when a device appears in both lists.
     #[serde(default)]
-    pub subnets: Vec<ipnet::IpNet>,
-    /// Controls whether same-subnet paths are preferred or required.
+    pub device_exclude: Vec<String>,
+    /// Connectivity domains used by clients to match local and remote NIC
+    /// addresses. Each inner list contains the CIDRs belonging to one domain;
+    /// a path matches when each address belongs to any CIDR in the same domain.
+    #[serde(default)]
+    pub subnets: RdmaSubnetDomains,
+    /// Controls whether paths in the same connectivity domain are preferred or required.
     #[serde(default)]
     pub subnet_policy: RdmaSubnetPolicy,
     /// Interval (milliseconds) of the background maintenance task, which
@@ -243,6 +248,107 @@ impl Default for RdmaSocketPoolConfig {
         // Every field carries an inline serde default, so the canonical
         // default is "deserialize an empty object" — one source of truth.
         serde_json::from_value(serde_json::Value::Object(serde_json::Map::default())).unwrap()
+    }
+}
+
+/// Groups of CIDRs that describe RDMA connectivity domains.
+///
+/// Serde represents this type as a nested list. Its string representation uses
+/// commas between CIDRs in one domain and semicolons between domains.
+#[cfg(feature = "rdma")]
+#[derive(Deserialize, Serialize, Debug, Default, PartialEq, Eq, Clone)]
+#[serde(transparent)]
+pub struct RdmaSubnetDomains(Vec<Vec<ipnet::IpNet>>);
+
+#[cfg(feature = "rdma")]
+impl RdmaSubnetDomains {
+    pub fn new(domains: Vec<Vec<ipnet::IpNet>>) -> Self {
+        Self(domains)
+    }
+
+    pub fn domains(&self) -> &[Vec<ipnet::IpNet>] {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn try_from_string(value: &str) -> crate::Result<Self> {
+        value.parse()
+    }
+}
+
+#[cfg(feature = "rdma")]
+impl std::fmt::Display for RdmaSubnetDomains {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (domain_index, domain) in self.0.iter().enumerate() {
+            if domain_index > 0 {
+                f.write_str(";")?;
+            }
+            for (subnet_index, subnet) in domain.iter().enumerate() {
+                if subnet_index > 0 {
+                    f.write_str(",")?;
+                }
+                subnet.fmt(f)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "rdma")]
+impl std::str::FromStr for RdmaSubnetDomains {
+    type Err = crate::Error;
+
+    fn from_str(value: &str) -> crate::Result<Self> {
+        if value.trim().is_empty() {
+            return Ok(Self::default());
+        }
+
+        let mut domains = Vec::new();
+        for (domain_index, domain) in value.split(';').enumerate() {
+            if domain.trim().is_empty() {
+                return Err(crate::Error::new(
+                    crate::ErrorKind::InvalidArgument,
+                    format!("RDMA subnet domain {} is empty", domain_index + 1),
+                ));
+            }
+
+            let mut subnets = Vec::new();
+            for (subnet_index, subnet) in domain.split(',').enumerate() {
+                let subnet = subnet.trim();
+                if subnet.is_empty() {
+                    return Err(crate::Error::new(
+                        crate::ErrorKind::InvalidArgument,
+                        format!(
+                            "RDMA subnet {} in domain {} is empty",
+                            subnet_index + 1,
+                            domain_index + 1
+                        ),
+                    ));
+                }
+                subnets.push(subnet.parse().map_err(|error| {
+                    crate::Error::new(
+                        crate::ErrorKind::InvalidArgument,
+                        format!(
+                            "invalid RDMA subnet {subnet:?} at domain {}, position {}: {error}",
+                            domain_index + 1,
+                            subnet_index + 1
+                        ),
+                    )
+                })?);
+            }
+            domains.push(subnets);
+        }
+        Ok(Self(domains))
+    }
+}
+
+#[cfg(feature = "rdma")]
+impl From<Vec<Vec<ipnet::IpNet>>> for RdmaSubnetDomains {
+    fn from(domains: Vec<Vec<ipnet::IpNet>>) -> Self {
+        Self::new(domains)
     }
 }
 
@@ -351,13 +457,29 @@ mod tests {
         assert_eq!(rdma.read_timeout_ms, 10_000);
         assert_eq!(rdma.max_inflight_read_wrs, 32);
         assert_eq!(rdma.traffic_class, 0);
+        assert!(rdma.device_exclude.is_empty());
         assert!(rdma.subnets.is_empty());
         assert_eq!(rdma.subnet_policy, RdmaSubnetPolicy::Prefer);
-        let require: RdmaSocketPoolConfig =
-            serde_json::from_str(r#"{"subnets":["10.11.0.0/16"],"subnet_policy":"require"}"#)
-                .unwrap();
-        assert_eq!(require.subnets, ["10.11.0.0/16".parse().unwrap()]);
+        let require: RdmaSocketPoolConfig = serde_json::from_str(
+            r#"{"device_exclude":["mlx5_1"],"subnets":[["10.11.0.0/16","10.12.0.0/16"],["192.168.0.0/24"]],"subnet_policy":"require"}"#,
+        )
+        .unwrap();
+        assert_eq!(require.device_exclude, ["mlx5_1"]);
+        assert_eq!(
+            require.subnets.domains(),
+            &[
+                vec![
+                    "10.11.0.0/16".parse().unwrap(),
+                    "10.12.0.0/16".parse().unwrap()
+                ],
+                vec!["192.168.0.0/24".parse().unwrap()]
+            ]
+        );
         assert_eq!(require.subnet_policy, RdmaSubnetPolicy::Require);
+        assert!(
+            serde_json::from_str::<RdmaSocketPoolConfig>(r#"{"subnets":["10.11.0.0/16"]}"#)
+                .is_err()
+        );
         // `Default` is exactly the all-defaults deserialization.
         let default: RdmaSocketPoolConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(default, RdmaSocketPoolConfig::default());
@@ -365,5 +487,41 @@ mod tests {
         assert!(
             serde_json::from_str::<RdmaSocketPoolConfig>(r#"{"remote_device_filter":[]}"#).is_err()
         );
+    }
+
+    #[cfg(feature = "rdma")]
+    #[test]
+    fn rdma_subnet_domains_string_roundtrip() {
+        let domains =
+            RdmaSubnetDomains::try_from_string(" 10.11.0.0/16, 10.12.0.0/16 ; 2001:db8::/32 ")
+                .unwrap();
+        assert_eq!(
+            domains.to_string(),
+            "10.11.0.0/16,10.12.0.0/16;2001:db8::/32"
+        );
+        assert_eq!(
+            serde_json::to_value(&domains).unwrap(),
+            serde_json::json!([["10.11.0.0/16", "10.12.0.0/16"], ["2001:db8::/32"]])
+        );
+        assert_eq!(
+            domains.to_string().parse::<RdmaSubnetDomains>().unwrap(),
+            domains
+        );
+        assert!(RdmaSubnetDomains::try_from_string("").unwrap().is_empty());
+    }
+
+    #[cfg(feature = "rdma")]
+    #[test]
+    fn rdma_subnet_domains_reject_invalid_strings() {
+        for value in [
+            ";",
+            "10.0.0.0/8;",
+            ";10.0.0.0/8",
+            "10.0.0.0/8,,10.1.0.0/16",
+            "invalid",
+        ] {
+            let error = RdmaSubnetDomains::try_from_string(value).unwrap_err();
+            assert_eq!(error.kind, crate::ErrorKind::InvalidArgument, "{value}");
+        }
     }
 }
