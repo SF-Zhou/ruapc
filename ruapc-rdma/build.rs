@@ -164,6 +164,8 @@ fn replace_custom_types(ast: &mut syn::File) {
 }
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(ruapc_ibv_port_attr_has_active_speed_ex)");
+
     // Probe without emitting link metadata yet. libibverbs must appear after
     // the static shim on the linker command line when --as-needed is enabled.
     let mut pkg_config = pkg_config::Config::new();
@@ -265,6 +267,25 @@ fn main() {
     let bindings_str = bindings.to_string();
     let mut ast = syn::parse_file(&bindings_str).expect("Failed to parse generated bindings");
     replace_custom_types(&mut ast);
+
+    let has_active_speed_ex = ast.items.iter().any(|item| {
+        let syn::Item::Struct(item) = item else {
+            return false;
+        };
+        item.ident == "ibv_port_attr"
+            && match &item.fields {
+                syn::Fields::Named(fields) => fields.named.iter().any(|field| {
+                    field
+                        .ident
+                        .as_ref()
+                        .is_some_and(|ident| ident == "active_speed_ex")
+                }),
+                _ => false,
+            }
+    });
+    if has_active_speed_ex {
+        println!("cargo:rustc-cfg=ruapc_ibv_port_attr_has_active_speed_ex");
+    }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     std::fs::write(out_dir.join("bindings.rs"), prettyplease::unparse(&ast))

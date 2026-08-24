@@ -7,6 +7,7 @@
 //! - [`flags`]: typed accessors and static names for `enumflags2` capability
 //!   enums generated from the installed header
 //! - [`gid`]: `ibv_gid` accessors, IPv6 conversion, and serialization
+//! - [`port_attr`]: link width, speed, and aggregate bandwidth helpers
 //! - [`wc`]: `ibv_wc` status/type helpers and immediate-data extraction
 //! - [`pthread`]: opaque pthread wrappers referenced by the bindings
 //!
@@ -15,6 +16,7 @@
 
 mod flags;
 mod gid;
+mod port_attr;
 mod pthread;
 mod wc;
 
