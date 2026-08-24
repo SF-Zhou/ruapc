@@ -119,6 +119,11 @@ impl Port {
         self.gids.iter().find(|gid| gid.index == gid_index)
     }
 
+    /// Returns the aggregate active link bandwidth in bits per second.
+    pub fn bandwidth_bps(&self) -> Option<u64> {
+        self.port_attr.bandwidth_bps()
+    }
+
     /// Returns `true` if the port can carry RDMA traffic: it is active and
     /// uses a supported link layer (InfiniBand or Ethernet).
     pub fn is_usable(&self) -> bool {
@@ -218,5 +223,19 @@ mod tests {
         };
         assert_eq!(port.find_gid(5).map(|g| g.index), Some(5));
         assert!(port.find_gid(0).is_none());
+    }
+
+    #[test]
+    fn test_port_bandwidth() {
+        let port = Port {
+            port_num: 1,
+            port_attr: ibv_port_attr {
+                active_width: 2,
+                active_speed: 32,
+                ..Default::default()
+            },
+            gids: Vec::new(),
+        };
+        assert_eq!(port.bandwidth_bps(), Some(100_000_000_000));
     }
 }

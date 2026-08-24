@@ -82,28 +82,11 @@ fn transport_str(t: ibv_transport_type) -> &'static str {
     }
 }
 
-fn active_width_str(w: u8) -> &'static str {
-    match w {
-        1 => "1",
-        2 => "4",
-        4 => "8",
-        8 => "12",
-        16 => "2",
-        _ => "invalid width",
-    }
-}
-
-fn active_speed_str(s: u8) -> &'static str {
-    match s {
-        1 => "2.5 Gbps",
-        2 => "5.0 Gbps",
-        4 | 8 => "10.0 Gbps",
-        16 => "14.0 Gbps",
-        32 => "25.0 Gbps",
-        64 => "50.0 Gbps",
-        128 => "100.0 Gbps",
-        _ => "invalid speed",
-    }
+fn speed_display(speed_bps: Option<u64>) -> String {
+    speed_bps.map_or_else(
+        || "invalid speed".to_string(),
+        |bps| format!("{:.1} Gbps", bps as f64 / 1_000_000_000.0),
+    )
 }
 
 fn phys_state_str(s: u8) -> &'static str {
@@ -284,13 +267,14 @@ fn print_port(port: &Port, verbose: bool) {
 
         println!(
             "\t\t\tactive_width:\t\t{}X ({})",
-            active_width_str(pa.active_width),
+            pa.active_width_lanes()
+                .map_or_else(|| "invalid width".to_string(), |width| width.to_string()),
             pa.active_width
         );
         println!(
             "\t\t\tactive_speed:\t\t{} ({})",
-            active_speed_str(pa.active_speed),
-            pa.active_speed
+            speed_display(pa.active_speed_bps()),
+            pa.active_speed_raw()
         );
         println!(
             "\t\t\tphys_state:\t\t{} ({})",
