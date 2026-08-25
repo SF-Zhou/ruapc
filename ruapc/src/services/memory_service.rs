@@ -228,7 +228,7 @@ impl MemoryService for () {
         match &ctx.endpoint {
             ContextEndpoint::Connected(socket) => {
                 socket
-                    .pull_into_target(regions, &src_layout, &req.ops, target)
+                    .pull_into_target(regions, &src_layout, &req.ops, target, ctx.remaining_time())
                     .await
             }
             _ => Err(crate::Error::new(

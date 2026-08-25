@@ -22,6 +22,21 @@ use attempt::{
     wire_timeout_ms,
 };
 
+#[derive(Clone, Copy)]
+pub(crate) struct ReadAttachment<'a, 'b> {
+    buffers: &'a [&'b Buffer],
+    charge_bytes: Option<u64>,
+}
+
+impl<'a, 'b> ReadAttachment<'a, 'b> {
+    pub(crate) const fn new(buffers: &'a [&'b Buffer], charge_bytes: Option<u64>) -> Self {
+        Self {
+            buffers,
+            charge_bytes,
+        }
+    }
+}
+
 /// RPC client configuration and request handler.
 ///
 /// The `Client` struct is used to make RPC requests to remote services.
@@ -143,8 +158,8 @@ impl Client {
     ///
     /// * `ctx` - The RPC context containing connection information
     /// * `req` - The request payload to send
-    /// * `read_buffers` - Registered buffers forming the request's read
-    ///   space (borrowed for the call).
+    /// * `read_attachment` - Registered buffers forming the request's read
+    ///   space and an optional override for the expected bytes read by the peer.
     /// * `write_target` - Pinned destination buffers forming the request's
     ///   write space; taken (and consumed) on success.
     /// * `write_buffers_slot` - Optional slot receiving all write buffers
@@ -154,7 +169,7 @@ impl Client {
         &self,
         ctx: &Context,
         req: &Req,
-        read_buffers: &[&Buffer],
+        read_attachment: ReadAttachment<'_, '_>,
         write_target: &mut Option<Arc<WriteTarget>>,
         write_buffers_slot: Option<&mut Vec<Buffer>>,
         method_name: &str,
@@ -172,7 +187,7 @@ impl Client {
             .request_inner(
                 ctx,
                 req,
-                read_buffers,
+                read_attachment,
                 write_target,
                 write_buffers_slot,
                 method_name,
@@ -190,7 +205,7 @@ impl Client {
         &self,
         ctx: &Context,
         req: &Req,
-        read_buffers: &[&Buffer],
+        read_attachment: ReadAttachment<'_, '_>,
         write_target: &mut Option<Arc<WriteTarget>>,
         write_buffers_slot: Option<&mut Vec<Buffer>>,
         method_name: &str,
@@ -208,12 +223,12 @@ impl Client {
             .into());
         }
 
-        if read_buffers.len() > MAX_REGIONS {
+        if read_attachment.buffers.len() > MAX_REGIONS {
             return Err(Error::new(
                 ErrorKind::InvalidCopyOp,
                 format!(
                     "too many read buffers: {} (limit {MAX_REGIONS})",
-                    read_buffers.len()
+                    read_attachment.buffers.len()
                 ),
             )
             .into());
@@ -255,7 +270,7 @@ impl Client {
                 .try_send(
                     ctx,
                     req,
-                    read_buffers,
+                    read_attachment,
                     write_target.as_ref(),
                     method_name,
                     AttemptOptions {
@@ -352,7 +367,7 @@ impl Client {
         &self,
         ctx: &'a Context,
         req: &Req,
-        read_buffers: &[&Buffer],
+        read_attachment: ReadAttachment<'_, '_>,
         write_target: Option<&Arc<WriteTarget>>,
         method_name: &str,
         attempt: AttemptOptions<'_>,
@@ -387,7 +402,23 @@ impl Client {
         }
 
         let (read_regions, write_regions) =
-            export_attached_regions(&socket, &ctx.state, read_buffers, write_target)?;
+            export_attached_regions(&socket, &ctx.state, read_attachment.buffers, write_target)?;
+        let read_bytes = read_attachment
+            .charge_bytes
+            .unwrap_or_else(|| read_regions.iter().map(|region| region.len).sum::<u64>());
+        if let Err(err) = socket
+            .reserve_rdma_send_bandwidth(read_bytes, Some(timeout))
+            .await
+        {
+            return Err(AttemptFailure::send(
+                err,
+                socket.rdma_remote_device().map(str::to_owned),
+            ));
+        }
+        let timeout = response_deadline.saturating_duration_since(std::time::Instant::now());
+        if timeout.is_zero() {
+            return Err(AttemptFailure::deadline());
+        }
 
         // The waiter entry expires after `timeout` (coarse, swept
         // periodically); no per-request timer is registered.

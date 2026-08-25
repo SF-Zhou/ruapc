@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Buffer, Context, core::WriteTarget};
 
-use super::Client;
+use super::{Client, ReadAttachment};
 
 /// A client wrapper that attaches registered buffers to RPC calls.
 ///
@@ -47,6 +47,7 @@ use super::Client;
 pub struct ClientWithBuffers<'a> {
     client: &'a Client,
     read_buffers: Vec<&'a Buffer>,
+    read_charge_bytes: Option<u64>,
     write_buffers: Mutex<Option<Vec<Buffer>>>,
 }
 
@@ -57,6 +58,7 @@ impl<'a> ClientWithBuffers<'a> {
         Self {
             client,
             read_buffers: Vec::new(),
+            read_charge_bytes: None,
             write_buffers: Mutex::new(None),
         }
     }
@@ -72,6 +74,13 @@ impl<'a> ClientWithBuffers<'a> {
     #[must_use]
     pub fn with_read_buffers(mut self, buffers: &'a [Buffer]) -> Self {
         self.read_buffers.extend(buffers.iter());
+        self
+    }
+
+    /// Overrides the SEND bandwidth charge for an internal request whose
+    /// peer will read only part of the advertised read space.
+    pub(crate) fn with_read_charge_bytes(mut self, bytes: u64) -> Self {
+        self.read_charge_bytes = Some(bytes);
         self
     }
 
@@ -114,7 +123,7 @@ impl<'a> ClientWithBuffers<'a> {
             .ruapc_request(
                 ctx,
                 req,
-                &self.read_buffers,
+                ReadAttachment::new(&self.read_buffers, self.read_charge_bytes),
                 &mut target,
                 Some(&mut returned),
                 method_name,
