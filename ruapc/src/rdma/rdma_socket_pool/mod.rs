@@ -207,6 +207,10 @@ impl RdmaSocketPool {
                 "rdma.preconnect_max_per_peer must cover connections_per_peer".into(),
             ));
         }
+        config.validate_bandwidth_limit()?;
+        for device in devices.rdma_devices() {
+            device.configure_bandwidth_limit(&config)?;
+        }
         let task_supervisor = TaskSupervisor::create();
         let port_refresher = RdmaDeviceRefresher::start(devices.clone(), &task_supervisor);
         Ok(Self {

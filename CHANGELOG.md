@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+### Added
+- Per-port, per-direction RDMA remote read/write bandwidth shaping based on a lock-free GCRA.
+  `rdma.bandwidth_limit_ratio` defaults to 95% of the port's reported link
+  bandwidth, `rdma.bandwidth_limit_burst_ms` controls burst tolerance, and
+  `rdma.bandwidth_limit_max_wait_ms` bounds admission delay and rejects
+  immediately when set to zero.
+
 ## [0.2.0-alpha.5] - 2026-08-23
 
 ### Changed

@@ -452,10 +452,20 @@ let (rsp, buffers) = client
    公平）。此外每连接还有 `qp.max_send_wr / 2` 的内部上限（非策略配置，
    仅防止设备级预算集中到单个 QP 时打爆其 send queue）。一批 WR 共享
    一个 `ReadBatch`（原子计数），最后一个 WC 到达时唤醒等待方
-3. NIC 层并发度由握手协商的 `max_rd_atomic`/`max_dest_rd_atomic` 决定：
+3. 每批 WR 在提交前按总字节数向**本地设备端口级 RECV** GCRA 预留带宽。
+   Client 携带 read buffers 发请求时按完整 read space，Server 发起
+   `remote_write` 的反向 `pull` 前按 `Σ op.len`，向同一端口的独立
+   **SEND** GCRA 预留带宽。
+   两个方向分别使用单个原子 TAT，并在该端口的所有连接间共享额度；
+   `rdma.bandwidth_limit_ratio`（默认 0.95）控制可用物理带宽比例，
+   `rdma.bandwidth_limit_burst_ms`（默认 0）控制额外突发容忍时间，
+   `rdma.bandwidth_limit_max_wait_ms`（默认 1s，0 表示立即拒绝）限制等待。
+   每个 `RdmaDevice` 管理自身各端口的限速器和配置；超限在任何 WR 提交前
+   返回 `RdmaRateLimited`，不会产生部分传输或破坏 QP
+4. NIC 层并发度由握手协商的 `max_rd_atomic`/`max_dest_rd_atomic` 决定：
    双方在 Endpoint 交换中携带设备能力（`rd_atomic_cap`，上限 16），
    两侧都取 min，天然满足 RC 的 initiator ≤ responder 约束
-4. 读完成后反向 RPC `is_message_waiting` 校验原始请求存活（单边读
+5. 读完成后反向 RPC `is_message_waiting` 校验原始请求存活（单边读
    Client 无感知，超时后内存可能已复用）
 
 ### RDMA Write 模拟：控制消息 + Client-side RDMA Read

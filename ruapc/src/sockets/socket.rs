@@ -104,6 +104,24 @@ impl Socket {
             _ => None,
         }
     }
+
+    /// Reserves local SEND bandwidth for memory the peer is expected to read.
+    #[allow(unused_variables)]
+    pub(crate) async fn reserve_rdma_send_bandwidth(
+        &self,
+        bytes: u64,
+        request_remaining: Option<std::time::Duration>,
+    ) -> Result<()> {
+        match self {
+            #[cfg(feature = "rdma")]
+            Self::RDMA(socket) => {
+                socket
+                    .reserve_send_bandwidth(bytes, request_remaining)
+                    .await
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Trait defining the interface for sending messages through different socket types.
@@ -256,12 +274,13 @@ impl Socket {
         src_layout: &SpaceLayout,
         ops: &[CopyOp],
         target: std::sync::Arc<crate::core::WriteTarget>,
+        request_remaining: Option<std::time::Duration>,
     ) -> Result<()> {
         match self {
             #[cfg(feature = "rdma")]
             Socket::RDMA(rdma_socket) => {
                 rdma_socket
-                    .pull_into_target(regions, src_layout, ops, target)
+                    .pull_into_target(regions, src_layout, ops, target, request_remaining)
                     .await
             }
             _ => Err(crate::Error::new(

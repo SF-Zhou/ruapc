@@ -9,7 +9,7 @@ use ruapc_rdma::{QueuePair, ReadSge, WRID, ibv_send_flags};
 use serde::Serialize;
 use tokio::sync::mpsc::Sender;
 
-use super::{RdmaPathInfo, RdmaState, SendPermit};
+use super::{RdmaBandwidthLimiter, RdmaPathInfo, RdmaState, SendPermit};
 use crate::{
     Buffer, BufferPool, Context, CopyOp, Error, RemoteIoError, RemoteSpace, SocketTrait, State,
     core::{
@@ -213,6 +213,22 @@ struct PlannedRead {
     sges: Vec<ReadSge>,
 }
 
+impl PlannedRead {
+    fn len(&self) -> u64 {
+        self.sges.iter().map(|sge| u64::from(sge.len)).sum()
+    }
+}
+
+pub(crate) struct RdmaSocketConfig {
+    pub(crate) max_msg_size: usize,
+    pub(crate) send_window: u32,
+    pub(crate) path: RdmaPathInfo,
+    pub(crate) read_timeout: Option<Duration>,
+    pub(crate) read_permits: Arc<tokio::sync::Semaphore>,
+    pub(crate) bandwidth_limiter: Arc<RdmaBandwidthLimiter>,
+    pub(crate) sq_read_cap: u32,
+}
+
 /// Translates the chunk plan of a validated op batch into concrete work
 /// requests, resolving remote regions to `(addr, rkey)` and local
 /// segments (given as per-segment `(base address, lkey)`) to scatter
@@ -293,6 +309,8 @@ pub struct RdmaSocket {
     /// client-side `pull`. Permits are forgotten on post and re-added by
     /// the poll thread per completion.
     pub(crate) read_permits: Arc<tokio::sync::Semaphore>,
+    /// Shared bandwidth shaper for the local RDMA port.
+    bandwidth_limiter: Arc<RdmaBandwidthLimiter>,
     /// Per-connection safety cap (`qp.max_send_wr / 2`, not a policy
     /// knob): the send queue is shared with regular sends, and the
     /// device-wide read budget landing on a single QP must not overflow
@@ -305,35 +323,30 @@ pub struct RdmaSocket {
 }
 
 impl RdmaSocket {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         queue_pair: QueuePair,
         rdmabuf_pool: Arc<BufferPool>,
         pending_sender: Sender<Buffer>,
         poller_waker: PollerWaker,
-        max_msg_size: usize,
-        send_window: u32,
-        path: RdmaPathInfo,
-        read_timeout: Option<Duration>,
-        read_permits: Arc<tokio::sync::Semaphore>,
-        sq_read_cap: u32,
+        config: RdmaSocketConfig,
     ) -> Self {
         Self {
             queue_pair,
             rdma_completions: dashmap::DashMap::default(),
             rdmabuf_pool,
-            state: RdmaState::new(send_window.max(1)),
+            state: RdmaState::new(config.send_window.max(1)),
             pending_sender,
             poller_waker,
-            max_msg_size,
-            path,
+            max_msg_size: config.max_msg_size,
+            path: config.path,
             conn_id: crate::task::next_conn_id(),
             peer_health: std::sync::OnceLock::new(),
             activation_requested: AtomicBool::new(false),
             accept_lease_id: AtomicU64::new(0),
-            read_permits,
-            sq_read_permits: tokio::sync::Semaphore::new(sq_read_cap.max(1) as usize),
-            read_timeout,
+            read_permits: config.read_permits,
+            bandwidth_limiter: config.bandwidth_limiter,
+            sq_read_permits: tokio::sync::Semaphore::new(config.sq_read_cap.max(1) as usize),
+            read_timeout: config.read_timeout,
         }
     }
 
@@ -412,6 +425,18 @@ impl RdmaSocket {
         self.poller_waker.wake();
     }
 
+    /// Reserves SEND bandwidth before advertising local read buffers to the
+    /// peer, which is expected to read the complete logical space.
+    pub(crate) async fn reserve_send_bandwidth(
+        &self,
+        bytes: u64,
+        request_remaining: Option<Duration>,
+    ) -> Result<()> {
+        self.bandwidth_limiter
+            .reserve_send(bytes, request_remaining)
+            .await
+    }
+
     /// Posts the planned reads and waits for the batch to complete.
     ///
     /// On success the hold is handed back. On failure the second element
@@ -422,8 +447,17 @@ impl RdmaSocket {
         &self,
         reads: &[PlannedRead],
         hold: ReadHold,
+        request_remaining: Option<Duration>,
     ) -> std::result::Result<ReadHold, (Error, Option<ReadHold>)> {
         debug_assert!(!reads.is_empty());
+        let bytes = reads.iter().map(PlannedRead::len).sum();
+        if let Err(error) = self
+            .bandwidth_limiter
+            .reserve_recv(bytes, request_remaining)
+            .await
+        {
+            return Err((error, Some(hold)));
+        }
         let (tx, rx) = tokio::sync::oneshot::channel();
         let deadline = self.read_timeout.map(|timeout| Instant::now() + timeout);
         let batch = ReadBatch::new(reads.len(), hold, tx, deadline);
@@ -521,6 +555,7 @@ impl RdmaSocket {
         src_layout: &SpaceLayout,
         ops: &[CopyOp],
         target: Arc<WriteTarget>,
+        request_remaining: Option<Duration>,
     ) -> Result<()> {
         let device = &self.queue_pair.device_index;
         let bases = target.export_sge_bases(device)?;
@@ -535,7 +570,10 @@ impl RdmaSocket {
         if planned.is_empty() {
             return Ok(());
         }
-        match self.execute_reads(&planned, ReadHold::Target(target)).await {
+        match self
+            .execute_reads(&planned, ReadHold::Target(target), request_remaining)
+            .await
+        {
             Ok(_) => Ok(()),
             Err((e, _)) => Err(e),
         }
@@ -632,7 +670,10 @@ impl SocketTrait for RdmaSocket {
             return Ok(local);
         }
 
-        let local = match self.execute_reads(&planned, ReadHold::Buffers(local)).await {
+        let local = match self
+            .execute_reads(&planned, ReadHold::Buffers(local), ctx.remaining_time())
+            .await
+        {
             Ok(ReadHold::Buffers(local)) => local,
             Ok(ReadHold::Target(_)) => unreachable!("remote_read holds buffers"),
             Err((e, hold)) => {
@@ -683,8 +724,14 @@ impl SocketTrait for RdmaSocket {
             msgid: ctx.msg_meta.msgid,
             ops: ops.to_vec(),
         };
+        let bytes = ops.iter().map(|op| op.len).sum();
         let client = crate::Client::default();
-        match client.with_read_buffers(&local).pull(ctx, &req).await {
+        match client
+            .with_read_buffers(&local)
+            .with_read_charge_bytes(bytes)
+            .pull(ctx, &req)
+            .await
+        {
             Ok(()) => Ok(local),
             Err(e) => Err(RemoteIoError::new(e, Some(local))),
         }

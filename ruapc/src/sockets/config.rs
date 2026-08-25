@@ -24,7 +24,7 @@ use crate::ListenMode;
 /// };
 /// ```
 #[serde_inline_default]
-#[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone)]
+#[derive(Deserialize, Serialize, Debug, PartialEq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct SocketPoolConfig {
     /// How accepted TCP streams are interpreted. Outbound transport is part
@@ -89,7 +89,7 @@ impl SocketPoolConfig {
 /// RDMA socket pool configuration.
 #[cfg(feature = "rdma")]
 #[serde_inline_default]
-#[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone)]
+#[derive(Deserialize, Serialize, Debug, PartialEq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct RdmaSocketPoolConfig {
     /// Requested Queue Pair capabilities for newly created RDMA connections.
@@ -231,6 +231,21 @@ pub struct RdmaSocketPoolConfig {
     /// QP must not overflow it.
     #[serde_inline_default(32u32)]
     pub max_inflight_read_wrs: u32,
+    /// Fraction of each local RDMA port's nominal bandwidth available to
+    /// remote reads and writes. `0` disables bandwidth limiting; otherwise
+    /// the value must be finite and in `(0, 1]`. Default is 0.95.
+    #[serde_inline_default(0.95f64)]
+    pub bandwidth_limit_ratio: f64,
+    /// Additional burst tolerance for the RDMA bandwidth limiter, in
+    /// milliseconds. The effective tolerance is at least one request's
+    /// transmission cost, so large requests can always make progress.
+    /// Default is 0 (no burst beyond the current request).
+    #[serde_inline_default(0u64)]
+    pub bandwidth_limit_burst_ms: u64,
+    /// Maximum time a remote read/write may wait for NIC bandwidth budget.
+    /// `0` rejects immediately when no budget is available. Default is 1s.
+    #[serde_inline_default(1_000u64)]
+    pub bandwidth_limit_max_wait_ms: u64,
     /// GRH traffic class (RoCE: the DSCP/ECN byte of outgoing RDMA
     /// packets) for connections *initiated by this pool*. The client
     /// decides: the value travels in the connect request and the server
@@ -248,6 +263,21 @@ impl Default for RdmaSocketPoolConfig {
         // Every field carries an inline serde default, so the canonical
         // default is "deserialize an empty object" — one source of truth.
         serde_json::from_value(serde_json::Value::Object(serde_json::Map::default())).unwrap()
+    }
+}
+
+#[cfg(feature = "rdma")]
+impl RdmaSocketPoolConfig {
+    pub(crate) fn validate_bandwidth_limit(&self) -> crate::Result<()> {
+        if self.bandwidth_limit_ratio.is_finite()
+            && (0.0..=1.0).contains(&self.bandwidth_limit_ratio)
+        {
+            return Ok(());
+        }
+        Err(crate::Error::new(
+            crate::ErrorKind::InvalidArgument,
+            "rdma.bandwidth_limit_ratio must be finite and between 0 and 1".into(),
+        ))
     }
 }
 
@@ -456,6 +486,9 @@ mod tests {
         assert_eq!(rdma.dispatch_workers, 32);
         assert_eq!(rdma.read_timeout_ms, 10_000);
         assert_eq!(rdma.max_inflight_read_wrs, 32);
+        assert_eq!(rdma.bandwidth_limit_ratio, 0.95);
+        assert_eq!(rdma.bandwidth_limit_burst_ms, 0);
+        assert_eq!(rdma.bandwidth_limit_max_wait_ms, 1_000);
         assert_eq!(rdma.traffic_class, 0);
         assert!(rdma.device_exclude.is_empty());
         assert!(rdma.subnets.is_empty());
@@ -487,6 +520,25 @@ mod tests {
         assert!(
             serde_json::from_str::<RdmaSocketPoolConfig>(r#"{"remote_device_filter":[]}"#).is_err()
         );
+    }
+
+    #[cfg(feature = "rdma")]
+    #[test]
+    fn rdma_bandwidth_limit_validation() {
+        for ratio in [0.0, 0.95, 1.0] {
+            let config = RdmaSocketPoolConfig {
+                bandwidth_limit_ratio: ratio,
+                ..Default::default()
+            };
+            assert!(config.validate_bandwidth_limit().is_ok());
+        }
+        for ratio in [-0.1, 1.1, f64::NAN, f64::INFINITY] {
+            let config = RdmaSocketPoolConfig {
+                bandwidth_limit_ratio: ratio,
+                ..Default::default()
+            };
+            assert!(config.validate_bandwidth_limit().is_err());
+        }
     }
 
     #[cfg(feature = "rdma")]

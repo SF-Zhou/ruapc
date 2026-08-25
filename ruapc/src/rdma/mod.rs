@@ -9,6 +9,9 @@ pub use path::{
     StripePhase,
 };
 
+mod rate_limiter;
+pub(crate) use rate_limiter::RdmaBandwidthLimiter;
+
 mod rdma_device;
 pub(crate) use rdma_device::RdmaDevice;
 
@@ -25,7 +28,7 @@ mod poller;
 pub(crate) use poller::{DevicePollers, PollerConfig, RegisterConn};
 
 mod rdma_socket;
-pub(crate) use rdma_socket::RdmaSocket;
+pub(crate) use rdma_socket::{RdmaSocket, RdmaSocketConfig};
 
 mod rdma_socket_pool;
 pub(crate) use rdma_socket_pool::{ConnCountGuard, RdmaPeerHealth, RdmaSocketPool};

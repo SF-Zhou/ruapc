@@ -27,6 +27,7 @@ use std::marker::PhantomData;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::client::ReadAttachment;
 use crate::{Buffer, Client, ClientWithBuffers, Context, Error, WithBuffers};
 
 /// Uniform request entry point implemented by [`Client`] and
@@ -61,8 +62,15 @@ impl RawCall for Client {
         Rsp: for<'c> Deserialize<'c> + JsonSchema,
         E: std::error::Error + From<Error> + for<'c> Deserialize<'c>,
     {
-        self.ruapc_request(ctx, req, &[], &mut None, slot, method_name)
-            .await
+        self.ruapc_request(
+            ctx,
+            req,
+            ReadAttachment::new(&[], None),
+            &mut None,
+            slot,
+            method_name,
+        )
+        .await
     }
 }
 

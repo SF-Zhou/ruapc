@@ -15,7 +15,7 @@ use ruapc_rdma::{QueuePair, ibv_qp_cap, ibv_qp_init_attr, ibv_qp_type};
 use super::super::path::RdmaPathInfo;
 use super::super::{
     ConnectRequest, ConnectionControl, RdmaConnectionConfig, RdmaDevice, RdmaInfo,
-    RdmaService as _, RdmaSocket, RegisterConn,
+    RdmaService as _, RdmaSocket, RdmaSocketConfig, RegisterConn,
 };
 use super::placement::{PathCandidate, PathPreference};
 use super::{ConnCountGuard, PeerState, RdmaSocketPool, Stripe, next_connection_id};
@@ -173,18 +173,32 @@ impl RdmaSocketPool {
                     self.config.max_inflight_read_wrs.max(1) as usize,
                 ))
             });
+        let bandwidth_limiter = self
+            .devices
+            .rdma_devices()
+            .get(device_index)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidArgument,
+                    format!("invalid local RDMA device index {device_index}"),
+                )
+            })?
+            .bandwidth_limiter(path.local.port_num)?;
         let sq_read_cap = (config.qp.max_send_wr / 2).max(1);
         let socket = Arc::new(RdmaSocket::new(
             queue_pair,
             self.buffer_pool.clone(),
             tx,
             poller.waker(),
-            config.max_msg_size as usize,
-            send_window,
-            path,
-            read_timeout,
-            read_permits,
-            sq_read_cap,
+            RdmaSocketConfig {
+                max_msg_size: config.max_msg_size as usize,
+                send_window,
+                path,
+                read_timeout,
+                read_permits,
+                bandwidth_limiter,
+                sq_read_cap,
+            },
         ));
 
         // Pre-post receive buffers *before* the remote can send: the
