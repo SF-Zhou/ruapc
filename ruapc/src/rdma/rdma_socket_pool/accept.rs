@@ -93,7 +93,7 @@ impl RdmaSocketPool {
         let poller = self.pollers.get_or_start(
             device,
             self.poller_config(),
-            self.config.poll_threads_per_device,
+            self.config.polling.poll_threads_per_device,
         )?;
         let queue_pair = self.create_queue_pair(device, &connection_config, &poller)?;
         let mut local_endpoint = self.build_endpoint(
@@ -106,7 +106,7 @@ impl RdmaSocketPool {
             &queue_pair,
             &local_endpoint,
             &request.endpoint,
-            self.config.pkey_index,
+            self.config.connection.pkey_index,
             connection_config.traffic_class,
         )?;
 
@@ -152,7 +152,7 @@ impl RdmaSocketPool {
                     server_connection_cookie: socket.conn_id,
                     state: AcceptLeaseState::Pending,
                     expires_at: Instant::now()
-                        + Duration::from_millis(self.config.connect_lease_ms),
+                        + Duration::from_millis(self.config.peers.connect_lease_ms),
                 });
             }
             dashmap::mapref::entry::Entry::Occupied(_) => {
@@ -218,7 +218,7 @@ impl RdmaSocketPool {
                 entry.get_mut().state =
                     advance_accept_lease(entry.get().state, AcceptLeaseEvent::Confirm);
                 entry.get_mut().expires_at =
-                    Instant::now() + Duration::from_millis(self.config.connect_lease_ms);
+                    Instant::now() + Duration::from_millis(self.config.peers.connect_lease_ms);
                 Ok(())
             }
         }
@@ -268,7 +268,8 @@ impl RdmaSocketPool {
         if self.lease_sweeper_started.swap(true, Ordering::Relaxed) {
             return;
         }
-        let interval = Duration::from_millis((self.config.connect_lease_ms / 4).clamp(100, 1_000));
+        let interval =
+            Duration::from_millis((self.config.peers.connect_lease_ms / 4).clamp(100, 1_000));
         let weak_state = Arc::downgrade(state);
         if self
             .task_supervisor

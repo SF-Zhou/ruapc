@@ -2,7 +2,8 @@ use ruapc_rdma::{Gid, LinkLayer};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{Context, RdmaQueuePairConfig, Result, rdma, service};
+use super::RdmaQueuePairConfig;
+use crate::{Context, Result, rdma, service};
 
 /// Port information advertised for RDMA connection negotiation.
 ///
@@ -54,7 +55,7 @@ impl RdmaInfo {
     /// are already filtered out at collection time.
     pub(crate) fn from_devices(
         devices: &[super::RdmaDevice],
-        config: &crate::RdmaSocketPoolConfig,
+        config: &crate::rdma::RdmaSocketPoolConfig,
         conn_counts: &[std::sync::atomic::AtomicUsize],
     ) -> Self {
         RdmaInfo {
@@ -74,28 +75,35 @@ impl RdmaInfo {
                         connection: rdma::RdmaConnectionConfig {
                             qp: RdmaQueuePairConfig {
                                 max_send_wr: config
+                                    .connection
                                     .qp
                                     .max_send_wr
                                     .min(info.device_attr.max_qp_wr as u32),
                                 max_recv_wr: config
+                                    .connection
                                     .qp
                                     .max_recv_wr
                                     .min(info.device_attr.max_qp_wr as u32),
                                 max_send_sge: config
+                                    .connection
                                     .qp
                                     .max_send_sge
                                     .min(info.device_attr.max_sge as u32),
                                 max_recv_sge: config
+                                    .connection
                                     .qp
                                     .max_recv_sge
                                     .min(info.device_attr.max_sge as u32),
                             },
-                            cq_len: config.cq_len.min(info.device_attr.max_cqe as u32),
-                            recv_queue_len: config.recv_queue_len,
-                            max_msg_size: config.max_msg_size.max(16 * 1024),
+                            cq_len: config
+                                .connection
+                                .cq_len
+                                .min(info.device_attr.max_cqe as u32),
+                            recv_queue_len: config.connection.recv_queue_len,
+                            max_msg_size: config.connection.max_msg_size,
                             // Advisory only: connecting clients dictate the
                             // traffic class of the connections they create.
-                            traffic_class: config.traffic_class,
+                            traffic_class: config.connection.traffic_class,
                         },
                         ports: info
                             .ports
@@ -177,10 +185,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rdma_service_info_returns_devices() {
-        let config = SocketPoolConfig {
-            rdma: Some(Default::default()),
-            ..Default::default()
-        };
+        let config = SocketPoolConfig::default();
         let ctx = Context::create(&config).expect("failed to create RDMA context");
         let result = ().info(&ctx, &()).await;
         assert!(result.is_ok());

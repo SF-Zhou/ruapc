@@ -55,15 +55,14 @@ impl State {
         mut router: Router,
         config: &SocketPoolConfig,
     ) -> Result<(Arc<Self>, DropGuard)> {
+        config.validate()?;
         // Build the Devices collection based on configuration.
         let devices = Arc::new(Self::discover_devices(config));
 
         // Create a shared buffer pool backed by all discovered devices.
-        let mut pool_builder = ruapc_bufpool::BufferPoolBuilder::new(devices.clone());
-        if config.buffer_pool_memory > 0 {
-            pool_builder = pool_builder.max_memory(config.buffer_pool_memory);
-        }
-        let buffer_pool = pool_builder.build();
+        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone())
+            .max_memory(config.buffer_pool_memory)
+            .build();
 
         router.build_open_api()?;
         let http_base_path = config.normalized_http_base_path()?;
@@ -106,11 +105,12 @@ impl State {
     /// Always adds a TCP device. When the `rdma` feature and
     /// `SocketPoolConfig::rdma` is `Some`, discovers available RDMA devices
     /// before constructing the shared buffer pool.
-    fn discover_devices(config: &SocketPoolConfig) -> Devices {
+    fn discover_devices(_config: &SocketPoolConfig) -> Devices {
+        let devices = Devices::default();
         #[cfg(feature = "rdma")]
-        {
-            let mut devices = Devices::default();
-            if let Some(rdma) = &config.rdma
+        let devices = {
+            let mut devices = devices;
+            if let Some(rdma) = &_config.rdma
                 && let Ok(mut active_devices) = ruapc_rdma::ActiveDevice::available()
             {
                 sort_rdma_devices(&mut active_devices);
@@ -120,8 +120,8 @@ impl State {
                         &dev.info().name,
                         dev.info().ports.iter().any(|port| port.is_usable()),
                         prefer_rxe,
-                        &rdma.device_filter,
-                        &rdma.device_exclude,
+                        &rdma.path.device_filter,
+                        &rdma.path.device_exclude,
                     ) {
                         continue;
                     }
@@ -129,12 +129,8 @@ impl State {
                 }
             }
             devices
-        }
-        #[cfg(not(feature = "rdma"))]
-        {
-            let _ = config;
-            Devices::default()
-        }
+        };
+        devices
     }
 
     /// Handles a received message from a socket.
@@ -182,7 +178,7 @@ impl State {
     /// Returns [`ErrorKind::InvalidArgument`](crate::ErrorKind::InvalidArgument)
     /// when RDMA resources were not enabled in `SocketPoolConfig`.
     #[cfg(feature = "rdma")]
-    pub async fn rdma_path_report(&self) -> Result<crate::RdmaPathReport> {
+    pub async fn rdma_path_report(&self) -> Result<crate::rdma::RdmaPathReport> {
         match self.socket_pool.rdma_pool() {
             Some(pool) => Ok(pool.path_report().await),
             None => Err(crate::Error::new(

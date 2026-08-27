@@ -6,7 +6,8 @@
 
 use std::{str::FromStr, sync::Arc};
 
-use ruapc::{Endpoint, ListenMode, RdmaConnDirection, SocketPoolConfig, Transport};
+use ruapc::rdma::RdmaConnDirection;
+use ruapc::{Endpoint, ListenMode, SocketPoolConfig, Transport};
 
 #[ruapc::service]
 trait Foo {
@@ -33,7 +34,6 @@ async fn test_rdma_path_report() {
 
     let config = SocketPoolConfig {
         listen_mode: ListenMode::UNIFIED,
-        rdma: Some(Default::default()),
         ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();

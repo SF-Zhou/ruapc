@@ -1,3 +1,10 @@
+mod config;
+pub use config::{
+    RdmaConnectionTuningConfig, RdmaMaintenanceConfig, RdmaPathPolicyConfig, RdmaPeerPoolConfig,
+    RdmaPollingConfig, RdmaQueuePairConfig, RdmaRemoteMemoryConfig, RdmaSocketPoolConfig,
+    RdmaSubnetDomains, RdmaSubnetPolicy,
+};
+
 mod endpoint;
 pub(crate) use endpoint::{
     ConnectRequest, ConnectionControl, DeviceSelection, Endpoint, RdmaConnectionConfig,

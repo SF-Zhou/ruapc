@@ -205,7 +205,6 @@ enum Expected {
 async fn run_test(tc: TestCase) {
     let config = SocketPoolConfig {
         listen_mode: ListenMode::UNIFIED,
-        rdma: Some(Default::default()),
         ..Default::default()
     };
     let mut router = Router::default();
@@ -401,7 +400,6 @@ async fn test_rdma_remote_write_timeout() {
 async fn setup(transport: Transport) -> (Arc<Server>, Context) {
     let config = SocketPoolConfig {
         listen_mode: ListenMode::UNIFIED,
-        rdma: Some(Default::default()),
         ..Default::default()
     };
     let mut router = Router::default();
@@ -594,7 +592,6 @@ impl EchoBufService for EchoBufImpl {
 async fn run_roundtrip_test(transport: Transport) {
     let config = SocketPoolConfig {
         listen_mode: ListenMode::UNIFIED,
-        rdma: Some(Default::default()),
         ..Default::default()
     };
     let mut router = Router::default();

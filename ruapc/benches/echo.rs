@@ -100,8 +100,6 @@ async fn run() {
 
     let config = SocketPoolConfig {
         listen_mode: ListenMode::UNIFIED,
-        #[cfg(feature = "rdma")]
-        rdma: Some(Default::default()),
         // The default pool (256 MiB) is sized for regular workloads; at
         // 1024 closed-loop tasks the per-request send buffers exhaust it
         // and allocation waits show up as artificial latency/timeouts.

@@ -3,7 +3,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_inline_default::serde_inline_default;
 
-use crate::RdmaQueuePairConfig;
+use super::RdmaQueuePairConfig;
 
 /// RDMA connection endpoint information.
 ///

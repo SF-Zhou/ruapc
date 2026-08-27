@@ -28,7 +28,7 @@
 //! accounted per *work completion* (one receive WC = one credit,
 //! regardless of how many messages the buffer carries), so received
 //! buffers accumulate into per-drain batches that are routed to a fixed
-//! pool of long-lived dispatch worker tasks (`rdma.dispatch_workers`),
+//! pool of long-lived dispatch worker tasks (`rdma.polling.dispatch_workers`),
 //! each owning one SPSC queue; the workers walk the `[4B len][message]`
 //! frames and parse them on tokio worker threads. Routing is sticky
 //! (spill on pressure, see [`Dispatcher`]), the enqueue is a non-blocking
@@ -786,7 +786,8 @@ impl DevicePollers {
         shard_count: u32,
     ) -> Result<Arc<DevicePoller>> {
         let name = device.info().name.clone();
-        let shard_count = shard_count.max(1) as usize;
+        debug_assert!(shard_count > 0);
+        let shard_count = shard_count as usize;
         let mut inner = self.0.lock().unwrap();
         let dispatcher = inner
             .dispatcher

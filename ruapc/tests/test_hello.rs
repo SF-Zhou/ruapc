@@ -37,8 +37,6 @@ async fn test_hello() {
 
         let config = SocketPoolConfig {
             listen_mode: ListenMode::UNIFIED,
-            #[cfg(feature = "rdma")]
-            rdma: Some(Default::default()),
             ..Default::default()
         };
         let server = ruapc::Server::create(router, &config).unwrap();
@@ -103,7 +101,7 @@ async fn test_typed_http_with_base_path() {
     foo.ruapc_export(&mut router);
 
     let config = SocketPoolConfig {
-        listen_mode: ListenMode::HTTP,
+        listen_mode: ListenMode::UNIFIED,
         http_base_path: "/rpc".to_string(),
         ..Default::default()
     };
@@ -133,7 +131,6 @@ async fn test_rdma_concurrent() {
 
     let config = SocketPoolConfig {
         listen_mode: ListenMode::UNIFIED,
-        rdma: Some(Default::default()),
         ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();
@@ -176,7 +173,6 @@ async fn test_rdma() {
 
     let config = SocketPoolConfig {
         listen_mode: ListenMode::UNIFIED,
-        rdma: Some(Default::default()),
         ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();

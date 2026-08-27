@@ -5,21 +5,13 @@ use std::{
     collections::HashSet,
     net::SocketAddr,
     sync::Arc,
-    sync::atomic::Ordering,
     time::{Duration, Instant},
 };
 
-use ruapc_bufpool::Device as _;
-use ruapc_rdma::{QueuePair, ibv_qp_cap, ibv_qp_init_attr, ibv_qp_type};
-
-use super::super::path::RdmaPathInfo;
-use super::super::{
-    ConnectRequest, ConnectionControl, RdmaConnectionConfig, RdmaDevice, RdmaInfo,
-    RdmaService as _, RdmaSocket, RdmaSocketConfig, RegisterConn,
-};
+use super::super::{ConnectRequest, ConnectionControl, RdmaInfo, RdmaService as _, RdmaSocket};
 use super::placement::{PathCandidate, PathPreference};
-use super::{ConnCountGuard, PeerState, RdmaSocketPool, Stripe, next_connection_id};
-use crate::{Buffer, Client, Context, Error, ErrorKind, Result, Socket, State};
+use super::{PeerState, RdmaSocketPool, Stripe, next_connection_id};
+use crate::{Client, Context, Error, ErrorKind, Result, Socket, State};
 
 pub(super) struct SocketRegistrationGuard {
     socket: Arc<RdmaSocket>,
@@ -76,173 +68,6 @@ pub(super) struct EstablishedSocket {
 impl RdmaSocketPool {
     const DEVICE_LIST_CACHE_TTL: Duration = Duration::from_secs(30);
 
-    /// Creates a QueuePair attached to the device's shared completion queue.
-    pub(super) fn create_queue_pair(
-        &self,
-        device: &RdmaDevice,
-        config: &RdmaConnectionConfig,
-        poller: &super::super::poller::DevicePoller,
-    ) -> Result<QueuePair> {
-        let pd = device.pd();
-        let cq = poller.cq();
-
-        let mut init_attr = ibv_qp_init_attr {
-            qp_type: ibv_qp_type::IBV_QPT_RC,
-            cap: ibv_qp_cap {
-                max_send_wr: config.qp.max_send_wr,
-                max_recv_wr: config.qp.max_recv_wr,
-                max_send_sge: config.qp.max_send_sge,
-                max_recv_sge: config.qp.max_recv_sge,
-                max_inline_data: 0,
-            },
-            ..Default::default()
-        };
-
-        let mut queue_pair = QueuePair::create(pd, cq, cq, &mut init_attr, device.index())
-            .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
-        queue_pair
-            .set_send_signal_interval(self.config.send_signal_interval, config.qp.max_send_wr);
-
-        Ok(queue_pair)
-    }
-
-    /// Wraps a connected QueuePair into an `RdmaSocket`, pre-posts receive
-    /// buffers and registers the connection with the device poll thread.
-    pub(super) fn register_socket(
-        &self,
-        mut queue_pair: QueuePair,
-        state: &Arc<State>,
-        poller: &super::super::poller::DevicePoller,
-        config: &RdmaConnectionConfig,
-        path: RdmaPathInfo,
-        device_index: usize,
-    ) -> Result<Arc<RdmaSocket>> {
-        // Reserve the poller slot first: its tag must be stamped into the
-        // QP before any work request is posted, since completions map back
-        // to the connection through the tag in their `wr_id`.
-        let qp_depth = (config.qp.max_send_wr + config.qp.max_recv_wr).saturating_mul(2);
-        let reservation = poller.reserve(qp_depth)?;
-        queue_pair.set_wr_tag(reservation.tag());
-
-        // Account the registered memory this connection's receive ring
-        // pins in the shared buffer pool, and warn when the pool is
-        // undersized for the connection count (before the ring allocation
-        // below starts failing under load). Steady-state traffic needs a
-        // multiple of the ring size: zero-copy dispatch holds ring-sized
-        // chunks for in-flight messages (each triggering a fresh repost
-        // allocation), and send serialization draws from the same pool —
-        // so rings exceeding a quarter of the pool are a reliable
-        // exhaustion predictor.
-        let ring_bytes = config.recv_queue_len as usize * config.max_msg_size as usize;
-        let (ring_reservation, ring_total) =
-            super::super::poller::RingReservation::add(&self.ring_bytes, ring_bytes);
-        let pool_capacity = self.buffer_pool.max_memory();
-        if ring_total.saturating_mul(4) >= pool_capacity
-            && !self.pool_capacity_warned.swap(true, Ordering::Relaxed)
-        {
-            tracing::warn!(
-                "RDMA buffer pool likely undersized: receive rings pin {ring_total}B of the \
-                 {pool_capacity}B pool (each connection pins recv_queue_len ({}) x \
-                 max_msg_size ({}) = {ring_bytes}B, and in-flight messages typically need a \
-                 multiple of that); raise SocketPoolConfig::buffer_pool_memory to >= 4x the \
-                 ring total, or lower rdma.recv_queue_len / rdma.max_msg_size / \
-                 rdma.connections_per_peer",
-                config.recv_queue_len,
-                config.max_msg_size,
-            );
-        }
-
-        // In-flight data WRs are bounded by the peer's receive ring; half
-        // the (negotiated) ring keeps ample headroom for ACK latency (and
-        // in-flight standalone ACKs) before the receiver could be overrun.
-        let send_window = (config.recv_queue_len / 2).max(1);
-
-        let (tx, rx) = tokio::sync::mpsc::channel::<Buffer>(1024);
-        // Software timeout for RDMA READ completions (0 disables).
-        let read_timeout = (self.config.read_timeout_ms > 0)
-            .then(|| Duration::from_millis(self.config.read_timeout_ms));
-        // In-flight READ budget: shared per local NIC (congestion
-        // control), plus a per-connection SQ-overflow guard (the send
-        // queue is shared with regular sends, so leave half to them).
-        let read_permits = self
-            .read_permits
-            .get(device_index)
-            .cloned()
-            .unwrap_or_else(|| {
-                Arc::new(tokio::sync::Semaphore::new(
-                    self.config.max_inflight_read_wrs.max(1) as usize,
-                ))
-            });
-        let bandwidth_limiter = self
-            .devices
-            .rdma_devices()
-            .get(device_index)
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::InvalidArgument,
-                    format!("invalid local RDMA device index {device_index}"),
-                )
-            })?
-            .bandwidth_limiter(path.local.port_num)?;
-        let sq_read_cap = (config.qp.max_send_wr / 2).max(1);
-        let socket = Arc::new(RdmaSocket::new(
-            queue_pair,
-            self.buffer_pool.clone(),
-            tx,
-            poller.waker(),
-            RdmaSocketConfig {
-                max_msg_size: config.max_msg_size as usize,
-                send_window,
-                path,
-                read_timeout,
-                read_permits,
-                bandwidth_limiter,
-                sq_read_cap,
-            },
-        ));
-
-        // Pre-post receive buffers *before* the remote can send: the
-        // registration is picked up asynchronously by the poll thread, but
-        // the recv ring must be ready as soon as the handshake response
-        // reaches the peer.
-        for _ in 0..config.recv_queue_len {
-            let buf = self.buffer_pool.allocate(config.max_msg_size as usize)?;
-            socket
-                .queue_pair
-                .recv(buf)
-                .map_err(|e| Error::new(ErrorKind::RdmaRecvFailed, e.to_string()))?;
-        }
-
-        poller.register(
-            reservation,
-            RegisterConn {
-                socket: socket.clone(),
-                state: state.clone(),
-                pending_receiver: rx,
-                recv_submitted: u64::from(config.recv_queue_len),
-                recv_buf_size: config.max_msg_size as usize,
-                send_window,
-                // Local-only send-side toggle; receivers walk the same
-                // frame loop either way.
-                msg_aggregation: self.config.msg_aggregation,
-                supervisor_guard: self.task_supervisor.start_async_task(),
-                ring_reservation,
-                conn_count_guard: ConnCountGuard::acquire(&self.conn_counts, device_index),
-            },
-        )?;
-
-        // Mark the socket as failed when the pool shuts down so the poll
-        // thread tears the connection down.
-        let socket_clone = socket.clone();
-        let task_supervisor = self.task_supervisor.start_async_task();
-        tokio::spawn(async move {
-            task_supervisor.stopped().await;
-            socket_clone.set_error();
-        });
-
-        Ok(socket)
-    }
-
     pub(super) async fn handshake(
         &self,
         peer: &Arc<PeerState>,
@@ -297,7 +122,7 @@ impl RdmaSocketPool {
         };
 
         if !existing.is_empty() {
-            let max_connections = self.config.preconnect_max_per_peer.max(1) as usize;
+            let max_connections = self.config.peers.preconnect_max_per_peer as usize;
             if existing
                 .iter()
                 .filter(|stripe| stripe.socket.state.is_ok())
@@ -330,7 +155,7 @@ impl RdmaSocketPool {
         // thread shards, across cores). Each stripe picks its own path:
         // local side by least connections, remote side by
         // power-of-two-choices over the peer's advertised per-NIC load.
-        let stripe_count = self.config.connections_per_peer.max(1);
+        let stripe_count = self.config.peers.connections_per_peer;
         let mut stripes: Vec<Stripe> = Vec::with_capacity(stripe_count as usize);
         let mut established_sockets = Vec::with_capacity(stripe_count as usize);
         for _ in 0..stripe_count {
@@ -462,7 +287,7 @@ impl RdmaSocketPool {
         let poller = self.pollers.get_or_start(
             device,
             self.poller_config(),
-            self.config.poll_threads_per_device,
+            self.config.polling.poll_threads_per_device,
         )?;
         let queue_pair = self.create_queue_pair(device, &connection_config, &poller)?;
         let local_endpoint = self.build_endpoint(
@@ -504,7 +329,7 @@ impl RdmaSocketPool {
             &queue_pair,
             &local_endpoint,
             &remote_endpoint,
-            self.config.pkey_index,
+            self.config.connection.pkey_index,
             connection_config.traffic_class,
         ) {
             // QP setup failures are typically path problems (no route

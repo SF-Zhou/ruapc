@@ -176,7 +176,6 @@ enum Expected {
 async fn run_test(tc: TestCase) {
     let config = SocketPoolConfig {
         listen_mode: ListenMode::UNIFIED,
-        rdma: Some(Default::default()),
         ..Default::default()
     };
     let mut router = Router::default();
@@ -369,7 +368,7 @@ async fn test_rdma_read_vectored_ops() {
 }
 
 /// More work requests than the per-NIC in-flight READ budget
-/// (`rdma.max_inflight_read_wrs`, default 32): 48 regions produce 48 READ
+/// (`rdma.remote_memory.max_inflight_read_wrs`, default 32): 48 regions produce 48 READ
 /// WRs, so the batch must queue on the device semaphore and complete as
 /// permits cycle back through the poll thread.
 #[cfg(feature = "rdma")]

@@ -59,28 +59,22 @@ impl Devices {
 
 impl ruapc_bufpool::Devices for Devices {
     fn len(&self) -> usize {
+        let len = 1;
         #[cfg(feature = "rdma")]
-        {
-            1 + self.rdma_devices.len()
-        }
-        #[cfg(not(feature = "rdma"))]
-        {
-            1
-        }
+        let len = len + self.rdma_devices.len();
+        len
     }
 
     fn register(&self, mem: &Arc<AlignedMemory>) -> std::io::Result<Vec<Box<dyn Registration>>> {
-        #[cfg(not(feature = "rdma"))]
-        {
-            Ok(vec![self.tcp_device.register(mem)?])
-        }
+        let regs = vec![self.tcp_device.register(mem)?];
         #[cfg(feature = "rdma")]
-        {
-            let mut regs = vec![self.tcp_device.register(mem)?];
+        let regs = {
+            let mut regs = regs;
             for rdma in &self.rdma_devices {
                 regs.push(rdma.register(mem)?);
             }
-            Ok(regs)
-        }
+            regs
+        };
+        Ok(regs)
     }
 }

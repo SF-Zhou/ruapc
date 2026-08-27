@@ -45,7 +45,7 @@ mod thread_cache;
 
 pub use aligned::AlignedMemory;
 pub use buffer::Buffer;
-pub use pool::{BufferPool, BufferPoolBuilder};
+pub use pool::{BufferPool, BufferPoolBuilder, DEFAULT_BUFFER_POOL_MEMORY};
 
 mod key;
 pub use key::{MemoryKey, RemoteBufferInfo};

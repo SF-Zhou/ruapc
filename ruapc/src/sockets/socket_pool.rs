@@ -423,8 +423,6 @@ impl std::fmt::Debug for SocketPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "rdma")]
-    use crate::RdmaSocketPoolConfig;
 
     #[tokio::test]
     async fn composite_pool_lifecycle() {
@@ -439,17 +437,17 @@ mod tests {
 
     #[cfg(feature = "rdma")]
     #[tokio::test]
-    async fn rdma_capability_is_explicit() {
+    async fn rdma_is_enabled_by_default_and_can_be_disabled() {
         let devices = crate::rdma::test_utils::make_rdma_devices();
-        let config = SocketPoolConfig {
-            rdma: Some(RdmaSocketPoolConfig::default()),
-            ..Default::default()
-        };
+        let config = SocketPoolConfig::default();
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
         let info = pool.rdma_device_list().unwrap();
         assert!(!info.devices.is_empty());
-        let disabled = SocketPoolConfig::default();
+        let disabled = SocketPoolConfig {
+            rdma: None,
+            ..Default::default()
+        };
         let disabled_devices = std::sync::Arc::new(crate::Devices::default());
         let disabled_buffers =
             ruapc_bufpool::BufferPoolBuilder::new(disabled_devices.clone()).build();

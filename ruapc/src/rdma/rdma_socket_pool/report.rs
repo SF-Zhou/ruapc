@@ -6,7 +6,7 @@ use std::{
 };
 
 use super::{RdmaSocket, RdmaSocketPool};
-use crate::{RdmaConnDirection, RdmaDeviceLoad, RdmaPathEntry, RdmaPathReport, StripePhase};
+use crate::rdma::{RdmaConnDirection, RdmaDeviceLoad, RdmaPathEntry, RdmaPathReport, StripePhase};
 
 impl RdmaSocketPool {
     /// Snapshot of every live connection with its NIC pair and phase, plus

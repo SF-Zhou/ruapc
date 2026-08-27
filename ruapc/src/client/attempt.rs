@@ -448,10 +448,10 @@ pub(super) fn is_connection_failure(err: &Error) -> bool {
             | ErrorKind::RdmaReadTimeout
     );
     #[cfg(feature = "rdma")]
-    let rdma = matches!(err.kind, ErrorKind::RdmaError(_));
-    #[cfg(not(feature = "rdma"))]
-    let rdma = false;
-    common || rdma
+    if matches!(err.kind, ErrorKind::RdmaError(_)) {
+        return true;
+    }
+    common
 }
 
 #[cfg(test)]

@@ -32,7 +32,7 @@ impl RdmaSocketPool {
     /// `Arc<State>` is available). The task holds only a `Weak<State>`;
     /// it exits when the pool's supervisor stops or the state is dropped.
     pub(super) fn ensure_maintenance_task(&self, state: &Arc<State>) {
-        let interval_ms = self.config.maintenance_interval_ms;
+        let interval_ms = self.config.maintenance.interval_ms;
         if interval_ms == 0 || self.maintenance_started.swap(true, Ordering::Relaxed) {
             return;
         }
@@ -183,8 +183,8 @@ impl RdmaSocketPool {
         let result: Result<()> = async {
             let plan = self.prepare_connect_plan(peer, state, None).await?;
             let mut existing = peer.active_snapshot();
-            let max_connections = self.config.preconnect_max_per_peer.max(1) as usize;
-            let min_per_remote = self.config.min_connections_per_remote_nic as usize;
+            let max_connections = self.config.peers.preconnect_max_per_peer as usize;
+            let min_per_remote = self.config.peers.min_connections_per_remote_nic as usize;
             let avoided_remote_nics = HashSet::new();
             let mut remote_names = Vec::new();
             for candidate in &plan.candidates {
@@ -207,7 +207,7 @@ impl RdmaSocketPool {
                 &healthy_remotes,
                 &coverage_blocked,
                 min_per_remote,
-                self.config.connections_per_peer.max(1) as usize,
+                self.config.peers.connections_per_peer as usize,
                 max_connections,
             );
             for action in actions {
@@ -265,7 +265,7 @@ impl RdmaSocketPool {
                     .filter(|stripe| stripe.socket.state.is_ok())
                     .count()
             };
-            let target = self.config.connections_per_peer.max(1) as usize;
+            let target = self.config.peers.connections_per_peer as usize;
             for _ in 0..target.saturating_sub(healthy_count(&existing)) {
                 if healthy_count(&existing) >= max_connections {
                     break;
@@ -368,7 +368,7 @@ impl RdmaSocketPool {
             &placement::Selection {
                 required_remote: None,
                 avoided_remotes: &HashSet::new(),
-                subnet_policy: self.config.subnet_policy,
+                subnet_policy: self.config.path.subnet_policy,
             },
             false,
         );
@@ -432,8 +432,8 @@ impl RdmaSocketPool {
         let Some((victim_index, best_index)) = placement::choose_rebalance(
             &stripe_views,
             &replacements,
-            self.config.min_connections_per_remote_nic as usize,
-            u64::from(self.config.rebalance_threshold.max(1)),
+            self.config.peers.min_connections_per_remote_nic as usize,
+            u64::from(self.config.maintenance.rebalance_threshold),
             !self.pseudo_random().is_multiple_of(2),
         ) else {
             return;
@@ -457,7 +457,7 @@ impl RdmaSocketPool {
     }
 
     pub(super) fn drain_then_close(&self, peer: &Arc<PeerState>, socket: Arc<RdmaSocket>) {
-        let drain = Duration::from_millis(self.config.drain_timeout_ms);
+        let drain = Duration::from_millis(self.config.maintenance.drain_timeout_ms);
         let guard = self.task_supervisor.start_async_task();
         let peer = peer.clone();
         tokio::spawn(async move {

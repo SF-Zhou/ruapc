@@ -8,7 +8,8 @@ use ruapc_bufpool::DeviceIndex;
 use ruapc_rdma::{ActiveDevice, Context, DeviceInfo, ProtectionDomain};
 
 use super::RdmaBandwidthLimiter;
-use crate::{Error, ErrorKind, RdmaSocketPoolConfig, Result};
+use super::RdmaSocketPoolConfig;
+use crate::{Error, ErrorKind, Result};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct BandwidthLimitConfig {
@@ -51,9 +52,9 @@ impl RdmaDevice {
 
     pub(crate) fn configure_bandwidth_limit(&self, config: &RdmaSocketPoolConfig) -> Result<()> {
         let bandwidth_config = BandwidthLimitConfig {
-            ratio: config.bandwidth_limit_ratio,
-            burst: Duration::from_millis(config.bandwidth_limit_burst_ms),
-            max_wait: Duration::from_millis(config.bandwidth_limit_max_wait_ms),
+            ratio: config.remote_memory.bandwidth_limit_ratio,
+            burst: Duration::from_millis(config.remote_memory.bandwidth_limit_burst_ms),
+            max_wait: Duration::from_millis(config.remote_memory.bandwidth_limit_max_wait_ms),
         };
         if let Err(requested) = self.bandwidth_config.set(bandwidth_config)
             && self.bandwidth_config.get() != Some(&requested)
@@ -194,10 +195,8 @@ mod tests {
         let second = rdma.bandwidth_limiter(port_num).unwrap();
         assert!(Arc::ptr_eq(&first, &second));
 
-        let different = RdmaSocketPoolConfig {
-            bandwidth_limit_ratio: 0.5,
-            ..config
-        };
+        let mut different = config;
+        different.remote_memory.bandwidth_limit_ratio = 0.5;
         assert!(rdma.configure_bandwidth_limit(&different).is_err());
     }
 }

@@ -21,12 +21,7 @@ pub struct Args {
 async fn main() {
     let args = Args::parse();
 
-    #[allow(unused_mut)]
-    let mut config = SocketPoolConfig::default();
-    #[cfg(feature = "rdma")]
-    if args.endpoint.transport() == ruapc::Transport::RDMA {
-        config.rdma = Some(Default::default());
-    }
+    let config = SocketPoolConfig::default();
     let ctx = Context::create(&config)
         .unwrap()
         .with_endpoint(args.endpoint);

@@ -1,4 +1,6 @@
 use clap::Parser;
+#[cfg(feature = "rdma")]
+use ruapc::rdma::RdmaSocketPoolConfig;
 use ruapc::*;
 use ruapc_demo::{
     EchoService, GreetService, MemBenchService, ReadCrcReq, Request, WriteCrcReq, crc32c_of,
@@ -121,16 +123,15 @@ fn socket_pool_config(args: &Args) -> SocketPoolConfig {
     };
     #[cfg(feature = "rdma")]
     if args.endpoint.transport() == Transport::RDMA {
-        config.rdma = Some(RdmaSocketPoolConfig {
-            poll_threads_per_device: args.poll_threads,
-            connections_per_peer: args.conns_per_peer,
-            device_filter: args.rdma_devices.clone(),
-            poll_spin_us: args.poll_spin_us,
-            dispatch_workers: args.dispatch_workers,
-            recv_queue_len: args.recv_queue_len,
-            traffic_class: args.traffic_class,
-            ..Default::default()
-        });
+        let mut rdma = RdmaSocketPoolConfig::default();
+        rdma.polling.poll_threads_per_device = args.poll_threads;
+        rdma.polling.poll_spin_us = args.poll_spin_us;
+        rdma.polling.dispatch_workers = args.dispatch_workers;
+        rdma.peers.connections_per_peer = args.conns_per_peer;
+        rdma.path.device_filter = args.rdma_devices.clone();
+        rdma.connection.recv_queue_len = args.recv_queue_len;
+        rdma.connection.traffic_class = args.traffic_class;
+        config.rdma = Some(rdma);
     }
     config
 }

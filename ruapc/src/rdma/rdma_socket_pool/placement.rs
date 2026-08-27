@@ -5,14 +5,14 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::atomic::Ordering;
 
-use foldhash::fast::RandomState;
-use ruapc_rdma::{DeviceInfo, Gid, GidType, LinkLayer, Port, QueuePair, ibv_mtu};
+use ruapc_rdma::{Gid, GidType, LinkLayer, Port};
 
 use super::super::path::{RdmaNicInfo, RdmaPathInfo, gid_ip};
 use super::super::rdma_service::RdmaPortInfo;
-use super::super::{DeviceSelection, Endpoint, RdmaConnectionConfig, RdmaDevice, RdmaInfo};
+use super::super::{DeviceSelection, RdmaConnectionConfig, RdmaInfo};
 use super::{PeerState, RdmaSocketPool, Stripe, placement};
-use crate::{Error, ErrorKind, RdmaQueuePairConfig, RdmaSubnetDomains, RdmaSubnetPolicy, Result};
+use crate::rdma::{RdmaSubnetDomains, RdmaSubnetPolicy};
+use crate::{Error, ErrorKind, Result};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum PathClass {
@@ -379,23 +379,6 @@ mod tests {
 }
 
 impl RdmaSocketPool {
-    pub(super) fn find_device_by_name(
-        &self,
-        selection: &DeviceSelection,
-    ) -> Result<(usize, &RdmaDevice)> {
-        self.devices
-            .rdma_devices()
-            .iter()
-            .enumerate()
-            .find(|(_, device)| device.info().name.as_str() == selection.device_name)
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::InvalidArgument,
-                    format!("RDMA device {} not found", selection.device_name),
-                )
-            })
-    }
-
     /// Enumerates every compatible (local NIC, remote NIC) pair.
     ///
     /// One candidate is produced per compatible port pair (the GID within
@@ -437,7 +420,7 @@ impl RdmaSocketPool {
                         link_layer_matches += 1;
 
                         let gid_pairs = Self::match_gid_pairs(local_port, remote_port);
-                        let pair_limit = if self.config.subnets.is_empty() {
+                        let pair_limit = if self.config.path.subnets.is_empty() {
                             1
                         } else {
                             gid_pairs.len()
@@ -453,8 +436,11 @@ impl RdmaSocketPool {
                                 .iter()
                                 .find(|gid| gid.index == remote_gid_index)
                                 .and_then(|gid| gid_ip(&gid.gid));
-                            let same_subnet =
-                                addresses_share_subnet(local_ip, remote_ip, &self.config.subnets);
+                            let same_subnet = addresses_share_subnet(
+                                local_ip,
+                                remote_ip,
+                                &self.config.path.subnets,
+                            );
                             let class = match local_port.port_attr.link_layer {
                                 LinkLayer::InfiniBand => PathClass::InfiniBand,
                                 LinkLayer::Ethernet
@@ -567,7 +553,7 @@ impl RdmaSocketPool {
             placement::Selection {
                 required_remote: preference.remote_device,
                 avoided_remotes: preference.avoided_remote_nics,
-                subnet_policy: self.config.subnet_policy,
+                subnet_policy: self.config.path.subnet_policy,
             },
             [self.pseudo_random(), self.pseudo_random()],
         )
@@ -647,225 +633,6 @@ impl RdmaSocketPool {
     fn first_gid(gids: &[Gid], mut predicate: impl FnMut(&Gid) -> bool) -> Option<u8> {
         gids.iter().find(|gid| predicate(gid)).map(|gid| gid.index)
     }
-
-    pub(super) fn negotiate_connection_config(
-        &self,
-        local_device: &RdmaDevice,
-        remote: &RdmaConnectionConfig,
-    ) -> RdmaConnectionConfig {
-        let local = self.local_connection_config(local_device);
-        let remote = *remote;
-        RdmaConnectionConfig {
-            qp: RdmaQueuePairConfig {
-                max_send_wr: local.qp.max_send_wr.min(remote.qp.max_recv_wr),
-                max_recv_wr: local.qp.max_recv_wr.min(remote.qp.max_send_wr),
-                // Scatter/gather lists are purely local WQE properties: a
-                // gather-list SEND arrives as one contiguous message no
-                // matter how many SGEs composed it, so neither side's SGE
-                // capability constrains the other.
-                max_send_sge: local.qp.max_send_sge,
-                max_recv_sge: local.qp.max_recv_sge,
-            },
-            cq_len: local.cq_len.min(remote.cq_len),
-            recv_queue_len: local.recv_queue_len.min(remote.recv_queue_len),
-            max_msg_size: local.max_msg_size.min(remote.max_msg_size),
-            // The connecting side dictates the traffic class; the remote
-            // advertisement is irrelevant here.
-            traffic_class: self.config.traffic_class,
-        }
-    }
-
-    pub(super) fn clamp_connection_config(
-        &self,
-        device: &RdmaDevice,
-        requested: RdmaConnectionConfig,
-    ) -> RdmaConnectionConfig {
-        let local = self.local_connection_config(device);
-        RdmaConnectionConfig {
-            qp: RdmaQueuePairConfig {
-                max_send_wr: requested.qp.max_send_wr.min(local.qp.max_send_wr),
-                max_recv_wr: requested.qp.max_recv_wr.min(local.qp.max_recv_wr),
-                // SGE lists are local WQE properties (see
-                // `negotiate_connection_config`): use our own capabilities
-                // regardless of what the initiator requested for itself.
-                max_send_sge: local.qp.max_send_sge,
-                max_recv_sge: local.qp.max_recv_sge,
-            },
-            cq_len: requested.cq_len.min(local.cq_len),
-            recv_queue_len: requested.recv_queue_len.min(local.recv_queue_len),
-            max_msg_size: requested.max_msg_size.min(local.max_msg_size),
-            // Client-chosen: applied verbatim so both directions of the
-            // connection share one traffic class.
-            traffic_class: requested.traffic_class,
-        }
-    }
-
-    fn local_connection_config(&self, device: &RdmaDevice) -> RdmaConnectionConfig {
-        let info = device.info();
-        RdmaConnectionConfig {
-            qp: RdmaQueuePairConfig {
-                max_send_wr: self
-                    .config
-                    .qp
-                    .max_send_wr
-                    .min(info.device_attr.max_qp_wr as u32),
-                max_recv_wr: self
-                    .config
-                    .qp
-                    .max_recv_wr
-                    .min(info.device_attr.max_qp_wr as u32),
-                max_send_sge: self
-                    .config
-                    .qp
-                    .max_send_sge
-                    .min(info.device_attr.max_sge as u32),
-                max_recv_sge: self
-                    .config
-                    .qp
-                    .max_recv_sge
-                    .min(info.device_attr.max_sge as u32),
-            },
-            cq_len: self.config.cq_len.min(info.device_attr.max_cqe as u32),
-            recv_queue_len: self.config.recv_queue_len,
-            // Enforce a small floor so a tiny misconfiguration cannot break
-            // the RPC control plane.
-            max_msg_size: self.config.max_msg_size.max(16 * 1024),
-            traffic_class: self.config.traffic_class,
-        }
-    }
-
-    /// Constructs an Endpoint from a QueuePair and selected local port/GID.
-    pub(super) fn build_endpoint(
-        &self,
-        qp: &QueuePair,
-        device: &RdmaDevice,
-        port_num: u8,
-        gid_index: u8,
-    ) -> Result<Endpoint> {
-        let info = device.info();
-        let port = Self::find_port(&info, port_num)?;
-        if !port.is_usable() {
-            return Err(Error::new(
-                ErrorKind::InvalidArgument,
-                format!("RDMA port {}:{} is not active", info.name, port_num),
-            ));
-        }
-
-        let gid = port.find_gid(gid_index).map(|gid| gid.gid);
-        if port.port_attr.link_layer.is_ethernet() && gid.is_none() {
-            return Err(Error::new(
-                ErrorKind::InvalidArgument,
-                format!(
-                    "RDMA port {}:{} does not have GID index {}",
-                    info.name, port_num, gid_index
-                ),
-            ));
-        }
-
-        Ok(Endpoint {
-            connection_cookie: 0,
-            qp_num: qp.qp_num(),
-            port_num,
-            gid_index,
-            lid: port.port_attr.lid,
-            gid: gid.unwrap_or_default(),
-            link_layer: port.port_attr.link_layer,
-            active_mtu: port.port_attr.active_mtu,
-            psn: Self::random_psn(qp.qp_num()),
-            rd_atomic_cap: Self::rd_atomic_cap(&info),
-        })
-    }
-
-    /// The device cap on concurrent RDMA READs per QP, advertised to the
-    /// peer via the endpoint exchange.
-    ///
-    /// The minimum of the initiator-side and responder-side device limits
-    /// is used for both directions, clamped to a sane ceiling — beyond ~16
-    /// the returns diminish while responder resources grow.
-    fn rd_atomic_cap(info: &DeviceInfo) -> u8 {
-        const RD_ATOMIC_CEILING: i32 = 16;
-        let cap = info
-            .device_attr
-            .max_qp_rd_atom
-            .min(info.device_attr.max_qp_init_rd_atom)
-            .clamp(1, RD_ATOMIC_CEILING);
-        u8::try_from(cap).unwrap_or(1)
-    }
-
-    /// Generates a pseudo-random 24-bit initial packet sequence number.
-    ///
-    /// Uniqueness across QP incarnations is what matters: drivers recycle
-    /// qp numbers, and a fresh QP reusing the (qp_num, GID) pair of a
-    /// recently destroyed one with a predictable PSN can silently blackhole
-    /// against stale peer state.
-    fn random_psn(qp_num: u32) -> u32 {
-        use std::hash::BuildHasher as _;
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
-        (RandomState::default().hash_one((qp_num, nanos)) as u32) & 0xFF_FFFF
-    }
-
-    pub(super) fn find_port(info: &DeviceInfo, port_num: u8) -> Result<&Port> {
-        info.ports
-            .iter()
-            .find(|port| port.port_num == port_num)
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::InvalidArgument,
-                    format!("RDMA port {}:{} not found", info.name, port_num),
-                )
-            })
-    }
-
-    pub(super) fn bring_qp_to_rts(
-        &self,
-        qp: &QueuePair,
-        local: &Endpoint,
-        remote: &Endpoint,
-        pkey_index: u16,
-        traffic_class: u8,
-    ) -> Result<()> {
-        if local.link_layer != remote.link_layer {
-            return Err(Error::new(
-                ErrorKind::InvalidArgument,
-                format!(
-                    "RDMA link layer mismatch: local {} remote {}",
-                    local.link_layer, remote.link_layer
-                ),
-            ));
-        }
-
-        let path_mtu = Self::min_mtu(local.active_mtu, remote.active_mtu);
-        // Both sides advertise their device cap and program the minimum
-        // for both `max_rd_atomic` (outbound reads) and
-        // `max_dest_rd_atomic` (inbound reads): the two ends compute the
-        // same value, which keeps the RC requirement
-        // `initiator.max_rd_atomic <= responder.max_dest_rd_atomic`
-        // trivially satisfied.
-        let rd_atomic = local.rd_atomic_cap.min(remote.rd_atomic_cap).max(1);
-        qp.connect(
-            local.port_num,
-            local.gid_index,
-            pkey_index,
-            local.link_layer,
-            path_mtu,
-            remote.qp_num,
-            remote.gid,
-            remote.lid,
-            local.psn,
-            remote.psn,
-            rd_atomic,
-            rd_atomic,
-            traffic_class,
-        )
-        .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))
-    }
-
-    fn min_mtu(a: ibv_mtu, b: ibv_mtu) -> ibv_mtu {
-        if (a as u32) <= (b as u32) { a } else { b }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -903,9 +670,9 @@ mod path_selection_tests {
     use super::super::maintenance::preconnect_backoff_delay;
     use super::super::{ConnCountGuard, RdmaSocketPool, next_connection_id};
     use super::*;
-    use crate::RdmaSocketPoolConfig;
     use crate::rdma::ConnectionControl;
     use crate::rdma::rdma_service::RdmaDeviceInfo;
+    use crate::rdma::{RdmaQueuePairConfig, RdmaSocketPoolConfig};
 
     fn make_pool() -> RdmaSocketPool {
         let devices = crate::rdma::test_utils::make_rdma_devices();
@@ -1050,10 +817,8 @@ mod path_selection_tests {
     async fn test_rejects_too_short_connect_lease() {
         let devices = crate::rdma::test_utils::make_rdma_devices();
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
-        let config = RdmaSocketPoolConfig {
-            connect_lease_ms: 14_999,
-            ..Default::default()
-        };
+        let mut config = RdmaSocketPoolConfig::default();
+        config.peers.connect_lease_ms = 14_999;
         let err = RdmaSocketPool::new(devices, buffer_pool, config).unwrap_err();
         assert_eq!(err.kind, ErrorKind::InvalidArgument);
     }
@@ -1224,10 +989,8 @@ mod path_selection_tests {
     async fn test_traffic_class_client_decides_server_obeys() {
         let devices = crate::rdma::test_utils::make_rdma_devices();
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
-        let config = RdmaSocketPoolConfig {
-            traffic_class: 96,
-            ..Default::default()
-        };
+        let mut config = RdmaSocketPoolConfig::default();
+        config.connection.traffic_class = 96;
         let pool = RdmaSocketPool::new(devices, buffer_pool, config).unwrap();
         let rdma_devices = pool.devices.rdma_devices();
         let device = &rdma_devices[0];

@@ -446,7 +446,7 @@ let (rsp, buffers) = client
    remote 连续块内 local 侧跨段时生成 SG list（上限 = 设备
    `max_send_sge`，超出再拆 WR）——多 buffer 对上层透明
 2. 并发 post 全部 WR。在飞 READ 数由**网卡（本地设备）级**信号量统一
-   限流（`rdma.max_inflight_read_wrs`，默认 32）：同一 NIC 上所有连接、
+   限流（`rdma.remote_memory.max_inflight_read_wrs`，默认 32）：同一 NIC 上所有连接、
    Server 侧 `remote_read` 与 Client 侧 `pull` 共享同一预算，这是读
    流量的拥塞控制主旋钮；permit 由 poll 线程随 completion 归还（FIFO
    公平）。此外每连接还有 `qp.max_send_wr / 2` 的内部上限（非策略配置，
@@ -488,7 +488,7 @@ let (rsp, buffers) = client
 ### RDMA Read 软件超时
 
 QP 硬件重传（timeout 0x12 × retry 6）不足以覆盖所有 NIC 卡死场景，
-RDMA READ 有独立的软件超时（`rdma.read_timeout_ms`，默认 10s，0 禁用）：
+RDMA READ 有独立的软件超时（`rdma.remote_memory.read_timeout_ms`，默认 10s，0 禁用）：
 
 - **不用逐操作 timer**：poll 线程的 housekeeping 里每 100ms 扫一次各连接
   的在飞 `ReadBatch` deadline（map 很小，成本可忽略），避免 tokio timer

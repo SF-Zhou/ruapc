@@ -22,7 +22,7 @@ use crate::slab::{NUM_SLAB_CLASSES, SlabClass, size_to_class};
 use crate::thread_cache::{self, CacheShard, MAG_REFILL, RawChunk};
 
 /// Default maximum memory limit (256 MiB).
-const DEFAULT_MAX_MEMORY: usize = 256 * 1024 * 1024;
+pub const DEFAULT_BUFFER_POOL_MEMORY: usize = 256 * 1024 * 1024;
 
 /// Default merge watermarks for each level (lazy buddy merging).
 ///
@@ -77,7 +77,7 @@ impl BufferPoolBuilder {
     #[must_use]
     pub fn new(devices: Arc<dyn Devices>) -> Self {
         Self {
-            max_memory: DEFAULT_MAX_MEMORY,
+            max_memory: DEFAULT_BUFFER_POOL_MEMORY,
             devices,
             merge_watermarks: DEFAULT_MERGE_WATERMARKS,
             starvation_timeout: DEFAULT_STARVATION_TIMEOUT,
