@@ -59,13 +59,10 @@ impl SocketHealth {
     }
 
     pub(crate) fn is_aggregate(&self) -> bool {
-        #[cfg(feature = "rdma")]
-        {
-            matches!(self, Self::RdmaPeer(_))
-        }
-        #[cfg(not(feature = "rdma"))]
-        {
-            false
+        match self {
+            #[cfg(feature = "rdma")]
+            Self::RdmaPeer(_) => true,
+            _ => false,
         }
     }
 

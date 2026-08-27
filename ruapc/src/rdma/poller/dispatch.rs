@@ -118,7 +118,8 @@ impl Dispatcher {
     /// `Dispatcher` clone (one per poll thread, plus the owning pool's)
     /// has been dropped.
     pub fn start(workers: u32) -> Self {
-        let workers: Arc<[DispatchWorker]> = (0..workers.max(1))
+        debug_assert!(workers > 0);
+        let workers: Arc<[DispatchWorker]> = (0..workers)
             .map(|_| {
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DispatchBatch>();
                 let backlog = Arc::new(std::sync::atomic::AtomicUsize::new(0));

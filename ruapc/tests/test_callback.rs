@@ -75,7 +75,7 @@ async fn test_callback_http() {
     let mut router = Router::default();
     foo.clone().ruapc_export(&mut router);
     let config = SocketPoolConfig {
-        listen_mode: ruapc::ListenMode::HTTP,
+        listen_mode: ruapc::ListenMode::UNIFIED,
         ..Default::default()
     };
     let server = Server::create(router, &config).unwrap();

@@ -43,13 +43,9 @@ pub use sockets::*;
 
 pub mod services;
 
+pub use ruapc_bufpool::DEFAULT_BUFFER_POOL_MEMORY;
 pub use ruapc_bufpool::Device as _;
 pub use ruapc_bufpool::Devices as _;
 
 #[cfg(feature = "rdma")]
-mod rdma;
-#[cfg(feature = "rdma")]
-pub use rdma::{
-    RdmaConnDirection, RdmaDeviceLoad, RdmaNicInfo, RdmaPathEntry, RdmaPathInfo, RdmaPathReport,
-    StripePhase,
-};
+pub mod rdma;

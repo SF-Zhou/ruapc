@@ -1,6 +1,6 @@
 use clap::Parser;
 #[cfg(feature = "rdma")]
-use ruapc::RdmaSocketPoolConfig;
+use ruapc::rdma::RdmaSocketPoolConfig;
 use ruapc::{
     Context, Error, ErrorKind, ListenMode, Result, Router, Server, SocketPoolConfig, WithBuffers,
 };
@@ -139,14 +139,13 @@ async fn async_main(args: Args) {
     };
     #[cfg(feature = "rdma")]
     {
-        config.rdma = Some(RdmaSocketPoolConfig {
-            poll_threads_per_device: args.poll_threads,
-            device_filter: args.rdma_devices.clone(),
-            poll_spin_us: args.poll_spin_us,
-            dispatch_workers: args.dispatch_workers,
-            recv_queue_len: args.recv_queue_len,
-            ..Default::default()
-        });
+        let mut rdma = RdmaSocketPoolConfig::default();
+        rdma.polling.poll_threads_per_device = args.poll_threads;
+        rdma.polling.poll_spin_us = args.poll_spin_us;
+        rdma.polling.dispatch_workers = args.dispatch_workers;
+        rdma.path.device_filter = args.rdma_devices.clone();
+        rdma.connection.recv_queue_len = args.recv_queue_len;
+        config.rdma = Some(rdma);
     }
     let server = Server::create(router, &config).unwrap();
 

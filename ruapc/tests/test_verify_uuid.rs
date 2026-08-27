@@ -45,8 +45,6 @@ async fn test_verify_message_id() {
 
         let config = SocketPoolConfig {
             listen_mode: ListenMode::UNIFIED,
-            #[cfg(feature = "rdma")]
-            rdma: Some(Default::default()),
             ..Default::default()
         };
         let server = ruapc::Server::create(router, &config).unwrap();

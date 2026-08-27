@@ -644,7 +644,7 @@ impl ConnState {
             if batch.expired(now)
                 && batch.fail(Error::new(
                     ErrorKind::RdmaReadTimeout,
-                    "RDMA READ did not complete within rdma.read_timeout_ms; \
+                    "RDMA READ did not complete within rdma.remote_memory.read_timeout_ms; \
                      failing the connection to flush it"
                         .into(),
                 ))

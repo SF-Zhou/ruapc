@@ -79,6 +79,7 @@ impl<'a> ClientWithBuffers<'a> {
 
     /// Overrides the SEND bandwidth charge for an internal request whose
     /// peer will read only part of the advertised read space.
+    #[cfg(feature = "rdma")]
     pub(crate) fn with_read_charge_bytes(mut self, bytes: u64) -> Self {
         self.read_charge_bytes = Some(bytes);
         self

@@ -8,10 +8,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Added
 - Per-port, per-direction RDMA remote read/write bandwidth shaping based on a lock-free GCRA.
-  `rdma.bandwidth_limit_ratio` defaults to 95% of the port's reported link
-  bandwidth, `rdma.bandwidth_limit_burst_ms` controls burst tolerance, and
-  `rdma.bandwidth_limit_max_wait_ms` bounds admission delay and rejects
+  `rdma.remote_memory.bandwidth_limit_ratio` defaults to 95% of the port's reported link
+  bandwidth, `bandwidth_limit_burst_ms` controls burst tolerance, and
+  `bandwidth_limit_max_wait_ms` bounds admission delay and rejects
   immediately when set to zero.
+
+### Changed
+- **BREAKING**: `RdmaSocketPoolConfig` is grouped into `connection`, `polling`,
+  `path`, `peers`, `maintenance`, and `remote_memory` sub-configurations.
+- `SocketPoolConfig::buffer_pool_memory` now defaults explicitly to
+  `DEFAULT_BUFFER_POOL_MEMORY` (256 MiB); zero is rejected instead of acting as
+  an implicit default.
+- When built with the `rdma` feature, `SocketPoolConfig::default()` now enables
+  RDMA resources with `RdmaSocketPoolConfig::default()`; set `rdma` to `None`
+  to disable them explicitly.
 
 ## [0.2.0-alpha.5] - 2026-08-23
 

@@ -5,7 +5,6 @@ pub use with_buffers::ClientWithBuffers;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_inline_default::serde_inline_default;
 use std::{sync::Arc, time::Duration};
 
 use crate::{
@@ -52,8 +51,8 @@ impl<'a, 'b> ReadAttachment<'a, 'b> {
 ///
 /// let rsp = client.echo(&ctx, &"hello".into()).await;
 /// ```
-#[serde_inline_default]
 #[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone)]
+#[serde(default, deny_unknown_fields)]
 pub struct Client {
     /// Response timeout after a connection is available. Default is 1 second.
     ///
@@ -61,18 +60,15 @@ pub struct Client {
     /// the remaining deadline of the context (for nested RPCs issued while
     /// handling a request). The budget travels with the request so the
     /// server can drop work the client no longer waits for.
-    #[serde_inline_default(Duration::from_secs(1))]
     #[serde(with = "humantime_serde")]
     pub timeout: Duration,
     /// Total budget for connection establishment and endpoint failover.
     /// Connection setup does not consume the response timeout; nested calls
     /// still cap both budgets at the parent context's remaining deadline.
-    #[serde_inline_default(Duration::from_secs(5))]
     #[serde(with = "humantime_serde")]
     pub connect_timeout: Duration,
     /// Whether to use MessagePack serialization. Default is true.
     /// When false, JSON serialization is used.
-    #[serde_inline_default(true)]
     pub use_msgpack: bool,
     /// Maximum number of retries for failures that occur *before the
     /// request reaches the wire* (connection acquire or send-queue
@@ -84,13 +80,17 @@ pub struct Client {
     /// whether a request is safe to re-issue after an ambiguous outcome is
     /// application knowledge, so that retry loop belongs to the caller.
     /// Default is 2.
-    #[serde_inline_default(2u32)]
     pub max_retries: u32,
 }
 
 impl Default for Client {
     fn default() -> Self {
-        serde_json::from_value(serde_json::Value::Object(serde_json::Map::default())).unwrap()
+        Self {
+            timeout: Duration::from_secs(1),
+            connect_timeout: Duration::from_secs(5),
+            use_msgpack: true,
+            max_retries: 2,
+        }
     }
 }
 
@@ -234,67 +234,15 @@ impl Client {
             .into());
         }
 
-        // 1.+2. acquire a socket and send the request, retrying failures
-        // that provably happen before the request reaches the wire. Each
-        // attempt allocates its waiter entry *after* the connection is
-        // established, so connection setup (which can be slow, e.g. RDMA QP
-        // negotiation with path failover) does not consume the budget. A
-        // failed attempt drops its receiver, cleaning the entry up (and,
-        // with it, the entry's write-target pin — the caller-held clone in
-        // `write_target` keeps the buffers available for the next attempt).
-        let connect_deadline = capped_deadline(
-            std::time::Instant::now(),
-            self.connect_timeout,
-            ctx.deadline,
-        );
-        let mut cycle = AttemptCycle::new(
-            self.initial_candidates(ctx)?,
-            u64::from(self.max_retries) + 1,
-        );
-        let (sent, endpoint_state) = loop {
-            let endpoint_state = cycle.next_candidate();
-            let endpoint = match (&ctx.endpoint, endpoint_state.clone()) {
-                (ContextEndpoint::Connected(socket), _) => {
-                    AttemptEndpoint::Connected(socket.clone())
-                }
-                (ContextEndpoint::Endpoints(_), Some(state)) => AttemptEndpoint::Endpoint(state),
-                (ContextEndpoint::Endpoints(_), None) => {
-                    unreachable!("an endpoint candidate was selected before try_send")
-                }
-                (ContextEndpoint::Invalid, _) => {
-                    unreachable!("request endpoint was validated before try_send")
-                }
-            };
-            let attempted_addr = endpoint_state.as_ref().map(|state| state.endpoint().addr());
-            let result = self
-                .try_send(
-                    ctx,
-                    req,
-                    read_attachment,
-                    write_target.as_ref(),
-                    method_name,
-                    AttemptOptions {
-                        endpoint,
-                        connect_deadline,
-                        remaining_acquire_attempts: cycle.remaining_attempts(),
-                        avoided_remote_nics: cycle.avoided_remote_nics(attempted_addr),
-                    },
-                )
-                .await;
-            match result {
-                Ok(sent) => break (sent, endpoint_state),
-                Err(failure) => {
-                    let attempt = cycle.attempt_index();
-                    if !cycle.note_failure(endpoint_state.as_ref(), &failure) {
-                        return Err(failure.error.into());
-                    }
-                    tracing::warn!(
-                        "attempt {attempt} for {method_name} failed, retrying: {}",
-                        failure.error
-                    );
-                }
-            }
-        };
+        let (sent, endpoint_state) = self
+            .send_with_retries(
+                ctx,
+                req,
+                read_attachment,
+                write_target.as_ref(),
+                method_name,
+            )
+            .await?;
         // 3. recv the single response (fails with Timeout once the waiter
         // entry expires). Ambiguous waiting-phase failures are surfaced to
         // the caller instead of being retried: the request may have
@@ -329,6 +277,74 @@ impl Client {
                 .unwrap_or_default();
         }
         response.payload.deserialize(&response.meta)?
+    }
+
+    /// Acquires a socket and sends the request, retrying only failures that
+    /// provably occur before the request reaches the wire.
+    async fn send_with_retries<'a, Req>(
+        &self,
+        ctx: &'a Context,
+        req: &Req,
+        read_attachment: ReadAttachment<'_, '_>,
+        write_target: Option<&Arc<WriteTarget>>,
+        method_name: &str,
+    ) -> Result<(SentRequest<'a>, Option<Arc<EndpointState>>), Error>
+    where
+        Req: Serialize + JsonSchema,
+    {
+        let connect_deadline = capped_deadline(
+            std::time::Instant::now(),
+            self.connect_timeout,
+            ctx.deadline,
+        );
+        let mut cycle = AttemptCycle::new(
+            self.initial_candidates(ctx)?,
+            u64::from(self.max_retries) + 1,
+        );
+        loop {
+            let endpoint_state = cycle.next_candidate();
+            let endpoint = match (&ctx.endpoint, endpoint_state.clone()) {
+                (ContextEndpoint::Connected(socket), _) => {
+                    AttemptEndpoint::Connected(socket.clone())
+                }
+                (ContextEndpoint::Endpoints(_), Some(state)) => AttemptEndpoint::Endpoint(state),
+                (ContextEndpoint::Endpoints(_), None) => {
+                    unreachable!("an endpoint candidate was selected before try_send")
+                }
+                (ContextEndpoint::Invalid, _) => {
+                    unreachable!("request endpoint was validated before try_send")
+                }
+            };
+            let attempted_addr = endpoint_state.as_ref().map(|state| state.endpoint().addr());
+            let result = self
+                .try_send(
+                    ctx,
+                    req,
+                    read_attachment,
+                    write_target,
+                    method_name,
+                    AttemptOptions {
+                        endpoint,
+                        connect_deadline,
+                        remaining_acquire_attempts: cycle.remaining_attempts(),
+                        avoided_remote_nics: cycle.avoided_remote_nics(attempted_addr),
+                    },
+                )
+                .await;
+            match result {
+                Ok(sent) => return Ok((sent, endpoint_state)),
+                Err(failure) => {
+                    let attempt = cycle.attempt_index();
+                    if !cycle.note_failure(endpoint_state.as_ref(), &failure) {
+                        return Err(failure.error);
+                    }
+                    tracing::warn!(
+                        "attempt {attempt} for {method_name} failed, retrying: {}",
+                        failure.error
+                    );
+                }
+            }
+        }
     }
 
     /// Validates the context's destination and resolves the ranked

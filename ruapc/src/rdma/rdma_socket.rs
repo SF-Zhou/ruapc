@@ -104,7 +104,7 @@ pub(crate) struct ReadBatch {
     remaining: AtomicUsize,
     /// Whether any completion carried an error status (or a post failed).
     failed: AtomicBool,
-    /// Timeout deadline (`None` when `rdma.read_timeout_ms` is 0).
+    /// Timeout deadline (`None` when `rdma.remote_memory.read_timeout_ms` is 0).
     deadline: Option<Instant>,
     inner: Mutex<ReadBatchInner>,
 }
@@ -304,7 +304,7 @@ pub struct RdmaSocket {
     accept_lease_id: AtomicU64,
     /// Bounds in-flight RDMA READ work requests per *local NIC*: shared
     /// by every connection of the pool on this device
-    /// (`rdma.max_inflight_read_wrs`) — the congestion control knob for
+    /// (`rdma.remote_memory.max_inflight_read_wrs`) — the congestion control knob for
     /// read traffic, covering both server-side `remote_read` and
     /// client-side `pull`. Permits are forgotten on post and re-added by
     /// the poll thread per completion.

@@ -23,7 +23,7 @@ pub enum ErrorKind {
     /// A `CopyOp` batch failed validation: out of bounds, arithmetic
     /// overflow, overlapping destination ranges, or too many ops/regions.
     InvalidCopyOp,
-    /// An RDMA READ did not complete within `rdma.read_timeout_ms`; the
+    /// An RDMA READ did not complete within `rdma.remote_memory.read_timeout_ms`; the
     /// connection is moved to the error state so the NIC flushes the
     /// outstanding work requests (releasing their buffers safely).
     RdmaReadTimeout,

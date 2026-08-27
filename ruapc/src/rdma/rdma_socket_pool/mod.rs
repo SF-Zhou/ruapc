@@ -10,10 +10,10 @@ use foldhash::fast::RandomState;
 use tokio_util::sync::DropGuard;
 
 use super::path::RdmaPathInfo;
-use super::{DevicePollers, PollerConfig, RdmaDeviceRefresher, RdmaSocket};
+use super::{DevicePollers, PollerConfig, RdmaDeviceRefresher, RdmaSocket, RdmaSocketPoolConfig};
 use crate::{
-    BufferPool, Client, Devices, Error, ErrorKind, RdmaSocketPoolConfig, Result, Socket,
-    SocketPoolConfig, SocketPoolTrait, State, TaskSupervisor,
+    BufferPool, Client, Devices, Error, ErrorKind, Result, Socket, SocketPoolConfig,
+    SocketPoolTrait, State, TaskSupervisor,
 };
 
 mod peer;
@@ -25,6 +25,7 @@ mod placement;
 use placement::PathCandidate;
 mod maintenance;
 mod report;
+mod setup;
 
 type PathKey = (String, u8, u8, String, u8, u8);
 type PeerMap = dashmap::DashMap<SocketAddr, Arc<PeerState>, RandomState>;
@@ -101,7 +102,7 @@ pub struct RdmaSocketPool {
     /// placement and is advertised to peers via `RdmaInfo`.
     conn_counts: Arc<Vec<AtomicUsize>>,
     /// Per local RDMA device budget of in-flight RDMA READ work requests
-    /// (`rdma.max_inflight_read_wrs`), indexed like
+    /// (`rdma.remote_memory.max_inflight_read_wrs`), indexed like
     /// `devices.rdma_devices()` and shared by every connection on the
     /// device — the congestion control for read traffic (server-side
     /// `remote_read` and client-side `pull` alike).
@@ -195,19 +196,7 @@ impl RdmaSocketPool {
         buffer_pool: Arc<BufferPool>,
         config: RdmaSocketPoolConfig,
     ) -> Result<Self> {
-        if config.connect_lease_ms < 15_000 {
-            return Err(Error::new(
-                ErrorKind::InvalidArgument,
-                "rdma.connect_lease_ms must be at least 15000".into(),
-            ));
-        }
-        if config.preconnect_max_per_peer.max(1) < config.connections_per_peer.max(1) {
-            return Err(Error::new(
-                ErrorKind::InvalidArgument,
-                "rdma.preconnect_max_per_peer must cover connections_per_peer".into(),
-            ));
-        }
-        config.validate_bandwidth_limit()?;
+        config.validate()?;
         for device in devices.rdma_devices() {
             device.configure_bandwidth_limit(&config)?;
         }
@@ -232,7 +221,7 @@ impl RdmaSocketPool {
             read_permits: (0..devices.rdma_devices().len())
                 .map(|_| {
                     Arc::new(tokio::sync::Semaphore::new(
-                        config.max_inflight_read_wrs.max(1) as usize,
+                        config.remote_memory.max_inflight_read_wrs as usize,
                     ))
                 })
                 .collect(),
@@ -381,9 +370,9 @@ impl RdmaSocketPool {
     /// Poll thread tunables derived from the pool configuration.
     fn poller_config(&self) -> PollerConfig {
         PollerConfig {
-            cq_len: self.config.device_cq_len,
-            spin_us: self.config.poll_spin_us,
-            dispatch_workers: self.config.dispatch_workers,
+            cq_len: self.config.polling.device_cq_len,
+            spin_us: self.config.polling.poll_spin_us,
+            dispatch_workers: self.config.polling.dispatch_workers,
         }
     }
 }
