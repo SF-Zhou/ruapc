@@ -104,7 +104,9 @@ impl State {
     ///
     /// Always adds a TCP device. When the `rdma` feature and
     /// `SocketPoolConfig::rdma` is `Some`, discovers available RDMA devices
-    /// before constructing the shared buffer pool.
+    /// before constructing the shared buffer pool. Devices with a DOWN port
+    /// are retained when `rdma.path.allow_down_ports` is enabled so the
+    /// periodic refresher can observe a later transition to ACTIVE.
     fn discover_devices(_config: &SocketPoolConfig) -> Devices {
         let devices = Devices::default();
         #[cfg(feature = "rdma")]
@@ -116,13 +118,7 @@ impl State {
                 sort_rdma_devices(&mut active_devices);
                 let prefer_rxe = std::env::var("RUAPC_PREFER_RXE").is_ok();
                 for dev in active_devices {
-                    if !rdma_device_allowed(
-                        &dev.info().name,
-                        dev.info().ports.iter().any(|port| port.is_usable()),
-                        prefer_rxe,
-                        &rdma.path.device_filter,
-                        &rdma.path.device_exclude,
-                    ) {
+                    if !rdma_device_allowed(dev.info(), prefer_rxe, &rdma.path) {
                         continue;
                     }
                     devices.add_rdma_device(dev);
@@ -196,16 +192,20 @@ fn sort_rdma_devices(devices: &mut [ruapc_rdma::ActiveDevice]) {
 
 #[cfg(feature = "rdma")]
 fn rdma_device_allowed(
-    name: &str,
-    usable: bool,
+    info: &ruapc_rdma::DeviceInfo,
     prefer_rxe: bool,
-    filter: &[String],
-    exclude: &[String],
+    path: &crate::rdma::RdmaPathPolicyConfig,
 ) -> bool {
-    usable
-        && (!prefer_rxe || name.starts_with("rxe"))
-        && (filter.is_empty() || filter.iter().any(|item| item == name))
-        && !exclude.iter().any(|item| item == name)
+    let has_allowed_port = info.ports.iter().any(|port| {
+        port.is_usable()
+            || (path.allow_down_ports
+                && port.port_attr.state == ruapc_rdma::ibv_port_state::IBV_PORT_DOWN)
+    });
+    has_allowed_port
+        && (!prefer_rxe || info.name.starts_with("rxe"))
+        && (path.device_filter.is_empty()
+            || path.device_filter.iter().any(|item| item == &info.name))
+        && !path.device_exclude.iter().any(|item| item == &info.name)
 }
 
 impl std::fmt::Debug for State {
@@ -230,27 +230,77 @@ mod tests {
     }
 
     #[cfg(feature = "rdma")]
-    #[test]
-    fn rdma_device_exclude_takes_precedence() {
-        let filter = vec!["mlx5_0".to_owned(), "mlx5_1".to_owned()];
-        let exclude = vec!["mlx5_1".to_owned()];
+    fn rdma_device_info(name: &str, state: ruapc_rdma::ibv_port_state) -> ruapc_rdma::DeviceInfo {
+        ruapc_rdma::DeviceInfo {
+            name: name.to_owned(),
+            ports: vec![ruapc_rdma::Port {
+                port_num: 1,
+                port_attr: ruapc_rdma::ibv_port_attr {
+                    state,
+                    link_layer: ruapc_rdma::LinkLayer::Ethernet,
+                    ..Default::default()
+                },
+                gids: Vec::new(),
+            }],
+            ..Default::default()
+        }
+    }
 
-        assert!(rdma_device_allowed(
-            "mlx5_0", true, false, &filter, &exclude
-        ));
+    #[cfg(feature = "rdma")]
+    #[test]
+    fn rdma_device_discovery_respects_down_port_policy() {
+        use ruapc_rdma::ibv_port_state::{
+            IBV_PORT_ACTIVE, IBV_PORT_ACTIVE_DEFER, IBV_PORT_ARMED, IBV_PORT_DOWN, IBV_PORT_INIT,
+            IBV_PORT_NOP,
+        };
+
+        let active = rdma_device_info("mlx5_0", IBV_PORT_ACTIVE);
+        let active_defer = rdma_device_info("mlx5_0", IBV_PORT_ACTIVE_DEFER);
+        let down = rdma_device_info("mlx5_0", IBV_PORT_DOWN);
+        let no_ports = ruapc_rdma::DeviceInfo {
+            name: "mlx5_0".to_owned(),
+            ..Default::default()
+        };
+        let mut path = crate::rdma::RdmaPathPolicyConfig::default();
+
+        assert!(rdma_device_allowed(&active, false, &path));
+        assert!(rdma_device_allowed(&active_defer, false, &path));
+        assert!(!rdma_device_allowed(&down, false, &path));
+
+        path.allow_down_ports = true;
+        assert!(rdma_device_allowed(&down, false, &path));
+        for state in [IBV_PORT_NOP, IBV_PORT_INIT, IBV_PORT_ARMED] {
+            assert!(!rdma_device_allowed(
+                &rdma_device_info("mlx5_0", state),
+                false,
+                &path,
+            ));
+        }
+        assert!(!rdma_device_allowed(&no_ports, false, &path));
+    }
+
+    #[cfg(feature = "rdma")]
+    #[test]
+    fn rdma_device_discovery_applies_name_policies_after_port_policy() {
+        use ruapc_rdma::ibv_port_state::IBV_PORT_DOWN;
+
+        let mlx5_0 = rdma_device_info("mlx5_0", IBV_PORT_DOWN);
+        let mlx5_1 = rdma_device_info("mlx5_1", IBV_PORT_DOWN);
+        let path = crate::rdma::RdmaPathPolicyConfig {
+            device_filter: vec!["mlx5_0".to_owned(), "mlx5_1".to_owned()],
+            device_exclude: vec!["mlx5_1".to_owned()],
+            allow_down_ports: true,
+            ..Default::default()
+        };
+
+        assert!(rdma_device_allowed(&mlx5_0, false, &path));
+        assert!(!rdma_device_allowed(&mlx5_1, false, &path));
         assert!(!rdma_device_allowed(
-            "mlx5_1", true, false, &filter, &exclude
+            &rdma_device_info("mlx5_2", IBV_PORT_DOWN),
+            false,
+            &path,
         ));
-        assert!(!rdma_device_allowed(
-            "mlx5_2", true, false, &filter, &exclude
-        ));
-        assert!(!rdma_device_allowed(
-            "mlx5_0", false, false, &filter, &exclude
-        ));
-        assert!(!rdma_device_allowed(
-            "mlx5_0", true, true, &filter, &exclude
-        ));
-        assert!(!rdma_device_allowed("mlx5_1", true, false, &[], &exclude));
+        assert!(!rdma_device_allowed(&mlx5_0, true, &path));
     }
 
     #[tokio::test]

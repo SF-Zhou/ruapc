@@ -136,6 +136,10 @@ pub struct RdmaPathPolicyConfig {
     pub device_filter: Vec<String>,
     /// Excluded devices. Exclusion takes precedence over `device_filter`.
     pub device_exclude: Vec<String>,
+    /// Retain devices with a port currently in the DOWN state during discovery.
+    /// The port remains unavailable for connections until it becomes active.
+    /// Defaults to `false`.
+    pub allow_down_ports: bool,
     /// Connectivity domains used to match local and remote NIC addresses.
     pub subnets: RdmaSubnetDomains,
     pub subnet_policy: RdmaSubnetPolicy,
@@ -390,7 +394,7 @@ mod tests {
     #[test]
     fn partial_nested_config_uses_struct_defaults() {
         let config: SocketPoolConfig = serde_json::from_str(
-            r#"{"rdma":{"connection":{"recv_queue_len":16},"path":{"device_exclude":["mlx5_1"],"subnet_policy":"require"}}}"#,
+            r#"{"rdma":{"connection":{"recv_queue_len":16},"path":{"device_exclude":["mlx5_1"],"allow_down_ports":true,"subnet_policy":"require"}}}"#,
         )
         .unwrap();
         let rdma = config.rdma.unwrap();
@@ -398,6 +402,7 @@ mod tests {
         assert_eq!(rdma.connection.qp, RdmaQueuePairConfig::default());
         assert_eq!(rdma.polling, RdmaPollingConfig::default());
         assert_eq!(rdma.path.device_exclude, ["mlx5_1"]);
+        assert!(rdma.path.allow_down_ports);
         assert_eq!(rdma.path.subnet_policy, RdmaSubnetPolicy::Require);
         assert_eq!(rdma.peers, RdmaPeerPoolConfig::default());
         assert_eq!(rdma.maintenance, RdmaMaintenanceConfig::default());
@@ -410,6 +415,7 @@ mod tests {
             serde_json::from_str::<RdmaSocketPoolConfig>("{}").unwrap(),
             RdmaSocketPoolConfig::default()
         );
+        assert!(!RdmaPathPolicyConfig::default().allow_down_ports);
         assert_eq!(
             serde_json::from_str::<RdmaQueuePairConfig>(r#"{"max_send_wr":128}"#).unwrap(),
             RdmaQueuePairConfig {
