@@ -7,6 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 ## [Unreleased]
 
 ### Added
+- `rdma.path.allow_down_ports` (default `false`) can retain devices whose ports
+  are currently DOWN during discovery, allowing the port refresher to make them
+  available after the link becomes active.
 - Per-port, per-direction RDMA remote read/write bandwidth shaping based on a lock-free GCRA.
   `rdma.remote_memory.bandwidth_limit_ratio` defaults to 95% of the port's reported link
   bandwidth, `bandwidth_limit_burst_ms` controls burst tolerance, and
