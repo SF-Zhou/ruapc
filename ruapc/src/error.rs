@@ -28,7 +28,7 @@ pub enum ErrorKind {
     /// outstanding work requests (releasing their buffers safely).
     RdmaReadTimeout,
     /// The local NIC bandwidth limiter could not admit an RDMA transfer
-    /// within `rdma.bandwidth_limit_max_wait_ms`.
+    /// within `rdma.remote_memory.bandwidth_limit_max_wait_ms`.
     RdmaRateLimited,
     /// Failed to serialize data.
     SerializeFailed,

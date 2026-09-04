@@ -81,8 +81,8 @@ impl SentBuffers {
 ///   buffer list.
 ///
 /// On the wire the response is just `T` (`WithBuffers` serializes
-/// transparently); the data travels out-of-band through the pull/push
-/// protocol into the client's pinned buffers.
+/// transparently); the data travels out-of-band through the internal
+/// remote-memory protocol into the client's pinned buffers.
 ///
 /// # Examples
 ///

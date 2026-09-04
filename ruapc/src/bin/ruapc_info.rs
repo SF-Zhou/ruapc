@@ -1,5 +1,8 @@
 use clap::Parser;
-use ruapc::{Client, Context, Endpoint, SocketPoolConfig, services::MetaService};
+use ruapc::{
+    Client, Context, Endpoint, SocketPoolConfig,
+    services::{DescribeRequest, ReflectionService},
+};
 
 #[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
@@ -12,9 +15,13 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub use_msgpack: bool,
 
-    /// Get metadata.
+    /// Print the full OpenAPI document instead of the structured service description.
     #[arg(long, default_value_t = false)]
     pub openapi: bool,
+
+    /// Describe one exact wire service name.
+    #[arg(long, conflicts_with = "openapi")]
+    pub service: Option<String>,
 }
 
 #[tokio::main]
@@ -36,7 +43,15 @@ async fn main() {
             Err(err) => eprintln!("request failed: {err}"),
         }
     } else {
-        match client.list_methods(&ctx, &()).await {
+        match client
+            .describe(
+                &ctx,
+                &DescribeRequest {
+                    service: args.service,
+                },
+            )
+            .await
+        {
             Ok(rsp) => println!("{}", serde_json::to_string_pretty(&rsp).unwrap()),
             Err(err) => eprintln!("request failed: {err}"),
         }

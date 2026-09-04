@@ -1,0 +1,5 @@
+error: service name cannot contain `/`
+ --> tests/ui/fail/service_name_with_slash.rs:3:25
+  |
+3 | #[ruapc::service(name = "foo/bar")]
+  |                         ^^^^^^^^^

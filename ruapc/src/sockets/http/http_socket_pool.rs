@@ -205,10 +205,19 @@ impl HttpSocketPool {
             }
         }
 
+        // Unary HTTP is part of the public RPC surface. Internal control
+        // methods remain available to trusted peers over the framed `/_rpc`
+        // stream, but must not be callable (or discoverable) as ordinary
+        // HTTP endpoints.
+        let method = path.trim_start_matches('/');
+        if req.method() != hyper::Method::POST || !state.router.is_public_method(method) {
+            return Ok(Self::not_found());
+        }
+
         const UNARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
         let (msgid, rx) = state.waiter.alloc(UNARY_TIMEOUT);
         let meta = MsgMeta {
-            method: path.trim_start_matches('/').to_string(),
+            method: method.to_string(),
             flags: MsgFlags::IsReq,
             msgid,
             read_regions: Vec::new(),

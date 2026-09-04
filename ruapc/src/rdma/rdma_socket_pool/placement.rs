@@ -9,7 +9,7 @@ use ruapc_rdma::{Gid, GidType, LinkLayer, Port};
 
 use super::super::path::{RdmaNicInfo, RdmaPathInfo, gid_ip};
 use super::super::rdma_service::RdmaPortInfo;
-use super::super::{DeviceSelection, RdmaConnectionConfig, RdmaInfo};
+use super::super::{DeviceSelection, RdmaConnectionLimits, RdmaPeerAdvertisement};
 use super::{PeerState, RdmaSocketPool, Stripe, placement};
 use crate::rdma::{RdmaSubnetDomains, RdmaSubnetPolicy};
 use crate::{Error, ErrorKind, Result};
@@ -25,7 +25,7 @@ pub(super) struct Candidate<'a> {
     pub(super) index: usize,
     pub(super) local_index: usize,
     pub(super) remote: &'a str,
-    pub(super) same_subnet: bool,
+    pub(super) same_connectivity_domain: bool,
     pub(super) class: PathClass,
     pub(super) blacklisted: bool,
     pub(super) local_load: u64,
@@ -104,8 +104,12 @@ pub(super) fn eligible_paths(
         eligible.retain(|candidate| !candidate.blacklisted);
     }
     match selection.subnet_policy {
-        RdmaSubnetPolicy::Prefer => retain_if_any(&mut eligible, |candidate| candidate.same_subnet),
-        RdmaSubnetPolicy::Require => eligible.retain(|candidate| candidate.same_subnet),
+        RdmaSubnetPolicy::Prefer => retain_if_any(&mut eligible, |candidate| {
+            candidate.same_connectivity_domain
+        }),
+        RdmaSubnetPolicy::Require => {
+            eligible.retain(|candidate| candidate.same_connectivity_domain)
+        }
     }
     if let Some(best_class) = eligible.iter().map(|candidate| candidate.class).min() {
         eligible.retain(|candidate| candidate.class == best_class);
@@ -116,7 +120,7 @@ pub(super) fn eligible_paths(
         .collect()
 }
 
-fn addresses_share_subnet(
+fn addresses_share_connectivity_domain(
     local: Option<IpAddr>,
     remote: Option<IpAddr>,
     subnet_domains: &RdmaSubnetDomains,
@@ -273,7 +277,7 @@ mod tests {
         let mut ib = candidate(0, "ib", false);
         ib.class = PathClass::InfiniBand;
         let mut roce = candidate(1, "roce", false);
-        roce.same_subnet = true;
+        roce.same_connectivity_domain = true;
         assert_eq!(
             choose_path(
                 &[ib, roce],
@@ -369,7 +373,7 @@ mod tests {
             index,
             local_index: 0,
             remote,
-            same_subnet: false,
+            same_connectivity_domain: false,
             class: PathClass::RoceV2,
             blacklisted,
             local_load: 0,
@@ -387,7 +391,7 @@ impl RdmaSocketPool {
     /// filters, keeping lower classes available as fallbacks.
     pub(super) fn enumerate_path_candidates(
         &self,
-        remote_info: &RdmaInfo,
+        remote_info: &RdmaPeerAdvertisement,
     ) -> Result<Vec<PathCandidate>> {
         let local_devices = self.devices.rdma_devices();
         if local_devices.is_empty() {
@@ -436,7 +440,7 @@ impl RdmaSocketPool {
                                 .iter()
                                 .find(|gid| gid.index == remote_gid_index)
                                 .and_then(|gid| gid_ip(&gid.gid));
-                            let same_subnet = addresses_share_subnet(
+                            let same_connectivity_domain = addresses_share_connectivity_domain(
                                 local_ip,
                                 remote_ip,
                                 &self.config.path.subnets,
@@ -458,7 +462,7 @@ impl RdmaSocketPool {
                                     port_num: remote_port.port_num,
                                     gid_index: remote_gid_index,
                                 },
-                                remote_limits: remote_device.connection,
+                                remote_limits: remote_device.limits,
                                 class,
                                 path: RdmaPathInfo {
                                     local: RdmaNicInfo {
@@ -473,7 +477,7 @@ impl RdmaSocketPool {
                                         gid_index: remote_gid_index,
                                         ip: remote_ip,
                                     },
-                                    same_subnet,
+                                    same_connectivity_domain,
                                 },
                             });
                         }
@@ -514,7 +518,7 @@ impl RdmaSocketPool {
         peer: &PeerState,
         candidates: &[PathCandidate],
         preference: PathPreference<'_>,
-        remote_info: &RdmaInfo,
+        remote_info: &RdmaPeerAdvertisement,
         peer_stripes: &[Stripe],
     ) -> Result<PathCandidate> {
         let views: Vec<placement::Candidate<'_>> = candidates
@@ -537,7 +541,7 @@ impl RdmaSocketPool {
                     index,
                     local_index: candidate.local_device_index,
                     remote: &candidate.path.remote.device,
-                    same_subnet: candidate.path.same_subnet,
+                    same_connectivity_domain: candidate.path.same_connectivity_domain,
                     class: candidate.class,
                     blacklisted: self.is_blacklisted(peer, candidate),
                     local_load: self
@@ -646,10 +650,10 @@ pub(super) struct PathPreference<'a> {
 pub(super) struct PathCandidate {
     /// Index of the local device in `devices.rdma_devices()`.
     pub(super) local_device_index: usize,
-    /// Remote device/port/GID to request in the `connect` RPC.
+    /// Remote device/port/GID to request in `prepare_connection`.
     pub(super) remote: DeviceSelection,
     /// Remote per-connection resource limits advertised for that device.
-    pub(super) remote_limits: RdmaConnectionConfig,
+    pub(super) remote_limits: RdmaConnectionLimits,
     /// Preferred transport class, considered after hard constraints and
     /// reachability filters so lower classes remain valid fallbacks.
     pub(super) class: PathClass,
@@ -668,11 +672,12 @@ mod path_selection_tests {
         AcceptLease, AcceptLeaseEvent, AcceptLeaseState, advance_accept_lease,
     };
     use super::super::maintenance::preconnect_backoff_delay;
-    use super::super::{ConnCountGuard, RdmaSocketPool, next_connection_id};
+    use super::super::{ConnCountGuard, RdmaSocketPool, next_attempt_id};
     use super::*;
-    use crate::rdma::ConnectionControl;
+    use crate::rdma::ConnectionLease;
+    use crate::rdma::RdmaSocketPoolConfig;
+    use crate::rdma::rdma_service::RDMA_BOOTSTRAP_PROTOCOL_VERSION;
     use crate::rdma::rdma_service::RdmaDeviceInfo;
-    use crate::rdma::{RdmaQueuePairConfig, RdmaSocketPoolConfig};
 
     fn make_pool() -> RdmaSocketPool {
         let devices = crate::rdma::test_utils::make_rdma_devices();
@@ -680,13 +685,12 @@ mod path_selection_tests {
         RdmaSocketPool::new(devices, buffer_pool, RdmaSocketPoolConfig::default()).unwrap()
     }
 
-    fn connection_limits() -> RdmaConnectionConfig {
-        RdmaConnectionConfig {
-            qp: RdmaQueuePairConfig::default(),
-            cq_len: 128,
+    fn connection_limits() -> RdmaConnectionLimits {
+        RdmaConnectionLimits {
+            max_send_wr: 64,
+            max_recv_wr: 64,
             recv_queue_len: 8,
             max_msg_size: 64 * 1024,
-            traffic_class: 0,
         }
     }
 
@@ -713,19 +717,20 @@ mod path_selection_tests {
                     gid_index: 0,
                     ip: None,
                 },
-                same_subnet: false,
+                same_connectivity_domain: false,
             },
         }
     }
 
-    fn remote_info(devices: &[(&str, u32)]) -> RdmaInfo {
-        RdmaInfo {
+    fn remote_info(devices: &[(&str, u32)]) -> RdmaPeerAdvertisement {
+        RdmaPeerAdvertisement {
+            protocol_version: RDMA_BOOTSTRAP_PROTOCOL_VERSION,
             devices: devices
                 .iter()
                 .map(|(name, load)| RdmaDeviceInfo {
                     name: (*name).to_string(),
                     active_connections: *load,
-                    connection: connection_limits(),
+                    limits: connection_limits(),
                     ports: Vec::new(),
                 })
                 .collect(),
@@ -832,7 +837,7 @@ mod path_selection_tests {
             connection_id,
             AcceptLease {
                 socket: socket.clone(),
-                server_connection_cookie: 7,
+                accepted_connection_id: 7,
                 state: AcceptLeaseState::Pending,
                 expires_at: Instant::now() + Duration::from_secs(1),
             },
@@ -856,20 +861,20 @@ mod path_selection_tests {
             connection_id,
             AcceptLease {
                 socket: Weak::new(),
-                server_connection_cookie: 7,
+                accepted_connection_id: 7,
                 state: AcceptLeaseState::Pending,
                 expires_at: Instant::now() + Duration::from_secs(1),
             },
         );
-        let mismatched = ConnectionControl {
-            connection_id,
-            server_connection_cookie: 8,
+        let mismatched = ConnectionLease {
+            attempt_id: connection_id,
+            accepted_connection_id: 8,
         };
         assert_eq!(
-            pool.rdma_confirm(&mismatched).unwrap_err().kind,
+            pool.rdma_commit_connection(&mismatched).unwrap_err().kind,
             ErrorKind::InvalidArgument
         );
-        pool.rdma_abort(&mismatched);
+        pool.rdma_cancel_connection(&mismatched);
         assert!(pool.accept_leases.contains_key(&connection_id));
         pool.accept_leases.remove(&connection_id);
 
@@ -877,16 +882,16 @@ mod path_selection_tests {
             connection_id,
             AcceptLease {
                 socket: Weak::new(),
-                server_connection_cookie: 7,
+                accepted_connection_id: 7,
                 state: AcceptLeaseState::Pending,
                 expires_at: Instant::now() - Duration::from_millis(1),
             },
         );
-        let control = ConnectionControl {
-            connection_id,
-            server_connection_cookie: 7,
+        let lease = ConnectionLease {
+            attempt_id: connection_id,
+            accepted_connection_id: 7,
         };
-        let err = pool.rdma_confirm(&control).unwrap_err();
+        let err = pool.rdma_commit_connection(&lease).unwrap_err();
         assert_eq!(err.kind, ErrorKind::InvalidArgument);
         assert!(!pool.accept_leases.contains_key(&connection_id));
     }
@@ -928,17 +933,17 @@ mod path_selection_tests {
             ],
             vec!["192.168.1.0/24".parse().unwrap()],
         ]);
-        assert!(addresses_share_subnet(
+        assert!(addresses_share_connectivity_domain(
             Some("10.11.1.2".parse().unwrap()),
             Some("10.12.200.3".parse().unwrap()),
             &subnets,
         ));
-        assert!(!addresses_share_subnet(
+        assert!(!addresses_share_connectivity_domain(
             Some("10.11.1.2".parse().unwrap()),
             Some("192.168.1.2".parse().unwrap()),
             &subnets,
         ));
-        assert!(!addresses_share_subnet(
+        assert!(!addresses_share_connectivity_domain(
             Some("10.11.1.2".parse().unwrap()),
             None,
             &subnets,
@@ -946,12 +951,12 @@ mod path_selection_tests {
     }
 
     #[tokio::test]
-    async fn test_same_subnet_is_preferred() {
+    async fn test_same_connectivity_domain_is_preferred() {
         let pool = make_pool();
-        let mut same_subnet = candidate(0, "remoteA");
-        same_subnet.path.same_subnet = true;
+        let mut same_domain = candidate(0, "remoteA");
+        same_domain.path.same_connectivity_domain = true;
         let other = candidate(0, "remoteB");
-        let candidates = [same_subnet, other];
+        let candidates = [same_domain, other];
         let info = remote_info(&[("remoteA", 10), ("remoteB", 0)]);
 
         let selected = pool
@@ -974,9 +979,9 @@ mod path_selection_tests {
     }
 
     #[test]
-    fn test_connection_ids_are_nonzero_and_unique() {
-        let first = next_connection_id();
-        let second = next_connection_id();
+    fn test_attempt_ids_are_nonzero_and_unique() {
+        let first = next_attempt_id();
+        let second = next_attempt_id();
         assert_ne!(first, 0);
         assert_ne!(second, 0);
         assert_ne!(first, second);
@@ -996,36 +1001,16 @@ mod path_selection_tests {
         let device = &rdma_devices[0];
 
         // Client path: local config wins over the remote advertisement.
-        let mut advertised = connection_limits();
-        advertised.traffic_class = 7;
-        let negotiated = pool.negotiate_connection_config(device, &advertised);
+        let advertised = connection_limits();
+        let negotiated = pool
+            .negotiate_connection_config(device, &advertised)
+            .unwrap();
         assert_eq!(negotiated.traffic_class, 96);
 
         // Server path: the requested (client-chosen) value passes through.
-        let mut requested = connection_limits();
-        requested.traffic_class = 42;
-        let clamped = pool.clamp_connection_config(device, requested);
+        let requested = connection_limits();
+        let clamped = pool.clamp_connection_config(device, requested, 42).unwrap();
         assert_eq!(clamped.traffic_class, 42);
-    }
-
-    /// Old peers omit `traffic_class` from the handshake payload; it must
-    /// deserialize to 0.
-    #[test]
-    fn test_connection_config_traffic_class_serde_default() {
-        let encoded = rmp_serde::to_vec_named(&serde_json::json!({
-            "qp": {
-                "max_send_wr": 64,
-                "max_recv_wr": 64,
-                "max_send_sge": 16,
-                "max_recv_sge": 1,
-            },
-            "cq_len": 128,
-            "recv_queue_len": 8,
-            "max_msg_size": 65536,
-        }))
-        .unwrap();
-        let config: RdmaConnectionConfig = rmp_serde::from_slice(&encoded).unwrap();
-        assert_eq!(config.traffic_class, 0);
     }
 
     #[tokio::test]
@@ -1101,10 +1086,10 @@ mod path_selection_tests {
     }
 
     #[tokio::test]
-    async fn test_device_list_advertises_connection_counts() {
+    async fn test_peer_advertisement_includes_connection_counts() {
         let pool = make_pool();
         pool.conn_counts[0].fetch_add(3, Ordering::AcqRel);
-        let info = pool.rdma_device_list().unwrap();
+        let info = pool.rdma_peer_advertisement().unwrap();
         assert_eq!(info.devices[0].active_connections, 3);
     }
 }

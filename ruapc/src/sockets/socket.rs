@@ -7,7 +7,7 @@ use crate::{
     Buffer, Context, CopyOp, MsgMeta, RemoteIoError, RemoteSpace, Result, State,
     core::scatter::SpaceLayout,
     http::HttpSocket,
-    services::{MemoryPushReq, MemoryReadReq, MemoryService},
+    services::{MemoryService, ReadInlineRequest, WriteInlineRequest},
     tcp::TcpSocket,
     ws::WebSocket,
 };
@@ -135,7 +135,8 @@ pub trait SocketTrait {
     /// the `local` buffers (see [`Context::remote_read`] for the space and
     /// op semantics; validation already happened there).
     ///
-    /// Default implementation (TCP/WS/HTTP): a reverse `MemoryService/read`
+    /// Default implementation (TCP/WS/HTTP): a reverse
+    /// `_ruapc.memory/read_inline`
     /// RPC returns the requested byte ranges inline, which are then
     /// scattered into `local` according to the ops.
     async fn remote_read(
@@ -147,24 +148,24 @@ pub trait SocketTrait {
     ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
         // Pass msgid so that the client verifies the original request is
         // still alive after reading its buffers.
-        let req = MemoryReadReq {
+        let req = ReadInlineRequest {
             regions: remote.regions().to_vec(),
             ops: ops.to_vec(),
-            msgid: ctx.msg_meta.msgid,
+            request_id: ctx.msg_meta.msgid,
         };
         let client = crate::Client::default();
-        let data: Vec<u8> = match client.read(ctx, &req).await {
-            Ok(rsp) => rsp.data,
+        let bytes: Vec<u8> = match client.read_inline(ctx, &req).await {
+            Ok(rsp) => rsp.bytes,
             Err(e) => return Err(RemoteIoError::new(e, Some(local))),
         };
         let expected: u64 = ops.iter().map(|op| op.len).sum();
-        if data.len() as u64 != expected {
+        if bytes.len() as u64 != expected {
             return Err(RemoteIoError::new(
                 crate::Error::new(
                     crate::ErrorKind::InvalidCopyOp,
                     format!(
                         "remote read returned {} bytes but the ops requested {expected}",
-                        data.len()
+                        bytes.len()
                     ),
                 ),
                 Some(local),
@@ -183,7 +184,7 @@ pub trait SocketTrait {
                 op.len,
                 |seg, off, len| {
                     let (off, len) = (off as usize, len as usize);
-                    local[seg][off..off + len].copy_from_slice(&data[cursor..cursor + len]);
+                    local[seg][off..off + len].copy_from_slice(&bytes[cursor..cursor + len]);
                     cursor += len;
                     Ok(())
                 },
@@ -197,7 +198,7 @@ pub trait SocketTrait {
     /// already happened there).
     ///
     /// Default implementation (TCP/WS/HTTP): the op payloads travel inline
-    /// in a reverse `MemoryService/push` RPC and the client copies them
+    /// in a reverse `_ruapc.memory/write_inline` RPC and the client copies them
     /// into its pinned write buffers.
     async fn remote_write(
         &self,
@@ -211,25 +212,25 @@ pub trait SocketTrait {
             Err(e) => return Err(RemoteIoError::new(e, Some(local))),
         };
         let total: u64 = ops.iter().map(|op| op.len).sum();
-        let mut data = Vec::with_capacity(total as usize);
+        let mut bytes = Vec::with_capacity(total as usize);
         for op in ops {
             let _ = layout.for_each_slice::<std::convert::Infallible>(
                 op.src_offset,
                 op.len,
                 |seg, off, len| {
                     let (off, len) = (off as usize, len as usize);
-                    data.extend_from_slice(&local[seg][off..off + len]);
+                    bytes.extend_from_slice(&local[seg][off..off + len]);
                     Ok(())
                 },
             );
         }
-        let req = MemoryPushReq {
-            msgid: ctx.msg_meta.msgid,
+        let req = WriteInlineRequest {
+            request_id: ctx.msg_meta.msgid,
             ops: ops.to_vec(),
-            data,
+            bytes,
         };
         let client = crate::Client::default();
-        match client.push(ctx, &req).await {
+        match client.write_inline(ctx, &req).await {
             Ok(()) => Ok(local),
             Err(e) => Err(RemoteIoError::new(e, Some(local))),
         }
@@ -261,11 +262,11 @@ impl Socket {
         }
     }
 
-    /// Executes the client side of a `MemoryService/pull` request: RDMA
+    /// Executes the client side of `_ruapc.memory/read_into_target`: RDMA
     /// READs from the peer's advertised regions into the request's pinned
     /// write target. Only meaningful on RDMA connections.
     #[allow(unused_variables)]
-    pub(crate) async fn pull_into_target(
+    pub(crate) async fn read_into_target(
         &self,
         regions: &[ruapc_bufpool::RemoteBufferInfo],
         src_layout: &SpaceLayout,
@@ -277,12 +278,12 @@ impl Socket {
             #[cfg(feature = "rdma")]
             Socket::RDMA(rdma_socket) => {
                 rdma_socket
-                    .pull_into_target(regions, src_layout, ops, target, request_remaining)
+                    .read_into_target(regions, src_layout, ops, target, request_remaining)
                     .await
             }
             _ => Err(crate::Error::new(
                 crate::ErrorKind::InvalidArgument,
-                "pull requires an RDMA connection (non-RDMA transports use push)".into(),
+                "read_into_target requires RDMA (other transports use write_inline)".into(),
             )),
         }
     }

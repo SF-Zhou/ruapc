@@ -7,12 +7,13 @@ use ruapc_bufpool::{AsDeviceIndex, RemoteBufferInfo};
 use crate::{Buffer, Error, ErrorKind, Result, core::scatter::SpaceLayout};
 
 /// The buffers a client hands over for the duration of one request so the
-/// server can write into them (via reverse-RPC pull or inline push).
+/// server can write into them (via `read_into_target` or `write_inline`).
 ///
 /// Shared as `Arc<WriteTarget>` between the pending request's waiter entry
-/// and any in-flight `MemoryService::pull` / `push` handler: **whoever
+/// and any in-flight `MemoryService::read_into_target` / `write_inline`
+/// handler: **whoever
 /// still holds a clone keeps the memory alive**, so a request timing out
-/// while a pull's RDMA READ is in flight can never hand the underlying
+/// while a `read_into_target` RDMA READ is in flight can never hand the underlying
 /// memory back to the pool early. The buffers materialize for the caller
 /// only when the last clone is unwrapped ([`try_into_buffers`]); if that
 /// fails (a handler still holds a clone), they simply drop back to the
@@ -26,8 +27,8 @@ use crate::{Buffer, Error, ErrorKind, Result, core::scatter::SpaceLayout};
 #[derive(Debug)]
 pub(crate) struct WriteTarget {
     /// The pinned buffers. Locked only for the brief moments a writer
-    /// needs `&mut` access (TCP push memcpy) or address/key export; the
-    /// RDMA pull path writes through the NIC and never takes `&mut`.
+    /// needs `&mut` access (`write_inline` memcpy) or address/key export; the
+    /// `read_into_target` path writes through the NIC and never takes `&mut`.
     buffers: Mutex<Vec<Buffer>>,
     /// Segment lengths frozen at construction.
     layout: SpaceLayout,
@@ -73,7 +74,7 @@ impl WriteTarget {
     }
 
     /// Exports each segment's `(base address, lkey)` for the given device,
-    /// in segment order. Used by the RDMA pull path to build READ scatter
+    /// in segment order. Used by `read_into_target` to build READ scatter
     /// lists; the caller must hold an `Arc<WriteTarget>` clone until the
     /// reads complete (the addresses stay valid exactly as long as the
     /// pin does).
@@ -92,7 +93,7 @@ impl WriteTarget {
             .collect()
     }
 
-    /// Copies `data` into the write space at `dst_offset` (TCP push path).
+    /// Copies `data` into the write space at `dst_offset` (`write_inline` path).
     ///
     /// The range must have been validated against
     /// [`total_len`](Self::total_len) beforehand.

@@ -30,8 +30,9 @@ struct WaiterEntry {
     /// Channel to send the response through.
     sender: oneshot::Sender<WaiterResult>,
     /// The pinned destination buffers of a request sent with
-    /// `with_write_buffers`. `MemoryService::push` / `pull` handlers clone
-    /// the `Arc` while writing, so the memory outlives the entry even if
+    /// `with_write_buffers`. `MemoryService::write_inline` /
+    /// `read_into_target` handlers clone the `Arc` while writing, so the
+    /// memory outlives the entry even if
     /// the request expires mid-transfer. Delivered together with the
     /// response when `post` is called.
     write_target: Option<Arc<WriteTarget>>,
@@ -185,8 +186,9 @@ impl Waiter {
 
     /// Returns a clone of the pending request's pinned write target, or
     /// `None` when the request completed/expired or attached no write
-    /// buffers. `MemoryService::push` / `pull` handlers hold this clone
-    /// while writing, which keeps the memory alive across the transfer.
+    /// buffers. `MemoryService::write_inline` / `read_into_target` handlers
+    /// hold this clone while writing, which keeps the memory alive across
+    /// the transfer.
     pub(crate) fn write_target(&self, msgid: u64) -> Option<Arc<WriteTarget>> {
         self.id_map
             .get(&msgid)

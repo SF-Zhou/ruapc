@@ -329,7 +329,8 @@ impl Context {
     /// overflow, op count, and non-overlapping destination ranges. On RDMA
     /// the ops are fragmented into one-sided RDMA READ work requests
     /// (contiguous remote range + local scatter-gather list) executed
-    /// concurrently; on TCP/WS/HTTP a reverse `MemoryService/read` RPC
+    /// concurrently; on TCP/WS/HTTP a reverse
+    /// `MemoryService::read_inline` RPC
     /// moves the bytes inline.
     ///
     /// Returns the same buffers, now filled at the ops' destination
@@ -420,11 +421,12 @@ impl Context {
     /// overflow, op count, non-overlapping destination ranges; overlap
     /// across *separate* `remote_write` calls is the caller's
     /// responsibility). No one-sided RDMA WRITE is used: on RDMA the
-    /// server sends a reverse `MemoryService/pull` RPC advertising `local`
+    /// server sends a reverse `MemoryService::read_into_target` RPC
+    /// advertising `local`
     /// as readable regions, and the *client* executes the RDMA READs into
     /// its pinned buffers — their lifetime is anchored client-side, which
     /// makes the transfer safe against client timeouts. On TCP the data
-    /// travels inline via `MemoryService/push`.
+    /// travels inline via `MemoryService::write_inline`.
     ///
     /// The transfer happens *here*, inside the handler, so its latency and
     /// errors are directly observable. Pair the witness with a response

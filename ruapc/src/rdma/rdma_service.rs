@@ -1,9 +1,15 @@
-use ruapc_rdma::{Gid, LinkLayer};
+use ruapc_rdma::{DeviceInfo, Gid, LinkLayer, Port};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::RdmaQueuePairConfig;
 use crate::{Context, Result, rdma, service};
+
+/// Version of the internal RDMA bootstrap protocol.
+pub(crate) const RDMA_BOOTSTRAP_PROTOCOL_VERSION: u32 = 1;
+
+fn port_is_connectable(port: &Port) -> bool {
+    port.is_usable() && (!port.port_attr.link_layer.is_ethernet() || !port.gids.is_empty())
+}
 
 /// Port information advertised for RDMA connection negotiation.
 ///
@@ -31,9 +37,52 @@ pub struct RdmaDeviceInfo {
     /// Advertised so that clients can prefer less-loaded server NICs.
     pub active_connections: u32,
     /// Server-advertised per-connection RDMA resource limits for this device.
-    pub connection: rdma::RdmaConnectionConfig,
+    pub limits: rdma::RdmaConnectionLimits,
     /// Usable ports on this device.
     pub ports: Vec<RdmaPortInfo>,
+}
+
+impl RdmaDeviceInfo {
+    fn from_device_info(
+        info: &DeviceInfo,
+        config: &crate::rdma::RdmaSocketPoolConfig,
+        active_connections: u32,
+    ) -> Option<Self> {
+        let ports: Vec<_> = info
+            .ports
+            .iter()
+            .filter(|port| port_is_connectable(port))
+            .map(|port| RdmaPortInfo {
+                port_num: port.port_num,
+                link_layer: port.port_attr.link_layer,
+                gids: port.gids.clone(),
+            })
+            .collect();
+        if ports.is_empty() {
+            return None;
+        }
+        let max_send_wr = config
+            .connection
+            .qp
+            .max_send_wr
+            .min(info.device_attr.max_qp_wr as u32);
+        let max_recv_wr = config
+            .connection
+            .qp
+            .max_recv_wr
+            .min(info.device_attr.max_qp_wr as u32);
+        Some(Self {
+            name: info.name.clone(),
+            active_connections,
+            limits: rdma::RdmaConnectionLimits {
+                max_send_wr,
+                max_recv_wr,
+                recv_queue_len: config.connection.recv_queue_len.min(max_recv_wr),
+                max_msg_size: config.connection.max_msg_size,
+            },
+            ports,
+        })
+    }
 }
 
 /// Information about available RDMA devices in the system.
@@ -42,13 +91,15 @@ pub struct RdmaDeviceInfo {
 /// RDMA connection negotiation. It contains only the minimal
 /// information needed to select a compatible device/port/GID pair.
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
-pub struct RdmaInfo {
+pub struct RdmaPeerAdvertisement {
+    /// Bootstrap wire protocol version understood by this peer.
+    pub protocol_version: u32,
     /// List of available RDMA devices with connection-relevant info
     pub devices: Vec<RdmaDeviceInfo>,
 }
 
-impl RdmaInfo {
-    /// Build `RdmaInfo` from the full device info list.
+impl RdmaPeerAdvertisement {
+    /// Build an advertisement from the full device info list.
     ///
     /// Only usable ports are advertised. GIDs unusable for communication
     /// (RoCE v2 GIDs derived from loopback or IPv6 link-local addresses)
@@ -58,64 +109,20 @@ impl RdmaInfo {
         config: &crate::rdma::RdmaSocketPoolConfig,
         conn_counts: &[std::sync::atomic::AtomicUsize],
     ) -> Self {
-        RdmaInfo {
+        RdmaPeerAdvertisement {
+            protocol_version: RDMA_BOOTSTRAP_PROTOCOL_VERSION,
             devices: devices
                 .iter()
                 .enumerate()
-                .map(|(index, d)| {
+                .filter_map(|(index, d)| {
                     let info = d.info();
-                    RdmaDeviceInfo {
-                        name: info.name.clone(),
-                        active_connections: conn_counts
-                            .get(index)
-                            .map(|c| c.load(std::sync::atomic::Ordering::Acquire))
-                            .unwrap_or(0)
-                            .try_into()
-                            .unwrap_or(u32::MAX),
-                        connection: rdma::RdmaConnectionConfig {
-                            qp: RdmaQueuePairConfig {
-                                max_send_wr: config
-                                    .connection
-                                    .qp
-                                    .max_send_wr
-                                    .min(info.device_attr.max_qp_wr as u32),
-                                max_recv_wr: config
-                                    .connection
-                                    .qp
-                                    .max_recv_wr
-                                    .min(info.device_attr.max_qp_wr as u32),
-                                max_send_sge: config
-                                    .connection
-                                    .qp
-                                    .max_send_sge
-                                    .min(info.device_attr.max_sge as u32),
-                                max_recv_sge: config
-                                    .connection
-                                    .qp
-                                    .max_recv_sge
-                                    .min(info.device_attr.max_sge as u32),
-                            },
-                            cq_len: config
-                                .connection
-                                .cq_len
-                                .min(info.device_attr.max_cqe as u32),
-                            recv_queue_len: config.connection.recv_queue_len,
-                            max_msg_size: config.connection.max_msg_size,
-                            // Advisory only: connecting clients dictate the
-                            // traffic class of the connections they create.
-                            traffic_class: config.connection.traffic_class,
-                        },
-                        ports: info
-                            .ports
-                            .iter()
-                            .filter(|port| port.is_usable())
-                            .map(|port| RdmaPortInfo {
-                                port_num: port.port_num,
-                                link_layer: port.port_attr.link_layer,
-                                gids: port.gids.clone(),
-                            })
-                            .collect(),
-                    }
+                    let active_connections = conn_counts
+                        .get(index)
+                        .map(|c| c.load(std::sync::atomic::Ordering::Acquire))
+                        .unwrap_or(0)
+                        .try_into()
+                        .unwrap_or(u32::MAX);
+                    RdmaDeviceInfo::from_device_info(&info, config, active_connections)
                 })
                 .collect(),
         }
@@ -127,54 +134,56 @@ impl RdmaInfo {
 /// This trait defines the core operations for managing RDMA connections
 /// and querying RDMA device information. It is designed to work with
 /// the service macro for RPC functionality.
-#[service]
-pub trait RdmaService {
-    /// Retrieves information about available RDMA devices.
-    async fn info(&self, ctx: &Context, _: &()) -> Result<rdma::RdmaInfo>;
+#[service(name = "_ruapc.rdma", internal)]
+pub(crate) trait RdmaBootstrapService {
+    /// Discovers the peer's connectable RDMA devices and limits.
+    async fn discover(&self, ctx: &Context, _: &()) -> Result<rdma::RdmaPeerAdvertisement>;
 
-    /// Establishes an RDMA connection with the selected server endpoint.
-    async fn connect(
+    /// Prepares an RDMA connection with the selected acceptor endpoint.
+    async fn prepare_connection(
         &self,
         ctx: &Context,
-        request: &rdma::ConnectRequest,
-    ) -> Result<rdma::Endpoint>;
+        request: &rdma::PrepareConnectionRequest,
+    ) -> Result<rdma::PrepareConnectionResponse>;
 
     /// Confirms that the initiator received the endpoint and retained its
     /// local QP. Unconfirmed accepts expire after the configured lease.
     /// The bootstrap service assumes a trusted control plane; the token
     /// correlates lifecycle state but does not authenticate the caller.
-    async fn confirm(&self, ctx: &Context, control: &rdma::ConnectionControl) -> Result<()>;
+    async fn commit_connection(&self, ctx: &Context, lease: &rdma::ConnectionLease) -> Result<()>;
 
     /// Best-effort idempotent cleanup when the initiator cannot complete the
     /// confirmation exchange.
-    async fn abort(&self, ctx: &Context, control: &rdma::ConnectionControl) -> Result<()>;
+    async fn cancel_connection(&self, ctx: &Context, lease: &rdma::ConnectionLease) -> Result<()>;
 }
 
-/// Default implementation of `RdmaService` for the unit type.
+/// Default implementation of `RdmaBootstrapService` for the unit type.
 ///
 /// This implementation delegates all operations to the socket pool
 /// stored in the context's state.
-impl RdmaService for () {
+impl RdmaBootstrapService for () {
     /// Retrieves RDMA device information from the socket pool.
-    async fn info(&self, ctx: &Context, (): &()) -> Result<rdma::RdmaInfo> {
-        ctx.state.socket_pool.rdma_device_list()
+    async fn discover(&self, ctx: &Context, (): &()) -> Result<rdma::RdmaPeerAdvertisement> {
+        ctx.state.socket_pool.rdma_peer_advertisement()
     }
 
-    /// Establishes an RDMA connection using the socket pool.
-    async fn connect(
+    /// Prepares an RDMA connection using the socket pool.
+    async fn prepare_connection(
         &self,
         ctx: &Context,
-        request: &rdma::ConnectRequest,
-    ) -> Result<rdma::Endpoint> {
-        ctx.state.socket_pool.rdma_accept(request, &ctx.state)
+        request: &rdma::PrepareConnectionRequest,
+    ) -> Result<rdma::PrepareConnectionResponse> {
+        ctx.state
+            .socket_pool
+            .rdma_prepare_connection(request, &ctx.state)
     }
 
-    async fn confirm(&self, ctx: &Context, control: &rdma::ConnectionControl) -> Result<()> {
-        ctx.state.socket_pool.rdma_confirm(control)
+    async fn commit_connection(&self, ctx: &Context, lease: &rdma::ConnectionLease) -> Result<()> {
+        ctx.state.socket_pool.rdma_commit_connection(lease)
     }
 
-    async fn abort(&self, ctx: &Context, control: &rdma::ConnectionControl) -> Result<()> {
-        ctx.state.socket_pool.rdma_abort(control)
+    async fn cancel_connection(&self, ctx: &Context, lease: &rdma::ConnectionLease) -> Result<()> {
+        ctx.state.socket_pool.rdma_cancel_connection(lease)
     }
 }
 
@@ -183,29 +192,83 @@ mod tests {
     use super::*;
     use crate::SocketPoolConfig;
 
-    #[tokio::test]
-    async fn test_rdma_service_info_returns_devices() {
-        let config = SocketPoolConfig::default();
-        let ctx = Context::create(&config).expect("failed to create RDMA context");
-        let result = ().info(&ctx, &()).await;
-        assert!(result.is_ok());
-        let info = result.unwrap();
-        assert!(!info.devices.is_empty());
-        let control = rdma::ConnectionControl {
-            connection_id: u64::MAX,
-            server_connection_cookie: u64::MAX,
+    #[test]
+    fn ethernet_advertisement_requires_a_gid() {
+        let mut ethernet = Port {
+            port_num: 1,
+            port_attr: ruapc_rdma::ibv_port_attr {
+                state: ruapc_rdma::ibv_port_state::IBV_PORT_ACTIVE,
+                link_layer: LinkLayer::Ethernet,
+                ..Default::default()
+            },
+            gids: Vec::new(),
         };
-        let err = ().confirm(&ctx, &control).await.unwrap_err();
-        assert_eq!(err.kind, crate::ErrorKind::InvalidArgument);
-        ().abort(&ctx, &control).await.unwrap();
+        assert!(!port_is_connectable(&ethernet));
+        let config = crate::rdma::RdmaSocketPoolConfig::default();
+        let ethernet_only = DeviceInfo {
+            name: "ethernet-only".into(),
+            ports: vec![ethernet.clone()],
+            ..Default::default()
+        };
+        assert!(RdmaDeviceInfo::from_device_info(&ethernet_only, &config, 0).is_none());
+
+        ethernet.gids.push(Gid {
+            index: 0,
+            gid: ruapc_rdma::ibv_gid::default(),
+            gid_type: ruapc_rdma::GidType::RoCEv2,
+        });
+        assert!(port_is_connectable(&ethernet));
+        let ethernet_with_gid = DeviceInfo {
+            name: "ethernet-with-gid".into(),
+            ports: vec![ethernet],
+            ..Default::default()
+        };
+        assert!(RdmaDeviceInfo::from_device_info(&ethernet_with_gid, &config, 0).is_some());
+
+        let infiniband = Port {
+            port_num: 1,
+            port_attr: ruapc_rdma::ibv_port_attr {
+                state: ruapc_rdma::ibv_port_state::IBV_PORT_ACTIVE,
+                link_layer: LinkLayer::InfiniBand,
+                ..Default::default()
+            },
+            gids: Vec::new(),
+        };
+        assert!(port_is_connectable(&infiniband));
     }
 
     #[tokio::test]
-    async fn test_rdma_service_connect_non_rdma_returns_err() {
-        // With a TCP pool, `connect` should propagate the error from rdma_accept.
+    async fn test_rdma_bootstrap_discover_returns_connectable_devices() {
+        let config = SocketPoolConfig::default();
+        let ctx = Context::create(&config).expect("failed to create RDMA context");
+        let result = ().discover(&ctx, &()).await;
+        assert!(result.is_ok());
+        let advertisement = result.unwrap();
+        assert_eq!(
+            advertisement.protocol_version,
+            RDMA_BOOTSTRAP_PROTOCOL_VERSION
+        );
+        assert!(!advertisement.devices.is_empty());
+        assert!(
+            advertisement
+                .devices
+                .iter()
+                .all(|device| !device.ports.is_empty())
+        );
+        let lease = rdma::ConnectionLease {
+            attempt_id: u64::MAX,
+            accepted_connection_id: u64::MAX,
+        };
+        let err = ().commit_connection(&ctx, &lease).await.unwrap_err();
+        assert_eq!(err.kind, crate::ErrorKind::InvalidArgument);
+        ().cancel_connection(&ctx, &lease).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_rdma_bootstrap_prepare_non_rdma_returns_err() {
+        // With a TCP pool, preparation propagates the socket-pool error.
         let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
-        let endpoint = rdma::Endpoint {
-            connection_cookie: 0,
+        let endpoint = rdma::RdmaQpEndpoint {
             qp_num: 0,
             port_num: 1,
             gid_index: 0,
@@ -216,25 +279,25 @@ mod tests {
             psn: 0,
             rd_atomic_cap: 1,
         };
-        let request = rdma::ConnectRequest {
-            connection_id: 1,
+        let request = rdma::PrepareConnectionRequest {
+            attempt_id: 1,
             endpoint,
             source_device: "test".into(),
-            same_subnet: false,
+            same_connectivity_domain: false,
             target: rdma::DeviceSelection {
                 device_name: "missing".into(),
                 port_num: 1,
                 gid_index: 0,
             },
-            config: rdma::RdmaConnectionConfig {
-                qp: RdmaQueuePairConfig::default(),
-                cq_len: 128,
+            limits: rdma::RdmaConnectionLimits {
+                max_send_wr: 64,
+                max_recv_wr: 64,
                 recv_queue_len: 64,
                 max_msg_size: 1024 * 1024,
-                traffic_class: 0,
             },
+            traffic_class: 0,
         };
-        let result = ().connect(&ctx, &request).await;
+        let result = ().prepare_connection(&ctx, &request).await;
         assert!(result.is_err());
     }
 }

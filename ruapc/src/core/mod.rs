@@ -9,7 +9,7 @@ mod server;
 pub use server::Server;
 
 mod router;
-pub use router::{MethodInfo, Router};
+pub use router::{MethodSchema, Router};
 
 mod state;
 pub use state::State;

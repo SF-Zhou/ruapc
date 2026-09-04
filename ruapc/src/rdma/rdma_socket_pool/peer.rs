@@ -9,7 +9,7 @@ use std::{
 
 use foldhash::fast::RandomState;
 
-use super::connect::CachedRdmaInfo;
+use super::connect::CachedPeerAdvertisement;
 use super::maintenance::RetryBackoff;
 use super::{PathKey, Stripe};
 
@@ -27,7 +27,7 @@ pub(super) struct PeerStripes {
 #[derive(Default)]
 pub(super) struct PeerMeta {
     pub(super) last_used: Option<Instant>,
-    pub(super) device_cache: Option<CachedRdmaInfo>,
+    pub(super) device_cache: Option<CachedPeerAdvertisement>,
     pub(super) backoff: HashMap<String, RetryBackoff, RandomState>,
     pub(super) blacklist: HashMap<PathKey, Instant, RandomState>,
 }

@@ -42,7 +42,7 @@ impl State {
     /// Creates a new state with the given router and configuration.
     ///
     /// Internally discovers devices, creates a shared buffer pool, registers
-    /// `MemoryService`, and creates the socket pool.
+    /// the internal remote-memory service, and creates the socket pool.
     ///
     /// # Returns
     ///

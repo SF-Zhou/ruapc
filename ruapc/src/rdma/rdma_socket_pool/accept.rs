@@ -1,4 +1,4 @@
-//! Server side of RDMA connection setup: accept, confirm/abort and the
+//! Server side of RDMA connection setup: prepare, commit/cancel and the
 //! accept-lease lifecycle.
 
 use std::{
@@ -8,7 +8,9 @@ use std::{
 };
 
 use super::super::path::{RdmaNicInfo, RdmaPathInfo, gid_ip};
-use super::super::{ConnectRequest, ConnectionControl, Endpoint, RdmaInfo};
+use super::super::{
+    ConnectionLease, PrepareConnectionRequest, PrepareConnectionResponse, RdmaPeerAdvertisement,
+};
 use super::{RdmaSocket, RdmaSocketPool};
 use crate::{Error, ErrorKind, Result, State};
 
@@ -48,38 +50,38 @@ pub(super) fn advance_accept_lease(
 
 pub(super) struct AcceptLease {
     pub(super) socket: Weak<RdmaSocket>,
-    pub(super) server_connection_cookie: u64,
+    pub(super) accepted_connection_id: u64,
     pub(super) state: AcceptLeaseState,
     pub(super) expires_at: Instant,
 }
 
 impl RdmaSocketPool {
-    pub(crate) fn rdma_device_list(&self) -> Result<RdmaInfo> {
-        Ok(RdmaInfo::from_devices(
+    pub(crate) fn rdma_peer_advertisement(&self) -> Result<RdmaPeerAdvertisement> {
+        Ok(RdmaPeerAdvertisement::from_devices(
             self.devices.rdma_devices(),
             &self.config,
             &self.conn_counts,
         ))
     }
 
-    pub(crate) fn rdma_accept(
+    pub(crate) fn rdma_prepare_connection(
         &self,
-        request: &ConnectRequest,
+        request: &PrepareConnectionRequest,
         state: &Arc<State>,
-    ) -> Result<Endpoint> {
-        if request.connection_id == 0 {
+    ) -> Result<PrepareConnectionResponse> {
+        if request.attempt_id == 0 {
             return Err(Error::new(
                 ErrorKind::InvalidArgument,
-                "RDMA connection id must be non-zero".into(),
+                "RDMA bootstrap attempt id must be non-zero".into(),
             ));
         }
         if let dashmap::mapref::entry::Entry::Occupied(entry) =
-            self.accept_leases.entry(request.connection_id)
+            self.accept_leases.entry(request.attempt_id)
         {
             if entry.get().expires_at > Instant::now() && entry.get().socket.strong_count() > 0 {
                 return Err(Error::new(
                     ErrorKind::InvalidArgument,
-                    format!("duplicate RDMA connection id {}", request.connection_id),
+                    format!("duplicate RDMA bootstrap attempt id {}", request.attempt_id),
                 ));
             }
             let (_, expired) = entry.remove_entry();
@@ -89,14 +91,15 @@ impl RdmaSocketPool {
         }
         let (device_index, device) = self.find_device_by_name(&request.target)?;
         let info = device.info();
-        let connection_config = self.clamp_connection_config(device, request.config);
+        let connection_config =
+            self.clamp_connection_config(device, request.limits, request.traffic_class)?;
         let poller = self.pollers.get_or_start(
             device,
             self.poller_config(),
             self.config.polling.poll_threads_per_device,
         )?;
         let queue_pair = self.create_queue_pair(device, &connection_config, &poller)?;
-        let mut local_endpoint = self.build_endpoint(
+        let local_endpoint = self.build_endpoint(
             &queue_pair,
             device,
             request.target.port_num,
@@ -128,7 +131,7 @@ impl RdmaSocketPool {
                 gid_index: request.endpoint.gid_index,
                 ip: remote_ip,
             },
-            same_subnet: request.same_subnet,
+            same_connectivity_domain: request.same_connectivity_domain,
         };
 
         let socket = self.register_socket(
@@ -139,17 +142,20 @@ impl RdmaSocketPool {
             path,
             device_index,
         )?;
-        local_endpoint.connection_cookie = socket.conn_id;
+        let lease = ConnectionLease {
+            attempt_id: request.attempt_id,
+            accepted_connection_id: socket.conn_id,
+        };
         {
             let mut inbound = self.inbound.lock().unwrap();
             inbound.retain(|conn| conn.strong_count() > 0);
             inbound.push(Arc::downgrade(&socket));
         }
-        match self.accept_leases.entry(request.connection_id) {
+        match self.accept_leases.entry(request.attempt_id) {
             dashmap::mapref::entry::Entry::Vacant(entry) => {
                 entry.insert(AcceptLease {
                     socket: Arc::downgrade(&socket),
-                    server_connection_cookie: socket.conn_id,
+                    accepted_connection_id: socket.conn_id,
                     state: AcceptLeaseState::Pending,
                     expires_at: Instant::now()
                         + Duration::from_millis(self.config.peers.connect_lease_ms),
@@ -159,11 +165,11 @@ impl RdmaSocketPool {
                 socket.set_error();
                 return Err(Error::new(
                     ErrorKind::InvalidArgument,
-                    format!("duplicate RDMA connection id {}", request.connection_id),
+                    format!("duplicate RDMA bootstrap attempt id {}", request.attempt_id),
                 ));
             }
         }
-        socket.set_accept_lease(request.connection_id);
+        socket.set_accept_lease(request.attempt_id);
         self.ensure_accept_lease_sweeper(state);
         self.ensure_maintenance_task(state);
         tracing::debug!(
@@ -171,25 +177,28 @@ impl RdmaSocketPool {
             remote_qp = request.endpoint.qp_num,
             "accepted RDMA connection"
         );
-        Ok(local_endpoint)
+        Ok(PrepareConnectionResponse {
+            endpoint: local_endpoint,
+            lease,
+        })
     }
 
-    pub(crate) fn rdma_confirm(&self, control: &ConnectionControl) -> Result<()> {
-        match self.accept_leases.entry(control.connection_id) {
+    pub(crate) fn rdma_commit_connection(&self, lease: &ConnectionLease) -> Result<()> {
+        match self.accept_leases.entry(lease.attempt_id) {
             dashmap::mapref::entry::Entry::Vacant(_) => Err(Error::new(
                 ErrorKind::InvalidArgument,
                 format!(
-                    "unknown or expired RDMA connection id {}",
-                    control.connection_id
+                    "unknown or expired RDMA bootstrap attempt id {}",
+                    lease.attempt_id
                 ),
             )),
             dashmap::mapref::entry::Entry::Occupied(mut entry) => {
-                if !Self::lease_matches_control(entry.get(), control) {
+                if !Self::lease_matches(entry.get(), lease) {
                     return Err(Error::new(
                         ErrorKind::InvalidArgument,
                         format!(
-                            "RDMA connection {} identity mismatch",
-                            control.connection_id
+                            "RDMA bootstrap attempt {} identity mismatch",
+                            lease.attempt_id
                         ),
                     ));
                 }
@@ -200,7 +209,7 @@ impl RdmaSocketPool {
                     }
                     return Err(Error::new(
                         ErrorKind::InvalidArgument,
-                        format!("expired RDMA connection id {}", control.connection_id),
+                        format!("expired RDMA bootstrap attempt id {}", lease.attempt_id),
                     ));
                 }
                 if !entry
@@ -212,7 +221,10 @@ impl RdmaSocketPool {
                     entry.remove();
                     return Err(Error::new(
                         ErrorKind::ConnectionClosed,
-                        format!("RDMA connection {} already closed", control.connection_id),
+                        format!(
+                            "RDMA connection for attempt {} already closed",
+                            lease.attempt_id
+                        ),
                     ));
                 }
                 entry.get_mut().state =
@@ -224,11 +236,11 @@ impl RdmaSocketPool {
         }
     }
 
-    pub(crate) fn rdma_abort(&self, control: &ConnectionControl) {
+    pub(crate) fn rdma_cancel_connection(&self, lease: &ConnectionLease) {
         if let Some((_, lease)) = self
             .accept_leases
-            .remove_if(&control.connection_id, |_, lease| {
-                Self::lease_matches_control(lease, control)
+            .remove_if(&lease.attempt_id, |_, active| {
+                Self::lease_matches(active, lease)
             })
             && let Some(socket) = lease.socket.upgrade()
         {
@@ -236,14 +248,14 @@ impl RdmaSocketPool {
         }
     }
 
-    pub(crate) fn rdma_receive_observed(&self, connection_id: u64, socket: &Arc<RdmaSocket>) {
+    pub(crate) fn rdma_receive_observed(&self, attempt_id: u64, socket: &Arc<RdmaSocket>) {
         let weak_socket = Arc::downgrade(socket);
-        self.observe_accept_receive(connection_id, &weak_socket);
+        self.observe_accept_receive(attempt_id, &weak_socket);
     }
 
-    pub(super) fn observe_accept_receive(&self, connection_id: u64, socket: &Weak<RdmaSocket>) {
+    pub(super) fn observe_accept_receive(&self, attempt_id: u64, socket: &Weak<RdmaSocket>) {
         let dashmap::mapref::entry::Entry::Occupied(mut entry) =
-            self.accept_leases.entry(connection_id)
+            self.accept_leases.entry(attempt_id)
         else {
             return;
         };
@@ -260,8 +272,8 @@ impl RdmaSocketPool {
         entry.get_mut().state = advance_accept_lease(entry.get().state, AcceptLeaseEvent::Receive);
     }
 
-    fn lease_matches_control(lease: &AcceptLease, control: &ConnectionControl) -> bool {
-        lease.server_connection_cookie == control.server_connection_cookie
+    fn lease_matches(active: &AcceptLease, lease: &ConnectionLease) -> bool {
+        active.accepted_connection_id == lease.accepted_connection_id
     }
 
     fn ensure_accept_lease_sweeper(&self, state: &Arc<State>) {
@@ -284,7 +296,7 @@ impl RdmaSocketPool {
                         break;
                     };
                     let now = Instant::now();
-                    pool.accept_leases.retain(|connection_id, lease| {
+                    pool.accept_leases.retain(|attempt_id, lease| {
                         let Some(socket) = lease.socket.upgrade() else {
                             return false;
                         };
@@ -293,13 +305,13 @@ impl RdmaSocketPool {
                         }
                         if lease.state == AcceptLeaseState::Active {
                             tracing::debug!(
-                                connection_id,
+                                attempt_id,
                                 qp = socket.queue_pair.qp_num(),
                                 "RDMA active lease tombstone expired"
                             );
                         } else {
                             tracing::warn!(
-                                connection_id,
+                                attempt_id,
                                 qp = socket.queue_pair.qp_num(),
                                 state = ?lease.state,
                                 "RDMA accept lease expired"

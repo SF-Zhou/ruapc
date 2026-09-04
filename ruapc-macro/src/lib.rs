@@ -18,6 +18,22 @@
 //! }
 //! ```
 //!
+//! The service name defaults to the Rust trait name. Use `name = "..."` to
+//! choose a stable wire name independently of the Rust API, and use
+//! `internal` for control-plane services that must remain dispatchable but
+//! hidden from public discovery and OpenAPI output:
+//!
+//! ```rust,ignore
+//! #[ruapc::service(name = "Control", internal)]
+//! pub trait ControlService {
+//!     async fn ping(&self, ctx: &Context, req: &()) -> Result<()>;
+//! }
+//! ```
+//!
+//! A configured name must be non-empty, have no leading or trailing
+//! whitespace, and cannot contain `/`, which is reserved as the separator in
+//! wire method names such as `Control/ping`.
+//!
 //! ### Requirements
 //!
 //! Service methods must follow this signature:
@@ -82,17 +98,113 @@
 //! resolving a client call only consults signatures and never has to prove
 //! the client bodies' futures `Send`. This keeps the `Send` proof acyclic
 //! for transports whose connection setup recursively performs RPCs through
-//! these client methods (e.g. the RDMA pool's bootstrap `info`/`connect`
+//! these client methods (e.g. the RDMA pool's `discover`/`prepare_connection`
 //! calls), which would otherwise be rejected with a query cycle (E0391).
 
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{FnArg, ItemTrait, ReturnType, TraitItem, parse_macro_input, parse_quote};
+use syn::{
+    Expr, ExprLit, FnArg, ItemTrait, Lit, LitStr, Meta, ReturnType, Token, TraitItem,
+    parse::Parser, parse_macro_input, parse_quote, punctuated::Punctuated, spanned::Spanned,
+};
+
+#[derive(Default)]
+struct ServiceArgs {
+    name: Option<LitStr>,
+    internal: bool,
+}
+
+fn parse_service_args(attr: TokenStream) -> syn::Result<ServiceArgs> {
+    let metas = Punctuated::<Meta, Token![,]>::parse_terminated.parse(attr)?;
+    let mut args = ServiceArgs::default();
+
+    for meta in metas {
+        match meta {
+            Meta::NameValue(meta) if meta.path.is_ident("name") => {
+                if args.name.is_some() {
+                    return Err(syn::Error::new(
+                        meta.path.span(),
+                        "duplicate `name` argument",
+                    ));
+                }
+
+                let Expr::Lit(ExprLit {
+                    lit: Lit::Str(name),
+                    ..
+                }) = meta.value
+                else {
+                    return Err(syn::Error::new(
+                        meta.value.span(),
+                        "`name` must be a string literal",
+                    ));
+                };
+
+                let value = name.value();
+                if value.is_empty() {
+                    return Err(syn::Error::new(name.span(), "service name cannot be empty"));
+                }
+                if value.trim() != value {
+                    return Err(syn::Error::new(
+                        name.span(),
+                        "service name cannot have leading or trailing whitespace",
+                    ));
+                }
+                if value.contains('/') {
+                    return Err(syn::Error::new(
+                        name.span(),
+                        "service name cannot contain `/`",
+                    ));
+                }
+
+                args.name = Some(name);
+            }
+            Meta::Path(path) if path.is_ident("internal") => {
+                if args.internal {
+                    return Err(syn::Error::new(
+                        path.span(),
+                        "duplicate `internal` argument",
+                    ));
+                }
+                args.internal = true;
+            }
+            Meta::Path(path) if path.is_ident("name") => {
+                return Err(syn::Error::new(
+                    path.span(),
+                    "`name` requires a string value, for example `name = \"MyService\"`",
+                ));
+            }
+            Meta::NameValue(meta) if meta.path.is_ident("internal") => {
+                return Err(syn::Error::new(
+                    meta.span(),
+                    "`internal` is a flag and does not take a value",
+                ));
+            }
+            Meta::List(meta) if meta.path.is_ident("name") || meta.path.is_ident("internal") => {
+                return Err(syn::Error::new(
+                    meta.span(),
+                    "expected `name = \"...\"` or `internal`",
+                ));
+            }
+            other => {
+                return Err(syn::Error::new(
+                    other.span(),
+                    "unknown `service` argument; expected `name = \"...\"` or `internal`",
+                ));
+            }
+        }
+    }
+
+    Ok(args)
+}
 
 /// Procedural macro for defining RPC services.
 ///
 /// This macro transforms a trait definition into a complete RPC service
 /// with both client and server implementations.
+///
+/// The optional `name = "..."` argument overrides the service's wire name.
+/// The optional `internal` flag registers its methods as internal so they are
+/// excluded from public discovery and OpenAPI output.
 ///
 /// # Panics
 ///
@@ -109,12 +221,24 @@ use syn::{FnArg, ItemTrait, ReturnType, TraitItem, parse_macro_input, parse_quot
 /// }
 /// ```
 #[proc_macro_attribute]
-pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
+pub fn service(attr: TokenStream, input: TokenStream) -> TokenStream {
+    let args = match parse_service_args(attr) {
+        Ok(args) => args,
+        Err(err) => return err.into_compile_error().into(),
+    };
     let input = parse_macro_input!(input as ItemTrait);
 
     let trait_ident = &input.ident;
     let visibility = input.vis;
-    let trait_name = trait_ident.to_string();
+    let service_name = args
+        .name
+        .unwrap_or_else(|| LitStr::new(&trait_ident.to_string(), trait_ident.span()));
+    let service_name_value = service_name.value();
+    let register_method = if args.internal {
+        quote! { add_internal_method }
+    } else {
+        quote! { add_method }
+    };
 
     let mut trait_methods = vec![];
     let mut invoke_branchs = vec![];
@@ -136,7 +260,7 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
             if *method_ident == "ruapc_export" || *method_ident == "ruapc_request" {
                 panic!("the function cannot be named `ruapc_export` or `ruapc_request`!");
             }
-            let method_name = format!("{trait_name}/{method_ident}");
+            let method_name = format!("{service_name_value}/{method_ident}");
 
             let req_type = req_type.ty.clone();
 
@@ -171,7 +295,7 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
             // signature comparison, which must prove the async body's
             // future is `Send` — and transports whose connection setup
             // recursively performs RPCs through these very methods (e.g.
-            // the RDMA pool's info/connect bootstrap) would make that
+            // the RDMA pool's discover/prepare bootstrap) would make that
             // proof cyclic (E0391). With the explicit signature, callers
             // discharge `Send` from the declared item bound alone and the
             // body is only type-checked once, acyclically.
@@ -197,7 +321,7 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
             // + `SentBuffers::reply`).
             invoke_branchs.push(quote! {
                 let this = self.clone();
-                router.add_method::<#req_type, #rsp_type>(#method_name, Box::new(move |ctx, payload| {
+                router.#register_method::<#req_type, #rsp_type>(#method_name, Box::new(move |ctx, payload| {
                     let this = this.clone();
                     // `spawn_handler` applies the dispatch policies (load
                     // shedding, deadline enforcement, cancellation
@@ -229,7 +353,7 @@ pub fn service(_attr: TokenStream, input: TokenStream) -> TokenStream {
 
     quote! {
         #visibility trait #trait_ident {
-            const NAME: &'static str = #trait_name;
+            const NAME: &'static str = #service_name;
 
             #(#trait_methods)*
 

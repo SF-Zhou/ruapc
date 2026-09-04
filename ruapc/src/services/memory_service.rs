@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Context, CopyOp, Result,
     core::ContextEndpoint,
-    core::scatter::{self, MAX_REGIONS, SpaceLayout},
+    core::scatter::{self, SpaceLayout},
 };
 
 /// Request to read byte ranges of the client's read space (TCP/WS/HTTP
@@ -19,47 +19,47 @@ use crate::{
 /// client.
 ///
 /// After reading, the service verifies that the original request
-/// (identified by `msgid`) is still being awaited. If it has already timed
+/// (identified by `request_id`) is still being awaited. If it has already timed
 /// out, the data is discarded and a Timeout error is returned, since the
 /// buffers may have been reclaimed.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct MemoryReadReq {
+pub(crate) struct ReadInlineRequest {
     /// The client's read regions, in space order.
-    pub regions: Vec<RemoteBufferInfo>,
+    pub(crate) regions: Vec<RemoteBufferInfo>,
     /// The validated op batch; response bytes are the op payloads
     /// concatenated in op order.
-    pub ops: Vec<CopyOp>,
+    pub(crate) ops: Vec<CopyOp>,
     /// Message ID of the original request. Used to verify the request
     /// is still alive after reading, ensuring the buffer data is valid.
-    pub msgid: u64,
+    pub(crate) request_id: u64,
 }
 
-/// Response of [`MemoryService::read`]: the requested op payloads,
+/// Response of [`MemoryService::read_inline`]: the requested op payloads,
 /// concatenated in op order.
 ///
 /// A struct (rather than a bare `Vec<u8>`) so the field can opt into
-/// `serde_bytes` — see [`MemoryPushReq::data`] for why that matters.
+/// `serde_bytes` — see [`WriteInlineRequest::bytes`] for why that matters.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct MemoryReadRsp {
+pub(crate) struct ReadInlineResponse {
     /// The bytes read from the requested ranges.
     #[serde(with = "serde_bytes")]
     #[schemars(with = "Vec<u8>")]
-    pub data: Vec<u8>,
+    pub(crate) bytes: Vec<u8>,
 }
 
 /// Request to write into the client's pinned write space with inline data
 /// (TCP/WS/HTTP fallback of `Context::remote_write`).
 ///
-/// Each op's `dst_offset` addresses the client's write space; `data` is
+/// Each op's `dst_offset` addresses the client's write space; `bytes` is
 /// the op payloads concatenated in op order (`src_offset` describes the
 /// server-local source and is opaque to the client).
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct MemoryPushReq {
+pub(crate) struct WriteInlineRequest {
     /// Message ID of the original client request (identifies the pinned
     /// write target).
-    pub msgid: u64,
+    pub(crate) request_id: u64,
     /// The op batch; validated against the write space on arrival.
-    pub ops: Vec<CopyOp>,
+    pub(crate) ops: Vec<CopyOp>,
     /// Op payloads, concatenated in op order.
     ///
     /// `serde_bytes` routes the field through serde's byte-string channel:
@@ -70,7 +70,7 @@ pub struct MemoryPushReq {
     /// still works, as an integer array.)
     #[serde(with = "serde_bytes")]
     #[schemars(with = "Vec<u8>")]
-    pub data: Vec<u8>,
+    pub(crate) bytes: Vec<u8>,
 }
 
 /// Request to write into the client's pinned write space by letting the
@@ -83,90 +83,113 @@ pub struct MemoryPushReq {
 /// fragments the batch into RDMA READ work requests into its pinned
 /// buffers.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct MemoryPullReq {
+pub(crate) struct ReadIntoTargetRequest {
     /// Message ID of the original client request (identifies the pinned
     /// write target).
-    pub msgid: u64,
+    pub(crate) request_id: u64,
     /// The op batch; validated against both spaces on arrival.
-    pub ops: Vec<CopyOp>,
+    pub(crate) ops: Vec<CopyOp>,
+}
+
+/// Identifies an original request whose client-owned memory may be accessed.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub(crate) struct RequestStatusRequest {
+    /// Message ID of the original request.
+    pub(crate) request_id: u64,
 }
 
 /// Built-in service for remote memory operations.
 ///
 /// Provides methods for:
-/// - `read`: peer reads ranges of this side's registered memory (reverse
+/// - `read_inline`: peer reads ranges of this side's registered memory (reverse
 ///   RPC, data inline in the response)
-/// - `push`: peer writes ranges of this side's pinned write buffers (data
+/// - `write_inline`: peer writes ranges of this side's pinned write buffers (data
 ///   inline in the request)
-/// - `pull`: peer asks this side to RDMA-READ from its memory into this
+/// - `read_into_target`: peer asks this side to RDMA-READ from its memory into this
 ///   side's pinned write buffers
-#[ruapc_macro::service]
-pub trait MemoryService {
+/// - `request_is_pending`: verifies that client-owned memory is still live
+#[ruapc_macro::service(name = "_ruapc.memory", internal)]
+pub(crate) trait MemoryService {
     /// Reads byte ranges from registered memory regions (TCP fallback).
     ///
     /// After reading, verifies the original request is still alive (not
     /// timed out).
-    async fn read(&self, ctx: &Context, req: &MemoryReadReq) -> Result<MemoryReadRsp>;
+    async fn read_inline(
+        &self,
+        ctx: &Context,
+        req: &ReadInlineRequest,
+    ) -> Result<ReadInlineResponse>;
 
     /// Receives data pushed by the server into the pinned write target
     /// (TCP fallback).
-    async fn push(&self, ctx: &Context, req: &MemoryPushReq) -> Result<()>;
+    async fn write_inline(&self, ctx: &Context, req: &WriteInlineRequest) -> Result<()>;
 
     /// Executes RDMA READs from the server's advertised regions
     /// (`read_regions` of this request's metadata) into the pinned write
     /// target (RDMA path).
-    async fn pull(&self, ctx: &Context, req: &MemoryPullReq) -> Result<()>;
+    async fn read_into_target(&self, ctx: &Context, req: &ReadIntoTargetRequest) -> Result<()>;
+
+    /// Reports whether the original request is still pending on this peer.
+    ///
+    /// One-sided RDMA READ uses this after completion because the owner of
+    /// the source buffers cannot otherwise observe that they were accessed.
+    async fn request_is_pending(&self, ctx: &Context, req: &RequestStatusRequest) -> Result<bool>;
 }
 
 impl MemoryService for () {
-    async fn read(&self, ctx: &Context, req: &MemoryReadReq) -> Result<MemoryReadRsp> {
-        if req.regions.len() > MAX_REGIONS {
-            return Err(crate::Error::new(
-                crate::ErrorKind::InvalidCopyOp,
-                format!("too many regions: {}", req.regions.len()),
-            ));
-        }
+    async fn read_inline(
+        &self,
+        ctx: &Context,
+        req: &ReadInlineRequest,
+    ) -> Result<ReadInlineResponse> {
+        validate_region_addresses(&req.regions, "read_inline")?;
         let layout = SpaceLayout::from_lens(req.regions.iter().map(|r| r.len))?;
         // The destination space is server-local and opaque here; only the
         // source side is checked (each region access is additionally
         // validated against the registration table below).
         let total = scatter::validate_ops(&req.ops, layout.total(), u64::MAX)?;
-        let mut data = Vec::with_capacity(usize::try_from(total).unwrap_or(0));
+        let mut bytes = Vec::with_capacity(usize::try_from(total).unwrap_or(0));
         for op in &req.ops {
             layout.for_each_slice::<crate::Error>(op.src_offset, op.len, |seg, off, len| {
                 let region = &req.regions[seg];
-                let bytes = ctx
+                let addr = region.addr.checked_add(off).ok_or_else(|| {
+                    crate::Error::new(
+                        crate::ErrorKind::InvalidCopyOp,
+                        "read_inline: region address overflows u64".into(),
+                    )
+                })?;
+                let chunk = ctx
                     .state
                     .devices
                     .tcp_device()
-                    .read_memory(region.key.lkey, region.addr.wrapping_add(off), len)
+                    .read_memory(region.key.lkey, addr, len)
                     .map_err(|e| {
                         crate::Error::new(crate::ErrorKind::InvalidArgument, e.to_string())
                     })?;
-                data.extend_from_slice(&bytes);
+                bytes.extend_from_slice(&chunk);
                 Ok(())
             })?;
         }
 
         // After reading, verify the original request is still alive.
-        if !ctx.state.waiter.contains_message_id(req.msgid) {
+        if !ctx.state.waiter.contains_message_id(req.request_id) {
             return Err(crate::Error::new(
                 crate::ErrorKind::Timeout,
-                "read: original request has already timed out, data discarded".into(),
+                "read_inline: original request has already timed out, data discarded".into(),
             ));
         }
 
-        Ok(MemoryReadRsp { data })
+        Ok(ReadInlineResponse { bytes })
     }
 
-    async fn push(&self, ctx: &Context, req: &MemoryPushReq) -> Result<()> {
+    async fn write_inline(&self, ctx: &Context, req: &WriteInlineRequest) -> Result<()> {
         // The write target pins the destination buffers; if the original
         // request already resolved or expired, there is nothing to write
         // into.
-        let Some(target) = ctx.state.waiter.write_target(req.msgid) else {
+        let Some(target) = ctx.state.waiter.write_target(req.request_id) else {
             return Err(crate::Error::new(
                 crate::ErrorKind::Timeout,
-                "push: original request is gone (timed out, completed, or \
+                "write_inline: original request is gone (timed out, completed, or \
                  attached no write buffers)"
                     .into(),
             ));
@@ -174,50 +197,43 @@ impl MemoryService for () {
         // The source space is server-local and opaque here; validate the
         // destination side against the pinned write space.
         let total = scatter::validate_ops(&req.ops, u64::MAX, target.total_len())?;
-        if total != req.data.len() as u64 {
+        if total != req.bytes.len() as u64 {
             return Err(crate::Error::new(
                 crate::ErrorKind::InvalidCopyOp,
                 format!(
-                    "push carries {} bytes but the ops describe {total}",
-                    req.data.len()
+                    "write_inline carries {} bytes but the ops describe {total}",
+                    req.bytes.len()
                 ),
             ));
         }
         let mut cursor = 0usize;
         for op in &req.ops {
             let len = op.len as usize;
-            target.copy_in(op.dst_offset, &req.data[cursor..cursor + len])?;
+            target.copy_in(op.dst_offset, &req.bytes[cursor..cursor + len])?;
             cursor += len;
         }
         Ok(())
     }
 
-    async fn pull(&self, ctx: &Context, req: &MemoryPullReq) -> Result<()> {
+    async fn read_into_target(&self, ctx: &Context, req: &ReadIntoTargetRequest) -> Result<()> {
         // The server's source buffers are advertised as this request's
         // read regions.
         let regions = &ctx.msg_meta.read_regions;
         if regions.is_empty() {
             return Err(crate::Error::new(
                 crate::ErrorKind::MissingBufferInfo,
-                "pull: request metadata carries no read regions".into(),
+                "read_into_target: request metadata carries no read regions".into(),
             ));
         }
-        let Some(target) = ctx.state.waiter.write_target(req.msgid) else {
+        let Some(target) = ctx.state.waiter.write_target(req.request_id) else {
             return Err(crate::Error::new(
                 crate::ErrorKind::Timeout,
-                "pull: original request is gone (timed out, completed, or \
+                "read_into_target: original request is gone (timed out, completed, or \
                  attached no write buffers)"
                     .into(),
             ));
         };
-        for region in regions {
-            if region.addr.checked_add(region.len).is_none() {
-                return Err(crate::Error::new(
-                    crate::ErrorKind::InvalidCopyOp,
-                    "pull: region addr + len overflows u64".into(),
-                ));
-            }
-        }
+        validate_region_addresses(regions, "read_into_target")?;
         let src_layout = SpaceLayout::from_lens(regions.iter().map(|r| r.len))?;
         scatter::validate_ops(&req.ops, src_layout.total(), target.total_len())?;
 
@@ -228,15 +244,31 @@ impl MemoryService for () {
         match &ctx.endpoint {
             ContextEndpoint::Connected(socket) => {
                 socket
-                    .pull_into_target(regions, &src_layout, &req.ops, target, ctx.remaining_time())
+                    .read_into_target(regions, &src_layout, &req.ops, target, ctx.remaining_time())
                     .await
             }
             _ => Err(crate::Error::new(
                 crate::ErrorKind::NotConnected,
-                "pull requires a connected socket".into(),
+                "read_into_target requires a connected socket".into(),
             )),
         }
     }
+
+    async fn request_is_pending(&self, ctx: &Context, req: &RequestStatusRequest) -> Result<bool> {
+        Ok(ctx.state.waiter.contains_message_id(req.request_id))
+    }
+}
+
+fn validate_region_addresses(regions: &[RemoteBufferInfo], operation: &str) -> Result<()> {
+    for region in regions {
+        if region.addr.checked_add(region.len).is_none() {
+            return Err(crate::Error::new(
+                crate::ErrorKind::InvalidCopyOp,
+                format!("{operation}: region address + length overflows u64"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -250,71 +282,73 @@ mod tests {
     #[test]
     fn test_bulk_fields_use_msgpack_bin() {
         const LEN: usize = 1024;
-        let data = vec![0xFFu8; LEN];
+        let bytes = vec![0xFFu8; LEN];
 
-        let req = MemoryPushReq {
-            msgid: 7,
+        let req = WriteInlineRequest {
+            request_id: 7,
             ops: vec![CopyOp::new(0, 0, LEN as u64)],
-            data: data.clone(),
+            bytes: bytes.clone(),
         };
         let encoded = rmp_serde::to_vec_named(&req).unwrap();
         assert!(
             encoded.len() < LEN + 128,
-            "MemoryPushReq must encode data as msgpack bin, got {} bytes for {LEN} data bytes",
+            "WriteInlineRequest must encode bytes as msgpack bin, got {} bytes for {LEN} data bytes",
             encoded.len()
         );
-        let decoded: MemoryPushReq = rmp_serde::from_slice(&encoded).unwrap();
-        assert_eq!(decoded.msgid, 7);
+        let decoded: WriteInlineRequest = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.request_id, 7);
         assert_eq!(decoded.ops.len(), 1);
-        assert_eq!(decoded.data, data);
+        assert_eq!(decoded.bytes, bytes);
 
-        let rsp = MemoryReadRsp { data: data.clone() };
+        let rsp = ReadInlineResponse {
+            bytes: bytes.clone(),
+        };
         let encoded = rmp_serde::to_vec_named(&rsp).unwrap();
         assert!(
             encoded.len() < LEN + 32,
-            "MemoryReadRsp must encode data as msgpack bin, got {} bytes for {LEN} data bytes",
+            "ReadInlineResponse must encode bytes as msgpack bin, got {} bytes for {LEN} data bytes",
             encoded.len()
         );
-        let decoded: MemoryReadRsp = rmp_serde::from_slice(&encoded).unwrap();
-        assert_eq!(decoded.data, data);
+        let decoded: ReadInlineResponse = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.bytes, bytes);
     }
 
     /// The JSON fallback (e.g. curl without MessagePack) must still
     /// roundtrip the byte fields.
     #[test]
     fn test_bulk_fields_json_roundtrip() {
-        let req = MemoryPushReq {
-            msgid: 1,
+        let req = WriteInlineRequest {
+            request_id: 1,
             ops: vec![CopyOp::new(4, 2, 4)],
-            data: vec![0, 1, 127, 255],
+            bytes: vec![0, 1, 127, 255],
         };
         let json = serde_json::to_string(&req).unwrap();
-        let decoded: MemoryPushReq = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded.msgid, 1);
+        let decoded: WriteInlineRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.request_id, 1);
         assert_eq!(decoded.ops, vec![CopyOp::new(4, 2, 4)]);
-        assert_eq!(decoded.data, vec![0, 1, 127, 255]);
+        assert_eq!(decoded.bytes, vec![0, 1, 127, 255]);
 
-        let rsp = MemoryReadRsp {
-            data: vec![42, 255],
+        let rsp = ReadInlineResponse {
+            bytes: vec![42, 255],
         };
         let json = serde_json::to_string(&rsp).unwrap();
-        let decoded: MemoryReadRsp = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded.data, vec![42, 255]);
+        let decoded: ReadInlineResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.bytes, vec![42, 255]);
     }
 
-    /// `push` must reject batches whose inline data length disagrees with
+    /// `write_inline` must reject batches whose inline data length disagrees with
     /// the ops, and requests without a pinned write target.
     #[tokio::test]
-    async fn test_push_validation() {
+    async fn test_write_inline_validation() {
         let ctx = Context::create(&crate::SocketPoolConfig::default()).unwrap();
 
         // No pending request with a write target.
-        let req = MemoryPushReq {
-            msgid: 42,
+        let req = WriteInlineRequest {
+            request_id: 42,
             ops: vec![CopyOp::new(0, 0, 4)],
-            data: vec![0; 4],
+            bytes: vec![0; 4],
         };
-        let err = ().push(&ctx, &req).await.unwrap_err();
+        let err = ().write_inline(&ctx, &req).await.unwrap_err();
         assert_eq!(err.kind, crate::ErrorKind::Timeout);
 
         // Pin a 8-byte write target on a pending request.
@@ -325,33 +359,44 @@ mod tests {
         ctx.state.waiter.bind_write_target(msgid, target);
 
         // Length mismatch between ops and data.
-        let req = MemoryPushReq {
-            msgid,
+        let req = WriteInlineRequest {
+            request_id: msgid,
             ops: vec![CopyOp::new(0, 0, 4)],
-            data: vec![0; 3],
+            bytes: vec![0; 3],
         };
-        let err = ().push(&ctx, &req).await.unwrap_err();
+        let err = ().write_inline(&ctx, &req).await.unwrap_err();
         assert_eq!(err.kind, crate::ErrorKind::InvalidCopyOp);
 
         // Out-of-bounds destination.
-        let req = MemoryPushReq {
-            msgid,
+        let req = WriteInlineRequest {
+            request_id: msgid,
             ops: vec![CopyOp::new(0, 5, 4)],
-            data: vec![0; 4],
+            bytes: vec![0; 4],
         };
-        let err = ().push(&ctx, &req).await.unwrap_err();
+        let err = ().write_inline(&ctx, &req).await.unwrap_err();
         assert_eq!(err.kind, crate::ErrorKind::InvalidCopyOp);
 
-        // Valid push writes through.
-        let req = MemoryPushReq {
-            msgid,
+        // A valid inline write reaches the pinned target.
+        let req = WriteInlineRequest {
+            request_id: msgid,
             ops: vec![CopyOp::new(0, 2, 4)],
-            data: b"data".to_vec(),
+            bytes: b"data".to_vec(),
         };
-        ().push(&ctx, &req).await.unwrap();
+        ().write_inline(&ctx, &req).await.unwrap();
         let target = ctx.state.waiter.write_target(msgid).unwrap();
         // The waiter entry still holds a clone, so unwrapping fails here —
         // which is exactly the pinning behavior we want.
         assert!(crate::core::WriteTarget::try_into_buffers(target).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_request_is_pending() {
+        let ctx = Context::create(&crate::SocketPoolConfig::default()).unwrap();
+        let missing = RequestStatusRequest { request_id: 9999 };
+        assert!(!().request_is_pending(&ctx, &missing).await.unwrap());
+
+        let (request_id, _rx) = ctx.state.waiter.alloc(std::time::Duration::from_secs(1));
+        let pending = RequestStatusRequest { request_id };
+        assert!(().request_is_pending(&ctx, &pending).await.unwrap());
     }
 }

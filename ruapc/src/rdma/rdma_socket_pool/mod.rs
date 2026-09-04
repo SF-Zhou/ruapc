@@ -99,13 +99,13 @@ pub struct RdmaSocketPool {
     peers: PeerMap,
     /// Live connection count per local RDMA device (outbound + inbound),
     /// indexed like `devices.rdma_devices()`. Drives least-connections
-    /// placement and is advertised to peers via `RdmaInfo`.
+    /// placement and is advertised to peers via `RdmaPeerAdvertisement`.
     conn_counts: Arc<Vec<AtomicUsize>>,
     /// Per local RDMA device budget of in-flight RDMA READ work requests
     /// (`rdma.remote_memory.max_inflight_read_wrs`), indexed like
     /// `devices.rdma_devices()` and shared by every connection on the
     /// device — the congestion control for read traffic (server-side
-    /// `remote_read` and client-side `pull` alike).
+    /// `remote_read` and client-side `read_into_target` alike).
     read_permits: Vec<Arc<tokio::sync::Semaphore>>,
     /// Inbound (accepted) connections, for path reporting and the
     /// port-down watchdog; dead entries are pruned opportunistically.
@@ -400,7 +400,7 @@ fn pseudo_random(seq: usize) -> u64 {
     RandomState::default().hash_one((seq, nanos))
 }
 
-fn next_connection_id() -> u64 {
+fn next_attempt_id() -> u64 {
     static BASE: OnceLock<u64> = OnceLock::new();
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let base = *BASE.get_or_init(|| pseudo_random(0));

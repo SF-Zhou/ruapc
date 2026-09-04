@@ -2,9 +2,28 @@
 
 use std::{str::FromStr, sync::Arc, time::Duration};
 
-use ruapc::{Client, Endpoint, ListenMode, SocketPoolConfig, Transport, services::MetaService};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use ruapc::{Client, Endpoint, ListenMode, SocketPoolConfig, Transport};
 
 const CLIENT_TIMEOUT: Duration = Duration::from_millis(200);
+
+// A wire-only test proxy: the built-in request-status operation is
+// intentionally not part of RuaPC's public Rust API or reflection surface.
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct RequestStatusRequest {
+    request_id: u64,
+}
+
+#[ruapc::service(name = "_ruapc.memory")]
+trait RequestStatusClient {
+    async fn request_is_pending(
+        &self,
+        ctx: &ruapc::Context,
+        req: &RequestStatusRequest,
+    ) -> ruapc::Result<bool>;
+}
 
 #[ruapc::service]
 trait Foo {
@@ -18,7 +37,14 @@ impl Foo for FooImpl {
         tokio::time::sleep(*req).await;
 
         let client = Client::default();
-        let in_waiting = client.is_message_waiting(ctx, &ctx.msg_meta.msgid).await?;
+        let in_waiting = client
+            .request_is_pending(
+                ctx,
+                &RequestStatusRequest {
+                    request_id: ctx.msg_meta.msgid,
+                },
+            )
+            .await?;
         if *req < CLIENT_TIMEOUT {
             assert!(in_waiting);
         } else {
