@@ -23,6 +23,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   immediately when set to zero.
 
 ### Changed
+- **BREAKING**: `AlignedMemory::as_mut_slice` requires a mutable receiver;
+  implementing `Devices` and calling raw TCP/RDMA memory operations now require
+  explicit unsafe contracts. QP-specific completion wrappers and unchecked
+  public task registration were removed; unsupported service declarations now
+  produce explicit macro diagnostics. See the
+  [API migration notes](docs/refactoring.md#api-changes).
+- **BREAKING**: Read attachments take ownership through
+  `with_read_buffer(Buffer)` / `with_read_buffers(Vec<Buffer>)`; setting an
+  attachment replaces the source list. Wrappers reuse immutable sources across
+  calls, expose shared `read_buffers()` views, and support conditional ownership
+  recovery through `take_read_buffers(&mut self)`. Local reverse-RPC readers
+  retain the source through cancellation; `read_inline` now sends logical ops
+  and a request ID without duplicating region metadata.
 - **BREAKING**: Built-in services now use the reserved `_ruapc.*` wire
   namespace. Remote-memory methods are named `read_inline`, `write_inline`,
   `read_into_target`, and `request_is_pending`; RDMA bootstrap methods are

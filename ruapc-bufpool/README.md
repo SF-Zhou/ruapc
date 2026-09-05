@@ -6,14 +6,14 @@ fixed-size buffer management. This crate is part of the [ruapc](../ruapc/) proje
 ## Features
 
 - **Buddy Memory Allocation**: Supports allocation of 1MiB, 4MiB, 16MiB, and 64MiB buffers
-- **Slab Layer for Small Buffers**: 64KiB and 256KiB allocations are served from slabs
+- **Slab Layer for Small Buffers**: 16KiB, 64KiB and 256KiB allocations are served from slabs
   (1MiB buddy leaves carved into fixed-size chunks) behind per-class mutexes, keeping
   small-buffer traffic off the buddy pool's global mutex; empty slabs are cached up to a
   watermark and returned to the buddy pool on demand
 - **Both Sync and Async APIs**: Designed for tokio environments with async-first design
 - **Automatic Memory Reclamation**: Buffers are automatically returned to the pool on drop
 - **Memory Limits**: Configurable maximum memory usage with async waiting when limits are reached
-- **Custom Allocators**: Pluggable allocator trait for memory allocation backend
+- **Aligned Memory**: Zero-initialized blocks with 2MiB alignment on 64-bit targets
 - **O(1) Buddy Merging**: Intrusive doubly-linked list with O(1) free/merge operations
 - **Lazy Buddy Merging**: Per-level watermarks defer merging on free to avoid split/merge
   thrashing; complete-but-unmerged quads are tracked on intrusive pending-merge lists and
@@ -55,16 +55,45 @@ Each 64MiB block is a **4-level quad-tree**:
 - Level 2: 4 nodes × 16MiB
 - Level 3: 1 node × 64MiB (root)
 
+## Implementation boundaries
+
+| Module | Responsibility |
+| --- | --- |
+| `pool.rs` | Public API and shared sync/async allocation transitions |
+| `pool/builder.rs` | Configuration and construction |
+| `pool/allocator.rs` | Budget, buddy splitting, free lists and lazy merging |
+| `pool/allocator/waiters.rs` | Direct handoff, cancellation and starvation reservations |
+| `pool/small.rs` | Slab/cache coordination and memory-pressure reclamation |
+| `buddy.rs` | Immutable region ownership and mutable allocation metadata |
+| `slab.rs` | Chunk ownership, free bitmaps and backing tokens |
+| `thread_cache.rs` | Thread magazines and their pool registry |
+
+Cache locks are released before touching slab classes; slab locks are released
+before returning backing to the buddy allocator. Public buffers retain the pool.
+Internal slab backing tokens do not, preventing a strong-reference cycle. Device
+registrations are destroyed before their backing memory.
+
+Thread-cache hits borrow the shard for one push or pop, avoiding temporary Arc
+reference-count updates. That TLS borrow ends before buffer construction, slab
+refill, or reclamation can call back into the pool.
+
+Buddy allocation metadata uses interior mutability under the pool mutex. Tree
+updates borrow only that metadata, allowing buffers to read immutable registration
+keys concurrently and preserving the raw pointers held by intrusive free lists.
+
 ## Core Types
 
-### `Allocator` / `DefaultAllocator`
-Pluggable memory allocation backend. Default uses `std::alloc` with 2MiB alignment for huge page support.
+### `AlignedMemory`
+Owns initialized memory with 2MiB alignment on 64-bit targets (4KiB otherwise).
+Linux 64-bit builds use anonymous mappings whose pages are initialized lazily by
+the OS. Other targets use the system zeroed allocator, which can make initial
+block allocation more expensive. Reusing a pooled buffer does not clear its bytes.
 
 ### `BufferPoolBuilder`
-Builder pattern for configuring max memory, custom allocator, and device registration.
+Builder pattern for configuring memory limits, merge policy, caching, starvation protection, and device registration.
 
 ### `BufferPool`
-Manages 64MiB buddy blocks and supports allocation at four size levels.
+Manages 64MiB buddy blocks and supports three slab sizes and four buddy sizes.
 - `allocate(size)` — synchronous, returns error if pool exhausted
 - `async_allocate(size)` — waits via `tokio::sync::oneshot` if pool exhausted
 
@@ -73,16 +102,22 @@ A buffer allocated from the pool. Supports `Deref<[u8]>`, `DerefMut`, `set_len`,
 
 ### Device Registration
 - `trait Device` — register memory with a device
-- `trait Devices` — collection of devices
+- `unsafe trait Devices` — collection that preserves pooled allocations' access rules
 - `trait Registration` — handle for a registered memory region
 - `TcpDevice` — TCP transport device (simulates RDMA-style registration)
+
+Registration may retain backing memory, but does not authorize independent byte
+access. `Devices` implementations must preserve the lifetime and shared/exclusive
+borrows of each allocation. `TcpDevice::read_memory` is unsafe: callers must hold
+the requested allocation alive and prevent concurrent writes throughout the copy.
 
 ## Usage
 
 ```rust
-use ruapc_bufpool::BufferPoolBuilder;
+use std::sync::Arc;
+use ruapc_bufpool::{BufferPoolBuilder, EmptyDevices};
 
-let pool = BufferPoolBuilder::new()
+let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
     .max_memory(256 * 1024 * 1024)
     .build();
 
@@ -98,4 +133,32 @@ drop(buffer);
 
 ```bash
 cargo test -p ruapc-bufpool
+cargo bench -p ruapc-bufpool --bench lazy_merge
+cargo bench -p ruapc-bufpool --bench contention
+cargo bench -p ruapc-bufpool --bench initialization
 ```
+
+For reproducible Linux contention measurements, set `RUAPC_BENCH_CPU_BASE` after
+checking the machine's CPU topology. Worker `i` is pinned to `base + i`, and the
+coordinator to `base + 16`, before warmup. Choose available physical cores and
+bind memory to their NUMA node. For example, on a machine with cores 96–112 on
+NUMA node 1:
+
+```bash
+RUAPC_BENCH_CPU_BASE=96 numactl --membind=1 cargo bench -p ruapc-bufpool --bench contention
+```
+
+Without this variable the operating system places the workers. Restricting the
+whole process to a CPU mask still allows workers to migrate between cache groups.
+
+Compare individual cases in fresh processes when evaluating a refactor. Pool
+lifetimes and allocation history can change the addresses used by later cases in
+the full matrix. These filters preserve the workload while selecting one case:
+
+```bash
+RUAPC_BENCH_CPU_BASE=96 RUAPC_BENCH_SIZE=65536 RUAPC_BENCH_THREADS=4 \
+    numactl --membind=1 cargo bench -p ruapc-bufpool --bench contention
+```
+
+Supported sizes are 65536 and 1048576 bytes; thread counts are 1, 2, 4, 8, and 16.
+Use the same harness, CPU and NUMA placement, and pool lifecycle for both versions.

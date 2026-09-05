@@ -2,8 +2,8 @@
 
 Low-level FFI bindings to libibverbs (RDMA verbs) with type-safe, RAII-based
 resource management. This crate is part of the [ruapc](../ruapc/) project but
-is independently usable by any application that needs a thin, safe layer over
-raw verbs.
+is independently usable by applications that need resource ownership and
+explicit DMA lifetime contracts over raw verbs.
 
 ## Features
 
@@ -14,13 +14,13 @@ raw verbs.
 - **C shim for every verbs entry point**: Rust never binds an `ibv_*` symbol
   directly (see below)
 - **Buffer-owning work requests**: `QueuePair::send`/`recv` take ownership of a
-  [`ruapc-bufpool`](../ruapc-bufpool/) `Buffer` and hand it back through the
-  matching `Completion`, so registered memory can never be recycled while the
-  NIC may still touch it
+  [`ruapc-bufpool`](../ruapc-bufpool/) `Buffer`. Poll `CompletionQueue` and recover
+  buffers through `unsafe QueuePair::take_buffer` only after the matching CQE
+  proves the NIC has finished with them. Shared CQs route by the WRID tag.
 - **Lock-free in-flight tracking**: buffers of posted work requests live in
   `WrSlots`, a fixed-size atomic slot array indexed by monotonic per-direction
   IDs — no `Mutex<HashMap>` on the completion path
-- **Selective signaling** with automatic reclamation of unsignaled send
+- **Selective signaling** with explicit reclamation helpers for unsignaled send
   buffers (RC send queues complete in order), plus gather-list sends and
   vectored RDMA READ (`read_sges`)
 - **Typed work request IDs**: `WRID` packs a work request type, an opaque
@@ -34,6 +34,15 @@ raw verbs.
   support iteration and static names without lookup tables. The Rust
   `ibv_port_cap_flags2` uses `u16` to match its only bound struct field rather
   than the standalone C enum's ABI width
+
+## DMA ownership
+
+`read_sges`, `take_buffer`, `take_send_buffer`, and `reclaim_send_buffers` are
+`unsafe` because their caller controls when registered memory becomes reusable.
+READ destinations must remain alive and exclusively available for DMA until
+completion or QP destruction. Buffer reclamation requires an observed completion
+for the owning QP; unsignaled data SENDs can be reclaimed after a later RC SQ
+completion. See each method's `Safety` documentation for the exact contract.
 
 ## Why a C shim?
 
