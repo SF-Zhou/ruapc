@@ -7,6 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 ## [Unreleased]
 
 ### Added
+- Owned RDMA READ submission through `QueuePair::prepare_reads` / `post_read`.
+  Plans take destination buffers and buffer-index/offset/length descriptors,
+  validate bounds and cross-request overlap, and return a non-cloneable posting
+  cursor. The dependency retains posted memory through cancellation, timeout
+  and error/flush completion.
 - Structured built-in reflection through
   `_ruapc.meta/describe`, including the RuaPC version, public service/method
   schemas, and resolvable OpenAPI components.
@@ -23,9 +28,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   immediately when set to zero.
 
 ### Changed
+- **BREAKING**: `ruapc_bufpool::Device::register` is replaced by an associated
+  `Registrar: MemoryRegistrar` and `registrar()` accessor. Safe device wrappers
+  no longer receive pool backing memory; custom registration implementations
+  require the unsafe `MemoryRegistrar` contract. `ruapc::Devices` now aliases
+  `DeviceSet<RdmaDevice>` with RDMA enabled, or `DeviceSet` otherwise; device
+  access uses `tcp_device()` / `devices()`, and insertion uses `push()`.
+- **BREAKING**: Raw-ID buffer reclamation methods `QueuePair::take_buffer`,
+  `take_send_buffer` and `reclaim_send_buffers` are replaced by `complete`,
+  which consumes a non-cloneable `Completion` from
+  `CompletionQueue::poll_batch` and checks CQ/QP/tag identity. `set_wr_tag` now
+  returns a result and permits one assignment, with no tag reuse on either CQ.
+  QP creation requires an RC QP, matching PD/CQ contexts, and no external SRQ
+  or raw context pointer.
+- **BREAKING**: `MemoryRegion::register` rejects offset-based addressing;
+  owned buffer operations require ordinary virtual-address registration.
+- The `ruapc` core now enforces `#![forbid(unsafe_code)]`. Registration,
+  raw verbs and DMA ownership enforcement reside in `ruapc-bufpool` and
+  `ruapc-rdma`; core operations use their safe ownership and completion APIs.
 - **BREAKING**: `AlignedMemory::as_mut_slice` requires a mutable receiver;
   implementing `Devices` and calling raw TCP/RDMA memory operations now require
-  explicit unsafe contracts. QP-specific completion wrappers and unchecked
+  explicit unsafe contracts. `QueuePair::poll_send` / `poll_recv` and unchecked
   public task registration were removed; unsupported service declarations now
   produce explicit macro diagnostics. See the
   [API migration notes](docs/refactoring.md#api-changes).
@@ -56,6 +79,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - When built with the `rdma` feature, `SocketPoolConfig::default()` now enables
   RDMA resources with `RdmaSocketPoolConfig::default()`; set `rdma` to `None`
   to disable them explicitly.
+
+### Fixed
+- Write targets move their buffers into owned RDMA READ plans for the entire
+  transfer. CPU copies and competing READs now return `BuffersInUse` while the
+  target is checked out, preventing concurrent CPU/NIC access to the same
+  destination. Cancelled or failed transfers can leave the target empty while
+  the QP retains and eventually recycles its buffers.
+- Completion tags and WR sequence numbers no longer wrap and allow stale CQEs
+  to reclaim newer work. If the provider fails to destroy a QP or deregister
+  memory, the process aborts rather than releasing memory that DMA may still access.
 
 ### Removed
 - **BREAKING**: Removed the dead `Metadata` type and the redundant

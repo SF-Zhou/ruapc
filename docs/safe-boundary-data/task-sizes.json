@@ -1,0 +1,166 @@
+{
+  "baseline": [
+    {
+      "task": "handler",
+      "copy_sizes": [
+        760,
+        764,
+        896
+      ],
+      "allocation_sizes": [
+        896,
+        128
+      ],
+      "symbol": "_RNvMs0_NtNtNtCs5em53W7yeFp_5tokio7runtime4task4coreINtB5_4CellNCINvNtNtCsfFVwisakRvb_5ruapc4core8dispatch13spawn_handlerNCNCNvYNtCsgz82ZEhJuN5_4echo8EchoImplNtB23_11EchoService12ruapc_export00NCNCB1W_00E0INtNtCscHgRw1M2fX5_5alloc4sync3ArcNtNtNtNtB9_9scheduler12multi_thread6handle6HandleEE3newB23_"
+    },
+    {
+      "task": "handler",
+      "copy_sizes": [
+        2104,
+        2108,
+        2304
+      ],
+      "allocation_sizes": [
+        2304,
+        128
+      ],
+      "symbol": "_RNvMs0_NtNtNtCs5em53W7yeFp_5tokio7runtime4task4coreINtB5_4CellNCINvNtNtCsfFVwisakRvb_5ruapc4core8dispatch13spawn_handlerNCNCNvYNtCsgz82ZEhJuN5_4echo8EchoImplNtB23_11EchoService12ruapc_export00NCNCB1W_00Es_0INtNtCscHgRw1M2fX5_5alloc4sync3ArcNtNtNtNtB9_9scheduler12multi_thread6handle6HandleEE3newB23_"
+    },
+    {
+      "task": "client",
+      "copy_sizes": [
+        4216,
+        4220,
+        4352
+      ],
+      "allocation_sizes": [
+        4352,
+        128
+      ],
+      "symbol": "_RNvMs0_NtNtNtCs5em53W7yeFp_5tokio7runtime4task4coreINtB5_4CellNCNCNvCsgz82ZEhJuN5_4echo16bench_concurrent00INtNtCscHgRw1M2fX5_5alloc4sync3ArcNtNtNtNtB9_9scheduler12multi_thread6handle6HandleEE3newB14_"
+    }
+  ],
+  "initial": [
+    {
+      "task": "handler",
+      "copy_sizes": [
+        760,
+        764,
+        896
+      ],
+      "allocation_sizes": [
+        896,
+        128
+      ],
+      "symbol": "_RNvMs0_NtNtNtCs5em53W7yeFp_5tokio7runtime4task4coreINtB5_4CellNCINvNtNtCs5XPWn3sPhRT_5ruapc4core8dispatch13spawn_handlerNCNCNvYNtCs6gOa9b2Nk8F_4echo8EchoImplNtB23_11EchoService12ruapc_export00NCNCB1W_00E0INtNtCscHgRw1M2fX5_5alloc4sync3ArcNtNtNtNtB9_9scheduler12multi_thread6handle6HandleEE3newB23_"
+    },
+    {
+      "task": "handler",
+      "copy_sizes": [
+        2104,
+        2108,
+        2304
+      ],
+      "allocation_sizes": [
+        2304,
+        128
+      ],
+      "symbol": "_RNvMs0_NtNtNtCs5em53W7yeFp_5tokio7runtime4task4coreINtB5_4CellNCINvNtNtCs5XPWn3sPhRT_5ruapc4core8dispatch13spawn_handlerNCNCNvYNtCs6gOa9b2Nk8F_4echo8EchoImplNtB23_11EchoService12ruapc_export00NCNCB1W_00Es_0INtNtCscHgRw1M2fX5_5alloc4sync3ArcNtNtNtNtB9_9scheduler12multi_thread6handle6HandleEE3newB23_"
+    },
+    {
+      "task": "client",
+      "copy_sizes": [
+        4264,
+        4268,
+        4480
+      ],
+      "allocation_sizes": [
+        4480,
+        128
+      ],
+      "symbol": "_RNvMs0_NtNtNtCs5em53W7yeFp_5tokio7runtime4task4coreINtB5_4CellNCNCNvCs6gOa9b2Nk8F_4echo16bench_concurrent00INtNtCscHgRw1M2fX5_5alloc4sync3ArcNtNtNtNtB9_9scheduler12multi_thread6handle6HandleEE3newB14_"
+    }
+  ],
+  "intermediate": [
+    {
+      "task": "handler",
+      "copy_sizes": [
+        760,
+        764,
+        896
+      ],
+      "allocation_sizes": [
+        896,
+        128
+      ],
+      "symbol": "_RNvMs0_NtNtNtCs5em53W7yeFp_5tokio7runtime4task4coreINtB5_4CellNCINvNtNtCs5XPWn3sPhRT_5ruapc4core8dispatch13spawn_handlerNCNCNvYNtCs6gOa9b2Nk8F_4echo8EchoImplNtB23_11EchoService12ruapc_export00NCNCB1W_00E0INtNtCscHgRw1M2fX5_5alloc4sync3ArcNtNtNtNtB9_9scheduler12multi_thread6handle6HandleEE3newB23_"
+    },
+    {
+      "task": "handler",
+      "copy_sizes": [
+        2104,
+        2108,
+        2304
+      ],
+      "allocation_sizes": [
+        2304,
+        128
+      ],
+      "symbol": "_RNvMs0_NtNtNtCs5em53W7yeFp_5tokio7runtime4task4coreINtB5_4CellNCINvNtNtCs5XPWn3sPhRT_5ruapc4core8dispatch13spawn_handlerNCNCNvYNtCs6gOa9b2Nk8F_4echo8EchoImplNtB23_11EchoService12ruapc_export00NCNCB1W_00Es_0INtNtCscHgRw1M2fX5_5alloc4sync3ArcNtNtNtNtB9_9scheduler12multi_thread6handle6HandleEE3newB23_"
+    },
+    {
+      "task": "client",
+      "copy_sizes": [
+        4224,
+        4228,
+        4352
+      ],
+      "allocation_sizes": [
+        4352,
+        128
+      ],
+      "symbol": "_RNvMs0_NtNtNtCs5em53W7yeFp_5tokio7runtime4task4coreINtB5_4CellNCNCNvCs6gOa9b2Nk8F_4echo16bench_concurrent00INtNtCscHgRw1M2fX5_5alloc4sync3ArcNtNtNtNtB9_9scheduler12multi_thread6handle6HandleEE3newB14_"
+    }
+  ],
+  "current": [
+    {
+      "task": "handler",
+      "copy_sizes": [
+        760,
+        764,
+        896
+      ],
+      "allocation_sizes": [
+        896,
+        128
+      ],
+      "symbol": "_RNvMs0_NtNtNtCs5em53W7yeFp_5tokio7runtime4task4coreINtB5_4CellNCINvNtNtCs5XPWn3sPhRT_5ruapc4core8dispatch13spawn_handlerNCNCNvYNtCs6gOa9b2Nk8F_4echo8EchoImplNtB23_11EchoService12ruapc_export00NCNCB1W_00E0INtNtCscHgRw1M2fX5_5alloc4sync3ArcNtNtNtNtB9_9scheduler12multi_thread6handle6HandleEE3newB23_"
+    },
+    {
+      "task": "handler",
+      "copy_sizes": [
+        2104,
+        2108,
+        2304
+      ],
+      "allocation_sizes": [
+        2304,
+        128
+      ],
+      "symbol": "_RNvMs0_NtNtNtCs5em53W7yeFp_5tokio7runtime4task4coreINtB5_4CellNCINvNtNtCs5XPWn3sPhRT_5ruapc4core8dispatch13spawn_handlerNCNCNvYNtCs6gOa9b2Nk8F_4echo8EchoImplNtB23_11EchoService12ruapc_export00NCNCB1W_00Es_0INtNtCscHgRw1M2fX5_5alloc4sync3ArcNtNtNtNtB9_9scheduler12multi_thread6handle6HandleEE3newB23_"
+    },
+    {
+      "task": "client",
+      "copy_sizes": [
+        3992,
+        3996,
+        4096
+      ],
+      "allocation_sizes": [
+        4096,
+        128
+      ],
+      "symbol": "_RNvMs0_NtNtNtCs5em53W7yeFp_5tokio7runtime4task4coreINtB5_4CellNCNCNvCs6gOa9b2Nk8F_4echo16bench_concurrent00INtNtCscHgRw1M2fX5_5alloc4sync3ArcNtNtNtNtB9_9scheduler12multi_thread6handle6HandleEE3newB14_"
+    }
+  ]
+}

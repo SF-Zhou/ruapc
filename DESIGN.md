@@ -9,7 +9,7 @@ invariants that a change must preserve.
 | Crate | Responsibility | Depends on |
 |---|---|---|
 | `ruapc-bufpool` | Registered memory, buddy allocation, slab and thread caches | Device registration contracts |
-| `ruapc-rdma` | libibverbs ownership and work-request submission | `ruapc-bufpool` |
+| `ruapc-rdma` | libibverbs ownership, owned work requests and completion evidence | `ruapc-bufpool` |
 | `ruapc-macro` | Parse and validate service traits, generate calls and handlers | Rust syntax and token libraries |
 | `ruapc` | Request lifecycle, routing, transport policy and remote memory | The three crates above; RDMA is optional |
 | `ruapc-demo` | Runnable services and verified workloads | `ruapc` |
@@ -19,6 +19,11 @@ calls remain statically dispatched; no boxed future is introduced to unify
 transports. The router's registered service closures are the application
 extension boundary: they capture arbitrary user service implementations and
 schedule concrete handler futures.
+
+The core crate enforces `#![forbid(unsafe_code)]`. Allocator, registration and
+verbs code belongs in its dependencies. Their safe APIs must own the memory
+used by hardware and validate the evidence for returning it; accepting raw
+addresses alongside a caller's ownership promise does not establish this boundary.
 
 ## Core library boundaries
 
@@ -106,10 +111,12 @@ local and remote segmentation can differ.
 
 `remote_memory/scatter.rs` owns bounds, overflow, region/op limits and
 non-overlapping destination validation, then fragments ranges at segment
-boundaries. `remote_memory/context.rs` completes fallible validation while
-borrowing the caller's buffers; ownership moves into the transport only after
-validation succeeds. `RemoteIoError` carries any recoverable local buffers;
-its buffer slot is empty while outstanding work still owns them.
+boundaries. `remote_memory/context.rs` validates the logical operation while
+borrowing the caller's buffers. After ownership moves into the RDMA dependency,
+it independently validates the concrete destination plan before posting and
+returns the buffers if validation fails. `RemoteIoError` carries recoverable
+local buffers; once work has been posted, failures can return no buffers even
+if the QP has since completed and recycled them.
 
 Client read attachments take ownership through `with_read_buffer(Buffer)` or
 `with_read_buffers(Vec<Buffer>)`. Calling either method on an existing wrapper
@@ -130,8 +137,18 @@ it does not accept peer-supplied addresses or look them up in a registration map
 
 RDMA transfers always use READ. For `remote_write`, the server advertises its
 source buffers and the client reads into its own pinned destination buffers.
-`Arc<WriteTarget>` is held both by the waiter and by in-flight writers. A
-request timeout cannot recycle memory that the NIC may still access.
+`Arc<WriteTarget>` is held both by the waiter and by in-flight writers. Its
+`Mutex<Option<Vec<Buffer>>>` grants either CPU access or an exclusive transfer:
+`take_for_read` removes the entire destination vector before passing it to the
+dependency's owned READ plan. While the slot is empty, `copy_in`, region export
+and another READ checkout return `BuffersInUse`. This excludes concurrent CPU
+and NIC writes, including competing reverse RPCs for the same request.
+
+`restore_after_read` puts back only buffers returned by the dependency: after
+successful completion, or an error before anything was posted. Cancellation or
+a posted-operation failure can leave the target empty; the QP then retains and
+eventually recycles its buffers. A timeout cannot recover those destinations
+through the now-empty target.
 
 A completed write returns `SentBuffers`; combining it with a response yields
 `WithBuffers<T>`. A handler with no transfer explicitly uses `sent_nothing()`.
@@ -146,20 +163,46 @@ lease: after source-side timeout or cancellation, the source side cannot observe
 when an already posted one-sided READ finishes. The existing post-READ
 `request_is_pending` check rejects data for an expired request, but does not
 acknowledge remote completion before source recovery or reuse. Destination-side
-READ batches separately retain their memory until every posted completion arrives.
+READ batches separately retain their memory until every posted completion arrives
+or their QP is successfully destroyed. Local destination ownership does not
+remove the source-side limitation.
 
 ## RDMA execution
 
-`rdma_socket.rs` owns connection identity, QP lifetime and message sending.
-`rdma_socket/read.rs` owns READ planning, posting, completion batches and
-remote-memory operations. A batch owns its buffers or write target until all
-posted completions have arrived, including flush completions after failure.
+`ruapc/src/rdma/rdma_socket.rs` owns connection identity, its QP and message
+sending. `rdma_socket/read.rs` translates logical copy operations into remote
+ranges and local buffer-index/offset/length descriptors, applies admission
+limits and awaits results. It never supplies local raw addresses or keys.
+
+`ruapc-rdma/src/verbs/queue_pair/read.rs` owns READ preparation and completion
+lifetime. Its private bookkeeping is inline in the QP. The connection handshake
+keeps its temporary `LocalConnection` in a box across peer negotiation, then
+moves the QP directly into the established socket. RPC client futures therefore
+do not carry the entire temporary QP during connection acquisition.
+`QueuePair::prepare_reads` consumes the destination `Vec<Buffer>`,
+validates bounds, overflow, scatter limits and destination overlap across all
+requests, then resolves addresses and keys from those owned buffers. The
+non-cloneable `ReadPosting` cursor is bound to the preparing QP and advances
+once per successful post. The QP records its private batch hold before the NIC
+can observe a work request and rolls that record back if posting fails.
+
+Dropping a posting cursor accounts the unposted suffix. Already posted work
+retains memory independently of the posting task and result receiver. Explicit
+cancellation before the first successful post can recover the buffers; after
+posting, neither dropping a future nor notifying an error releases them early.
+Forgetting an owner can retain memory indefinitely. Successful completion of
+the whole batch returns the vector; failed batches recycle it only after their
+posted work has settled.
 
 READ admission combines per-device concurrency, a per-connection SQ guard,
 negotiated atomic-read capabilities and device-port bandwidth limits. The
 poller's periodic sweep enforces READ timeouts without per-operation timers.
 Timeout fails the waiter and moves the QP to ERR; it never force-recycles DMA
-memory. QP destruction precedes dropping memory still held by the socket.
+memory. Poller shutdown likewise fails receivers while leaving the QP's holds
+intact. Normal connection removal waits for pending READs and the flow ledger
+to settle. Final QP destruction precedes releasing any remaining work-request
+buffers; a provider failure to destroy the QP aborts the process, since an error
+state or failed destruction alone cannot prove that DMA has stopped.
 
 `poller` separates CQ draining, maintenance and idle wakeup. Dispatch workers
 parse received frames away from the poll thread. `poller/flow.rs` owns the
@@ -167,10 +210,20 @@ credit ledger: a data SEND slot is reusable only after local completion and
 remote receive acknowledgement. ACK fields have explicit bounds; credit that
 does not fit remains pending for a later ACK.
 
+`CompletionQueue::poll_batch` fills private `CompletionBatch` storage and lends
+one non-cloneable token per CQE. Its borrow prevents the entries from being
+changed while a token is live. `QueuePair::complete` consumes that token and
+checks its CQ identity, QP number and permanently assigned WRID tag before
+recovering SEND/RECV buffers or settling READ ownership. Copying raw metadata
+does not copy this authority. A later RC SQ completion also permits reclamation
+of earlier unsignaled SENDs. Each CQ permanently claims connection tags; core
+poller slots retire after their final generation rather than wrapping. WR
+sequence numbers also cannot wrap and authorize recovery of a newer operation.
+
 The low-level `QueuePair` submission helper owns SQ locking, WR-slot
 registration and post-failure rollback for SEND, SEND-with-immediate and
-gather SEND. Operations exposing raw DMA lifetime requirements are `unsafe`
-and document the completion/destruction proof callers must provide.
+gather SEND. Raw DMA APIs remain explicitly unsafe in the dependency; the core
+uses the owned submission and CQ-issued completion interfaces.
 
 Bootstrap and multi-NIC placement are described in
 [RDMA connection lifecycle](docs/rdma-connection.md). Peer identity is the
@@ -205,10 +258,26 @@ access to an `AlignedMemory` slice requires an exclusive borrow.
 Device registrations are destroyed before their backing memory. Growth
 failure restores reserved budget and wakes eligible waiters; cancellation
 passes reserved capacity to another waiter or returns it to the allocator.
-Implementing `Devices` is unsafe: retaining memory for registration does not
-grant independent byte access while pool buffers exist. Low-level registered
-TCP reads carry the same explicit access contract; normal RPC reads use their
-owned request source and safe slices.
+
+`ruapc::Devices` is a type alias for `ruapc_bufpool::DeviceSet<RdmaDevice>`
+with RDMA enabled, or `DeviceSet` for stream transports. `DeviceSet` assigns
+stable device indices, keeps TCP at index zero and registers memory directly
+through each device's associated `MemoryRegistrar`. Safe `Device` wrappers
+provide identity, metadata and a registrar reference; they never receive the
+pool's backing memory. The core's `RdmaDevice` delegates registration to
+`ActiveDevice`, whose audited implementation lives in
+`ruapc-rdma/src/buffer_registration.rs`; TCP's implementation stays in
+`ruapc-bufpool/src/tcp_device.rs`.
+
+`MemoryRegistrar` and the custom collection trait `Devices` have unsafe
+implementation contracts. Retaining backing memory for registration grants no
+independent byte access while pool buffers exist, and registration destruction
+must end its use of that region before returning. `DeviceSet` drops completed
+registrations on partial failure. The RDMA registrar accepts only ordinary
+virtual-address mappings; failed deregistration aborts before releasing memory.
+Low-level registered TCP reads carry an
+explicit access contract; normal RPC reads use their owned request source and
+safe slices.
 
 ## Generated services and examples
 

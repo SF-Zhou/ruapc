@@ -101,7 +101,9 @@ Manages 64MiB buddy blocks and supports three slab sizes and four buddy sizes.
 A buffer allocated from the pool. Supports `Deref<[u8]>`, `DerefMut`, `set_len`, `extend_from_slice`, and automatic return on drop.
 
 ### Device Registration
-- `trait Device` — register memory with a device
+- `trait Device` — device identity and access to an audited registrar; safe wrappers never receive pool memory
+- `unsafe trait MemoryRegistrar` — register memory while preserving each allocation's access and lifetime rules
+- `DeviceSet<D>` — safely combine a TCP device with statically dispatched additional devices
 - `unsafe trait Devices` — collection that preserves pooled allocations' access rules
 - `trait Registration` — handle for a registered memory region
 - `TcpDevice` — TCP transport device (simulates RDMA-style registration)

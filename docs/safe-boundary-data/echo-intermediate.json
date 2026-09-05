@@ -1,0 +1,799 @@
+{
+  "baseline_commit": "1d35f32",
+  "placement": {
+    "cpu_ids": "0-7",
+    "numa_memory_node": 0,
+    "rdma_device": "mlx5_0"
+  },
+  "runs_per_version": 3,
+  "iterations": {
+    "warmup": 5000,
+    "serial": 50000
+  },
+  "raw": {
+    "ruapc-safe-api-echo-baseline-1.log": "ruapc: end-to-end echo RPC benchmark (unified server, one port)\nserial iterations: 50000; warmup iterations: 5000; transport: None; RDMA device: Some(\"mlx5_0\")\n\nTCP\n  serial        16B:    14.00 us/op\n  serial      4096B:    15.73 us/op\n  concurrent    16B:    876.4 kops/s |    73.02 us/op (64 tasks)\n  concurrent    16B:    957.2 kops/s |  1069.82 us/op (1024 tasks)\n\nWS\n  serial        16B:    17.56 us/op\n  serial      4096B:    20.71 us/op\n  concurrent    16B:    322.9 kops/s |   198.19 us/op (64 tasks)\n  concurrent    16B:    307.8 kops/s |  3326.34 us/op (1024 tasks)\n\nHTTP\n  serial        16B:    17.74 us/op\n  serial      4096B:    20.11 us/op\n  concurrent    16B:    341.5 kops/s |   187.42 us/op (64 tasks)\n  concurrent    16B:    370.7 kops/s |  2762.19 us/op (1024 tasks)\n\nRDMA\n  serial        16B:    16.12 us/op\n  serial      4096B:    17.81 us/op\n  concurrent    16B:    939.0 kops/s |    68.16 us/op (64 tasks)\n  concurrent    16B:   1391.3 kops/s |   735.99 us/op (1024 tasks)\n\nRDMA (2 endpoints)\n  concurrent    16B:    929.2 kops/s |    68.88 us/op (64 tasks)\n  concurrent    16B:   1393.5 kops/s |   734.84 us/op (1024 tasks)\n\n",
+    "ruapc-safe-api-echo-baseline-2.log": "ruapc: end-to-end echo RPC benchmark (unified server, one port)\nserial iterations: 50000; warmup iterations: 5000; transport: None; RDMA device: Some(\"mlx5_0\")\n\nTCP\n  serial        16B:    14.93 us/op\n  serial      4096B:    16.54 us/op\n  concurrent    16B:    860.5 kops/s |    74.38 us/op (64 tasks)\n  concurrent    16B:    992.8 kops/s |  1031.38 us/op (1024 tasks)\n\nWS\n  serial        16B:    18.47 us/op\n  serial      4096B:    20.86 us/op\n  concurrent    16B:    322.4 kops/s |   198.52 us/op (64 tasks)\n  concurrent    16B:    310.7 kops/s |  3295.77 us/op (1024 tasks)\n\nHTTP\n  serial        16B:    18.63 us/op\n  serial      4096B:    20.75 us/op\n  concurrent    16B:    348.6 kops/s |   183.58 us/op (64 tasks)\n  concurrent    16B:    377.6 kops/s |  2712.04 us/op (1024 tasks)\n\nRDMA\n  serial        16B:    15.17 us/op\n  serial      4096B:    18.28 us/op\n  concurrent    16B:    944.7 kops/s |    67.74 us/op (64 tasks)\n  concurrent    16B:   1403.9 kops/s |   729.39 us/op (1024 tasks)\n\nRDMA (2 endpoints)\n  concurrent    16B:    979.6 kops/s |    65.33 us/op (64 tasks)\n  concurrent    16B:   1438.9 kops/s |   711.67 us/op (1024 tasks)\n\n",
+    "ruapc-safe-api-echo-baseline-3.log": "ruapc: end-to-end echo RPC benchmark (unified server, one port)\nserial iterations: 50000; warmup iterations: 5000; transport: None; RDMA device: Some(\"mlx5_0\")\n\nTCP\n  serial        16B:    14.98 us/op\n  serial      4096B:    16.28 us/op\n  concurrent    16B:    876.5 kops/s |    73.02 us/op (64 tasks)\n  concurrent    16B:    999.9 kops/s |  1024.10 us/op (1024 tasks)\n\nWS\n  serial        16B:    18.47 us/op\n  serial      4096B:    20.43 us/op\n  concurrent    16B:    324.5 kops/s |   197.22 us/op (64 tasks)\n  concurrent    16B:    299.3 kops/s |  3420.76 us/op (1024 tasks)\n\nHTTP\n  serial        16B:    18.49 us/op\n  serial      4096B:    20.15 us/op\n  concurrent    16B:    353.4 kops/s |   181.08 us/op (64 tasks)\n  concurrent    16B:    376.4 kops/s |  2720.56 us/op (1024 tasks)\n\nRDMA\n  serial        16B:    15.12 us/op\n  serial      4096B:    17.89 us/op\n  concurrent    16B:    963.7 kops/s |    66.41 us/op (64 tasks)\n  concurrent    16B:   1418.2 kops/s |   722.05 us/op (1024 tasks)\n\nRDMA (2 endpoints)\n  concurrent    16B:    960.7 kops/s |    66.62 us/op (64 tasks)\n  concurrent    16B:   1427.0 kops/s |   717.61 us/op (1024 tasks)\n\n",
+    "ruapc-safe-api-echo-current-1.log": "ruapc: end-to-end echo RPC benchmark (unified server, one port)\nserial iterations: 50000; warmup iterations: 5000; transport: None; RDMA device: Some(\"mlx5_0\")\n\nTCP\n  serial        16B:    14.58 us/op\n  serial      4096B:    15.94 us/op\n  concurrent    16B:    843.8 kops/s |    75.85 us/op (64 tasks)\n  concurrent    16B:    920.9 kops/s |  1111.93 us/op (1024 tasks)\n\nWS\n  serial        16B:    18.70 us/op\n  serial      4096B:    20.90 us/op\n  concurrent    16B:    332.3 kops/s |   192.61 us/op (64 tasks)\n  concurrent    16B:    317.8 kops/s |  3222.32 us/op (1024 tasks)\n\nHTTP\n  serial        16B:    17.84 us/op\n  serial      4096B:    19.90 us/op\n  concurrent    16B:    336.8 kops/s |   190.05 us/op (64 tasks)\n  concurrent    16B:    367.4 kops/s |  2786.87 us/op (1024 tasks)\n\nRDMA\n  serial        16B:    15.25 us/op\n  serial      4096B:    17.40 us/op\n  concurrent    16B:    949.3 kops/s |    67.42 us/op (64 tasks)\n  concurrent    16B:   1398.5 kops/s |   732.22 us/op (1024 tasks)\n\nRDMA (2 endpoints)\n  concurrent    16B:    951.1 kops/s |    67.29 us/op (64 tasks)\n  concurrent    16B:   1347.5 kops/s |   759.94 us/op (1024 tasks)\n\n",
+    "ruapc-safe-api-echo-current-2.log": "ruapc: end-to-end echo RPC benchmark (unified server, one port)\nserial iterations: 50000; warmup iterations: 5000; transport: None; RDMA device: Some(\"mlx5_0\")\n\nTCP\n  serial        16B:    14.42 us/op\n  serial      4096B:    16.13 us/op\n  concurrent    16B:    841.4 kops/s |    76.07 us/op (64 tasks)\n  concurrent    16B:    928.9 kops/s |  1102.43 us/op (1024 tasks)\n\nWS\n  serial        16B:    18.56 us/op\n  serial      4096B:    20.36 us/op\n  concurrent    16B:    330.4 kops/s |   193.71 us/op (64 tasks)\n  concurrent    16B:    317.5 kops/s |  3225.24 us/op (1024 tasks)\n\nHTTP\n  serial        16B:    17.87 us/op\n  serial      4096B:    19.66 us/op\n  concurrent    16B:    347.4 kops/s |   184.23 us/op (64 tasks)\n  concurrent    16B:    368.9 kops/s |  2775.71 us/op (1024 tasks)\n\nRDMA\n  serial        16B:    14.84 us/op\n  serial      4096B:    17.82 us/op\n  concurrent    16B:    976.3 kops/s |    65.55 us/op (64 tasks)\n  concurrent    16B:   1409.3 kops/s |   726.59 us/op (1024 tasks)\n\nRDMA (2 endpoints)\n  concurrent    16B:    956.5 kops/s |    66.91 us/op (64 tasks)\n  concurrent    16B:   1421.7 kops/s |   720.24 us/op (1024 tasks)\n\n",
+    "ruapc-safe-api-echo-current-3.log": "ruapc: end-to-end echo RPC benchmark (unified server, one port)\nserial iterations: 50000; warmup iterations: 5000; transport: None; RDMA device: Some(\"mlx5_0\")\n\nTCP\n  serial        16B:    14.46 us/op\n  serial      4096B:    15.69 us/op\n  concurrent    16B:    837.5 kops/s |    76.42 us/op (64 tasks)\n  concurrent    16B:    942.6 kops/s |  1086.38 us/op (1024 tasks)\n\nWS\n  serial        16B:    17.80 us/op\n  serial      4096B:    20.25 us/op\n  concurrent    16B:    329.4 kops/s |   194.29 us/op (64 tasks)\n  concurrent    16B:    312.6 kops/s |  3275.45 us/op (1024 tasks)\n\nHTTP\n  serial        16B:    18.95 us/op\n  serial      4096B:    19.82 us/op\n  concurrent    16B:    350.5 kops/s |   182.60 us/op (64 tasks)\n  concurrent    16B:    381.4 kops/s |  2684.91 us/op (1024 tasks)\n\nRDMA\n  serial        16B:    16.62 us/op\n  serial      4096B:    17.87 us/op\n  concurrent    16B:    912.7 kops/s |    70.12 us/op (64 tasks)\n  concurrent    16B:   1345.9 kops/s |   760.81 us/op (1024 tasks)\n\nRDMA (2 endpoints)\n  concurrent    16B:    887.8 kops/s |    72.09 us/op (64 tasks)\n  concurrent    16B:   1380.2 kops/s |   741.94 us/op (1024 tasks)\n\n"
+  },
+  "results": [
+    {
+      "transport": "TCP",
+      "operation": "serial",
+      "bytes": 16,
+      "tasks": 1,
+      "baseline": {
+        "us_per_op": {
+          "samples": [
+            14.0,
+            14.93,
+            14.98
+          ],
+          "median": 14.93,
+          "min": 14.0,
+          "max": 14.98
+        }
+      },
+      "current": {
+        "us_per_op": {
+          "samples": [
+            14.58,
+            14.42,
+            14.46
+          ],
+          "median": 14.46,
+          "min": 14.42,
+          "max": 14.58
+        }
+      },
+      "comparison_metric": "us_per_op",
+      "median_change_percent": -3.148024112525105
+    },
+    {
+      "transport": "TCP",
+      "operation": "serial",
+      "bytes": 4096,
+      "tasks": 1,
+      "baseline": {
+        "us_per_op": {
+          "samples": [
+            15.73,
+            16.54,
+            16.28
+          ],
+          "median": 16.28,
+          "min": 15.73,
+          "max": 16.54
+        }
+      },
+      "current": {
+        "us_per_op": {
+          "samples": [
+            15.94,
+            16.13,
+            15.69
+          ],
+          "median": 15.94,
+          "min": 15.69,
+          "max": 16.13
+        }
+      },
+      "comparison_metric": "us_per_op",
+      "median_change_percent": -2.0884520884520974
+    },
+    {
+      "transport": "TCP",
+      "operation": "concurrent",
+      "bytes": 16,
+      "tasks": 64,
+      "baseline": {
+        "kops_per_second": {
+          "samples": [
+            876.4,
+            860.5,
+            876.5
+          ],
+          "median": 876.4,
+          "min": 860.5,
+          "max": 876.5
+        },
+        "us_per_op": {
+          "samples": [
+            73.02,
+            74.38,
+            73.02
+          ],
+          "median": 73.02,
+          "min": 73.02,
+          "max": 74.38
+        }
+      },
+      "current": {
+        "kops_per_second": {
+          "samples": [
+            843.8,
+            841.4,
+            837.5
+          ],
+          "median": 841.4,
+          "min": 837.5,
+          "max": 843.8
+        },
+        "us_per_op": {
+          "samples": [
+            75.85,
+            76.07,
+            76.42
+          ],
+          "median": 76.07,
+          "min": 75.85,
+          "max": 76.42
+        }
+      },
+      "comparison_metric": "kops_per_second",
+      "median_change_percent": -3.9936102236421744
+    },
+    {
+      "transport": "TCP",
+      "operation": "concurrent",
+      "bytes": 16,
+      "tasks": 1024,
+      "baseline": {
+        "kops_per_second": {
+          "samples": [
+            957.2,
+            992.8,
+            999.9
+          ],
+          "median": 992.8,
+          "min": 957.2,
+          "max": 999.9
+        },
+        "us_per_op": {
+          "samples": [
+            1069.82,
+            1031.38,
+            1024.1
+          ],
+          "median": 1031.38,
+          "min": 1024.1,
+          "max": 1069.82
+        }
+      },
+      "current": {
+        "kops_per_second": {
+          "samples": [
+            920.9,
+            928.9,
+            942.6
+          ],
+          "median": 928.9,
+          "min": 920.9,
+          "max": 942.6
+        },
+        "us_per_op": {
+          "samples": [
+            1111.93,
+            1102.43,
+            1086.38
+          ],
+          "median": 1102.43,
+          "min": 1086.38,
+          "max": 1111.93
+        }
+      },
+      "comparison_metric": "kops_per_second",
+      "median_change_percent": -6.436341659951649
+    },
+    {
+      "transport": "WS",
+      "operation": "serial",
+      "bytes": 16,
+      "tasks": 1,
+      "baseline": {
+        "us_per_op": {
+          "samples": [
+            17.56,
+            18.47,
+            18.47
+          ],
+          "median": 18.47,
+          "min": 17.56,
+          "max": 18.47
+        }
+      },
+      "current": {
+        "us_per_op": {
+          "samples": [
+            18.7,
+            18.56,
+            17.8
+          ],
+          "median": 18.56,
+          "min": 17.8,
+          "max": 18.7
+        }
+      },
+      "comparison_metric": "us_per_op",
+      "median_change_percent": 0.48727666486194643
+    },
+    {
+      "transport": "WS",
+      "operation": "serial",
+      "bytes": 4096,
+      "tasks": 1,
+      "baseline": {
+        "us_per_op": {
+          "samples": [
+            20.71,
+            20.86,
+            20.43
+          ],
+          "median": 20.71,
+          "min": 20.43,
+          "max": 20.86
+        }
+      },
+      "current": {
+        "us_per_op": {
+          "samples": [
+            20.9,
+            20.36,
+            20.25
+          ],
+          "median": 20.36,
+          "min": 20.25,
+          "max": 20.9
+        }
+      },
+      "comparison_metric": "us_per_op",
+      "median_change_percent": -1.6900048285852343
+    },
+    {
+      "transport": "WS",
+      "operation": "concurrent",
+      "bytes": 16,
+      "tasks": 64,
+      "baseline": {
+        "kops_per_second": {
+          "samples": [
+            322.9,
+            322.4,
+            324.5
+          ],
+          "median": 322.9,
+          "min": 322.4,
+          "max": 324.5
+        },
+        "us_per_op": {
+          "samples": [
+            198.19,
+            198.52,
+            197.22
+          ],
+          "median": 198.19,
+          "min": 197.22,
+          "max": 198.52
+        }
+      },
+      "current": {
+        "kops_per_second": {
+          "samples": [
+            332.3,
+            330.4,
+            329.4
+          ],
+          "median": 330.4,
+          "min": 329.4,
+          "max": 332.3
+        },
+        "us_per_op": {
+          "samples": [
+            192.61,
+            193.71,
+            194.29
+          ],
+          "median": 193.71,
+          "min": 192.61,
+          "max": 194.29
+        }
+      },
+      "comparison_metric": "kops_per_second",
+      "median_change_percent": 2.3227005264787826
+    },
+    {
+      "transport": "WS",
+      "operation": "concurrent",
+      "bytes": 16,
+      "tasks": 1024,
+      "baseline": {
+        "kops_per_second": {
+          "samples": [
+            307.8,
+            310.7,
+            299.3
+          ],
+          "median": 307.8,
+          "min": 299.3,
+          "max": 310.7
+        },
+        "us_per_op": {
+          "samples": [
+            3326.34,
+            3295.77,
+            3420.76
+          ],
+          "median": 3326.34,
+          "min": 3295.77,
+          "max": 3420.76
+        }
+      },
+      "current": {
+        "kops_per_second": {
+          "samples": [
+            317.8,
+            317.5,
+            312.6
+          ],
+          "median": 317.5,
+          "min": 312.6,
+          "max": 317.8
+        },
+        "us_per_op": {
+          "samples": [
+            3222.32,
+            3225.24,
+            3275.45
+          ],
+          "median": 3225.24,
+          "min": 3222.32,
+          "max": 3275.45
+        }
+      },
+      "comparison_metric": "kops_per_second",
+      "median_change_percent": 3.15139701104612
+    },
+    {
+      "transport": "HTTP",
+      "operation": "serial",
+      "bytes": 16,
+      "tasks": 1,
+      "baseline": {
+        "us_per_op": {
+          "samples": [
+            17.74,
+            18.63,
+            18.49
+          ],
+          "median": 18.49,
+          "min": 17.74,
+          "max": 18.63
+        }
+      },
+      "current": {
+        "us_per_op": {
+          "samples": [
+            17.84,
+            17.87,
+            18.95
+          ],
+          "median": 17.87,
+          "min": 17.84,
+          "max": 18.95
+        }
+      },
+      "comparison_metric": "us_per_op",
+      "median_change_percent": -3.3531638723634294
+    },
+    {
+      "transport": "HTTP",
+      "operation": "serial",
+      "bytes": 4096,
+      "tasks": 1,
+      "baseline": {
+        "us_per_op": {
+          "samples": [
+            20.11,
+            20.75,
+            20.15
+          ],
+          "median": 20.15,
+          "min": 20.11,
+          "max": 20.75
+        }
+      },
+      "current": {
+        "us_per_op": {
+          "samples": [
+            19.9,
+            19.66,
+            19.82
+          ],
+          "median": 19.82,
+          "min": 19.66,
+          "max": 19.9
+        }
+      },
+      "comparison_metric": "us_per_op",
+      "median_change_percent": -1.6377171215880781
+    },
+    {
+      "transport": "HTTP",
+      "operation": "concurrent",
+      "bytes": 16,
+      "tasks": 64,
+      "baseline": {
+        "kops_per_second": {
+          "samples": [
+            341.5,
+            348.6,
+            353.4
+          ],
+          "median": 348.6,
+          "min": 341.5,
+          "max": 353.4
+        },
+        "us_per_op": {
+          "samples": [
+            187.42,
+            183.58,
+            181.08
+          ],
+          "median": 183.58,
+          "min": 181.08,
+          "max": 187.42
+        }
+      },
+      "current": {
+        "kops_per_second": {
+          "samples": [
+            336.8,
+            347.4,
+            350.5
+          ],
+          "median": 347.4,
+          "min": 336.8,
+          "max": 350.5
+        },
+        "us_per_op": {
+          "samples": [
+            190.05,
+            184.23,
+            182.6
+          ],
+          "median": 184.23,
+          "min": 182.6,
+          "max": 190.05
+        }
+      },
+      "comparison_metric": "kops_per_second",
+      "median_change_percent": -0.3442340791738552
+    },
+    {
+      "transport": "HTTP",
+      "operation": "concurrent",
+      "bytes": 16,
+      "tasks": 1024,
+      "baseline": {
+        "kops_per_second": {
+          "samples": [
+            370.7,
+            377.6,
+            376.4
+          ],
+          "median": 376.4,
+          "min": 370.7,
+          "max": 377.6
+        },
+        "us_per_op": {
+          "samples": [
+            2762.19,
+            2712.04,
+            2720.56
+          ],
+          "median": 2720.56,
+          "min": 2712.04,
+          "max": 2762.19
+        }
+      },
+      "current": {
+        "kops_per_second": {
+          "samples": [
+            367.4,
+            368.9,
+            381.4
+          ],
+          "median": 368.9,
+          "min": 367.4,
+          "max": 381.4
+        },
+        "us_per_op": {
+          "samples": [
+            2786.87,
+            2775.71,
+            2684.91
+          ],
+          "median": 2775.71,
+          "min": 2684.91,
+          "max": 2786.87
+        }
+      },
+      "comparison_metric": "kops_per_second",
+      "median_change_percent": -1.9925611052072245
+    },
+    {
+      "transport": "RDMA",
+      "operation": "serial",
+      "bytes": 16,
+      "tasks": 1,
+      "baseline": {
+        "us_per_op": {
+          "samples": [
+            16.12,
+            15.17,
+            15.12
+          ],
+          "median": 15.17,
+          "min": 15.12,
+          "max": 16.12
+        }
+      },
+      "current": {
+        "us_per_op": {
+          "samples": [
+            15.25,
+            14.84,
+            16.62
+          ],
+          "median": 15.25,
+          "min": 14.84,
+          "max": 16.62
+        }
+      },
+      "comparison_metric": "us_per_op",
+      "median_change_percent": 0.5273566249176076
+    },
+    {
+      "transport": "RDMA",
+      "operation": "serial",
+      "bytes": 4096,
+      "tasks": 1,
+      "baseline": {
+        "us_per_op": {
+          "samples": [
+            17.81,
+            18.28,
+            17.89
+          ],
+          "median": 17.89,
+          "min": 17.81,
+          "max": 18.28
+        }
+      },
+      "current": {
+        "us_per_op": {
+          "samples": [
+            17.4,
+            17.82,
+            17.87
+          ],
+          "median": 17.82,
+          "min": 17.4,
+          "max": 17.87
+        }
+      },
+      "comparison_metric": "us_per_op",
+      "median_change_percent": -0.3912800447177234
+    },
+    {
+      "transport": "RDMA",
+      "operation": "concurrent",
+      "bytes": 16,
+      "tasks": 64,
+      "baseline": {
+        "kops_per_second": {
+          "samples": [
+            939.0,
+            944.7,
+            963.7
+          ],
+          "median": 944.7,
+          "min": 939.0,
+          "max": 963.7
+        },
+        "us_per_op": {
+          "samples": [
+            68.16,
+            67.74,
+            66.41
+          ],
+          "median": 67.74,
+          "min": 66.41,
+          "max": 68.16
+        }
+      },
+      "current": {
+        "kops_per_second": {
+          "samples": [
+            949.3,
+            976.3,
+            912.7
+          ],
+          "median": 949.3,
+          "min": 912.7,
+          "max": 976.3
+        },
+        "us_per_op": {
+          "samples": [
+            67.42,
+            65.55,
+            70.12
+          ],
+          "median": 67.42,
+          "min": 65.55,
+          "max": 70.12
+        }
+      },
+      "comparison_metric": "kops_per_second",
+      "median_change_percent": 0.48692706679367426
+    },
+    {
+      "transport": "RDMA",
+      "operation": "concurrent",
+      "bytes": 16,
+      "tasks": 1024,
+      "baseline": {
+        "kops_per_second": {
+          "samples": [
+            1391.3,
+            1403.9,
+            1418.2
+          ],
+          "median": 1403.9,
+          "min": 1391.3,
+          "max": 1418.2
+        },
+        "us_per_op": {
+          "samples": [
+            735.99,
+            729.39,
+            722.05
+          ],
+          "median": 729.39,
+          "min": 722.05,
+          "max": 735.99
+        }
+      },
+      "current": {
+        "kops_per_second": {
+          "samples": [
+            1398.5,
+            1409.3,
+            1345.9
+          ],
+          "median": 1398.5,
+          "min": 1345.9,
+          "max": 1409.3
+        },
+        "us_per_op": {
+          "samples": [
+            732.22,
+            726.59,
+            760.81
+          ],
+          "median": 732.22,
+          "min": 726.59,
+          "max": 760.81
+        }
+      },
+      "comparison_metric": "kops_per_second",
+      "median_change_percent": -0.3846427808248509
+    },
+    {
+      "transport": "RDMA (2 endpoints)",
+      "operation": "concurrent",
+      "bytes": 16,
+      "tasks": 64,
+      "baseline": {
+        "kops_per_second": {
+          "samples": [
+            929.2,
+            979.6,
+            960.7
+          ],
+          "median": 960.7,
+          "min": 929.2,
+          "max": 979.6
+        },
+        "us_per_op": {
+          "samples": [
+            68.88,
+            65.33,
+            66.62
+          ],
+          "median": 66.62,
+          "min": 65.33,
+          "max": 68.88
+        }
+      },
+      "current": {
+        "kops_per_second": {
+          "samples": [
+            951.1,
+            956.5,
+            887.8
+          ],
+          "median": 951.1,
+          "min": 887.8,
+          "max": 956.5
+        },
+        "us_per_op": {
+          "samples": [
+            67.29,
+            66.91,
+            72.09
+          ],
+          "median": 67.29,
+          "min": 66.91,
+          "max": 72.09
+        }
+      },
+      "comparison_metric": "kops_per_second",
+      "median_change_percent": -0.9992713646299611
+    },
+    {
+      "transport": "RDMA (2 endpoints)",
+      "operation": "concurrent",
+      "bytes": 16,
+      "tasks": 1024,
+      "baseline": {
+        "kops_per_second": {
+          "samples": [
+            1393.5,
+            1438.9,
+            1427.0
+          ],
+          "median": 1427.0,
+          "min": 1393.5,
+          "max": 1438.9
+        },
+        "us_per_op": {
+          "samples": [
+            734.84,
+            711.67,
+            717.61
+          ],
+          "median": 717.61,
+          "min": 711.67,
+          "max": 734.84
+        }
+      },
+      "current": {
+        "kops_per_second": {
+          "samples": [
+            1347.5,
+            1421.7,
+            1380.2
+          ],
+          "median": 1380.2,
+          "min": 1347.5,
+          "max": 1421.7
+        },
+        "us_per_op": {
+          "samples": [
+            759.94,
+            720.24,
+            741.94
+          ],
+          "median": 741.94,
+          "min": 720.24,
+          "max": 759.94
+        }
+      },
+      "comparison_metric": "kops_per_second",
+      "median_change_percent": -3.279607568325149
+    }
+  ]
+}
