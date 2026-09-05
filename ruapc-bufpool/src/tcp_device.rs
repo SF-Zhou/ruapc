@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use dashmap::DashMap;
 
-use crate::{AlignedMemory, Device, DeviceIndex, MemoryKey, Registration};
+use crate::{AlignedMemory, Device, DeviceIndex, MemoryKey, MemoryRegistrar, Registration};
 
 #[derive(Default)]
 struct TcpRegistry {
@@ -54,6 +54,12 @@ impl Registration for TcpMemoryRegistration {
 }
 
 impl Device for TcpDevice {
+    type Registrar = Self;
+
+    fn registrar(&self) -> &Self::Registrar {
+        self
+    }
+
     fn index(&self) -> DeviceIndex {
         self.index
     }
@@ -61,7 +67,12 @@ impl Device for TcpDevice {
     fn set_index(&mut self, idx: DeviceIndex) {
         self.index = idx;
     }
+}
 
+// SAFETY: the private registry only retains the region for registration lifetime.
+// Its only byte-access API requires the caller to prove allocation ownership and
+// read access. Dropping the handle removes the retained region from the registry.
+unsafe impl MemoryRegistrar for TcpDevice {
     fn register(&self, mem: &Arc<AlignedMemory>) -> std::io::Result<Box<dyn Registration>> {
         let id = self
             .registry

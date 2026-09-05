@@ -99,12 +99,12 @@ pub struct RdmaSocketPool {
     /// registration and device resources.
     peers: PeerMap,
     /// Live connection count per local RDMA device (outbound + inbound),
-    /// indexed like `devices.rdma_devices()`. Drives least-connections
+    /// indexed like `devices.devices()`. Drives least-connections
     /// placement and is advertised to peers via `RdmaPeerAdvertisement`.
     conn_counts: Arc<Vec<AtomicUsize>>,
     /// Per local RDMA device budget of in-flight RDMA READ work requests
     /// (`rdma.remote_memory.max_inflight_read_wrs`), indexed like
-    /// `devices.rdma_devices()` and shared by every connection on the
+    /// `devices.devices()` and shared by every connection on the
     /// device — the congestion control for read traffic (server-side
     /// `remote_read` and client-side `read_into_target` alike).
     read_permits: Vec<Arc<tokio::sync::Semaphore>>,
@@ -198,7 +198,7 @@ impl RdmaSocketPool {
         config: RdmaSocketPoolConfig,
     ) -> Result<Self> {
         config.validate()?;
-        for device in devices.rdma_devices() {
+        for device in devices.devices() {
             device.configure_bandwidth_limit(&config)?;
         }
         let task_supervisor = TaskSupervisor::create();
@@ -215,11 +215,11 @@ impl RdmaSocketPool {
             _port_refresher: port_refresher,
             peers: PeerMap::default(),
             conn_counts: Arc::new(
-                (0..devices.rdma_devices().len())
+                (0..devices.devices().len())
                     .map(|_| AtomicUsize::new(0))
                     .collect(),
             ),
-            read_permits: (0..devices.rdma_devices().len())
+            read_permits: (0..devices.devices().len())
                 .map(|_| {
                     Arc::new(tokio::sync::Semaphore::new(
                         config.remote_memory.max_inflight_read_wrs as usize,

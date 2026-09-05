@@ -111,7 +111,7 @@ impl RdmaSocketPool {
     fn local_nic_dead(&self, nic: &RdmaNicInfo) -> bool {
         let Some(device) = self
             .devices
-            .rdma_devices()
+            .devices()
             .iter()
             .find(|d| d.info().name == nic.device)
         else {
@@ -391,7 +391,7 @@ impl RdmaSocketPool {
         };
         let local_count = |name: &str| -> u64 {
             self.devices
-                .rdma_devices()
+                .devices()
                 .iter()
                 .enumerate()
                 .find(|(_, device)| device.info().name == name)

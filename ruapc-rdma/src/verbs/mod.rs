@@ -19,7 +19,7 @@ mod comp_channel;
 pub use comp_channel::CompChannel;
 
 mod completion_queue;
-pub use completion_queue::CompletionQueue;
+pub use completion_queue::{Completion, CompletionBatch, CompletionQueue, Completions};
 
 mod context;
 pub use context::Context;
@@ -40,6 +40,9 @@ mod qp_connection;
 pub use qp_connection::QpConnectionConfig;
 
 mod queue_pair;
-pub use queue_pair::{MAX_GATHER_SGE, QueuePair, ReadSge, WrBuffers};
+pub use queue_pair::{
+    CompletedWork, CompletionCursor, MAX_GATHER_SGE, QueuePair, ReadFailure, ReadPosting,
+    ReadReceiver, ReadRequest, ReadSegment, ReadSge, WrBuffers,
+};
 
 mod wr_slots;

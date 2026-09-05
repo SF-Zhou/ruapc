@@ -4,7 +4,7 @@
 use std::{collections::VecDeque, sync::Arc, time::Instant};
 
 use bytes::Bytes;
-use ruapc_rdma::{WRType, WrBuffers, ibv_send_flags, ibv_wc};
+use ruapc_rdma::{Completion, CompletionCursor, WRType, WrBuffers, ibv_send_flags, ibv_wc};
 
 use super::{
     BudgetGuard, RegisterConn, RingReservation, dispatch::DispatchBatch, flow::FlowControl,
@@ -78,8 +78,8 @@ pub(super) struct ConnState {
     /// Window-blocked framed sends in FIFO order.
     pub(super) pending_sends: VecDeque<Buffer>,
     pending_receiver: tokio::sync::mpsc::Receiver<Buffer>,
-    /// Next send-queue id that has not been swept yet (see `sweep_sq`).
-    sq_swept: u64,
+    /// Progress of the QP-owned selective SEND reclamation.
+    completion_cursor: CompletionCursor,
     /// Negotiated receive buffer size (`max_msg_size`).
     recv_buf_size: usize,
     /// Whether to aggregate window-blocked sends.
@@ -108,7 +108,7 @@ impl ConnState {
             flow: FlowControl::new(reg.send_window, reg.recv_submitted, Instant::now()),
             pending_sends: VecDeque::new(),
             pending_receiver: reg.pending_receiver,
-            sq_swept: 0,
+            completion_cursor: CompletionCursor::default(),
             recv_buf_size: reg.recv_buf_size,
             msg_aggregation: reg.msg_aggregation,
             recv_buf_cache: Vec::new(),
@@ -123,26 +123,24 @@ impl ConnState {
     }
 
     /// Handles one work completion for this connection.
-    #[allow(unsafe_code)] // Verbs memory ownership contract; see each SAFETY comment.
-    pub(super) fn handle_wc(&mut self, wc: &ibv_wc, batch: &mut DispatchBatch) {
-        if !wc.is_recv() {
-            // Sweep unsignaled data sends completed before this SQ
-            // completion (RC SQs complete in post order): reclaim their
-            // buffers and count each as one completed data WR. Only plain
-            // data sends are ever unsignaled, so every swept buffer is a
-            // data WR.
-            let id = wc.wr_id.get_id();
-            for swept in self.sq_swept..id {
-                // SAFETY: this RC SQ completion proves preceding unsignaled SENDs finished.
-                if unsafe { self.socket.queue_pair.take_send_buffer(swept) }.is_some() {
-                    self.flow.data_completed();
-                }
+    pub(super) fn handle_wc(&mut self, completion: Completion<'_>, batch: &mut DispatchBatch) {
+        let completed = match self
+            .socket
+            .queue_pair
+            .complete(completion, &mut self.completion_cursor)
+        {
+            Ok(completed) => completed,
+            Err(error) => {
+                tracing::error!(%error, "completion does not belong to the routed RDMA connection");
+                self.socket.set_error();
+                return;
             }
-            self.sq_swept = self.sq_swept.max(id + 1);
+        };
+        for _ in 0..completed.swept_sends {
+            self.flow.data_completed();
         }
-
-        // SAFETY: the poller routed this observed CQE to its owning QP.
-        let buffer = unsafe { self.socket.queue_pair.take_buffer(&wc.wr_id) };
+        let wc = completed.wc;
+        let buffer = completed.buffer;
         let result = if wc.is_recv() {
             // Receive WRs always post a single buffer.
             self.handle_recv_completion(wc, buffer.and_then(WrBuffers::into_single), batch)
@@ -304,9 +302,6 @@ impl ConnState {
                 // taken at post time.
                 self.socket.read_permits.add_permits(1);
                 self.socket.sq_read_permits.add_permits(1);
-                if let Some((_, batch)) = self.socket.rdma_completions.remove(&wc.wr_id) {
-                    batch.complete_one(wc.succ());
-                }
                 if wc.succ() {
                     return Ok(());
                 }
@@ -588,24 +583,7 @@ impl ConnState {
     /// eventually surface as flush completions — which is what releases
     /// their memory holds safely.
     pub(super) fn sweep_read_timeouts(&self, now: Instant) {
-        if self.socket.rdma_completions.is_empty() {
-            return;
-        }
-        let mut fired = false;
-        for entry in self.socket.rdma_completions.iter() {
-            let batch = entry.value();
-            if batch.expired(now)
-                && batch.fail(Error::new(
-                    ErrorKind::RdmaReadTimeout,
-                    "RDMA READ did not complete within rdma.remote_memory.read_timeout_ms; \
-                     failing the connection to flush it"
-                        .into(),
-                ))
-            {
-                fired = true;
-            }
-        }
-        if fired {
+        if self.socket.queue_pair.expire_reads(now) {
             tracing::error!(
                 "RDMA READ timeout on qp={}, moving connection to error state",
                 self.socket.queue_pair.qp_num()
@@ -620,21 +598,14 @@ impl ConnState {
     /// every outstanding work request then produces a flush CQE, so waiting
     /// for the ACK and recv counters to settle guarantees the QP finished
     /// flushing. Buffers of successfully-completed unsignaled sends never
-    /// produce a CQE and are reclaimed explicitly before removal.
+    /// produce a CQE and remain owned by the QP until it is destroyed.
     /// Outstanding RDMA READ batches also block removal: their memory
     /// holds may only be released once their (flush) completions arrived.
-    #[allow(unsafe_code)] // Verbs memory ownership contract; see each SAFETY comment.
     pub(super) fn ready_to_remove(&mut self) -> bool {
-        if self.socket.state.is_ok()
-            || !self.flow.flushed()
-            || !self.pending_sends.is_empty()
-            || !self.socket.rdma_completions.is_empty()
-        {
-            return false;
-        }
-        // SAFETY: the QP is in ERR and receive, ACK and READ flushes settled.
-        unsafe { self.socket.queue_pair.reclaim_send_buffers() };
-        true
+        !self.socket.state.is_ok()
+            && self.flow.flushed()
+            && self.pending_sends.is_empty()
+            && !self.socket.queue_pair.has_pending_reads()
     }
 }
 

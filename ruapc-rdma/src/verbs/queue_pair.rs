@@ -4,10 +4,15 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+mod read;
+pub use read::{ReadFailure, ReadPosting, ReadReceiver, ReadRequest, ReadSegment};
+
 use ruapc_bufpool::{Buffer, DeviceIndex};
 
 use super::{
-    completion_queue::CompletionQueue, protection_domain::ProtectionDomain, wr_slots::WrSlots,
+    completion_queue::{Completion, CompletionQueue},
+    protection_domain::ProtectionDomain,
+    wr_slots::WrSlots,
 };
 use crate::{
     Error, ErrorKind, QpConnectionConfig, Result, WRID, WRType, ibv_qp_attr, ibv_qp_attr_mask,
@@ -18,7 +23,7 @@ use crate::{
 pub const MAX_GATHER_SGE: usize = 32;
 
 /// Buffers owned by one in-flight receive or send work request.
-/// RDMA READ memory is owned by the caller until its completion arrives.
+/// Owned RDMA READ destinations are tracked separately in the QP's read state.
 #[derive(Debug)]
 pub enum WrBuffers {
     One(Buffer),
@@ -40,6 +45,23 @@ impl From<Buffer> for WrBuffers {
     fn from(buffer: Buffer) -> Self {
         Self::One(buffer)
     }
+}
+
+/// Progress of the selective SEND sweep for one QP. Keep one cursor per
+/// completion consumer; it avoids rescanning IDs already covered by a CQE.
+/// The cursor provides no reclamation authority without a completion proof.
+#[derive(Debug, Default)]
+pub struct CompletionCursor {
+    sq_swept: u64,
+}
+
+/// Metadata and owned buffers released by a verified completion.
+#[derive(Debug)]
+pub struct CompletedWork<'a> {
+    pub wc: &'a crate::ibv_wc,
+    pub buffer: Option<WrBuffers>,
+    /// Earlier data SENDs reclaimed under RC's ordered SQ completion rule.
+    pub swept_sends: usize,
 }
 
 /// One local scatter segment of an RDMA READ posted via
@@ -84,17 +106,19 @@ pub struct QueuePair {
     _pd: Arc<ProtectionDomain>,
     _send_cq: Arc<CompletionQueue>,
     _recv_cq: Arc<CompletionQueue>,
-    /// In-flight buffers of send-queue work requests (send/send_imm/read).
+    /// SEND buffers and the shared sequence counter for all SQ work requests.
     send_wrs: WrSlots,
     /// In-flight buffers of receive-queue work requests.
     recv_wrs: WrSlots,
+    /// Ownership of destinations is internal to this QP through completion.
+    read_state: read::ReadState,
     /// Selective signaling interval for data sends posted via [`send`].
     ///
     /// `0` or `1` signals every work request. With interval `N > 1`, only
     /// data sends whose SQ id is a multiple of `N` carry
     /// `IBV_SEND_SIGNALED`; completions of the unsignaled ones are inferred
     /// from later signaled completions (RC SQs complete in order) and their
-    /// buffers are reclaimed via [`take_send_buffer`](Self::take_send_buffer).
+    /// buffers are reclaimed by [`complete`](Self::complete).
     ///
     /// [`send`]: Self::send
     send_signal_interval: u64,
@@ -114,7 +138,8 @@ pub struct QueuePair {
     /// hardware post order exactly. Without this lock, two concurrent
     /// posters could allocate ids in one order and post in the other,
     /// letting the completion sweep reclaim the buffer of a still-in-flight
-    /// work request. The completion path stays lock-free.
+    /// work request. SEND buffer reclamation does not acquire this lock;
+    /// READ completion separately synchronizes its batch accounting.
     sq_post_lock: Mutex<()>,
     pub device_index: DeviceIndex,
 }
@@ -127,6 +152,16 @@ impl QueuePair {
         init_attr: &mut crate::ibv_qp_init_attr,
         device_index: DeviceIndex,
     ) -> Result<Self> {
+        // Completion of a later SQ request only authorizes the selective
+        // SEND sweep for reliable-connected queue pairs.
+        if init_attr.qp_type != crate::ibv_qp_type::IBV_QPT_RC
+            || !init_attr.srq.is_null()
+            || !init_attr.qp_context.is_null()
+            || !Arc::ptr_eq(pd.context(), send_cq.context())
+            || !Arc::ptr_eq(pd.context(), recv_cq.context())
+        {
+            return Err(ErrorKind::InvalidQueuePairConfig.into());
+        }
         init_attr.send_cq = send_cq.as_ptr();
         init_attr.recv_cq = recv_cq.as_ptr();
         let ptr = unsafe { crate::ruapc_ibv_create_qp(pd.as_ptr(), init_attr) };
@@ -149,9 +184,10 @@ impl QueuePair {
             _recv_cq: Arc::clone(recv_cq),
             send_wrs: WrSlots::new(init_attr.cap.max_send_wr),
             recv_wrs: WrSlots::new(init_attr.cap.max_recv_wr),
+            read_state: read::ReadState::new(),
             max_send_sge: init_attr.cap.max_send_sge as usize,
             send_signal_interval: 1,
-            wr_tag: 0,
+            wr_tag: u32::MAX,
             sq_post_lock: Mutex::new(()),
             device_index,
         })
@@ -159,12 +195,19 @@ impl QueuePair {
 
     /// Sets the connection tag embedded in every posted `wr_id`.
     ///
-    /// Must be called before any work request is posted: completions of
-    /// work requests posted with a different tag would be attributed to
-    /// the wrong (or no) connection.
-    pub fn set_wr_tag(&mut self, tag: u32) {
-        assert!(tag <= WRID::TAG_MAX, "wr tag too large");
+    /// Called exactly once, before posting. The tag must never have been used
+    /// on either CQ, even by a destroyed QP: a retained CQE must not authorize
+    /// reclamation on a replacement QP with the same provider-assigned QPN.
+    pub fn set_wr_tag(&mut self, tag: u32) -> Result<()> {
+        if self.wr_tag != u32::MAX {
+            return Err(ErrorKind::InvalidQueuePairConfig.into());
+        }
+        self._send_cq.claim_tag(tag)?;
+        if !Arc::ptr_eq(&self._send_cq, &self._recv_cq) {
+            self._recv_cq.claim_tag(tag)?;
+        }
         self.wr_tag = tag;
+        Ok(())
     }
 
     /// Sets the selective signaling interval for data sends.
@@ -429,45 +472,48 @@ impl QueuePair {
         })
     }
 
-    /// Recovers the buffers owned by a completed work request.
+    /// Consumes a CQ-issued completion proof and releases the completed memory.
     ///
-    /// # Safety
-    ///
-    /// `wr_id` must belong to this QP and its work completion must already have
-    /// been observed. The NIC must no longer access the returned buffers.
-    pub unsafe fn take_buffer(&self, wr_id: &WRID) -> Option<WrBuffers> {
-        match wr_id.get_type() {
-            WRType::Recv => self.recv_wrs.take(wr_id.get_id()),
-            WRType::SendData | WRType::SendImm | WRType::Read => self.send_wrs.take(wr_id.get_id()),
+    /// Validates the CQ, QP number and permanently assigned connection tag before
+    /// accessing any ownership table. For SQ completions, RC ordering also proves
+    /// that preceding unsignaled data SENDs no longer access their buffers.
+    /// READ ownership is settled here; callers receive only completion metadata.
+    #[inline]
+    pub fn complete<'a>(
+        &self,
+        completion: Completion<'a>,
+        cursor: &mut CompletionCursor,
+    ) -> Result<CompletedWork<'a>> {
+        let wc = completion.info();
+        let cq = if wc.is_recv() {
+            &self._recv_cq
+        } else {
+            &self._send_cq
+        };
+        if !completion.belongs_to(cq, self.qp_num(), self.wr_tag) {
+            return Err(ErrorKind::InvalidCompletion.into());
         }
-    }
-
-    /// Takes the buffer(s) of a send-queue work request by raw SQ id.
-    ///
-    /// Used by the completion handler to reclaim buffers of *unsignaled*
-    /// data sends: when a signaled completion with id `X` is polled, all SQ
-    /// work requests with ids below `X` are guaranteed complete (RC SQs
-    /// complete in order). Returns `None` for ids without stored buffers
-    /// (buffer-less immediate sends or failed posts).
-    ///
-    /// # Safety
-    ///
-    /// The work request must belong to this QP and be complete. Completion of
-    /// a later RC send-queue id establishes this for unsignaled data SENDs.
-    pub unsafe fn take_send_buffer(&self, id: u64) -> Option<WrBuffers> {
-        self.send_wrs.take(id)
-    }
-
-    /// Reclaims every in-flight send buffer, returning how many were taken.
-    ///
-    /// # Safety
-    ///
-    /// The QP must have transitioned to the error state
-    /// and its outstanding completions have been drained: buffers of
-    /// unsignaled data sends that completed successfully never produce a
-    /// CQE, so teardown must reclaim them explicitly.
-    pub unsafe fn reclaim_send_buffers(&self) -> usize {
-        self.send_wrs.reclaim_all()
+        let id = wc.wr_id.get_id();
+        let mut swept_sends = 0;
+        let buffer = if wc.is_recv() {
+            self.recv_wrs.take(id)
+        } else {
+            for swept in cursor.sq_swept..id {
+                if self.send_wrs.take(swept).is_some() {
+                    swept_sends += 1;
+                }
+            }
+            cursor.sq_swept = cursor.sq_swept.max(id + 1);
+            if wc.wr_id.get_type() == WRType::Read {
+                self.complete_read(wc.wr_id, wc.succ());
+            }
+            self.send_wrs.take(id)
+        };
+        Ok(CompletedWork {
+            wc,
+            buffer,
+            swept_sends,
+        })
     }
 
     /// Applies raw QP attributes, preserving the provider's returned errno.
@@ -566,7 +612,12 @@ fn modify_error(qp_num: u32, attr: &ibv_qp_attr, attr_mask: c_int, errno: c_int)
 
 impl Drop for QueuePair {
     fn drop(&mut self) {
-        let _ = unsafe { crate::ruapc_ibv_destroy_qp(self.ptr) };
+        // Field destruction releases SEND/RECV buffers, READ destinations and
+        // their PD/MR ownership. If the provider cannot destroy the QP, DMA may
+        // still access them; unwinding would release those holds as well.
+        if unsafe { crate::ruapc_ibv_destroy_qp(self.ptr) } != 0 {
+            std::process::abort();
+        }
     }
 }
 impl std::fmt::Debug for QueuePair {
@@ -583,6 +634,76 @@ unsafe impl Sync for QueuePair {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn init_attr() -> crate::ibv_qp_init_attr {
+        crate::ibv_qp_init_attr {
+            qp_type: crate::ibv_qp_type::IBV_QPT_RC,
+            cap: crate::ibv_qp_cap {
+                max_send_wr: 4,
+                max_recv_wr: 4,
+                max_send_sge: 1,
+                max_recv_sge: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn qp_tag_is_immutable_and_survives_qp_destruction() {
+        let device = crate::test_utils::open_device();
+        let cq = CompletionQueue::create(device.context(), 16, None).unwrap();
+        let create = || {
+            QueuePair::create(
+                device.pd(),
+                &cq,
+                &cq,
+                &mut init_attr(),
+                DeviceIndex::default(),
+            )
+            .unwrap()
+        };
+        let mut qp = create();
+        qp.set_wr_tag(42).unwrap();
+        assert!(qp.set_wr_tag(43).is_err());
+        drop(qp);
+        let mut replacement = create();
+        assert!(replacement.set_wr_tag(42).is_err());
+        replacement.set_wr_tag(43).unwrap();
+    }
+
+    #[test]
+    fn qp_creation_rejects_unowned_resources_and_foreign_contexts() {
+        let device = crate::test_utils::open_device();
+        let cq = CompletionQueue::create(device.context(), 16, None).unwrap();
+        let mut attrs = init_attr();
+        attrs.srq = ptr::dangling_mut();
+        assert_eq!(
+            QueuePair::create(device.pd(), &cq, &cq, &mut attrs, DeviceIndex::default())
+                .unwrap_err()
+                .kind,
+            ErrorKind::InvalidQueuePairConfig
+        );
+        attrs.srq = ptr::null_mut();
+        attrs.qp_context = ptr::dangling_mut();
+        assert!(
+            QueuePair::create(device.pd(), &cq, &cq, &mut attrs, DeviceIndex::default()).is_err()
+        );
+        let foreign = crate::test_utils::open_device();
+        let foreign_cq = CompletionQueue::create(foreign.context(), 16, None).unwrap();
+        assert_eq!(
+            QueuePair::create(
+                device.pd(),
+                &cq,
+                &foreign_cq,
+                &mut init_attr(),
+                DeviceIndex::default()
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::InvalidQueuePairConfig
+        );
+    }
 
     #[test]
     fn signaling_preserves_flags_and_forces_window_tail_completion() {

@@ -28,16 +28,57 @@ pub trait Registration: Send + Sync + std::fmt::Debug {
     fn memory_key(&self) -> MemoryKey;
 }
 
-/// Trait representing a device that can register memory.
+/// A device's audited memory-registration capability.
+///
+/// # Safety
+///
+/// Implementations may retain the supplied memory only to keep a registration
+/// alive. They must not expose that memory to callers or access its bytes
+/// independently of the pool's individual allocations. CPU and device accesses
+/// must preserve each allocation's lifetime and shared/exclusive borrowing rules.
+/// Dropping a registration must end its use of the region before returning.
+///
+/// This bound lets [`crate::DeviceSet`] combine devices without handing backing
+/// memory to application-defined, safe device wrappers.
+/// Implementing a registrar requires an explicit safety commitment:
+///
+/// ```compile_fail,E0200
+/// use std::sync::Arc;
+/// use ruapc_bufpool::{AlignedMemory, MemoryRegistrar, Registration};
+///
+/// #[derive(Debug)]
+/// struct UncheckedRegistrar;
+///
+/// impl MemoryRegistrar for UncheckedRegistrar {
+///     fn register(&self, _: &Arc<AlignedMemory>)
+///         -> std::io::Result<Box<dyn Registration>>
+///     {
+///         unimplemented!()
+///     }
+/// }
+/// ```
+pub unsafe trait MemoryRegistrar: Send + Sync + std::fmt::Debug {
+    /// Registers the given aligned memory region with this device.
+    fn register(&self, mem: &Arc<AlignedMemory>) -> Result<Box<dyn Registration>>;
+}
+
+/// Device identity and a reference to its audited registration capability.
+///
+/// Application wrappers may implement this trait safely: they never receive
+/// pool memory. [`crate::DeviceSet`] registers memory directly with the returned
+/// [`MemoryRegistrar`], so wrappers cannot intercept the registered region.
 pub trait Device: Send + Sync + std::fmt::Debug {
+    /// The implementation responsible for registration and memory lifetime.
+    type Registrar: MemoryRegistrar;
+
+    /// Returns this device's registration capability.
+    fn registrar(&self) -> &Self::Registrar;
+
     /// Returns the device index.
     fn index(&self) -> DeviceIndex;
 
     /// Sets the device index.
     fn set_index(&mut self, idx: DeviceIndex);
-
-    /// Registers the given aligned memory region with this device.
-    fn register(&self, mem: &Arc<AlignedMemory>) -> Result<Box<dyn Registration>>;
 }
 
 impl AsDeviceIndex for DeviceIndex {

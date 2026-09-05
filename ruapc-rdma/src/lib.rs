@@ -9,8 +9,9 @@
 //!   completion channel) are wrapped in types that automatically clean up on drop.
 //! - **QueuePair**: High-level [`send`](QueuePair::send) / [`recv`](QueuePair::recv)
 //!   take ownership of a [`ruapc_bufpool::Buffer`]. Poll [`CompletionQueue`] and
-//!   recover buffers with [`take_buffer`](QueuePair::take_buffer) after completion; [`read_sges`](QueuePair::read_sges)
-//!   posts vectored RDMA READs from caller-managed memory.
+//!   pass CQ-issued [`Completion`] proofs to [`QueuePair::complete`] to recover
+//!   finished buffers. [`QueuePair::prepare_reads`] owns READ destinations
+//!   until all posted requests complete.
 //! - **Type-safe bindings**: Generated FFI types have custom Rust wrappers
 //!   (`FwVer`, `Guid`, `WRID`, `LinkLayer`) substituted at build time.
 //!   Every verbs entry point is routed through a C shim compiled against the
@@ -49,6 +50,8 @@ pub use ffi::{
 mod error;
 pub use error::{Error, ErrorKind, Result};
 
+mod buffer_registration;
+
 mod fd_poll;
 pub use fd_poll::poll_readable2;
 
@@ -57,8 +60,10 @@ pub use types::{DeviceInfo, FwVer, Gid, GidType, Guid, LinkLayer, Port, WRID, WR
 
 mod verbs;
 pub use verbs::{
-    ActiveDevice, CompChannel, CompletionQueue, Context, Device, DeviceList, MAX_GATHER_SGE,
-    MemoryRegion, ProtectionDomain, QpConnectionConfig, QueuePair, ReadSge, WrBuffers,
+    ActiveDevice, CompChannel, CompletedWork, Completion, CompletionBatch, CompletionCursor,
+    CompletionQueue, Completions, Context, Device, DeviceList, MAX_GATHER_SGE, MemoryRegion,
+    ProtectionDomain, QpConnectionConfig, QueuePair, ReadFailure, ReadPosting, ReadReceiver,
+    ReadRequest, ReadSegment, ReadSge, WrBuffers,
 };
 
 #[cfg(test)]

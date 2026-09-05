@@ -118,7 +118,7 @@ impl AcceptLease {
 impl RdmaSocketPool {
     pub(crate) fn rdma_peer_advertisement(&self) -> Result<RdmaPeerAdvertisement> {
         Ok(RdmaPeerAdvertisement::from_devices(
-            self.devices.rdma_devices(),
+            self.devices.devices(),
             &self.config,
             &self.conn_counts,
         ))

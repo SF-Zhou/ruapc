@@ -14,7 +14,7 @@ impl RdmaSocketPool {
     pub(crate) async fn path_report(&self) -> RdmaPathReport {
         let devices = self
             .devices
-            .rdma_devices()
+            .devices()
             .iter()
             .enumerate()
             .map(|(index, device)| RdmaDeviceLoad {

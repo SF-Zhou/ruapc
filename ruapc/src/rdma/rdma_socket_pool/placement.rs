@@ -393,7 +393,7 @@ impl RdmaSocketPool {
         &self,
         remote_info: &RdmaPeerAdvertisement,
     ) -> Result<Vec<PathCandidate>> {
-        let local_devices = self.devices.rdma_devices();
+        let local_devices = self.devices.devices();
         if local_devices.is_empty() {
             return Err(Error::new(
                 ErrorKind::InvalidArgument,
@@ -648,7 +648,7 @@ pub(super) struct PathPreference<'a> {
 /// One compatible (local NIC, remote NIC) pair a new connection could use.
 #[derive(Clone, Debug)]
 pub(super) struct PathCandidate {
-    /// Index of the local device in `devices.rdma_devices()`.
+    /// Index of the local device in `devices.devices()`.
     pub(super) local_device_index: usize,
     /// Remote device/port/GID to request in `prepare_connection`.
     pub(super) remote: DeviceSelection,
@@ -897,7 +897,7 @@ mod path_selection_tests {
         let mut config = RdmaSocketPoolConfig::default();
         config.connection.traffic_class = 96;
         let pool = RdmaSocketPool::new(devices, buffer_pool, config).unwrap();
-        let rdma_devices = pool.devices.rdma_devices();
+        let rdma_devices = pool.devices.devices();
         let device = &rdma_devices[0];
 
         // Client path: local config wins over the remote advertisement.

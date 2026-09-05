@@ -2,15 +2,13 @@
 
 mod read;
 
-use read::ReadBatch;
-
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
 
-use ruapc_rdma::{QueuePair, WRID, ibv_send_flags};
+use ruapc_rdma::{QueuePair, ibv_send_flags};
 use serde::Serialize;
 use tokio::sync::mpsc::Sender;
 
@@ -34,14 +32,8 @@ pub(crate) struct RdmaSocketConfig {
 
 #[derive(Debug)]
 pub struct RdmaSocket {
-    /// Declared before `rdma_completions` deliberately: fields drop in
-    /// declaration order, and the QP must be destroyed first
-    /// (`ibv_destroy_qp` returning guarantees no further DMA) before any
-    /// [`read::ReadHold`] parked in `rdma_completions` releases its memory back
-    /// to the pool.
+    /// The QP owns posted memory through completion and successful destruction.
     pub(crate) queue_pair: QueuePair,
-    /// In-flight RDMA READ work requests, each mapping to its batch.
-    pub(crate) rdma_completions: dashmap::DashMap<WRID, Arc<ReadBatch>>,
     pub(crate) rdmabuf_pool: Arc<BufferPool>,
     pub(crate) state: RdmaState,
     /// Window-blocked framed sends, flushed by the poll thread once
@@ -93,7 +85,6 @@ impl RdmaSocket {
     ) -> Self {
         Self {
             queue_pair,
-            rdma_completions: dashmap::DashMap::default(),
             rdmabuf_pool,
             state: RdmaState::new(config.send_window.max(1)),
             pending_sender,

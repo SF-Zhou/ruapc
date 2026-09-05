@@ -17,11 +17,13 @@ bin = ["dep:clap"]
 [dependencies]
 clap = { workspace = true, optional = true }
 enumflags2 = { version = "0.7", features = ["serde"] }
+dashmap.workspace = true
 libc.workspace = true
 ruapc-bufpool = { version = "0.2.0-alpha.5", path = "../ruapc-bufpool" }
 schemars.workspace = true
 serde.workspace = true
 strum = { version = "0.28", features = ["derive"] }
+tokio = { workspace = true, features = ["sync"] }
 
 [[bin]]
 name = "ibv_devinfo"

@@ -1,9 +1,5 @@
-//! RDMA READ planning and batch ownership. Memory remains held until every
-//! posted work request has completed, including error and flush completions.
-
-mod batch;
-
-pub(super) use batch::{ReadBatch, ReadHold};
+//! READ planning in logical buffer coordinates. The verbs crate owns posted
+//! destinations and validates their local ranges before exposing them to DMA.
 
 use std::{
     sync::Arc,
@@ -11,7 +7,7 @@ use std::{
 };
 
 use ruapc_bufpool::RemoteBufferInfo;
-use ruapc_rdma::ReadSge;
+use ruapc_rdma::{ReadFailure, ReadPosting, ReadRequest, ReadSegment};
 
 use super::RdmaSocket;
 use crate::{
@@ -23,197 +19,137 @@ use crate::{
     services::{MemoryService, ReadIntoTargetRequest, RequestStatusRequest},
 };
 
-/// One planned RDMA READ work request: a contiguous remote range
-/// scattered into up to `max_send_sge` local segments.
-#[derive(Debug)]
-struct PlannedRead {
-    remote_addr: u64,
-    rkey: u32,
-    sges: Vec<ReadSge>,
-}
-
-impl PlannedRead {
-    fn len(&self) -> u64 {
-        self.sges.iter().map(|sge| u64::from(sge.len)).sum()
-    }
-}
-
-/// Translates the chunk plan of a validated op batch into concrete work
-/// requests, resolving remote regions to `(addr, rkey)` and local
-/// segments (given as per-segment `(base address, lkey)`) to scatter
-/// entries.
 fn build_planned_reads(
     regions: &[RemoteBufferInfo],
     src_layout: &SpaceLayout,
     dst_layout: &SpaceLayout,
-    dst_bases: &[(u64, u32)],
     ops: &[CopyOp],
     max_sge: usize,
-) -> Result<Vec<PlannedRead>> {
+) -> Result<Vec<ReadRequest>> {
     scatter::plan_chunks(src_layout, dst_layout, ops, max_sge.max(1))
         .into_iter()
         .map(|chunk| {
             let region = &regions[chunk.seg];
-            let sges = chunk
+            let segments = chunk
                 .dst
-                .iter()
+                .into_iter()
                 .map(|slice| {
-                    let (base, lkey) = dst_bases[slice.seg];
-                    Ok(ReadSge {
-                        addr: base + slice.off,
-                        len: u32::try_from(slice.len).map_err(|_| {
-                            Error::new(
-                                ErrorKind::InvalidCopyOp,
-                                "scatter slice exceeds u32::MAX bytes".into(),
-                            )
-                        })?,
-                        lkey,
+                    Ok(ReadSegment {
+                        buffer: slice.seg,
+                        offset: usize::try_from(slice.off)
+                            .map_err(|_| Error::kind(ErrorKind::InvalidCopyOp))?,
+                        len: usize::try_from(slice.len)
+                            .map_err(|_| Error::kind(ErrorKind::InvalidCopyOp))?,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok(PlannedRead {
-                remote_addr: region.addr + chunk.off,
+            Ok(ReadRequest {
+                remote_addr: region
+                    .addr
+                    .checked_add(chunk.off)
+                    .ok_or_else(|| Error::kind(ErrorKind::InvalidCopyOp))?,
                 rkey: region.key.rkey,
-                sges,
+                segments,
             })
         })
         .collect()
 }
 
+fn plan_error(error: ruapc_rdma::Error) -> Error {
+    if error.kind == ruapc_rdma::ErrorKind::InvalidReadPlan {
+        Error::new(ErrorKind::InvalidCopyOp, error.to_string())
+    } else {
+        error.into()
+    }
+}
+
+fn completion_error(reason: ReadFailure) -> Error {
+    match reason {
+        ReadFailure::Timeout => Error::new(
+            ErrorKind::RdmaReadTimeout,
+            "RDMA READ exceeded rdma.remote_memory.read_timeout_ms".into(),
+        ),
+        ReadFailure::ConnectionClosed => Error::new(
+            ErrorKind::ConnectionClosed,
+            "RDMA poller shut down with reads in flight".into(),
+        ),
+        ReadFailure::Completion | ReadFailure::Cancelled => Error::new(
+            ErrorKind::RdmaSendFailed,
+            "RDMA READ batch failed or was abandoned".into(),
+        ),
+    }
+}
+
 impl RdmaSocket {
-    /// Resolves every outstanding read batch of a socket with
-    /// `ConnectionClosed` (without releasing their memory holds).
     pub(crate) fn fail_read_batches(&self) {
-        for entry in self.rdma_completions.iter() {
-            entry.value().fail(Error::new(
-                ErrorKind::ConnectionClosed,
-                "rdma poll thread shut down with reads in flight".into(),
-            ));
-        }
+        self.queue_pair.fail_pending_reads();
     }
 
-    /// Posts the planned reads and waits for the batch to complete.
-    ///
-    /// On success the hold is handed back. On failure the second element
-    /// carries the hold only when *nothing* reached the hardware; once a
-    /// work request is in flight the memory stays parked in the batch
-    /// until its (possibly flush) completion arrives.
+    /// Preparation takes real buffer ownership; local addresses and keys never
+    /// cross this layer's interface. Failed/cancelled batches stay in the QP
+    /// until all posted requests complete or it is successfully destroyed.
     async fn execute_reads(
         &self,
-        reads: &[PlannedRead],
-        hold: ReadHold,
+        reads: Vec<ReadRequest>,
+        local: Vec<Buffer>,
         request_remaining: Option<Duration>,
-    ) -> std::result::Result<ReadHold, (Error, Option<ReadHold>)> {
-        debug_assert!(!reads.is_empty());
-        let bytes = reads.iter().map(PlannedRead::len).sum();
+    ) -> std::result::Result<Vec<Buffer>, (Error, Option<Vec<Buffer>>)> {
+        let bytes = reads
+            .iter()
+            .flat_map(|read| &read.segments)
+            .map(|segment| segment.len as u64)
+            .sum();
         if let Err(error) = self
             .bandwidth_limiter
             .reserve_recv(bytes, request_remaining)
             .await
         {
-            return Err((error, Some(hold)));
+            return Err((error, Some(local)));
         }
-        let (tx, rx) = tokio::sync::oneshot::channel();
         let deadline = self.read_timeout.map(|timeout| Instant::now() + timeout);
-        let batch = ReadBatch::new(reads.len(), hold, tx, deadline);
-
-        for (posted, read) in reads.iter().enumerate() {
-            if let Err(err) = self.post_read(read, &batch).await {
+        let (mut posting, receiver) = self
+            .queue_pair
+            .prepare_reads(local, reads, deadline)
+            .map_err(|(error, buffers)| (plan_error(error), Some(buffers)))?;
+        for posted in 0..posting.remaining() {
+            if let Err(error) = self.post_read(&mut posting).await {
                 if posted == 0 {
-                    // Nothing reached the hardware: recover the hold now.
-                    return Err((err, batch.cancel()));
+                    return Err((error, posting.cancel()));
                 }
-                // Some reads are in flight. Account the unposted suffix before
-                // failing the connection, then let flush completions settle it.
-                batch.abort_unposted(reads.len() - posted);
+                // Drop accounts the unposted suffix before flushing the QP.
+                drop(posting);
                 self.set_error();
-                let _ = rx.await;
-                return Err((err, None));
+                let _ = receiver.await;
+                return Err((error, None));
             }
         }
-
-        match rx.await {
-            Ok(Ok(hold)) => Ok(hold),
-            Ok(Err(e)) => Err((e, None)),
-            Err(_) => Err((
-                Error::new(
-                    ErrorKind::RdmaSendFailed,
-                    "RDMA read batch abandoned (connection torn down)".into(),
-                ),
-                None,
-            )),
+        let result = receiver.await;
+        // Retain the posting owner's Arc until notification so the runtime
+        // task, rather than the CQ poller, normally destroys the batch.
+        drop(posting);
+        match result {
+            Ok(Ok(buffers)) => Ok(buffers),
+            Ok(Err(reason)) => Err((completion_error(reason), None)),
+            Err(_) => Err((completion_error(ReadFailure::Cancelled), None)),
         }
     }
 
-    /// Acquire device/SQ capacity and publish the memory hold as one post
-    /// transaction. Failed posts return permits through RAII; successful posts
-    /// transfer permit ownership to the completion poller.
-    #[allow(unsafe_code)] // Verbs memory ownership contract; see each SAFETY comment.
-    async fn post_read(&self, read: &PlannedRead, batch: &Arc<ReadBatch>) -> Result<()> {
+    async fn post_read(&self, posting: &mut ReadPosting) -> Result<()> {
         let permits_closed =
             |_| Error::new(ErrorKind::RdmaSendFailed, "RDMA read permits closed".into());
-        // Take the per-connection guard first: a congested SQ must not hoard
-        // the shared device's permits while waiting for its own capacity.
+        // A congested connection must not reserve the whole device's capacity.
         let sq_permit = self
             .sq_read_permits
             .acquire()
             .await
             .map_err(permits_closed)?;
         let device_permit = self.read_permits.acquire().await.map_err(permits_closed)?;
-        // SAFETY: the validated plan resolves registered destination memory.
-        // Register the batch hold before posting; completion or QP destruction
-        // releases it only after the NIC can no longer access that memory.
-        unsafe {
-            self.queue_pair.read_sges(
-                &read.sges,
-                read.remote_addr,
-                read.rkey,
-                |wr_id| {
-                    self.rdma_completions.insert(wr_id, batch.clone());
-                },
-                |wr_id| {
-                    self.rdma_completions.remove(&wr_id);
-                },
-            )
-        }?;
+        self.queue_pair.post_read(posting).map_err(plan_error)?;
         sq_permit.forget();
         device_permit.forget();
         Ok(())
     }
 
-    /// Planning only borrows destination buffers, so all validation failures
-    /// reach the caller before their ownership moves into a DMA hold.
-    fn plan_remote_read(
-        &self,
-        ops: &[CopyOp],
-        local: &[Buffer],
-        remote: &RemoteSpace<'_>,
-    ) -> Result<Vec<PlannedRead>> {
-        let device = &self.queue_pair.device_index;
-        let bases = local
-            .iter()
-            .map(|buf| {
-                let key = buf
-                    .memory_key(device)
-                    .map_err(|e| Error::new(ErrorKind::InvalidArgument, e.to_string()))?;
-                Ok((buf.as_ptr() as u64, key.lkey))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let layout = SpaceLayout::from_lens(local.iter().map(|b| b.len() as u64))?;
-        build_planned_reads(
-            remote.regions(),
-            remote.layout(),
-            &layout,
-            &bases,
-            ops,
-            self.queue_pair.gather_limit(),
-        )
-    }
-
-    /// Executes the client side of `_ruapc.memory/read_into_target`: RDMA READs from
-    /// the peer's regions into the pinned write target. The target `Arc`
-    /// keeps the destination memory alive for as long as any read is in
-    /// flight, so no post-transfer liveness verification is needed.
     pub(crate) async fn read_into_target(
         &self,
         regions: &[RemoteBufferInfo],
@@ -222,25 +158,31 @@ impl RdmaSocket {
         target: Arc<WriteTarget>,
         request_remaining: Option<Duration>,
     ) -> Result<()> {
-        let device = &self.queue_pair.device_index;
-        let bases = target.export_sge_bases(device)?;
         let planned = build_planned_reads(
             regions,
             src_layout,
             target.layout(),
-            &bases,
             ops,
             self.queue_pair.gather_limit(),
         )?;
         if planned.is_empty() {
             return Ok(());
         }
+        let buffers = target.take_for_read()?;
         match self
-            .execute_reads(&planned, ReadHold::Target(target), request_remaining)
+            .execute_reads(planned, buffers, request_remaining)
             .await
         {
-            Ok(_) => Ok(()),
-            Err((e, _)) => Err(e),
+            Ok(buffers) => {
+                target.restore_after_read(buffers);
+                Ok(())
+            }
+            Err((error, buffers)) => {
+                if let Some(buffers) = buffers {
+                    target.restore_after_read(buffers);
+                }
+                Err(error)
+            }
         }
     }
 
@@ -251,43 +193,39 @@ impl RdmaSocket {
         local: Vec<Buffer>,
         remote: &RemoteSpace<'_>,
     ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
-        let planned = match self.plan_remote_read(ops, &local, remote) {
+        let layout = SpaceLayout::from_lens(local.iter().map(|buffer| buffer.len() as u64));
+        let planned = layout.and_then(|layout| {
+            build_planned_reads(
+                remote.regions(),
+                remote.layout(),
+                &layout,
+                ops,
+                self.queue_pair.gather_limit(),
+            )
+        });
+        let planned = match planned {
             Ok(planned) => planned,
-            Err(e) => return Err(RemoteIoError::new(e, Some(local))),
+            Err(error) => return Err(RemoteIoError::new(error, Some(local))),
         };
         if planned.is_empty() {
             return Ok(local);
         }
-
-        let local = match self
-            .execute_reads(&planned, ReadHold::Buffers(local), ctx.remaining_time())
+        let local = self
+            .execute_reads(planned, local, ctx.remaining_time())
             .await
-        {
-            Ok(ReadHold::Buffers(local)) => local,
-            Ok(ReadHold::Target(_)) => unreachable!("remote_read holds buffers"),
-            Err((e, hold)) => {
-                let buffers = match hold {
-                    Some(ReadHold::Buffers(buffers)) => Some(buffers),
-                    _ => None,
-                };
-                return Err(RemoteIoError::new(e, buffers));
-            }
-        };
+            .map_err(|(error, buffers)| RemoteIoError::new(error, buffers))?;
 
-        // After the RDMA READs complete, verify the client's original
-        // request is still alive. RDMA READ is one-sided — the client
-        // cannot know its memory was read — and once its request times
-        // out, the read buffers may have been reclaimed and refilled, so
-        // the data would be garbage.
+        // A one-sided READ cannot acknowledge source lifetime to the peer.
+        // Reject data from a request that expired before the read completed.
         let request = RequestStatusRequest {
             request_id: ctx.msg_meta.msgid,
         };
         let client = crate::Client::default();
-        let still_waiting: bool = match client.request_is_pending(ctx, &request).await {
-            Ok(w) => w,
-            Err(e) => return Err(RemoteIoError::new(e, Some(local))),
+        let pending = match client.request_is_pending(ctx, &request).await {
+            Ok(pending) => pending,
+            Err(error) => return Err(RemoteIoError::new(error, Some(local))),
         };
-        if !still_waiting {
+        if !pending {
             return Err(RemoteIoError::new(
                 Error::new(
                     ErrorKind::Timeout,
@@ -296,7 +234,6 @@ impl RdmaSocket {
                 Some(local),
             ));
         }
-
         Ok(local)
     }
 
@@ -306,7 +243,7 @@ impl RdmaSocket {
         ops: &[CopyOp],
         local: Vec<Buffer>,
     ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
-        // No one-sided RDMA WRITE (unsafe against client buffer lifetime):
+        // The reverse RPC lets the client own the destination through completion:
         // send a reverse `read_into_target` RPC advertising our source buffers as read
         // regions; the client executes RDMA READs into its pinned write
         // target. The request owns the source buffers through ReadSource;

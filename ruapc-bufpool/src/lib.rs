@@ -51,10 +51,10 @@ mod key;
 pub use key::{MemoryKey, RemoteBufferInfo};
 
 mod device;
-pub use device::{AsDeviceIndex, Device, DeviceIndex, Registration};
+pub use device::{AsDeviceIndex, Device, DeviceIndex, MemoryRegistrar, Registration};
 
 mod tcp_device;
 pub use tcp_device::{TcpDevice, TcpMemoryRegistration};
 
 mod devices;
-pub use devices::{Devices, EmptyDevices};
+pub use devices::{DeviceSet, Devices, EmptyDevices};

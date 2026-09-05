@@ -52,7 +52,7 @@ use std::{
 };
 
 use foldhash::fast::RandomState;
-use ruapc_rdma::{CompChannel, CompletionQueue, ibv_wc, poll_readable2};
+use ruapc_rdma::{CompChannel, Completion, CompletionBatch, CompletionQueue, poll_readable2};
 
 use conn::ConnState;
 use dispatch::{DispatchBatch, Dispatcher, MAX_DISPATCH_BATCH};
@@ -179,8 +179,12 @@ struct Incoming {
 fn release_slot(shared: &PollerShared, slot: u16) {
     let mut inner = shared.inner.lock().unwrap();
     let generation = &mut inner.generations[slot as usize];
-    *generation = generation.wrapping_add(1);
-    inner.free_slots.push(slot);
+    // Tags remain reserved in the CQ for its lifetime. Retire an exhausted
+    // slot instead of making a retained completion valid for a later QP.
+    if let Some(next) = generation.checked_add(1) {
+        *generation = next;
+        inner.free_slots.push(slot);
+    }
 }
 
 /// A reserved poller slot (plus CQ budget) for a connection about to be
@@ -508,7 +512,10 @@ impl PollLoop {
     }
 
     fn run_until_shutdown(&mut self) -> ruapc_rdma::Result<()> {
-        let mut wcs = [ibv_wc::default(); 64];
+        // The local owner lets completion proofs borrow the CQ while routing
+        // mutably updates this loop. Clone once per thread, never per CQE.
+        let cq = self.cq.clone();
+        let mut wcs = CompletionBatch::<64>::new();
         let mut batch: DispatchBatch = Vec::new();
         let mut spin_until = Instant::now();
         let mut next_housekeeping = Instant::now();
@@ -516,7 +523,7 @@ impl PollLoop {
         let mut last_dump = Instant::now();
 
         loop {
-            let progressed = self.drain_completions(&mut wcs, &mut batch)?;
+            let progressed = self.drain_completions(&cq, &mut wcs, &mut batch)?;
 
             // This O(connections) pass runs after progress or at the periodic
             // cadence, never on every empty iteration of the spin window.
@@ -552,7 +559,7 @@ impl PollLoop {
             // Arm notifications, then poll again before sleeping. A completion
             // racing the arm must be observed here or signal the channel.
             self.cq.req_notify(false)?;
-            if self.poll_completions(&mut wcs, &mut batch)? > 0 {
+            if self.poll_completions(&cq, &mut wcs, &mut batch)? > 0 {
                 self.dispatcher.flush(&mut batch);
                 spin_until = Instant::now() + self.spin;
                 continue;
@@ -567,14 +574,15 @@ impl PollLoop {
     /// normal drain and the arm/poll race check use the same CQE routing path.
     fn drain_completions(
         &mut self,
-        wcs: &mut [ibv_wc],
+        cq: &CompletionQueue,
+        wcs: &mut CompletionBatch<64>,
         batch: &mut DispatchBatch,
     ) -> ruapc_rdma::Result<bool> {
         let mut progressed = false;
         loop {
-            let count = self.poll_completions(wcs, batch)?;
+            let count = self.poll_completions(cq, wcs, batch)?;
             progressed |= count > 0;
-            if count < wcs.len() {
+            if count < wcs.capacity() {
                 break;
             }
         }
@@ -584,11 +592,13 @@ impl PollLoop {
 
     fn poll_completions(
         &mut self,
-        wcs: &mut [ibv_wc],
+        cq: &CompletionQueue,
+        wcs: &mut CompletionBatch<64>,
         batch: &mut DispatchBatch,
     ) -> ruapc_rdma::Result<usize> {
-        let count = self.cq.poll(wcs)?;
-        for wc in &wcs[..count] {
+        let completions = cq.poll_batch(wcs)?;
+        let count = completions.len();
+        for wc in completions {
             self.dispatch(wc, batch);
         }
         if batch.len() >= MAX_DISPATCH_BATCH {
@@ -682,8 +692,8 @@ impl PollLoop {
         }
     }
 
-    fn dispatch(&mut self, wc: &ibv_wc, batch: &mut DispatchBatch) {
-        let (slot, generation) = split_tag(wc.wr_id.get_tag());
+    fn dispatch(&mut self, wc: Completion<'_>, batch: &mut DispatchBatch) {
+        let (slot, generation) = split_tag(wc.info().wr_id.get_tag());
         if let Some(Some(conn)) = self.conns.get_mut(slot)
             && conn.generation == generation
         {
@@ -864,5 +874,27 @@ mod tests {
             assert!(tag <= WRID::TAG_MAX);
             assert_eq!(split_tag(tag), (slot as usize, generation));
         }
+    }
+
+    #[test]
+    fn exhausted_slot_generation_is_retired() {
+        let shared = PollerShared {
+            inner: Mutex::new(SharedInner {
+                generations: vec![254],
+                ..Default::default()
+            }),
+            has_incoming: AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
+        };
+        release_slot(&shared, 0);
+        {
+            let mut inner = shared.inner.lock().unwrap();
+            assert_eq!(inner.generations[0], 255);
+            assert_eq!(inner.free_slots.pop(), Some(0));
+        }
+        release_slot(&shared, 0);
+        let inner = shared.inner.lock().unwrap();
+        assert_eq!(inner.generations[0], 255);
+        assert!(inner.free_slots.is_empty());
     }
 }

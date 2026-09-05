@@ -1,4 +1,4 @@
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 // `SocketTrait` / `SocketPoolTrait` / the call-glue traits use `async fn`
 // without `+ Send` in the trait declaration. That is deliberate: per the
 // project's enum-dispatch design these traits are only consumed through the
