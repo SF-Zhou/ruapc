@@ -41,6 +41,8 @@ pub enum ErrorKind {
     IBRegMemoryRegionFail,
     /// Failed to create queue pair.
     IBCreateQueuePairFail,
+    /// Invalid parameters supplied when connecting a queue pair.
+    InvalidQueuePairConfig,
     /// Failed to modify queue pair state.
     IBModifyQueuePairFail,
     /// Failed to post receive work request.

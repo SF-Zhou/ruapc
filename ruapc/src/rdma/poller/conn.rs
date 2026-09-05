@@ -182,7 +182,22 @@ impl ConnState {
         } else {
             self.handle_send_completion(wc, buffer)
         };
-        if result.is_err() {
+        if let Err(err) = result {
+            // QP setup only programs the NIC; an unreachable path often first
+            // fails on the activation SEND. Preserve that completion error,
+            // while suppressing the ensuing flush-completion noise.
+            if self.socket.state.is_ok() {
+                tracing::warn!(
+                    conn_id = self.socket.conn_id,
+                    local_qp = self.socket.queue_pair.qp_num(),
+                    path = ?self.socket.path,
+                    wr_id = ?wc.wr_id,
+                    status = ?wc.status,
+                    vendor_err = wc.vendor_err,
+                    %err,
+                    "RDMA work completion failed; closing connection"
+                );
+            }
             self.socket.set_error();
         }
     }
@@ -196,7 +211,6 @@ impl ConnState {
         self.recv.completed += 1;
 
         if !wc.succ() {
-            self.socket.set_error();
             return Err(Error::new(
                 ErrorKind::RdmaRecvFailed,
                 format!(
@@ -338,7 +352,6 @@ impl ConnState {
         if wc.succ() {
             Ok(())
         } else {
-            tracing::error!("send completion error: {wc:?}");
             Err(Error::new(
                 ErrorKind::RdmaSendFailed,
                 format!("send completion error: {wc:?}"),

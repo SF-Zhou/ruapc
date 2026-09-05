@@ -34,6 +34,78 @@ pub struct RdmaQpEndpoint {
     pub rd_atomic_cap: u8,
 }
 
+impl RdmaQpEndpoint {
+    /// Checks the wire endpoint before its values reach the verbs interface.
+    pub(crate) fn validate(&self) -> Result<()> {
+        const MAX_QPN_PSN: u32 = 0xFF_FFFF;
+        if self.qp_num == 0 || self.qp_num > MAX_QPN_PSN {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                format!(
+                    "RDMA endpoint qp_num {} must be in 1..={MAX_QPN_PSN}",
+                    self.qp_num
+                ),
+            ));
+        }
+        if self.psn > MAX_QPN_PSN {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                format!(
+                    "RDMA endpoint psn {} exceeds the 24-bit limit {MAX_QPN_PSN}",
+                    self.psn
+                ),
+            ));
+        }
+        if self.port_num == 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "RDMA endpoint port_num 0 is invalid; ports are numbered from 1".into(),
+            ));
+        }
+        if !(1..=16).contains(&self.rd_atomic_cap) {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                format!(
+                    "RDMA endpoint rd_atomic_cap {} must be in 1..=16",
+                    self.rd_atomic_cap
+                ),
+            ));
+        }
+        // `ibv_mtu` is a Rust enum: deserialization already restricts the
+        // active MTU to the five verbs-supported sizes (256 through 4096).
+        match self.link_layer {
+            LinkLayer::Unspecified => {
+                return Err(Error::new(
+                    ErrorKind::InvalidArgument,
+                    "RDMA endpoint link_layer is Unspecified; expected InfiniBand or Ethernet"
+                        .into(),
+                ));
+            }
+            // Native IB uses LID routing in our QP setup, so a GID is optional.
+            LinkLayer::InfiniBand if !(1..=0xBFFF).contains(&self.lid) => {
+                return Err(Error::new(
+                    ErrorKind::InvalidArgument,
+                    format!(
+                        "RDMA InfiniBand endpoint lid {} must be a unicast LID in 1..=49151",
+                        self.lid
+                    ),
+                ));
+            }
+            LinkLayer::Ethernet => {
+                let gid = self.gid.as_ipv6();
+                if gid.is_unspecified() || gid.is_multicast() {
+                    return Err(Error::new(
+                        ErrorKind::InvalidArgument,
+                        format!("RDMA Ethernet endpoint gid {gid} must be a nonzero unicast GID"),
+                    ));
+                }
+            }
+            LinkLayer::InfiniBand => {}
+        }
+        Ok(())
+    }
+}
+
 /// Server-side RDMA device/port/GID selected by the client.
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
 pub struct DeviceSelection {
@@ -84,12 +156,13 @@ impl RdmaConnectionLimits {
         Ok(negotiated)
     }
 
-    fn validate(self) -> Result<()> {
+    pub(crate) fn validate(self) -> Result<()> {
         if self.recv_queue_len < RdmaConnectionTuningConfig::MIN_RECV_QUEUE_LEN {
             return Err(Error::new(
                 ErrorKind::InvalidArgument,
                 format!(
-                    "negotiated RDMA recv_queue_len must be at least {}",
+                    "RDMA recv_queue_len {} must be at least {}",
+                    self.recv_queue_len,
                     RdmaConnectionTuningConfig::MIN_RECV_QUEUE_LEN
                 ),
             ));
@@ -97,14 +170,18 @@ impl RdmaConnectionLimits {
         if self.recv_queue_len > self.max_send_wr || self.recv_queue_len > self.max_recv_wr {
             return Err(Error::new(
                 ErrorKind::InvalidArgument,
-                "negotiated RDMA recv_queue_len exceeds a queue-pair work-request limit".into(),
+                format!(
+                    "RDMA recv_queue_len {} exceeds max_send_wr {} or max_recv_wr {}",
+                    self.recv_queue_len, self.max_send_wr, self.max_recv_wr
+                ),
             ));
         }
         if self.max_msg_size < RdmaConnectionTuningConfig::MIN_MAX_MSG_SIZE {
             return Err(Error::new(
                 ErrorKind::InvalidArgument,
                 format!(
-                    "negotiated RDMA max_msg_size must be at least {}",
+                    "RDMA max_msg_size {} must be at least {}",
+                    self.max_msg_size,
                     RdmaConnectionTuningConfig::MIN_MAX_MSG_SIZE
                 ),
             ));
@@ -166,11 +243,331 @@ pub struct ConnectionLease {
 pub struct PrepareConnectionResponse {
     pub endpoint: RdmaQpEndpoint,
     pub lease: ConnectionLease,
+    /// Actual limits configured by the acceptor, from its own perspective.
+    pub limits: RdmaConnectionLimits,
+}
+
+impl PrepareConnectionResponse {
+    /// Confirms that the acceptor prepared the exact path and limits requested.
+    /// A stale discovery result must fail bootstrap instead of producing peers
+    /// with different receive rings, send windows, or message-size limits.
+    pub(crate) fn validate_for(&self, request: &PrepareConnectionRequest) -> Result<()> {
+        if self.lease.attempt_id == 0
+            || self.lease.attempt_id != request.attempt_id
+            || self.lease.accepted_connection_id == 0
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                format!(
+                    "RDMA prepare response lease {:?} does not identify request attempt_id {} with a nonzero accepted_connection_id",
+                    self.lease, request.attempt_id
+                ),
+            ));
+        }
+        self.endpoint.validate()?;
+        if self.endpoint.port_num != request.target.port_num
+            || self.endpoint.gid_index != request.target.gid_index
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                format!(
+                    "RDMA prepare response port {} GID index {} differs from requested target {}:{} GID index {}",
+                    self.endpoint.port_num,
+                    self.endpoint.gid_index,
+                    request.target.device_name,
+                    request.target.port_num,
+                    request.target.gid_index
+                ),
+            ));
+        }
+        if self.endpoint.link_layer != request.endpoint.link_layer {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                format!(
+                    "RDMA prepare response link layer {} differs from initiator {}",
+                    self.endpoint.link_layer, request.endpoint.link_layer
+                ),
+            ));
+        }
+        self.limits.validate()?;
+        let expected = RdmaConnectionLimits {
+            max_send_wr: request.limits.max_recv_wr,
+            max_recv_wr: request.limits.max_send_wr,
+            recv_queue_len: request.limits.recv_queue_len,
+            max_msg_size: request.limits.max_msg_size,
+        };
+        if self.limits != expected {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                format!(
+                    "RDMA prepare response limits {:?} differ from expected acceptor limits {expected:?}; peer capabilities may have changed since discovery",
+                    self.limits
+                ),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn valid_endpoint() -> RdmaQpEndpoint {
+        RdmaQpEndpoint {
+            qp_num: 42,
+            port_num: 1,
+            gid_index: 0,
+            lid: 1,
+            gid: ibv_gid::default(),
+            link_layer: LinkLayer::InfiniBand,
+            active_mtu: ibv_mtu::IBV_MTU_1024,
+            psn: 0,
+            rd_atomic_cap: 16,
+        }
+    }
+
+    fn prepared_connection() -> (PrepareConnectionRequest, PrepareConnectionResponse) {
+        let request = PrepareConnectionRequest {
+            attempt_id: 11,
+            endpoint: valid_endpoint(),
+            source_device: "initiator_0".into(),
+            same_connectivity_domain: true,
+            target: DeviceSelection {
+                device_name: "acceptor_0".into(),
+                port_num: 2,
+                gid_index: 3,
+            },
+            limits: RdmaConnectionLimits {
+                max_send_wr: 80,
+                max_recv_wr: 4,
+                recv_queue_len: 4,
+                max_msg_size: 64 * 1024,
+            },
+            traffic_class: 0,
+        };
+        let response = PrepareConnectionResponse {
+            endpoint: RdmaQpEndpoint {
+                qp_num: 43,
+                port_num: request.target.port_num,
+                gid_index: request.target.gid_index,
+                ..valid_endpoint()
+            },
+            lease: ConnectionLease {
+                attempt_id: request.attempt_id,
+                accepted_connection_id: 12,
+            },
+            limits: RdmaConnectionLimits {
+                max_send_wr: 4,
+                max_recv_wr: 80,
+                ..request.limits
+            },
+        };
+        (request, response)
+    }
+
+    #[test]
+    fn endpoint_accepts_native_ib_without_gid_and_unicast_roce_addresses() {
+        let endpoint = valid_endpoint();
+        endpoint.validate().unwrap();
+        for address in ["fe80::1", "::ffff:192.0.2.1", "2001:db8:1::"] {
+            RdmaQpEndpoint {
+                link_layer: LinkLayer::Ethernet,
+                lid: 0,
+                gid: serde_json::from_value(serde_json::json!(address)).unwrap(),
+                ..endpoint
+            }
+            .validate()
+            .unwrap();
+        }
+        RdmaQpEndpoint {
+            qp_num: 0xFF_FFFF,
+            psn: 0xFF_FFFF,
+            rd_atomic_cap: 1,
+            lid: 0xBFFF,
+            ..endpoint
+        }
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn endpoint_rejects_invalid_wire_values_before_qp_setup() {
+        let endpoint = valid_endpoint();
+        for (invalid, field) in [
+            (
+                RdmaQpEndpoint {
+                    qp_num: 0,
+                    ..endpoint
+                },
+                "qp_num",
+            ),
+            (
+                RdmaQpEndpoint {
+                    qp_num: 0x100_0000,
+                    ..endpoint
+                },
+                "qp_num",
+            ),
+            (
+                RdmaQpEndpoint {
+                    psn: 0x100_0000,
+                    ..endpoint
+                },
+                "psn",
+            ),
+            (
+                RdmaQpEndpoint {
+                    port_num: 0,
+                    ..endpoint
+                },
+                "port_num",
+            ),
+            (
+                RdmaQpEndpoint {
+                    rd_atomic_cap: 0,
+                    ..endpoint
+                },
+                "rd_atomic_cap",
+            ),
+            (
+                RdmaQpEndpoint {
+                    rd_atomic_cap: 17,
+                    ..endpoint
+                },
+                "rd_atomic_cap",
+            ),
+            (
+                RdmaQpEndpoint {
+                    link_layer: LinkLayer::Unspecified,
+                    ..endpoint
+                },
+                "link_layer",
+            ),
+            (RdmaQpEndpoint { lid: 0, ..endpoint }, "lid"),
+            (
+                RdmaQpEndpoint {
+                    lid: 0xC000,
+                    ..endpoint
+                },
+                "lid",
+            ),
+            (
+                RdmaQpEndpoint {
+                    link_layer: LinkLayer::Ethernet,
+                    ..endpoint
+                },
+                "gid",
+            ),
+            (
+                RdmaQpEndpoint {
+                    link_layer: LinkLayer::Ethernet,
+                    gid: serde_json::from_value(serde_json::json!("ff02::1")).unwrap(),
+                    ..endpoint
+                },
+                "gid",
+            ),
+        ] {
+            let err = invalid.validate().unwrap_err();
+            assert_eq!(err.kind, ErrorKind::InvalidArgument);
+            assert!(err.msg.contains(field), "{err}");
+        }
+    }
+
+    #[test]
+    fn endpoint_wire_format_rejects_unknown_mtu() {
+        let mut endpoint = serde_json::to_value(valid_endpoint()).unwrap();
+        endpoint["active_mtu"] = serde_json::json!("IBV_MTU_8192");
+        assert!(serde_json::from_value::<RdmaQpEndpoint>(endpoint).is_err());
+    }
+
+    #[test]
+    fn prepare_response_requires_correlated_nonzero_lease() {
+        let (request, response) = prepared_connection();
+        response.validate_for(&request).unwrap();
+        for lease in [
+            ConnectionLease {
+                attempt_id: 0,
+                ..response.lease
+            },
+            ConnectionLease {
+                attempt_id: request.attempt_id + 1,
+                ..response.lease
+            },
+            ConnectionLease {
+                accepted_connection_id: 0,
+                ..response.lease
+            },
+        ] {
+            let err = PrepareConnectionResponse { lease, ..response }
+                .validate_for(&request)
+                .unwrap_err();
+            assert!(err.msg.contains("lease"), "{err}");
+        }
+    }
+
+    #[test]
+    fn prepare_response_requires_valid_endpoint_on_selected_port_and_link() {
+        let (request, response) = prepared_connection();
+        for endpoint in [
+            RdmaQpEndpoint {
+                port_num: 1,
+                ..response.endpoint
+            },
+            RdmaQpEndpoint {
+                gid_index: 0,
+                ..response.endpoint
+            },
+            RdmaQpEndpoint {
+                psn: 0x100_0000,
+                ..response.endpoint
+            },
+            RdmaQpEndpoint {
+                link_layer: LinkLayer::Ethernet,
+                gid: serde_json::from_value(serde_json::json!("fe80::1")).unwrap(),
+                ..response.endpoint
+            },
+        ] {
+            assert!(
+                PrepareConnectionResponse {
+                    endpoint,
+                    ..response
+                }
+                .validate_for(&request)
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_response_rejects_changed_or_unmirrored_limits() {
+        let (request, response) = prepared_connection();
+        for limits in [
+            request.limits,
+            RdmaConnectionLimits {
+                max_send_wr: 5,
+                ..response.limits
+            },
+            RdmaConnectionLimits {
+                max_recv_wr: 79,
+                ..response.limits
+            },
+            RdmaConnectionLimits {
+                recv_queue_len: 3,
+                ..response.limits
+            },
+            RdmaConnectionLimits {
+                max_msg_size: 32 * 1024,
+                ..response.limits
+            },
+        ] {
+            let err = PrepareConnectionResponse { limits, ..response }
+                .validate_for(&request)
+                .unwrap_err();
+            assert!(err.msg.contains("limits"), "{err}");
+            assert!(err.msg.contains("discovery"), "{err}");
+        }
+    }
 
     #[test]
     fn asymmetric_limits_are_mirrored_between_peers() {
