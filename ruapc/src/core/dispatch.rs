@@ -18,9 +18,8 @@
 //! handlers are the supported way to stop wasted work.
 
 use std::sync::atomic::Ordering;
-use std::time::Instant;
 
-use crate::{Context, Error, ErrorKind, MethodMetrics, Payload, State};
+use crate::{Context, Error, ErrorKind, Payload, State};
 
 /// Spawns a request handler with dispatch policies applied.
 ///
@@ -40,7 +39,9 @@ where
 
     // Load shedding: reject before spawning any work.
     let cap = state.max_inflight_requests;
-    if cap > 0 && metrics.server_inflight.load(Ordering::Relaxed) >= cap as i64 {
+    let inflight = metrics.server_inflight.fetch_add(1, Ordering::Relaxed);
+    if cap > 0 && inflight >= cap as i64 {
+        metrics.server_inflight.fetch_sub(1, Ordering::Relaxed);
         metrics.request_rejected();
         tokio::spawn(async move {
             ctx.send_err_rsp(Error::new(
@@ -52,6 +53,10 @@ where
         return;
     }
 
+    // Own the reservation before any early return or handler construction.
+    let guard = InflightGuard { state };
+    let metrics = &guard.state.metrics;
+
     // Deadline enforcement: the client stopped waiting already.
     if ctx.is_expired() {
         metrics.request_expired();
@@ -62,21 +67,13 @@ where
         return;
     }
 
-    let method_metrics = metrics.server_method(method);
-    method_metrics.requests.increment(1);
-    method_metrics.inflight.increment(1.0);
-    metrics.server_inflight.fetch_add(1, Ordering::Relaxed);
-
-    let guard = InflightGuard {
-        state,
-        method_metrics,
-        start: Instant::now(),
-    };
+    let method_call = metrics.server_method(method).start();
     let fut = f(ctx, payload);
     tokio::spawn(async move {
         // The guard lives inside the task: normal completion and panic
         // both run its Drop.
         let _guard = guard;
+        let _method_call = method_call;
         fut.await;
     });
 }
@@ -85,16 +82,10 @@ where
 /// and panic alike.
 struct InflightGuard {
     state: std::sync::Arc<State>,
-    method_metrics: MethodMetrics,
-    start: Instant,
 }
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
-        self.method_metrics
-            .latency
-            .record(self.start.elapsed().as_secs_f64());
-        self.method_metrics.inflight.decrement(1.0);
         self.state
             .metrics
             .server_inflight
@@ -124,6 +115,51 @@ mod tests {
 
     fn tcp_config() -> SocketPoolConfig {
         SocketPoolConfig::default()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn simultaneous_arrivals_cannot_exceed_capacity() {
+        const CAP: usize = 4;
+        const THREADS: usize = 32;
+        let ctx = make_ctx(
+            &SocketPoolConfig {
+                max_inflight_requests: CAP,
+                ..Default::default()
+            },
+            30_000,
+        );
+        let admitted = std::sync::atomic::AtomicUsize::new(0);
+        let barrier = std::sync::Barrier::new(THREADS);
+        let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let runtime = tokio::runtime::Handle::current();
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    let _entered = runtime.enter();
+                    barrier.wait();
+                    let release = release.clone();
+                    spawn_handler(ctx.clone(), "TestSvc/x", Payload::Empty, |_, _| {
+                        admitted.fetch_add(1, Ordering::Relaxed);
+                        async move {
+                            let _permit = release.acquire().await.unwrap();
+                        }
+                    });
+                });
+            }
+        });
+        assert_eq!(admitted.load(Ordering::Relaxed), CAP);
+        assert_eq!(
+            ctx.state.metrics.server_inflight.load(Ordering::Relaxed),
+            CAP as i64
+        );
+        release.add_permits(CAP);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while ctx.state.metrics.server_inflight.load(Ordering::Relaxed) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

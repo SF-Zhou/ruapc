@@ -38,6 +38,7 @@
 
 mod conn;
 mod dispatch;
+mod flow;
 
 use std::{
     io::{Read as _, Write as _},
@@ -54,8 +55,7 @@ use foldhash::fast::RandomState;
 use ruapc_rdma::{CompChannel, CompletionQueue, ibv_wc, poll_readable2};
 
 use conn::ConnState;
-pub(crate) use dispatch::FRAME_HEADER;
-use dispatch::{DispatchBatch, Dispatcher, MAX_DISPATCH_BATCH, fail_read_batches};
+use dispatch::{DispatchBatch, Dispatcher, MAX_DISPATCH_BATCH};
 
 use super::RdmaSocket;
 use crate::{Buffer, Error, ErrorKind, Result, State, task::TaskSupervisorGuard};
@@ -499,6 +499,15 @@ impl PollLoop {
     const READ_SWEEP_INTERVAL: Duration = Duration::from_millis(100);
 
     fn run(mut self) {
+        if let Err(error) = self.run_until_shutdown() {
+            tracing::error!(%error, "stopping RDMA poll thread");
+        }
+        // Every exit, including provider errors, closes registration and fails
+        // outstanding reads before connection ownership is released.
+        self.shutdown_cleanup();
+    }
+
+    fn run_until_shutdown(&mut self) -> ruapc_rdma::Result<()> {
         let mut wcs = [ibv_wc::default(); 64];
         let mut batch: DispatchBatch = Vec::new();
         let mut spin_until = Instant::now();
@@ -507,171 +516,145 @@ impl PollLoop {
         let mut last_dump = Instant::now();
 
         loop {
-            // 1. Drain the completion queue.
-            let mut progressed = false;
-            loop {
-                let n = match self.cq.poll(&mut wcs) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        tracing::error!("CQ poll failed, stopping RDMA poll thread: {e}");
-                        self.shutdown_cleanup();
-                        return;
-                    }
-                };
-                for wc in &wcs[..n] {
-                    self.dispatch(wc, &mut batch);
-                }
-                if batch.len() >= MAX_DISPATCH_BATCH {
-                    self.dispatcher.flush(&mut batch);
-                }
-                progressed |= n > 0;
-                if n < wcs.len() {
-                    break;
-                }
-            }
-            self.dispatcher.flush(&mut batch);
+            let progressed = self.drain_completions(&mut wcs, &mut batch)?;
 
-            // 2. Registration inbox and per-connection housekeeping:
-            //    pending sends, flow control, teardown. This pass is
-            //    O(connections) including clock reads, so during the spin
-            //    window it only runs when a completion was processed or the
-            //    periodic interval elapsed — not on every idle spin
-            //    iteration. `register()` wakes the thread, so a registration
-            //    is picked up after at most one housekeeping interval.
+            // This O(connections) pass runs after progress or at the periodic
+            // cadence, never on every empty iteration of the spin window.
             let now = Instant::now();
             if progressed || now >= next_housekeeping {
                 next_housekeeping = now + Self::HOUSEKEEPING_INTERVAL;
-
                 if self.shared.shutdown.load(Ordering::Acquire) {
-                    break;
+                    return Ok(());
                 }
                 self.drain_incoming();
-
                 if tracing::enabled!(tracing::Level::DEBUG)
                     && last_dump.elapsed() >= Self::DUMP_INTERVAL
                 {
                     last_dump = Instant::now();
-                    for conn in self.conns.iter().flatten() {
-                        tracing::debug!(
-                            "conn dump: qp={} ok={} pending={} send={:?} recv={:?}",
-                            conn.socket.queue_pair.qp_num(),
-                            conn.socket.state.is_ok(),
-                            conn.pending_sends.len(),
-                            conn.send,
-                            conn.recv,
-                        );
-                    }
+                    self.dump_connections();
                 }
-
                 let sweep_reads = now >= next_read_sweep;
                 if sweep_reads {
                     next_read_sweep = now + Self::READ_SWEEP_INTERVAL;
                 }
-
-                for slot in 0..self.conns.len() {
-                    let Some(conn) = self.conns[slot].as_mut() else {
-                        continue;
-                    };
-                    if sweep_reads {
-                        conn.sweep_read_timeouts(now);
-                    }
-                    conn.drain_pending();
-                    if conn.recv_deficit > 0 {
-                        conn.retry_recv_deficit();
-                    }
-                    if let Err(e) = conn.update_flow_control() {
-                        tracing::error!("flow control update error: {e}");
-                    }
-                    if conn.ready_to_remove() {
-                        // Eagerly fail requests waiting on this connection
-                        // and abort handlers serving its peer; all involved
-                        // structures are runtime-agnostic, safe to touch
-                        // from the poll thread.
-                        conn.state.metrics.connection_closed("RDMA");
-                        conn.state.connection_closed(
-                            conn.socket.conn_id,
-                            &Error::new(
-                                ErrorKind::ConnectionClosed,
-                                "rdma connection closed".into(),
-                            ),
-                        );
-                        // Drop the connection before recycling its slot so
-                        // no new occupant can race its teardown.
-                        self.conns[slot] = None;
-                        release_slot(&self.shared, slot as u16);
-                    }
-                }
+                self.maintain_connections(now, sweep_reads);
             }
 
             if progressed {
                 spin_until = now + self.spin;
                 continue;
             }
-
-            // 3. Busy-poll window after the last completion.
             if now < spin_until {
                 std::hint::spin_loop();
                 continue;
             }
 
-            // 4. Idle: arm the CQ notification, close the race with one more
-            //    poll, then sleep on the completion channel + wake pipe.
-            if let Err(e) = self.cq.req_notify(false) {
-                tracing::error!("req_notify failed, stopping RDMA poll thread: {e}");
-                self.shutdown_cleanup();
-                return;
+            // Arm notifications, then poll again before sleeping. A completion
+            // racing the arm must be observed here or signal the channel.
+            self.cq.req_notify(false)?;
+            if self.poll_completions(&mut wcs, &mut batch)? > 0 {
+                self.dispatcher.flush(&mut batch);
+                spin_until = Instant::now() + self.spin;
+                continue;
             }
-            match self.cq.poll(&mut wcs) {
-                Ok(0) => {}
-                Ok(n) => {
-                    for wc in &wcs[..n] {
-                        self.dispatch(wc, &mut batch);
-                    }
-                    self.dispatcher.flush(&mut batch);
-                    spin_until = Instant::now() + self.spin;
-                    continue;
-                }
-                Err(e) => {
-                    tracing::error!("CQ poll failed, stopping RDMA poll thread: {e}");
-                    self.shutdown_cleanup();
-                    return;
-                }
-            }
-
-            match poll_readable2(
-                self.comp_channel.fd().as_raw_fd(),
-                self.wake_rx.as_raw_fd(),
-                Self::IDLE_TIMEOUT_MS,
-            ) {
-                Ok((cq_ready, wake_ready)) => {
-                    if cq_ready {
-                        while self.comp_channel.get_event().is_ok() {
-                            self.unack_cq_events += 1;
-                        }
-                        if self.unack_cq_events >= Self::ACK_EVENTS_BATCH {
-                            self.cq.ack_events(self.unack_cq_events);
-                            self.unack_cq_events = 0;
-                        }
-                    }
-                    if wake_ready {
-                        let mut buf = [0u8; 256];
-                        while matches!(self.wake_rx.read(&mut buf), Ok(n) if n > 0) {}
-                    }
-                    if cq_ready || wake_ready {
-                        spin_until = Instant::now() + self.spin;
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("poll(2) failed, stopping RDMA poll thread: {e}");
-                    self.shutdown_cleanup();
-                    return;
-                }
+            if self.wait_for_event()? {
+                spin_until = Instant::now() + self.spin;
             }
         }
+    }
 
-        // Shutdown: connections are dropped here; their buffers return to
-        // the pool when the QPs are destroyed.
-        self.shutdown_cleanup();
+    /// Drain a burst completely while bounding each dispatch batch. Both the
+    /// normal drain and the arm/poll race check use the same CQE routing path.
+    fn drain_completions(
+        &mut self,
+        wcs: &mut [ibv_wc],
+        batch: &mut DispatchBatch,
+    ) -> ruapc_rdma::Result<bool> {
+        let mut progressed = false;
+        loop {
+            let count = self.poll_completions(wcs, batch)?;
+            progressed |= count > 0;
+            if count < wcs.len() {
+                break;
+            }
+        }
+        self.dispatcher.flush(batch);
+        Ok(progressed)
+    }
+
+    fn poll_completions(
+        &mut self,
+        wcs: &mut [ibv_wc],
+        batch: &mut DispatchBatch,
+    ) -> ruapc_rdma::Result<usize> {
+        let count = self.cq.poll(wcs)?;
+        for wc in &wcs[..count] {
+            self.dispatch(wc, batch);
+        }
+        if batch.len() >= MAX_DISPATCH_BATCH {
+            self.dispatcher.flush(batch);
+        }
+        Ok(count)
+    }
+
+    fn dump_connections(&self) {
+        for conn in self.conns.iter().flatten() {
+            tracing::debug!(
+                "conn dump: qp={} ok={} pending={} flow={:?}",
+                conn.socket.queue_pair.qp_num(),
+                conn.socket.state.is_ok(),
+                conn.pending_sends.len(),
+                conn.flow,
+            );
+        }
+    }
+
+    fn maintain_connections(&mut self, now: Instant, sweep_reads: bool) {
+        for slot in 0..self.conns.len() {
+            let Some(conn) = self.conns[slot].as_mut() else {
+                continue;
+            };
+            if sweep_reads {
+                conn.sweep_read_timeouts(now);
+            }
+            conn.drain_pending();
+            if conn.recv_deficit > 0 {
+                conn.retry_recv_deficit();
+            }
+            if let Err(e) = conn.update_flow_control() {
+                tracing::error!("flow control update error: {e}");
+            }
+            if conn.ready_to_remove() {
+                // Dropping the registration guard fails waiters and settles
+                // metrics before this slot is available to another connection.
+                self.conns[slot] = None;
+                release_slot(&self.shared, slot as u16);
+            }
+        }
+    }
+
+    /// Sleep until a CQ notification, explicit wake, or housekeeping timeout.
+    /// Draining both sources before returning avoids a permanently readable fd.
+    fn wait_for_event(&mut self) -> ruapc_rdma::Result<bool> {
+        let (cq_ready, wake_ready) = poll_readable2(
+            self.comp_channel.fd().as_raw_fd(),
+            self.wake_rx.as_raw_fd(),
+            Self::IDLE_TIMEOUT_MS,
+        )?;
+        if cq_ready {
+            while self.comp_channel.get_event().is_ok() {
+                self.unack_cq_events += 1;
+            }
+            if self.unack_cq_events >= Self::ACK_EVENTS_BATCH {
+                self.cq.ack_events(self.unack_cq_events);
+                self.unack_cq_events = 0;
+            }
+        }
+        if wake_ready {
+            let mut buf = [0u8; 256];
+            while matches!(self.wake_rx.read(&mut buf), Ok(n) if n > 0) {}
+        }
+        Ok(cq_ready || wake_ready)
     }
 
     /// Moves newly registered connections from the shared inbox into their
@@ -734,7 +717,16 @@ impl PollLoop {
         };
         for incoming in &drained {
             incoming.conn.socket.set_error();
-            fail_read_batches(&incoming.conn.socket);
+            incoming.conn.socket.fail_read_batches();
+            // Inbox entries have not opened their metric registration yet,
+            // but a sender may already have bound a waiter to the socket.
+            incoming.conn.state.connection_closed(
+                incoming.conn.socket.conn_id,
+                &Error::new(
+                    ErrorKind::ConnectionClosed,
+                    "rdma poll thread stopped".into(),
+                ),
+            );
         }
         drop(drained);
         for conn in self.conns.iter().flatten() {
@@ -743,8 +735,10 @@ impl PollLoop {
             // exits: resolve the waiting tasks now. The memory holds stay
             // parked in the batches and are released when the socket (and
             // its QP, first) is dropped.
-            fail_read_batches(&conn.socket);
+            conn.socket.fail_read_batches();
         }
+        // RegisteredConnection guards notify ordinary waiters and close the
+        // connection gauges exactly once, including already-failing sockets.
         self.conns.clear();
         if self.unack_cq_events > 0 {
             self.cq.ack_events(self.unack_cq_events);
@@ -823,10 +817,9 @@ impl std::fmt::Debug for DevicePollers {
 
 #[cfg(test)]
 mod tests {
-    use bytes::Bytes;
     use ruapc_rdma::WRID;
 
-    use super::{dispatch::for_each_frame, *};
+    use super::*;
 
     /// The shared CQ length must be clamped to the device's `max_cqe`:
     /// drivers reject larger requests with EINVAL (e.g. the rxe soft-RoCE
@@ -871,36 +864,5 @@ mod tests {
             assert!(tag <= WRID::TAG_MAX);
             assert_eq!(split_tag(tag), (slot as usize, generation));
         }
-    }
-
-    #[test]
-    fn test_for_each_frame_walks_all_frames() {
-        let mut buf = Vec::new();
-        let frames: [&[u8]; 3] = [b"first", b"", b"third-frame"];
-        for frame in frames {
-            buf.extend_from_slice(&u32::try_from(frame.len()).unwrap().to_be_bytes());
-            buf.extend_from_slice(frame);
-        }
-        let mut seen = Vec::new();
-        for_each_frame(&Bytes::from(buf), |frame| seen.push(frame));
-        assert_eq!(seen, frames.map(Bytes::from_static).to_vec());
-    }
-
-    #[test]
-    fn test_for_each_frame_stops_on_truncation() {
-        // Header claims 100 bytes but only 3 follow.
-        let mut buf = 100u32.to_be_bytes().to_vec();
-        buf.extend_from_slice(b"abc");
-        let mut count = 0;
-        for_each_frame(&Bytes::from(buf), |_| count += 1);
-        assert_eq!(count, 0);
-
-        // One valid frame, then a truncated header.
-        let mut buf = 1u32.to_be_bytes().to_vec();
-        buf.extend_from_slice(b"x");
-        buf.extend_from_slice(&[0u8, 0]);
-        let mut count = 0;
-        for_each_frame(&Bytes::from(buf), |_| count += 1);
-        assert_eq!(count, 1);
     }
 }

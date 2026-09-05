@@ -11,15 +11,14 @@ use super::{
 };
 use crate::{
     Error, ErrorKind, QpConnectionConfig, Result, WRID, WRType, ibv_qp_attr, ibv_qp_attr_mask,
-    ibv_wc,
 };
 
 /// Maximum gather-list length accepted by [`QueuePair::send_gather`];
 /// bounds its stack-allocated SGE array.
 pub const MAX_GATHER_SGE: usize = 32;
 
-/// Buffers owned by one in-flight work request: receives, reads and plain
-/// sends hold one buffer; gather-list sends hold several.
+/// Buffers owned by one in-flight receive or send work request.
+/// RDMA READ memory is owned by the caller until its completion arrives.
 #[derive(Debug)]
 pub enum WrBuffers {
     One(Buffer),
@@ -43,11 +42,6 @@ impl From<Buffer> for WrBuffers {
     }
 }
 
-pub struct Completion {
-    pub wc: ibv_wc,
-    pub buffer: Option<WrBuffers>,
-}
-
 /// One local scatter segment of an RDMA READ posted via
 /// [`QueuePair::read_sges`]: a raw (address, length, lkey) triple. The
 /// caller owns the memory and must keep it alive until the read's
@@ -62,11 +56,34 @@ pub struct ReadSge {
     pub lkey: u32,
 }
 
+/// Signaling is explicit at each entry point: window-tail and backlog sends
+/// must complete independently; ordinary data sends may share a later CQE.
+#[derive(Clone, Copy)]
+enum SendSignaling {
+    Selective,
+    Always,
+    Explicit,
+}
+
+impl SendSignaling {
+    #[inline]
+    fn flags(self, id: u64, interval: u64, flags: crate::ibv_send_flags) -> crate::ibv_send_flags {
+        let signaled = crate::ibv_send_flags::IBV_SEND_SIGNALED;
+        match self {
+            Self::Explicit => flags,
+            Self::Selective if interval > 1 && !id.is_multiple_of(interval) => {
+                crate::ibv_send_flags(flags.0 & !signaled.0)
+            }
+            Self::Selective | Self::Always => flags | signaled,
+        }
+    }
+}
+
 pub struct QueuePair {
     ptr: *mut crate::ibv_qp,
     _pd: Arc<ProtectionDomain>,
-    send_cq: Arc<CompletionQueue>,
-    recv_cq: Arc<CompletionQueue>,
+    _send_cq: Arc<CompletionQueue>,
+    _recv_cq: Arc<CompletionQueue>,
     /// In-flight buffers of send-queue work requests (send/send_imm/read).
     send_wrs: WrSlots,
     /// In-flight buffers of receive-queue work requests.
@@ -128,8 +145,8 @@ impl QueuePair {
         Ok(Self {
             ptr,
             _pd: Arc::clone(pd),
-            send_cq: Arc::clone(send_cq),
-            recv_cq: Arc::clone(recv_cq),
+            _send_cq: Arc::clone(send_cq),
+            _recv_cq: Arc::clone(recv_cq),
             send_wrs: WrSlots::new(init_attr.cap.max_send_wr),
             recv_wrs: WrSlots::new(init_attr.cap.max_recv_wr),
             max_send_sge: init_attr.cap.max_send_sge as usize,
@@ -159,16 +176,6 @@ impl QueuePair {
         self.send_signal_interval = u64::from(interval.clamp(1, limit));
     }
 
-    /// Computes the send flags for a data send with the given SQ id,
-    /// applying the selective signaling policy.
-    fn data_send_flags(&self, id: u64, flags: crate::ibv_send_flags) -> crate::ibv_send_flags {
-        if self.send_signal_interval > 1 && !id.is_multiple_of(self.send_signal_interval) {
-            crate::ibv_send_flags(flags.0 & !crate::ibv_send_flags::IBV_SEND_SIGNALED.0)
-        } else {
-            flags | crate::ibv_send_flags::IBV_SEND_SIGNALED
-        }
-    }
-
     fn lkey(&self, buffer: &Buffer) -> Result<u32> {
         buffer
             .memory_key(&self.device_index)
@@ -195,45 +202,30 @@ impl QueuePair {
     /// stay stranded until an unrelated signaled WR (e.g. a keepalive ACK)
     /// happens to sweep them.
     pub fn send(&self, buffer: Buffer, flags: crate::ibv_send_flags) -> Result<u64> {
-        self.send_data(buffer, flags, false)
+        self.send_buffer(buffer, None, flags, SendSignaling::Selective)
     }
 
     /// Posts a data send with `IBV_SEND_SIGNALED` enforced, bypassing the
     /// selective signaling policy.
     pub fn send_signaled(&self, buffer: Buffer, flags: crate::ibv_send_flags) -> Result<u64> {
-        self.send_data(buffer, flags, true)
+        self.send_buffer(buffer, None, flags, SendSignaling::Always)
     }
 
-    fn send_data(
+    /// Builds the one-buffer SGE before transferring ownership to the SQ.
+    #[inline]
+    fn send_buffer(
         &self,
         buffer: Buffer,
+        imm: Option<u32>,
         flags: crate::ibv_send_flags,
-        force_signal: bool,
+        signaling: SendSignaling,
     ) -> Result<u64> {
-        let addr = buffer.as_ptr() as u64;
-        let len = buffer.len() as u32;
-        let lkey = self.lkey(&buffer)?;
-        let _guard = self.sq_post_lock.lock().unwrap();
-        let id = self.send_wrs.alloc_id();
-        let flags = if force_signal {
-            flags | crate::ibv_send_flags::IBV_SEND_SIGNALED
-        } else {
-            self.data_send_flags(id, flags)
-        };
-        let wr_id = WRID::send_data(self.wr_tag, id);
-        self.send_wrs.insert(id, buffer.into());
-        self.post_send_verb(
-            wr_id,
-            addr,
-            len,
-            lkey,
-            crate::ibv_wr_opcode::IBV_WR_SEND,
-            flags.0,
-        )
-        .inspect_err(|_e| {
-            self.send_wrs.take(id);
-        })?;
-        Ok(id)
+        let mut sge = [crate::ibv_sge {
+            addr: buffer.as_ptr() as u64,
+            length: buffer.len() as u32,
+            lkey: self.lkey(&buffer)?,
+        }];
+        self.post_send_buffers(Some(buffer.into()), &mut sge, imm, flags, signaling)
     }
 
     /// Longest gather list this QP can post (negotiated `max_send_sge`,
@@ -274,8 +266,40 @@ impl QueuePair {
                 lkey: self.lkey(buffer)?,
             };
         }
-        let num_sge = buffers.len() as c_int;
+        let count = buffers.len();
+        self.post_send_buffers(
+            Some(WrBuffers::Many(buffers)),
+            &mut sges[..count],
+            imm,
+            crate::ibv_send_flags::IBV_SEND_SIGNALED,
+            SendSignaling::Always,
+        )
+    }
 
+    /// Posts a send with immediate data and returns its send-queue id.
+    pub fn send_imm(&self, buffer: Buffer, imm: u32, flags: crate::ibv_send_flags) -> Result<u64> {
+        self.send_buffer(buffer, Some(imm), flags, SendSignaling::Explicit)
+    }
+
+    pub fn send_imm_only(&self, imm: u32, flags: crate::ibv_send_flags) -> Result<()> {
+        self.post_send_buffers(None, &mut [], Some(imm), flags, SendSignaling::Explicit)
+            .map(|_| ())
+    }
+
+    /// The common SEND transaction: allocate an SQ id in hardware post order,
+    /// install the memory hold before posting, and undo it on post failure.
+    ///
+    /// READs use a separate transaction because their memory belongs to a batch,
+    /// while a standalone ACK intentionally reserves an id without a buffer.
+    #[inline]
+    fn post_send_buffers(
+        &self,
+        buffers: Option<WrBuffers>,
+        sges: &mut [crate::ibv_sge],
+        imm: Option<u32>,
+        flags: crate::ibv_send_flags,
+        signaling: SendSignaling,
+    ) -> Result<u64> {
         let _guard = self.sq_post_lock.lock().unwrap();
         let id = self.send_wrs.alloc_id();
         let (wr_id, opcode, imm_data) = match imm {
@@ -290,73 +314,29 @@ impl QueuePair {
                 0,
             ),
         };
-        self.send_wrs.insert(id, WrBuffers::Many(buffers));
+        if let Some(buffers) = buffers {
+            self.send_wrs.insert(id, buffers);
+        }
         let mut wr = crate::ibv_send_wr {
             wr_id,
-            sg_list: sges.as_mut_ptr(),
-            num_sge,
+            sg_list: if sges.is_empty() {
+                ptr::null_mut()
+            } else {
+                sges.as_mut_ptr()
+            },
+            num_sge: sges.len() as c_int,
             opcode,
-            send_flags: crate::ibv_send_flags::IBV_SEND_SIGNALED.0,
+            send_flags: signaling.flags(id, self.send_signal_interval, flags).0,
             __bindgen_anon_1: crate::ibv_send_wr__bindgen_ty_1 { imm_data },
             ..Default::default()
         };
+        // SAFETY: the slot table owns every SGE's buffer before the NIC can
+        // observe the WR. The stack-allocated descriptor is consumed by post.
         unsafe { self.post_send(&mut wr) }.map_err(|(_, err)| {
             self.send_wrs.take(id);
             err
         })?;
         Ok(id)
-    }
-
-    /// Posts a send with immediate data and returns its send-queue id.
-    pub fn send_imm(&self, buffer: Buffer, imm: u32, flags: crate::ibv_send_flags) -> Result<u64> {
-        let addr = buffer.as_ptr() as u64;
-        let len = buffer.len() as u32;
-        let lkey = self.lkey(&buffer)?;
-        let _guard = self.sq_post_lock.lock().unwrap();
-        let id = self.send_wrs.alloc_id();
-        let wr_id = WRID::send_imm(self.wr_tag, id);
-        self.send_wrs.insert(id, buffer.into());
-        let mut sge = crate::ibv_sge {
-            addr,
-            length: len,
-            lkey,
-        };
-        let mut wr = crate::ibv_send_wr {
-            wr_id,
-            sg_list: &mut sge,
-            num_sge: 1,
-            opcode: crate::ibv_wr_opcode::IBV_WR_SEND_WITH_IMM,
-            send_flags: flags.0,
-            __bindgen_anon_1: crate::ibv_send_wr__bindgen_ty_1 {
-                imm_data: imm.to_be(),
-            },
-            ..Default::default()
-        };
-        unsafe { self.post_send(&mut wr) }.map_err(|(_, err)| {
-            self.send_wrs.take(id);
-            err
-        })?;
-        Ok(id)
-    }
-
-    pub fn send_imm_only(&self, imm: u32, flags: crate::ibv_send_flags) -> Result<()> {
-        // Allocates an ID (the WR consumes a hardware SQ slot) but stores no
-        // buffer; the slot stays empty and `take` will return `None`.
-        let _guard = self.sq_post_lock.lock().unwrap();
-        let id = self.send_wrs.alloc_id();
-        let wr_id = WRID::send_imm(self.wr_tag, id);
-        let mut wr = crate::ibv_send_wr {
-            wr_id,
-            sg_list: ptr::null_mut(),
-            num_sge: 0,
-            opcode: crate::ibv_wr_opcode::IBV_WR_SEND_WITH_IMM,
-            send_flags: flags.0,
-            __bindgen_anon_1: crate::ibv_send_wr__bindgen_ty_1 {
-                imm_data: imm.to_be(),
-            },
-            ..Default::default()
-        };
-        unsafe { self.post_send(&mut wr) }.map_err(|(_, err)| err)
     }
 
     /// Posts one RDMA READ from a contiguous remote region into the local
@@ -369,7 +349,13 @@ impl QueuePair {
     /// [`WRID`] *before* the work request is posted (under the SQ post
     /// lock), so a completion can never race the caller's bookkeeping; on
     /// post failure `unregister` undoes it.
-    pub fn read_sges(
+    ///
+    /// # Safety
+    ///
+    /// Every SGE must describe writable registered memory on this QP's device.
+    /// Keep that memory alive and exclusively available for DMA until the WR's
+    /// success, error, or flush completion is observed (or the QP is destroyed).
+    pub unsafe fn read_sges(
         &self,
         sges: &[ReadSge],
         remote_addr: u64,
@@ -419,31 +405,6 @@ impl QueuePair {
         Ok(wr_id)
     }
 
-    fn post_send_verb(
-        &self,
-        wr_id: WRID,
-        addr: u64,
-        len: u32,
-        lkey: u32,
-        opcode: crate::ibv_wr_opcode,
-        send_flags: u32,
-    ) -> Result<()> {
-        let mut sge = crate::ibv_sge {
-            addr,
-            length: len,
-            lkey,
-        };
-        let mut wr = crate::ibv_send_wr {
-            wr_id,
-            sg_list: &mut sge,
-            num_sge: 1,
-            opcode,
-            send_flags,
-            ..Default::default()
-        };
-        unsafe { self.post_send(&mut wr) }.map_err(|(_, err)| err)
-    }
-
     pub fn recv(&self, buffer: Buffer) -> Result<()> {
         let id = self.recv_wrs.alloc_id();
         let wr_id = WRID::recv(self.wr_tag, id);
@@ -468,26 +429,13 @@ impl QueuePair {
         })
     }
 
-    pub fn poll_send(&self, wc: &mut [ibv_wc]) -> Result<Vec<Completion>> {
-        let n = self.send_cq.poll(wc)?;
-        Ok(self.take_buffers(&wc[..n]))
-    }
-
-    pub fn poll_recv(&self, wc: &mut [ibv_wc]) -> Result<Vec<Completion>> {
-        let n = self.recv_cq.poll(wc)?;
-        Ok(self.take_buffers(&wc[..n]))
-    }
-
-    fn take_buffers(&self, wc: &[ibv_wc]) -> Vec<Completion> {
-        let mut completions = Vec::with_capacity(wc.len());
-        for wc in wc {
-            let buffer = self.take_buffer(&wc.wr_id);
-            completions.push(Completion { wc: *wc, buffer });
-        }
-        completions
-    }
-
-    pub fn take_buffer(&self, wr_id: &WRID) -> Option<WrBuffers> {
+    /// Recovers the buffers owned by a completed work request.
+    ///
+    /// # Safety
+    ///
+    /// `wr_id` must belong to this QP and its work completion must already have
+    /// been observed. The NIC must no longer access the returned buffers.
+    pub unsafe fn take_buffer(&self, wr_id: &WRID) -> Option<WrBuffers> {
         match wr_id.get_type() {
             WRType::Recv => self.recv_wrs.take(wr_id.get_id()),
             WRType::SendData | WRType::SendImm | WRType::Read => self.send_wrs.take(wr_id.get_id()),
@@ -501,17 +449,24 @@ impl QueuePair {
     /// work requests with ids below `X` are guaranteed complete (RC SQs
     /// complete in order). Returns `None` for ids without stored buffers
     /// (buffer-less immediate sends or failed posts).
-    pub fn take_send_buffer(&self, id: u64) -> Option<WrBuffers> {
+    ///
+    /// # Safety
+    ///
+    /// The work request must belong to this QP and be complete. Completion of
+    /// a later RC send-queue id establishes this for unsignaled data SENDs.
+    pub unsafe fn take_send_buffer(&self, id: u64) -> Option<WrBuffers> {
         self.send_wrs.take(id)
     }
 
     /// Reclaims every in-flight send buffer, returning how many were taken.
     ///
-    /// Only safe to call after the QP has transitioned to the error state
+    /// # Safety
+    ///
+    /// The QP must have transitioned to the error state
     /// and its outstanding completions have been drained: buffers of
     /// unsignaled data sends that completed successfully never produce a
     /// CQE, so teardown must reclaim them explicitly.
-    pub fn reclaim_send_buffers(&self) -> usize {
+    pub unsafe fn reclaim_send_buffers(&self) -> usize {
         self.send_wrs.reclaim_all()
     }
 
@@ -628,6 +583,32 @@ unsafe impl Sync for QueuePair {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signaling_preserves_flags_and_forces_window_tail_completion() {
+        use crate::ibv_send_flags as Flags;
+        let flags = Flags::IBV_SEND_INLINE | Flags::IBV_SEND_SIGNALED;
+        for id in 0..16 {
+            let selective = SendSignaling::Selective.flags(id, 4, flags);
+            assert_eq!(
+                selective.0 & Flags::IBV_SEND_INLINE.0,
+                Flags::IBV_SEND_INLINE.0
+            );
+            assert_eq!(selective.0 & Flags::IBV_SEND_SIGNALED.0 != 0, id % 4 == 0);
+            assert_eq!(SendSignaling::Always.flags(id, 4, flags).0, flags.0);
+            assert_eq!(SendSignaling::Selective.flags(id, 1, flags).0, flags.0);
+        }
+        assert_eq!(
+            SendSignaling::Explicit
+                .flags(0, 4, Flags::IBV_SEND_INLINE)
+                .0,
+            Flags::IBV_SEND_INLINE.0
+        );
+        assert_eq!(
+            SendSignaling::Always.flags(1, 4, Flags::IBV_SEND_INLINE).0,
+            flags.0
+        );
+    }
 
     #[test]
     fn modify_error_reports_provider_errno_and_target_state() {

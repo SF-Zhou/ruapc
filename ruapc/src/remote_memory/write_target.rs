@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use ruapc_bufpool::{AsDeviceIndex, RemoteBufferInfo};
 
-use crate::{Buffer, Error, ErrorKind, Result, core::scatter::SpaceLayout};
+use crate::{Buffer, Error, ErrorKind, Result, remote_memory::scatter::SpaceLayout};
 
 /// The buffers a client hands over for the duration of one request so the
 /// server can write into them (via `read_into_target` or `write_inline`).

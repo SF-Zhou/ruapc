@@ -1,45 +1,30 @@
 use std::sync::Arc;
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::{
     SocketTrait, State,
-    error::{Error, ErrorKind, Result},
-    msg::{MsgMeta, SendMsg},
+    error::{ErrorKind, Result},
+    msg::MsgMeta,
 };
 
 #[derive(Debug, Clone)]
 pub struct TcpSocket {
-    inner: Arc<TcpSocketInner>,
-}
-
-#[derive(Debug)]
-pub(crate) struct TcpSocketInner {
-    stream: mpsc::Sender<Bytes>,
-    lifecycle: crate::sockets::ConnectionLifecycle,
-}
-
-impl TcpSocketInner {
-    pub(crate) fn is_closed(&self) -> bool {
-        self.lifecycle.is_closed() || self.stream.is_closed()
-    }
+    inner: Arc<crate::sockets::ChannelConnection>,
 }
 
 impl TcpSocket {
     pub fn new(stream: mpsc::Sender<Bytes>) -> Self {
         Self {
-            inner: Arc::new(TcpSocketInner {
-                stream,
-                lifecycle: crate::sockets::ConnectionLifecycle::new(),
-            }),
+            inner: Arc::new(crate::sockets::ChannelConnection::new(stream)),
         }
     }
 
     /// Unique id of the underlying connection.
     pub(crate) fn conn_id(&self) -> u64 {
-        self.inner.lifecycle.conn_id()
+        self.inner.conn_id()
     }
 
     /// Whether `other` refers to the same underlying connection.
@@ -50,14 +35,14 @@ impl TcpSocket {
     /// Marks the connection closed; returns `true` exactly once (the send
     /// and recv loops both report failures — teardown must run once).
     pub(crate) fn mark_closed(&self) -> bool {
-        self.inner.lifecycle.close_once()
+        self.inner.close_once()
     }
 
     pub(crate) fn is_closed(&self) -> bool {
         self.inner.is_closed()
     }
 
-    pub(crate) fn health(&self) -> std::sync::Weak<TcpSocketInner> {
+    pub(crate) fn health(&self) -> std::sync::Weak<crate::sockets::ChannelConnection> {
         Arc::downgrade(&self.inner)
     }
 }
@@ -79,68 +64,13 @@ impl SocketTrait for TcpSocket {
         payload: &P,
         state: &Arc<State>,
     ) -> Result<()> {
-        struct TcpSocketBytes(BytesMut);
+        let bytes = crate::msg::frame::encode(meta, payload)?;
 
-        impl SendMsg for TcpSocketBytes {
-            fn size(&self) -> usize {
-                self.0.size()
-            }
-
-            fn prepare(&mut self) -> Result<()> {
-                self.0.extend_from_slice(&super::MAGIC_NUM.to_be_bytes());
-                self.0.extend_from_slice(&0u32.to_be_bytes());
-                self.0.prepare()
-            }
-
-            fn finish(&mut self, meta_offset: usize, payload_offset: usize) -> Result<()> {
-                const S: usize = std::mem::size_of::<u32>();
-                if meta_offset < S {
-                    return Err(Error::new(
-                        ErrorKind::SerializeFailed,
-                        format!("invalid meta offset: {meta_offset}"),
-                    ));
-                }
-
-                self.0.finish(meta_offset, payload_offset)?;
-                let total_len = u32::try_from(self.size() - meta_offset)?;
-                self.0[meta_offset - S..meta_offset].copy_from_slice(&total_len.to_be_bytes());
-                Ok(())
-            }
-
-            fn writer(&mut self) -> impl std::io::Write {
-                self.0.writer()
-            }
-        }
-
-        let mut bytes = TcpSocketBytes(BytesMut::with_capacity(512));
-        meta.serialize_to(payload, &mut bytes)?;
-        if bytes.0.len() >= super::MAX_MSG_SIZE {
-            return Err(Error::new(
-                ErrorKind::TcpParseMsgFailed,
-                format!("msg is too long: {}", bytes.0.len()),
-            ));
-        }
-
-        // Bind the pending request to this connection so it fails eagerly
-        // if the connection dies before the response arrives.
-        if meta.is_req() {
-            state.waiter.bind_connection(meta.msgid, self.conn_id());
-        }
-
-        if self.is_closed() {
-            return Err(Error::new(
-                ErrorKind::ConnectionClosed,
-                "TCP connection is closed".into(),
-            ));
-        }
-
-        self.inner
-            .stream
-            .send(bytes.0.into())
+        let sender = self.inner.prepare_send(meta, state, "TCP")?;
+        sender
+            .send(bytes)
             .await
-            .map_err(|e| Error::new(ErrorKind::TcpSendMsgFailed, e.to_string()))?;
-
-        Ok(())
+            .map_err(|error| crate::Error::new(ErrorKind::TcpSendMsgFailed, error.to_string()))
     }
 }
 

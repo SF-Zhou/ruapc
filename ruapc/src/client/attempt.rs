@@ -14,8 +14,9 @@ use ruapc_bufpool::RemoteBufferInfo;
 
 use crate::{
     Buffer, Endpoint, Socket, State,
-    core::{EndpointState, WriteTarget},
+    core::EndpointState,
     error::{Error, ErrorKind},
+    remote_memory::WriteTarget,
     sockets::AcquireOptions,
 };
 
@@ -326,7 +327,7 @@ pub(super) async fn acquire_for_attempt(
 pub(super) fn export_attached_regions(
     socket: &Socket,
     state: &State,
-    read_buffers: &[&Buffer],
+    read_buffers: &[Buffer],
     write_target: Option<&Arc<WriteTarget>>,
 ) -> std::result::Result<(Vec<RemoteBufferInfo>, Vec<RemoteBufferInfo>), AttemptFailure> {
     let mut read_regions = Vec::new();

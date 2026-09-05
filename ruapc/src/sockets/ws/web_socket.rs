@@ -6,40 +6,25 @@ use tokio::sync::mpsc;
 
 use crate::{
     SocketTrait, State,
-    error::{Error, ErrorKind, Result},
+    error::{ErrorKind, Result},
     msg::MsgMeta,
 };
 
 #[derive(Debug, Clone)]
 pub struct WebSocket {
-    inner: Arc<WebSocketInner>,
-}
-
-#[derive(Debug)]
-pub(crate) struct WebSocketInner {
-    stream: mpsc::Sender<Bytes>,
-    lifecycle: crate::sockets::ConnectionLifecycle,
-}
-
-impl WebSocketInner {
-    pub(crate) fn is_closed(&self) -> bool {
-        self.lifecycle.is_closed() || self.stream.is_closed()
-    }
+    inner: Arc<crate::sockets::ChannelConnection>,
 }
 
 impl WebSocket {
     pub fn new(stream: mpsc::Sender<Bytes>) -> Self {
         Self {
-            inner: Arc::new(WebSocketInner {
-                stream,
-                lifecycle: crate::sockets::ConnectionLifecycle::new(),
-            }),
+            inner: Arc::new(crate::sockets::ChannelConnection::new(stream)),
         }
     }
 
     /// Unique id of the underlying connection.
     pub(crate) fn conn_id(&self) -> u64 {
-        self.inner.lifecycle.conn_id()
+        self.inner.conn_id()
     }
 
     /// Whether `other` refers to the same underlying connection.
@@ -50,14 +35,14 @@ impl WebSocket {
     /// Marks the connection closed; returns `true` exactly once (the send
     /// and recv loops both report failures — teardown must run once).
     pub(crate) fn mark_closed(&self) -> bool {
-        self.inner.lifecycle.close_once()
+        self.inner.close_once()
     }
 
     pub(crate) fn is_closed(&self) -> bool {
         self.inner.is_closed()
     }
 
-    pub(crate) fn health(&self) -> std::sync::Weak<WebSocketInner> {
+    pub(crate) fn health(&self) -> std::sync::Weak<crate::sockets::ChannelConnection> {
         Arc::downgrade(&self.inner)
     }
 }
@@ -82,25 +67,10 @@ impl SocketTrait for WebSocket {
         let mut bytes = BytesMut::with_capacity(512);
         meta.serialize_to(payload, &mut bytes)?;
 
-        // Bind the pending request to this connection so it fails eagerly
-        // if the connection dies before the response arrives.
-        if meta.is_req() {
-            state.waiter.bind_connection(meta.msgid, self.conn_id());
-        }
-
-        if self.is_closed() {
-            return Err(Error::new(
-                ErrorKind::ConnectionClosed,
-                "WebSocket connection is closed".into(),
-            ));
-        }
-
-        self.inner
-            .stream
-            .send(bytes.into())
+        let sender = self.inner.prepare_send(meta, state, "WebSocket")?;
+        sender
+            .send(bytes.freeze())
             .await
-            .map_err(|e| Error::new(ErrorKind::WebSocketSendFailed, e.to_string()))?;
-
-        Ok(())
+            .map_err(|error| crate::Error::new(ErrorKind::WebSocketSendFailed, error.to_string()))
     }
 }

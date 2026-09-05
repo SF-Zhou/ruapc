@@ -129,7 +129,7 @@ impl HttpSocketPool {
                 () = task_supervisor.stopped() => {},
                 r = connection => {
                     if let Err(e) = r {
-                        tracing::error!("recv loop for {addr} failed: {e}");
+                        tracing::debug!(%addr, error = %e, "HTTP connection ended");
                     }
                 }
             }
@@ -214,19 +214,11 @@ impl HttpSocketPool {
             return Ok(Self::not_found());
         }
 
-        const UNARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-        let (msgid, rx) = state.waiter.alloc(UNARY_TIMEOUT);
-        let meta = MsgMeta {
-            method: method.to_string(),
-            flags: MsgFlags::IsReq,
-            msgid,
-            read_regions: Vec::new(),
-            write_regions: Vec::new(),
-            timeout_ms: u32::try_from(UNARY_TIMEOUT.as_millis()).unwrap_or(u32::MAX),
-        };
+        let method = method.to_owned();
         // Cap the request body at the wire-format message limit; an
         // unauthenticated POST must not be able to buffer unbounded data.
-        let limited = http_body_util::Limited::new(req.into_body(), tcp::MAX_MSG_SIZE);
+        let limited =
+            http_body_util::Limited::new(req.into_body(), crate::msg::frame::MAX_MSG_SIZE);
         let bytes = match limited.collect().await {
             Ok(collected) => collected.to_bytes(),
             Err(e) if e.is::<http_body_util::LengthLimitError>() => {
@@ -243,6 +235,19 @@ impl HttpSocketPool {
                     ))))
                     .unwrap());
             }
+        };
+        // A unary request starts its response budget when its complete body
+        // arrives, just like framed TCP, WebSocket and HTTP/2 messages. Pending
+        // uploads own no waiter entry and cannot expire a future handler's slot.
+        const UNARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        let (msgid, rx) = state.waiter.alloc(UNARY_TIMEOUT);
+        let meta = MsgMeta {
+            method,
+            flags: MsgFlags::IsReq,
+            msgid,
+            read_regions: Vec::new(),
+            write_regions: Vec::new(),
+            timeout_ms: u32::try_from(UNARY_TIMEOUT.as_millis()).unwrap_or(u32::MAX),
         };
         let msg = Message::new(meta, bytes.into());
 
@@ -314,12 +319,9 @@ impl HttpSocketPool {
                     )),
                     r = Self::recv_loop(req.into_body(), &socket_for_recv, &state) => r,
                 };
-                if let Err(e) = &r {
-                    tracing::error!("http rpc recv loop for {addr} failed: {e}");
-                }
-                // The stream ended: eagerly fail requests (e.g. reverse
-                // RPCs) still pending on this connection and abort
-                // handlers still serving its requests.
+                Self::log_stream_result(addr, "server", &r);
+                // The stream ended: eagerly fail pending requests (including
+                // reverse RPCs); running handlers retain their own lifetimes.
                 if stream_socket.mark_closed() {
                     state.metrics.connection_closed("HTTP");
                     let err = Error::new(
@@ -338,6 +340,21 @@ impl HttpSocketPool {
             .unwrap())
     }
 
+    fn log_stream_result(addr: SocketAddr, side: &'static str, result: &Result<()>) {
+        let Err(error) = result else {
+            return;
+        };
+        match error.kind {
+            // Local shutdown and a peer closing/resetting its HTTP body are
+            // connection lifecycle events. Pending callers receive their own
+            // ConnectionClosed errors through the waiter.
+            ErrorKind::ConnectionClosed | ErrorKind::HttpWaitRspFailed => {
+                tracing::debug!(%addr, side, %error, "HTTP RPC stream ended");
+            }
+            _ => tracing::warn!(%addr, side, %error, "invalid HTTP RPC stream"),
+        }
+    }
+
     /// Read framed messages from an HTTP body stream.
     ///
     /// Uses the same wire format as TCP: `[magic][len][body]`.
@@ -345,7 +362,7 @@ impl HttpSocketPool {
         let mut buffer = BytesMut::with_capacity(1 << 20);
         loop {
             // Try to parse complete messages from the buffer.
-            while let Some(bytes) = tcp::parse_message(&mut buffer)? {
+            while let Some(bytes) = crate::msg::frame::parse_message(&mut buffer)? {
                 let msg = Message::parse(bytes)?;
                 state.handle_recv(socket, msg)?;
             }
@@ -427,10 +444,12 @@ impl HttpSocketPool {
         let recv_task = supervisor
             .try_start_async_task()
             .ok_or_else(|| Error::new(ErrorKind::ConnectionClosed, "HTTP pool stopped".into()))?;
-        state.metrics.connection_opened("HTTP");
-
         // Publish before the receive task can observe EOF and evict it.
         socket_map.publish(*addr, socket.clone()).await;
+        // Publish may wait for the map lock and be cancelled by the connect
+        // deadline. Start accounting only after that await; from here to spawn
+        // there is no cancellation point that could strand an open connection.
+        state.metrics.connection_opened("HTTP");
 
         // Spawn recv loop on the response body. When it exits — error or
         // clean end of stream — evict the socket from the pool and eagerly
@@ -448,9 +467,7 @@ impl HttpSocketPool {
                 )),
                 r = Self::recv_loop(rsp.into_body(), &socket_for_recv, &state) => r,
             };
-            if let Err(e) = &r {
-                tracing::error!("http rpc client recv loop for {addr} failed: {e}");
-            }
+            Self::log_stream_result(addr, "client", &r);
             if !stream_socket.mark_closed() {
                 return;
             }
@@ -470,5 +487,81 @@ impl HttpSocketPool {
 impl std::fmt::Debug for HttpSocketPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpSocketPool").finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn unary_body_collection_precedes_waiter_and_handler_budget() {
+        let mut router = crate::Router::default();
+        router.add_method::<(), (u32, u64, usize)>(
+            "Budget/check",
+            Box::new(|mut ctx, payload| {
+                tokio::spawn(async move {
+                    payload.deserialize::<()>(&ctx.msg_meta).unwrap();
+                    let observed = (
+                        ctx.msg_meta.timeout_ms,
+                        ctx.remaining_time().unwrap().as_millis() as u64,
+                        ctx.state.waiter.pending_count(),
+                    );
+                    ctx.send_rsp::<_, Error>(Ok(observed)).await;
+                });
+                Ok(())
+            }),
+        );
+        let config = SocketPoolConfig {
+            listen_mode: crate::ListenMode::HTTP,
+            #[cfg(feature = "rdma")]
+            rdma: None,
+            ..Default::default()
+        };
+        let server = crate::Server::create(router, &config).unwrap();
+        let addr = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(
+            b"POST /Budget/check HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        ).await.unwrap();
+
+        // Hyper sends 100 Continue only when the body is polled. This proves
+        // the request reached collection, without sleeps or a 30s timeout.
+        let mut interim = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !interim.ends_with(b"\r\n\r\n") {
+                interim.push(stream.read_u8().await.unwrap());
+            }
+        })
+        .await
+        .unwrap();
+        assert!(interim.starts_with(b"HTTP/1.1 100 Continue"));
+        assert_eq!(server.state().waiter.pending_count(), 0);
+
+        stream.write_all(b"4\r\nnull\r\n0\r\n\r\n").await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_to_end(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200 OK"));
+        let body_start = response
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let observed: Result<(u32, u64, usize)> =
+            serde_json::from_slice(&response[body_start..]).unwrap();
+        let (advertised, remaining, pending) = observed.unwrap();
+        assert_eq!(advertised, 30_000);
+        assert!((25_000..=30_000).contains(&remaining));
+        assert_eq!(pending, 1);
+        assert_eq!(server.state().waiter.pending_count(), 0);
+        server.stop();
+        server.join().await;
     }
 }

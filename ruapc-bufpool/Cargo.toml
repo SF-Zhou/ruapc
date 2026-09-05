@@ -14,6 +14,7 @@ license.workspace = true
 aliasable.workspace = true
 dashmap.workspace = true
 foldhash.workspace = true
+libc.workspace = true
 schemars.workspace = true
 serde.workspace = true
 tokio = { workspace = true, features = ["sync"] }

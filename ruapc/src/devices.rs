@@ -57,7 +57,10 @@ impl Devices {
     }
 }
 
-impl ruapc_bufpool::Devices for Devices {
+// SAFETY: registrations retain memory without accessing its bytes. Actual
+// transfers enforce the ownership and access rules of their individual buffers.
+#[allow(unsafe_code)]
+unsafe impl ruapc_bufpool::Devices for Devices {
     fn len(&self) -> usize {
         let len = 1;
         #[cfg(feature = "rdma")]

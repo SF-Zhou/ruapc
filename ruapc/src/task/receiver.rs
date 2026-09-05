@@ -9,12 +9,19 @@ use crate::{
 ///
 /// The receiver is used internally to wait for responses from remote services.
 /// It wraps a oneshot channel and handles automatic cleanup of waiter entries.
-pub(crate) enum Receiver<'a> {
-    /// Active oneshot receiver with cleanup guard.
-    OneShotRx(oneshot::Receiver<WaiterResult>, WaiterCleaner<'a>),
+pub(crate) struct Receiver<'a> {
+    response: oneshot::Receiver<WaiterResult>,
+    cleanup: WaiterCleaner<'a>,
 }
 
-impl Receiver<'_> {
+impl<'a> Receiver<'a> {
+    pub(crate) fn new(
+        response: oneshot::Receiver<WaiterResult>,
+        cleanup: WaiterCleaner<'a>,
+    ) -> Self {
+        Self { response, cleanup }
+    }
+
     /// Receives a response message along with any write buffer.
     ///
     /// This method waits for a response to arrive through the channel.
@@ -27,20 +34,15 @@ impl Receiver<'_> {
     /// present if the request attached write buffers; the server may have
     /// written into it during the request.
     pub(crate) async fn recv(self) -> Result<WaiterResponse> {
-        match self {
-            Receiver::OneShotRx(rx, cleaner) => {
-                // A dropped sender means the waiter entry vanished without a
-                // response — most commonly the coarse expiry sweep. An
-                // explicit `Err` is an eager failure (e.g. the connection
-                // carrying the request was closed).
-                let result = match rx.await {
-                    Ok(waiter_result) => waiter_result,
-                    Err(_) => Err(Error::kind(ErrorKind::Timeout)),
-                };
-                std::mem::forget(cleaner);
-                result
-            }
-        }
+        let Self { response, cleanup } = self;
+        // The entry has already been removed by post, eager failure or the
+        // expiry sweep. Cancellation before this await resolves instead
+        // drops `cleanup` and removes the still-pending entry.
+        let result = response
+            .await
+            .unwrap_or_else(|_| Err(Error::kind(ErrorKind::Timeout)));
+        cleanup.disarm();
+        result
     }
 }
 

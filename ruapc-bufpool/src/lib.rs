@@ -9,7 +9,7 @@
 //! - **Both Sync and Async APIs**: Designed for tokio environments with async-first design
 //! - **Automatic Memory Reclamation**: Buffers are automatically returned to the pool on drop
 //! - **Memory Limits**: Configurable maximum memory usage with async waiting when limits are reached
-//! - **Custom Allocators**: Pluggable allocator trait for memory allocation backend
+//! - **Aligned Memory**: Zero-initialized blocks with 2 MiB alignment on 64-bit targets
 //! - **O(1) Buddy Merging**: Intrusive doubly-linked list with O(1) free/merge operations
 //! - **Device Registration**: Support for registering memory with devices (RDMA, TCP)
 //!

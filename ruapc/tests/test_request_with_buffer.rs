@@ -45,7 +45,7 @@ impl UploadService for UploadServiceImpl {
 }
 
 // --------------------------------------------------------------------------
-// Service: normal request (no buffer) — verify backwards compatibility
+// Service: normal request carries no memory attachments
 // --------------------------------------------------------------------------
 
 #[service]
@@ -87,7 +87,7 @@ async fn test_upload_with_read_buffer_tcp() {
     let ctx = Context::create(&config).unwrap();
     let ctx = ctx.with_endpoint(ruapc::Endpoint::tcp(addr));
 
-    // 1. Test normal request (no buffer) — backwards compatibility.
+    // 1. Test a normal request without memory attachments.
     let client = Client::default();
     let rsp = client.ping(&ctx, &"hello".to_string()).await.unwrap();
     assert_eq!(rsp, "pong");
@@ -102,21 +102,20 @@ async fn test_upload_with_read_buffer_tcp() {
 
     let req = UploadReq {};
 
-    // Use client.with_read_buffer(&buf) to attach the buffer.
-    let rsp: UploadRsp = client
-        .with_read_buffer(&buf)
-        .upload(&ctx, &req)
-        .await
-        .unwrap();
+    // Move the source into a wrapper that can reuse it across requests.
+    let mut source = client.with_read_buffer(buf);
+    let rsp: UploadRsp = source.upload(&ctx, &req).await.unwrap();
     assert_eq!(rsp.data, test_data);
 
     // 3. Verify the same buffer can be reused (retry scenario).
-    let rsp2: UploadRsp = client
-        .with_read_buffer(&buf)
-        .upload(&ctx, &req)
-        .await
-        .unwrap();
+    let rsp2: UploadRsp = source.upload(&ctx, &req).await.unwrap();
     assert_eq!(rsp2.data, test_data);
+    assert_eq!(&source.read_buffers()[0][..], test_data);
+    let recovered = source
+        .take_read_buffers()
+        .expect("completed reads release the source for reuse");
+    assert_eq!(&recovered[0][..], test_data);
+    assert!(source.read_buffers().is_empty());
 
     // 4. Verify upload without an attached buffer fails with a proper
     //    MissingBufferInfo error (not a server panic / timeout).
@@ -155,7 +154,7 @@ async fn test_upload_with_read_buffer_websocket() {
     let req = UploadReq {};
 
     let rsp: UploadRsp = client
-        .with_read_buffer(&buf)
+        .with_read_buffer(buf)
         .upload(&ctx, &req)
         .await
         .unwrap();
@@ -192,7 +191,7 @@ async fn test_upload_with_read_buffer_http() {
     let req = UploadReq {};
 
     let rsp: UploadRsp = client
-        .with_read_buffer(&buf)
+        .with_read_buffer(buf)
         .upload(&ctx, &req)
         .await
         .unwrap();

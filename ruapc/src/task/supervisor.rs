@@ -35,7 +35,7 @@ struct TaskSupervisorState {
 /// # #[tokio::main]
 /// # async fn main() {
 /// let supervisor = TaskSupervisor::create();
-/// let guard = supervisor.start_async_task();
+/// let guard = supervisor.try_start_async_task().unwrap();
 /// tokio::spawn(async move {
 ///     // Task work here
 ///     drop(guard); // Automatically decrements running count
@@ -134,17 +134,11 @@ impl TaskSupervisor {
         self.0.stopped.cancelled()
     }
 
-    /// Starts tracking a new async task.
-    ///
-    /// Increments the running task counter and returns a guard that will
-    /// automatically decrement it when dropped.
-    ///
-    /// # Returns
-    ///
-    /// Returns a `TaskSupervisorGuard` that must be kept alive for the
-    /// duration of the task.
+    /// Registers infrastructure during construction or under an existing task
+    /// guard. These callers guarantee the task count cannot have reached zero;
+    /// external callers must use the shutdown-aware `try_start_async_task`.
     #[must_use]
-    pub fn start_async_task(&self) -> TaskSupervisorGuard {
+    pub(crate) fn start_async_task(&self) -> TaskSupervisorGuard {
         self.0.running.fetch_add(1, Ordering::AcqRel);
         TaskSupervisorGuard(self.0.clone())
     }
@@ -181,13 +175,6 @@ impl TaskSupervisorHandle {
     #[must_use]
     pub fn try_start_async_task(&self) -> Option<TaskSupervisorGuard> {
         try_start_async_task(&self.0)
-    }
-
-    /// Starts tracking a new async task.
-    #[must_use]
-    pub fn start_async_task(&self) -> TaskSupervisorGuard {
-        self.0.running.fetch_add(1, Ordering::AcqRel);
-        TaskSupervisorGuard(self.0.clone())
     }
 
     /// Returns a future that completes when the owner requests shutdown.

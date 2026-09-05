@@ -49,6 +49,7 @@
 //! spawn overhead.
 
 use clap::Parser;
+use ruapc_demo::app::{RuntimeOptions, init_tracing};
 use std::{
     future::Future,
     sync::{
@@ -74,9 +75,8 @@ struct Args {
     #[arg(long, default_value = "0.0")]
     pending_frac: f64,
 
-    /// Tokio worker threads per runtime (0 = number of CPUs).
-    #[arg(long, default_value = "0")]
-    worker_threads: usize,
+    #[command(flatten)]
+    runtime: RuntimeOptions,
 
     /// Number of independent tokio runtimes; producers are assigned
     /// round-robin (producer p -> runtime p % M). Total worker threads =
@@ -313,24 +313,35 @@ struct WorkItem {
     t0: Instant,
 }
 
-/// Shared MPMC queue for pool mode: mutex-protected deque + semaphore
-/// (structurally what async-channel does internally).
-struct PoolQueue {
-    q: std::sync::Mutex<std::collections::VecDeque<Box<WorkItem>>>,
-    sem: tokio::sync::Semaphore,
+/// Both pool experiments use the same queue; their per-message allocation
+/// and dispatch behavior differ only in the stored item type.
+struct WorkQueue<T> {
+    items: std::sync::Mutex<std::collections::VecDeque<T>>,
+    available: tokio::sync::Semaphore,
 }
+
+impl<T> WorkQueue<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            items: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(capacity)),
+            available: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    async fn pop(&self) -> Option<T> {
+        let permit = self.available.acquire().await.ok()?;
+        permit.forget();
+        self.items.lock().unwrap().pop_front()
+    }
+}
+
+type PoolQueue = WorkQueue<Box<WorkItem>>;
 
 /// Pre-spawned consumer task: waits for a permit, pops one item, handles
 /// it inline. `--pool-tasks` of these per producer.
 async fn run_pool_task(pool: Arc<PoolQueue>, counters: Arc<Counters>, args: Args) {
     let heavy_thr = heavy_threshold(args.heavy_frac);
-    loop {
-        let Ok(permit) = pool.sem.acquire().await else {
-            return;
-        };
-        permit.forget();
-        let item = pool.q.lock().unwrap().pop_front();
-        let Some(item) = item else { continue };
+    while let Some(item) = pool.pop().await {
         let spin_ns = if item.heavy {
             args.heavy_spin_ns
         } else {
@@ -347,11 +358,7 @@ async fn run_pool_task(pool: Arc<PoolQueue>, counters: Arc<Counters>, args: Args
 
 type BoxFut = std::pin::Pin<Box<dyn Future<Output = ()> + Send>>;
 
-/// Shared MPMC queue of pre-built handler futures (pool-first mode).
-struct PoolFutQueue {
-    q: std::sync::Mutex<std::collections::VecDeque<BoxFut>>,
-    sem: tokio::sync::Semaphore,
-}
+type PoolFutQueue = WorkQueue<BoxFut>;
 
 /// Future that suspends exactly once (self-waking), modeling a handler
 /// that hits an await point.
@@ -381,13 +388,7 @@ impl Future for YieldOnce {
 /// because `spawn` guarantees an initial poll, which re-registers the
 /// task's own waker per the `Future` contract.
 async fn run_pool_first_task(pool: Arc<PoolFutQueue>) {
-    loop {
-        let Ok(permit) = pool.sem.acquire().await else {
-            return;
-        };
-        permit.forget();
-        let item = pool.q.lock().unwrap().pop_front();
-        let Some(mut fut) = item else { continue };
+    while let Some(mut fut) = pool.pop().await {
         let ready =
             std::future::poll_fn(|cx| std::task::Poll::Ready(fut.as_mut().poll(cx).is_ready()))
                 .await;
@@ -464,16 +465,54 @@ async fn run_dispatcher(
     }
 }
 
+/// A producer has exactly one injection path. Keeping this choice in an enum
+/// prevents impossible combinations of optional queues and runtime handles.
+enum DispatchTarget {
+    Direct(tokio::runtime::Handle),
+    Batched(Vec<tokio::sync::mpsc::UnboundedSender<(usize, usize, Instant)>>),
+    ItemPool(Arc<PoolQueue>),
+    FuturePool(Arc<PoolFutQueue>),
+}
+
+impl DispatchTarget {
+    fn create(runtime: &tokio::runtime::Runtime, counters: &Arc<Counters>, args: &Args) -> Self {
+        match args.mode {
+            Mode::Direct => Self::Direct(runtime.handle().clone()),
+            Mode::Pool => {
+                let pool = Arc::new(PoolQueue::new(args.inflight.max(1)));
+                for _ in 0..args.pool_tasks.max(1) {
+                    runtime.spawn(run_pool_task(pool.clone(), counters.clone(), args.clone()));
+                }
+                Self::ItemPool(pool)
+            }
+            Mode::PoolFirst => {
+                let pool = Arc::new(PoolFutQueue::new(args.inflight.max(1)));
+                for _ in 0..args.pool_tasks.max(1) {
+                    runtime.spawn(run_pool_first_task(pool.clone()));
+                }
+                Self::FuturePool(pool)
+            }
+            Mode::Inline | Mode::Spawn | Mode::Chunk => {
+                let senders = (0..args.dispatchers.max(1))
+                    .map(|_| {
+                        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+                        runtime.spawn(run_dispatcher(receiver, counters.clone(), args.clone()));
+                        sender
+                    })
+                    .collect();
+                Self::Batched(senders)
+            }
+        }
+    }
+}
+
 /// Producer OS thread: keeps the window full by injecting batches, exactly
 /// like a poll thread forwarding parsed messages. Batches are assigned to
 /// simulated connections round-robin (one CQ drain usually carries a run
 /// of completions from the same connection).
 fn run_producer(
     counters: Arc<Counters>,
-    tx: Option<Vec<tokio::sync::mpsc::UnboundedSender<(usize, usize, Instant)>>>,
-    pool: Option<Arc<PoolQueue>>,
-    pool_fut: Option<Arc<PoolFutQueue>>,
-    handle: tokio::runtime::Handle,
+    target: DispatchTarget,
     args: Args,
     done: Arc<AtomicBool>,
 ) {
@@ -500,54 +539,50 @@ fn run_producer(
             .inflight
             .fetch_add(room as u64, Ordering::Relaxed);
         let t0 = Instant::now();
-        if let Some(pf) = &pool_fut {
-            // Build one boxed handler future per message; the poll thread
-            // pays the allocation, routing/deser stay lazy inside.
-            {
-                let mut q = pf.q.lock().unwrap();
-                for _ in 0..room {
-                    let heavy = rng.pick(heavy_thr);
-                    let pending = rng.pick(pending_thr);
-                    let counters = counters.clone();
-                    let spin_ns = if heavy {
-                        args.heavy_spin_ns
-                    } else {
-                        args.handler_spin_ns
-                    };
-                    q.push_back(Box::pin(async move {
-                        if pending {
-                            YieldOnce::default().await;
-                        }
-                        handle_msg(&counters, conn, spin_ns);
-                        if heavy_thr != 0 {
-                            counters.hist(heavy).record(t0.elapsed().as_nanos() as u64);
-                        }
-                    }) as BoxFut);
+        match &target {
+            DispatchTarget::FuturePool(pool) => {
+                // Build one boxed future per message on the producer thread.
+                {
+                    let mut queue = pool.items.lock().unwrap();
+                    for _ in 0..room {
+                        let heavy = rng.pick(heavy_thr);
+                        let pending = rng.pick(pending_thr);
+                        let counters = counters.clone();
+                        let spin_ns = if heavy {
+                            args.heavy_spin_ns
+                        } else {
+                            args.handler_spin_ns
+                        };
+                        queue.push_back(Box::pin(async move {
+                            if pending {
+                                YieldOnce::default().await;
+                            }
+                            handle_msg(&counters, conn, spin_ns);
+                            if heavy_thr != 0 {
+                                counters.hist(heavy).record(t0.elapsed().as_nanos() as u64);
+                            }
+                        }) as BoxFut);
+                    }
                 }
+                pool.available.add_permits(room);
             }
-            pf.sem.add_permits(room);
-            continue;
-        }
-        if let Some(pool) = &pool {
-            {
-                let mut q = pool.q.lock().unwrap();
-                for _ in 0..room {
-                    let heavy = rng.pick(heavy_thr);
-                    q.push_back(Box::new(WorkItem { conn, heavy, t0 }));
+            DispatchTarget::ItemPool(pool) => {
+                {
+                    let mut queue = pool.items.lock().unwrap();
+                    for _ in 0..room {
+                        let heavy = rng.pick(heavy_thr);
+                        queue.push_back(Box::new(WorkItem { conn, heavy, t0 }));
+                    }
                 }
+                pool.available.add_permits(room);
             }
-            pool.sem.add_permits(room);
-            continue;
-        }
-        match &tx {
-            Some(tx) => {
-                if tx[seq % tx.len()].send((room, conn, t0)).is_err() {
+            DispatchTarget::Batched(senders) => {
+                if senders[seq % senders.len()].send((room, conn, t0)).is_err() {
                     return;
                 }
             }
-            None => {
-                // Remote-inject path: one spawn per message from outside
-                // the runtime, like the pre-dispatcher architecture.
+            DispatchTarget::Direct(handle) => {
+                // One remote-injected spawn per message, outside the runtime.
                 for _ in 0..room {
                     let heavy = rng.pick(heavy_thr);
                     let counters = counters.clone();
@@ -572,24 +607,10 @@ fn run_producer(
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
+    init_tracing();
     let args = Args::parse();
-
-    let runtimes: Vec<tokio::runtime::Runtime> = (0..args.runtimes.max(1))
-        .map(|_| {
-            let mut builder = tokio::runtime::Builder::new_multi_thread();
-            builder.enable_all();
-            if args.worker_threads > 0 {
-                builder.worker_threads(args.worker_threads);
-            }
-            builder.build().expect("failed to build tokio runtime")
-        })
+    let runtimes: Vec<_> = (0..args.runtimes.max(1))
+        .map(|_| args.runtime.build())
         .collect();
 
     let done = Arc::new(AtomicBool::new(false));
@@ -601,56 +622,13 @@ fn main() {
         let counters = Arc::new(Counters::new(args.conns));
         producer_counters.push(counters.clone());
 
-        let pool = if args.mode == Mode::Pool {
-            let pool = Arc::new(PoolQueue {
-                q: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(
-                    args.inflight.max(1),
-                )),
-                sem: tokio::sync::Semaphore::new(0),
-            });
-            for _ in 0..args.pool_tasks.max(1) {
-                runtime.spawn(run_pool_task(pool.clone(), counters.clone(), args.clone()));
-            }
-            Some(pool)
-        } else {
-            None
-        };
-
-        let pool_fut = if args.mode == Mode::PoolFirst {
-            let pool = Arc::new(PoolFutQueue {
-                q: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(
-                    args.inflight.max(1),
-                )),
-                sem: tokio::sync::Semaphore::new(0),
-            });
-            for _ in 0..args.pool_tasks.max(1) {
-                runtime.spawn(run_pool_first_task(pool.clone()));
-            }
-            Some(pool)
-        } else {
-            None
-        };
-
-        let tx = if matches!(args.mode, Mode::Direct | Mode::Pool | Mode::PoolFirst) {
-            None
-        } else {
-            let txs = (0..args.dispatchers.max(1))
-                .map(|_| {
-                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                    runtime.spawn(run_dispatcher(rx, counters.clone(), args.clone()));
-                    tx
-                })
-                .collect();
-            Some(txs)
-        };
-
-        let handle = runtime.handle().clone();
+        let target = DispatchTarget::create(runtime, &counters, &args);
         let args = args.clone();
         let done = done.clone();
         producer_threads.push(
             std::thread::Builder::new()
                 .name(format!("producer-{p}"))
-                .spawn(move || run_producer(counters, tx, pool, pool_fut, handle, args, done))
+                .spawn(move || run_producer(counters, target, args, done))
                 .expect("failed to spawn producer thread"),
         );
     }
@@ -682,8 +660,8 @@ fn main() {
         "mode={:?} runtimes={} workers={} dispatchers={} producers={} batch={} chunk={} inflight={} conns={} spin={}ns heavy={}@{}ns",
         args.mode,
         runtimes.len(),
-        if args.worker_threads > 0 {
-            args.worker_threads.to_string()
+        if args.runtime.worker_threads > 0 {
+            args.runtime.worker_threads.to_string()
         } else {
             "ncpu".to_string()
         },

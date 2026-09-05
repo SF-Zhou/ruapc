@@ -1,3 +1,8 @@
+//! Shared service contracts, setup, and verified workloads for the examples.
+
+pub mod app;
+pub mod workload;
+
 use ruapc::{Context, Result, WithBuffers};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

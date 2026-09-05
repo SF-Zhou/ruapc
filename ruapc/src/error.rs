@@ -16,6 +16,9 @@ pub enum ErrorKind {
     NotConnected,
     /// Local buffer capacity is too small for the requested transfer.
     BufferTooSmall,
+    /// The transfer finished, but an active reader still owns the source
+    /// buffers and prevents their return to the caller.
+    BuffersInUse,
     /// The request carries no memory regions for the attempted operation
     /// (client did not attach buffers via `with_read_buffers` /
     /// `with_write_buffers`).
@@ -215,10 +218,10 @@ impl std::fmt::Display for Error {
 /// are handed back here whenever they survived the operation, so callers
 /// can reuse them (e.g. to retry) instead of losing them to the pool.
 ///
-/// The buffers are `None` only for connection-fatal failures where they
-/// are still referenced by in-flight hardware work (e.g. RDMA READs whose
-/// completions have not arrived); in that case they are returned to the
-/// pool once the underlying work requests have been flushed.
+/// The buffers are `None` when an active reader or hardware operation still
+/// owns them (e.g. RDMA READs whose completions have not arrived). They return
+/// to the pool after the last holder releases them; recovery never forces an
+/// in-flight allocation back into circulation.
 ///
 /// Converting into [`Error`] (e.g. via the `?` operator) drops any
 /// recovered buffers back to the pool.

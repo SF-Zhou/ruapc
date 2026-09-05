@@ -40,6 +40,6 @@ mod qp_connection;
 pub use qp_connection::QpConnectionConfig;
 
 mod queue_pair;
-pub use queue_pair::{Completion, MAX_GATHER_SGE, QueuePair, ReadSge, WrBuffers};
+pub use queue_pair::{MAX_GATHER_SGE, QueuePair, ReadSge, WrBuffers};
 
 mod wr_slots;

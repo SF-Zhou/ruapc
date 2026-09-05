@@ -1,16 +1,11 @@
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashMap, sync::Arc};
 
 use foldhash::fast::RandomState;
-use indexmap::IndexMap;
-use openapiv3::{
-    Components, MediaType, OpenAPI, Operation, Paths, ReferenceOr, RequestBody, Response,
-    Responses, StatusCode,
-};
-use schemars::{JsonSchema, Schema, SchemaGenerator};
-use serde::{Deserialize, Serialize};
+use openapiv3::OpenAPI;
+use schemars::JsonSchema;
+
+mod schema;
+pub use schema::MethodSchema;
 
 #[cfg(feature = "rdma")]
 use crate::rdma::RdmaBootstrapService;
@@ -22,18 +17,6 @@ use crate::{
 
 /// Type alias for service method handler functions.
 type Func = Box<dyn Fn(Context, Payload) -> Result<()> + Send + Sync>;
-
-/// JSON schema information for a service method.
-///
-/// Contains the request and response schemas exposed through reflection and
-/// OpenAPI generation.
-#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
-pub struct MethodSchema {
-    /// JSON schema for the request type.
-    pub request_schema: Schema,
-    /// JSON schema for the response type.
-    pub response_schema: Schema,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MethodVisibility {
@@ -72,11 +55,7 @@ struct Method {
 /// EchoService::ruapc_export(Arc::new(EchoImpl), &mut router);
 /// ```
 pub struct Router {
-    /// Schema generator for JSON schemas.
-    generator: Mutex<SchemaGenerator>,
-    // Keep internal schemas out of the public generator and its OpenAPI
-    // components while retaining complete method metadata in the registry.
-    internal_generator: Mutex<SchemaGenerator>,
+    schemas: schema::SchemaRegistry,
     /// Registered methods mapped by name (e.g., "ServiceName/method_name").
     methods: HashMap<String, Method, RandomState>,
     /// Generated OpenAPI specification.
@@ -85,12 +64,8 @@ pub struct Router {
 
 impl Default for Router {
     fn default() -> Self {
-        let settings = schemars::generate::SchemaSettings::openapi3();
         let mut this = Self {
-            generator: Mutex::new(SchemaGenerator::new(settings)),
-            internal_generator: Mutex::new(SchemaGenerator::new(
-                schemars::generate::SchemaSettings::openapi3(),
-            )),
+            schemas: schema::SchemaRegistry::default(),
             methods: HashMap::default(),
             openapi: OpenAPI::default(),
         };
@@ -164,26 +139,10 @@ impl Router {
             "RPC method `{name}` is already registered"
         );
 
-        let (request_schema, response_schema) = {
-            let generator = if visibility.is_public() {
-                &self.generator
-            } else {
-                &self.internal_generator
-            };
-            let mut generator = generator.lock().unwrap();
-            (
-                generator.subschema_for::<Req>(),
-                generator.subschema_for::<Rsp>(),
-            )
-        };
-
         self.methods.insert(
             name.to_string(),
             Method {
-                schema: MethodSchema {
-                    request_schema,
-                    response_schema,
-                },
+                schema: self.schemas.register::<Req, Rsp>(visibility.is_public()),
                 visibility,
                 func,
             },
@@ -210,83 +169,7 @@ impl Router {
     /// let openapi_json = serde_json::to_string_pretty(&router.openapi).unwrap();
     /// ```
     pub fn build_open_api(&mut self) -> Result<()> {
-        let mut paths = BTreeMap::new();
-        for (name, schema) in self.method_schemas() {
-            let request_schema = serde_json::to_value(&schema.request_schema)?;
-            let response_schema = serde_json::to_value(&schema.response_schema)?;
-
-            let request_body = RequestBody {
-                content: {
-                    IndexMap::from([(
-                        "application/json".to_string(),
-                        MediaType {
-                            schema: Some(serde_json::from_value(request_schema)?),
-                            ..Default::default()
-                        },
-                    )])
-                },
-                required: true,
-                ..Default::default()
-            };
-
-            let response = Response {
-                content: {
-                    IndexMap::from([(
-                        "application/json".to_string(),
-                        MediaType {
-                            schema: Some(serde_json::from_value(response_schema)?),
-                            ..Default::default()
-                        },
-                    )])
-                },
-                ..Default::default()
-            };
-
-            let operation = Operation {
-                operation_id: Some(format!("/{name}")),
-                request_body: Some(ReferenceOr::Item(request_body)),
-                responses: Responses {
-                    responses: IndexMap::from([(
-                        StatusCode::Code(200),
-                        ReferenceOr::Item(response),
-                    )]),
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-
-            let path_item = openapiv3::PathItem {
-                post: Some(operation),
-                ..Default::default()
-            };
-
-            paths.insert(format!("/{name}"), ReferenceOr::Item(path_item));
-        }
-
-        let definitions = {
-            let generator = self.generator.lock().unwrap();
-            let mut snapshot = generator.clone();
-            snapshot.take_definitions(true)
-        };
-        let schemas = definitions
-            .into_iter()
-            .map(|(name, schema)| Ok((name, serde_json::from_value(schema)?)))
-            .collect::<Result<IndexMap<_, _>>>()?;
-
-        // Create base OpenAPI specification with natural builder pattern
-        self.openapi = OpenAPI {
-            openapi: "3.0.0".to_string(),
-            components: Some(Components {
-                schemas,
-                ..Default::default()
-            }),
-            paths: Paths {
-                paths: paths.into_iter().collect(),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
+        self.openapi = self.schemas.build(self.method_schemas())?;
         Ok(())
     }
 

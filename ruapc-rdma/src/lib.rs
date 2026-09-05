@@ -8,8 +8,8 @@
 //! - **RAII wrappers**: All libibverbs resources (context, PD, CQ, QP, MR,
 //!   completion channel) are wrapped in types that automatically clean up on drop.
 //! - **QueuePair**: High-level [`send`](QueuePair::send) / [`recv`](QueuePair::recv)
-//!   take ownership of a [`ruapc_bufpool::Buffer`] and return it via
-//!   [`Completion`] when the work request completes; [`read_sges`](QueuePair::read_sges)
+//!   take ownership of a [`ruapc_bufpool::Buffer`]. Poll [`CompletionQueue`] and
+//!   recover buffers with [`take_buffer`](QueuePair::take_buffer) after completion; [`read_sges`](QueuePair::read_sges)
 //!   posts vectored RDMA READs from caller-managed memory.
 //! - **Type-safe bindings**: Generated FFI types have custom Rust wrappers
 //!   (`FwVer`, `Guid`, `WRID`, `LinkLayer`) substituted at build time.
@@ -57,9 +57,8 @@ pub use types::{DeviceInfo, FwVer, Gid, GidType, Guid, LinkLayer, Port, WRID, WR
 
 mod verbs;
 pub use verbs::{
-    ActiveDevice, CompChannel, Completion, CompletionQueue, Context, Device, DeviceList,
-    MAX_GATHER_SGE, MemoryRegion, ProtectionDomain, QpConnectionConfig, QueuePair, ReadSge,
-    WrBuffers,
+    ActiveDevice, CompChannel, CompletionQueue, Context, Device, DeviceList, MAX_GATHER_SGE,
+    MemoryRegion, ProtectionDomain, QpConnectionConfig, QueuePair, ReadSge, WrBuffers,
 };
 
 #[cfg(test)]

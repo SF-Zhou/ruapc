@@ -6,7 +6,20 @@ use std::sync::Arc;
 use crate::{AlignedMemory, Registration};
 
 /// Trait for a collection of devices that can register memory.
-pub trait Devices: Send + Sync + std::fmt::Debug {
+///
+/// # Safety
+///
+/// The pool grants exclusive access to individual allocations through
+/// [`crate::Buffer`]. Implementations may retain the supplied `Arc` to keep a
+/// registration alive, but must not expose it to callers or access its bytes
+/// independently of those allocations. Any CPU or device access must preserve
+/// the allocation's lifetime and obey its shared/exclusive borrowing rules.
+/// In particular, retaining the `Arc` does not authorize reading its slice while
+/// a buffer can be mutated or returned to the pool.
+///
+/// Registration handle destruction must end any use of its region before it
+/// returns; the pool releases backing memory after dropping all handles.
+pub unsafe trait Devices: Send + Sync + std::fmt::Debug {
     /// Returns the number of devices.
     fn len(&self) -> usize;
 
@@ -23,7 +36,8 @@ pub trait Devices: Send + Sync + std::fmt::Debug {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct EmptyDevices;
 
-impl Devices for EmptyDevices {
+// SAFETY: this collection neither retains nor accesses the supplied memory.
+unsafe impl Devices for EmptyDevices {
     fn len(&self) -> usize {
         0
     }

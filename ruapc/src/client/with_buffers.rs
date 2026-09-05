@@ -1,9 +1,12 @@
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{Buffer, Context, core::WriteTarget};
+use crate::{
+    Buffer, Context,
+    remote_memory::{ReadSource, WriteTarget},
+};
 
 use super::{Client, ReadAttachment};
 
@@ -17,8 +20,8 @@ use super::{Client, ReadAttachment};
 ///
 /// The attached read buffers form the request's *read space*, advertised
 /// in the request metadata; the server reads from it via
-/// [`Context::remote_read`](crate::Context::remote_read). They remain
-/// borrowed by the caller.
+/// [`Context::remote_read`](crate::Context::remote_read). They are
+/// owned by this wrapper and kept immutable while pending reads hold them.
 ///
 /// # Write buffers
 ///
@@ -34,11 +37,11 @@ use super::{Client, ReadAttachment};
 ///
 /// ```rust,ignore
 /// // Server reads from the client's buffers:
-/// let rsp = client.with_read_buffers(&bufs).upload(&ctx, &req).await?;
+/// let rsp = client.with_read_buffers(bufs).upload(&ctx, &req).await?;
 ///
 /// // Upload and download in a single call:
 /// let (rsp, out) = client
-///     .with_read_buffers(&src_bufs)
+///     .with_read_buffers(src_bufs)
 ///     .with_write_buffers(dst_bufs)
 ///     .transform(&ctx, &req)
 ///     .await?
@@ -46,7 +49,7 @@ use super::{Client, ReadAttachment};
 /// ```
 pub struct ClientWithBuffers<'a> {
     client: &'a Client,
-    read_buffers: Vec<&'a Buffer>,
+    read_source: Option<Arc<ReadSource>>,
     read_charge_bytes: Option<u64>,
     write_buffers: Mutex<Option<Vec<Buffer>>>,
 }
@@ -57,24 +60,43 @@ impl<'a> ClientWithBuffers<'a> {
     pub(super) fn new(client: &'a Client) -> Self {
         Self {
             client,
-            read_buffers: Vec::new(),
+            read_source: None,
             read_charge_bytes: None,
             write_buffers: Mutex::new(None),
         }
     }
 
-    /// Appends one buffer to the request's read space.
+    /// Replaces the request's read space with one owned buffer.
     #[must_use]
-    pub fn with_read_buffer(mut self, buffer: &'a Buffer) -> Self {
-        self.read_buffers.push(buffer);
+    pub fn with_read_buffer(self, buffer: Buffer) -> Self {
+        self.with_read_buffers(vec![buffer])
+    }
+
+    /// Replaces the request's read space with owned buffers.
+    #[must_use]
+    pub fn with_read_buffers(mut self, buffers: Vec<Buffer>) -> Self {
+        self.read_source = (!buffers.is_empty()).then(|| Arc::new(ReadSource { buffers }));
         self
     }
 
-    /// Appends buffers to the request's read space.
-    #[must_use]
-    pub fn with_read_buffers(mut self, buffers: &'a [Buffer]) -> Self {
-        self.read_buffers.extend(buffers.iter());
-        self
+    /// Returns an immutable view of the attached source buffers.
+    pub fn read_buffers(&self) -> &[Buffer] {
+        self.read_source
+            .as_ref()
+            .map_or(&[], |source| source.buffers.as_slice())
+    }
+
+    /// Recovers the source buffers when no pending request or local reader
+    /// still holds them. On `None`, the wrapper retains its source so the
+    /// caller can retry after those operations finish.
+    pub fn take_read_buffers(&mut self) -> Option<Vec<Buffer>> {
+        match Arc::try_unwrap(self.read_source.take()?) {
+            Ok(source) => Some(source.buffers),
+            Err(source) => {
+                self.read_source = Some(source);
+                None
+            }
+        }
     }
 
     /// Overrides the SEND bandwidth charge for an internal request whose
@@ -124,7 +146,7 @@ impl<'a> ClientWithBuffers<'a> {
             .ruapc_request(
                 ctx,
                 req,
-                ReadAttachment::new(&self.read_buffers, self.read_charge_bytes),
+                ReadAttachment::new(self.read_source.as_ref(), self.read_charge_bytes),
                 &mut target,
                 Some(&mut returned),
                 method_name,
@@ -155,6 +177,57 @@ impl<'a> ClientWithBuffers<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn forgotten_request_cannot_release_an_active_read_source() {
+        use crate::{
+            MsgMeta, SocketPoolConfig,
+            services::{DescribeRequest, ReflectionService as _},
+        };
+        use std::{
+            future::Future,
+            task::{Context as TaskContext, Poll, Waker},
+        };
+
+        let base = Context::create(&SocketPoolConfig::default()).unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let ctx = Context::server_ctx(
+            &base.state,
+            crate::Socket::TCP(crate::tcp::TcpSocket::new(sender)),
+            MsgMeta {
+                timeout_ms: 30_000,
+                ..Default::default()
+            },
+        );
+        let mut buffer = ctx.state.buffer_pool.allocate(16).unwrap();
+        buffer.set_len(4);
+        buffer.copy_from_slice(b"data");
+        let client = Client::default();
+        let mut wrapper = client.with_read_buffer(buffer);
+        let request_payload = DescribeRequest::default();
+        let mut request = Box::pin(wrapper.describe(&ctx, &request_payload));
+        assert!(matches!(
+            request
+                .as_mut()
+                .poll(&mut TaskContext::from_waker(Waker::noop())),
+            Poll::Pending
+        ));
+        // Forgetting a future is safe Rust: source ownership must not depend on
+        // the request's Drop running before the wrapper can be reused/dropped.
+        std::mem::forget(request);
+        assert!(wrapper.take_read_buffers().is_none());
+        let source = ctx.state.waiter.read_source(0).unwrap();
+        ctx.state
+            .waiter
+            .expire(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        assert!(wrapper.take_read_buffers().is_none());
+        assert_eq!(
+            source.read_inline(&[crate::CopyOp::new(0, 0, 4)]).unwrap(),
+            b"data"
+        );
+        drop(source);
+        assert_eq!(&wrapper.take_read_buffers().unwrap()[0][..], b"data");
+    }
 
     #[tokio::test]
     async fn test_write_buffers_recoverable_after_failed_call() {

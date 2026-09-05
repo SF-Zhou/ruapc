@@ -10,12 +10,14 @@
 //! and returned to the buddy pool beyond it, immediately when the buddy pool
 //! has pending demand (async waiters or an anti-starvation reservation), or
 //! in bulk when a buddy allocation misses. Returning a slab is simply
-//! dropping its backing [`Buffer`], which flows through the regular buddy
+//! releasing its backing token, which flows through the regular buddy
 //! free path (merging, waiter handoff and reservation absorption included).
 
 use std::collections::HashMap;
 use std::ptr::NonNull;
+use std::sync::Arc;
 
+use crate::BufferPool;
 use crate::buddy::{BuddyBlock, SIZE_1MIB};
 use crate::buffer::Buffer;
 
@@ -53,11 +55,60 @@ pub(crate) fn size_to_class(size: usize) -> Option<usize> {
     SLAB_CLASS_SIZES.iter().position(|&s| size <= s)
 }
 
+/// Exclusive ownership of a slab chunk while it is outside the free bitmap.
+/// It is moved between a thread cache and a live Buffer, never copied. The pool
+/// owns its backing block; callers must keep the pool alive while using it.
+pub(crate) struct RawChunk {
+    pub(crate) ptr: NonNull<u8>,
+    pub(crate) index: usize,
+    pub(crate) block: NonNull<BuddyBlock>,
+}
+
+// SAFETY: ownership is transferred, not shared; slab bitmaps and cache magazines
+// synchronize which thread owns each chunk. The owning pool keeps the block alive.
+unsafe impl Send for RawChunk {}
+
+impl RawChunk {
+    pub(crate) fn into_buffer(self, class: usize, pool: &Arc<BufferPool>) -> Buffer {
+        // SAFETY: the token owns one allocated chunk and the Arc retains its pool.
+        unsafe { Buffer::new_chunk(self.ptr, class, self.index, self.block, Arc::clone(pool)) }
+    }
+}
+
+/// A buddy leaf owned by the slab layer inside its pool.
+///
+/// Unlike a public Buffer, this token does not retain an Arc to the pool: that
+/// would create a pool -> slab -> Buffer -> pool ownership cycle. Live chunks
+/// retain the pool instead. The token is returned explicitly after releasing the
+/// slab lock, or forgotten when the pool drops its blocks during destruction.
+pub(crate) struct SlabBacking {
+    ptr: NonNull<u8>,
+    index: usize,
+    block: NonNull<BuddyBlock>,
+}
+
+// SAFETY: a SlabBacking is owned by its pool's slab layer and accessed under the
+// corresponding class mutex. Its block outlives the slab layer.
+unsafe impl Send for SlabBacking {}
+
+impl SlabBacking {
+    fn new(buffer: Buffer) -> Self {
+        debug_assert_eq!(buffer.capacity(), SLAB_BACKING_SIZE);
+        let ptr = NonNull::new(buffer.as_ptr().cast_mut()).unwrap();
+        let (level, index, block) = buffer.into_raw_parts();
+        debug_assert_eq!(level, 0);
+        Self { ptr, index, block }
+    }
+
+    pub(crate) fn release(self, pool: &Arc<BufferPool>) {
+        pool.return_buffer(0, self.index, self.block);
+    }
+}
+
 /// A single slab: a 1 MiB buddy leaf carved into equal chunks.
 struct Slab {
-    /// Backing buffer from the buddy pool. Dropping it returns the memory
-    /// through the regular buddy free path.
-    backing: Buffer,
+    /// Buddy leaf retained without an Arc back to the owning pool.
+    backing: SlabBacking,
     /// Bitmask of free chunks (bit `i` set = chunk `i` is free).
     free_mask: u64,
     /// Whether this slab's address is currently on the `available` stack.
@@ -96,9 +147,8 @@ impl SlabClass {
 
     /// Takes a free chunk from any available slab.
     ///
-    /// Returns the chunk pointer, its index within the slab, and the
-    /// `BuddyBlock` containing it (for device registration lookups).
-    pub(crate) fn alloc(&mut self) -> Option<(NonNull<u8>, usize, NonNull<BuddyBlock>)> {
+    /// The returned token owns the chunk until it is returned to this bitmap.
+    pub(crate) fn alloc(&mut self) -> Option<RawChunk> {
         loop {
             let &addr = self.available.last()?;
             let Some(slab) = self.slabs.get_mut(&addr) else {
@@ -124,14 +174,13 @@ impl SlabClass {
             }
 
             let ptr = unsafe {
-                NonNull::new_unchecked(
-                    slab.backing
-                        .as_ptr()
-                        .cast_mut()
-                        .add(index * self.chunk_size),
-                )
+                NonNull::new_unchecked(slab.backing.ptr.as_ptr().add(index * self.chunk_size))
             };
-            return Some((ptr, index, slab.backing.block_ptr()));
+            return Some(RawChunk {
+                ptr,
+                index,
+                block: slab.backing.block,
+            });
         }
     }
 
@@ -147,7 +196,7 @@ impl SlabClass {
         let prev = self.slabs.insert(
             addr,
             Slab {
-                backing,
+                backing: SlabBacking::new(backing),
                 free_mask: self.full_mask,
                 in_available: true,
             },
@@ -168,7 +217,7 @@ impl SlabClass {
         chunk_addr: usize,
         index: usize,
         max_empty: usize,
-    ) -> Option<Buffer> {
+    ) -> Option<SlabBacking> {
         let base = chunk_addr & !(SLAB_BACKING_SIZE - 1);
         let slab = self
             .slabs
@@ -196,7 +245,7 @@ impl SlabClass {
     /// Removes all cached empty slabs, returning their backing buffers so
     /// the caller can release them to the buddy pool (outside the class
     /// lock).
-    pub(crate) fn drain_empty(&mut self) -> Vec<Buffer> {
+    pub(crate) fn drain_empty(&mut self) -> Vec<SlabBacking> {
         if self.empty_count == 0 {
             return Vec::new();
         }

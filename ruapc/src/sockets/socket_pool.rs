@@ -299,7 +299,7 @@ impl SocketPool {
     /// peer that stalls mid-prefix (then only a genuine — if broken — RuaPC
     /// client is plausible, so fall back to TCP).
     async fn peek_is_tcp_magic(stream: &tokio::net::TcpStream) -> Result<bool> {
-        let magic = crate::sockets::tcp::MAGIC_NUM.to_be_bytes();
+        let magic = crate::msg::frame::MAGIC_NUM.to_be_bytes();
         let mut buf = [0u8; std::mem::size_of::<u32>()];
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
         loop {

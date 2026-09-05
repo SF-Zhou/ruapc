@@ -1,29 +1,18 @@
 use clap::Parser;
-#[cfg(feature = "rdma")]
-use ruapc::rdma::RdmaSocketPoolConfig;
-use ruapc::*;
+use ruapc::{Client, Context, Endpoint};
 use ruapc_demo::{
-    EchoService, GreetService, MemBenchService, ReadCrcReq, Request, WriteCrcReq, crc32c_of,
-    fill_pattern,
+    EchoService, GreetService, Request,
+    app::{PoolOptions, RuntimeOptions, init_tracing},
+    workload::{Rpc, Workload},
 };
 use std::{
+    num::NonZeroUsize,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
-
-/// Which RPC to exercise (single-shot, stress, and bench modes).
-#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Rpc {
-    /// Plain payload echo.
-    Echo,
-    /// Server remote-reads the client's buffer and returns its CRC32C.
-    Read,
-    /// Server remote-writes into the client's buffer and returns the CRC32C.
-    Write,
-}
 
 #[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
@@ -41,7 +30,7 @@ pub struct Args {
     pub use_msgpack: bool,
 
     /// Enable stress testing.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, conflicts_with = "bench")]
     pub stress: bool,
 
     /// Enable latency benchmark (reports throughput and latency percentiles).
@@ -55,7 +44,7 @@ pub struct Args {
 
     /// The number of coroutines.
     #[arg(long, default_value = "32")]
-    pub coroutines: usize,
+    pub coroutines: NonZeroUsize,
 
     /// Request payload size in bytes (bench mode).
     #[arg(long, default_value = "1024")]
@@ -75,253 +64,110 @@ pub struct Args {
     #[arg(long, default_value = "3")]
     pub warmup_secs: u64,
 
-    /// RDMA: number of (CQ + poll thread) shards per device.
-    #[arg(long, default_value = "1")]
-    pub poll_threads: u32,
+    #[command(flatten)]
+    pub runtime: RuntimeOptions,
 
-    /// RDMA: number of connections (QPs) per peer; requests are striped.
-    #[arg(long, default_value = "1")]
-    pub conns_per_peer: u32,
-
-    /// RDMA: comma-separated device allowlist (e.g. "mlx5_0").
-    #[arg(long, value_delimiter = ',')]
-    pub rdma_devices: Vec<String>,
-
-    /// Buffer pool memory limit in MiB (0 = library default).
-    #[arg(long, default_value = "0")]
-    pub pool_mem_mb: usize,
-
-    /// Tokio worker threads (0 = number of CPUs).
-    #[arg(long, default_value = "0")]
-    pub worker_threads: usize,
-
-    /// RDMA: poll-thread busy-poll window in microseconds.
-    #[arg(long, default_value = "50")]
-    pub poll_spin_us: u64,
-
-    /// RDMA: number of dispatch worker tasks shared by all poll threads.
-    #[arg(long, default_value = "32")]
-    pub dispatch_workers: u32,
-
-    /// RDMA: receive ring depth per connection (negotiated to the minimum
-    /// of both sides); the send window is half of it. Small values force
-    /// aggregation under load; raise for large-message pipelines.
-    #[arg(long, default_value = "8")]
-    pub recv_queue_len: u32,
-
-    /// RDMA: GRH traffic class (RoCE DSCP/ECN byte) for the connections
-    /// this client creates; the server applies the same value on its side.
-    #[arg(long, default_value = "0")]
-    pub traffic_class: u8,
+    #[command(flatten)]
+    pub pool: PoolOptions,
 }
 
-fn socket_pool_config(args: &Args) -> SocketPoolConfig {
-    #[allow(unused_mut)]
-    let mut config = SocketPoolConfig {
-        buffer_pool_memory: args.pool_mem_mb * 1024 * 1024,
-        ..Default::default()
-    };
-    #[cfg(feature = "rdma")]
-    if args.endpoint.transport() == Transport::RDMA {
-        let mut rdma = RdmaSocketPoolConfig::default();
-        rdma.polling.poll_threads_per_device = args.poll_threads;
-        rdma.polling.poll_spin_us = args.poll_spin_us;
-        rdma.polling.dispatch_workers = args.dispatch_workers;
-        rdma.peers.connections_per_peer = args.conns_per_peer;
-        rdma.path.device_filter = args.rdma_devices.clone();
-        rdma.connection.recv_queue_len = args.recv_queue_len;
-        rdma.connection.traffic_class = args.traffic_class;
-        config.rdma = Some(rdma);
-    }
-    config
-}
-
-/// Per-coroutine benchmark operation: owns the buffers it needs and issues
-/// one verified RPC per `call`.
-enum BenchOp {
-    Echo(Request),
-    Read {
-        bufs: Vec<Buffer>,
-        expected_crc: u32,
-    },
-    Write {
-        bufs: Option<Vec<Buffer>>,
-        len: usize,
-    },
-}
-
-impl BenchOp {
-    /// Allocates and fills the buffers up front (outside the timed loop) so
-    /// pool growth / device registration doesn't pollute latency numbers.
-    async fn create(args: &Args, ctx: &Context, payload: Request, seed: u64) -> Self {
-        match args.rpc {
-            Rpc::Echo => BenchOp::Echo(payload),
-            Rpc::Read => {
-                let len = args.buffer_size;
-                let mut buf = ctx
-                    .state
-                    .buffer_pool
-                    .async_allocate(len)
-                    .await
-                    .expect("failed to allocate read buffer");
-                fill_pattern(&mut buf[..len], seed);
-                buf.set_len(len);
-                let expected_crc = crc32c_of([&buf]);
-                BenchOp::Read {
-                    bufs: vec![buf],
-                    expected_crc,
-                }
-            }
-            Rpc::Write => {
-                let len = args.buffer_size;
-                let mut buf = ctx
-                    .state
-                    .buffer_pool
-                    .async_allocate(len)
-                    .await
-                    .expect("failed to allocate write buffer");
-                buf.set_len(len);
-                BenchOp::Write {
-                    bufs: Some(vec![buf]),
-                    len,
-                }
-            }
-        }
+impl Args {
+    fn context(&self) -> Context {
+        #[cfg(feature = "rdma")]
+        let enable_rdma = self.endpoint.transport() == ruapc::Transport::RDMA;
+        #[cfg(not(feature = "rdma"))]
+        let enable_rdma = false;
+        Context::create(&self.pool.config(enable_rdma))
+            .expect("failed to create RPC context")
+            .with_endpoint(self.endpoint)
     }
 
-    async fn call(&mut self, client: &Client, ctx: &Context) -> Result<()> {
-        match self {
-            BenchOp::Echo(payload) => {
-                client.echo(ctx, payload).await?;
-                Ok(())
-            }
-            BenchOp::Read { bufs, expected_crc } => {
-                let crc = client
-                    .with_read_buffers(bufs)
-                    .read_crc(ctx, &ReadCrcReq {})
-                    .await?;
-                if crc != *expected_crc {
-                    return Err(Error::new(
-                        ErrorKind::InvalidArgument,
-                        format!("crc32c mismatch: got {crc:#010x}, expect {expected_crc:#010x}"),
-                    ));
-                }
-                Ok(())
-            }
-            BenchOp::Write { bufs, len } => {
-                // Replace the buffers if a previous failed call could not
-                // recover them (its transfer may still be in flight).
-                let dst = match bufs.take() {
-                    Some(b) => b,
-                    None => {
-                        let mut b = ctx
-                            .state
-                            .buffer_pool
-                            .async_allocate(*len)
-                            .await
-                            .map_err(|e| Error::new(ErrorKind::InvalidArgument, e.to_string()))?;
-                        b.set_len(*len);
-                        vec![b]
-                    }
-                };
-                let wrapper = client.with_write_buffers(dst);
-                match wrapper.write_crc(ctx, &WriteCrcReq { len: *len }).await {
-                    Ok(rsp) => {
-                        let (expected_crc, returned) = rsp.into_parts();
-                        let crc = crc32c_of(&returned);
-                        *bufs = Some(returned);
-                        if crc != expected_crc {
-                            return Err(Error::new(
-                                ErrorKind::InvalidArgument,
-                                format!(
-                                    "crc32c mismatch: got {crc:#010x}, expect {expected_crc:#010x}"
-                                ),
-                            ));
-                        }
-                        Ok(())
-                    }
-                    Err(e) => {
-                        *bufs = wrapper.take_write_buffers();
-                        Err(e)
-                    }
-                }
-            }
-        }
+    async fn workload<'a>(
+        &self,
+        client: &'a Client,
+        ctx: &Context,
+        payload: Request,
+        seed: usize,
+    ) -> Workload<'a> {
+        Workload::create(
+            client,
+            self.rpc,
+            ctx,
+            payload,
+            self.buffer_size,
+            seed as u64,
+        )
+        .await
+        .expect("failed to prepare RPC workload")
     }
 }
 
 #[derive(Default)]
-struct State {
+struct Counters {
     total: AtomicUsize,
     fails: AtomicUsize,
 }
 
 async fn stress_test(args: Args) {
-    let state = Arc::new(State::default());
+    let state = Arc::new(Counters::default());
     let start_time = std::time::Instant::now();
-    let mut tasks = vec![];
-    let ctx = Context::create(&socket_pool_config(&args))
-        .unwrap()
-        .with_endpoint(args.endpoint);
-    for i in 0..args.coroutines {
+    let mut tasks = tokio::task::JoinSet::new();
+    let ctx = args.context();
+    for i in 0..args.coroutines.get() {
         let state = state.clone();
         let ctx = ctx.clone();
         let args = args.clone();
-        tasks.push(tokio::spawn(async move {
+        tasks.spawn(async move {
             let client = Client {
                 timeout: Duration::from_secs(5),
                 use_msgpack: args.use_msgpack,
                 ..Default::default()
             };
-            let mut op = BenchOp::create(&args, &ctx, Request(args.value.clone()), i as u64).await;
+            let mut op = args
+                .workload(&client, &ctx, Request(args.value.clone()), i)
+                .await;
             while start_time.elapsed().as_secs() < args.secs {
                 for _ in 0..256 {
-                    let result = op.call(&client, &ctx).await;
-                    state.total.fetch_add(1, Ordering::AcqRel);
+                    let result = op.call(&ctx).await;
+                    state.total.fetch_add(1, Ordering::Relaxed);
                     if result.is_err() {
-                        state.fails.fetch_add(1, Ordering::AcqRel);
+                        state.fails.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
-        }));
+        });
     }
-    tokio::select! {
-        _ = async {
-            for task in tasks {
-                task.await.unwrap();
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    while !tasks.is_empty() {
+        tokio::select! {
+            Some(result) = tasks.join_next() => {
+                result.expect("stress worker failed");
             }
-        } => {
-        }
-        _ = async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                interval.tick().await;
-                let total = state.total.swap(0, Ordering::AcqRel);
-                let fails = state.fails.swap(0, Ordering::AcqRel);
+            _ = interval.tick() => {
+                let total = state.total.swap(0, Ordering::Relaxed);
+                let fails = state.fails.swap(0, Ordering::Relaxed);
                 tracing::info!("QPS: {total}/s, fails: {fails}/s");
             }
-        } => {
         }
     }
 }
 
 async fn bench_test(args: Args) {
-    let ctx = Context::create(&socket_pool_config(&args))
-        .unwrap()
-        .with_endpoint(args.endpoint);
+    let ctx = args.context();
 
     let payload = Request("x".repeat(args.payload_size));
     let warmup = Duration::from_secs(args.warmup_secs);
     let total = Duration::from_secs(args.secs);
     assert!(total > warmup, "--secs must be larger than --warmup-secs");
-    let start = std::time::Instant::now();
+    let ready = Arc::new(tokio::sync::Barrier::new(args.coroutines.get()));
 
-    let mut tasks = Vec::with_capacity(args.coroutines);
-    for i in 0..args.coroutines {
+    let mut tasks = tokio::task::JoinSet::new();
+    for i in 0..args.coroutines.get() {
         let ctx = ctx.clone();
         let payload = payload.clone();
         let args = args.clone();
-        tasks.push(tokio::spawn(async move {
+        let ready = ready.clone();
+        tasks.spawn(async move {
             // Latency in nanoseconds, 1ns..60s, 3 significant digits.
             let mut hist = hdrhistogram::Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3)
                 .expect("failed to create histogram");
@@ -330,7 +176,11 @@ async fn bench_test(args: Args) {
                 use_msgpack: args.use_msgpack,
                 ..Default::default()
             };
-            let mut op = BenchOp::create(&args, &ctx, payload, i as u64).await;
+            let mut op = args.workload(&client, &ctx, payload, i).await;
+            // Every worker has allocated and initialized its buffers before
+            // warmup begins, so pool growth cannot consume measurement time.
+            ready.wait().await;
+            let start = std::time::Instant::now();
             let mut fails = 0u64;
             loop {
                 let elapsed = start.elapsed();
@@ -338,25 +188,26 @@ async fn bench_test(args: Args) {
                     break;
                 }
                 let t = std::time::Instant::now();
-                let result = op.call(&client, &ctx).await;
+                let result = op.call(&ctx).await;
                 let nanos = t.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-                if result.is_err() {
-                    fails += 1;
+                if elapsed < warmup {
                     continue;
                 }
-                if elapsed >= warmup {
+                if result.is_err() {
+                    fails += 1;
+                } else {
                     let _ = hist.record(nanos.max(1));
                 }
             }
             (hist, fails)
-        }));
+        });
     }
 
     let mut merged = hdrhistogram::Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3)
         .expect("failed to create histogram");
     let mut fails = 0u64;
-    for task in tasks {
-        let (hist, f) = task.await.unwrap();
+    while let Some(task) = tasks.join_next().await {
+        let (hist, f) = task.expect("benchmark worker failed");
         merged.add(hist).unwrap();
         fails += f;
     }
@@ -406,21 +257,9 @@ async fn bench_test(args: Args) {
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
+    init_tracing();
     let args = Args::parse();
-
-    let mut builder = tokio::runtime::Builder::new_multi_thread();
-    builder.enable_all();
-    if args.worker_threads > 0 {
-        builder.worker_threads(args.worker_threads);
-    }
-    let runtime = builder.build().expect("failed to build tokio runtime");
+    let runtime = args.runtime.build();
     runtime.block_on(async_main(args));
 }
 
@@ -430,9 +269,7 @@ async fn async_main(args: Args) {
     } else if args.stress {
         stress_test(args).await;
     } else {
-        let ctx = Context::create(&socket_pool_config(&args))
-            .unwrap()
-            .with_endpoint(args.endpoint);
+        let ctx = args.context();
         let client = Client {
             use_msgpack: args.use_msgpack,
             ..Default::default()
@@ -446,8 +283,10 @@ async fn async_main(args: Args) {
                 tracing::info!("greet rsp: {:?}", rsp);
             }
             Rpc::Read | Rpc::Write => {
-                let mut op = BenchOp::create(&args, &ctx, Request(args.value.clone()), 0).await;
-                match op.call(&client, &ctx).await {
+                let mut op = args
+                    .workload(&client, &ctx, Request(args.value.clone()), 0)
+                    .await;
+                match op.call(&ctx).await {
                     Ok(()) => tracing::info!(
                         "{:?} of {} bytes: crc32c verified",
                         args.rpc,

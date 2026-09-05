@@ -22,14 +22,18 @@ pub use client::{Client, ClientWithBuffers};
 
 mod core;
 #[doc(hidden)]
-pub use core::{CallPlain, CallWithBuffer, RawCall, RpcCall, catch_handler_panic, spawn_handler};
-pub use core::{
-    Context, CopyOp, Listener, MAX_COPY_OPS, MAX_REGIONS, MethodSchema, RemoteSpace,
-    ResultWithBuffers, Router, SentBuffers, Server, State, WithBuffers,
+pub use client::{CallPlain, CallWithBuffer, RawCall, RpcCall};
+pub use core::{Context, Listener, MethodSchema, Router, Server, State};
+#[doc(hidden)]
+pub use core::{catch_handler_panic, spawn_handler};
+
+mod remote_memory;
+pub use remote_memory::{
+    CopyOp, MAX_COPY_OPS, MAX_REGIONS, RemoteSpace, ResultWithBuffers, SentBuffers, WithBuffers,
 };
 
 mod metrics;
-pub(crate) use metrics::{MethodMetrics, Metrics};
+pub(crate) use metrics::Metrics;
 
 mod task;
 pub(crate) use task::Receiver;

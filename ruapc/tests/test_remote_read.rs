@@ -209,7 +209,7 @@ async fn run_test(tc: TestCase) {
         delay_ms: tc.delay_ms,
     };
 
-    let c = client.with_read_buffers(&bufs);
+    let c = client.with_read_buffers(bufs);
     let result: Result<ReadRsp> = match tc.method {
         Method::All => c.read_all(&ctx, &req).await,
         Method::Swapped => c.read_swapped(&ctx, &req).await,

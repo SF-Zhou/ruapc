@@ -188,7 +188,7 @@ impl TcpSocketPool {
     }
 
     fn parse_message(buffer: &mut BytesMut) -> Result<Option<Bytes>> {
-        super::parse_message(buffer)
+        crate::msg::frame::parse_message(buffer)
     }
 
     async fn start_recv_loop(

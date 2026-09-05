@@ -30,7 +30,7 @@ pub struct Buffer {
     len: usize,
 
     /// The allocation kind: buddy level (0-3) for buddy buffers, or
-    /// `NUM_LEVELS + class` for slab chunks (64 KiB / 256 KiB).
+    /// `NUM_LEVELS + class` for slab chunks (16 KiB / 64 KiB / 256 KiB).
     level: u8,
 
     /// Index within the level in the buddy block (buddy buffers), or the
@@ -38,12 +38,12 @@ pub struct Buffer {
     index: u8,
 }
 
-// SAFETY: Buffer can be sent between threads as it only contains
-// raw pointers that are owned by the pool
+// SAFETY: each buffer exclusively owns a disjoint initialized region. Moving
+// the buffer transfers that ownership; its Arc keeps the backing pool alive.
 unsafe impl Send for Buffer {}
 
-// SAFETY: Buffer can be shared between threads as it provides
-// exclusive access to its memory region
+// SAFETY: shared references expose immutable slices; mutable slices require
+// &mut Buffer. Raw-pointer/DMA users must maintain the same access rules.
 unsafe impl Sync for Buffer {}
 
 impl Buffer {
@@ -52,8 +52,8 @@ impl Buffer {
     /// # Safety
     ///
     /// The caller must ensure:
-    /// - `ptr` points to a valid memory region of the appropriate size for `level`
-    /// - `block` points to a valid `BuddyBlock`
+    /// - `ptr` exclusively owns initialized bytes of the size for `level`
+    /// - `block` belongs to `pool` and remains installed for the pool's lifetime
     /// - `level` is in range 0-3
     /// - `index` is valid for the given level
     pub(crate) unsafe fn new(
@@ -87,8 +87,8 @@ impl Buffer {
     /// # Safety
     ///
     /// The caller must ensure:
-    /// - `ptr` points to a valid chunk of `SLAB_CLASS_SIZES[class]` bytes
-    ///   inside a slab owned by the pool's slab layer
+    /// - `ptr` exclusively owns an initialized chunk of `SLAB_CLASS_SIZES[class]`
+    ///   bytes inside a slab owned by the pool's slab layer
     /// - `block` points to the `BuddyBlock` containing the chunk
     /// - `class` is a valid slab class and `index` a valid chunk index
     pub(crate) unsafe fn new_chunk(
@@ -138,11 +138,6 @@ impl Buffer {
         }
     }
 
-    /// Returns the buddy block containing this buffer.
-    pub(crate) const fn block_ptr(&self) -> NonNull<BuddyBlock> {
-        self.block
-    }
-
     /// Returns the logical length of the buffer in bytes.
     ///
     /// Initially set to the full capacity. Use `set_len` to adjust.
@@ -152,7 +147,7 @@ impl Buffer {
     }
 
     /// Returns the capacity of the buffer in bytes (determined by the
-    /// allocation size class): 64 KiB, 256 KiB, 1 MiB, 4 MiB, 16 MiB or
+    /// allocation size class): 16 KiB, 64 KiB, 256 KiB, 1 MiB, 4 MiB, 16 MiB or
     /// 64 MiB. Returns 0 for empty buffers created by [`empty`](Self::empty).
     #[must_use]
     pub const fn capacity(&self) -> usize {
@@ -256,8 +251,9 @@ impl Buffer {
             ));
         }
         let idx = device_index.as_device_index();
-        unsafe { &*self.block.as_ptr() }
-            .registrations
+        // SAFETY: this buffer retains the block; registrations remain immutable.
+        // Borrow only that field while other threads change allocation metadata.
+        unsafe { &(*self.block.as_ptr()).registrations }
             .get(idx.index as usize)
             .map(|r| r.memory_key())
             .ok_or_else(|| {
@@ -273,6 +269,9 @@ impl Buffer {
     /// Used by the pool to reclaim a buffer while already holding the pool
     /// mutex (e.g. when a waiter cancelled before receiving a handed-off
     /// buffer): running `Drop` would re-enter the non-reentrant mutex.
+    ///
+    /// Also used to transfer a buddy leaf to the pool's internal slab layer
+    /// without retaining an Arc back to the pool.
     ///
     /// The internal `Arc<BufferPool>` reference is released here. This is
     /// safe to call while holding the pool mutex as long as the caller owns
