@@ -75,7 +75,8 @@ async fn test_http() {
 
     let client = reqwest::Client::new();
     let req = client
-        .post(format!("http://{}/MetaService/list_methods", addr))
+        .post(format!("http://{}/_ruapc.meta/describe", addr))
+        .json(&ruapc::services::DescribeRequest::default())
         .build()
         .unwrap();
     let rsp = client
@@ -84,11 +85,21 @@ async fn test_http() {
         .unwrap()
         .error_for_status()
         .unwrap()
-        .json::<ruapc::Result<Vec<String>>>()
+        .json::<ruapc::Result<ruapc::services::ServerDescription>>()
         .await
         .unwrap()
         .unwrap();
-    assert!(!rsp.is_empty());
+    let foo = rsp
+        .services
+        .iter()
+        .find(|service| service.name == "Foo")
+        .expect("Foo should be publicly discoverable");
+    assert!(foo.methods.iter().any(|method| method.name == "hello"));
+    assert!(
+        rsp.services
+            .iter()
+            .all(|service| service.name != "_ruapc.memory")
+    );
 
     server.stop();
     server.join().await;

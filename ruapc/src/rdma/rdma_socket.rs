@@ -19,7 +19,7 @@ use crate::{
     error::{ErrorKind, Result},
     msg::MsgMeta,
     rdma::poller::{FRAME_HEADER, PollerWaker},
-    services::{MemoryService, MetaService},
+    services::{MemoryService, ReadIntoTargetRequest, RequestStatusRequest},
 };
 
 /// Serializes a message as one wire frame: `[4B frame_len][4B meta_len]
@@ -84,7 +84,7 @@ impl crate::msg::SendMsg for FramedBuffer<'_> {
 pub(crate) enum ReadHold {
     /// Server-side `remote_read`: the local destination buffers.
     Buffers(Vec<Buffer>),
-    /// Client-side `pull`: the request's pinned write target. Never read
+    /// Client-side `read_into_target`: the request's pinned write target. Never read
     /// back — held purely for ownership until the batch settles.
     Target(#[allow(dead_code)] Arc<WriteTarget>),
 }
@@ -306,7 +306,7 @@ pub struct RdmaSocket {
     /// by every connection of the pool on this device
     /// (`rdma.remote_memory.max_inflight_read_wrs`) — the congestion control knob for
     /// read traffic, covering both server-side `remote_read` and
-    /// client-side `pull`. Permits are forgotten on post and re-added by
+    /// client-side `read_into_target`. Permits are forgotten on post and re-added by
     /// the poll thread per completion.
     pub(crate) read_permits: Arc<tokio::sync::Semaphore>,
     /// Shared bandwidth shaper for the local RDMA port.
@@ -545,11 +545,11 @@ impl RdmaSocket {
         }
     }
 
-    /// Executes the client side of a `MemoryService/pull`: RDMA READs from
+    /// Executes the client side of `_ruapc.memory/read_into_target`: RDMA READs from
     /// the peer's regions into the pinned write target. The target `Arc`
     /// keeps the destination memory alive for as long as any read is in
     /// flight, so no post-transfer liveness verification is needed.
-    pub(crate) async fn pull_into_target(
+    pub(crate) async fn read_into_target(
         &self,
         regions: &[RemoteBufferInfo],
         src_layout: &SpaceLayout,
@@ -690,9 +690,11 @@ impl SocketTrait for RdmaSocket {
         // cannot know its memory was read — and once its request times
         // out, the read buffers may have been reclaimed and refilled, so
         // the data would be garbage.
-        let msgid = ctx.msg_meta.msgid;
+        let request = RequestStatusRequest {
+            request_id: ctx.msg_meta.msgid,
+        };
         let client = crate::Client::default();
-        let still_waiting: bool = match client.is_message_waiting(ctx, &msgid).await {
+        let still_waiting: bool = match client.request_is_pending(ctx, &request).await {
             Ok(w) => w,
             Err(e) => return Err(RemoteIoError::new(e, Some(local))),
         };
@@ -716,12 +718,12 @@ impl SocketTrait for RdmaSocket {
         local: Vec<Buffer>,
     ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
         // No one-sided RDMA WRITE (unsafe against client buffer lifetime):
-        // send a reverse `pull` RPC advertising our source buffers as read
+        // send a reverse `read_into_target` RPC advertising our source buffers as read
         // regions; the client executes RDMA READs into its pinned write
         // target. This future holds `local` across the await, so the
         // advertised regions stay valid for the whole transfer.
-        let req = crate::services::MemoryPullReq {
-            msgid: ctx.msg_meta.msgid,
+        let req = ReadIntoTargetRequest {
+            request_id: ctx.msg_meta.msgid,
             ops: ops.to_vec(),
         };
         let bytes = ops.iter().map(|op| op.len).sum();
@@ -729,7 +731,7 @@ impl SocketTrait for RdmaSocket {
         match client
             .with_read_buffers(&local)
             .with_read_charge_bytes(bytes)
-            .pull(ctx, &req)
+            .read_into_target(ctx, &req)
             .await
         {
             Ok(()) => Ok(local),

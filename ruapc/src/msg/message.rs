@@ -64,12 +64,12 @@ pub struct MsgMeta {
     /// Regions of the sender's registered memory the receiver may *read*
     /// (RDMA READ or reverse-RPC copy). In order, they form one logical
     /// contiguous space. Attached by `Client::with_read_buffers`; also
-    /// used by the reverse `MemoryService/pull` request to advertise the
+    /// used by the reverse `_ruapc.memory/read_into_target` request to advertise the
     /// server's source buffers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read_regions: Vec<RemoteBufferInfo>,
     /// Regions of the sender's registered memory the receiver may *write*
-    /// (through the pull/push protocol). In order, they form one logical
+    /// (through the internal remote-memory protocol). In order, they form one logical
     /// contiguous space. Attached by `Client::with_write_buffers`; the
     /// buffers stay pinned client-side until the request resolves.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -444,7 +444,7 @@ mod tests {
             len: 1 << 40,
         };
         let meta = MsgMeta {
-            method: "MemoryService/pull".into(),
+            method: "_ruapc.memory/read_into_target".into(),
             flags: MsgFlags::IsReq | MsgFlags::UseMessagePack,
             msgid: u64::MAX - 1,
             read_regions: vec![region, region],

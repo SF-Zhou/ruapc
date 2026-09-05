@@ -7,7 +7,8 @@ pub use config::{
 
 mod endpoint;
 pub(crate) use endpoint::{
-    ConnectRequest, ConnectionControl, DeviceSelection, Endpoint, RdmaConnectionConfig,
+    ConnectionLease, DeviceSelection, PrepareConnectionRequest, PrepareConnectionResponse,
+    RdmaConnectionConfig, RdmaConnectionLimits, RdmaQpEndpoint,
 };
 
 mod path;
@@ -26,7 +27,7 @@ mod rdma_device_refresher;
 pub(crate) use rdma_device_refresher::RdmaDeviceRefresher;
 
 mod rdma_service;
-pub(crate) use rdma_service::{RdmaInfo, RdmaService};
+pub(crate) use rdma_service::{RdmaBootstrapService, RdmaPeerAdvertisement};
 
 mod rdma_state;
 pub(crate) use rdma_state::{RdmaState, SendPermit};

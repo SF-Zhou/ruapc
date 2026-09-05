@@ -47,8 +47,9 @@ pub struct RdmaPathInfo {
     pub local: RdmaNicInfo,
     /// NIC on the peer side of the connection.
     pub remote: RdmaNicInfo,
-    /// Whether both NIC addresses belong to a client-configured subnet.
-    pub same_subnet: bool,
+    /// Whether both NIC addresses belong to one client-configured
+    /// connectivity domain.
+    pub same_connectivity_domain: bool,
 }
 
 /// Direction of an RDMA connection relative to this process.

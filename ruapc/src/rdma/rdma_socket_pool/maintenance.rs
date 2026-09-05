@@ -356,7 +356,7 @@ impl RdmaSocketPool {
                 index,
                 local_index: candidate.local_device_index,
                 remote: &candidate.path.remote.device,
-                same_subnet: candidate.path.same_subnet,
+                same_connectivity_domain: candidate.path.same_connectivity_domain,
                 class: candidate.class,
                 blacklisted: self.is_blacklisted(peer, candidate),
                 local_load: 0,

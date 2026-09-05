@@ -158,14 +158,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_buffers_recoverable_after_failed_call() {
-        use crate::{SocketPoolConfig, services::MetaService as _};
+        use crate::{
+            SocketPoolConfig,
+            services::{DescribeRequest, ReflectionService as _},
+        };
         let ctx = crate::Context::create(&SocketPoolConfig::default()).unwrap();
         let client = Client::default();
         let mut buf = ctx.state.buffer_pool.allocate(64 * 1024).unwrap();
         buf.set_len(16);
         let wrapper = client.with_write_buffers(vec![buf]);
         // Invalid endpoint: the call fails before reaching the wire.
-        let result = wrapper.list_methods(&ctx, &()).await;
+        let result = wrapper.describe(&ctx, &DescribeRequest::default()).await;
         assert!(result.is_err());
         let recovered = wrapper.take_write_buffers().expect("buffers recoverable");
         assert_eq!(recovered.len(), 1);

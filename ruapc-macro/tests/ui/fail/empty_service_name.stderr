@@ -1,0 +1,5 @@
+error: service name cannot be empty
+ --> tests/ui/fail/empty_service_name.rs:3:25
+  |
+3 | #[ruapc::service(name = "")]
+  |                         ^^

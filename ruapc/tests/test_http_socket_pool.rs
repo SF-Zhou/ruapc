@@ -51,7 +51,24 @@ async fn test_http_openapi_json_endpoint() {
     // Verify the response is valid JSON and contains expected OpenAPI structure
     let openapi_json: serde_json::Value = response.json().await.unwrap();
     assert!(openapi_json.get("openapi").is_some());
-    assert!(openapi_json.get("paths").is_some());
+    let paths = openapi_json["paths"].as_object().unwrap();
+    assert!(paths.contains_key("/TestService/test_method"));
+    assert!(paths.contains_key("/_ruapc.meta/describe"));
+    assert!(
+        paths
+            .keys()
+            .all(|path| !path.starts_with("/_ruapc.memory/") && !path.starts_with("/_ruapc.rdma/"))
+    );
+
+    // Internal control-plane methods remain usable on framed peer RPC
+    // streams, but are not exposed as ordinary unary HTTP endpoints.
+    let response = client
+        .post(format!("http://{}/_ruapc.memory/request_is_pending", addr))
+        .json(&serde_json::json!({ "request_id": 1 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
 
     server.stop();
     server.join().await;

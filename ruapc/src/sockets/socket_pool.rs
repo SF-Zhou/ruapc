@@ -7,7 +7,10 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_util::sync::DropGuard;
 
 #[cfg(feature = "rdma")]
-use crate::rdma::{ConnectRequest, Endpoint, RdmaSocketPool};
+use crate::rdma::{
+    ConnectionLease, PrepareConnectionRequest, PrepareConnectionResponse, RdmaPeerAdvertisement,
+    RdmaSocketPool,
+};
 use crate::{
     Endpoint as RpcEndpoint, Error, ErrorKind, ListenMode, Result, Socket, SocketPoolConfig, State,
     TaskSupervisor, Transport, http::HttpSocketPool, tcp::TcpSocketPool, ws::WebSocketPool,
@@ -325,9 +328,9 @@ impl SocketPool {
     }
 
     #[cfg(feature = "rdma")]
-    pub fn rdma_device_list(&self) -> Result<crate::rdma::RdmaInfo> {
+    pub(crate) fn rdma_peer_advertisement(&self) -> Result<RdmaPeerAdvertisement> {
         match &self.rdma {
-            Some(pool) => pool.rdma_device_list(),
+            Some(pool) => pool.rdma_peer_advertisement(),
             None => Err(Error::new(
                 ErrorKind::InvalidArgument,
                 "RDMA is not enabled".into(),
@@ -336,9 +339,13 @@ impl SocketPool {
     }
 
     #[cfg(feature = "rdma")]
-    pub fn rdma_accept(&self, request: &ConnectRequest, state: &Arc<State>) -> Result<Endpoint> {
+    pub(crate) fn rdma_prepare_connection(
+        &self,
+        request: &PrepareConnectionRequest,
+        state: &Arc<State>,
+    ) -> Result<PrepareConnectionResponse> {
         match &self.rdma {
-            Some(pool) => pool.rdma_accept(request, state),
+            Some(pool) => pool.rdma_prepare_connection(request, state),
             None => Err(Error::new(
                 ErrorKind::InvalidArgument,
                 "RDMA is not enabled".into(),
@@ -347,9 +354,9 @@ impl SocketPool {
     }
 
     #[cfg(feature = "rdma")]
-    pub fn rdma_confirm(&self, control: &crate::rdma::ConnectionControl) -> Result<()> {
+    pub(crate) fn rdma_commit_connection(&self, lease: &ConnectionLease) -> Result<()> {
         match &self.rdma {
-            Some(pool) => pool.rdma_confirm(control),
+            Some(pool) => pool.rdma_commit_connection(lease),
             None => Err(Error::new(
                 ErrorKind::InvalidArgument,
                 "RDMA is not enabled".into(),
@@ -358,10 +365,10 @@ impl SocketPool {
     }
 
     #[cfg(feature = "rdma")]
-    pub fn rdma_abort(&self, control: &crate::rdma::ConnectionControl) -> Result<()> {
+    pub(crate) fn rdma_cancel_connection(&self, lease: &ConnectionLease) -> Result<()> {
         match &self.rdma {
             Some(pool) => {
-                pool.rdma_abort(control);
+                pool.rdma_cancel_connection(lease);
                 Ok(())
             }
             None => Err(Error::new(
@@ -372,7 +379,7 @@ impl SocketPool {
     }
 
     #[cfg(feature = "rdma")]
-    pub fn rdma_receive_observed(
+    pub(crate) fn rdma_receive_observed(
         &self,
         connection_id: u64,
         socket: &std::sync::Arc<crate::rdma::RdmaSocket>,
@@ -442,7 +449,7 @@ mod tests {
         let config = SocketPoolConfig::default();
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
-        let info = pool.rdma_device_list().unwrap();
+        let info = pool.rdma_peer_advertisement().unwrap();
         assert!(!info.devices.is_empty());
         let disabled = SocketPoolConfig {
             rdma: None,
@@ -453,6 +460,6 @@ mod tests {
             ruapc_bufpool::BufferPoolBuilder::new(disabled_devices.clone()).build();
         let disabled_pool =
             SocketPool::create(&disabled, &disabled_devices, &disabled_buffers).unwrap();
-        assert!(disabled_pool.rdma_device_list().is_err());
+        assert!(disabled_pool.rdma_peer_advertisement().is_err());
     }
 }

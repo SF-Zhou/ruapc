@@ -267,7 +267,7 @@ impl Client {
         }
         // Hand every attached write buffer back to the caller. Dropping
         // our own clone first makes the returned target unique in the
-        // normal case; a pull/push handler racing the response keeps the
+        // normal case; a remote-memory handler racing the response keeps the
         // buffers alive until it finishes, after which they fall back to
         // the pool.
         drop(write_target.take());
@@ -440,7 +440,7 @@ impl Client {
         // periodically); no per-request timer is registered.
         let (msgid, receiver) = ctx.state.waiter.alloc(timeout);
         if let Some(target) = write_target {
-            // Pin the write buffers to the pending request so push/pull
+            // Pin the write buffers to the pending request so remote-memory
             // handlers can reach (and keep alive) the destination memory.
             ctx.state.waiter.bind_write_target(msgid, target.clone());
         }
@@ -557,10 +557,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_ruapc_request_invalid_endpoint_returns_err() {
-        use crate::{SocketPoolConfig, services::MetaService as _};
+        use crate::{
+            SocketPoolConfig,
+            services::{DescribeRequest, ReflectionService as _},
+        };
         let ctx = crate::Context::create(&SocketPoolConfig::default()).unwrap();
         let client = Client::default();
-        let result = client.list_methods(&ctx, &()).await;
+        let result = client.describe(&ctx, &DescribeRequest::default()).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.kind, crate::ErrorKind::InvalidArgument);

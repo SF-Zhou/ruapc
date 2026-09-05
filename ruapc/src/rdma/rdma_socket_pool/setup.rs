@@ -7,8 +7,8 @@ use ruapc_rdma::{DeviceInfo, Port, QueuePair, ibv_mtu, ibv_qp_cap, ibv_qp_init_a
 
 use super::super::path::RdmaPathInfo;
 use super::super::{
-    DeviceSelection, Endpoint, RdmaConnectionConfig, RdmaDevice, RdmaQueuePairConfig, RdmaSocket,
-    RdmaSocketConfig, RegisterConn,
+    DeviceSelection, RdmaConnectionConfig, RdmaConnectionLimits, RdmaDevice, RdmaQpEndpoint,
+    RdmaQueuePairConfig, RdmaSocket, RdmaSocketConfig, RegisterConn,
 };
 use super::{ConnCountGuard, RdmaSocketPool};
 use crate::{Buffer, Error, ErrorKind, Result, State};
@@ -34,43 +34,43 @@ impl RdmaSocketPool {
     pub(super) fn negotiate_connection_config(
         &self,
         local_device: &RdmaDevice,
-        remote: &RdmaConnectionConfig,
-    ) -> RdmaConnectionConfig {
+        remote: &RdmaConnectionLimits,
+    ) -> Result<RdmaConnectionConfig> {
         let local = self.local_connection_config(local_device);
-        let remote = *remote;
-        RdmaConnectionConfig {
+        let negotiated = RdmaConnectionLimits::from(local).negotiate(*remote)?;
+        Ok(RdmaConnectionConfig {
             qp: RdmaQueuePairConfig {
-                max_send_wr: local.qp.max_send_wr.min(remote.qp.max_recv_wr),
-                max_recv_wr: local.qp.max_recv_wr.min(remote.qp.max_send_wr),
+                max_send_wr: negotiated.max_send_wr,
+                max_recv_wr: negotiated.max_recv_wr,
                 // Scatter/gather lists are local WQE properties.
                 max_send_sge: local.qp.max_send_sge,
                 max_recv_sge: local.qp.max_recv_sge,
             },
-            cq_len: local.cq_len.min(remote.cq_len),
-            recv_queue_len: local.recv_queue_len.min(remote.recv_queue_len),
-            max_msg_size: local.max_msg_size.min(remote.max_msg_size),
+            recv_queue_len: negotiated.recv_queue_len,
+            max_msg_size: negotiated.max_msg_size,
             traffic_class: self.config.connection.traffic_class,
-        }
+        })
     }
 
     pub(super) fn clamp_connection_config(
         &self,
         device: &RdmaDevice,
-        requested: RdmaConnectionConfig,
-    ) -> RdmaConnectionConfig {
+        initiator: RdmaConnectionLimits,
+        traffic_class: u8,
+    ) -> Result<RdmaConnectionConfig> {
         let local = self.local_connection_config(device);
-        RdmaConnectionConfig {
+        let negotiated = RdmaConnectionLimits::from(local).negotiate(initiator)?;
+        Ok(RdmaConnectionConfig {
             qp: RdmaQueuePairConfig {
-                max_send_wr: requested.qp.max_send_wr.min(local.qp.max_send_wr),
-                max_recv_wr: requested.qp.max_recv_wr.min(local.qp.max_recv_wr),
+                max_send_wr: negotiated.max_send_wr,
+                max_recv_wr: negotiated.max_recv_wr,
                 max_send_sge: local.qp.max_send_sge,
                 max_recv_sge: local.qp.max_recv_sge,
             },
-            cq_len: requested.cq_len.min(local.cq_len),
-            recv_queue_len: requested.recv_queue_len.min(local.recv_queue_len),
-            max_msg_size: requested.max_msg_size.min(local.max_msg_size),
-            traffic_class: requested.traffic_class,
-        }
+            recv_queue_len: negotiated.recv_queue_len,
+            max_msg_size: negotiated.max_msg_size,
+            traffic_class,
+        })
     }
 
     fn local_connection_config(&self, device: &RdmaDevice) -> RdmaConnectionConfig {
@@ -102,12 +102,12 @@ impl RdmaSocketPool {
                     .max_recv_sge
                     .min(info.device_attr.max_sge as u32),
             },
-            cq_len: self
+            recv_queue_len: self
                 .config
                 .connection
-                .cq_len
-                .min(info.device_attr.max_cqe as u32),
-            recv_queue_len: self.config.connection.recv_queue_len,
+                .recv_queue_len
+                .min(self.config.connection.qp.max_recv_wr)
+                .min(info.device_attr.max_qp_wr as u32),
             max_msg_size: self.config.connection.max_msg_size,
             traffic_class: self.config.connection.traffic_class,
         }
@@ -141,14 +141,14 @@ impl RdmaSocketPool {
         Ok(queue_pair)
     }
 
-    /// Constructs an Endpoint from a QueuePair and selected local port/GID.
+    /// Constructs an endpoint from a QueuePair and selected local port/GID.
     pub(super) fn build_endpoint(
         &self,
         qp: &QueuePair,
         device: &RdmaDevice,
         port_num: u8,
         gid_index: u8,
-    ) -> Result<Endpoint> {
+    ) -> Result<RdmaQpEndpoint> {
         let info = device.info();
         let port = Self::find_port(&info, port_num)?;
         if !port.is_usable() {
@@ -167,8 +167,7 @@ impl RdmaSocketPool {
                 ),
             ));
         }
-        Ok(Endpoint {
-            connection_cookie: 0,
+        Ok(RdmaQpEndpoint {
             qp_num: qp.qp_num(),
             port_num,
             gid_index,
@@ -215,8 +214,8 @@ impl RdmaSocketPool {
     pub(super) fn bring_qp_to_rts(
         &self,
         qp: &QueuePair,
-        local: &Endpoint,
-        remote: &Endpoint,
+        local: &RdmaQpEndpoint,
+        remote: &RdmaQpEndpoint,
         pkey_index: u16,
         traffic_class: u8,
     ) -> Result<()> {

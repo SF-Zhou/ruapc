@@ -30,8 +30,6 @@ impl RdmaSocketPoolConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct RdmaConnectionTuningConfig {
     pub qp: RdmaQueuePairConfig,
-    /// Legacy per-connection CQ limit exchanged during negotiation.
-    pub cq_len: u32,
     /// Number of pre-posted receives. The send window is half this value.
     pub recv_queue_len: u32,
     pub pkey_index: u16,
@@ -48,7 +46,6 @@ impl Default for RdmaConnectionTuningConfig {
     fn default() -> Self {
         Self {
             qp: RdmaQueuePairConfig::default(),
-            cq_len: 128,
             recv_queue_len: 8,
             pkey_index: 0,
             send_signal_interval: 8,
@@ -64,6 +61,12 @@ impl RdmaConnectionTuningConfig {
     pub const MIN_MAX_MSG_SIZE: u32 = 16 * 1024;
 
     fn validate(&self) -> crate::Result<()> {
+        if self.qp.max_send_wr < Self::MIN_RECV_QUEUE_LEN {
+            return Err(invalid_config(format!(
+                "rdma.connection.qp.max_send_wr must be at least {}",
+                Self::MIN_RECV_QUEUE_LEN
+            )));
+        }
         if self.recv_queue_len < Self::MIN_RECV_QUEUE_LEN {
             return Err(invalid_config(format!(
                 "rdma.connection.recv_queue_len must be at least {}",
@@ -73,6 +76,11 @@ impl RdmaConnectionTuningConfig {
         if self.recv_queue_len > self.qp.max_recv_wr {
             return Err(invalid_config(
                 "rdma.connection.recv_queue_len must not exceed qp.max_recv_wr",
+            ));
+        }
+        if self.qp.max_send_sge == 0 || self.qp.max_recv_sge == 0 {
+            return Err(invalid_config(
+                "rdma.connection.qp scatter/gather limits must be nonzero",
             ));
         }
         if self.send_signal_interval == 0 {
@@ -429,6 +437,12 @@ mod tests {
     fn rejects_invalid_effective_limits() {
         let mut config = RdmaSocketPoolConfig::default();
         config.connection.recv_queue_len = 0;
+        assert!(config.validate().is_err());
+        config.connection = RdmaConnectionTuningConfig::default();
+        config.connection.qp.max_send_wr = 1;
+        assert!(config.validate().is_err());
+        config.connection = RdmaConnectionTuningConfig::default();
+        config.connection.qp.max_send_sge = 0;
         assert!(config.validate().is_err());
         config.connection = RdmaConnectionTuningConfig::default();
         config.polling.dispatch_workers = 0;

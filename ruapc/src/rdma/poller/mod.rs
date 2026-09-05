@@ -353,7 +353,7 @@ impl DevicePoller {
             return Err(Error::new(
                 ErrorKind::RdmaSendFailed,
                 format!(
-                    "shared CQ capacity exhausted: {} + {qp_depth} > {} (raise rdma.device_cq_len)",
+                    "shared CQ capacity exhausted: {} + {qp_depth} > {} (raise rdma.polling.device_cq_len)",
                     budget.load(Ordering::Acquire),
                     self.cq_capacity
                 ),

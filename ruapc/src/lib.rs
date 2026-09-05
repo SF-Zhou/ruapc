@@ -24,7 +24,7 @@ mod core;
 #[doc(hidden)]
 pub use core::{CallPlain, CallWithBuffer, RawCall, RpcCall, catch_handler_panic, spawn_handler};
 pub use core::{
-    Context, CopyOp, Listener, MAX_COPY_OPS, MAX_REGIONS, MethodInfo, RemoteSpace,
+    Context, CopyOp, Listener, MAX_COPY_OPS, MAX_REGIONS, MethodSchema, RemoteSpace,
     ResultWithBuffers, Router, SentBuffers, Server, State, WithBuffers,
 };
 

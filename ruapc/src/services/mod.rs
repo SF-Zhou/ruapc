@@ -2,13 +2,16 @@
 //!
 //! This module provides built-in services that are automatically
 //! registered with every RuaPC server, including:
-//! - MetaService: Introspection and metadata service
-//! - MemoryService: Remote Read/Write operations over TCP
+//! - [`ReflectionService`]: public service and schema discovery
+//! - internal remote-memory and RDMA bootstrap services
 
 mod meta_service;
-pub use meta_service::{MetaService, Metadata};
+pub use meta_service::{
+    DescribeRequest, MethodDescription, REFLECTION_PROTOCOL_VERSION, ReflectionService,
+    ServerDescription, ServiceDescription,
+};
 
 mod memory_service;
-pub use memory_service::{
-    MemoryPullReq, MemoryPushReq, MemoryReadReq, MemoryReadRsp, MemoryService,
-};
+pub(crate) use memory_service::{MemoryService, ReadInlineRequest, WriteInlineRequest};
+#[cfg(feature = "rdma")]
+pub(crate) use memory_service::{ReadIntoTargetRequest, RequestStatusRequest};

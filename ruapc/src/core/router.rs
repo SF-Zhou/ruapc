@@ -13,11 +13,11 @@ use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "rdma")]
-use crate::rdma::RdmaService;
+use crate::rdma::RdmaBootstrapService;
 use crate::{
     Context, Payload,
     error::{Error, ErrorKind, Result},
-    services::{MemoryService, MetaService},
+    services::{MemoryService, ReflectionService},
 };
 
 /// Type alias for service method handler functions.
@@ -25,20 +25,34 @@ type Func = Box<dyn Fn(Context, Payload) -> Result<()> + Send + Sync>;
 
 /// JSON schema information for a service method.
 ///
-/// Contains the request and response schemas used for OpenAPI generation
-/// and runtime validation.
+/// Contains the request and response schemas exposed through reflection and
+/// OpenAPI generation.
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
-pub struct MethodInfo {
+pub struct MethodSchema {
     /// JSON schema for the request type.
-    pub req_schema: Schema,
+    pub request_schema: Schema,
     /// JSON schema for the response type.
-    pub rsp_schema: Schema,
+    pub response_schema: Schema,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MethodVisibility {
+    Public,
+    Internal,
+}
+
+impl MethodVisibility {
+    fn is_public(self) -> bool {
+        self == Self::Public
+    }
 }
 
 /// Internal method representation containing metadata and handler.
-pub struct Method {
+struct Method {
     /// Method schema information.
-    pub info: MethodInfo,
+    schema: MethodSchema,
+    /// Whether this method is exposed through public reflection APIs.
+    visibility: MethodVisibility,
     /// The actual handler function for this method.
     func: Func,
 }
@@ -59,9 +73,12 @@ pub struct Method {
 /// ```
 pub struct Router {
     /// Schema generator for JSON schemas.
-    pub generator: Mutex<SchemaGenerator>,
+    generator: Mutex<SchemaGenerator>,
+    // Keep internal schemas out of the public generator and its OpenAPI
+    // components while retaining complete method metadata in the registry.
+    internal_generator: Mutex<SchemaGenerator>,
     /// Registered methods mapped by name (e.g., "ServiceName/method_name").
-    pub methods: HashMap<String, Method, RandomState>,
+    methods: HashMap<String, Method, RandomState>,
     /// Generated OpenAPI specification.
     pub openapi: OpenAPI,
 }
@@ -71,14 +88,17 @@ impl Default for Router {
         let settings = schemars::generate::SchemaSettings::openapi3();
         let mut this = Self {
             generator: Mutex::new(SchemaGenerator::new(settings)),
+            internal_generator: Mutex::new(SchemaGenerator::new(
+                schemars::generate::SchemaSettings::openapi3(),
+            )),
             methods: HashMap::default(),
             openapi: OpenAPI::default(),
         };
         let dummy = Arc::new(());
-        MetaService::ruapc_export(dummy.clone(), &mut this);
+        ReflectionService::ruapc_export(dummy.clone(), &mut this);
         MemoryService::ruapc_export(dummy.clone(), &mut this);
         #[cfg(feature = "rdma")]
-        RdmaService::ruapc_export(dummy.clone(), &mut this);
+        RdmaBootstrapService::ruapc_export(dummy.clone(), &mut this);
         this
     }
 }
@@ -103,8 +123,54 @@ impl Router {
         Req: JsonSchema,
         Rsp: JsonSchema,
     {
-        let (req_schema, rsp_schema) = {
-            let mut generator = self.generator.lock().unwrap();
+        self.add_method_with_visibility::<Req, Rsp>(name, func, MethodVisibility::Public);
+    }
+
+    /// Registers a dispatchable method that is hidden from public reflection.
+    ///
+    /// This is public only because `#[ruapc::service(internal)]` expands in
+    /// downstream crates and must be able to call it.
+    #[doc(hidden)]
+    pub fn add_internal_method<Req, Rsp>(&mut self, name: &str, func: Func)
+    where
+        Req: JsonSchema,
+        Rsp: JsonSchema,
+    {
+        self.add_method_with_visibility::<Req, Rsp>(name, func, MethodVisibility::Internal);
+    }
+
+    fn add_method_with_visibility<Req, Rsp>(
+        &mut self,
+        name: &str,
+        func: Func,
+        visibility: MethodVisibility,
+    ) where
+        Req: JsonSchema,
+        Rsp: JsonSchema,
+    {
+        let valid_name = name.split_once('/').is_some_and(|(service, method)| {
+            !service.is_empty()
+                && !method.is_empty()
+                && !method.contains('/')
+                && service.trim() == service
+                && method.trim() == method
+        });
+        assert!(
+            valid_name,
+            "RPC method `{name}` must have the form `Service/method`"
+        );
+        assert!(
+            !self.methods.contains_key(name),
+            "RPC method `{name}` is already registered"
+        );
+
+        let (request_schema, response_schema) = {
+            let generator = if visibility.is_public() {
+                &self.generator
+            } else {
+                &self.internal_generator
+            };
+            let mut generator = generator.lock().unwrap();
             (
                 generator.subschema_for::<Req>(),
                 generator.subschema_for::<Rsp>(),
@@ -114,10 +180,11 @@ impl Router {
         self.methods.insert(
             name.to_string(),
             Method {
-                info: MethodInfo {
-                    req_schema,
-                    rsp_schema,
+                schema: MethodSchema {
+                    request_schema,
+                    response_schema,
                 },
+                visibility,
                 func,
             },
         );
@@ -144,9 +211,9 @@ impl Router {
     /// ```
     pub fn build_open_api(&mut self) -> Result<()> {
         let mut paths = BTreeMap::new();
-        for (name, method) in &self.methods {
-            let request_schema = serde_json::to_value(&method.info.req_schema)?;
-            let response_schema = serde_json::to_value(&method.info.rsp_schema)?;
+        for (name, schema) in self.method_schemas() {
+            let request_schema = serde_json::to_value(&schema.request_schema)?;
+            let response_schema = serde_json::to_value(&schema.response_schema)?;
 
             let request_body = RequestBody {
                 content: {
@@ -196,8 +263,11 @@ impl Router {
             paths.insert(format!("/{name}"), ReferenceOr::Item(path_item));
         }
 
-        let mut generator = self.generator.lock().unwrap();
-        let definitions = generator.take_definitions(true);
+        let definitions = {
+            let generator = self.generator.lock().unwrap();
+            let mut snapshot = generator.clone();
+            snapshot.take_definitions(true)
+        };
         let schemas = definitions
             .into_iter()
             .map(|(name, schema)| Ok((name, serde_json::from_value(schema)?)))
@@ -220,7 +290,7 @@ impl Router {
         Ok(())
     }
 
-    /// Returns an iterator over all registered method names.
+    /// Returns an iterator over publicly discoverable method names.
     ///
     /// # Examples
     ///
@@ -231,8 +301,32 @@ impl Router {
     ///     println!("Registered method: {}", method_name);
     /// }
     /// ```
-    pub fn method_names(&self) -> impl Iterator<Item = &String> {
-        self.methods.keys()
+    pub fn method_names(&self) -> impl Iterator<Item = &str> {
+        self.methods
+            .iter()
+            .filter(|(_, method)| method.visibility.is_public())
+            .map(|(name, _)| name.as_str())
+    }
+
+    /// Returns whether `name` identifies a publicly exposed method.
+    pub fn is_public_method(&self, name: &str) -> bool {
+        self.methods
+            .get(name)
+            .is_some_and(|method| method.visibility.is_public())
+    }
+
+    pub(crate) fn all_method_names(&self) -> impl Iterator<Item = &str> {
+        self.methods.keys().map(String::as_str)
+    }
+
+    /// Returns the schemas of all publicly discoverable methods.
+    pub fn method_schemas(&self) -> impl Iterator<Item = (&str, &MethodSchema)> {
+        self.methods.iter().filter_map(|(name, method)| {
+            method
+                .visibility
+                .is_public()
+                .then_some((name.as_str(), &method.schema))
+        })
     }
 
     /// Dispatches an incoming message to the appropriate handler.
@@ -263,7 +357,7 @@ impl Router {
 impl std::fmt::Debug for Router {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Router")
-            .field("methods", &self.methods.keys())
+            .field("methods", &self.all_method_names().collect::<Vec<_>>())
             .field("generator", &())
             .finish()
     }
@@ -285,19 +379,44 @@ mod tests {
         result: u64,
     }
 
+    #[derive(Serialize, Deserialize, JsonSchema)]
+    struct InternalReq {
+        secret: String,
+    }
+
     fn noop_func(_ctx: Context, _payload: Payload) -> Result<()> {
         Ok(())
     }
 
     #[test]
-    fn test_router_default_has_meta_service() {
+    fn test_router_default_has_exact_builtin_methods() {
         let router = Router::default();
-        // MetaService methods are registered by default.
-        let names: Vec<_> = router.method_names().collect();
-        assert!(
-            names.iter().any(|n| n.contains("MetaService")),
-            "MetaService should be registered by default"
+        let mut public_names: Vec<_> = router.method_names().collect();
+        public_names.sort_unstable();
+        assert_eq!(
+            public_names,
+            ["_ruapc.meta/describe", "_ruapc.meta/openapi"]
         );
+
+        let mut all_names: Vec<_> = router.all_method_names().collect();
+        all_names.sort_unstable();
+        let mut expected = vec![
+            "_ruapc.memory/read_inline",
+            "_ruapc.memory/read_into_target",
+            "_ruapc.memory/request_is_pending",
+            "_ruapc.memory/write_inline",
+            "_ruapc.meta/describe",
+            "_ruapc.meta/openapi",
+        ];
+        #[cfg(feature = "rdma")]
+        expected.extend([
+            "_ruapc.rdma/cancel_connection",
+            "_ruapc.rdma/commit_connection",
+            "_ruapc.rdma/discover",
+            "_ruapc.rdma/prepare_connection",
+        ]);
+        expected.sort_unstable();
+        assert_eq!(all_names, expected);
     }
 
     #[test]
@@ -310,6 +429,30 @@ mod tests {
         let new_count = router.method_names().count();
         assert_eq!(new_count, initial_count + 1);
         assert!(router.method_names().any(|n| n == "TestSvc/do_thing"));
+        assert!(router.is_public_method("TestSvc/do_thing"));
+    }
+
+    #[test]
+    fn test_internal_method_is_dispatchable_but_not_publicly_discoverable() {
+        let mut router = Router::default();
+        let initial_public_count = router.method_names().count();
+        let initial_total_count = router.all_method_names().count();
+
+        router.add_internal_method::<InternalReq, DummyRsp>("Control/secret", Box::new(noop_func));
+
+        assert_eq!(router.method_names().count(), initial_public_count);
+        assert_eq!(router.all_method_names().count(), initial_total_count + 1);
+        assert!(!router.is_public_method("Control/secret"));
+        assert!(
+            router
+                .all_method_names()
+                .any(|name| name == "Control/secret")
+        );
+        assert!(
+            router
+                .method_schemas()
+                .all(|(name, _)| name != "Control/secret")
+        );
     }
 
     #[test]
@@ -327,6 +470,37 @@ mod tests {
             "expected MySvc/my_op in OpenAPI paths, got: {:?}",
             path_keys
         );
+
+        let first = serde_json::to_value(&router.openapi).unwrap();
+        router.build_open_api().unwrap();
+        let second = serde_json::to_value(&router.openapi).unwrap();
+        assert_eq!(second, first, "OpenAPI generation should be idempotent");
+    }
+
+    #[test]
+    fn test_build_open_api_excludes_internal_methods_and_schemas() {
+        let mut router = Router::default();
+        router.add_internal_method::<InternalReq, DummyRsp>("Control/secret", Box::new(noop_func));
+        router.build_open_api().unwrap();
+
+        assert!(!router.openapi.paths.paths.contains_key("/Control/secret"));
+        let components = router.openapi.components.as_ref().unwrap();
+        assert!(!components.schemas.contains_key("InternalReq"));
+    }
+
+    #[test]
+    #[should_panic(expected = "RPC method `Duplicate/run` is already registered")]
+    fn test_duplicate_wire_name_is_rejected_across_visibilities() {
+        let mut router = Router::default();
+        router.add_method::<DummyReq, DummyRsp>("Duplicate/run", Box::new(noop_func));
+        router.add_internal_method::<DummyReq, DummyRsp>("Duplicate/run", Box::new(noop_func));
+    }
+
+    #[test]
+    #[should_panic(expected = "must have the form `Service/method`")]
+    fn test_invalid_wire_method_name_is_rejected() {
+        let mut router = Router::default();
+        router.add_method::<DummyReq, DummyRsp>("missing_separator", Box::new(noop_func));
     }
 
     #[test]

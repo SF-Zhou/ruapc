@@ -1,0 +1,5 @@
+error: service name cannot have leading or trailing whitespace
+ --> tests/ui/fail/service_name_with_whitespace.rs:3:25
+  |
+3 | #[ruapc::service(name = " Foo")]
+  |                         ^^^^^^

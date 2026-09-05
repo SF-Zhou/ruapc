@@ -1,0 +1,11 @@
+error: duplicate `name` argument
+ --> tests/ui/fail/duplicate_service_arguments.rs:3:34
+  |
+3 | #[ruapc::service(name = "First", name = "Second")]
+  |                                  ^^^^
+
+error: duplicate `internal` argument
+ --> tests/ui/fail/duplicate_service_arguments.rs:8:28
+  |
+8 | #[ruapc::service(internal, internal)]
+  |                            ^^^^^^^^

@@ -411,19 +411,19 @@ let (rsp, buffers) = client
 - **witness 保证服务端契约**：`WithBuffers` 字段私有，唯一产生路径是
   `remote_write → SentBuffers::reply`（或显式的 `sent_nothing()`）
 - **WriteTarget pin 保证客户端安全**：`with_write_buffers` 的 buffers
-  移入 `Arc<WriteTarget>`，挂在 waiter entry 上；`push`/`pull` handler
+  移入 `Arc<WriteTarget>`，挂在 waiter entry 上；`write_inline` / `read_into_target` handler
   执行写入时 clone 这个 Arc——即使原请求超时、entry 被清理，在飞的
   RDMA READ 仍持有内存，绝不会把 NIC 可能还在写的内存还给 pool。
   正常路径下全部 buffers 随响应原子交付并从 `WithBuffers` 返回；
   失败路径可通过 `ClientWithBuffers::take_write_buffers()` 找回
-- wire 上的响应就是 `T`（`WithBuffers` 透明序列化），数据走 out-of-band
-  的 pull/push 协议；未附加 write buffers 的调用得到空 buffer 列表
+- wire 上的响应就是 `T`（`WithBuffers` 透明序列化），数据走内部的
+  out-of-band reverse RPC；未附加 write buffers 的调用得到空 buffer 列表
 
 ## 传输层实现
 
 ### TCP：反向 RPC 模拟
 
-**Remote Read 流程（`MemoryService/read`）：**
+**Remote Read 流程（内部 `_ruapc.memory/read_inline`）：**
 
 1. Server 校验 op 批量后发反向 RPC，携带 read regions 回显 + ops
 2. Client 重新校验（region 注册表存在性、`addr + len` 不越界、op 边界），
@@ -432,7 +432,7 @@ let (rsp, buffers) = client
    复用的内存，丢弃并返回 Timeout
 4. Server 按 ops 把 blob 散射进 local 空间
 
-**Remote Write 流程（`MemoryService/push`）：**
+**Remote Write 流程（内部 `_ruapc.memory/write_inline`）：**
 
 1. Server 把各 op 的源区间按顺序拼成内联 blob，随 ops 发反向 RPC
 2. Client 查 waiter 拿到 `Arc<WriteTarget>`（不存在 → Timeout），校验 ops
@@ -447,35 +447,35 @@ let (rsp, buffers) = client
    `max_send_sge`，超出再拆 WR）——多 buffer 对上层透明
 2. 并发 post 全部 WR。在飞 READ 数由**网卡（本地设备）级**信号量统一
    限流（`rdma.remote_memory.max_inflight_read_wrs`，默认 32）：同一 NIC 上所有连接、
-   Server 侧 `remote_read` 与 Client 侧 `pull` 共享同一预算，这是读
+   Server 侧 `remote_read` 与 Client 侧 `read_into_target` 共享同一预算，这是读
    流量的拥塞控制主旋钮；permit 由 poll 线程随 completion 归还（FIFO
    公平）。此外每连接还有 `qp.max_send_wr / 2` 的内部上限（非策略配置，
    仅防止设备级预算集中到单个 QP 时打爆其 send queue）。一批 WR 共享
    一个 `ReadBatch`（原子计数），最后一个 WC 到达时唤醒等待方
 3. 每批 WR 在提交前按总字节数向**本地设备端口级 RECV** GCRA 预留带宽。
    Client 携带 read buffers 发请求时按完整 read space，Server 发起
-   `remote_write` 的反向 `pull` 前按 `Σ op.len`，向同一端口的独立
+   `remote_write` 的反向 `read_into_target` 前按 `Σ op.len`，向同一端口的独立
    **SEND** GCRA 预留带宽。
    两个方向分别使用单个原子 TAT，并在该端口的所有连接间共享额度；
-   `rdma.bandwidth_limit_ratio`（默认 0.95）控制可用物理带宽比例，
-   `rdma.bandwidth_limit_burst_ms`（默认 0）控制额外突发容忍时间，
-   `rdma.bandwidth_limit_max_wait_ms`（默认 1s，0 表示立即拒绝）限制等待。
+   `rdma.remote_memory.bandwidth_limit_ratio`（默认 0.95）控制可用物理带宽比例，
+   `rdma.remote_memory.bandwidth_limit_burst_ms`（默认 0）控制额外突发容忍时间，
+   `rdma.remote_memory.bandwidth_limit_max_wait_ms`（默认 1s，0 表示立即拒绝）限制等待。
    每个 `RdmaDevice` 管理自身各端口的限速器和配置；超限在任何 WR 提交前
    返回 `RdmaRateLimited`，不会产生部分传输或破坏 QP
 4. NIC 层并发度由握手协商的 `max_rd_atomic`/`max_dest_rd_atomic` 决定：
-   双方在 Endpoint 交换中携带设备能力（`rd_atomic_cap`，上限 16），
+   双方在 `RdmaQpEndpoint` 交换中携带设备能力（`rd_atomic_cap`，上限 16），
    两侧都取 min，天然满足 RC 的 initiator ≤ responder 约束
-5. 读完成后反向 RPC `is_message_waiting` 校验原始请求存活（单边读
+5. 读完成后反向 RPC `_ruapc.memory/request_is_pending` 校验原始请求存活（单边读
    Client 无感知，超时后内存可能已复用）
 
 ### RDMA Write 模拟：控制消息 + Client-side RDMA Read
 
 1. Server 调用 `ctx.remote_write(ops, local)`：把 local buffers 作为反向
-   RPC（`MemoryService/pull`）的 **read regions** 附加（与 Client 附加
+   RPC（`_ruapc.memory/read_into_target`）的 **read regions** 附加（与 Client 附加
    read buffers 完全同一机制——角色对称），body 携带 ops
 2. Client 查 waiter 拿 `Arc<WriteTarget>`、校验 ops，走**同一套**
    fragmentation + 批量 READ 引擎，从 Server 内存读进 pinned buffers
-3. `pull` 响应即完成通知；Server 端 `remote_write` 返回 `SentBuffers`
+3. `read_into_target` 响应即完成通知；Server 端 `remote_write` 返回 `SentBuffers`
 4. 无需读后存活校验：目的内存由 Arc pin 住（Client 侧），源内存由
    Server 的 future 跨 await 持有
 

@@ -134,15 +134,14 @@ curl -s -X POST -d '"hello HTTP"' http://0.0.0.0:8000/EchoService/echo | json_pp
 #> {
 #>    "Ok" : "hello HTTP"
 #> }
-curl -s -X POST http://0.0.0.0:8000/MetaService/list_methods | json_pp
-#> {
-#>    "Ok" : [
-#>       "EchoService/echo",
-#>       "MetaService/list_methods",
-#>       "MetaService/openapi",
-#>       "GreetService/greet"
-#>    ]
-#> }
+curl -s -X POST -H 'content-type: application/json' -d '{}' \
+  http://0.0.0.0:8000/_ruapc.meta/describe \
+  | jq '.Ok.services | map({name, methods: [.methods[].name]})'
+#> [
+#>   {"name":"EchoService","methods":["echo"]},
+#>   {"name":"GreetService","methods":["greet"]},
+#>   {"name":"_ruapc.meta","methods":["describe","openapi"]}
+#> ]
 
 # Access interactive API documentation
 open http://0.0.0.0:8000/rapidoc
@@ -161,6 +160,9 @@ let config = SocketPoolConfig {
 
 This exposes RPC methods at `/api/v1/ServiceName/method`, the HTTP/2 RPC
 stream at `/api/v1/_rpc`, and API documentation at `/api/v1/rapidoc`.
+
+See [Built-in RPC services](docs/builtin-services.md) for the public reflection
+contract and the internal remote-memory/RDMA control interfaces.
 
 ### Remote Read/Write
 

@@ -7,6 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 ## [Unreleased]
 
 ### Added
+- Structured built-in reflection through
+  `_ruapc.meta/describe`, including the RuaPC version, public service/method
+  schemas, and resolvable OpenAPI components.
+- `#[service(name = "...", internal)]` support for stable wire names and
+  dispatchable control-plane methods that stay out of public discovery and
+  OpenAPI.
 - `rdma.path.allow_down_ports` (default `false`) can retain devices whose ports
   are currently DOWN during discovery, allowing the port refresher to make them
   available after the link becomes active.
@@ -17,6 +23,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   immediately when set to zero.
 
 ### Changed
+- **BREAKING**: Built-in services now use the reserved `_ruapc.*` wire
+  namespace. Remote-memory methods are named `read_inline`, `write_inline`,
+  `read_into_target`, and `request_is_pending`; RDMA bootstrap methods are
+  named `discover`, `prepare_connection`, `commit_connection`, and
+  `cancel_connection`. Internal methods are hidden from OpenAPI and unary HTTP.
+- **BREAKING**: RDMA bootstrap types now separate peer-advertised directional
+  limits from local QP settings. Per-connection CQ and wire SGE fields were
+  removed, endpoint leases are returned separately from QP endpoints, and
+  asymmetric send/receive limits are negotiated in the correct direction.
+- **BREAKING**: Router registration rejects duplicate wire names. `MethodInfo` is replaced
+  by `MethodSchema` with explicit `request_schema` / `response_schema` fields;
+  `method_names()` and `method_schemas()` expose public methods only.
 - **BREAKING**: `RdmaSocketPoolConfig` is grouped into `connection`, `polling`,
   `path`, `peers`, `maintenance`, and `remote_memory` sub-configurations.
 - `SocketPoolConfig::buffer_pool_memory` now defaults explicitly to
@@ -25,6 +43,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - When built with the `rdma` feature, `SocketPoolConfig::default()` now enables
   RDMA resources with `RdmaSocketPoolConfig::default()`; set `rdma` to `None`
   to disable them explicitly.
+
+### Removed
+- **BREAKING**: Removed the dead `Metadata` type and the redundant
+  `MetaService/list_methods` API. The public raw message-waiter probe was also
+  removed; its safety-critical use is now an internal remote-memory method.
 
 ## [0.2.0-alpha.5] - 2026-08-23
 
