@@ -445,7 +445,7 @@ impl RdmaSocketPool {
             return;
         };
         match self
-            .connect_stripe(peer, state, &plan.acquire_ctx, best)
+            .connect_stripe(peer, state, &plan.bootstrap_ctx, best)
             .await
         {
             Ok(established) => {

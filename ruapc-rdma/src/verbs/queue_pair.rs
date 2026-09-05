@@ -10,8 +10,8 @@ use super::{
     completion_queue::CompletionQueue, protection_domain::ProtectionDomain, wr_slots::WrSlots,
 };
 use crate::{
-    Error, ErrorKind, LinkLayer, Result, WRID, WRType, ibv_gid, ibv_mtu, ibv_qp_attr,
-    ibv_qp_attr_mask, ibv_qp_state, ibv_wc,
+    Error, ErrorKind, QpConnectionConfig, Result, WRID, WRType, ibv_qp_attr, ibv_qp_attr_mask,
+    ibv_wc,
 };
 
 /// Maximum gather-list length accepted by [`QueuePair::send_gather`];
@@ -114,7 +114,14 @@ impl QueuePair {
         init_attr.recv_cq = recv_cq.as_ptr();
         let ptr = unsafe { crate::ruapc_ibv_create_qp(pd.as_ptr(), init_attr) };
         if ptr.is_null() {
-            return Err(ErrorKind::IBCreateQueuePairFail.with_errno());
+            let source = std::io::Error::last_os_error();
+            return Err(Error::new(
+                ErrorKind::IBCreateQueuePairFail,
+                format!(
+                    "ibv_create_qp failed: type={:?}, requested_cap={:?}: {source}",
+                    init_attr.qp_type, init_attr.cap,
+                ),
+            ));
         }
         // `ibv_create_qp` updates `init_attr.cap` with the actual (possibly
         // larger) queue depths; size the slot arrays from those.
@@ -508,158 +515,36 @@ impl QueuePair {
         self.send_wrs.reclaim_all()
     }
 
-    pub fn modify(&self, attr: &mut crate::ibv_qp_attr, attr_mask: c_int) -> Result<()> {
+    /// Applies raw QP attributes, preserving the provider's returned errno.
+    pub fn modify(&self, attr: &mut ibv_qp_attr, attr_mask: c_int) -> Result<()> {
         let ret = unsafe { crate::ruapc_ibv_modify_qp(self.ptr, attr, attr_mask) };
         if ret != 0 {
-            return Err(ErrorKind::IBModifyQueuePairFail.with_errno());
+            return Err(modify_error(self.qp_num(), attr, attr_mask, ret));
         }
         Ok(())
     }
 
-    const ACCESS_FLAGS: u32 = crate::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0
-        | crate::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE.0
-        | crate::ibv_access_flags::IBV_ACCESS_REMOTE_READ.0
-        | crate::ibv_access_flags::IBV_ACCESS_RELAXED_ORDERING.0;
-
-    pub fn init(&self, port_num: u8, pkey_index: u16) -> Result<()> {
-        let mut attr = ibv_qp_attr {
-            qp_state: ibv_qp_state::IBV_QPS_INIT,
-            pkey_index,
-            port_num,
-            qp_access_flags: Self::ACCESS_FLAGS,
-            ..Default::default()
-        };
-        let mask = ibv_qp_attr_mask::IBV_QP_STATE
-            | ibv_qp_attr_mask::IBV_QP_PKEY_INDEX
-            | ibv_qp_attr_mask::IBV_QP_PORT
-            | ibv_qp_attr_mask::IBV_QP_ACCESS_FLAGS;
-        self.modify(&mut attr, mask.0 as _)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn ready_to_recv(
-        &self,
-        remote_qp_num: u32,
-        remote_gid: ibv_gid,
-        remote_lid: u16,
-        local_port_num: u8,
-        local_gid_index: u8,
-        link_layer: LinkLayer,
-        path_mtu: ibv_mtu,
-        rq_psn: u32,
-        max_dest_rd_atomic: u8,
-        traffic_class: u8,
-    ) -> Result<()> {
-        let mut ah_attr = crate::ibv_ah_attr {
-            sl: 0,
-            src_path_bits: 0,
-            static_rate: 0,
-            port_num: local_port_num,
-            ..Default::default()
-        };
-
-        match link_layer {
-            LinkLayer::InfiniBand => {
-                ah_attr.dlid = remote_lid;
-                ah_attr.is_global = 0;
-            }
-            LinkLayer::Ethernet => {
-                ah_attr.grh = crate::ibv_global_route {
-                    dgid: remote_gid,
-                    flow_label: 0,
-                    sgid_index: local_gid_index,
-                    hop_limit: 0xff,
-                    traffic_class,
-                };
-                ah_attr.is_global = 1;
-            }
-            LinkLayer::Unspecified => {
-                return Err(Error::new(
-                    ErrorKind::IBModifyQueuePairFail,
-                    "RDMA link layer is unspecified".into(),
-                ));
-            }
+    /// Connects a freshly created reliable-connected QP: RESET → INIT → RTR → RTS.
+    ///
+    /// All parameters are validated before the first transition. A provider
+    /// failure leaves the QP at the last successful stage; callers must discard
+    /// it instead of retrying this method on the same QP. Receive buffers must
+    /// be posted before the peer is allowed to send application traffic.
+    pub fn connect(&self, config: &QpConnectionConfig) -> Result<()> {
+        config.validate()?;
+        for (transition, (mut attr, mask)) in [
+            ("RESET -> INIT", config.init_attributes()),
+            ("INIT -> RTR", config.receive_attributes()),
+            ("RTR -> RTS", config.send_attributes()),
+        ] {
+            self.modify(&mut attr, mask.0 as _).map_err(|error| {
+                Error::new(
+                    error.kind,
+                    format!("{transition}: {}; connection={config:?}", error.msg),
+                )
+            })?;
         }
-
-        let mut attr = ibv_qp_attr {
-            qp_state: ibv_qp_state::IBV_QPS_RTR,
-            path_mtu,
-            dest_qp_num: remote_qp_num,
-            rq_psn: rq_psn & 0xFF_FFFF,
-            // Concurrency of inbound RDMA READs (peer as initiator);
-            // negotiated by the caller from both sides' device caps.
-            max_dest_rd_atomic: max_dest_rd_atomic.max(1),
-            // 0.01ms (encoding 1): an RNR NAK costs ~10µs instead of the
-            // common-default 1.28ms (0x12). The receive ring is normally
-            // pre-posted ahead of the peer's send window, so RNR is a rare
-            // transient (repost lag); a short backoff keeps it invisible
-            // instead of quantizing the connection's RTT in 1.28ms steps.
-            min_rnr_timer: 0x01,
-            ah_attr,
-            ..Default::default()
-        };
-        let mask = ibv_qp_attr_mask::IBV_QP_STATE
-            | ibv_qp_attr_mask::IBV_QP_AV
-            | ibv_qp_attr_mask::IBV_QP_PATH_MTU
-            | ibv_qp_attr_mask::IBV_QP_DEST_QPN
-            | ibv_qp_attr_mask::IBV_QP_RQ_PSN
-            | ibv_qp_attr_mask::IBV_QP_MAX_DEST_RD_ATOMIC
-            | ibv_qp_attr_mask::IBV_QP_MIN_RNR_TIMER;
-        self.modify(&mut attr, mask.0 as _)
-    }
-
-    pub fn ready_to_send(&self, sq_psn: u32, max_rd_atomic: u8) -> Result<()> {
-        let mut attr = ibv_qp_attr {
-            qp_state: ibv_qp_state::IBV_QPS_RTS,
-            timeout: 0x12,
-            retry_cnt: 6,
-            rnr_retry: 6,
-            sq_psn: sq_psn & 0xFF_FFFF,
-            // Concurrency of outbound RDMA READs (this side as initiator);
-            // must not exceed the peer's `max_dest_rd_atomic`.
-            max_rd_atomic: max_rd_atomic.max(1),
-            ..Default::default()
-        };
-        let mask = ibv_qp_attr_mask::IBV_QP_STATE
-            | ibv_qp_attr_mask::IBV_QP_TIMEOUT
-            | ibv_qp_attr_mask::IBV_QP_RETRY_CNT
-            | ibv_qp_attr_mask::IBV_QP_RNR_RETRY
-            | ibv_qp_attr_mask::IBV_QP_SQ_PSN
-            | ibv_qp_attr_mask::IBV_QP_MAX_QP_RD_ATOMIC;
-        self.modify(&mut attr, mask.0 as _)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn connect(
-        &self,
-        local_port_num: u8,
-        local_gid_index: u8,
-        pkey_index: u16,
-        link_layer: LinkLayer,
-        path_mtu: ibv_mtu,
-        remote_qp_num: u32,
-        remote_gid: ibv_gid,
-        remote_lid: u16,
-        local_psn: u32,
-        remote_psn: u32,
-        max_rd_atomic: u8,
-        max_dest_rd_atomic: u8,
-        traffic_class: u8,
-    ) -> Result<()> {
-        self.init(local_port_num, pkey_index)?;
-        self.ready_to_recv(
-            remote_qp_num,
-            remote_gid,
-            remote_lid,
-            local_port_num,
-            local_gid_index,
-            link_layer,
-            path_mtu,
-            remote_psn,
-            max_dest_rd_atomic,
-            traffic_class,
-        )?;
-        self.ready_to_send(local_psn, max_rd_atomic)
+        Ok(())
     }
 
     /// Posts a raw send work request chain.
@@ -707,6 +592,23 @@ impl QueuePair {
     }
 }
 
+// ibv_modify_qp returns an errno value directly; last_os_error() can be stale.
+fn modify_error(qp_num: u32, attr: &ibv_qp_attr, attr_mask: c_int, errno: c_int) -> Error {
+    let target = if attr_mask & ibv_qp_attr_mask::IBV_QP_STATE.0 as c_int != 0 {
+        format!("{:?}", attr.qp_state)
+    } else {
+        "unchanged".to_owned()
+    };
+    Error::new(
+        ErrorKind::IBModifyQueuePairFail,
+        format!(
+            "ibv_modify_qp failed: qp_num={qp_num}, target_state={target}, \
+             attr_mask={attr_mask:#x}, errno={errno}: {}",
+            std::io::Error::from_raw_os_error(errno),
+        ),
+    )
+}
+
 impl Drop for QueuePair {
     fn drop(&mut self) {
         let _ = unsafe { crate::ruapc_ibv_destroy_qp(self.ptr) };
@@ -722,3 +624,31 @@ impl std::fmt::Debug for QueuePair {
 }
 unsafe impl Send for QueuePair {}
 unsafe impl Sync for QueuePair {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn modify_error_reports_provider_errno_and_target_state() {
+        let attr = ibv_qp_attr {
+            qp_state: crate::ibv_qp_state::IBV_QPS_ERR,
+            ..Default::default()
+        };
+        let error = modify_error(
+            42,
+            &attr,
+            ibv_qp_attr_mask::IBV_QP_STATE.0 as _,
+            libc::EINVAL,
+        );
+        assert_eq!(error.kind, ErrorKind::IBModifyQueuePairFail);
+        assert!(error.msg.contains("qp_num=42"));
+        assert!(error.msg.contains("target_state=IBV_QPS_ERR"));
+        assert!(error.msg.contains(&format!("errno={}", libc::EINVAL)));
+        assert!(
+            error
+                .msg
+                .contains(&std::io::Error::from_raw_os_error(libc::EINVAL).to_string())
+        );
+    }
+}

@@ -215,6 +215,9 @@ cargo run --bin remote_memory --features rdma -- --transport rdma
 
 ### RDMA Support
 
+See [RDMA connection establishment](docs/rdma-connection.md) (中文) for the
+bootstrap sequence, parameter negotiation, connection leases, and diagnostics.
+
 ```bash
 # Make sure the process has unlimited memory lock limit.
 sudo prlimit --pid $$ -l=unlimited

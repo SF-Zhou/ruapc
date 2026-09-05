@@ -87,13 +87,16 @@ metadata API.
 
 ## Internal RDMA bootstrap service
 
-When the `rdma` feature is enabled, `_ruapc.rdma` is used over the bootstrap
-connection to discover paths and establish queue pairs.
+When the `rdma` feature is enabled, `_ruapc.rdma` is used over a TCP bootstrap
+connection to discover paths and establish queue pairs. The current bootstrap
+protocol version is **2**; peers must advertise exactly this version. There is
+no compatibility branch for older versions. See [RDMA connection establishment](rdma-connection.md)
+for the sequence, negotiation, leases, rollback, and diagnostic logs.
 
 | Method | Request | Success value | Purpose |
 |---|---|---|---|
 | `_ruapc.rdma/discover` | `()` | `RdmaPeerAdvertisement` | Advertises the protocol version and currently connectable devices. |
-| `_ruapc.rdma/prepare_connection` | `PrepareConnectionRequest` | `PrepareConnectionResponse` | Creates the acceptor QP and returns its endpoint plus a lease. |
+| `_ruapc.rdma/prepare_connection` | `PrepareConnectionRequest` | `PrepareConnectionResponse` | Creates the acceptor QP and returns its endpoint, lease, and actual limits. |
 | `_ruapc.rdma/commit_connection` | `ConnectionLease` | `()` | Idempotently confirms that the initiator retained the QP. |
 | `_ruapc.rdma/cancel_connection` | `ConnectionLease` | `()` | Best-effort cleanup when setup cannot complete. |
 
@@ -149,7 +152,8 @@ PrepareConnectionRequest
 
 PrepareConnectionResponse
 ├─ endpoint: RdmaQpEndpoint
-└─ lease: ConnectionLease
+├─ lease: ConnectionLease
+└─ limits: RdmaConnectionLimits  acceptor's actual resolved limits
 
 ConnectionLease
 ├─ attempt_id: u64
@@ -162,6 +166,13 @@ local QP properties and are therefore not sent on the wire. Completion queues
 are shared per device, so there is no per-connection CQ field either. Devices
 with no currently usable advertised port are omitted even when discovery keeps
 a DOWN device locally for later port refresh.
+
+The prepare response must exactly mirror the initiator's resolved send/receive
+limits and match its receive-ring length and message-size limit. Changed
+capabilities since discovery therefore fail setup instead of leaving the peers
+with inconsistent runtime settings. Commit confirms ownership; activation also
+requires a successful data-plane receive and completes asynchronously after
+stripe publication.
 
 ## Exposure rules
 

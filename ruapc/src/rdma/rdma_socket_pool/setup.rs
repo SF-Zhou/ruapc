@@ -3,7 +3,10 @@
 use std::{sync::Arc, sync::atomic::Ordering, time::Duration};
 
 use ruapc_bufpool::Device as _;
-use ruapc_rdma::{DeviceInfo, Port, QueuePair, ibv_mtu, ibv_qp_cap, ibv_qp_init_attr, ibv_qp_type};
+use ruapc_rdma::{
+    DeviceInfo, Port, QpConnectionConfig, QueuePair, ibv_mtu, ibv_qp_cap, ibv_qp_init_attr,
+    ibv_qp_type,
+};
 
 use super::super::path::RdmaPathInfo;
 use super::super::{
@@ -13,7 +16,105 @@ use super::super::{
 use super::{ConnCountGuard, RdmaSocketPool};
 use crate::{Buffer, Error, ErrorKind, Result, State};
 
+/// Resources owned by one local endpoint before it is handed to the poller.
+/// Both initiator and acceptor use the same negotiation and setup sequence.
+pub(super) struct LocalConnection {
+    queue_pair: QueuePair,
+    pub(super) endpoint: RdmaQpEndpoint,
+    pub(super) config: RdmaConnectionConfig,
+    poller: Arc<super::super::poller::DevicePoller>,
+    device_index: usize,
+}
+
+impl LocalConnection {
+    pub(super) fn connect(&self, pool: &RdmaSocketPool, remote: &RdmaQpEndpoint) -> Result<()> {
+        pool.bring_qp_to_rts(
+            &self.queue_pair,
+            &self.endpoint,
+            remote,
+            pool.config.connection.pkey_index,
+            self.config.traffic_class,
+        )
+        .map_err(|err| at_stage("connect queue pair", err))
+    }
+
+    pub(super) fn register(
+        self,
+        pool: &RdmaSocketPool,
+        state: &Arc<State>,
+        path: RdmaPathInfo,
+    ) -> Result<Arc<RdmaSocket>> {
+        pool.register_socket(
+            self.queue_pair,
+            state,
+            &self.poller,
+            &self.config,
+            path,
+            self.device_index,
+        )
+        .map_err(|err| at_stage("register socket", err))
+    }
+}
+
+/// Add setup context without losing the original error kind (notably timeout,
+/// overload and the specific verbs failure).
+pub(super) fn at_stage(stage: &str, err: Error) -> Error {
+    Error::new(err.kind, format!("RDMA {stage}: {}", err.msg))
+}
+
 impl RdmaSocketPool {
+    pub(super) fn prepare_local_connection(
+        &self,
+        device_index: usize,
+        selection: &DeviceSelection,
+        peer_limits: RdmaConnectionLimits,
+        traffic_class: u8,
+    ) -> Result<LocalConnection> {
+        let device = self
+            .devices
+            .rdma_devices()
+            .get(device_index)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidArgument,
+                    format!("local RDMA device index {device_index} is unavailable"),
+                )
+            })?;
+        let config = self
+            .resolve_connection_config(device, peer_limits, traffic_class)
+            .map_err(|err| at_stage("negotiate limits", err))?;
+        let poller = self
+            .pollers
+            .get_or_start(
+                device,
+                self.poller_config(),
+                self.config.polling.poll_threads_per_device,
+            )
+            .map_err(|err| at_stage("start completion poller", err))?;
+        let queue_pair = self
+            .create_queue_pair(device, &config, &poller)
+            .map_err(|err| at_stage("create queue pair", err))?;
+        let endpoint = self
+            .build_endpoint(&queue_pair, device, selection.port_num, selection.gid_index)
+            .map_err(|err| at_stage("build local endpoint", err))?;
+        endpoint
+            .validate()
+            .map_err(|err| at_stage("validate local endpoint", err))?;
+        tracing::debug!(
+            local_qp = endpoint.qp_num,
+            ?endpoint,
+            ?config,
+            "RDMA local endpoint prepared"
+        );
+        Ok(LocalConnection {
+            queue_pair,
+            endpoint,
+            config,
+            poller,
+            device_index,
+        })
+    }
+
     pub(super) fn find_device_by_name(
         &self,
         selection: &DeviceSelection,
@@ -31,35 +132,14 @@ impl RdmaSocketPool {
             })
     }
 
-    pub(super) fn negotiate_connection_config(
-        &self,
-        local_device: &RdmaDevice,
-        remote: &RdmaConnectionLimits,
-    ) -> Result<RdmaConnectionConfig> {
-        let local = self.local_connection_config(local_device);
-        let negotiated = RdmaConnectionLimits::from(local).negotiate(*remote)?;
-        Ok(RdmaConnectionConfig {
-            qp: RdmaQueuePairConfig {
-                max_send_wr: negotiated.max_send_wr,
-                max_recv_wr: negotiated.max_recv_wr,
-                // Scatter/gather lists are local WQE properties.
-                max_send_sge: local.qp.max_send_sge,
-                max_recv_sge: local.qp.max_recv_sge,
-            },
-            recv_queue_len: negotiated.recv_queue_len,
-            max_msg_size: negotiated.max_msg_size,
-            traffic_class: self.config.connection.traffic_class,
-        })
-    }
-
-    pub(super) fn clamp_connection_config(
+    pub(super) fn resolve_connection_config(
         &self,
         device: &RdmaDevice,
-        initiator: RdmaConnectionLimits,
+        peer: RdmaConnectionLimits,
         traffic_class: u8,
     ) -> Result<RdmaConnectionConfig> {
         let local = self.local_connection_config(device);
-        let negotiated = RdmaConnectionLimits::from(local).negotiate(initiator)?;
+        let negotiated = RdmaConnectionLimits::from(local).negotiate(peer)?;
         Ok(RdmaConnectionConfig {
             qp: RdmaQueuePairConfig {
                 max_send_wr: negotiated.max_send_wr,
@@ -133,7 +213,7 @@ impl RdmaSocketPool {
             ..Default::default()
         };
         let mut queue_pair = QueuePair::create(device.pd(), cq, cq, &mut init_attr, device.index())
-            .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
+            .map_err(Error::from)?;
         queue_pair.set_send_signal_interval(
             self.config.connection.send_signal_interval,
             config.qp.max_send_wr,
@@ -186,8 +266,8 @@ impl RdmaSocketPool {
             .device_attr
             .max_qp_rd_atom
             .min(info.device_attr.max_qp_init_rd_atom)
-            .clamp(1, RD_ATOMIC_CEILING);
-        u8::try_from(cap).unwrap_or(1)
+            .clamp(0, RD_ATOMIC_CEILING);
+        cap as u8
     }
 
     fn random_psn(qp_num: u32) -> u32 {
@@ -229,23 +309,25 @@ impl RdmaSocketPool {
             ));
         }
         let path_mtu = Self::min_mtu(local.active_mtu, remote.active_mtu);
-        let rd_atomic = local.rd_atomic_cap.min(remote.rd_atomic_cap).max(1);
-        qp.connect(
-            local.port_num,
-            local.gid_index,
+        local.validate()?;
+        remote.validate()?;
+        let rd_atomic = local.rd_atomic_cap.min(remote.rd_atomic_cap);
+        qp.connect(&QpConnectionConfig {
+            local_port_num: local.port_num,
+            local_gid_index: local.gid_index,
             pkey_index,
-            local.link_layer,
+            link_layer: local.link_layer,
             path_mtu,
-            remote.qp_num,
-            remote.gid,
-            remote.lid,
-            local.psn,
-            remote.psn,
-            rd_atomic,
-            rd_atomic,
+            remote_qp_num: remote.qp_num,
+            remote_gid: remote.gid,
+            remote_lid: remote.lid,
+            local_psn: local.psn,
+            remote_psn: remote.psn,
+            max_rd_atomic: rd_atomic,
+            max_dest_rd_atomic: rd_atomic,
             traffic_class,
-        )
-        .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))
+        })
+        .map_err(Error::from)
     }
 
     fn min_mtu(a: ibv_mtu, b: ibv_mtu) -> ibv_mtu {
@@ -262,7 +344,11 @@ impl RdmaSocketPool {
         path: RdmaPathInfo,
         device_index: usize,
     ) -> Result<Arc<RdmaSocket>> {
-        let qp_depth = (config.qp.max_send_wr + config.qp.max_recv_wr).saturating_mul(2);
+        let qp_depth = config
+            .qp
+            .max_send_wr
+            .saturating_add(config.qp.max_recv_wr)
+            .saturating_mul(2);
         let reservation = poller.reserve(qp_depth)?;
         queue_pair.set_wr_tag(reservation.tag());
 
@@ -325,12 +411,24 @@ impl RdmaSocketPool {
             },
         ));
 
-        for _ in 0..config.recv_queue_len {
-            let buf = self.buffer_pool.allocate(config.max_msg_size as usize)?;
+        for posted in 0..config.recv_queue_len {
+            let stage = || {
+                format!(
+                    "pre-post receive {}/{} ({} bytes, QP {})",
+                    posted + 1,
+                    config.recv_queue_len,
+                    config.max_msg_size,
+                    socket.queue_pair.qp_num()
+                )
+            };
+            let buf = self
+                .buffer_pool
+                .allocate(config.max_msg_size as usize)
+                .map_err(|err| at_stage(&stage(), err.into()))?;
             socket
                 .queue_pair
                 .recv(buf)
-                .map_err(|e| Error::new(ErrorKind::RdmaRecvFailed, e.to_string()))?;
+                .map_err(|err| at_stage(&stage(), err.into()))?;
         }
         poller.register(
             reservation,
@@ -348,11 +446,15 @@ impl RdmaSocketPool {
             },
         )?;
 
-        let socket_clone = socket.clone();
+        // The shutdown watcher must not retain a failed/rolled-back QP after
+        // its poller entry is drained. The poller owns the live socket.
+        let weak_socket = Arc::downgrade(&socket);
         let task_supervisor = self.task_supervisor.start_async_task();
         tokio::spawn(async move {
             task_supervisor.stopped().await;
-            socket_clone.set_error();
+            if let Some(socket) = weak_socket.upgrade() {
+                socket.set_error();
+            }
         });
         Ok(socket)
     }

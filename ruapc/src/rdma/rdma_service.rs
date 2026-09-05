@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Context, Result, rdma, service};
 
 /// Version of the internal RDMA bootstrap protocol.
-pub(crate) const RDMA_BOOTSTRAP_PROTOCOL_VERSION: u32 = 1;
+pub(crate) const RDMA_BOOTSTRAP_PROTOCOL_VERSION: u32 = 2;
 
 fn port_is_connectable(port: &Port) -> bool {
     port.is_usable() && (!port.port_attr.link_layer.is_ethernet() || !port.gids.is_empty())
@@ -147,7 +147,9 @@ pub(crate) trait RdmaBootstrapService {
     ) -> Result<rdma::PrepareConnectionResponse>;
 
     /// Confirms that the initiator received the endpoint and retained its
-    /// local QP. Unconfirmed accepts expire after the configured lease.
+    /// local QP. The first confirmation starts the data-plane activation
+    /// budget; repeated confirmations do not extend it. The connection
+    /// remains leased until a successful receive also proves activation.
     /// The bootstrap service assumes a trusted control plane; the token
     /// correlates lifecycle state but does not authenticate the caller.
     async fn commit_connection(&self, ctx: &Context, lease: &rdma::ConnectionLease) -> Result<()>;

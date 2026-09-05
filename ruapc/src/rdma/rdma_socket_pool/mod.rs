@@ -21,6 +21,7 @@ pub(crate) use peer::PeerState;
 mod accept;
 use accept::AcceptLease;
 mod connect;
+mod handshake;
 mod placement;
 use placement::PathCandidate;
 mod maintenance;
@@ -84,8 +85,8 @@ impl Drop for ConnCountGuard {
 /// Rust drops struct fields in **declaration order**, so the fields below
 /// are intentionally ordered to satisfy the ibverbs requirement.
 pub struct RdmaSocketPool {
-    /// Client used for acquiring RDMA connections (no RDMA resources).
-    pub acquire_client: Client,
+    /// Client for bootstrap control RPCs over TCP (no RDMA resources).
+    pub bootstrap_client: Client,
     /// Supervisor for managing asynchronous tasks — dropped first so that
     /// watcher tasks finish and connections are marked for teardown.
     pub task_supervisor: TaskSupervisor,
@@ -203,7 +204,7 @@ impl RdmaSocketPool {
         let task_supervisor = TaskSupervisor::create();
         let port_refresher = RdmaDeviceRefresher::start(devices.clone(), &task_supervisor);
         Ok(Self {
-            acquire_client: Client {
+            bootstrap_client: Client {
                 timeout: std::time::Duration::from_secs(5),
                 connect_timeout: std::time::Duration::from_secs(5),
                 use_msgpack: true,
@@ -258,12 +259,19 @@ impl RdmaSocketPool {
                 peer.connect.lock(),
             )
             .await
-            .map_err(|_| Error::new(ErrorKind::Timeout, "request deadline expired".into())),
+            .map_err(|_| {
+                Error::new(
+                    ErrorKind::Timeout,
+                    format!(
+                        "RDMA connection to {addr}: deadline expired waiting for peer connect lock"
+                    ),
+                )
+            }),
             None => Ok(peer.connect.lock().await),
         };
         let guard = guard?;
         let result = self
-            .handshake(&peer, state, avoided_remote_nics, deadline)
+            .connect_peer(&peer, state, avoided_remote_nics, deadline)
             .await;
         drop(guard);
         if result.is_ok() {

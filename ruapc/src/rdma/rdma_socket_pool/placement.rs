@@ -664,17 +664,13 @@ pub(super) struct PathCandidate {
 #[cfg(test)]
 mod path_selection_tests {
     use std::net::SocketAddr;
+    use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
-    use std::sync::{Arc, Weak};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
-    use super::super::accept::{
-        AcceptLease, AcceptLeaseEvent, AcceptLeaseState, advance_accept_lease,
-    };
     use super::super::maintenance::preconnect_backoff_delay;
     use super::super::{ConnCountGuard, RdmaSocketPool, next_attempt_id};
     use super::*;
-    use crate::rdma::ConnectionLease;
     use crate::rdma::RdmaSocketPoolConfig;
     use crate::rdma::rdma_service::RDMA_BOOTSTRAP_PROTOCOL_VERSION;
     use crate::rdma::rdma_service::RdmaDeviceInfo;
@@ -828,102 +824,6 @@ mod path_selection_tests {
         assert_eq!(err.kind, ErrorKind::InvalidArgument);
     }
 
-    #[tokio::test]
-    async fn test_accept_lease_transitions_are_state_checked() {
-        let pool = make_pool();
-        let connection_id = 42;
-        let socket = Weak::new();
-        pool.accept_leases.insert(
-            connection_id,
-            AcceptLease {
-                socket: socket.clone(),
-                accepted_connection_id: 7,
-                state: AcceptLeaseState::Pending,
-                expires_at: Instant::now() + Duration::from_secs(1),
-            },
-        );
-        pool.observe_accept_receive(connection_id, &socket);
-        assert!(pool.accept_leases.contains_key(&connection_id));
-        assert_eq!(
-            pool.accept_leases.get(&connection_id).unwrap().state,
-            AcceptLeaseState::ReceiveObserved
-        );
-
-        pool.accept_leases.get_mut(&connection_id).unwrap().state = AcceptLeaseState::Confirmed;
-        pool.observe_accept_receive(connection_id, &socket);
-        assert_eq!(
-            pool.accept_leases.get(&connection_id).unwrap().state,
-            AcceptLeaseState::Active
-        );
-        pool.accept_leases.remove(&connection_id);
-
-        pool.accept_leases.insert(
-            connection_id,
-            AcceptLease {
-                socket: Weak::new(),
-                accepted_connection_id: 7,
-                state: AcceptLeaseState::Pending,
-                expires_at: Instant::now() + Duration::from_secs(1),
-            },
-        );
-        let mismatched = ConnectionLease {
-            attempt_id: connection_id,
-            accepted_connection_id: 8,
-        };
-        assert_eq!(
-            pool.rdma_commit_connection(&mismatched).unwrap_err().kind,
-            ErrorKind::InvalidArgument
-        );
-        pool.rdma_cancel_connection(&mismatched);
-        assert!(pool.accept_leases.contains_key(&connection_id));
-        pool.accept_leases.remove(&connection_id);
-
-        pool.accept_leases.insert(
-            connection_id,
-            AcceptLease {
-                socket: Weak::new(),
-                accepted_connection_id: 7,
-                state: AcceptLeaseState::Pending,
-                expires_at: Instant::now() - Duration::from_millis(1),
-            },
-        );
-        let lease = ConnectionLease {
-            attempt_id: connection_id,
-            accepted_connection_id: 7,
-        };
-        let err = pool.rdma_commit_connection(&lease).unwrap_err();
-        assert_eq!(err.kind, ErrorKind::InvalidArgument);
-        assert!(!pool.accept_leases.contains_key(&connection_id));
-    }
-
-    #[test]
-    fn test_accept_lease_events_commit_in_either_order() {
-        assert_eq!(
-            advance_accept_lease(AcceptLeaseState::Pending, AcceptLeaseEvent::Confirm),
-            AcceptLeaseState::Confirmed
-        );
-        assert_eq!(
-            advance_accept_lease(AcceptLeaseState::Confirmed, AcceptLeaseEvent::Receive),
-            AcceptLeaseState::Active
-        );
-        assert_eq!(
-            advance_accept_lease(AcceptLeaseState::Pending, AcceptLeaseEvent::Receive),
-            AcceptLeaseState::ReceiveObserved
-        );
-        assert_eq!(
-            advance_accept_lease(AcceptLeaseState::ReceiveObserved, AcceptLeaseEvent::Confirm),
-            AcceptLeaseState::Active
-        );
-        assert_eq!(
-            advance_accept_lease(AcceptLeaseState::Confirmed, AcceptLeaseEvent::Confirm),
-            AcceptLeaseState::Confirmed
-        );
-        assert_eq!(
-            advance_accept_lease(AcceptLeaseState::Active, AcceptLeaseEvent::Confirm),
-            AcceptLeaseState::Active
-        );
-    }
-
     #[test]
     fn test_addresses_share_connectivity_domain() {
         let subnets = RdmaSubnetDomains::new(vec![
@@ -1003,13 +903,15 @@ mod path_selection_tests {
         // Client path: local config wins over the remote advertisement.
         let advertised = connection_limits();
         let negotiated = pool
-            .negotiate_connection_config(device, &advertised)
+            .resolve_connection_config(device, advertised, pool.config.connection.traffic_class)
             .unwrap();
         assert_eq!(negotiated.traffic_class, 96);
 
         // Server path: the requested (client-chosen) value passes through.
         let requested = connection_limits();
-        let clamped = pool.clamp_connection_config(device, requested, 42).unwrap();
+        let clamped = pool
+            .resolve_connection_config(device, requested, 42)
+            .unwrap();
         assert_eq!(clamped.traffic_class, 42);
     }
 

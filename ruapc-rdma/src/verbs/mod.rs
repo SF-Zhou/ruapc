@@ -36,6 +36,9 @@ pub use memory_region::MemoryRegion;
 mod protection_domain;
 pub use protection_domain::ProtectionDomain;
 
+mod qp_connection;
+pub use qp_connection::QpConnectionConfig;
+
 mod queue_pair;
 pub use queue_pair::{Completion, MAX_GATHER_SGE, QueuePair, ReadSge, WrBuffers};
 

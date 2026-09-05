@@ -1,78 +1,24 @@
-//! Client side of RDMA connection setup: handshake, stripe establishment,
-//! admission and the connect-plan/advertisement machinery.
+//! Outbound pool orchestration: discovery, path failover, stripe publication.
+//! The per-path bootstrap transaction lives in `handshake`.
 
 use std::{
     collections::HashSet,
-    net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use super::super::rdma_service::RDMA_BOOTSTRAP_PROTOCOL_VERSION;
-use super::super::{
-    ConnectionLease, PrepareConnectionRequest, RdmaBootstrapService as _, RdmaConnectionLimits,
-    RdmaPeerAdvertisement, RdmaSocket,
-};
+use super::super::{RdmaBootstrapService as _, RdmaPeerAdvertisement, RdmaSocket};
+use super::handshake::EstablishedSocket;
 use super::placement::{PathCandidate, PathPreference};
-use super::{PeerState, RdmaSocketPool, Stripe, next_attempt_id};
-use crate::{Client, Context, Error, ErrorKind, Result, Socket, State};
-
-pub(super) struct SocketRegistrationGuard {
-    socket: Arc<RdmaSocket>,
-    armed: bool,
-    cancel: Option<(
-        crate::TaskSupervisorHandle,
-        Client,
-        Context,
-        ConnectionLease,
-    )>,
-}
-
-impl SocketRegistrationGuard {
-    pub(super) fn new(
-        socket: &Arc<RdmaSocket>,
-        supervisor: crate::TaskSupervisorHandle,
-        client: Client,
-        context: Context,
-        lease: ConnectionLease,
-    ) -> Self {
-        Self {
-            socket: socket.clone(),
-            armed: true,
-            cancel: Some((supervisor, client, context, lease)),
-        }
-    }
-
-    pub(super) fn commit(&mut self) {
-        self.armed = false;
-        self.cancel = None;
-    }
-}
-
-impl Drop for SocketRegistrationGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            self.socket.set_error();
-            if let Some((supervisor, client, context, lease)) = self.cancel.take() {
-                let _ = supervisor.try_spawn(async move {
-                    if let Err(err) = client.cancel_connection(&context, &lease).await {
-                        tracing::debug!(attempt_id = lease.attempt_id, %err, "RDMA cancellation cleanup failed");
-                    }
-                });
-            }
-        }
-    }
-}
-
-pub(super) struct EstablishedSocket {
-    pub(super) socket: Arc<RdmaSocket>,
-    pub(super) registration: SocketRegistrationGuard,
-}
+use super::setup::at_stage;
+use super::{PeerState, RdmaSocketPool, Stripe};
+use crate::{Context, Error, ErrorKind, Result, Socket, State};
 
 impl RdmaSocketPool {
     const ADVERTISEMENT_CACHE_TTL: Duration = Duration::from_secs(30);
 
-    pub(super) async fn handshake(
+    pub(super) async fn connect_peer(
         &self,
         peer: &Arc<PeerState>,
         state: &Arc<State>,
@@ -108,7 +54,10 @@ impl RdmaSocketPool {
             .flatten();
         let plan = match self.prepare_connect_plan(peer, state, deadline).await {
             Ok(plan) => plan,
-            Err(_) if fallback.is_some() => return Ok(fallback.expect("checked above")),
+            Err(err) if fallback.is_some() => {
+                tracing::debug!(peer = %addr, %err, "RDMA discovery failed; using existing stripe");
+                return Ok(fallback.expect("checked above"));
+            }
             Err(err) => return Err(err),
         };
         if !avoided_remote_nics.is_empty()
@@ -147,7 +96,10 @@ impl RdmaSocketPool {
                 .await
             {
                 Ok(established) => established,
-                Err(_) if fallback.is_some() => return Ok(fallback.expect("checked above")),
+                Err(err) if fallback.is_some() => {
+                    tracing::debug!(peer = %addr, %err, "RDMA additional connection failed; using existing stripe");
+                    return Ok(fallback.expect("checked above"));
+                }
                 Err(err) => return Err(err),
             };
             let stripe = self.admit_established(peer, established);
@@ -177,6 +129,17 @@ impl RdmaSocketPool {
             }
         }
 
+        // Earlier handshakes may have closed while later stripes were being
+        // prepared. Keep the initial set all-or-nothing at publication.
+        if let Some(stripe) = stripes.iter().find(|stripe| !stripe.socket.state.is_ok()) {
+            return Err(Error::new(
+                ErrorKind::ConnectionClosed,
+                format!(
+                    "RDMA initial stripe {} to {addr} closed before publication",
+                    stripe.socket.conn_id
+                ),
+            ));
+        }
         let socket = self
             .pick_stripe(&stripes, avoided_remote_nics)
             .or_else(|| self.pick_stripe(&stripes, &HashSet::new()))
@@ -201,21 +164,25 @@ impl RdmaSocketPool {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(Error::new(
                 ErrorKind::Timeout,
-                "request deadline expired".into(),
+                format!(
+                    "RDMA discovery for {}: connection deadline expired",
+                    peer.addr
+                ),
             ));
         }
-        let mut acquire_ctx = Context::create_with_state_and_addr(state, &peer.addr);
-        acquire_ctx.deadline = deadline;
-        let remote_info = self.fetch_peer_advertisement(peer, &acquire_ctx).await?;
+        let mut bootstrap_ctx = Context::create_with_state_and_addr(state, &peer.addr);
+        bootstrap_ctx.deadline = deadline;
+        let remote_info = self.fetch_peer_advertisement(peer, &bootstrap_ctx).await?;
         let candidates = match self.enumerate_path_candidates(&remote_info) {
             Ok(candidates) => candidates,
             Err(err) => {
                 self.invalidate_advertisement_cache(peer);
-                return Err(err);
+                return Err(at_stage(&format!("select paths to {}", peer.addr), err));
             }
         };
+        tracing::debug!(peer = %peer.addr, remote_devices = remote_info.devices.len(), candidates = candidates.len(), "RDMA connection paths enumerated");
         Ok(ConnectPlan {
-            acquire_ctx,
+            bootstrap_ctx,
             remote_info,
             candidates,
             deadline,
@@ -235,6 +202,8 @@ impl RdmaSocketPool {
         existing: &[Stripe],
     ) -> Result<EstablishedSocket> {
         let mut remaining: Vec<PathCandidate> = plan.candidates.clone();
+        let mut last_failure = None;
+        let mut attempted = 0;
         loop {
             if plan
                 .deadline
@@ -242,231 +211,100 @@ impl RdmaSocketPool {
             {
                 return Err(Error::new(
                     ErrorKind::Timeout,
-                    "request deadline expired".into(),
+                    format!(
+                        "RDMA path failover to {}: connection deadline expired after {attempted} attempts",
+                        peer.addr
+                    ),
                 ));
             }
-            let candidate =
-                self.select_candidate(peer, &remaining, preference, &plan.remote_info, existing)?;
+            let candidate = match self.select_candidate(
+                peer,
+                &remaining,
+                preference,
+                &plan.remote_info,
+                existing,
+            ) {
+                Ok(candidate) => candidate,
+                Err(err) => {
+                    return Err(last_failure.unwrap_or_else(|| {
+                        at_stage(&format!("select path to {}", peer.addr), err)
+                    }));
+                }
+            };
+            attempted += 1;
             match self
-                .connect_stripe(peer, state, &plan.acquire_ctx, &candidate)
+                .connect_stripe(peer, state, &plan.bootstrap_ctx, &candidate)
                 .await
             {
                 Ok(socket) => return Ok(socket),
                 Err(err) => {
                     remaining.retain(|remaining| remaining.path != candidate.path);
+                    let err = at_stage(
+                        &format!(
+                            "path failover exhausted {attempted} attempts to {}",
+                            peer.addr
+                        ),
+                        err,
+                    );
                     if remaining.is_empty() {
                         return Err(err);
                     }
-                    tracing::warn!(
+                    tracing::debug!(
                         peer = %peer.addr,
                         local = %candidate.path.local.device,
                         remote = %candidate.path.remote.device,
-                        "RDMA path failed ({err}); trying another NIC pair"
+                        remaining_candidates = remaining.len(),
+                        "trying another RDMA NIC pair"
                     );
+                    last_failure = Some(err);
                 }
             }
         }
     }
 
-    /// Establishes one RDMA connection (stripe) towards `addr` on the
-    /// given path candidate.
-    pub(super) async fn connect_stripe(
-        &self,
-        peer: &Arc<PeerState>,
-        state: &Arc<State>,
-        acquire_ctx: &Context,
-        candidate: &PathCandidate,
-    ) -> Result<EstablishedSocket> {
-        let device = self
-            .devices
-            .rdma_devices()
-            .get(candidate.local_device_index)
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::InvalidArgument,
-                    "selected RDMA device disappeared".into(),
-                )
-            })?;
-        let connection_config =
-            self.negotiate_connection_config(device, &candidate.remote_limits)?;
-        let poller = self.pollers.get_or_start(
-            device,
-            self.poller_config(),
-            self.config.polling.poll_threads_per_device,
-        )?;
-        let queue_pair = self.create_queue_pair(device, &connection_config, &poller)?;
-        let local_endpoint = self.build_endpoint(
-            &queue_pair,
-            device,
-            candidate.path.local.port_num,
-            candidate.path.local.gid_index,
-        )?;
-
-        let attempt_id = next_attempt_id();
-        let prepare_request = PrepareConnectionRequest {
-            attempt_id,
-            endpoint: local_endpoint,
-            source_device: candidate.path.local.device.clone(),
-            same_connectivity_domain: candidate.path.same_connectivity_domain,
-            target: candidate.remote.clone(),
-            limits: RdmaConnectionLimits::from(connection_config),
-            traffic_class: connection_config.traffic_class,
-        };
-        // Box the recursive RPC call: `Client::prepare_connection` is generated by
-        // `#[service]` and its future (through `SocketPool::acquire`)
-        // contains this pool's futures — without the indirection this
-        // coroutine's type would be infinitely sized. (No `Send`-proof
-        // cycle arises from the recursion: the macro emits client impls
-        // as `fn -> impl Future + Send`, so callers take `Send` from the
-        // signature instead of inspecting the client bodies.)
-        let response = match Box::pin(
-            self.acquire_client
-                .prepare_connection(acquire_ctx, &prepare_request),
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(err) => {
-                self.invalidate_advertisement_cache(peer);
-                return Err(err);
-            }
-        };
-        if response.lease.attempt_id != attempt_id || response.lease.accepted_connection_id == 0 {
-            return Err(Error::new(
-                ErrorKind::InvalidArgument,
-                "peer returned an invalid RDMA connection lease".into(),
-            ));
-        }
-        let remote_endpoint = response.endpoint;
-        let lease = response.lease;
-        if let Err(err) = self.bring_qp_to_rts(
-            &queue_pair,
-            &local_endpoint,
-            &remote_endpoint,
-            self.config.connection.pkey_index,
-            connection_config.traffic_class,
-        ) {
-            // QP setup failures are typically path problems (no route
-            // between the selected NIC pair): penalize the pair so
-            // placement falls over to other candidates.
-            self.blacklist_path(peer, &candidate.path);
-            self.schedule_cancel_connection(&peer.addr, state, lease);
-            return Err(err);
-        }
-
-        let socket = match self.register_socket(
-            queue_pair,
-            state,
-            &poller,
-            &connection_config,
-            candidate.path.clone(),
-            candidate.local_device_index,
-        ) {
-            Ok(socket) => socket,
-            Err(err) => {
-                self.schedule_cancel_connection(&peer.addr, state, lease);
-                return Err(err);
-            }
-        };
-        let registration = SocketRegistrationGuard::new(
-            &socket,
-            self.task_supervisor.handle(),
-            self.acquire_client.clone(),
-            Context::create_with_state_and_addr(state, &peer.addr),
-            lease,
-        );
-        if acquire_ctx.is_expired() {
-            return Err(Error::new(
-                ErrorKind::Timeout,
-                "RDMA acquire deadline expired before commit".into(),
-            ));
-        }
-        self.commit_connection(acquire_ctx, &lease).await?;
-        if acquire_ctx.is_expired() {
-            return Err(Error::new(
-                ErrorKind::Timeout,
-                "RDMA acquire deadline expired after commit".into(),
-            ));
-        }
-        tracing::info!(
-            local_device = %candidate.path.local.device,
-            local_port = candidate.path.local.port_num,
-            local_gid_index = candidate.path.local.gid_index,
-            remote_device = %candidate.remote.device_name,
-            remote_port = candidate.remote.port_num,
-            remote_gid_index = candidate.remote.gid_index,
-            local_qp = socket.queue_pair.qp_num(),
-            remote_qp = remote_endpoint.qp_num,
-            "acquired RDMA socket"
-        );
-        Ok(EstablishedSocket {
-            socket,
-            registration,
-        })
-    }
-
-    /// Runs the commit RPC, retrying once after an ambiguous response
-    /// timeout. `commit_connection` is idempotent on the server (the lease
-    /// state machine absorbs duplicates), so this local retry rescues an
-    /// otherwise healthy QP from a lost response on the bootstrap
-    /// connection instead of tearing it down and failing over paths. The
-    /// generic client deliberately never retries after send — idempotency
-    /// is knowledge only this call site has.
-    async fn commit_connection(&self, ctx: &Context, lease: &ConnectionLease) -> Result<()> {
-        match Box::pin(self.acquire_client.commit_connection(ctx, lease)).await {
-            Err(err) if matches!(err.kind, ErrorKind::Timeout) && !ctx.is_expired() => {
-                tracing::debug!(
-                    attempt_id = lease.attempt_id,
-                    "RDMA connection commit timed out, retrying once"
-                );
-                Box::pin(self.acquire_client.commit_connection(ctx, lease)).await
-            }
-            result => result,
-        }
-    }
-
     /// Admits one confirmed connection into request rotation.
-    /// Ordering is always track -> commit -> publish -> activate.
+    /// Under the publication lock: track -> disarm rollback -> publish;
+    /// then request data-plane activation.
     pub(super) fn admit_established(
         &self,
         peer: &Arc<PeerState>,
         established: EstablishedSocket,
     ) -> Stripe {
-        let EstablishedSocket {
-            socket,
-            mut registration,
-        } = established;
+        let EstablishedSocket { socket, rollback } = established;
         let stripe = Stripe { socket };
+        let mut stripes = peer.stripes.write().unwrap();
         stripe.socket.set_peer_health(peer);
-        registration.commit();
-        peer.stripes.write().unwrap().active.push(stripe.clone());
+        rollback.disarm();
+        stripes.active.push(stripe.clone());
+        drop(stripes);
         stripe.socket.request_activation();
+        tracing::debug!(peer = %peer.addr, conn_id = stripe.socket.conn_id, "RDMA stripe published; activation requested");
         stripe
     }
 
     /// Atomically publishes an initial stripe set after every handshake
-    /// succeeded. Dropping before commit cancels every unadmitted connection.
+    /// succeeded. Dropping before publication cancels every unadmitted connection.
     fn admit_initial(&self, peer: &Arc<PeerState>, established: Vec<EstablishedSocket>) {
-        let mut registrations = Vec::with_capacity(established.len());
+        let mut rollbacks = Vec::with_capacity(established.len());
         let stripes: Vec<Stripe> = established
             .into_iter()
             .map(|established| {
-                let EstablishedSocket {
-                    socket,
-                    registration,
-                } = established;
+                let EstablishedSocket { socket, rollback } = established;
                 socket.set_peer_health(peer);
-                registrations.push(registration);
+                rollbacks.push(rollback);
                 Stripe { socket }
             })
             .collect();
-        for registration in &mut registrations {
-            registration.commit();
+        let mut published = peer.stripes.write().unwrap();
+        for rollback in rollbacks {
+            rollback.disarm();
         }
-        peer.stripes.write().unwrap().active = stripes.clone();
+        published.active = stripes.clone();
+        drop(published);
         for stripe in &stripes {
             stripe.socket.request_activation();
         }
+        tracing::debug!(peer = %peer.addr, stripes = stripes.len(), "RDMA initial stripes published; activation requested");
     }
 
     /// Replaces `victim` only if it is still in rotation. The replacement is
@@ -477,10 +315,7 @@ impl RdmaSocketPool {
         victim: &Arc<RdmaSocket>,
         established: EstablishedSocket,
     ) -> bool {
-        let EstablishedSocket {
-            socket,
-            mut registration,
-        } = established;
+        let EstablishedSocket { socket, rollback } = established;
         let mut stripes = peer.stripes.write().unwrap();
         let Some(position) = stripes
             .active
@@ -490,7 +325,7 @@ impl RdmaSocketPool {
             return false;
         };
         socket.set_peer_health(peer);
-        registration.commit();
+        rollback.disarm();
         stripes.active.push(Stripe {
             socket: socket.clone(),
         });
@@ -498,23 +333,9 @@ impl RdmaSocketPool {
         stripes.draining.push(victim.clone());
         drop(stripes);
         socket.request_activation();
+        tracing::debug!(peer = %peer.addr, conn_id = socket.conn_id, previous_conn_id = victim.socket.conn_id, "RDMA replacement published; activation requested");
         self.drain_then_close(peer, victim.socket);
         true
-    }
-
-    fn schedule_cancel_connection(
-        &self,
-        addr: &SocketAddr,
-        state: &Arc<State>,
-        lease: ConnectionLease,
-    ) {
-        let cancel_ctx = Context::create_with_state_and_addr(state, addr);
-        let cancel_client = self.acquire_client.clone();
-        let _ = self.task_supervisor.handle().try_spawn(async move {
-            if let Err(err) = cancel_client.cancel_connection(&cancel_ctx, &lease).await {
-                tracing::debug!(attempt_id = lease.attempt_id, %err, "RDMA cancellation cleanup failed");
-            }
-        });
     }
 
     async fn fetch_peer_advertisement(
@@ -523,18 +344,20 @@ impl RdmaSocketPool {
         ctx: &Context,
     ) -> Result<RdmaPeerAdvertisement> {
         if let Some(info) = self.get_cached_advertisement(peer) {
+            tracing::debug!(peer = %peer.addr, devices = info.devices.len(), "using cached RDMA advertisement");
             return Ok(info);
         }
 
-        // Boxed for the same reason as the `prepare_connection` call in
-        // `connect_stripe`: keeps this coroutine's type finite.
-        let info = Box::pin(self.acquire_client.discover(ctx, &())).await?;
+        // Boxed to break the bootstrap RPC / socket acquire future recursion.
+        let info = Box::pin(self.bootstrap_client.discover(ctx, &()))
+            .await
+            .map_err(|err| at_stage(&format!("discover peer {}", peer.addr), err))?;
         if info.protocol_version != RDMA_BOOTSTRAP_PROTOCOL_VERSION {
             return Err(Error::new(
                 ErrorKind::InvalidArgument,
                 format!(
-                    "unsupported RDMA bootstrap protocol version {} (expected {})",
-                    info.protocol_version, RDMA_BOOTSTRAP_PROTOCOL_VERSION
+                    "RDMA peer {} advertised unsupported bootstrap protocol version {} (expected {})",
+                    peer.addr, info.protocol_version, RDMA_BOOTSTRAP_PROTOCOL_VERSION
                 ),
             ));
         }
@@ -555,7 +378,7 @@ impl RdmaSocketPool {
         }
     }
 
-    fn invalidate_advertisement_cache(&self, peer: &PeerState) {
+    pub(super) fn invalidate_advertisement_cache(&self, peer: &PeerState) {
         peer.meta.lock().unwrap().device_cache = None;
     }
 }
@@ -564,7 +387,7 @@ impl RdmaSocketPool {
 /// context, the peer's advertised device list and the compatible path
 /// candidates derived from it.
 pub(super) struct ConnectPlan {
-    pub(super) acquire_ctx: Context,
+    pub(super) bootstrap_ctx: Context,
     pub(super) remote_info: RdmaPeerAdvertisement,
     pub(super) candidates: Vec<PathCandidate>,
     deadline: Option<Instant>,

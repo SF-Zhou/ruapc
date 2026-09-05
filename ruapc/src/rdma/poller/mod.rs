@@ -351,7 +351,7 @@ impl DevicePoller {
             .is_err()
         {
             return Err(Error::new(
-                ErrorKind::RdmaSendFailed,
+                ErrorKind::Overloaded,
                 format!(
                     "shared CQ capacity exhausted: {} + {qp_depth} > {} (raise rdma.polling.device_cq_len)",
                     budget.load(Ordering::Acquire),
@@ -367,7 +367,7 @@ impl DevicePoller {
         let mut inner = self.shared.inner.lock().unwrap();
         if self.shared.shutdown.load(Ordering::Acquire) {
             return Err(Error::new(
-                ErrorKind::RdmaSendFailed,
+                ErrorKind::ConnectionClosed,
                 "RDMA poll thread is not running".into(),
             ));
         }
@@ -376,7 +376,7 @@ impl DevicePoller {
             None => {
                 if inner.generations.len() >= MAX_SLOTS {
                     return Err(Error::new(
-                        ErrorKind::RdmaSendFailed,
+                        ErrorKind::Overloaded,
                         format!("poller connection slots exhausted ({MAX_SLOTS})"),
                     ));
                 }
@@ -407,7 +407,7 @@ impl DevicePoller {
                 // Put the budget back so the reservation drop frees the slot.
                 reservation.budget = Some(budget);
                 return Err(Error::new(
-                    ErrorKind::RdmaSendFailed,
+                    ErrorKind::ConnectionClosed,
                     "RDMA poll thread is not running".into(),
                 ));
             }

@@ -160,7 +160,10 @@ pub struct RdmaPeerPoolConfig {
     pub connections_per_peer: u32,
     pub min_connections_per_remote_nic: u32,
     pub preconnect_max_per_peer: u32,
-    /// Accepted connection lease in milliseconds. Must be at least 15s.
+    /// Budget for preparation and, after the first commit, data-plane
+    /// activation. Once active, retain the lease for this long solely for
+    /// idempotent commits. Duplicate commits do not extend any budget.
+    /// Milliseconds; must be at least 15s.
     pub connect_lease_ms: u64,
 }
 
