@@ -1,6 +1,10 @@
 //! End-to-end echo RPC benchmark across transports.
 //!
 //! Run with: `cargo bench -p ruapc --bench echo`
+//! Optional environment settings: `RUAPC_BENCH_SERIAL_ITERS` (default 5000),
+//! `RUAPC_BENCH_WARMUP_ITERS` (default 1000), and `RUAPC_BENCH_TRANSPORT`
+//! (`TCP`, `WS`, `HTTP`, or `RDMA`; unset measures every transport).
+//! `RUAPC_BENCH_RDMA_DEVICE` restricts both peers to one named RDMA device.
 //!
 //! A single UNIFIED server serves all protocols on one port; each transport
 //! is measured with the same client-side workload:
@@ -27,6 +31,49 @@ const CONCURRENT_TASKS: [usize; 2] = [64, 1024];
 /// so every concurrency level issues the same amount of work.
 const CONCURRENT_TOTAL_OPS: usize = 256_000;
 
+struct BenchOptions {
+    warmup_iters: usize,
+    serial_iters: usize,
+    transport: Option<Transport>,
+    rdma_device: Option<String>,
+}
+
+impl BenchOptions {
+    fn from_env() -> Self {
+        let serial_iters = env_iters("RUAPC_BENCH_SERIAL_ITERS", SERIAL_ITERS);
+        assert!(serial_iters > 0, "RUAPC_BENCH_SERIAL_ITERS must be nonzero");
+        Self {
+            warmup_iters: env_iters("RUAPC_BENCH_WARMUP_ITERS", WARMUP_ITERS),
+            serial_iters,
+            transport: optional_env("RUAPC_BENCH_TRANSPORT")
+                .map(|value| value.parse().expect("invalid RUAPC_BENCH_TRANSPORT")),
+            rdma_device: optional_env("RUAPC_BENCH_RDMA_DEVICE"),
+        }
+    }
+
+    fn includes(&self, transport: Transport) -> bool {
+        self.transport.is_none_or(|selected| selected == transport)
+    }
+}
+
+fn optional_env(name: &str) -> Option<String> {
+    match std::env::var(name) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => panic!("invalid {name}: {error}"),
+    }
+}
+
+fn env_iters(name: &str, default: usize) -> usize {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse()
+            .unwrap_or_else(|_| panic!("{name} must be a nonnegative integer")),
+        Err(std::env::VarError::NotPresent) => default,
+        Err(error) => panic!("invalid {name}: {error}"),
+    }
+}
+
 #[ruapc::service]
 trait EchoService {
     async fn echo(&self, ctx: &ruapc::Context, req: &String) -> ruapc::Result<String>;
@@ -41,22 +88,27 @@ impl EchoService for EchoImpl {
 }
 
 /// Serial round-trip latency: one request in flight at a time.
-async fn bench_serial(ctx: &Context, payload_size: usize) {
+async fn bench_serial(
+    ctx: &Context,
+    payload_size: usize,
+    warmup_iters: usize,
+    serial_iters: usize,
+) {
     let client = Client::default();
     let req = "x".repeat(payload_size);
 
-    for _ in 0..WARMUP_ITERS {
+    for _ in 0..warmup_iters {
         client.echo(ctx, &req).await.unwrap();
     }
 
     let start = Instant::now();
-    for _ in 0..SERIAL_ITERS {
+    for _ in 0..serial_iters {
         std::hint::black_box(client.echo(ctx, &req).await.unwrap());
     }
     let secs = start.elapsed().as_secs_f64();
 
     #[allow(clippy::cast_precision_loss)]
-    let us_per_op = secs * 1e6 / SERIAL_ITERS as f64;
+    let us_per_op = secs * 1e6 / serial_iters as f64;
     println!("  serial     {payload_size:>5}B: {us_per_op:>8.2} us/op");
 }
 
@@ -93,7 +145,7 @@ async fn bench_concurrent(ctx: &Context, payload_size: usize, num_tasks: usize) 
     );
 }
 
-async fn run() {
+async fn run(options: BenchOptions) {
     let echo = Arc::new(EchoImpl);
     let mut router = Router::default();
     echo.ruapc_export(&mut router);
@@ -106,11 +158,27 @@ async fn run() {
         buffer_pool_memory: 1 << 30,
         ..Default::default()
     };
+    #[cfg(feature = "rdma")]
+    let config = {
+        let mut config = config;
+        if let Some(device) = &options.rdma_device {
+            config
+                .rdma
+                .get_or_insert_with(Default::default)
+                .path
+                .device_filter = vec![device.clone()];
+        }
+        config
+    };
     let server = Server::create(router, &config).unwrap();
     let addr = std::net::SocketAddr::from_str("127.0.0.1:0").unwrap();
     let addr = server.listen(addr).await.unwrap();
     #[cfg(feature = "rdma")]
-    let second_addr = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let second_addr = if options.includes(Transport::RDMA) {
+        Some(server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap())
+    } else {
+        None
+    };
 
     let base_ctx = Context::create(&config).unwrap();
 
@@ -122,6 +190,9 @@ async fn run() {
         Transport::RDMA,
     ];
     for transport in transports {
+        if !options.includes(transport) {
+            continue;
+        }
         println!("{transport:?}");
         let ctx = base_ctx.with_endpoint(Endpoint::new(transport, addr));
 
@@ -135,7 +206,13 @@ async fn run() {
         }
 
         for payload_size in [16, 4096] {
-            bench_serial(&ctx, payload_size).await;
+            bench_serial(
+                &ctx,
+                payload_size,
+                options.warmup_iters,
+                options.serial_iters,
+            )
+            .await;
         }
         for num_tasks in CONCURRENT_TASKS {
             bench_concurrent(&ctx, 16, num_tasks).await;
@@ -144,7 +221,7 @@ async fn run() {
     }
 
     #[cfg(feature = "rdma")]
-    {
+    if let Some(second_addr) = second_addr {
         println!("RDMA (2 endpoints)");
         let ctx = base_ctx.with_endpoints(vec![
             Endpoint::new(Transport::RDMA, addr),
@@ -166,12 +243,17 @@ async fn run() {
 }
 
 fn main() {
+    let options = BenchOptions::from_env();
     println!("ruapc: end-to-end echo RPC benchmark (unified server, one port)");
+    println!(
+        "serial iterations: {}; warmup iterations: {}; transport: {:?}; RDMA device: {:?}",
+        options.serial_iters, options.warmup_iters, options.transport, options.rdma_device,
+    );
     println!();
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap()
-        .block_on(run());
+        .block_on(run(options));
 }

@@ -63,3 +63,7 @@ reqwest = { version = "0.12", features = ["json"] }
 [[bench]]
 name = "echo"
 harness = false
+
+[[bench]]
+name = "remote_memory"
+harness = false
