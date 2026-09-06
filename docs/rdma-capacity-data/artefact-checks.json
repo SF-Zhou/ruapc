@@ -1,0 +1,45 @@
+{
+  "production_source_fingerprints": true,
+  "supplemental_source_fingerprints": true,
+  "immutable_binary_fingerprints": true,
+  "cargo_lock": true,
+  "echo-stock-paired": {
+    "complete_runs": 18,
+    "pairs": 9
+  },
+  "echo-long-paired": {
+    "complete_runs": 10,
+    "pairs": 5
+  },
+  "remote-memory-paired": {
+    "complete_runs": 6,
+    "pairs": 3
+  },
+  "remote-memory-extended-paired": {
+    "complete_runs": 10,
+    "pairs": 5
+  },
+  "multi_stripe_pairs": {
+    "complete_runs": 20,
+    "pairs_per_connection_count": 5,
+    "connections": [
+      128,
+      256
+    ]
+  },
+  "python_harness_syntax": true,
+  "checked_at_utc": "2026-09-06T15:20:10.304284+00:00",
+  "iteration": "v1",
+  "remote_diagnostic": {
+    "complete_runs": 20,
+    "pairs_per_direction": 5,
+    "directions": [
+      "read",
+      "write"
+    ]
+  },
+  "four_capacity_patches_apply_sequentially_to_archived_baseline": true,
+  "remote_diagnostic_patch_applies_independently_to_clean_archive": true,
+  "all_six_probe_sources_match_their_patched_archive": true,
+  "v1_frozen_snapshot_fingerprints": true
+}

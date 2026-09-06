@@ -6,68 +6,67 @@ a slot advances its sequence floor above every sequence allocated by its
 previous occupants. This combines direct array routing with stale-completion
 rejection, without a separate connection-generation field.
 
-## Previous design and the ownership change
+## CQ-sized layout
 
-The previous WRID layout used 2 type bits, 22 opaque connection-tag bits and
-40 per-direction sequence bits. The core poller divided the tag into a 14-bit
-slot and an 8-bit generation. The poller allocated the tag, then assigned it
-through `QueuePair::set_wr_tag`; the dependency's CQ permanently marked that
-tag in a 512 KiB bitmap. Each poller slot retired after 256 generations.
+At CQ creation, the provider's actual positive `cqe` sets the route capacity
+`C`. The CQ fixes `s = ceil(log2(C))` slot bits and `q = 62 - s` sequence bits
+for its entire lifetime. Slot indices are `u32`; only slots `0..C` may be
+allocated, even when the encoding has spare positions. The route table grows
+on demand rather than allocating C entries at startup.
 
-That design supported direct array lookup and rejected old tags, but split
-identifier ownership between the poller and the verbs layer. Connection churn
-consumed generations independently of the number of work requests, while a
-long-lived QP had only the separate 40-bit sequence budget. A poller reservation
-also needed to manage tag identity before connection registration.
-
-The replacement makes the verbs layer responsible for allocation, posting
-identity and reuse. The poller reads the QP's immutable `CompletionRoute` and
-installs its connection in that slot. Its reservation now accounts for CQ work
-capacity; it does not allocate QP identity.
-
-| Property | Previous design | CQ-owned routes |
-|---|---|---|
-| WRID layout | 2 type + 22 tag + 40 sequence | 2 type + 14 slot + 48 sequence |
-| Slot owner | Core poller | Completion queue |
-| QP identity setup | Caller assigns a tag | QP creation acquires a route lease |
-| Reuse protection | 8-bit generation plus permanent tag bitmap | Sequence watermark preserved across QPs |
-| Slot lifetime limit | 256 generations | Exhaustion of the 48-bit sequence space |
-| Live slot limit per CQ/poller | 16384 | 16384 |
-| Completion lookup | Array index plus generation check | Array index plus sequence-floor check |
-
-This is an API change: `set_wr_tag`, `get_tag` and the tag constants are removed.
-`send_route()` and `recv_route()` expose the CQ-assigned route; `WRID::get_slot()`
-returns an array index. WRID constructors remain value constructors and do not
-confer authority to recover buffers. WRIDs are local verbs metadata and are not
-part of the RPC message framing exchanged with peers.
-
-## Bit layout and direction
+The provider reports `cqe` as a positive `c_int`, so `1 <= C <= 2^31 - 1`.
+Consequently `0 <= s <= 31` and `31 <= q <= 62`; a capacity-one CQ needs no
+slot bits.
 
 ```text
-63     62 61                    48 47                              0
-+--------+------------------------+--------------------------------+
-| type:2 | CQ route slot:14       | per-direction sequence:48      |
-+--------+------------------------+--------------------------------+
+| type: 2 bits | CQ-local slot: s bits | per-direction sequence: q bits |
 ```
 
-The type values remain `Recv`, `SendData`, `SendImm` and `Read`. A receive queue
-has its own sequence stream. SEND, SEND-with-immediate and READ all consume the
-send queue's stream. Two directions can use the same numeric sequence because
-their types distinguish them; SEND and READ cannot reuse an SQ sequence.
+`CompletionQueue::{capacity, route_capacity, sequence_bits}` expose these
+bounds. `Completion::{slot, sequence}` decodes through the token's originating
+CQ. A raw WRID exposes only `raw()` and `get_type()` because decoding its slot
+without the CQ layout is ambiguous. `CompletionRoute` precomputes the slot
+prefix and masks, so posting still combines a prefix and sequence with OR.
 
-Keeping the type in WRID is necessary for failed and flushed completions. The
-rdma-core `ibv_poll_cq` contract guarantees only `wr_id`, `status`, `qp_num` and
-`vendor_err` when status is not success. In particular, `opcode` cannot be used
-to recover the direction or READ bookkeeping on that path.
-See the [rdma-core `ibv_poll_cq(3)` manual](https://www.man7.org/linux/man-pages/man3/ibv_poll_cq.3.html).
+The previous CQ-owned layout fixed 14 slot bits and 48 sequence bits, limiting
+each CQ to 16384 QPs regardless of available CQ capacity. Before CQ-owned
+leases, poller-assigned tags also had a separate 8-bit generation counter and
+a permanently claimed tag bitmap. Both limits are removed. Completion lookup
+remains a direct array index with a sequence-floor check; no QPN hash table or
+per-WR routing allocation is introduced.
 
-The 14 slot bits retain the old 16384 simultaneous-slot ceiling. Actual usable
-QP counts also depend on CQ capacity, queue-depth reservations and device
-resources. Reclaiming the 8 generation bits expands the sequence range by
-256 times, from 40 to 48 bits. At a continuous one million allocations per
-second in the limiting direction, one fresh slot has roughly 8.9 years of
-sequence space. This is a capacity illustration, not a lifetime guarantee:
-failed posts consume sequences, and every lease consumes at least one step.
+| Actual CQ capacity C | Slot bits s | Sequence bits q |
+|---:|---:|---:|
+| 16384 | 14 | 48 |
+| 65536 | 16 | 46 |
+| 262144 | 18 | 44 |
+| 1048576 | 20 | 42 |
+| 2147483647 | 31 | 31 |
+
+Larger CQs trade sequence space for simultaneous route capacity. At one million
+allocations per second in one direction, 46 bits last about 2.23 years, while
+42 bits last about 50.9 days. The extreme 31-bit sequence space lasts only
+about 35.8 minutes at that rate. These are fresh-slot capacity illustrations,
+not lifetime guarantees: both failed posts and earlier occupants consume
+sequence space. Exhaustion fails explicitly and retires a slot; it never wraps.
+Use multiple CQ shards when more connection capacity and a longer sequence
+range are both needed. A CQ's layout cannot change, including while old tokens
+are retained; resizing and reinterpreting existing WRIDs is not supported.
+
+CQE capacity is not a verbs-imposed limit on the number of associated QPs;
+using C route slots is this library's admission policy. Hardware QP resources,
+registered buffers and the core's completion-credit budget impose additional
+limits. The provider may round the requested CQ size up; the actual value,
+not the request, controls both routing and admission. See the
+[rdma-core CQ creation contract](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/man/ibv_create_cq.3).
+
+The type values remain `Recv`, `SendData`, `SendImm` and `Read`. RQ has its own
+sequence stream; all SEND forms and READ share SQ's stream. On failed CQEs,
+only `wr_id`, `status`, `qp_num` and `vendor_err` are guaranteed, so opcode
+cannot recover direction or READ bookkeeping. See the
+[rdma-core CQ polling contract](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/man/ibv_poll_cq.3).
+
+WRIDs are local verbs metadata, not part of the RPC wire format.
 
 ## Route leases and watermarks
 
@@ -127,7 +126,7 @@ fails, the process aborts before releasing resources still accessible to DMA.
 
 Completion routing and completion authority have separate checks:
 
-1. The core indexes its connection array using `wrid.get_slot()` and verifies
+1. The core indexes its connection array using `completion.slot()` and verifies
    `sequence >= route.first_sequence()` before changing flow accounting.
 2. `CompletionQueue::poll_batch` lends a non-cloneable token from its private
    batch storage. The storage cannot change while that token is borrowed.
@@ -145,15 +144,16 @@ still available to accept it.
 
 The same reasoning prevents ABA when both a slot and a provider QP number are
 reused. Every CQ-local slot incarnation has a higher floor; every allocated
-sequence fits in 48 bits; exhaustion never resets a counter or reintroduces an
+sequence fits in the CQ's sequence bits; exhaustion never resets a counter or reintroduces an
 old identity. CQ identity additionally separates identical numeric routes from
 different completion queues.
 
 Selective SEND signaling retains RC SQ ordering. The existing SQ posting mutex
 serializes sequence allocation with posting so a later completion cannot sweep
 a still-unposted earlier ID. The signaling cadence uses the offset from this
-QP's first sequence, so its first SEND remains signaled independently of prior
-occupants. Reclamation starts at the current route's floor,
+QP's first sequence, so a data SEND at SQ offset zero is signaled independently
+of prior occupants. Earlier READs, ACKs and failed posts in the same QP still
+advance that shared SQ offset. Reclamation starts at the current route's floor,
 avoiding a scan through the sequence space used by previous QPs in that slot.
 READ destinations retain their independent batch ownership through completion
 or successful QP destruction.
@@ -180,21 +180,50 @@ ownership handles cleanup. Both ordinary CQ draining and the poll-after-arming
 event-race check use this dispatch path. Established-route hits do not acquire
 the inbox mutex or the CQ allocator mutex.
 
+## Connection maintenance at large route counts
+
+CQE routing and inbox registration mark a connection dirty once per drain.
+The poller maintains that compact list immediately after draining completions,
+including the arm/re-poll race path, so credit publication and pending sends
+do not wait for a periodic scan. The list and its membership bits belong only
+to the poll thread; no per-CQE shared atomic or notification allocation is
+needed. Removal and full scans clear or rebuild the list before slot reuse.
+
+Every 100 ms a full pass handles keepalive deadlines, READ timeouts and
+teardown that became ready without a CQE. Existing pending-send, activation
+and error wakeups set a shared hint before writing the wake pipe. The poller
+consumes that hint before maintenance, so a concurrent wake schedules another
+pass. These undirected wakeups still require a full connection scan; they are
+not claimed to be O(active). The normal CQE path no longer scans idle QPs.
+
+Only receive-buffer deficits remain on the dirty list for timed recovery:
+100 microseconds while busy, up to a 1 ms idle poll timeout. Window-blocked
+pending sends wait for a CQE, a wake or periodic housekeeping; they do not
+force busy spinning. `poll_spin_us = 0` retains its event-driven behavior.
+
+An ACK-of-ACK delta independently triggers a send only after at least two
+received ACKs, including when the send window is one. DATA acknowledgments and
+keepalives can still carry a smaller pending ACK delta. An activation ACK
+therefore cannot cause an unending pure-ACK exchange on the minimum receive
+ring. DATA acknowledgment remains immediate at window one, and the ACK
+admission limit used by the CQ budget is unchanged. The default ring/window
+already used this two-ACK threshold.
+
 ## Bounded failures and buffer-slot collisions
 
 Sequence allocation is bounded, under the SQ posting guard or with an atomic
-update for RQ. The last valid sequence is `2^48 - 1`; the next counter value is
-the exhausted sentinel `2^48`. Concurrent allocation cannot increment beyond
+update for RQ. The last valid sequence is `2^q - 1`; the next counter value is
+the exhausted sentinel `2^q`. Concurrent allocation cannot increment beyond
 the sentinel or wrap to zero.
 
 | Failure | Behavior |
 |---|---|
 | `WorkRequestIdsExhausted` | The direction has no remaining sequence; no new WRID is issued. |
-| `CompletionRoutesExhausted` | No reusable slot remains and all 16384 slot positions have been issued. |
+| `CompletionRoutesExhausted` | No reusable slot remains and all C slot positions have been issued. |
 | `WorkRequestSlotsExhausted` | A SEND/RECV buffer's bounded tracking position is still occupied; posting fails without replacing that buffer. |
 | `InvalidCompletion` | CQ, QPN, slot or sequence floor does not belong to the QP; ownership tables are not accessed. |
 
-A lease whose next watermark exceeds `2^48 - 1` permanently retires its slot
+A lease whose next watermark exceeds `2^q - 1` permanently retires its slot
 on release. Another slot may be allocated if capacity remains. Exhaustion does
 not recycle identifiers, and creating a new QP on the same exhausted slot is
 not a reset mechanism.
@@ -214,31 +243,84 @@ that same thread from processing the completion needed to free the position.
 Taking a buffer requires an exact sequence match, so an old completion cannot
 take a newer buffer that happens to use the same array position.
 
+## CQ admission and sharding
+
+For a connection, let R be the posted receive-ring length, W = max(1, R / 2)
+its data SEND window, A = max(2, W) its standalone ACK limit, and
+K = max(1, negotiated max_send_wr / 2) its per-QP READ admission limit. H is
+the shared per-NIC `max_inflight_read_wrs`. Each CQ admits connections only if:
+
+```text
+sum(R + W + A) + min(H, sum(K)) <= actual CQ capacity
+```
+
+This replaces the old `2 * (max_send_wr + max_recv_wr)` reservation per QP.
+With default R8/W4/A4/K32/H32, the budget is `16*N + 32` for N > 0, instead
+of `256*N`. At actual capacity 65536, that supports 4094 connections instead
+of 256. A provider that rounds the requested size up can admit more. The
+registered receive ring is still R buffers per connection: reducing the CQ
+budget does not eliminate memory or hardware QP limits.
+
+This bound includes error and flush CQEs for unsignaled SENDs; selective
+signaling does not discount the budget. Data and ACK credits are returned
+only after local completion and peer confirmation. Every receive replacement
+follows consumption of an earlier CQE. READ permits return after completion
+processing. Thus each unpolled CQE still consumes a software credit, even if
+the provider has already recycled its queue entry. H is reserved once per CQ,
+up to its combined K, because all per-NIC READs could concentrate on that CQ.
+Activation SENDs consume the same capped ACK credits.
+
+`poll_threads_per_device` bounds CQ shards and their dedicated OS threads.
+Shards start lazily and share the fixed dispatcher worker pool. Before QP
+creation, setup tries shards in increasing reserved
+fraction, rechecking admission on each; equal loads rotate fairly. A failed
+admission on one shard does not prevent another from accepting the connection.
+Both incoming and outgoing connections use this path. No CQ-wide lock or
+counter is added to WR posting or normal CQE dispatch.
+
+The reservation is stored with its QP in `ReservedQueuePair`, preserving
+QP-before-reservation destruction order through setup errors, handoff and
+socket teardown. Removing a poller entry does not release credits while a
+socket owner can still submit work. On destruction, the guard marks its
+budget retired and wakes the poller. The poller takes a retirement snapshot
+**before polling**, then releases only that snapshot after observing an empty
+CQ. Later retirements require a later drain. This also covers providers that
+leave CQEs behind on QP destruction, such as the
+[RXE userspace provider](https://github.com/linux-rdma/rdma-core/blob/master/providers/rxe/rxe.c)
+and [kernel QP cleanup](https://github.com/torvalds/linux/blob/master/drivers/infiniband/sw/rxe/rxe_qp.c).
+
+Connection failure closes per-QP READ admission and wakes tasks waiting for
+SQ or NIC permits. Normal connection removal waits until all SQ READ permits
+have returned, covering the race between the last state check and posting.
+The NIC semaphore stays open for other connections. Poller shutdown instead
+fails outstanding waiters and releases its connection entries while the QPs
+retain any DMA holds until destruction. A stopped poller admits no new
+connections; its remaining reservations cannot be reused without completion
+evidence.
+
+`rdma_path_report().completion_queues` exposes each shard's actual capacity,
+reserved entries, reserved connections, route capacity and sequence width.
+Reserved connections include setup and retired QPs awaiting a drain, so this
+count can temporarily exceed the established paths count.
+
 ## Memory and capacity
 
-The old claimed-tag bitmap allocated 512 KiB per CQ. The replacement's payload
-is 8 bytes for every slot ever issued, plus 2 bytes for each reusable slot on
-the free list, excluding vector capacity slack, vector headers and the mutex.
-At 16384 issued slots these payloads are at most 128 KiB and 32 KiB respectively.
-The CQ's allocator starts empty and grows dynamically.
-
-In normal operation, slot reuse makes growth follow the peak number of
-simultaneously leased routes, including QPs retained outside the poller. At
-sequence exhaustion, retired slots remain in the watermark table, so further
-QP creation can grow the table even without an increase in peak live QPs.
-Connection churn is therefore bounded by consumed sequence space rather than
-an independent 256-generation limit; the table is not an unbounded connection
-history.
-
-Each lease keeps an SQ posting mutex and counter, an atomic RQ counter, one
-route descriptor and a CQ reference. On the measured x86-64 build, `QueuePair`
-grows from 184 to 232 bytes (+48 bytes), and `CompletionQueue` from 40 to 80
-bytes (+40 bytes), excluding their heap storage. `CompletionCursor` remains
-8 bytes. See [the type-size measurements](wrid-data/type-sizes.json). The core
-connection array grows to the highest installed route slot. The per-QP
-`WrSlots` arrays and READ bookkeeping remain separate ownership costs.
+The route allocator stores 8 bytes per issued slot and a 4-byte index per free
+slot, excluding vector slack and headers. It grows with peak route occupancy;
+retired sequence-exhausted slots also remain in the watermark table. It has
+no eager allocation proportional to the full CQ capacity. CompletionRoute
+stores precomputed encoding masks; QP buffer slots and READ batch ownership
+remain separate costs. The poller's connection array grows to the highest
+installed slot. Each QP's READ ownership map uses four lock shards rather
+than scaling empty tables with the host CPU count. The periodic timeout sweep
+skips QPs whose READ semaphore has all permits available; a concurrently
+starting READ is checked on the next scheduled sweep.
 
 ## Validation and performance evidence
+
+The current capacity redesign is validated in [RDMA capacity](rdma-capacity.md).
+The measurements below are historical evidence for the earlier CQ-owned lease
+change at `601f404`, before dynamic bit widths and completion-credit admission.
 
 Tests cover cross-direction watermarks, empty-lease reuse, slot and sequence
 exhaustion, concurrent allocation, retained completion tokens, provider QPN
@@ -260,8 +342,8 @@ measured the preceding tag-bitmap implementation; its test count and throughput
 tables are historical evidence for that change, not measurements of these
 route leases.
 
-The final workspace validation passed **521 tests, zero failures**, with 13
-ignored documentation examples. [Validation records](wrid-data/checks.json)
+The earlier lease redesign's validation passed **521 tests, zero failures**,
+with 13 ignored documentation examples. [Validation records](wrid-data/checks.json)
 include the source fingerprint, [test output](wrid-data/tests.log) and
 [Clippy output](wrid-data/clippy.log):
 
@@ -278,7 +360,7 @@ accounting. Other regression cases cover 10000 reuses of one route, an SQ
 completion starting at sequence `2^47`, and SQ posting-guard exclusion through
 the entire transaction, including poisoned-lock cleanup.
 
-### Final performance comparison
+### Historical lease-design performance comparison
 
 The baseline is commit `642a7d9efd6c51c298a541b42e144ff96591ae50`. Both versions
 use the same lockfile and benchmark harness, with 2560000 requests per

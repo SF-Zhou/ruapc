@@ -33,6 +33,8 @@ pub enum ErrorKind {
     IBGetCompQueueEventFail,
     /// Failed to create completion queue.
     IBCreateCompQueueFail,
+    /// A completion queue requires a positive CQE capacity.
+    InvalidCompletionQueueConfig,
     /// Failed to request notification on completion queue.
     IBReqNotifyCompQueueFail,
     /// Failed to poll completion queue.

@@ -63,6 +63,10 @@ impl RdmaSocketPool {
                 phase: StripePhase::Active,
             });
         }
-        RdmaPathReport { devices, paths }
+        RdmaPathReport {
+            devices,
+            paths,
+            completion_queues: self.pollers.report(),
+        }
     }
 }

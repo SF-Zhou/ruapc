@@ -379,6 +379,7 @@ impl RdmaSocketPool {
     fn poller_config(&self) -> PollerConfig {
         PollerConfig {
             cq_len: self.config.polling.device_cq_len,
+            read_limit: self.config.remote_memory.max_inflight_read_wrs,
             spin_us: self.config.polling.poll_spin_us,
             dispatch_workers: self.config.polling.dispatch_workers,
         }

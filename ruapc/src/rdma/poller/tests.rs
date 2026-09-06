@@ -17,6 +17,7 @@ async fn test_cq_len_clamped_to_device_max() {
     let device = crate::rdma::test_utils::open_rdma_device();
     let config = PollerConfig {
         cq_len: u32::MAX,
+        read_limit: 1,
         spin_us: 0,
         dispatch_workers: 1,
     };
@@ -45,6 +46,135 @@ fn test_ring_reservation_accounting() {
     assert_eq!(total.load(Ordering::Acquire), 0);
 }
 
+#[test]
+fn wake_during_maintenance_survives_draining_the_pipe() {
+    let (writer, mut reader) = UnixStream::pair().unwrap();
+    writer.set_nonblocking(true).unwrap();
+    reader.set_nonblocking(true).unwrap();
+    let requested = Arc::new(AtomicBool::new(false));
+    let waker = PollerWaker(Arc::new(writer), requested.clone());
+    waker.wake();
+    assert!(requested.swap(false, Ordering::AcqRel));
+    // The first maintenance pass is in progress when a different sender
+    // publishes work. Consuming both pipe bytes must preserve its new hint.
+    waker.clone().wake();
+    let mut bytes = [0; 2];
+    reader.read_exact(&mut bytes).unwrap();
+    assert!(requested.swap(false, Ordering::AcqRel));
+    assert!(!requested.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn shard_admission_tries_other_queues_and_reclaims_failed_setup() {
+    let device = crate::rdma::test_utils::open_rdma_device();
+    let config = PollerConfig {
+        cq_len: 63,
+        read_limit: 32,
+        spin_us: 0,
+        dispatch_workers: 1,
+    };
+    let dispatcher = Dispatcher::start(1);
+    let mut shards = DeviceShards::default();
+    for index in 0..2 {
+        shards.shards.push(Arc::new(
+            DevicePoller::start(
+                device.context(),
+                &format!("admission-test-{index}"),
+                config,
+                dispatcher.clone(),
+            )
+            .unwrap(),
+        ));
+    }
+    // Give the less loaded shard an unsaturated READ reserve. The larger
+    // READ demand below can fit only on the other shard, whose shared READ
+    // reserve is already paid. Lowest current usage alone is insufficient.
+    let connection = |recv_queue_len, max_send_wr| crate::rdma::RdmaConnectionConfig {
+        recv_queue_len,
+        max_msg_size: 1024,
+        traffic_class: 0,
+        qp: crate::rdma::RdmaQueuePairConfig {
+            max_send_wr,
+            ..Default::default()
+        },
+    };
+    assert_eq!(shards.shards[0].cq_capacity, 63);
+    let a = shards.shards[0]
+        .reserve(Demand::connection(&connection(8, 2)))
+        .unwrap();
+    let b = shards.shards[1]
+        .reserve(Demand::connection(&connection(2, 64)))
+        .unwrap();
+    assert_eq!(shards.shards[0].shared.budget.snapshot().0, 17);
+    assert_eq!(shards.shards[1].shared.budget.snapshot().0, 37);
+    let (chosen, c) = shards
+        .reserve(Demand::connection(&connection(8, 64)))
+        .unwrap();
+    assert!(Arc::ptr_eq(&chosen, &shards.shards[1]));
+    assert_eq!(chosen.shared.budget.snapshot().0, 53);
+    assert!(
+        shards
+            .reserve(Demand::connection(&connection(8, 64)))
+            .is_err()
+    );
+    // These reservations model failed setup before QP creation. Their wake
+    // causes even idle shards to drain and make the credits available again.
+    drop((a, b, c));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while shards
+            .shards
+            .iter()
+            .any(|p| p.shared.budget.snapshot().1 != 0)
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("retired setup capacity must be reclaimed");
+    assert!(
+        shards
+            .reserve(Demand::connection(&connection(8, 64)))
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn failed_new_shard_does_not_hide_existing_capacity() {
+    let devices = crate::rdma::test_utils::make_rdma_devices();
+    let device = &devices.devices()[0];
+    let pollers = DevicePollers::default();
+    let config = PollerConfig {
+        cq_len: 63,
+        read_limit: 1,
+        spin_us: 0,
+        dispatch_workers: 1,
+    };
+    let connection = crate::rdma::RdmaConnectionConfig {
+        recv_queue_len: 2,
+        max_msg_size: 1024,
+        traffic_class: 0,
+        qp: crate::rdma::RdmaQueuePairConfig::default(),
+    };
+    let (first, a) = pollers.reserve(device, config, 2, &connection).unwrap();
+    // Bypass public config validation to deterministically fail only the new
+    // CQ creation; the existing shard can still satisfy this reservation.
+    let (second, b) = pollers
+        .reserve(
+            device,
+            PollerConfig {
+                cq_len: 0,
+                ..config
+            },
+            2,
+            &connection,
+        )
+        .unwrap();
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(pollers.report().len(), 1);
+    assert_eq!(pollers.report()[0].connections, 2);
+    drop((a, b));
+}
+
 /// The test controls CQ consumption itself so it can stop a registrar after
 /// posting but before publication, without racing an independently running loop.
 fn manual_poller(context: &Arc<ruapc_rdma::Context>) -> (DevicePoller, PollLoop) {
@@ -52,19 +182,20 @@ fn manual_poller(context: &Arc<ruapc_rdma::Context>) -> (DevicePoller, PollLoop)
     let cq = CompletionQueue::create(context, 16, Some(&channel)).unwrap();
     let shared = Arc::new(PollerShared {
         inner: Mutex::new(SharedInner::default()),
+        budget: CqBudget::new(cq.capacity(), 1),
         has_incoming: AtomicBool::new(false),
         shutdown: AtomicBool::new(false),
     });
     let (wake_tx, wake_rx) = UnixStream::pair().unwrap();
     wake_tx.set_nonblocking(true).unwrap();
     wake_rx.set_nonblocking(true).unwrap();
+    let maintenance_requested = Arc::new(AtomicBool::new(false));
     let poller = DevicePoller {
         cq: cq.clone(),
         shared: shared.clone(),
-        waker: PollerWaker(Arc::new(wake_tx)),
+        waker: PollerWaker(Arc::new(wake_tx), maintenance_requested.clone()),
         thread: None,
-        wr_budget: Arc::new(AtomicU32::new(0)),
-        cq_capacity: 16,
+        cq_capacity: cq.capacity(),
     };
     let poll_loop = PollLoop {
         cq,
@@ -74,9 +205,190 @@ fn manual_poller(context: &Arc<ruapc_rdma::Context>) -> (DevicePoller, PollLoop)
         dispatcher: Dispatcher::start(1),
         spin: Duration::ZERO,
         conns: Vec::new(),
+        dirty_slots: Vec::new(),
+        maintenance_requested,
         unack_cq_events: 0,
     };
     (poller, poll_loop)
+}
+
+/// An admitted QP with no posted WRs lets maintenance tests control software
+/// credits without inventing CQEs or requiring a connected peer.
+fn register_idle_socket(
+    poller: &DevicePoller,
+    device: &crate::rdma::RdmaDevice,
+    buffer_pool: &Arc<crate::BufferPool>,
+    state: &Arc<State>,
+) -> Arc<RdmaSocket> {
+    let connection = crate::rdma::RdmaConnectionConfig {
+        recv_queue_len: 2,
+        max_msg_size: 1024,
+        traffic_class: 0,
+        qp: crate::rdma::RdmaQueuePairConfig {
+            max_send_wr: 4,
+            max_recv_wr: 4,
+            max_send_sge: 1,
+            max_recv_sge: 1,
+        },
+    };
+    let reservation = poller.reserve(Demand::connection(&connection)).unwrap();
+    let mut attrs = ruapc_rdma::ibv_qp_init_attr {
+        qp_type: ruapc_rdma::ibv_qp_type::IBV_QPT_RC,
+        cap: ruapc_rdma::ibv_qp_cap {
+            max_send_wr: 4,
+            max_recv_wr: 4,
+            max_send_sge: 1,
+            max_recv_sge: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let qp = QueuePair::create(
+        device.pd(),
+        poller.cq(),
+        poller.cq(),
+        &mut attrs,
+        device.index(),
+    )
+    .unwrap();
+    let nic = RdmaNicInfo {
+        device: device.info().name.clone(),
+        port_num: device.info().ports[0].port_num,
+        gid_index: 0,
+        ip: None,
+    };
+    let (pending_sender, pending_receiver) = tokio::sync::mpsc::channel(4);
+    let socket = Arc::new(RdmaSocket::new(
+        reservation.bind(qp),
+        buffer_pool.clone(),
+        pending_sender,
+        poller.waker(),
+        RdmaSocketConfig {
+            max_msg_size: 1024,
+            send_window: 1,
+            path: RdmaPathInfo {
+                local: nic.clone(),
+                remote: nic.clone(),
+                same_connectivity_domain: true,
+            },
+            read_timeout: None,
+            read_permits: Arc::new(tokio::sync::Semaphore::new(1)),
+            bandwidth_limiter: Arc::new(RdmaBandwidthLimiter::new(
+                nic.device,
+                nic.port_num,
+                0,
+                Duration::ZERO,
+                Duration::ZERO,
+            )),
+            sq_read_cap: 2,
+        },
+    ));
+    poller
+        .register(
+            RegisterConn {
+                socket: socket.clone(),
+                state: state.clone(),
+                pending_receiver,
+                recv_submitted: 0,
+                recv_buf_size: 1024,
+                send_window: 1,
+                msg_aggregation: false,
+                supervisor_guard: crate::TaskSupervisor::create().start_async_task(),
+                ring_reservation: RingReservation::add(&Arc::new(AtomicUsize::new(0)), 0).0,
+                conn_count_guard: ConnCountGuard::acquire(&Arc::new(vec![AtomicUsize::new(0)]), 0),
+            },
+            || Ok(()),
+        )
+        .unwrap();
+    socket
+}
+
+#[tokio::test]
+async fn dirty_maintenance_is_bounded_and_survives_slot_reuse() {
+    let devices = crate::rdma::test_utils::make_rdma_devices();
+    let device = &devices.devices()[0];
+    let (poller, mut poll_loop) = manual_poller(device.context());
+    let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+    let (state, _stop) = State::create(
+        crate::Router::default(),
+        &crate::SocketPoolConfig {
+            rdma: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let first = register_idle_socket(&poller, device, &buffer_pool, &state);
+    let second = register_idle_socket(&poller, device, &buffer_pool, &state);
+    let first_slot = first.queue_pair.send_route().slot();
+    let second_slot = second.queue_pair.send_route().slot();
+    assert!(poll_loop.drain_incoming(false));
+    assert_eq!(poll_loop.dirty_slots.len(), 2);
+    poll_loop.maintain_dirty_connections(Instant::now(), false);
+    assert!(poll_loop.dirty_slots.is_empty());
+
+    // A pending send on an unrelated connection must stay untouched when
+    // only the first connection has completion work. Exhaust its window
+    // first so a later full scan can drain the message without posting it.
+    assert!(matches!(
+        second.state.try_acquire(),
+        crate::rdma::SendPermit::Granted { .. }
+    ));
+    second
+        .pending_sender
+        .try_send(buffer_pool.allocate(64).unwrap())
+        .unwrap();
+    poll_loop.mark_dirty(first_slot);
+    poll_loop.mark_dirty(first_slot);
+    assert_eq!(poll_loop.dirty_slots, [first_slot]);
+    poll_loop.maintain_dirty_connections(Instant::now(), false);
+    assert!(
+        poll_loop.conns[second_slot]
+            .as_ref()
+            .unwrap()
+            .pending_sends
+            .is_empty()
+    );
+    poll_loop.maintain_connections(Instant::now(), false, false);
+    assert_eq!(
+        poll_loop.conns[second_slot]
+            .as_ref()
+            .unwrap()
+            .pending_sends
+            .len(),
+        1
+    );
+    assert!(
+        poll_loop.dirty_slots.is_empty(),
+        "a full window must not force retry polling"
+    );
+
+    // A receive allocation deficit stays listed once across both kinds of
+    // maintenance, including more CQEs before the next timed retry.
+    poll_loop.conns[first_slot].as_mut().unwrap().recv_deficit = 1;
+    poll_loop.mark_dirty(first_slot);
+    poll_loop.maintain_dirty_connections(Instant::now(), false);
+    poll_loop.mark_dirty(first_slot);
+    assert_eq!(poll_loop.dirty_slots, [first_slot]);
+    poll_loop.maintain_connections(Instant::now(), false, false);
+    assert_eq!(poll_loop.dirty_slots, [first_slot]);
+    poll_loop.conns[first_slot].as_mut().unwrap().recv_deficit = 0;
+
+    first.set_error();
+    poll_loop.maintain_dirty_connections(Instant::now(), false);
+    assert!(poll_loop.conns[first_slot].is_none());
+    assert!(poll_loop.dirty_slots.is_empty());
+    drop(first);
+    poll_loop
+        .drain_completions(poller.cq(), &mut CompletionBatch::new(), &mut Vec::new())
+        .unwrap();
+    let replacement = register_idle_socket(&poller, device, &buffer_pool, &state);
+    assert_eq!(replacement.queue_pair.send_route().slot(), first_slot);
+    assert!(poll_loop.drain_incoming(false));
+    assert_eq!(poll_loop.dirty_slots, [first_slot]);
+    poll_loop.maintain_dirty_connections(Instant::now(), false);
+    assert!(!poll_loop.conns[first_slot].as_ref().unwrap().dirty);
+    assert!(poll_loop.dirty_slots.is_empty());
+    poll_loop.shutdown_cleanup();
 }
 
 #[tokio::test]
@@ -124,7 +436,15 @@ async fn early_flush_completion_waits_for_registration_and_settles_receive() {
     };
     let (pending_sender, pending_receiver) = tokio::sync::mpsc::channel(1);
     let socket = Arc::new(RdmaSocket::new(
-        qp,
+        poller
+            .reserve(Demand::connection(&crate::rdma::RdmaConnectionConfig {
+                qp: crate::rdma::RdmaQueuePairConfig::default(),
+                recv_queue_len: 1,
+                max_msg_size: 1024,
+                traffic_class: 0,
+            }))
+            .unwrap()
+            .bind(qp),
         buffer_pool.clone(),
         pending_sender,
         poller.waker(),
@@ -171,7 +491,6 @@ async fn early_flush_completion_waits_for_registration_and_settles_receive() {
         ring_reservation: RingReservation::add(&ring_total, 1024).0,
         conn_count_guard: ConnCountGuard::acquire(&counts, 0),
     };
-    let reservation = poller.reserve(8).unwrap();
     let buffer = buffer_pool.allocate(1024).unwrap();
     let cq = poller.cq().clone();
     let (posted_tx, posted_rx) = mpsc::channel();
@@ -184,7 +503,7 @@ async fn early_flush_completion_waits_for_registration_and_settles_receive() {
         let poller = &poller;
         let socket = &socket;
         let registrar = scope.spawn(move || {
-            poller.register(reservation, registration, || {
+            poller.register(registration, || {
                 socket.queue_pair.recv(buffer)?;
                 // INIT -> ERR flushes a real posted receive without needing a
                 // peer or routable network. The socket is closed for teardown.
@@ -246,7 +565,15 @@ async fn early_flush_completion_waits_for_registration_and_settles_receive() {
         "the flush CQE must settle the receive ledger"
     );
     poll_loop.shutdown_cleanup();
-    assert_eq!(poller.wr_budget.load(Ordering::Acquire), 0);
+    // Removing poller state cannot release CQ capacity while another socket
+    // owner may still submit work. Destruction plus a later drain does.
+    assert_eq!(poller.shared.budget.snapshot().1, 1);
+    drop(socket);
+    assert_eq!(poller.shared.budget.snapshot().1, 1);
+    poll_loop
+        .drain_completions(&cq, &mut CompletionBatch::new(), &mut Vec::new())
+        .unwrap();
+    assert_eq!(poller.shared.budget.snapshot(), (0, 0));
     assert_eq!(counts[0].load(Ordering::Acquire), 0);
     assert_eq!(ring_total.load(Ordering::Acquire), 0);
 }

@@ -8,9 +8,7 @@ use ruapc_rdma::{
     Completion, CompletionCursor, CompletionRoute, WRType, WrBuffers, ibv_send_flags, ibv_wc,
 };
 
-use super::{
-    BudgetGuard, RegisterConn, RingReservation, dispatch::DispatchBatch, flow::FlowControl,
-};
+use super::{RegisterConn, RingReservation, dispatch::DispatchBatch, flow::FlowControl};
 use crate::{
     Buffer, Error, ErrorKind, Result, Socket, State,
     rdma::{RdmaSocket, SendPermit},
@@ -73,6 +71,9 @@ impl Drop for RegisteredConnection {
 /// Field order matters for teardown: handlers holding buffers come before
 /// `socket` so buffers are released before the QP can be destroyed.
 pub(super) struct ConnState {
+    /// Listed once in the poller's active maintenance queue. Never shared
+    /// with posting tasks and never used to authorize completion ownership.
+    pub(super) dirty: bool,
     /// CQ-assigned route and sequence floor; stale completions are discarded
     /// before they can affect a replacement connection's flow control.
     pub(super) route: CompletionRoute,
@@ -96,16 +97,16 @@ pub(super) struct ConnState {
     pub(super) recv_deficit: u64,
     pub(super) socket: Arc<RdmaSocket>,
     registration: RegisteredConnection,
-    _budget: BudgetGuard,
     _supervisor_guard: TaskSupervisorGuard,
     _ring_reservation: RingReservation,
     _conn_count_guard: super::super::ConnCountGuard,
 }
 
 impl ConnState {
-    pub(super) fn new(reg: RegisterConn, budget: BudgetGuard) -> Self {
+    pub(super) fn new(reg: RegisterConn) -> Self {
         let registration = RegisteredConnection::new(reg.state, reg.socket.conn_id);
         Self {
+            dirty: false,
             route: reg.socket.queue_pair.send_route(),
             flow: FlowControl::new(reg.send_window, reg.recv_submitted, Instant::now()),
             pending_sends: VecDeque::new(),
@@ -117,7 +118,6 @@ impl ConnState {
             recv_deficit: 0,
             socket: reg.socket,
             registration,
-            _budget: budget,
             _supervisor_guard: reg.supervisor_guard,
             _ring_reservation: reg.ring_reservation,
             _conn_count_guard: reg.conn_count_guard,
@@ -342,7 +342,10 @@ impl ConnState {
             self.pending_sends.clear();
             return Ok(());
         }
-        if self.socket.take_activation_request()
+        // Activation consumes the same bounded ACK capacity as keepalives.
+        // Leave the request pending when the limit is full.
+        if self.flow.can_submit_ack()
+            && self.socket.take_activation_request()
             && let Err(err) = self.submit_ack(0)
         {
             self.socket.request_activation();
@@ -585,6 +588,12 @@ impl ConnState {
     /// eventually surface as flush completions — which is what releases
     /// their memory holds safely.
     pub(super) fn sweep_read_timeouts(&self, now: Instant) {
+        // Avoid walking every shard of an empty READ map for every idle QP.
+        // A READ starting after this check is covered by the next sweep; a
+        // posted READ retains its SQ permit until completion processing.
+        if self.socket.sq_read_permits.available_permits() == self.socket.sq_read_cap {
+            return;
+        }
         if self.socket.queue_pair.expire_reads(now) {
             tracing::error!(
                 "RDMA READ timeout on qp={}, moving connection to error state",
@@ -603,10 +612,15 @@ impl ConnState {
     /// produce a CQE and remain owned by the QP until it is destroyed.
     /// Outstanding RDMA READ batches also block removal: their memory
     /// holds may only be released once their (flush) completions arrived.
+    /// Closing READ admission and waiting for every SQ permit also covers
+    /// a posting task paused before it installs its batch in the QP. Removing
+    /// its route earlier would lose that task's completion and NIC permit.
     pub(super) fn ready_to_remove(&mut self) -> bool {
         !self.socket.state.is_ok()
             && self.flow.flushed()
             && self.pending_sends.is_empty()
+            && self.socket.sq_read_permits.is_closed()
+            && self.socket.sq_read_permits.available_permits() == self.socket.sq_read_cap
             && !self.socket.queue_pair.has_pending_reads()
     }
 }

@@ -193,12 +193,14 @@ impl QueuePair {
     }
 
     /// This QP's send completion route, assigned at creation by its CQ.
+    #[inline]
     pub fn send_route(&self) -> CompletionRoute {
         self.send_route.route()
     }
 
     /// This QP's receive completion route. With a shared CQ it equals
     /// [`send_route`](Self::send_route).
+    #[inline]
     pub fn recv_route(&self) -> CompletionRoute {
         self.receive_route().route()
     }
@@ -211,6 +213,7 @@ impl QueuePair {
         self.receive_route().cq()
     }
 
+    #[inline]
     fn receive_route(&self) -> &RouteLease {
         self.recv_route.as_ref().unwrap_or(&self.send_route)
     }
@@ -353,15 +356,15 @@ impl QueuePair {
         // the selective completion sweep to be safe.
         let posting = self.send_route.lock_send()?;
         let id = posting.sequence();
-        let slot = self.send_route().slot() as u16;
+        let route = self.send_route();
         let (wr_id, opcode, imm_data) = match imm {
             Some(imm) => (
-                WRID::send_imm(slot, id),
+                route.encode(WRType::SendImm, id),
                 crate::ibv_wr_opcode::IBV_WR_SEND_WITH_IMM,
                 imm.to_be(),
             ),
             None => (
-                WRID::send_data(slot, id),
+                route.encode(WRType::SendData, id),
                 crate::ibv_wr_opcode::IBV_WR_SEND,
                 0,
             ),
@@ -447,7 +450,7 @@ impl QueuePair {
 
         let posting = self.send_route.lock_send()?;
         let id = posting.sequence();
-        let wr_id = WRID::read(self.send_route().slot() as u16, id);
+        let wr_id = self.send_route().encode(WRType::Read, id);
         register(wr_id);
         let mut wr = crate::ibv_send_wr {
             wr_id,
@@ -472,7 +475,7 @@ impl QueuePair {
         let len = buffer.capacity() as u32;
         let lkey = self.lkey(&buffer)?;
         let id = self.receive_route().alloc_recv()?;
-        let wr_id = WRID::recv(self.recv_route().slot() as u16, id);
+        let wr_id = self.recv_route().encode(WRType::Recv, id);
         self.recv_wrs
             .insert(id, buffer.into())
             .map_err(|_| ErrorKind::WorkRequestSlotsExhausted)?;
@@ -514,7 +517,7 @@ impl QueuePair {
         if !completion.belongs_to(route.cq(), self.qp_num(), route.route()) {
             return Err(ErrorKind::InvalidCompletion.into());
         }
-        let id = wc.wr_id.get_id();
+        let id = completion.sequence();
         let mut swept_sends = 0;
         let buffer = if wc.is_recv() {
             self.recv_wrs.take(id)
@@ -713,7 +716,7 @@ mod tests {
         let route = replacement.send_route();
         assert_eq!(route.slot(), old_route.slot());
         assert_eq!(route.first_sequence(), old_route.first_sequence() + 300);
-        assert!(!route.contains(WRID::send_data(old_route.slot() as u16, 299)));
+        assert!(!route.contains(old_route.encode(WRType::SendData, 299)));
         assert_eq!(replacement.send_route.lock_send().unwrap().sequence(), 300);
         assert_eq!(replacement.receive_route().alloc_recv().unwrap(), 300);
     }
@@ -722,7 +725,7 @@ mod tests {
     fn separate_cqs_own_independent_qp_routes() {
         let device = crate::test_utils::open_device();
         let send_cq = CompletionQueue::create(device.context(), 16, None).unwrap();
-        let recv_cq = CompletionQueue::create(device.context(), 16, None).unwrap();
+        let recv_cq = CompletionQueue::create(device.context(), 1024, None).unwrap();
         let qp = QueuePair::create(
             device.pd(),
             &send_cq,
@@ -734,6 +737,8 @@ mod tests {
         assert!(qp.recv_route.is_some());
         assert!(Arc::ptr_eq(qp.send_cq(), &send_cq));
         assert!(Arc::ptr_eq(qp.recv_cq(), &recv_cq));
+        assert_eq!(qp.send_route().sequence_bits(), send_cq.sequence_bits());
+        assert_eq!(qp.recv_route().sequence_bits(), recv_cq.sequence_bits());
         for _ in 0..7 {
             qp.send_route.lock_send().unwrap().sequence();
         }

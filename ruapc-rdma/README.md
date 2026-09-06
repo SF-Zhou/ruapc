@@ -23,9 +23,10 @@ explicit DMA lifetime contracts over raw verbs.
 - **Selective signaling** with completion-driven reclamation of unsignaled
   SEND buffers (RC send queues complete in order), plus gather-list sends and
   owned vectored RDMA READ plans (`prepare_reads` / `post_read`)
-- **CQ-owned work request IDs**: `WRID` packs 2 type bits, 14 route-slot bits
-  and a 48-bit per-direction sequence into `wr_id`. QPs acquire their route at
-  creation; slot reuse carries sequence watermarks across QP lifetimes.
+- **CQ-owned work request IDs**: `WRID` packs 2 type bits, a CQ-sized route slot
+  and a per-direction sequence into `wr_id`. Each CQ fixes the split when it
+  is created; QPs acquire their route automatically, and slot reuse carries
+  sequence watermarks across QP lifetimes.
 - **Serializable device snapshots**: `DeviceInfo`/`Port`/`Gid` (and the raw
   `ibv_device_attr`/`ibv_port_attr`) implement serde + schemars; GID types are
   classified (IB / RoCE v1 / RoCE v2) and non-routable GIDs filtered out
@@ -46,7 +47,20 @@ reclamation. Creating
 and validating the borrowed proof needs no allocation or reference-count update;
 READ batch accounting retains its own synchronization.
 
-Each CQ leases up to 16384 route slots. `QueuePair::create` acquires the lease
+Each CQ leases up to its actual provider-returned CQE capacity in route slots.
+`CompletionQueue::capacity()` and `route_capacity()` expose that limit.
+The slot width is `ceil(log2(capacity))`; the remaining `62 - slot_bits` bits
+hold the sequence, reported by `sequence_bits()`. This supports larger CQs
+without a fixed 16384- or 65536-QP routing ceiling. A larger routing capacity
+uses more slot bits and has a smaller sequence budget. The layout stays fixed
+for the CQ's complete lifetime, including any retained completion tokens.
+
+`WRID` independently exposes only its type and raw bits. Use
+`Completion::slot()` and `Completion::sequence()` to decode with the originating
+CQ's layout. Application code cannot accidentally choose another CQ's layout
+through these token accessors; raw metadata still carries no recovery authority.
+
+`QueuePair::create` acquires the lease
 before creating the provider QP; it owns the lease until QP destruction succeeds.
 `send_route()` and `recv_route()` expose immutable route metadata. A shared
 send/receive CQ uses one route, while separate CQs each allocate their own.

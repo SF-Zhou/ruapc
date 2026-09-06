@@ -6,7 +6,50 @@ use std::sync::{
 };
 
 use super::CompletionQueue;
-use crate::{ErrorKind, Result, WRID};
+use crate::{ErrorKind, Result, WRID, WRType};
+
+/// Immutable for the CQ's complete lifetime, including retained CQ tokens.
+/// The provider's positive `c_int` CQ capacity requires at most 31 slot bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) struct WrIdLayout {
+    sequence_mask: u64,
+    slot_mask: u64,
+    capacity: u32,
+    sequence_bits: u32,
+}
+
+impl WrIdLayout {
+    pub(super) fn new(capacity: u32) -> Self {
+        assert!(capacity > 0 && capacity <= i32::MAX as u32);
+        let slot_bits = u32::BITS - (capacity - 1).leading_zeros();
+        let sequence_bits = WRID::TYPE_SHIFT - slot_bits;
+        let sequence_mask = (1 << sequence_bits) - 1;
+        Self {
+            sequence_mask,
+            slot_mask: WRID::PAYLOAD_MASK ^ sequence_mask,
+            capacity,
+            sequence_bits,
+        }
+    }
+
+    pub(super) fn capacity(self) -> u32 {
+        self.capacity
+    }
+
+    pub(super) fn sequence_bits(self) -> u32 {
+        self.sequence_bits
+    }
+
+    #[inline]
+    pub(super) fn slot(self, wrid: WRID) -> usize {
+        ((wrid.raw() & self.slot_mask) >> self.sequence_bits) as usize
+    }
+
+    #[inline]
+    pub(super) fn sequence(self, wrid: WRID) -> u64 {
+        wrid.raw() & self.sequence_mask
+    }
+}
 
 /// Identifies one QP's use of a CQ route slot.
 ///
@@ -20,15 +63,17 @@ use crate::{ErrorKind, Result, WRID};
 /// CQ and checks the provider's QP number before releasing memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CompletionRoute {
-    slot: u16,
     first_sequence: u64,
+    /// Pre-shifted slot bits; posting does not need a variable shift.
+    prefix: u64,
+    layout: WrIdLayout,
 }
 
 impl CompletionRoute {
     /// Returns the CQ-local slot as an array index.
     #[inline]
     pub fn slot(self) -> usize {
-        usize::from(self.slot)
+        (self.prefix >> self.layout.sequence_bits) as usize
     }
 
     /// First sequence that can belong to this occupant of the slot.
@@ -37,40 +82,67 @@ impl CompletionRoute {
         self.first_sequence
     }
 
+    /// Sequence width fixed when the originating CQ was created.
+    pub fn sequence_bits(self) -> u32 {
+        self.layout.sequence_bits
+    }
+
+    /// Last sequence that can be allocated in this CQ's layout.
+    #[inline]
+    pub fn max_sequence(self) -> u64 {
+        self.layout.sequence_mask
+    }
+
     /// Whether the WRID addresses this slot and is not from an older occupant.
     /// This does not establish that the work request was posted or completed.
     #[inline]
     pub fn contains(self, wrid: WRID) -> bool {
-        wrid.get_slot() == self.slot() && wrid.get_id() >= self.first_sequence
+        wrid.raw() & self.layout.slot_mask == self.prefix
+            && self.layout.sequence(wrid) >= self.first_sequence
+    }
+
+    #[inline]
+    pub(crate) fn encode(self, kind: WRType, sequence: u64) -> WRID {
+        debug_assert!(sequence <= self.layout.sequence_mask);
+        WRID::new(kind, self.prefix | sequence)
     }
 }
 
 /// Only QP construction and destruction take the allocator's enclosing lock.
 /// Normally grows with peak simultaneous QPs; exhausted slots remain retired.
-#[derive(Default)]
 pub(super) struct RouteAllocator {
+    layout: WrIdLayout,
     next_sequences: Vec<u64>,
-    free: Vec<u16>,
+    free: Vec<u32>,
 }
 
 impl RouteAllocator {
+    pub(super) fn new(layout: WrIdLayout) -> Self {
+        Self {
+            layout,
+            next_sequences: Vec::new(),
+            free: Vec::new(),
+        }
+    }
+
     pub(super) fn allocate(&mut self) -> Result<CompletionRoute> {
         let slot = match self.free.pop() {
             Some(slot) => slot,
             None => {
-                if self.next_sequences.len() > usize::from(WRID::SLOT_MAX) {
+                if self.next_sequences.len() >= self.layout.capacity as usize {
                     return Err(ErrorKind::CompletionRoutesExhausted.into());
                 }
-                let slot = self.next_sequences.len() as u16;
+                let slot = self.next_sequences.len() as u32;
                 self.next_sequences.push(0);
                 slot
             }
         };
-        let first_sequence = self.next_sequences[usize::from(slot)];
-        debug_assert!(first_sequence <= WRID::ID_MASK);
+        let first_sequence = self.next_sequences[slot as usize];
+        debug_assert!(first_sequence <= self.layout.sequence_mask);
         Ok(CompletionRoute {
-            slot,
             first_sequence,
+            prefix: u64::from(slot) << self.layout.sequence_bits,
+            layout: self.layout,
         })
     }
 
@@ -79,8 +151,8 @@ impl RouteAllocator {
         // gives every lease a distinct identity for poller registration/removal.
         let next = send_next.max(recv_next).max(route.first_sequence + 1);
         self.next_sequences[route.slot()] = next;
-        if next <= WRID::ID_MASK {
-            self.free.push(route.slot);
+        if next <= self.layout.sequence_mask {
+            self.free.push(route.slot() as u32);
         }
         // A slot that consumed its final sequence is permanently retired.
     }
@@ -123,29 +195,31 @@ impl RouteLease {
         }
     }
 
+    #[inline]
     pub(crate) fn cq(&self) -> &Arc<CompletionQueue> {
         &self.cq
     }
 
+    #[inline]
     pub(crate) fn route(&self) -> CompletionRoute {
         self.route
     }
 
     #[inline]
     pub(crate) fn lock_send(&self) -> Result<SendSequenceGuard<'_>> {
-        lock_send_sequence(&self.send_next)
+        lock_send_sequence(&self.send_next, self.route.max_sequence())
     }
 
     #[inline]
     pub(crate) fn alloc_recv(&self) -> Result<u64> {
-        allocate_sequence(&self.recv_next)
+        allocate_sequence(&self.recv_next, self.route.max_sequence())
     }
 }
 
 #[inline]
-fn lock_send_sequence(next: &Mutex<u64>) -> Result<SendSequenceGuard<'_>> {
+fn lock_send_sequence(next: &Mutex<u64>, max_sequence: u64) -> Result<SendSequenceGuard<'_>> {
     let mut next = next.lock().unwrap();
-    if *next > WRID::ID_MASK {
+    if *next > max_sequence {
         return Err(ErrorKind::WorkRequestIdsExhausted.into());
     }
     let sequence = *next;
@@ -157,9 +231,9 @@ fn lock_send_sequence(next: &Mutex<u64>) -> Result<SendSequenceGuard<'_>> {
 }
 
 #[inline]
-fn allocate_sequence(next: &AtomicU64) -> Result<u64> {
+fn allocate_sequence(next: &AtomicU64, max_sequence: u64) -> Result<u64> {
     next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-        (value <= WRID::ID_MASK).then(|| value + 1)
+        (value <= max_sequence).then(|| value + 1)
     })
     .map_err(|_| ErrorKind::WorkRequestIdsExhausted.into())
 }
@@ -188,26 +262,100 @@ mod tests {
     use super::*;
 
     #[test]
+    fn layout_roundtrips_every_type_at_capacity_and_sequence_boundaries() {
+        for (capacity, slot_bits) in [
+            (1, 0),
+            (2, 1),
+            (3, 2),
+            (16_384, 14),
+            (16_385, 15),
+            (65_536, 16),
+            (65_537, 17),
+            (i32::MAX as u32, 31),
+        ] {
+            let layout = WrIdLayout::new(capacity);
+            assert_eq!(layout.capacity(), capacity);
+            assert_eq!(layout.sequence_bits(), 62 - slot_bits);
+            for slot in [0, capacity / 2, capacity - 1] {
+                let route = CompletionRoute {
+                    first_sequence: 0,
+                    prefix: u64::from(slot) << layout.sequence_bits,
+                    layout,
+                };
+                assert_eq!(route.slot(), slot as usize);
+                for kind in [
+                    WRType::Recv,
+                    WRType::SendData,
+                    WRType::SendImm,
+                    WRType::Read,
+                ] {
+                    for sequence in [0, 1, route.max_sequence()] {
+                        let wrid = route.encode(kind, sequence);
+                        assert_eq!(wrid.get_type(), kind);
+                        assert_eq!(layout.slot(wrid), slot as usize);
+                        assert_eq!(layout.sequence(wrid), sequence);
+                        assert!(route.contains(wrid));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exhausted_routes_retire_for_each_layout_width() {
+        for capacity in [1, 2, 16_385, 65_537, i32::MAX as u32] {
+            let layout = WrIdLayout::new(capacity);
+            let mut allocator = RouteAllocator::new(layout);
+            let route = allocator.allocate().unwrap();
+            let max_sequence = route.max_sequence();
+            let recv = AtomicU64::new(max_sequence);
+            let send = Mutex::new(max_sequence);
+            assert_eq!(
+                allocate_sequence(&recv, max_sequence).unwrap(),
+                max_sequence
+            );
+            assert_eq!(
+                lock_send_sequence(&send, max_sequence).unwrap().sequence(),
+                max_sequence
+            );
+            assert!(allocate_sequence(&recv, max_sequence).is_err());
+            assert!(lock_send_sequence(&send, max_sequence).is_err());
+            allocator.release(route, *send.lock().unwrap(), recv.load(Ordering::Relaxed));
+            if capacity == 1 {
+                assert_eq!(
+                    allocator.allocate().unwrap_err().kind,
+                    ErrorKind::CompletionRoutesExhausted
+                );
+            } else {
+                let replacement = allocator.allocate().unwrap();
+                assert_eq!(replacement.slot(), 1);
+                assert!(!replacement.contains(route.encode(WRType::Recv, max_sequence)));
+            }
+        }
+    }
+
+    #[test]
     fn reuse_starts_after_both_directions_and_rejects_old_wrids() {
-        let mut allocator = RouteAllocator::default();
+        let mut allocator = RouteAllocator::new(WrIdLayout::new(65_537));
         let old = allocator.allocate().unwrap();
         allocator.release(old, 4, 12);
         let current = allocator.allocate().unwrap();
         assert_eq!(current.slot(), old.slot());
         assert_eq!(current.first_sequence(), 12);
         for sequence in 0..12 {
-            assert!(!current.contains(WRID::recv(old.slot, sequence)));
-            assert!(!current.contains(WRID::send_data(old.slot, sequence)));
-            assert!(!current.contains(WRID::send_imm(old.slot, sequence)));
-            assert!(!current.contains(WRID::read(old.slot, sequence)));
+            assert!(!current.contains(old.encode(WRType::Recv, sequence)));
+            assert!(!current.contains(old.encode(WRType::SendData, sequence)));
+            assert!(!current.contains(old.encode(WRType::SendImm, sequence)));
+            assert!(!current.contains(old.encode(WRType::Read, sequence)));
         }
-        assert!(current.contains(WRID::read(current.slot, 12)));
-        assert!(!current.contains(WRID::read(current.slot + 1, 12)));
+        assert!(current.contains(current.encode(WRType::Read, 12)));
+        let other = allocator.allocate().unwrap();
+        assert!(!current.contains(other.encode(WRType::Read, 12)));
     }
 
     #[test]
     fn unused_leases_still_have_distinct_incarnations() {
-        let mut allocator = RouteAllocator::default();
+        let mut allocator = RouteAllocator::new(WrIdLayout::new(65_537));
         // Reuse outlives the previous 8-bit, 256-generation slot limit.
         for sequence in 0..10_000 {
             let route = allocator.allocate().unwrap();
@@ -220,14 +368,18 @@ mod tests {
 
     #[test]
     fn routes_are_exclusive_and_reusable_at_capacity() {
-        let mut allocator = RouteAllocator::default();
-        let routes: Vec<_> = (0..=WRID::SLOT_MAX)
+        let mut allocator = RouteAllocator::new(WrIdLayout::new(65_537));
+        let routes: Vec<_> = (0..65_537u32)
             .map(|slot| {
                 let route = allocator.allocate().unwrap();
-                assert_eq!(route.slot(), usize::from(slot));
+                assert_eq!(route.slot(), slot as usize);
                 route
             })
             .collect();
+        // Both prior fixed-width boundaries are crossed without aliasing.
+        assert_ne!(routes[16_383], routes[16_384]);
+        assert_ne!(routes[65_535], routes[65_536]);
+        assert_eq!(routes.last().unwrap().slot(), 65_536);
         assert_eq!(
             allocator.allocate().unwrap_err().kind,
             ErrorKind::CompletionRoutesExhausted
@@ -241,26 +393,30 @@ mod tests {
 
     #[test]
     fn exhausted_sequences_never_wrap_and_retire_the_route() {
-        let counter = AtomicU64::new(WRID::ID_MASK);
-        assert_eq!(allocate_sequence(&counter).unwrap(), WRID::ID_MASK);
+        let max_sequence = WrIdLayout::new(65_537).sequence_mask;
+        let counter = AtomicU64::new(max_sequence);
+        assert_eq!(
+            allocate_sequence(&counter, max_sequence).unwrap(),
+            max_sequence
+        );
         for _ in 0..10 {
             assert_eq!(
-                allocate_sequence(&counter).unwrap_err().kind,
+                allocate_sequence(&counter, max_sequence).unwrap_err().kind,
                 ErrorKind::WorkRequestIdsExhausted
             );
-            assert_eq!(counter.load(Ordering::Relaxed), WRID::ID_MASK + 1);
+            assert_eq!(counter.load(Ordering::Relaxed), max_sequence + 1);
         }
         let counter = AtomicU64::new(u64::MAX);
-        assert!(allocate_sequence(&counter).is_err());
+        assert!(allocate_sequence(&counter, max_sequence).is_err());
         assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
 
-        let mut allocator = RouteAllocator::default();
+        let mut allocator = RouteAllocator::new(WrIdLayout::new(65_537));
         let old = allocator.allocate().unwrap();
-        allocator.release(old, WRID::ID_MASK, WRID::ID_MASK);
+        allocator.release(old, max_sequence, max_sequence);
         let last = allocator.allocate().unwrap();
         assert_eq!(last.slot(), old.slot());
-        assert_eq!(last.first_sequence(), WRID::ID_MASK);
-        allocator.release(last, WRID::ID_MASK + 1, WRID::ID_MASK);
+        assert_eq!(last.first_sequence(), max_sequence);
+        allocator.release(last, max_sequence + 1, max_sequence);
         let fresh = allocator.allocate().unwrap();
         assert_ne!(fresh.slot(), old.slot());
         assert_eq!(fresh.first_sequence(), 0);
@@ -268,7 +424,7 @@ mod tests {
 
     #[test]
     fn concurrent_route_allocation_is_exclusive() {
-        let allocator = Mutex::new(RouteAllocator::default());
+        let allocator = Mutex::new(RouteAllocator::new(WrIdLayout::new(65_537)));
         let routes = std::thread::scope(|scope| {
             let threads: Vec<_> = (0..8)
                 .map(|_| {
@@ -297,13 +453,14 @@ mod tests {
 
     #[test]
     fn concurrent_sequences_are_unique_including_the_exhaustion_boundary() {
-        let counter = AtomicU64::new(WRID::ID_MASK - 999);
+        let max_sequence = WrIdLayout::new(i32::MAX as u32).sequence_mask;
+        let counter = AtomicU64::new(max_sequence - 999);
         let sequences = std::thread::scope(|scope| {
             let threads: Vec<_> = (0..8)
                 .map(|_| {
                     scope.spawn(|| {
                         (0..200)
-                            .filter_map(|_| allocate_sequence(&counter).ok())
+                            .filter_map(|_| allocate_sequence(&counter, max_sequence).ok())
                             .collect::<Vec<_>>()
                     })
                 })
@@ -315,29 +472,34 @@ mod tests {
         });
         assert_eq!(sequences.len(), 1000);
         assert_eq!(sequences.into_iter().collect::<HashSet<_>>().len(), 1000);
-        assert_eq!(counter.load(Ordering::Relaxed), WRID::ID_MASK + 1);
+        assert_eq!(counter.load(Ordering::Relaxed), max_sequence + 1);
     }
 
     #[test]
     fn send_sequence_exhaustion_never_wraps() {
-        let next = Mutex::new(WRID::ID_MASK);
-        assert_eq!(lock_send_sequence(&next).unwrap().sequence(), WRID::ID_MASK);
+        let max_sequence = WrIdLayout::new(i32::MAX as u32).sequence_mask;
+        let next = Mutex::new(max_sequence);
+        assert_eq!(
+            lock_send_sequence(&next, max_sequence).unwrap().sequence(),
+            max_sequence
+        );
         for _ in 0..10 {
             assert_eq!(
-                lock_send_sequence(&next).unwrap_err().kind,
+                lock_send_sequence(&next, max_sequence).unwrap_err().kind,
                 ErrorKind::WorkRequestIdsExhausted
             );
-            assert_eq!(*next.lock().unwrap(), WRID::ID_MASK + 1);
+            assert_eq!(*next.lock().unwrap(), max_sequence + 1);
         }
         let next = Mutex::new(u64::MAX);
-        assert!(lock_send_sequence(&next).is_err());
+        assert!(lock_send_sequence(&next, max_sequence).is_err());
         assert_eq!(*next.lock().unwrap(), u64::MAX);
     }
 
     #[test]
     fn send_sequence_guard_excludes_posters_until_transaction_finishes() {
+        let max_sequence = WrIdLayout::new(16).sequence_mask;
         let next = Mutex::new(0);
-        let first = lock_send_sequence(&next).unwrap();
+        let first = lock_send_sequence(&next, max_sequence).unwrap();
         assert_eq!(first.sequence(), 0);
         std::thread::scope(|scope| {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -348,7 +510,7 @@ mod tests {
                     Err(std::sync::TryLockError::WouldBlock)
                 ));
                 tx.send(()).unwrap();
-                lock_send_sequence(next).unwrap().sequence()
+                lock_send_sequence(next, max_sequence).unwrap().sequence()
             });
             rx.recv().unwrap();
             drop(first);

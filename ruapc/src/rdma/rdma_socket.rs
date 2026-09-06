@@ -8,7 +8,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use ruapc_rdma::{QueuePair, ibv_send_flags};
+use ruapc_rdma::ibv_send_flags;
 use serde::Serialize;
 use tokio::sync::mpsc::Sender;
 
@@ -17,7 +17,10 @@ use crate::{
     Buffer, BufferPool, Context, CopyOp, Error, RemoteIoError, RemoteSpace, SocketTrait, State,
     error::{ErrorKind, Result},
     msg::MsgMeta,
-    rdma::{frame::FramedBuffer, poller::PollerWaker},
+    rdma::{
+        frame::FramedBuffer,
+        poller::{PollerWaker, ReservedQueuePair},
+    },
 };
 
 pub(crate) struct RdmaSocketConfig {
@@ -33,7 +36,7 @@ pub(crate) struct RdmaSocketConfig {
 #[derive(Debug)]
 pub struct RdmaSocket {
     /// The QP owns posted memory through completion and successful destruction.
-    pub(crate) queue_pair: QueuePair,
+    pub(crate) queue_pair: ReservedQueuePair,
     pub(crate) rdmabuf_pool: Arc<BufferPool>,
     pub(crate) state: RdmaState,
     /// Window-blocked framed sends, flushed by the poll thread once
@@ -69,15 +72,17 @@ pub struct RdmaSocket {
     /// device-wide read budget landing on a single QP must not overflow
     /// it. Accounted exactly like `read_permits`.
     pub(crate) sq_read_permits: tokio::sync::Semaphore,
+    pub(crate) sq_read_cap: usize,
     /// Software deadline for RDMA READ completions; `None` disables the
     /// timeout. Enforced by the poll thread's periodic sweep, not by
     /// per-operation timers.
     read_timeout: Option<Duration>,
+    read_closed: tokio::sync::Notify,
 }
 
 impl RdmaSocket {
     pub(crate) fn new(
-        queue_pair: QueuePair,
+        queue_pair: ReservedQueuePair,
         rdmabuf_pool: Arc<BufferPool>,
         pending_sender: Sender<Buffer>,
         poller_waker: PollerWaker,
@@ -98,7 +103,9 @@ impl RdmaSocket {
             read_permits: config.read_permits,
             bandwidth_limiter: config.bandwidth_limiter,
             sq_read_permits: tokio::sync::Semaphore::new(config.sq_read_cap.max(1) as usize),
+            sq_read_cap: config.sq_read_cap.max(1) as usize,
             read_timeout: config.read_timeout,
+            read_closed: tokio::sync::Notify::new(),
         }
     }
 
@@ -168,6 +175,8 @@ impl RdmaSocket {
         if !self.state.set_error() {
             return;
         }
+        self.sq_read_permits.close();
+        self.read_closed.notify_waiters();
         let mut attr = ruapc_rdma::ibv_qp_attr {
             qp_state: ruapc_rdma::ibv_qp_state::IBV_QPS_ERR,
             ..Default::default()

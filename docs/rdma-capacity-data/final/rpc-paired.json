@@ -1,0 +1,278 @@
+{
+  "pairs": 5,
+  "connections": [
+    128,
+    256
+  ],
+  "concurrent_total_ops": 2560000,
+  "runs": [
+    {
+      "connections": 128,
+      "pair": 1,
+      "version": "baseline",
+      "artifact": "rpc-128-baseline-1.json",
+      "qps": {
+        "64": 571751.3837913369,
+        "1024": 766541.188565171
+      }
+    },
+    {
+      "connections": 128,
+      "pair": 1,
+      "version": "current",
+      "artifact": "rpc-128-current-1.json",
+      "qps": {
+        "64": 569485.0919434059,
+        "1024": 765276.4414486678
+      }
+    },
+    {
+      "connections": 128,
+      "pair": 2,
+      "version": "current",
+      "artifact": "rpc-128-current-2.json",
+      "qps": {
+        "64": 574518.7277432777,
+        "1024": 758879.3219021488
+      }
+    },
+    {
+      "connections": 128,
+      "pair": 2,
+      "version": "baseline",
+      "artifact": "rpc-128-baseline-2.json",
+      "qps": {
+        "64": 573230.6400464235,
+        "1024": 763302.5337719673
+      }
+    },
+    {
+      "connections": 128,
+      "pair": 3,
+      "version": "baseline",
+      "artifact": "rpc-128-baseline-3.json",
+      "qps": {
+        "64": 575612.7090763107,
+        "1024": 764214.3283706869
+      }
+    },
+    {
+      "connections": 128,
+      "pair": 3,
+      "version": "current",
+      "artifact": "rpc-128-current-3.json",
+      "qps": {
+        "64": 568128.9953998941,
+        "1024": 761111.0469898178
+      }
+    },
+    {
+      "connections": 128,
+      "pair": 4,
+      "version": "current",
+      "artifact": "rpc-128-current-4.json",
+      "qps": {
+        "64": 569913.5114415627,
+        "1024": 760949.6740392409
+      }
+    },
+    {
+      "connections": 128,
+      "pair": 4,
+      "version": "baseline",
+      "artifact": "rpc-128-baseline-4.json",
+      "qps": {
+        "64": 572218.7173453246,
+        "1024": 756677.076583565
+      }
+    },
+    {
+      "connections": 128,
+      "pair": 5,
+      "version": "baseline",
+      "artifact": "rpc-128-baseline-5.json",
+      "qps": {
+        "64": 567744.508740071,
+        "1024": 747135.0203639952
+      }
+    },
+    {
+      "connections": 128,
+      "pair": 5,
+      "version": "current",
+      "artifact": "rpc-128-current-5.json",
+      "qps": {
+        "64": 584651.4160005279,
+        "1024": 759140.4817528924
+      }
+    },
+    {
+      "connections": 256,
+      "pair": 1,
+      "version": "baseline",
+      "artifact": "rpc-256-baseline-1.json",
+      "qps": {
+        "64": 516180.1523051441,
+        "1024": 764779.1380898665
+      }
+    },
+    {
+      "connections": 256,
+      "pair": 1,
+      "version": "current",
+      "artifact": "rpc-256-current-1.json",
+      "qps": {
+        "64": 553781.7790572613,
+        "1024": 718497.3285125624
+      }
+    },
+    {
+      "connections": 256,
+      "pair": 2,
+      "version": "current",
+      "artifact": "rpc-256-current-2.json",
+      "qps": {
+        "64": 551127.3976146198,
+        "1024": 756598.8823354031
+      }
+    },
+    {
+      "connections": 256,
+      "pair": 2,
+      "version": "baseline",
+      "artifact": "rpc-256-baseline-2.json",
+      "qps": {
+        "64": 515133.21525746246,
+        "1024": 762528.0507448406
+      }
+    },
+    {
+      "connections": 256,
+      "pair": 3,
+      "version": "baseline",
+      "artifact": "rpc-256-baseline-3.json",
+      "qps": {
+        "64": 514828.2993574726,
+        "1024": 759619.350328263
+      }
+    },
+    {
+      "connections": 256,
+      "pair": 3,
+      "version": "current",
+      "artifact": "rpc-256-current-3.json",
+      "qps": {
+        "64": 548535.1944130831,
+        "1024": 759053.2165203685
+      }
+    },
+    {
+      "connections": 256,
+      "pair": 4,
+      "version": "current",
+      "artifact": "rpc-256-current-4.json",
+      "qps": {
+        "64": 555929.2909652003,
+        "1024": 750953.5045852801
+      }
+    },
+    {
+      "connections": 256,
+      "pair": 4,
+      "version": "baseline",
+      "artifact": "rpc-256-baseline-4.json",
+      "qps": {
+        "64": 512701.7765529523,
+        "1024": 750966.2712346596
+      }
+    },
+    {
+      "connections": 256,
+      "pair": 5,
+      "version": "baseline",
+      "artifact": "rpc-256-baseline-5.json",
+      "qps": {
+        "64": 514244.8411300535,
+        "1024": 753362.1122329482
+      }
+    },
+    {
+      "connections": 256,
+      "pair": 5,
+      "version": "current",
+      "artifact": "rpc-256-current-5.json",
+      "qps": {
+        "64": 559075.267406765,
+        "1024": 753213.6373257518
+      }
+    }
+  ],
+  "binaries": {
+    "baseline": {
+      "path": "/tmp/ruapc-capacity-bench/capacity-rpc-baseline",
+      "sha256": "37d10645552d7bd4ffe18f4eb5c6a847dfd1c24d71e011bf8a9e4bf2bd743e74"
+    },
+    "current": {
+      "path": "/tmp/ruapc-capacity-bench/capacity-rpc-final",
+      "sha256": "fa8a8425b328b0f4b478180f323df2b92e8bd49440965d458517c66b17e4b0e8"
+    }
+  },
+  "summary": {
+    "128_connections/64_tasks": {
+      "baseline_median_qps": 572218.7173453246,
+      "current_median_qps": 569913.5114415627,
+      "median_change_percent": -0.4028539846540391,
+      "paired_ratio_median_change_percent": -0.39637715135956153,
+      "baseline_min_max": [
+        567744.508740071,
+        575612.7090763107
+      ],
+      "current_min_max": [
+        568128.9953998941,
+        584651.4160005279
+      ]
+    },
+    "128_connections/1024_tasks": {
+      "baseline_median_qps": 763302.5337719673,
+      "current_median_qps": 760949.6740392409,
+      "median_change_percent": -0.30824733688480377,
+      "paired_ratio_median_change_percent": -0.1649940192868904,
+      "baseline_min_max": [
+        747135.0203639952,
+        766541.188565171
+      ],
+      "current_min_max": [
+        758879.3219021488,
+        765276.4414486678
+      ]
+    },
+    "256_connections/64_tasks": {
+      "baseline_median_qps": 514828.2993574726,
+      "current_median_qps": 553781.7790572613,
+      "median_change_percent": 7.566305066835732,
+      "paired_ratio_median_change_percent": 7.284593679977203,
+      "baseline_min_max": [
+        512701.7765529523,
+        516180.1523051441
+      ],
+      "current_min_max": [
+        548535.1944130831,
+        559075.267406765
+      ]
+    },
+    "256_connections/1024_tasks": {
+      "baseline_median_qps": 759619.350328263,
+      "current_median_qps": 753213.6373257518,
+      "median_change_percent": -0.843279334543412,
+      "paired_ratio_median_change_percent": -0.07452861853110004,
+      "baseline_min_max": [
+        750966.2712346596,
+        764779.1380898665
+      ],
+      "current_min_max": [
+        718497.3285125624,
+        759053.2165203685
+      ]
+    }
+  }
+}

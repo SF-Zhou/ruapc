@@ -31,7 +31,10 @@ pub(super) struct ReadState {
 impl ReadState {
     pub(super) fn new() -> Self {
         Self {
-            batches: dashmap::DashMap::new(),
+            // One QP serializes SQ posting and has one CQ completion consumer.
+            // Sizing this local table by the host CPU count wastes hundreds of
+            // empty lock shards per connection on large machines.
+            batches: dashmap::DashMap::with_shard_amount(4),
             owner: next_owner(),
         }
     }

@@ -1,0 +1,2524 @@
+--- a/ruapc-rdma/src/error.rs
++++ b/ruapc-rdma/src/error.rs
+@@ -33,6 +33,8 @@
+     IBGetCompQueueEventFail,
+     /// Failed to create completion queue.
+     IBCreateCompQueueFail,
++    /// A completion queue requires a positive CQE capacity.
++    InvalidCompletionQueueConfig,
+     /// Failed to request notification on completion queue.
+     IBReqNotifyCompQueueFail,
+     /// Failed to poll completion queue.
+--- a/ruapc-rdma/src/ffi/wc.rs
++++ b/ruapc-rdma/src/ffi/wc.rs
+@@ -76,17 +76,25 @@
+ 
+     #[test]
+     fn test_wc_type_checks() {
+-        let wc = make_wc(WRID::recv(0, 1), ibv_wc_status::IBV_WC_SUCCESS, 0);
++        let wc = make_wc(WRID::new(WRType::Recv, 1), ibv_wc_status::IBV_WC_SUCCESS, 0);
+         assert!(wc.is_recv());
+         assert!(!wc.is_send_data());
+         assert!(!wc.is_send_imm());
+ 
+-        let wc = make_wc(WRID::send_data(0, 2), ibv_wc_status::IBV_WC_SUCCESS, 0);
++        let wc = make_wc(
++            WRID::new(WRType::SendData, 2),
++            ibv_wc_status::IBV_WC_SUCCESS,
++            0,
++        );
+         assert!(!wc.is_recv());
+         assert!(wc.is_send_data());
+         assert!(!wc.is_send_imm());
+ 
+-        let wc = make_wc(WRID::send_imm(0, 3), ibv_wc_status::IBV_WC_SUCCESS, 0);
++        let wc = make_wc(
++            WRID::new(WRType::SendImm, 3),
++            ibv_wc_status::IBV_WC_SUCCESS,
++            0,
++        );
+         assert!(!wc.is_recv());
+         assert!(!wc.is_send_data());
+         assert!(wc.is_send_imm());
+@@ -94,23 +102,27 @@
+ 
+     #[test]
+     fn test_wc_succ() {
+-        let wc = make_wc(WRID::recv(0, 0), ibv_wc_status::IBV_WC_SUCCESS, 0);
++        let wc = make_wc(WRID::new(WRType::Recv, 0), ibv_wc_status::IBV_WC_SUCCESS, 0);
+         assert!(wc.succ());
+ 
+-        let wc = make_wc(WRID::recv(0, 0), ibv_wc_status::IBV_WC_LOC_LEN_ERR, 0);
++        let wc = make_wc(
++            WRID::new(WRType::Recv, 0),
++            ibv_wc_status::IBV_WC_LOC_LEN_ERR,
++            0,
++        );
+         assert!(!wc.succ());
+     }
+ 
+     #[test]
+     fn test_wc_imm_none() {
+-        let wc = make_wc(WRID::recv(0, 0), ibv_wc_status::IBV_WC_SUCCESS, 0);
++        let wc = make_wc(WRID::new(WRType::Recv, 0), ibv_wc_status::IBV_WC_SUCCESS, 0);
+         assert_eq!(wc.imm(), None);
+     }
+ 
+     #[test]
+     fn test_wc_imm_some() {
+         let mut wc = make_wc(
+-            WRID::recv(0, 0),
++            WRID::new(WRType::Recv, 0),
+             ibv_wc_status::IBV_WC_SUCCESS,
+             ibv_wc_flags::IBV_WC_WITH_IMM.0,
+         );
+@@ -120,9 +132,13 @@
+ 
+     #[test]
+     fn test_wc_debug() {
+-        let wc = make_wc(WRID::recv(0, 123), ibv_wc_status::IBV_WC_SUCCESS, 0);
++        let wc = make_wc(
++            WRID::new(WRType::Recv, 123),
++            ibv_wc_status::IBV_WC_SUCCESS,
++            0,
++        );
+         let debug = format!("{:?}", wc);
+-        assert!(debug.contains("Recv(0:123)"));
++        assert!(debug.contains("Recv(0x000000000000007b)"));
+         assert!(debug.contains("IBV_WC_SUCCESS"));
+     }
+ }
+--- a/ruapc-rdma/src/types/wrid.rs
++++ b/ruapc-rdma/src/types/wrid.rs
+@@ -1,23 +1,23 @@
+-//! Work request ID with type, CQ route slot and per-direction sequence.
+-//!
+-//! The WRID (Work Request ID) encodes a [`WRType`], a CQ-owned route slot
+-//! and a monotonic per-direction sequence into a single 64-bit value:
++//! CQ-specific work request identities with two fixed work-type bits.
+ //!
+ //! ```text
+-//! | 2 bits | 14 bits | 48 bits  |
+-//! | type   | slot    | sequence |
++//! | type: 2 bits | CQ route slot: s bits | sequence: 62 - s bits |
+ //! ```
+ //!
+-//! Each CQ leases slots to QPs and preserves their sequence watermark when a
+-//! slot is reused. A completion maps to its QP with a plain array index; its
+-//! sequence also distinguishes that QP from previous occupants of the slot.
++//! Each CQ fixes `s` from its actual capacity at creation. A WRID therefore
++//! cannot decode its own slot or sequence: use the originating CQ's
++//! [`crate::Completion::slot`] and [`crate::Completion::sequence`] instead.
++//! CQ-owned route leases preserve sequence watermarks across QP lifetimes.
+ 
+-/// Work request ID with encoded type, CQ route slot and sequence.
++/// A work request identity. Only its type is independent of its originating CQ.
+ #[repr(transparent)]
+ #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+ pub struct WRID(u64);
+ 
+-/// Work request type encoded in a [`WRID`]
++/// Work request type encoded in a [`WRID`].
++///
++/// The type remains available even for error CQEs, whose provider opcode need
++/// not be valid. SEND variants and READ share one SQ sequence stream.
+ #[repr(u8)]
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+ pub enum WRType {
+@@ -32,50 +32,18 @@
+ }
+ 
+ impl WRID {
+-    /// Bit position of the type field.
++    /// Bit position of the type field, independent of CQ layout.
+     pub const TYPE_SHIFT: u32 = 62;
+-    /// Bit position of the CQ route slot field.
+-    pub const SLOT_SHIFT: u32 = 48;
+-    /// Width of the CQ route slot field.
+-    pub const SLOT_BITS: u32 = Self::TYPE_SHIFT - Self::SLOT_SHIFT;
+-    /// Maximum CQ route slot value.
+-    pub const SLOT_MAX: u16 = (1 << Self::SLOT_BITS) - 1;
+-    /// Mask extracting the ID field.
+-    pub const ID_MASK: u64 = (1 << Self::SLOT_SHIFT) - 1;
++    pub(crate) const PAYLOAD_MASK: u64 = (1 << Self::TYPE_SHIFT) - 1;
+ 
+-    /// Creates a new WRID with the specified type, CQ route slot and sequence.
++    /// Called with the prefix and sequence validated by the CQ route allocator.
+     #[inline]
+-    pub fn new(wr_type: WRType, slot: u16, id: u64) -> Self {
+-        assert!(slot <= Self::SLOT_MAX, "slot too large");
+-        assert!(id <= Self::ID_MASK, "ID too large");
+-        Self(((wr_type as u64) << Self::TYPE_SHIFT) | (u64::from(slot) << Self::SLOT_SHIFT) | id)
++    pub(crate) fn new(wr_type: WRType, payload: u64) -> Self {
++        debug_assert!(payload <= Self::PAYLOAD_MASK);
++        Self(((wr_type as u64) << Self::TYPE_SHIFT) | payload)
+     }
+ 
+-    /// Creates a WRID for a receive operation
+-    #[inline]
+-    pub fn recv(slot: u16, id: u64) -> Self {
+-        Self::new(WRType::Recv, slot, id)
+-    }
+-
+-    /// Creates a WRID for a send data operation
+-    #[inline]
+-    pub fn send_data(slot: u16, id: u64) -> Self {
+-        Self::new(WRType::SendData, slot, id)
+-    }
+-
+-    /// Creates a WRID for a send with immediate data operation
+-    #[inline]
+-    pub fn send_imm(slot: u16, id: u64) -> Self {
+-        Self::new(WRType::SendImm, slot, id)
+-    }
+-
+-    /// Creates a WRID for an RDMA read operation
+-    #[inline]
+-    pub fn read(slot: u16, id: u64) -> Self {
+-        Self::new(WRType::Read, slot, id)
+-    }
+-
+-    /// Returns the type of the work request
++    /// Returns the type of the work request.
+     #[inline]
+     pub fn get_type(&self) -> WRType {
+         match self.0 >> Self::TYPE_SHIFT {
+@@ -87,18 +55,6 @@
+         }
+     }
+ 
+-    /// Returns the CQ route slot as an array index.
+-    #[inline]
+-    pub fn get_slot(&self) -> usize {
+-        ((self.0 >> Self::SLOT_SHIFT) as usize) & Self::SLOT_MAX as usize
+-    }
+-
+-    /// Returns the ID portion of the WRID
+-    #[inline]
+-    pub fn get_id(&self) -> u64 {
+-        self.0 & Self::ID_MASK
+-    }
+-
+     /// Returns the raw underlying `u64` value.
+     #[inline]
+     pub fn raw(&self) -> u64 {
+@@ -108,13 +64,8 @@
+ 
+ impl std::fmt::Debug for WRID {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+-        let name = match self.get_type() {
+-            WRType::Recv => "Recv",
+-            WRType::SendData => "SendData",
+-            WRType::SendImm => "SendImm",
+-            WRType::Read => "Read",
+-        };
+-        write!(f, "{name}({}:{})", self.get_slot(), self.get_id())
++        // Slot/sequence formatting would require the originating CQ's layout.
++        write!(f, "{:?}({:#018x})", self.get_type(), self.0)
+     }
+ }
+ 
+@@ -123,56 +74,27 @@
+     use super::*;
+ 
+     #[test]
+-    fn test_wrid_roundtrip_all_types() {
+-        for (wr_type, slot, id) in [
+-            (WRType::Recv, 0u16, 0u64),
+-            (WRType::SendData, 1, 2000),
+-            (WRType::SendImm, WRID::SLOT_MAX, 3000),
+-            (WRType::Read, 0x3F_0F, WRID::ID_MASK),
++    fn type_and_payload_roundtrip_without_assuming_a_cq_layout() {
++        for wr_type in [
++            WRType::Recv,
++            WRType::SendData,
++            WRType::SendImm,
++            WRType::Read,
+         ] {
+-            let wrid = WRID::new(wr_type, slot, id);
+-            assert_eq!(wrid.get_type(), wr_type);
+-            assert_eq!(wrid.get_slot(), usize::from(slot));
+-            assert_eq!(wrid.get_id(), id);
++            for payload in [0, 1, WRID::PAYLOAD_MASK] {
++                let wrid = WRID::new(wr_type, payload);
++                assert_eq!(wrid.get_type(), wr_type);
++                assert_eq!(wrid.raw() & WRID::PAYLOAD_MASK, payload);
++                assert_eq!(wrid.raw(), ((wr_type as u64) << WRID::TYPE_SHIFT) | payload);
++            }
+         }
+     }
+ 
+     #[test]
+-    fn test_wrid_constructors() {
+-        assert_eq!(WRID::recv(7, 1).get_type(), WRType::Recv);
+-        assert_eq!(WRID::send_data(7, 2).get_type(), WRType::SendData);
+-        assert_eq!(WRID::send_imm(7, 3).get_type(), WRType::SendImm);
+-        assert_eq!(WRID::read(7, 4).get_type(), WRType::Read);
+-        assert_eq!(WRID::read(7, 4).get_slot(), 7);
+-        assert_eq!(WRID::read(7, 4).get_id(), 4);
+-    }
+-
+-    #[test]
+-    #[should_panic(expected = "ID too large")]
+-    fn test_wrid_rejects_large_id() {
+-        let _ = WRID::recv(0, WRID::ID_MASK + 1);
+-    }
+-
+-    #[test]
+-    #[should_panic(expected = "slot too large")]
+-    fn test_wrid_rejects_large_slot() {
+-        let _ = WRID::recv(WRID::SLOT_MAX + 1, 0);
+-    }
+-
+-    #[test]
+-    fn test_wrid_debug_format() {
+-        let wrid = WRID::recv(5, 0x1234);
+-        assert_eq!(format!("{wrid:?}"), "Recv(5:4660)");
+-        let wrid = WRID::send_data(0, 0x5678);
+-        assert_eq!(format!("{wrid:?}"), "SendData(0:22136)");
+-    }
+-
+-    #[test]
+-    fn test_wrid_raw_is_stable() {
+-        let wrid = WRID::new(WRType::SendImm, 3, 9);
++    fn debug_prints_raw_identity_without_guessing_the_layout() {
+         assert_eq!(
+-            wrid.raw(),
+-            (2u64 << WRID::TYPE_SHIFT) | (3u64 << WRID::SLOT_SHIFT) | 9
++            format!("{:?}", WRID::new(WRType::Recv, 123)),
++            "Recv(0x000000000000007b)"
+         );
+     }
+ }
+--- a/ruapc-rdma/src/verbs/completion_queue.rs
++++ b/ruapc-rdma/src/verbs/completion_queue.rs
+@@ -11,8 +11,8 @@
+ 
+ mod routes;
+ pub use routes::CompletionRoute;
+-use routes::RouteAllocator;
+ pub(super) use routes::RouteLease;
++use routes::{RouteAllocator, WrIdLayout};
+ 
+ /// Reusable stack storage for polling authenticated work completions.
+ /// Entries cannot be changed while any completion from the batch is borrowed.
+@@ -60,6 +60,19 @@
+         self.wc
+     }
+ 
++    /// Decodes the route slot using this completion's originating CQ.
++    #[inline]
++    pub fn slot(&self) -> usize {
++        self.cq.layout.slot(self.wc.wr_id)
++    }
++
++    /// Decodes the work-queue sequence using this completion's originating CQ.
++    #[inline]
++    pub fn sequence(&self) -> u64 {
++        self.cq.layout.sequence(self.wc.wr_id)
++    }
++
++    #[inline]
+     pub(super) fn belongs_to(
+         &self,
+         cq: &CompletionQueue,
+@@ -103,6 +116,8 @@
+     _context: Arc<Context>,
+     /// Prevents the completion channel from being destroyed while this CQ exists.
+     _channel: Option<Arc<CompChannel>>,
++    /// Fixed at CQ creation; changing it could reinterpret retained completions.
++    layout: WrIdLayout,
+     /// Setup-only slot allocation and reuse watermarks. Polling never locks it.
+     routes: Mutex<RouteAllocator>,
+ }
+@@ -120,6 +135,9 @@
+         cq_size: c_int,
+         channel: Option<&Arc<CompChannel>>,
+     ) -> Result<Arc<Self>> {
++        if cq_size <= 0 {
++            return Err(ErrorKind::InvalidCompletionQueueConfig.into());
++        }
+         let channel_ptr = channel.map(|c| c.as_ptr()).unwrap_or(ptr::null_mut());
+         let ptr = unsafe {
+             crate::ruapc_ibv_create_cq(
+@@ -133,17 +151,48 @@
+         if ptr.is_null() {
+             return Err(ErrorKind::IBCreateCompQueueFail.with_errno());
+         }
++        // Providers can round the requested capacity up. Use the returned
++        // capacity both as the route limit and to choose the immutable layout.
++        let actual_capacity = unsafe { (*ptr).cqe };
++        if actual_capacity < cq_size {
++            let _ = unsafe { crate::ruapc_ibv_destroy_cq(ptr) };
++            return Err(crate::Error::new(
++                ErrorKind::IBCreateCompQueueFail,
++                format!("provider CQ capacity {actual_capacity} is below requested {cq_size}"),
++            ));
++        }
++        let layout = WrIdLayout::new(actual_capacity as u32);
+         Ok(Arc::new(Self {
+             ptr,
+             _context: Arc::clone(context),
+             _channel: channel.cloned(),
+-            routes: Mutex::new(RouteAllocator::default()),
++            layout,
++            routes: Mutex::new(RouteAllocator::new(layout)),
+         }))
+     }
+ 
+     /// Returns the raw CQ pointer.
+     pub fn as_ptr(&self) -> *mut crate::ibv_cq {
+         self.ptr
++    }
++
++    /// Actual CQE capacity returned by the provider, at least the requested size.
++    pub fn capacity(&self) -> u32 {
++        self.layout.capacity()
++    }
++
++    /// Number of CQ-local route positions available to QPs.
++    ///
++    /// Equals [`Self::capacity`]. Exhausted sequence spaces retire positions;
++    /// the layout is never resized or reinterpreted during this CQ's lifetime.
++    pub fn route_capacity(&self) -> u32 {
++        self.layout.capacity()
++    }
++
++    /// Work-queue sequence width after reserving two type bits and enough
++    /// route bits for every position in [`Self::route_capacity`].
++    pub fn sequence_bits(&self) -> u32 {
++        self.layout.sequence_bits()
+     }
+ 
+     pub(super) fn context(&self) -> &Arc<Context> {
+@@ -205,6 +254,8 @@
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         f.debug_struct("CompletionQueue")
+             .field("ptr", &self.ptr)
++            .field("capacity", &self.capacity())
++            .field("sequence_bits", &self.sequence_bits())
+             .finish()
+     }
+ }
+@@ -231,10 +282,12 @@
+         // API requires an actual provider completion, covered by the doctest.
+         let wc = ibv_wc {
+             qp_num: 42,
+-            wr_id: WRID::recv(route.slot() as u16, lease.alloc_recv().unwrap()),
++            wr_id: route.encode(WRType::Recv, lease.alloc_recv().unwrap()),
+             ..Default::default()
+         };
+         let completion = super::Completion { cq: &cq, wc: &wc };
++        assert_eq!(completion.slot(), route.slot());
++        assert_eq!(completion.sequence(), route.first_sequence());
+         assert!(completion.belongs_to(&cq, 42, route));
+         assert!(!completion.belongs_to(&other_cq, 42, route));
+         assert!(!completion.belongs_to(&cq, 43, route));
+@@ -279,6 +332,62 @@
+         let ctx = Arc::clone(dev.context());
+         let cq = CompletionQueue::create(&ctx, 16, None).unwrap();
+         assert!(!cq.as_ptr().is_null());
++        assert!(cq.capacity() >= 16);
++        assert_eq!(cq.capacity(), unsafe { (*cq.as_ptr()).cqe as u32 });
++        assert_eq!(cq.route_capacity(), cq.capacity());
++        let slot_bits = u32::BITS - (cq.capacity() - 1).leading_zeros();
++        assert_eq!(cq.sequence_bits(), 62 - slot_bits);
++    }
++
++    #[test]
++    fn cq_rejects_nonpositive_requested_capacity() {
++        let dev = open_device();
++        for capacity in [0, -1, i32::MIN] {
++            assert_eq!(
++                CompletionQueue::create(dev.context(), capacity, None)
++                    .unwrap_err()
++                    .kind,
++                ErrorKind::InvalidCompletionQueueConfig
++            );
++        }
++    }
++
++    #[test]
++    fn token_decoding_uses_its_originating_cq_layout() {
++        let dev = open_device();
++        let cq = CompletionQueue::create(dev.context(), 16, None).unwrap();
++        let other_cq = CompletionQueue::create(dev.context(), 1024, None).unwrap();
++        let first = cq.allocate_route().unwrap();
++        let second = cq.allocate_route().unwrap();
++        let route = second.route();
++        let sequence = route.max_sequence();
++        let wc = ibv_wc {
++            qp_num: 42,
++            wr_id: route.encode(WRType::Read, sequence),
++            ..Default::default()
++        };
++        let token = super::Completion { cq: &cq, wc: &wc };
++        assert_eq!(token.slot(), 1);
++        assert_eq!(token.sequence(), sequence);
++        assert!(token.belongs_to(&cq, 42, route));
++        assert!(!token.belongs_to(&other_cq, 42, route));
++        assert!(!token.belongs_to(&cq, 42, first.route()));
++
++        // Equal raw bits need not describe equal slot/sequence pairs on two
++        // CQs. The token chooses its own decoder without accepting caller input.
++        let other = super::Completion {
++            cq: &other_cq,
++            wc: &wc,
++        };
++        assert_eq!(other.slot(), other_cq.layout.slot(wc.wr_id));
++        assert_eq!(other.sequence(), other_cq.layout.sequence(wc.wr_id));
++        if cq.sequence_bits() != other_cq.sequence_bits() {
++            assert_ne!(
++                (token.slot(), token.sequence()),
++                (other.slot(), other.sequence())
++            );
++        }
++        assert!(!other.belongs_to(&cq, 42, route));
+     }
+ 
+     #[test]
+--- a/ruapc-rdma/src/verbs/completion_queue/routes.rs
++++ b/ruapc-rdma/src/verbs/completion_queue/routes.rs
+@@ -6,7 +6,50 @@
+ };
+ 
+ use super::CompletionQueue;
+-use crate::{ErrorKind, Result, WRID};
++use crate::{ErrorKind, Result, WRID, WRType};
++
++/// Immutable for the CQ's complete lifetime, including retained CQ tokens.
++/// The provider's positive `c_int` CQ capacity requires at most 31 slot bits.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
++pub(super) struct WrIdLayout {
++    sequence_mask: u64,
++    slot_mask: u64,
++    capacity: u32,
++    sequence_bits: u32,
++}
++
++impl WrIdLayout {
++    pub(super) fn new(capacity: u32) -> Self {
++        assert!(capacity > 0 && capacity <= i32::MAX as u32);
++        let slot_bits = u32::BITS - (capacity - 1).leading_zeros();
++        let sequence_bits = WRID::TYPE_SHIFT - slot_bits;
++        let sequence_mask = (1 << sequence_bits) - 1;
++        Self {
++            sequence_mask,
++            slot_mask: WRID::PAYLOAD_MASK ^ sequence_mask,
++            capacity,
++            sequence_bits,
++        }
++    }
++
++    pub(super) fn capacity(self) -> u32 {
++        self.capacity
++    }
++
++    pub(super) fn sequence_bits(self) -> u32 {
++        self.sequence_bits
++    }
++
++    #[inline]
++    pub(super) fn slot(self, wrid: WRID) -> usize {
++        ((wrid.raw() & self.slot_mask) >> self.sequence_bits) as usize
++    }
++
++    #[inline]
++    pub(super) fn sequence(self, wrid: WRID) -> u64 {
++        wrid.raw() & self.sequence_mask
++    }
++}
+ 
+ /// Identifies one QP's use of a CQ route slot.
+ ///
+@@ -20,15 +63,17 @@
+ /// CQ and checks the provider's QP number before releasing memory.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+ pub struct CompletionRoute {
+-    slot: u16,
+     first_sequence: u64,
++    /// Pre-shifted slot bits; posting does not need a variable shift.
++    prefix: u64,
++    layout: WrIdLayout,
+ }
+ 
+ impl CompletionRoute {
+     /// Returns the CQ-local slot as an array index.
+     #[inline]
+     pub fn slot(self) -> usize {
+-        usize::from(self.slot)
++        (self.prefix >> self.layout.sequence_bits) as usize
+     }
+ 
+     /// First sequence that can belong to this occupant of the slot.
+@@ -37,40 +82,67 @@
+         self.first_sequence
+     }
+ 
++    /// Sequence width fixed when the originating CQ was created.
++    pub fn sequence_bits(self) -> u32 {
++        self.layout.sequence_bits
++    }
++
++    /// Last sequence that can be allocated in this CQ's layout.
++    #[inline]
++    pub fn max_sequence(self) -> u64 {
++        self.layout.sequence_mask
++    }
++
+     /// Whether the WRID addresses this slot and is not from an older occupant.
+     /// This does not establish that the work request was posted or completed.
+     #[inline]
+     pub fn contains(self, wrid: WRID) -> bool {
+-        wrid.get_slot() == self.slot() && wrid.get_id() >= self.first_sequence
++        wrid.raw() & self.layout.slot_mask == self.prefix
++            && self.layout.sequence(wrid) >= self.first_sequence
++    }
++
++    #[inline]
++    pub(crate) fn encode(self, kind: WRType, sequence: u64) -> WRID {
++        debug_assert!(sequence <= self.layout.sequence_mask);
++        WRID::new(kind, self.prefix | sequence)
+     }
+ }
+ 
+ /// Only QP construction and destruction take the allocator's enclosing lock.
+ /// Normally grows with peak simultaneous QPs; exhausted slots remain retired.
+-#[derive(Default)]
+ pub(super) struct RouteAllocator {
++    layout: WrIdLayout,
+     next_sequences: Vec<u64>,
+-    free: Vec<u16>,
++    free: Vec<u32>,
+ }
+ 
+ impl RouteAllocator {
++    pub(super) fn new(layout: WrIdLayout) -> Self {
++        Self {
++            layout,
++            next_sequences: Vec::new(),
++            free: Vec::new(),
++        }
++    }
++
+     pub(super) fn allocate(&mut self) -> Result<CompletionRoute> {
+         let slot = match self.free.pop() {
+             Some(slot) => slot,
+             None => {
+-                if self.next_sequences.len() > usize::from(WRID::SLOT_MAX) {
++                if self.next_sequences.len() >= self.layout.capacity as usize {
+                     return Err(ErrorKind::CompletionRoutesExhausted.into());
+                 }
+-                let slot = self.next_sequences.len() as u16;
++                let slot = self.next_sequences.len() as u32;
+                 self.next_sequences.push(0);
+                 slot
+             }
+         };
+-        let first_sequence = self.next_sequences[usize::from(slot)];
+-        debug_assert!(first_sequence <= WRID::ID_MASK);
++        let first_sequence = self.next_sequences[slot as usize];
++        debug_assert!(first_sequence <= self.layout.sequence_mask);
+         Ok(CompletionRoute {
+-            slot,
+             first_sequence,
++            prefix: u64::from(slot) << self.layout.sequence_bits,
++            layout: self.layout,
+         })
+     }
+ 
+@@ -79,8 +151,8 @@
+         // gives every lease a distinct identity for poller registration/removal.
+         let next = send_next.max(recv_next).max(route.first_sequence + 1);
+         self.next_sequences[route.slot()] = next;
+-        if next <= WRID::ID_MASK {
+-            self.free.push(route.slot);
++        if next <= self.layout.sequence_mask {
++            self.free.push(route.slot() as u32);
+         }
+         // A slot that consumed its final sequence is permanently retired.
+     }
+@@ -123,29 +195,31 @@
+         }
+     }
+ 
++    #[inline]
+     pub(crate) fn cq(&self) -> &Arc<CompletionQueue> {
+         &self.cq
+     }
+ 
++    #[inline]
+     pub(crate) fn route(&self) -> CompletionRoute {
+         self.route
+     }
+ 
+     #[inline]
+     pub(crate) fn lock_send(&self) -> Result<SendSequenceGuard<'_>> {
+-        lock_send_sequence(&self.send_next)
++        lock_send_sequence(&self.send_next, self.route.max_sequence())
+     }
+ 
+     #[inline]
+     pub(crate) fn alloc_recv(&self) -> Result<u64> {
+-        allocate_sequence(&self.recv_next)
++        allocate_sequence(&self.recv_next, self.route.max_sequence())
+     }
+ }
+ 
+ #[inline]
+-fn lock_send_sequence(next: &Mutex<u64>) -> Result<SendSequenceGuard<'_>> {
++fn lock_send_sequence(next: &Mutex<u64>, max_sequence: u64) -> Result<SendSequenceGuard<'_>> {
+     let mut next = next.lock().unwrap();
+-    if *next > WRID::ID_MASK {
++    if *next > max_sequence {
+         return Err(ErrorKind::WorkRequestIdsExhausted.into());
+     }
+     let sequence = *next;
+@@ -157,9 +231,9 @@
+ }
+ 
+ #[inline]
+-fn allocate_sequence(next: &AtomicU64) -> Result<u64> {
++fn allocate_sequence(next: &AtomicU64, max_sequence: u64) -> Result<u64> {
+     next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+-        (value <= WRID::ID_MASK).then(|| value + 1)
++        (value <= max_sequence).then(|| value + 1)
+     })
+     .map_err(|_| ErrorKind::WorkRequestIdsExhausted.into())
+ }
+@@ -188,26 +262,100 @@
+     use super::*;
+ 
+     #[test]
++    fn layout_roundtrips_every_type_at_capacity_and_sequence_boundaries() {
++        for (capacity, slot_bits) in [
++            (1, 0),
++            (2, 1),
++            (3, 2),
++            (16_384, 14),
++            (16_385, 15),
++            (65_536, 16),
++            (65_537, 17),
++            (i32::MAX as u32, 31),
++        ] {
++            let layout = WrIdLayout::new(capacity);
++            assert_eq!(layout.capacity(), capacity);
++            assert_eq!(layout.sequence_bits(), 62 - slot_bits);
++            for slot in [0, capacity / 2, capacity - 1] {
++                let route = CompletionRoute {
++                    first_sequence: 0,
++                    prefix: u64::from(slot) << layout.sequence_bits,
++                    layout,
++                };
++                assert_eq!(route.slot(), slot as usize);
++                for kind in [
++                    WRType::Recv,
++                    WRType::SendData,
++                    WRType::SendImm,
++                    WRType::Read,
++                ] {
++                    for sequence in [0, 1, route.max_sequence()] {
++                        let wrid = route.encode(kind, sequence);
++                        assert_eq!(wrid.get_type(), kind);
++                        assert_eq!(layout.slot(wrid), slot as usize);
++                        assert_eq!(layout.sequence(wrid), sequence);
++                        assert!(route.contains(wrid));
++                    }
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn exhausted_routes_retire_for_each_layout_width() {
++        for capacity in [1, 2, 16_385, 65_537, i32::MAX as u32] {
++            let layout = WrIdLayout::new(capacity);
++            let mut allocator = RouteAllocator::new(layout);
++            let route = allocator.allocate().unwrap();
++            let max_sequence = route.max_sequence();
++            let recv = AtomicU64::new(max_sequence);
++            let send = Mutex::new(max_sequence);
++            assert_eq!(
++                allocate_sequence(&recv, max_sequence).unwrap(),
++                max_sequence
++            );
++            assert_eq!(
++                lock_send_sequence(&send, max_sequence).unwrap().sequence(),
++                max_sequence
++            );
++            assert!(allocate_sequence(&recv, max_sequence).is_err());
++            assert!(lock_send_sequence(&send, max_sequence).is_err());
++            allocator.release(route, *send.lock().unwrap(), recv.load(Ordering::Relaxed));
++            if capacity == 1 {
++                assert_eq!(
++                    allocator.allocate().unwrap_err().kind,
++                    ErrorKind::CompletionRoutesExhausted
++                );
++            } else {
++                let replacement = allocator.allocate().unwrap();
++                assert_eq!(replacement.slot(), 1);
++                assert!(!replacement.contains(route.encode(WRType::Recv, max_sequence)));
++            }
++        }
++    }
++
++    #[test]
+     fn reuse_starts_after_both_directions_and_rejects_old_wrids() {
+-        let mut allocator = RouteAllocator::default();
++        let mut allocator = RouteAllocator::new(WrIdLayout::new(65_537));
+         let old = allocator.allocate().unwrap();
+         allocator.release(old, 4, 12);
+         let current = allocator.allocate().unwrap();
+         assert_eq!(current.slot(), old.slot());
+         assert_eq!(current.first_sequence(), 12);
+         for sequence in 0..12 {
+-            assert!(!current.contains(WRID::recv(old.slot, sequence)));
+-            assert!(!current.contains(WRID::send_data(old.slot, sequence)));
+-            assert!(!current.contains(WRID::send_imm(old.slot, sequence)));
+-            assert!(!current.contains(WRID::read(old.slot, sequence)));
+-        }
+-        assert!(current.contains(WRID::read(current.slot, 12)));
+-        assert!(!current.contains(WRID::read(current.slot + 1, 12)));
++            assert!(!current.contains(old.encode(WRType::Recv, sequence)));
++            assert!(!current.contains(old.encode(WRType::SendData, sequence)));
++            assert!(!current.contains(old.encode(WRType::SendImm, sequence)));
++            assert!(!current.contains(old.encode(WRType::Read, sequence)));
++        }
++        assert!(current.contains(current.encode(WRType::Read, 12)));
++        let other = allocator.allocate().unwrap();
++        assert!(!current.contains(other.encode(WRType::Read, 12)));
+     }
+ 
+     #[test]
+     fn unused_leases_still_have_distinct_incarnations() {
+-        let mut allocator = RouteAllocator::default();
++        let mut allocator = RouteAllocator::new(WrIdLayout::new(65_537));
+         // Reuse outlives the previous 8-bit, 256-generation slot limit.
+         for sequence in 0..10_000 {
+             let route = allocator.allocate().unwrap();
+@@ -220,14 +368,18 @@
+ 
+     #[test]
+     fn routes_are_exclusive_and_reusable_at_capacity() {
+-        let mut allocator = RouteAllocator::default();
+-        let routes: Vec<_> = (0..=WRID::SLOT_MAX)
++        let mut allocator = RouteAllocator::new(WrIdLayout::new(65_537));
++        let routes: Vec<_> = (0..65_537u32)
+             .map(|slot| {
+                 let route = allocator.allocate().unwrap();
+-                assert_eq!(route.slot(), usize::from(slot));
++                assert_eq!(route.slot(), slot as usize);
+                 route
+             })
+             .collect();
++        // Both prior fixed-width boundaries are crossed without aliasing.
++        assert_ne!(routes[16_383], routes[16_384]);
++        assert_ne!(routes[65_535], routes[65_536]);
++        assert_eq!(routes.last().unwrap().slot(), 65_536);
+         assert_eq!(
+             allocator.allocate().unwrap_err().kind,
+             ErrorKind::CompletionRoutesExhausted
+@@ -241,26 +393,30 @@
+ 
+     #[test]
+     fn exhausted_sequences_never_wrap_and_retire_the_route() {
+-        let counter = AtomicU64::new(WRID::ID_MASK);
+-        assert_eq!(allocate_sequence(&counter).unwrap(), WRID::ID_MASK);
++        let max_sequence = WrIdLayout::new(65_537).sequence_mask;
++        let counter = AtomicU64::new(max_sequence);
++        assert_eq!(
++            allocate_sequence(&counter, max_sequence).unwrap(),
++            max_sequence
++        );
+         for _ in 0..10 {
+             assert_eq!(
+-                allocate_sequence(&counter).unwrap_err().kind,
++                allocate_sequence(&counter, max_sequence).unwrap_err().kind,
+                 ErrorKind::WorkRequestIdsExhausted
+             );
+-            assert_eq!(counter.load(Ordering::Relaxed), WRID::ID_MASK + 1);
++            assert_eq!(counter.load(Ordering::Relaxed), max_sequence + 1);
+         }
+         let counter = AtomicU64::new(u64::MAX);
+-        assert!(allocate_sequence(&counter).is_err());
++        assert!(allocate_sequence(&counter, max_sequence).is_err());
+         assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+ 
+-        let mut allocator = RouteAllocator::default();
++        let mut allocator = RouteAllocator::new(WrIdLayout::new(65_537));
+         let old = allocator.allocate().unwrap();
+-        allocator.release(old, WRID::ID_MASK, WRID::ID_MASK);
++        allocator.release(old, max_sequence, max_sequence);
+         let last = allocator.allocate().unwrap();
+         assert_eq!(last.slot(), old.slot());
+-        assert_eq!(last.first_sequence(), WRID::ID_MASK);
+-        allocator.release(last, WRID::ID_MASK + 1, WRID::ID_MASK);
++        assert_eq!(last.first_sequence(), max_sequence);
++        allocator.release(last, max_sequence + 1, max_sequence);
+         let fresh = allocator.allocate().unwrap();
+         assert_ne!(fresh.slot(), old.slot());
+         assert_eq!(fresh.first_sequence(), 0);
+@@ -268,7 +424,7 @@
+ 
+     #[test]
+     fn concurrent_route_allocation_is_exclusive() {
+-        let allocator = Mutex::new(RouteAllocator::default());
++        let allocator = Mutex::new(RouteAllocator::new(WrIdLayout::new(65_537)));
+         let routes = std::thread::scope(|scope| {
+             let threads: Vec<_> = (0..8)
+                 .map(|_| {
+@@ -297,13 +453,14 @@
+ 
+     #[test]
+     fn concurrent_sequences_are_unique_including_the_exhaustion_boundary() {
+-        let counter = AtomicU64::new(WRID::ID_MASK - 999);
++        let max_sequence = WrIdLayout::new(i32::MAX as u32).sequence_mask;
++        let counter = AtomicU64::new(max_sequence - 999);
+         let sequences = std::thread::scope(|scope| {
+             let threads: Vec<_> = (0..8)
+                 .map(|_| {
+                     scope.spawn(|| {
+                         (0..200)
+-                            .filter_map(|_| allocate_sequence(&counter).ok())
++                            .filter_map(|_| allocate_sequence(&counter, max_sequence).ok())
+                             .collect::<Vec<_>>()
+                     })
+                 })
+@@ -315,29 +472,34 @@
+         });
+         assert_eq!(sequences.len(), 1000);
+         assert_eq!(sequences.into_iter().collect::<HashSet<_>>().len(), 1000);
+-        assert_eq!(counter.load(Ordering::Relaxed), WRID::ID_MASK + 1);
++        assert_eq!(counter.load(Ordering::Relaxed), max_sequence + 1);
+     }
+ 
+     #[test]
+     fn send_sequence_exhaustion_never_wraps() {
+-        let next = Mutex::new(WRID::ID_MASK);
+-        assert_eq!(lock_send_sequence(&next).unwrap().sequence(), WRID::ID_MASK);
++        let max_sequence = WrIdLayout::new(i32::MAX as u32).sequence_mask;
++        let next = Mutex::new(max_sequence);
++        assert_eq!(
++            lock_send_sequence(&next, max_sequence).unwrap().sequence(),
++            max_sequence
++        );
+         for _ in 0..10 {
+             assert_eq!(
+-                lock_send_sequence(&next).unwrap_err().kind,
++                lock_send_sequence(&next, max_sequence).unwrap_err().kind,
+                 ErrorKind::WorkRequestIdsExhausted
+             );
+-            assert_eq!(*next.lock().unwrap(), WRID::ID_MASK + 1);
++            assert_eq!(*next.lock().unwrap(), max_sequence + 1);
+         }
+         let next = Mutex::new(u64::MAX);
+-        assert!(lock_send_sequence(&next).is_err());
++        assert!(lock_send_sequence(&next, max_sequence).is_err());
+         assert_eq!(*next.lock().unwrap(), u64::MAX);
+     }
+ 
+     #[test]
+     fn send_sequence_guard_excludes_posters_until_transaction_finishes() {
++        let max_sequence = WrIdLayout::new(16).sequence_mask;
+         let next = Mutex::new(0);
+-        let first = lock_send_sequence(&next).unwrap();
++        let first = lock_send_sequence(&next, max_sequence).unwrap();
+         assert_eq!(first.sequence(), 0);
+         std::thread::scope(|scope| {
+             let (tx, rx) = std::sync::mpsc::channel();
+@@ -348,7 +510,7 @@
+                     Err(std::sync::TryLockError::WouldBlock)
+                 ));
+                 tx.send(()).unwrap();
+-                lock_send_sequence(next).unwrap().sequence()
++                lock_send_sequence(next, max_sequence).unwrap().sequence()
+             });
+             rx.recv().unwrap();
+             drop(first);
+--- a/ruapc-rdma/src/verbs/queue_pair.rs
++++ b/ruapc-rdma/src/verbs/queue_pair.rs
+@@ -193,12 +193,14 @@
+     }
+ 
+     /// This QP's send completion route, assigned at creation by its CQ.
++    #[inline]
+     pub fn send_route(&self) -> CompletionRoute {
+         self.send_route.route()
+     }
+ 
+     /// This QP's receive completion route. With a shared CQ it equals
+     /// [`send_route`](Self::send_route).
++    #[inline]
+     pub fn recv_route(&self) -> CompletionRoute {
+         self.receive_route().route()
+     }
+@@ -211,6 +213,7 @@
+         self.receive_route().cq()
+     }
+ 
++    #[inline]
+     fn receive_route(&self) -> &RouteLease {
+         self.recv_route.as_ref().unwrap_or(&self.send_route)
+     }
+@@ -353,15 +356,15 @@
+         // the selective completion sweep to be safe.
+         let posting = self.send_route.lock_send()?;
+         let id = posting.sequence();
+-        let slot = self.send_route().slot() as u16;
++        let route = self.send_route();
+         let (wr_id, opcode, imm_data) = match imm {
+             Some(imm) => (
+-                WRID::send_imm(slot, id),
++                route.encode(WRType::SendImm, id),
+                 crate::ibv_wr_opcode::IBV_WR_SEND_WITH_IMM,
+                 imm.to_be(),
+             ),
+             None => (
+-                WRID::send_data(slot, id),
++                route.encode(WRType::SendData, id),
+                 crate::ibv_wr_opcode::IBV_WR_SEND,
+                 0,
+             ),
+@@ -447,7 +450,7 @@
+ 
+         let posting = self.send_route.lock_send()?;
+         let id = posting.sequence();
+-        let wr_id = WRID::read(self.send_route().slot() as u16, id);
++        let wr_id = self.send_route().encode(WRType::Read, id);
+         register(wr_id);
+         let mut wr = crate::ibv_send_wr {
+             wr_id,
+@@ -472,7 +475,7 @@
+         let len = buffer.capacity() as u32;
+         let lkey = self.lkey(&buffer)?;
+         let id = self.receive_route().alloc_recv()?;
+-        let wr_id = WRID::recv(self.recv_route().slot() as u16, id);
++        let wr_id = self.recv_route().encode(WRType::Recv, id);
+         self.recv_wrs
+             .insert(id, buffer.into())
+             .map_err(|_| ErrorKind::WorkRequestSlotsExhausted)?;
+@@ -514,7 +517,7 @@
+         if !completion.belongs_to(route.cq(), self.qp_num(), route.route()) {
+             return Err(ErrorKind::InvalidCompletion.into());
+         }
+-        let id = wc.wr_id.get_id();
++        let id = completion.sequence();
+         let mut swept_sends = 0;
+         let buffer = if wc.is_recv() {
+             self.recv_wrs.take(id)
+@@ -713,7 +716,7 @@
+         let route = replacement.send_route();
+         assert_eq!(route.slot(), old_route.slot());
+         assert_eq!(route.first_sequence(), old_route.first_sequence() + 300);
+-        assert!(!route.contains(WRID::send_data(old_route.slot() as u16, 299)));
++        assert!(!route.contains(old_route.encode(WRType::SendData, 299)));
+         assert_eq!(replacement.send_route.lock_send().unwrap().sequence(), 300);
+         assert_eq!(replacement.receive_route().alloc_recv().unwrap(), 300);
+     }
+@@ -722,7 +725,7 @@
+     fn separate_cqs_own_independent_qp_routes() {
+         let device = crate::test_utils::open_device();
+         let send_cq = CompletionQueue::create(device.context(), 16, None).unwrap();
+-        let recv_cq = CompletionQueue::create(device.context(), 16, None).unwrap();
++        let recv_cq = CompletionQueue::create(device.context(), 1024, None).unwrap();
+         let qp = QueuePair::create(
+             device.pd(),
+             &send_cq,
+@@ -734,6 +737,8 @@
+         assert!(qp.recv_route.is_some());
+         assert!(Arc::ptr_eq(qp.send_cq(), &send_cq));
+         assert!(Arc::ptr_eq(qp.recv_cq(), &recv_cq));
++        assert_eq!(qp.send_route().sequence_bits(), send_cq.sequence_bits());
++        assert_eq!(qp.recv_route().sequence_bits(), recv_cq.sequence_bits());
+         for _ in 0..7 {
+             qp.send_route.lock_send().unwrap().sequence();
+         }
+--- a/ruapc-rdma/src/verbs/queue_pair/read.rs
++++ b/ruapc-rdma/src/verbs/queue_pair/read.rs
+@@ -31,7 +31,10 @@
+ impl ReadState {
+     pub(super) fn new() -> Self {
+         Self {
+-            batches: dashmap::DashMap::new(),
++            // One QP serializes SQ posting and has one CQ completion consumer.
++            // Sizing this local table by the host CPU count wastes hundreds of
++            // empty lock shards per connection on large machines.
++            batches: dashmap::DashMap::with_shard_amount(4),
+             owner: next_owner(),
+         }
+     }
+--- a/ruapc-rdma/src/verbs/wr_slots.rs
++++ b/ruapc-rdma/src/verbs/wr_slots.rs
+@@ -30,8 +30,8 @@
+ const EMPTY: u64 = 0;
+ /// Slot is being written to or drained; transient state.
+ const WRITING: u64 = 1;
+-/// Occupied slots store `id + TAG_BASE`. IDs are bounded by
+-/// [`crate::WRID`], so this never collides with `EMPTY`/`WRITING`.
++/// Occupied slots store `id + TAG_BASE`. CQ layouts use at most 62 sequence
++/// bits, so this never overflows or collides with `EMPTY`/`WRITING`.
+ const TAG_BASE: u64 = 2;
+ 
+ struct Slot {
+--- a/ruapc/src/rdma/config.rs
++++ b/ruapc/src/rdma/config.rs
+@@ -102,9 +102,13 @@
+ #[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone)]
+ #[serde(default, deny_unknown_fields)]
+ pub struct RdmaPollingConfig {
++    /// Requested entries per CQ shard, clamped to the device limit.
++    /// Admission uses the actual capacity returned by the provider.
+     pub device_cq_len: u32,
+     /// Busy-poll duration after the latest completion. Zero disables spinning.
+     pub poll_spin_us: u64,
++    /// Maximum CQ shards (one poll thread each) per device. Shards start
++    /// lazily and receive connections according to available CQ credits.
+     pub poll_threads_per_device: u32,
+     pub dispatch_workers: u32,
+ }
+@@ -122,6 +126,9 @@
+ 
+ impl RdmaPollingConfig {
+     fn validate(&self) -> crate::Result<()> {
++        if self.device_cq_len == 0 {
++            return Err(invalid_config("rdma.polling.device_cq_len must be nonzero"));
++        }
+         if self.poll_threads_per_device == 0 {
+             return Err(invalid_config(
+                 "rdma.polling.poll_threads_per_device must be nonzero",
+--- a/ruapc/src/rdma/mod.rs
++++ b/ruapc/src/rdma/mod.rs
+@@ -15,8 +15,8 @@
+ 
+ mod path;
+ pub use path::{
+-    RdmaConnDirection, RdmaDeviceLoad, RdmaNicInfo, RdmaPathEntry, RdmaPathInfo, RdmaPathReport,
+-    StripePhase,
++    RdmaConnDirection, RdmaCqLoad, RdmaDeviceLoad, RdmaNicInfo, RdmaPathEntry, RdmaPathInfo,
++    RdmaPathReport, StripePhase,
+ };
+ 
+ mod rate_limiter;
+--- a/ruapc/src/rdma/path.rs
++++ b/ruapc/src/rdma/path.rs
+@@ -97,9 +97,24 @@
+     pub connections: usize,
+ }
+ 
++/// One CQ shard's admission and WRID capacity. Reservations include QPs
++/// being prepared and destroyed QPs whose residual completions need draining.
++#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
++pub struct RdmaCqLoad {
++    pub device: String,
++    pub shard: usize,
++    pub capacity: u32,
++    pub reserved: u32,
++    pub connections: u64,
++    pub route_capacity: u32,
++    pub sequence_bits: u32,
++}
++
+ /// Snapshot of all live RDMA connections and per-device load.
+ #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+ pub struct RdmaPathReport {
++    /// CQ shard capacities and current reserved completion credits.
++    pub completion_queues: Vec<RdmaCqLoad>,
+     /// Per-device live connection counts.
+     pub devices: Vec<RdmaDeviceLoad>,
+     /// Every live connection with its path.
+--- a/ruapc/src/rdma/poller/budget.rs
++++ b/ruapc/src/rdma/poller/budget.rs
+@@ -0,0 +1,204 @@
++//! CQ admission is bounded by software credits, including error/flush CQEs
++//! for unsignaled sends. Queue depths alone do not bound unpolled CQEs: a
++//! provider can recycle a WQE before its CQE is consumed.
++//!
++//! Each connection reserves R receive credits + W data credits + A ACK
++//! credits. READs share a per-NIC semaphore H, so a CQ reserves only
++//! min(H, sum of its connections' READ limits). Credits are returned only
++//! after completion processing. No CQ-wide counter is touched per WR.
++
++use std::sync::{
++    Mutex,
++    atomic::{AtomicBool, Ordering},
++};
++
++use super::flow::FlowControl;
++use crate::rdma::RdmaConnectionConfig;
++
++#[derive(Clone, Copy, Debug, Default)]
++pub(super) struct Demand {
++    base: u64,
++    reads: u64,
++    connections: u64,
++}
++
++impl Demand {
++    pub(super) fn connection(config: &RdmaConnectionConfig) -> Self {
++        let window = (config.recv_queue_len / 2).max(1);
++        Self {
++            base: u64::from(config.recv_queue_len)
++                + u64::from(window)
++                + u64::from(FlowControl::ack_limit(window)),
++            reads: u64::from((config.qp.max_send_wr / 2).max(1)),
++            connections: 1,
++        }
++    }
++
++    fn add(&mut self, other: Self) {
++        self.base += other.base;
++        self.reads += other.reads;
++        self.connections += other.connections;
++    }
++
++    fn subtract(&mut self, other: Self) {
++        self.base -= other.base;
++        self.reads -= other.reads;
++        self.connections -= other.connections;
++    }
++
++    pub(super) fn is_empty(self) -> bool {
++        self.connections == 0
++    }
++}
++
++#[derive(Debug, Default)]
++struct Ledger {
++    used: Demand,
++    retired: Demand,
++}
++
++#[derive(Debug)]
++pub(super) struct CqBudget {
++    capacity: u32,
++    read_limit: u32,
++    ledger: Mutex<Ledger>,
++    has_retired: AtomicBool,
++}
++
++impl CqBudget {
++    pub(super) fn new(capacity: u32, read_limit: u32) -> Self {
++        Self {
++            capacity,
++            read_limit,
++            ledger: Mutex::default(),
++            has_retired: AtomicBool::new(false),
++        }
++    }
++
++    fn entries(&self, demand: Demand) -> u64 {
++        demand.base + demand.reads.min(u64::from(self.read_limit))
++    }
++
++    pub(super) fn snapshot(&self) -> (u32, u64) {
++        let ledger = self.ledger.lock().unwrap();
++        (self.entries(ledger.used) as u32, ledger.used.connections)
++    }
++
++    pub(super) fn reserve(&self, demand: Demand) -> bool {
++        let mut ledger = self.ledger.lock().unwrap();
++        let mut next = ledger.used;
++        next.add(demand);
++        if self.entries(next) > u64::from(self.capacity) {
++            return false;
++        }
++        ledger.used = next;
++        true
++    }
++
++    /// Called only after the reservation's QP has been destroyed. Some
++    /// providers leave its CQEs in the CQ, so capacity is not free yet.
++    pub(super) fn retire(&self, demand: Demand) {
++        let mut ledger = self.ledger.lock().unwrap();
++        ledger.retired.add(demand);
++        self.has_retired.store(true, Ordering::Release);
++    }
++
++    /// Take this snapshot BEFORE polling. An empty CQ observed before a
++    /// concurrent retirement is not evidence that that QP's CQEs are gone.
++    pub(super) fn take_retired(&self) -> Demand {
++        if !self.has_retired.load(Ordering::Acquire) {
++            return Demand::default();
++        }
++        let mut ledger = self.ledger.lock().unwrap();
++        self.has_retired.store(false, Ordering::Release);
++        std::mem::take(&mut ledger.retired)
++    }
++
++    pub(super) fn release_drained(&self, retired: Demand) {
++        if !retired.is_empty() {
++            self.ledger.lock().unwrap().used.subtract(retired);
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn demand(base: u64, reads: u64) -> Demand {
++        Demand {
++            base,
++            reads,
++            connections: 1,
++        }
++    }
++
++    #[test]
++    fn default_capacity_scales_with_credits_and_shared_reads() {
++        let budget = CqBudget::new(65_536, 32);
++        let config = crate::rdma::RdmaConnectionConfig {
++            qp: crate::rdma::RdmaQueuePairConfig::default(),
++            recv_queue_len: 8,
++            max_msg_size: 262_144,
++            traffic_class: 0,
++        };
++        let demand = Demand::connection(&config);
++        assert_eq!(demand.base, 16);
++        for _ in 0..4094 {
++            assert!(budget.reserve(demand));
++        }
++        assert_eq!(budget.snapshot(), (65_536, 4094));
++        assert!(!budget.reserve(demand));
++    }
++
++    #[test]
++    fn read_reserve_follows_connected_capacity_up_to_nic_limit() {
++        let budget = CqBudget::new(100, 32);
++        for expected in [10, 20, 30, 40, 42] {
++            assert!(budget.reserve(demand(2, 8)));
++            assert_eq!(budget.snapshot().0, expected);
++        }
++        budget.retire(demand(2, 8));
++        let retired = budget.take_retired();
++        assert_eq!(budget.snapshot().0, 42);
++        budget.release_drained(retired);
++        assert_eq!(budget.snapshot().0, 40);
++    }
++
++    #[test]
++    fn later_retirement_requires_a_new_drain() {
++        let budget = CqBudget::new(16, 0);
++        let demand = demand(8, 0);
++        assert!(budget.reserve(demand));
++        assert!(budget.reserve(demand));
++        budget.retire(demand);
++        let snapshot = budget.take_retired();
++        budget.retire(demand); // Racing the poll that returns zero.
++        assert!(!budget.reserve(demand));
++        budget.release_drained(snapshot);
++        assert_eq!(budget.snapshot(), (8, 1));
++        assert!(budget.reserve(demand));
++        assert!(!budget.reserve(demand));
++        budget.release_drained(budget.take_retired());
++        assert_eq!(budget.snapshot(), (8, 1));
++    }
++
++    #[test]
++    fn concurrent_admission_cannot_overbook() {
++        let budget = CqBudget::new(512, 32);
++        let admitted = std::sync::atomic::AtomicU32::new(0);
++        std::thread::scope(|scope| {
++            for _ in 0..8 {
++                scope.spawn(|| {
++                    for _ in 0..100 {
++                        if budget.reserve(demand(16, 32)) {
++                            admitted.fetch_add(1, Ordering::Relaxed);
++                        }
++                    }
++                });
++            }
++        });
++        assert_eq!(admitted.load(Ordering::Relaxed), 30);
++        assert_eq!(budget.snapshot(), (512, 30));
++    }
++}
+--- a/ruapc/src/rdma/poller/conn.rs
++++ b/ruapc/src/rdma/poller/conn.rs
+@@ -8,9 +8,7 @@
+     Completion, CompletionCursor, CompletionRoute, WRType, WrBuffers, ibv_send_flags, ibv_wc,
+ };
+ 
+-use super::{
+-    BudgetGuard, RegisterConn, RingReservation, dispatch::DispatchBatch, flow::FlowControl,
+-};
++use super::{RegisterConn, RingReservation, dispatch::DispatchBatch, flow::FlowControl};
+ use crate::{
+     Buffer, Error, ErrorKind, Result, Socket, State,
+     rdma::{RdmaSocket, SendPermit},
+@@ -96,14 +94,13 @@
+     pub(super) recv_deficit: u64,
+     pub(super) socket: Arc<RdmaSocket>,
+     registration: RegisteredConnection,
+-    _budget: BudgetGuard,
+     _supervisor_guard: TaskSupervisorGuard,
+     _ring_reservation: RingReservation,
+     _conn_count_guard: super::super::ConnCountGuard,
+ }
+ 
+ impl ConnState {
+-    pub(super) fn new(reg: RegisterConn, budget: BudgetGuard) -> Self {
++    pub(super) fn new(reg: RegisterConn) -> Self {
+         let registration = RegisteredConnection::new(reg.state, reg.socket.conn_id);
+         Self {
+             route: reg.socket.queue_pair.send_route(),
+@@ -117,7 +114,6 @@
+             recv_deficit: 0,
+             socket: reg.socket,
+             registration,
+-            _budget: budget,
+             _supervisor_guard: reg.supervisor_guard,
+             _ring_reservation: reg.ring_reservation,
+             _conn_count_guard: reg.conn_count_guard,
+@@ -342,7 +338,10 @@
+             self.pending_sends.clear();
+             return Ok(());
+         }
+-        if self.socket.take_activation_request()
++        // Activation consumes the same bounded ACK capacity as keepalives.
++        // Leave the request pending when the limit is full.
++        if self.flow.can_submit_ack()
++            && self.socket.take_activation_request()
+             && let Err(err) = self.submit_ack(0)
+         {
+             self.socket.request_activation();
+@@ -585,6 +584,12 @@
+     /// eventually surface as flush completions — which is what releases
+     /// their memory holds safely.
+     pub(super) fn sweep_read_timeouts(&self, now: Instant) {
++        // Avoid walking every shard of an empty READ map for every idle QP.
++        // A READ starting after this check is covered by the next sweep; a
++        // posted READ retains its SQ permit until completion processing.
++        if self.socket.sq_read_permits.available_permits() == self.socket.sq_read_cap {
++            return;
++        }
+         if self.socket.queue_pair.expire_reads(now) {
+             tracing::error!(
+                 "RDMA READ timeout on qp={}, moving connection to error state",
+@@ -603,10 +608,15 @@
+     /// produce a CQE and remain owned by the QP until it is destroyed.
+     /// Outstanding RDMA READ batches also block removal: their memory
+     /// holds may only be released once their (flush) completions arrived.
++    /// Closing READ admission and waiting for every SQ permit also covers
++    /// a posting task paused before it installs its batch in the QP. Removing
++    /// its route earlier would lose that task's completion and NIC permit.
+     pub(super) fn ready_to_remove(&mut self) -> bool {
+         !self.socket.state.is_ok()
+             && self.flow.flushed()
+             && self.pending_sends.is_empty()
++            && self.socket.sq_read_permits.is_closed()
++            && self.socket.sq_read_permits.available_permits() == self.socket.sq_read_cap
+             && !self.socket.queue_pair.has_pending_reads()
+     }
+ }
+--- a/ruapc/src/rdma/poller/flow.rs
++++ b/ruapc/src/rdma/poller/flow.rs
+@@ -42,6 +42,12 @@
+ }
+ 
+ impl FlowControl {
++    /// Standalone ACKs, including connection activation, share this limit.
++    /// CQ admission reserves the same count for success and flush CQEs.
++    pub(super) fn ack_limit(send_window: u32) -> u32 {
++        send_window.max(2)
++    }
++
+     pub(super) fn new(send_window: u32, recv_submitted: u64, now: Instant) -> Self {
+         Self {
+             recv: RecvStats {
+@@ -51,7 +57,7 @@
+             send: SendStats::default(),
+             last_ack: now,
+             ack_threshold: u64::from((send_window / 2).max(1)).min(ACK_COUNTER_MAX),
+-            ack_limit: u64::from(send_window.max(2)),
++            ack_limit: u64::from(Self::ack_limit(send_window)),
+         }
+     }
+ 
+@@ -183,14 +189,20 @@
+ 
+     #[test]
+     fn standalone_acks_need_both_completion_and_confirmation_to_reuse_capacity() {
+-        let mut flow = FlowControl::new(2, 0, Instant::now());
+-        flow.ack_posted(true);
+-        flow.ack_posted(true);
+-        assert!(!flow.can_submit_ack());
+-        flow.ack_completed();
+-        assert!(!flow.can_submit_ack());
+-        flow.peer_ack(1 << 16);
+-        assert!(flow.can_submit_ack());
++        for window in [1, 2, 4, 8, 32, 128] {
++            let mut flow = FlowControl::new(window, 0, Instant::now());
++            for _ in 0..FlowControl::ack_limit(window) {
++                assert!(flow.can_submit_ack());
++                flow.ack_posted(true);
++            }
++            assert!(!flow.can_submit_ack());
++            flow.ack_completed();
++            assert!(!flow.can_submit_ack());
++            flow.peer_ack(1 << 16);
++            assert!(flow.can_submit_ack());
++            flow.ack_posted(true);
++            assert!(!flow.can_submit_ack());
++        }
+     }
+ 
+     #[test]
+--- a/ruapc/src/rdma/poller/mod.rs
++++ b/ruapc/src/rdma/poller/mod.rs
+@@ -1,8 +1,7 @@
+ //! Dedicated per-device RDMA completion poll thread
+ //!
+-//! Each RDMA device gets one shared completion queue (send + recv for
+-//! every connection on that device) and one dedicated OS thread that polls
+-//! it:
++//! Each RDMA device has configurable CQ shards, each with a dedicated OS
++//! poll thread. Admission selects a shard by available completion credits:
+ //!
+ //! - **Busy phase**: after any completion, the thread keeps polling the CQ
+ //!   for a configurable spin window (`poll_spin_us`), eliminating the
+@@ -36,6 +35,7 @@
+ //! when every worker is saturated does it degrade to spawning a one-shot
+ //! task per batch, so it still never blocks.
+ 
++mod budget;
+ mod conn;
+ mod dispatch;
+ mod flow;
+@@ -46,7 +46,7 @@
+     os::unix::net::UnixStream,
+     sync::{
+         Arc, Mutex,
+-        atomic::{AtomicBool, AtomicU32, Ordering},
++        atomic::{AtomicBool, Ordering},
+     },
+     time::{Duration, Instant},
+ };
+@@ -54,6 +54,7 @@
+ use foldhash::fast::RandomState;
+ use ruapc_rdma::{CompChannel, Completion, CompletionBatch, CompletionQueue, poll_readable2};
+ 
++use budget::{CqBudget, Demand};
+ use conn::ConnState;
+ use dispatch::{DispatchBatch, Dispatcher, MAX_DISPATCH_BATCH};
+ 
+@@ -129,6 +130,7 @@
+ /// inbox and the shutdown flag. Route allocation belongs to the CQ.
+ struct PollerShared {
+     inner: Mutex<SharedInner>,
++    budget: CqBudget,
+     /// Fast-path hint that `inner.incoming` is non-empty; written under
+     /// the `inner` lock, read lock-free by the poll thread.
+     has_incoming: AtomicBool,
+@@ -137,22 +139,59 @@
+     shutdown: AtomicBool,
+ }
+ 
++impl std::fmt::Debug for PollerShared {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("PollerShared")
++            .field("budget", &self.budget)
++            .finish_non_exhaustive()
++    }
++}
++
+ #[derive(Default)]
+ struct SharedInner {
+     /// Registered connections awaiting pickup by the poll thread.
+-    incoming: Vec<Incoming>,
+-}
+-
+-struct Incoming {
+-    conn: Box<RegisterConn>,
+-    budget: BudgetGuard,
+-}
+-
+-/// CQ budget for a connection about to be registered. Dropping an
+-/// unconsumed reservation releases the budget; the QP owns its route.
+-pub struct ConnReservation {
++    incoming: Vec<RegisterConn>,
++}
++
++/// CQ credits owned from before QP creation through destruction. Owners
++/// must declare their QP field before this guard, so QP destruction precedes
++/// retirement. A poll-to-empty after retirement authorizes credit reuse.
++#[derive(Debug)]
++pub(crate) struct ConnReservation {
+     shared: Arc<PollerShared>,
+-    budget: BudgetGuard,
++    demand: Demand,
++    waker: PollerWaker,
++}
++
++/// This wrapper preserves destruction order even on setup errors and when
++/// moved between the handshake and the socket. Do not split its fields.
++#[derive(Debug)]
++pub(crate) struct ReservedQueuePair {
++    qp: ruapc_rdma::QueuePair,
++    reservation: ConnReservation,
++}
++
++impl std::ops::Deref for ReservedQueuePair {
++    type Target = ruapc_rdma::QueuePair;
++    fn deref(&self) -> &Self::Target {
++        &self.qp
++    }
++}
++
++impl ConnReservation {
++    pub(crate) fn bind(self, qp: ruapc_rdma::QueuePair) -> ReservedQueuePair {
++        ReservedQueuePair {
++            qp,
++            reservation: self,
++        }
++    }
++}
++
++impl Drop for ConnReservation {
++    fn drop(&mut self) {
++        self.shared.budget.retire(self.demand);
++        self.waker.wake();
++    }
+ }
+ 
+ /// Handle to a per-device poll thread.
+@@ -165,8 +204,6 @@
+     shared: Arc<PollerShared>,
+     waker: PollerWaker,
+     thread: Option<std::thread::JoinHandle<()>>,
+-    /// Sum of (send + recv) queue depths registered on the shared CQ.
+-    wr_budget: Arc<AtomicU32>,
+     cq_capacity: u32,
+ }
+ 
+@@ -175,6 +212,8 @@
+ pub struct PollerConfig {
+     /// Shared CQ capacity (entries).
+     pub cq_len: u32,
++    /// Per-NIC READ limit, shared by all connections.
++    pub read_limit: u32,
+     /// Busy-poll window after the last completion, in microseconds.
+     /// `0` disables spinning (pure event-driven mode).
+     pub spin_us: u64,
+@@ -221,6 +260,7 @@
+         let cq = CompletionQueue::create(ctx, cq_len as _, Some(&comp_channel))
+             .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
+ 
++        let cq_capacity = cq.capacity();
+         let (wake_tx, wake_rx) =
+             UnixStream::pair().map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
+         wake_tx
+@@ -232,6 +272,7 @@
+ 
+         let shared = Arc::new(PollerShared {
+             inner: Mutex::new(SharedInner::default()),
++            budget: CqBudget::new(cq_capacity, config.read_limit),
+             has_incoming: AtomicBool::new(false),
+             shutdown: AtomicBool::new(false),
+         });
+@@ -265,8 +306,7 @@
+             shared,
+             waker: PollerWaker(Arc::new(wake_tx)),
+             thread: Some(thread),
+-            wr_budget: Arc::new(AtomicU32::new(0)),
+-            cq_capacity: cq_len,
++            cq_capacity,
+         })
+     }
+ 
+@@ -280,42 +320,28 @@
+         self.waker.clone()
+     }
+ 
+-    /// Reserves CQ budget for a new connection.
+-    ///
+-    /// `qp_depth` is the connection's total queue depth (send + recv work
+-    /// requests); the reservation fails if the shared CQ cannot absorb it.
+-    pub fn reserve(&self, qp_depth: u32) -> Result<ConnReservation> {
+-        let budget = self.wr_budget.clone();
+-        if budget
+-            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+-                used.checked_add(qp_depth)
+-                    .filter(|total| *total <= self.cq_capacity)
+-            })
+-            .is_err()
+-        {
+-            return Err(Error::new(
+-                ErrorKind::Overloaded,
+-                format!(
+-                    "shared CQ capacity exhausted: {} + {qp_depth} > {} (raise rdma.polling.device_cq_len)",
+-                    budget.load(Ordering::Acquire),
+-                    self.cq_capacity
+-                ),
+-            ));
+-        }
+-        let budget = BudgetGuard {
+-            budget,
+-            depth: qp_depth,
+-        };
+-
++    /// Reserve before creating a QP, including connections still negotiating.
++    fn reserve(&self, demand: Demand) -> Result<ConnReservation> {
+         if self.shared.shutdown.load(Ordering::Acquire) {
+             return Err(Error::new(
+                 ErrorKind::ConnectionClosed,
+                 "RDMA poll thread is not running".into(),
+             ));
+         }
++        if !self.shared.budget.reserve(demand) {
++            return Err(Error::new(
++                ErrorKind::Overloaded,
++                format!(
++                    "shared CQ capacity exhausted: {} of {} entries reserved; connection needs {demand:?}",
++                    self.shared.budget.snapshot().0,
++                    self.cq_capacity
++                ),
++            ));
++        }
+         Ok(ConnReservation {
+             shared: self.shared.clone(),
+-            budget,
++            demand,
++            waker: self.waker(),
+         })
+     }
+ 
+@@ -323,12 +349,11 @@
+     /// An early CQE's routing miss waits for this transaction before retrying.
+     pub fn register(
+         &self,
+-        reservation: ConnReservation,
+         conn: RegisterConn,
+         post_receives: impl FnOnce() -> Result<()>,
+     ) -> Result<()> {
+         let qp = &conn.socket.queue_pair;
+-        if !Arc::ptr_eq(&reservation.shared, &self.shared)
++        if !Arc::ptr_eq(&conn.socket.queue_pair.reservation.shared, &self.shared)
+             || !Arc::ptr_eq(qp.send_cq(), &self.cq)
+             || !Arc::ptr_eq(qp.recv_cq(), &self.cq)
+         {
+@@ -346,25 +371,11 @@
+                 ));
+             }
+             post_receives()?;
+-            inner.incoming.push(Incoming {
+-                conn: Box::new(conn),
+-                budget: reservation.budget,
+-            });
++            inner.incoming.push(conn);
+             self.shared.has_incoming.store(true, Ordering::Release);
+         }
+         self.waker.wake();
+         Ok(())
+-    }
+-}
+-
+-struct BudgetGuard {
+-    budget: Arc<AtomicU32>,
+-    depth: u32,
+-}
+-
+-impl Drop for BudgetGuard {
+-    fn drop(&mut self) {
+-        self.budget.fetch_sub(self.depth, Ordering::AcqRel);
+     }
+ }
+ 
+@@ -392,7 +403,7 @@
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         f.debug_struct("DevicePoller")
+             .field("cq_capacity", &self.cq_capacity)
+-            .field("wr_budget", &self.wr_budget.load(Ordering::Acquire))
++            .field("cq_reserved", &self.shared.budget.snapshot())
+             .finish()
+     }
+ }
+@@ -507,11 +518,16 @@
+         wcs: &mut CompletionBatch<64>,
+         batch: &mut DispatchBatch,
+     ) -> ruapc_rdma::Result<bool> {
++        let retired = self.shared.budget.take_retired();
+         let mut progressed = false;
+         loop {
+             let count = self.poll_completions(cq, wcs, batch)?;
+             progressed |= count > 0;
+-            if count < wcs.capacity() {
++            if count == 0 {
++                self.shared.budget.release_drained(retired);
++                break;
++            }
++            if retired.is_empty() && count < wcs.capacity() {
+                 break;
+             }
+         }
+@@ -607,18 +623,18 @@
+             std::mem::take(&mut inner.incoming)
+         };
+         for incoming in drained {
+-            let slot = incoming.conn.socket.queue_pair.send_route().slot();
++            let slot = incoming.socket.queue_pair.send_route().slot();
+             if self.conns.len() <= slot {
+                 self.conns.resize_with(slot + 1, || None);
+             }
+             debug_assert!(self.conns[slot].is_none(), "poller slot {slot} occupied");
+-            self.conns[slot] = Some(ConnState::new(*incoming.conn, incoming.budget));
++            self.conns[slot] = Some(ConnState::new(incoming));
+         }
+     }
+ 
+     fn dispatch(&mut self, wc: Completion<'_>, batch: &mut DispatchBatch) {
+         let id = wc.info().wr_id;
+-        let slot = id.get_slot();
++        let slot = wc.slot();
+         if let Some(Some(conn)) = self.conns.get_mut(slot)
+             && conn.route.contains(id)
+         {
+@@ -649,12 +665,12 @@
+             std::mem::take(&mut inner.incoming)
+         };
+         for incoming in &drained {
+-            incoming.conn.socket.set_error();
+-            incoming.conn.socket.fail_read_batches();
++            incoming.socket.set_error();
++            incoming.socket.fail_read_batches();
+             // Inbox entries have not opened their metric registration yet,
+             // but a sender may already have bound a waiter to the socket.
+-            incoming.conn.state.connection_closed(
+-                incoming.conn.socket.conn_id,
++            incoming.state.connection_closed(
++                incoming.socket.conn_id,
+                 &Error::new(
+                     ErrorKind::ConnectionClosed,
+                     "rdma poll thread stopped".into(),
+@@ -680,20 +696,16 @@
+     }
+ }
+ 
+-/// Lazily-created poller shards, keyed by device name.
+-///
+-/// A device may run several (shared CQ + poll thread) shards; connections
+-/// are assigned round-robin so their completion processing spreads across
+-/// cores. All shards share one [`Dispatcher`] (created with the first
+-/// shard), so the pool runs a single fixed set of dispatch worker tasks.
++/// Lazily-created CQ/poll-thread shards, keyed by device name. Connections
++/// reserve completion credits on the least utilized shard that can admit
++/// them, before QP creation or peer negotiation. All shards share one fixed
++/// dispatcher worker pool; the configured thread count bounds CPU usage.
+ #[derive(Default)]
+ pub struct DevicePollers(Mutex<PollersInner>);
+ 
+ #[derive(Default)]
+ struct PollersInner {
+     devices: std::collections::HashMap<String, DeviceShards, RandomState>,
+-    /// Shared dispatch worker pool; started lazily so worker tasks only
+-    /// exist once RDMA is actually used (and inside a runtime).
+     dispatcher: Option<Dispatcher>,
+ }
+ 
+@@ -704,41 +716,116 @@
+ }
+ 
+ impl DevicePollers {
+-    /// Returns a poller shard for the given device (round-robin across
+-    /// `shard_count` shards), starting it if necessary.
+-    pub fn get_or_start(
++    /// Select and reserve as one setup operation. Creating each configured
++    /// shard lazily spreads even a small number of connections across cores.
++    pub(crate) fn reserve(
+         &self,
+         device: &super::RdmaDevice,
+         config: PollerConfig,
+         shard_count: u32,
+-    ) -> Result<Arc<DevicePoller>> {
++        connection: &super::RdmaConnectionConfig,
++    ) -> Result<(Arc<DevicePoller>, ConnReservation)> {
+         let name = device.info().name.clone();
+-        debug_assert!(shard_count > 0);
+-        let shard_count = shard_count as usize;
++        let demand = Demand::connection(connection);
+         let mut inner = self.0.lock().unwrap();
+         let dispatcher = inner
+             .dispatcher
+             .get_or_insert_with(|| Dispatcher::start(config.dispatch_workers))
+             .clone();
+         let entry = inner.devices.entry(name.clone()).or_default();
+-        let index = entry.next % shard_count;
+-        entry.next = entry.next.wrapping_add(1);
+-        if let Some(poller) = entry.shards.get(index) {
+-            return Ok(poller.clone());
+-        }
+-        debug_assert_eq!(index, entry.shards.len());
+-        tracing::info!(
+-            "starting RDMA poll thread {name}.{index} (existing shards: {})",
+-            entry.shards.len()
+-        );
+-        let poller = Arc::new(DevicePoller::start(
+-            device.context(),
+-            &format!("{name}.{index}"),
+-            config,
+-            dispatcher,
+-        )?);
+-        entry.shards.push(poller.clone());
+-        Ok(poller)
++        if entry.shards.len() < shard_count as usize {
++            let index = entry.shards.len();
++            match DevicePoller::start(
++                device.context(),
++                &format!("{name}.{index}"),
++                config,
++                dispatcher,
++            ) {
++                Ok(poller) => {
++                    tracing::info!(
++                        device = name,
++                        shard = index,
++                        capacity = poller.cq_capacity,
++                        "started RDMA CQ shard"
++                    );
++                    entry.shards.push(Arc::new(poller));
++                }
++                Err(error) if !entry.shards.is_empty() => {
++                    // An optional new thread/CQ is not required if an existing
++                    // shard has room (e.g. provider CQ resources exhausted).
++                    return entry.reserve(demand).map_err(|admission| {
++                        Error::new(
++                            admission.kind,
++                            format!(
++                                "RDMA device {name}: {}; new shard failed: {error}",
++                                admission.msg
++                            ),
++                        )
++                    });
++                }
++                Err(error) => return Err(error),
++            }
++        }
++        entry
++            .reserve(demand)
++            .map_err(|err| Error::new(err.kind, format!("RDMA device {name}: {}", err.msg)))
++    }
++
++    pub(crate) fn report(&self) -> Vec<super::path::RdmaCqLoad> {
++        let inner = self.0.lock().unwrap();
++        let mut result = Vec::new();
++        for (device, entry) in &inner.devices {
++            for (shard, poller) in entry.shards.iter().enumerate() {
++                let (reserved, connections) = poller.shared.budget.snapshot();
++                result.push(super::path::RdmaCqLoad {
++                    device: device.clone(),
++                    shard,
++                    capacity: poller.cq_capacity,
++                    reserved,
++                    connections,
++                    route_capacity: poller.cq.route_capacity(),
++                    sequence_bits: poller.cq.sequence_bits(),
++                });
++            }
++        }
++        result.sort_by(|a, b| (&a.device, a.shard).cmp(&(&b.device, b.shard)));
++        result
++    }
++}
++
++impl DeviceShards {
++    fn reserve(&mut self, demand: Demand) -> Result<(Arc<DevicePoller>, ConnReservation)> {
++        let count = self.shards.len();
++        let start = self.next % count;
++        self.next = self.next.wrapping_add(1);
++        let mut candidates: Vec<_> = (0..count).map(|offset| (start + offset) % count).collect();
++        // Stable sort rotates equally utilized shards. Recheck admission
++        // under each budget's mutex; a reclamation can race these snapshots.
++        let loads: Vec<_> = self
++            .shards
++            .iter()
++            .map(|p| p.shared.budget.snapshot().0)
++            .collect();
++        candidates.sort_by(|&a, &b| {
++            (u64::from(loads[a]) * u64::from(self.shards[b].cq_capacity))
++                .cmp(&(u64::from(loads[b]) * u64::from(self.shards[a].cq_capacity)))
++        });
++        let mut error = None;
++        for index in candidates {
++            let poller = &self.shards[index];
++            match poller.reserve(demand) {
++                Ok(reservation) => return Ok((poller.clone(), reservation)),
++                Err(err) => error = Some(err),
++            }
++        }
++        let error = error.expect("at least one configured CQ shard");
++        Err(Error::new(
++            error.kind,
++            format!(
++                "all {count} RDMA CQ shards unavailable: {}; raise rdma.polling.device_cq_len or poll_threads_per_device",
++                error.msg
++            ),
++        ))
+     }
+ }
+ 
+--- a/ruapc/src/rdma/poller/tests.rs
++++ b/ruapc/src/rdma/poller/tests.rs
+@@ -17,6 +17,7 @@
+     let device = crate::rdma::test_utils::open_rdma_device();
+     let config = PollerConfig {
+         cq_len: u32::MAX,
++        read_limit: 1,
+         spin_us: 0,
+         dispatch_workers: 1,
+     };
+@@ -45,6 +46,117 @@
+     assert_eq!(total.load(Ordering::Acquire), 0);
+ }
+ 
++#[tokio::test]
++async fn shard_admission_tries_other_queues_and_reclaims_failed_setup() {
++    let device = crate::rdma::test_utils::open_rdma_device();
++    let config = PollerConfig {
++        cq_len: 63,
++        read_limit: 32,
++        spin_us: 0,
++        dispatch_workers: 1,
++    };
++    let dispatcher = Dispatcher::start(1);
++    let mut shards = DeviceShards::default();
++    for index in 0..2 {
++        shards.shards.push(Arc::new(
++            DevicePoller::start(
++                device.context(),
++                &format!("admission-test-{index}"),
++                config,
++                dispatcher.clone(),
++            )
++            .unwrap(),
++        ));
++    }
++    // Give the less loaded shard an unsaturated READ reserve. The larger
++    // READ demand below can fit only on the other shard, whose shared READ
++    // reserve is already paid. Lowest current usage alone is insufficient.
++    let connection = |recv_queue_len, max_send_wr| crate::rdma::RdmaConnectionConfig {
++        recv_queue_len,
++        max_msg_size: 1024,
++        traffic_class: 0,
++        qp: crate::rdma::RdmaQueuePairConfig {
++            max_send_wr,
++            ..Default::default()
++        },
++    };
++    assert_eq!(shards.shards[0].cq_capacity, 63);
++    let a = shards.shards[0]
++        .reserve(Demand::connection(&connection(8, 2)))
++        .unwrap();
++    let b = shards.shards[1]
++        .reserve(Demand::connection(&connection(2, 64)))
++        .unwrap();
++    assert_eq!(shards.shards[0].shared.budget.snapshot().0, 17);
++    assert_eq!(shards.shards[1].shared.budget.snapshot().0, 37);
++    let (chosen, c) = shards
++        .reserve(Demand::connection(&connection(8, 64)))
++        .unwrap();
++    assert!(Arc::ptr_eq(&chosen, &shards.shards[1]));
++    assert_eq!(chosen.shared.budget.snapshot().0, 53);
++    assert!(
++        shards
++            .reserve(Demand::connection(&connection(8, 64)))
++            .is_err()
++    );
++    // These reservations model failed setup before QP creation. Their wake
++    // causes even idle shards to drain and make the credits available again.
++    drop((a, b, c));
++    tokio::time::timeout(Duration::from_secs(5), async {
++        while shards
++            .shards
++            .iter()
++            .any(|p| p.shared.budget.snapshot().1 != 0)
++        {
++            tokio::time::sleep(Duration::from_millis(1)).await;
++        }
++    })
++    .await
++    .expect("retired setup capacity must be reclaimed");
++    assert!(
++        shards
++            .reserve(Demand::connection(&connection(8, 64)))
++            .is_ok()
++    );
++}
++
++#[tokio::test]
++async fn failed_new_shard_does_not_hide_existing_capacity() {
++    let devices = crate::rdma::test_utils::make_rdma_devices();
++    let device = &devices.devices()[0];
++    let pollers = DevicePollers::default();
++    let config = PollerConfig {
++        cq_len: 63,
++        read_limit: 1,
++        spin_us: 0,
++        dispatch_workers: 1,
++    };
++    let connection = crate::rdma::RdmaConnectionConfig {
++        recv_queue_len: 2,
++        max_msg_size: 1024,
++        traffic_class: 0,
++        qp: crate::rdma::RdmaQueuePairConfig::default(),
++    };
++    let (first, a) = pollers.reserve(device, config, 2, &connection).unwrap();
++    // Bypass public config validation to deterministically fail only the new
++    // CQ creation; the existing shard can still satisfy this reservation.
++    let (second, b) = pollers
++        .reserve(
++            device,
++            PollerConfig {
++                cq_len: 0,
++                ..config
++            },
++            2,
++            &connection,
++        )
++        .unwrap();
++    assert!(Arc::ptr_eq(&first, &second));
++    assert_eq!(pollers.report().len(), 1);
++    assert_eq!(pollers.report()[0].connections, 2);
++    drop((a, b));
++}
++
+ /// The test controls CQ consumption itself so it can stop a registrar after
+ /// posting but before publication, without racing an independently running loop.
+ fn manual_poller(context: &Arc<ruapc_rdma::Context>) -> (DevicePoller, PollLoop) {
+@@ -52,6 +164,7 @@
+     let cq = CompletionQueue::create(context, 16, Some(&channel)).unwrap();
+     let shared = Arc::new(PollerShared {
+         inner: Mutex::new(SharedInner::default()),
++        budget: CqBudget::new(cq.capacity(), 1),
+         has_incoming: AtomicBool::new(false),
+         shutdown: AtomicBool::new(false),
+     });
+@@ -63,8 +176,7 @@
+         shared: shared.clone(),
+         waker: PollerWaker(Arc::new(wake_tx)),
+         thread: None,
+-        wr_budget: Arc::new(AtomicU32::new(0)),
+-        cq_capacity: 16,
++        cq_capacity: cq.capacity(),
+     };
+     let poll_loop = PollLoop {
+         cq,
+@@ -124,7 +236,15 @@
+     };
+     let (pending_sender, pending_receiver) = tokio::sync::mpsc::channel(1);
+     let socket = Arc::new(RdmaSocket::new(
+-        qp,
++        poller
++            .reserve(Demand::connection(&crate::rdma::RdmaConnectionConfig {
++                qp: crate::rdma::RdmaQueuePairConfig::default(),
++                recv_queue_len: 1,
++                max_msg_size: 1024,
++                traffic_class: 0,
++            }))
++            .unwrap()
++            .bind(qp),
+         buffer_pool.clone(),
+         pending_sender,
+         poller.waker(),
+@@ -171,7 +291,6 @@
+         ring_reservation: RingReservation::add(&ring_total, 1024).0,
+         conn_count_guard: ConnCountGuard::acquire(&counts, 0),
+     };
+-    let reservation = poller.reserve(8).unwrap();
+     let buffer = buffer_pool.allocate(1024).unwrap();
+     let cq = poller.cq().clone();
+     let (posted_tx, posted_rx) = mpsc::channel();
+@@ -184,7 +303,7 @@
+         let poller = &poller;
+         let socket = &socket;
+         let registrar = scope.spawn(move || {
+-            poller.register(reservation, registration, || {
++            poller.register(registration, || {
+                 socket.queue_pair.recv(buffer)?;
+                 // INIT -> ERR flushes a real posted receive without needing a
+                 // peer or routable network. The socket is closed for teardown.
+@@ -246,7 +365,15 @@
+         "the flush CQE must settle the receive ledger"
+     );
+     poll_loop.shutdown_cleanup();
+-    assert_eq!(poller.wr_budget.load(Ordering::Acquire), 0);
++    // Removing poller state cannot release CQ capacity while another socket
++    // owner may still submit work. Destruction plus a later drain does.
++    assert_eq!(poller.shared.budget.snapshot().1, 1);
++    drop(socket);
++    assert_eq!(poller.shared.budget.snapshot().1, 1);
++    poll_loop
++        .drain_completions(&cq, &mut CompletionBatch::new(), &mut Vec::new())
++        .unwrap();
++    assert_eq!(poller.shared.budget.snapshot(), (0, 0));
+     assert_eq!(counts[0].load(Ordering::Acquire), 0);
+     assert_eq!(ring_total.load(Ordering::Acquire), 0);
+ }
+--- a/ruapc/src/rdma/rdma_socket.rs
++++ b/ruapc/src/rdma/rdma_socket.rs
+@@ -8,7 +8,7 @@
+ };
+ use std::time::Duration;
+ 
+-use ruapc_rdma::{QueuePair, ibv_send_flags};
++use ruapc_rdma::ibv_send_flags;
+ use serde::Serialize;
+ use tokio::sync::mpsc::Sender;
+ 
+@@ -17,7 +17,10 @@
+     Buffer, BufferPool, Context, CopyOp, Error, RemoteIoError, RemoteSpace, SocketTrait, State,
+     error::{ErrorKind, Result},
+     msg::MsgMeta,
+-    rdma::{frame::FramedBuffer, poller::PollerWaker},
++    rdma::{
++        frame::FramedBuffer,
++        poller::{PollerWaker, ReservedQueuePair},
++    },
+ };
+ 
+ pub(crate) struct RdmaSocketConfig {
+@@ -33,7 +36,7 @@
+ #[derive(Debug)]
+ pub struct RdmaSocket {
+     /// The QP owns posted memory through completion and successful destruction.
+-    pub(crate) queue_pair: QueuePair,
++    pub(crate) queue_pair: ReservedQueuePair,
+     pub(crate) rdmabuf_pool: Arc<BufferPool>,
+     pub(crate) state: RdmaState,
+     /// Window-blocked framed sends, flushed by the poll thread once
+@@ -69,15 +72,17 @@
+     /// device-wide read budget landing on a single QP must not overflow
+     /// it. Accounted exactly like `read_permits`.
+     pub(crate) sq_read_permits: tokio::sync::Semaphore,
++    pub(crate) sq_read_cap: usize,
+     /// Software deadline for RDMA READ completions; `None` disables the
+     /// timeout. Enforced by the poll thread's periodic sweep, not by
+     /// per-operation timers.
+     read_timeout: Option<Duration>,
++    read_closed: tokio::sync::Notify,
+ }
+ 
+ impl RdmaSocket {
+     pub(crate) fn new(
+-        queue_pair: QueuePair,
++        queue_pair: ReservedQueuePair,
+         rdmabuf_pool: Arc<BufferPool>,
+         pending_sender: Sender<Buffer>,
+         poller_waker: PollerWaker,
+@@ -98,7 +103,9 @@
+             read_permits: config.read_permits,
+             bandwidth_limiter: config.bandwidth_limiter,
+             sq_read_permits: tokio::sync::Semaphore::new(config.sq_read_cap.max(1) as usize),
++            sq_read_cap: config.sq_read_cap.max(1) as usize,
+             read_timeout: config.read_timeout,
++            read_closed: tokio::sync::Notify::new(),
+         }
+     }
+ 
+@@ -168,6 +175,8 @@
+         if !self.state.set_error() {
+             return;
+         }
++        self.sq_read_permits.close();
++        self.read_closed.notify_waiters();
+         let mut attr = ruapc_rdma::ibv_qp_attr {
+             qp_state: ruapc_rdma::ibv_qp_state::IBV_QPS_ERR,
+             ..Default::default()
+--- a/ruapc/src/rdma/rdma_socket/read.rs
++++ b/ruapc/src/rdma/rdma_socket/read.rs
+@@ -8,10 +8,12 @@
+ 
+ use ruapc_bufpool::RemoteBufferInfo;
+ use ruapc_rdma::{ReadFailure, ReadPosting, ReadRequest, ReadSegment};
++use tokio::sync::{Notify, Semaphore, SemaphorePermit};
+ 
+ use super::RdmaSocket;
+ use crate::{
+     Buffer, Context, CopyOp, Error, ErrorKind, RemoteIoError, RemoteSpace, Result,
++    rdma::RdmaState,
+     remote_memory::{
+         WriteTarget,
+         scatter::{self, SpaceLayout},
+@@ -80,6 +82,49 @@
+     }
+ }
+ 
++fn read_closed_error() -> Error {
++    Error::new(
++        ErrorKind::ConnectionClosed,
++        "RDMA connection closed before READ posting".into(),
++    )
++}
++
++async fn acquire_read_permits<'a>(
++    state: &RdmaState,
++    sq: &'a Semaphore,
++    device: &'a Semaphore,
++    closed: &Notify,
++) -> Result<(SemaphorePermit<'a>, SemaphorePermit<'a>)> {
++    if !state.is_ok() {
++        return Err(read_closed_error());
++    }
++    // Uncontended reads need only the existing semaphore operations. A
++    // closure waiter is registered only when either resource is exhausted.
++    if let Ok(sq_permit) = sq.try_acquire()
++        && let Ok(device_permit) = device.try_acquire()
++    {
++        return Ok((sq_permit, device_permit));
++    }
++    let notified = closed.notified();
++    tokio::pin!(notified);
++    // Register before checking state so closure cannot fall between that
++    // check and the first poll of a blocked semaphore acquisition.
++    notified.as_mut().enable();
++    if !state.is_ok() {
++        return Err(read_closed_error());
++    }
++    tokio::select! {
++        biased;
++        _ = &mut notified => Err(read_closed_error()),
++        permits = async {
++            // A congested connection must not reserve the whole NIC's capacity.
++            let sq_permit = sq.acquire().await.map_err(|_| read_closed_error())?;
++            let device_permit = device.acquire().await.map_err(|_| read_closed_error())?;
++            Ok((sq_permit, device_permit))
++        } => permits,
++    }
++}
++
+ impl RdmaSocket {
+     pub(crate) fn fail_read_batches(&self) {
+         self.queue_pair.fail_pending_reads();
+@@ -94,6 +139,9 @@
+         local: Vec<Buffer>,
+         request_remaining: Option<Duration>,
+     ) -> std::result::Result<Vec<Buffer>, (Error, Option<Vec<Buffer>>)> {
++        if !self.state.is_ok() {
++            return Err((read_closed_error(), Some(local)));
++        }
+         let bytes = reads
+             .iter()
+             .flat_map(|read| &read.segments)
+@@ -135,15 +183,18 @@
+     }
+ 
+     async fn post_read(&self, posting: &mut ReadPosting) -> Result<()> {
+-        let permits_closed =
+-            |_| Error::new(ErrorKind::RdmaSendFailed, "RDMA read permits closed".into());
+-        // A congested connection must not reserve the whole device's capacity.
+-        let sq_permit = self
+-            .sq_read_permits
+-            .acquire()
+-            .await
+-            .map_err(permits_closed)?;
+-        let device_permit = self.read_permits.acquire().await.map_err(permits_closed)?;
++        let (sq_permit, device_permit) = acquire_read_permits(
++            &self.state,
++            &self.sq_read_permits,
++            &self.read_permits,
++            &self.read_closed,
++        )
++        .await?;
++        if !self.state.is_ok() {
++            return Err(read_closed_error());
++        }
++        // The held SQ permit keeps the completion route registered even if
++        // closing the connection races this final check and the actual post.
+         self.queue_pair.post_read(posting).map_err(plan_error)?;
+         sq_permit.forget();
+         device_permit.forget();
+@@ -274,3 +325,80 @@
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[tokio::test]
++    async fn closing_read_admission_wakes_a_task_waiting_for_sq_capacity() {
++        let state = RdmaState::new(4);
++        let sq = Semaphore::new(1);
++        let device = Semaphore::new(2);
++        let closed = Notify::new();
++        let outstanding = sq.acquire().await.unwrap();
++        let acquiring = acquire_read_permits(&state, &sq, &device, &closed);
++        tokio::pin!(acquiring);
++        assert!(futures_util::poll!(&mut acquiring).is_pending());
++        assert_eq!(device.available_permits(), 2);
++
++        state.set_error();
++        sq.close();
++        closed.notify_waiters();
++        assert_eq!(
++            acquiring.await.unwrap_err().kind,
++            ErrorKind::ConnectionClosed
++        );
++        assert_eq!(sq.available_permits(), 0);
++        drop(outstanding);
++        assert_eq!(sq.available_permits(), 1);
++        assert_eq!(device.available_permits(), 2);
++    }
++
++    #[tokio::test]
++    async fn closing_read_admission_releases_sq_capacity_while_device_is_full() {
++        let state = RdmaState::new(4);
++        let sq = Semaphore::new(2);
++        let device = Semaphore::new(1);
++        let closed = Notify::new();
++        let unrelated_read = device.acquire().await.unwrap();
++        let acquiring = acquire_read_permits(&state, &sq, &device, &closed);
++        tokio::pin!(acquiring);
++        assert!(futures_util::poll!(&mut acquiring).is_pending());
++        assert_eq!(sq.available_permits(), 1);
++
++        state.set_error();
++        sq.close();
++        closed.notify_waiters();
++        assert_eq!(
++            acquiring.await.unwrap_err().kind,
++            ErrorKind::ConnectionClosed
++        );
++        assert_eq!(sq.available_permits(), 2);
++        assert_eq!(device.available_permits(), 0);
++        assert!(!device.is_closed());
++        drop(unrelated_read);
++        assert_eq!(device.available_permits(), 1);
++    }
++
++    #[tokio::test]
++    async fn closure_before_registering_a_waiter_rejects_without_taking_permits() {
++        let state = RdmaState::new(4);
++        let sq = Semaphore::new(2);
++        let device = Semaphore::new(2);
++        let closed = Notify::new();
++        state.set_error();
++        sq.close();
++        closed.notify_waiters();
++
++        assert_eq!(
++            acquire_read_permits(&state, &sq, &device, &closed)
++                .await
++                .unwrap_err()
++                .kind,
++            ErrorKind::ConnectionClosed
++        );
++        assert_eq!(sq.available_permits(), 2);
++        assert_eq!(device.available_permits(), 2);
++    }
++}
+--- a/ruapc/src/rdma/rdma_socket_pool/mod.rs
++++ b/ruapc/src/rdma/rdma_socket_pool/mod.rs
+@@ -379,6 +379,7 @@
+     fn poller_config(&self) -> PollerConfig {
+         PollerConfig {
+             cq_len: self.config.polling.device_cq_len,
++            read_limit: self.config.remote_memory.max_inflight_read_wrs,
+             spin_us: self.config.polling.poll_spin_us,
+             dispatch_workers: self.config.polling.dispatch_workers,
+         }
+--- a/ruapc/src/rdma/rdma_socket_pool/report.rs
++++ b/ruapc/src/rdma/rdma_socket_pool/report.rs
+@@ -63,6 +63,10 @@
+                 phase: StripePhase::Active,
+             });
+         }
+-        RdmaPathReport { devices, paths }
++        RdmaPathReport {
++            devices,
++            paths,
++            completion_queues: self.pollers.report(),
++        }
+     }
+ }
+--- a/ruapc/src/rdma/rdma_socket_pool/setup.rs
++++ b/ruapc/src/rdma/rdma_socket_pool/setup.rs
+@@ -22,7 +22,7 @@
+ /// futures carry only that pointer instead of an entire temporary QP. The box
+ /// is consumed at registration; established connections own the QP directly.
+ pub(super) struct LocalConnection {
+-    queue_pair: QueuePair,
++    queue_pair: super::super::poller::ReservedQueuePair,
+     pub(super) endpoint: RdmaQpEndpoint,
+     pub(super) config: RdmaConnectionConfig,
+     poller: Arc<super::super::poller::DevicePoller>,
+@@ -82,17 +82,19 @@
+         let config = self
+             .resolve_connection_config(device, peer_limits, traffic_class)
+             .map_err(|err| at_stage("negotiate limits", err))?;
+-        let poller = self
++        let (poller, reservation) = self
+             .pollers
+-            .get_or_start(
++            .reserve(
+                 device,
+                 self.poller_config(),
+                 self.config.polling.poll_threads_per_device,
++                &config,
+             )
+-            .map_err(|err| at_stage("start completion poller", err))?;
++            .map_err(|err| at_stage("reserve completion capacity", err))?;
+         let queue_pair = self
+             .create_queue_pair(device, &config, &poller)
+             .map_err(|err| at_stage("create queue pair", err))?;
++        let queue_pair = reservation.bind(queue_pair);
+         let endpoint = self
+             .build_endpoint(&queue_pair, device, selection.port_num, selection.gid_index)
+             .map_err(|err| at_stage("build local endpoint", err))?;
+@@ -336,20 +338,13 @@
+     /// Wraps a connected QueuePair, pre-posts receives and registers it with the poller.
+     pub(super) fn register_socket(
+         &self,
+-        queue_pair: QueuePair,
++        queue_pair: super::super::poller::ReservedQueuePair,
+         state: &Arc<State>,
+         poller: &super::super::poller::DevicePoller,
+         config: &RdmaConnectionConfig,
+         path: RdmaPathInfo,
+         device_index: usize,
+     ) -> Result<Arc<RdmaSocket>> {
+-        let qp_depth = config
+-            .qp
+-            .max_send_wr
+-            .saturating_add(config.qp.max_recv_wr)
+-            .saturating_mul(2);
+-        let reservation = poller.reserve(qp_depth)?;
+-
+         let ring_bytes = config.recv_queue_len as usize * config.max_msg_size as usize;
+         let (ring_reservation, ring_total) =
+             super::super::poller::RingReservation::add(&self.ring_bytes, ring_bytes);
+@@ -428,7 +423,6 @@
+             })
+             .collect::<Result<Vec<_>>>()?;
+         poller.register(
+-            reservation,
+             RegisterConn {
+                 socket: socket.clone(),
+                 state: state.clone(),
+--- a/ruapc/tests/test_rdma_bootstrap.rs
++++ b/ruapc/tests/test_rdma_bootstrap.rs
+@@ -89,9 +89,9 @@
+     let (server, address) = start_server(&server_config).await;
+     let mut client_config = server_config.clone();
+     let rdma = client_config.rdma.as_mut().unwrap();
+-    // register_socket reserves twice the combined SQ/RQ depth per stripe.
+-    rdma.polling.device_cq_len =
+-        2 * (rdma.connection.qp.max_send_wr + rdma.connection.qp.max_recv_wr);
++    // One stripe needs R4 + W2 + A2 + min(H32, K8) = 16 CQEs.
++    // Request 16: providers may round to 31, still below two stripes' 32.
++    rdma.polling.device_cq_len = 16;
+     let context = Context::create(&client_config)
+         .unwrap()
+         .with_endpoint(Endpoint::new(Transport::RDMA, address));
+@@ -102,9 +102,9 @@
+     let error = client.ping(&context, &7).await.unwrap_err();
+     assert_eq!(error.kind, ErrorKind::Overloaded, "{error}");
+     for expected in [
+-        "register socket",
++        "reserve completion capacity",
+         "shared CQ capacity exhausted",
+-        "64 + 64 > 64",
++        "all 1 RDMA CQ shards unavailable",
+         "attempt",
+         &address.to_string(),
+     ] {

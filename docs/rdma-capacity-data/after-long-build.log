@@ -1,0 +1,3 @@
+   Compiling ruapc v0.2.0-alpha.5 (/tmp/ruapc-capacity-after/ruapc)
+    Finished `bench` profile [optimized] target(s) in 3.11s
+  Executable benches/echo.rs (/tmp/ruapc-capacity-after-target/release/deps/echo-3cf06c283b4c4119)

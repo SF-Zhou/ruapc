@@ -1,23 +1,23 @@
-//! Work request ID with type, CQ route slot and per-direction sequence.
-//!
-//! The WRID (Work Request ID) encodes a [`WRType`], a CQ-owned route slot
-//! and a monotonic per-direction sequence into a single 64-bit value:
+//! CQ-specific work request identities with two fixed work-type bits.
 //!
 //! ```text
-//! | 2 bits | 14 bits | 48 bits  |
-//! | type   | slot    | sequence |
+//! | type: 2 bits | CQ route slot: s bits | sequence: 62 - s bits |
 //! ```
 //!
-//! Each CQ leases slots to QPs and preserves their sequence watermark when a
-//! slot is reused. A completion maps to its QP with a plain array index; its
-//! sequence also distinguishes that QP from previous occupants of the slot.
+//! Each CQ fixes `s` from its actual capacity at creation. A WRID therefore
+//! cannot decode its own slot or sequence: use the originating CQ's
+//! [`crate::Completion::slot`] and [`crate::Completion::sequence`] instead.
+//! CQ-owned route leases preserve sequence watermarks across QP lifetimes.
 
-/// Work request ID with encoded type, CQ route slot and sequence.
+/// A work request identity. Only its type is independent of its originating CQ.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WRID(u64);
 
-/// Work request type encoded in a [`WRID`]
+/// Work request type encoded in a [`WRID`].
+///
+/// The type remains available even for error CQEs, whose provider opcode need
+/// not be valid. SEND variants and READ share one SQ sequence stream.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WRType {
@@ -32,50 +32,18 @@ pub enum WRType {
 }
 
 impl WRID {
-    /// Bit position of the type field.
+    /// Bit position of the type field, independent of CQ layout.
     pub const TYPE_SHIFT: u32 = 62;
-    /// Bit position of the CQ route slot field.
-    pub const SLOT_SHIFT: u32 = 48;
-    /// Width of the CQ route slot field.
-    pub const SLOT_BITS: u32 = Self::TYPE_SHIFT - Self::SLOT_SHIFT;
-    /// Maximum CQ route slot value.
-    pub const SLOT_MAX: u16 = (1 << Self::SLOT_BITS) - 1;
-    /// Mask extracting the ID field.
-    pub const ID_MASK: u64 = (1 << Self::SLOT_SHIFT) - 1;
+    pub(crate) const PAYLOAD_MASK: u64 = (1 << Self::TYPE_SHIFT) - 1;
 
-    /// Creates a new WRID with the specified type, CQ route slot and sequence.
+    /// Called with the prefix and sequence validated by the CQ route allocator.
     #[inline]
-    pub fn new(wr_type: WRType, slot: u16, id: u64) -> Self {
-        assert!(slot <= Self::SLOT_MAX, "slot too large");
-        assert!(id <= Self::ID_MASK, "ID too large");
-        Self(((wr_type as u64) << Self::TYPE_SHIFT) | (u64::from(slot) << Self::SLOT_SHIFT) | id)
+    pub(crate) fn new(wr_type: WRType, payload: u64) -> Self {
+        debug_assert!(payload <= Self::PAYLOAD_MASK);
+        Self(((wr_type as u64) << Self::TYPE_SHIFT) | payload)
     }
 
-    /// Creates a WRID for a receive operation
-    #[inline]
-    pub fn recv(slot: u16, id: u64) -> Self {
-        Self::new(WRType::Recv, slot, id)
-    }
-
-    /// Creates a WRID for a send data operation
-    #[inline]
-    pub fn send_data(slot: u16, id: u64) -> Self {
-        Self::new(WRType::SendData, slot, id)
-    }
-
-    /// Creates a WRID for a send with immediate data operation
-    #[inline]
-    pub fn send_imm(slot: u16, id: u64) -> Self {
-        Self::new(WRType::SendImm, slot, id)
-    }
-
-    /// Creates a WRID for an RDMA read operation
-    #[inline]
-    pub fn read(slot: u16, id: u64) -> Self {
-        Self::new(WRType::Read, slot, id)
-    }
-
-    /// Returns the type of the work request
+    /// Returns the type of the work request.
     #[inline]
     pub fn get_type(&self) -> WRType {
         match self.0 >> Self::TYPE_SHIFT {
@@ -87,18 +55,6 @@ impl WRID {
         }
     }
 
-    /// Returns the CQ route slot as an array index.
-    #[inline]
-    pub fn get_slot(&self) -> usize {
-        ((self.0 >> Self::SLOT_SHIFT) as usize) & Self::SLOT_MAX as usize
-    }
-
-    /// Returns the ID portion of the WRID
-    #[inline]
-    pub fn get_id(&self) -> u64 {
-        self.0 & Self::ID_MASK
-    }
-
     /// Returns the raw underlying `u64` value.
     #[inline]
     pub fn raw(&self) -> u64 {
@@ -108,13 +64,8 @@ impl WRID {
 
 impl std::fmt::Debug for WRID {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self.get_type() {
-            WRType::Recv => "Recv",
-            WRType::SendData => "SendData",
-            WRType::SendImm => "SendImm",
-            WRType::Read => "Read",
-        };
-        write!(f, "{name}({}:{})", self.get_slot(), self.get_id())
+        // Slot/sequence formatting would require the originating CQ's layout.
+        write!(f, "{:?}({:#018x})", self.get_type(), self.0)
     }
 }
 
@@ -123,56 +74,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_wrid_roundtrip_all_types() {
-        for (wr_type, slot, id) in [
-            (WRType::Recv, 0u16, 0u64),
-            (WRType::SendData, 1, 2000),
-            (WRType::SendImm, WRID::SLOT_MAX, 3000),
-            (WRType::Read, 0x3F_0F, WRID::ID_MASK),
+    fn type_and_payload_roundtrip_without_assuming_a_cq_layout() {
+        for wr_type in [
+            WRType::Recv,
+            WRType::SendData,
+            WRType::SendImm,
+            WRType::Read,
         ] {
-            let wrid = WRID::new(wr_type, slot, id);
-            assert_eq!(wrid.get_type(), wr_type);
-            assert_eq!(wrid.get_slot(), usize::from(slot));
-            assert_eq!(wrid.get_id(), id);
+            for payload in [0, 1, WRID::PAYLOAD_MASK] {
+                let wrid = WRID::new(wr_type, payload);
+                assert_eq!(wrid.get_type(), wr_type);
+                assert_eq!(wrid.raw() & WRID::PAYLOAD_MASK, payload);
+                assert_eq!(wrid.raw(), ((wr_type as u64) << WRID::TYPE_SHIFT) | payload);
+            }
         }
     }
 
     #[test]
-    fn test_wrid_constructors() {
-        assert_eq!(WRID::recv(7, 1).get_type(), WRType::Recv);
-        assert_eq!(WRID::send_data(7, 2).get_type(), WRType::SendData);
-        assert_eq!(WRID::send_imm(7, 3).get_type(), WRType::SendImm);
-        assert_eq!(WRID::read(7, 4).get_type(), WRType::Read);
-        assert_eq!(WRID::read(7, 4).get_slot(), 7);
-        assert_eq!(WRID::read(7, 4).get_id(), 4);
-    }
-
-    #[test]
-    #[should_panic(expected = "ID too large")]
-    fn test_wrid_rejects_large_id() {
-        let _ = WRID::recv(0, WRID::ID_MASK + 1);
-    }
-
-    #[test]
-    #[should_panic(expected = "slot too large")]
-    fn test_wrid_rejects_large_slot() {
-        let _ = WRID::recv(WRID::SLOT_MAX + 1, 0);
-    }
-
-    #[test]
-    fn test_wrid_debug_format() {
-        let wrid = WRID::recv(5, 0x1234);
-        assert_eq!(format!("{wrid:?}"), "Recv(5:4660)");
-        let wrid = WRID::send_data(0, 0x5678);
-        assert_eq!(format!("{wrid:?}"), "SendData(0:22136)");
-    }
-
-    #[test]
-    fn test_wrid_raw_is_stable() {
-        let wrid = WRID::new(WRType::SendImm, 3, 9);
+    fn debug_prints_raw_identity_without_guessing_the_layout() {
         assert_eq!(
-            wrid.raw(),
-            (2u64 << WRID::TYPE_SHIFT) | (3u64 << WRID::SLOT_SHIFT) | 9
+            format!("{:?}", WRID::new(WRType::Recv, 123)),
+            "Recv(0x000000000000007b)"
         );
     }
 }

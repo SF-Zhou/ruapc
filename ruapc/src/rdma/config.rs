@@ -102,9 +102,13 @@ impl RdmaConnectionTuningConfig {
 #[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone)]
 #[serde(default, deny_unknown_fields)]
 pub struct RdmaPollingConfig {
+    /// Requested entries per CQ shard, clamped to the device limit.
+    /// Admission uses the actual capacity returned by the provider.
     pub device_cq_len: u32,
     /// Busy-poll duration after the latest completion. Zero disables spinning.
     pub poll_spin_us: u64,
+    /// Maximum CQ shards (one poll thread each) per device. Shards start
+    /// lazily and receive connections according to available CQ credits.
     pub poll_threads_per_device: u32,
     pub dispatch_workers: u32,
 }
@@ -122,6 +126,9 @@ impl Default for RdmaPollingConfig {
 
 impl RdmaPollingConfig {
     fn validate(&self) -> crate::Result<()> {
+        if self.device_cq_len == 0 {
+            return Err(invalid_config("rdma.polling.device_cq_len must be nonzero"));
+        }
         if self.poll_threads_per_device == 0 {
             return Err(invalid_config(
                 "rdma.polling.poll_threads_per_device must be nonzero",

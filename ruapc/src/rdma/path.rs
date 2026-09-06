@@ -97,9 +97,24 @@ pub struct RdmaDeviceLoad {
     pub connections: usize,
 }
 
+/// One CQ shard's admission and WRID capacity. Reservations include QPs
+/// being prepared and destroyed QPs whose residual completions need draining.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RdmaCqLoad {
+    pub device: String,
+    pub shard: usize,
+    pub capacity: u32,
+    pub reserved: u32,
+    pub connections: u64,
+    pub route_capacity: u32,
+    pub sequence_bits: u32,
+}
+
 /// Snapshot of all live RDMA connections and per-device load.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RdmaPathReport {
+    /// CQ shard capacities and current reserved completion credits.
+    pub completion_queues: Vec<RdmaCqLoad>,
     /// Per-device live connection counts.
     pub devices: Vec<RdmaDeviceLoad>,
     /// Every live connection with its path.
