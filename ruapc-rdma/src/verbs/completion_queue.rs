@@ -3,14 +3,16 @@
 use std::{
     os::raw::c_int,
     ptr,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex},
 };
 
 use super::{comp_channel::CompChannel, context::Context};
-use crate::{ErrorKind, Result, WRID, ibv_wc};
+use crate::{ErrorKind, Result, ibv_wc};
+
+mod routes;
+pub use routes::CompletionRoute;
+use routes::RouteAllocator;
+pub(super) use routes::RouteLease;
 
 /// Reusable stack storage for polling authenticated work completions.
 /// Entries cannot be changed while any completion from the batch is borrowed.
@@ -58,8 +60,13 @@ impl<'a> Completion<'a> {
         self.wc
     }
 
-    pub(super) fn belongs_to(&self, cq: &CompletionQueue, qp_num: u32, tag: u32) -> bool {
-        ptr::eq(self.cq, cq) && self.wc.qp_num == qp_num && self.wc.wr_id.get_tag() == tag
+    pub(super) fn belongs_to(
+        &self,
+        cq: &CompletionQueue,
+        qp_num: u32,
+        route: CompletionRoute,
+    ) -> bool {
+        ptr::eq(self.cq, cq) && self.wc.qp_num == qp_num && route.contains(self.wc.wr_id)
     }
 }
 
@@ -85,31 +92,6 @@ impl<'a> Iterator for Completions<'a> {
 
 impl ExactSizeIterator for Completions<'_> {}
 
-/// A tag is never reused during the CQ's lifetime, including after QP drop.
-/// This makes a retained completion harmless even when a provider reuses a QPN.
-struct ClaimedTags(Box<[AtomicU64]>);
-
-impl ClaimedTags {
-    fn new() -> Self {
-        Self(
-            (0..=(WRID::TAG_MAX as usize / 64))
-                .map(|_| AtomicU64::new(0))
-                .collect(),
-        )
-    }
-
-    fn claim(&self, tag: u32) -> Result<()> {
-        if tag > WRID::TAG_MAX {
-            return Err(ErrorKind::InvalidQueuePairConfig.into());
-        }
-        let mask = 1u64 << (tag % 64);
-        if self.0[tag as usize / 64].fetch_or(mask, Ordering::Relaxed) & mask != 0 {
-            return Err(ErrorKind::InvalidQueuePairConfig.into());
-        }
-        Ok(())
-    }
-}
-
 /// A completion queue (CQ).
 ///
 /// Holds work completions from send/recv operations. Maintains shared
@@ -121,8 +103,8 @@ pub struct CompletionQueue {
     _context: Arc<Context>,
     /// Prevents the completion channel from being destroyed while this CQ exists.
     _channel: Option<Arc<CompChannel>>,
-    /// 512 KiB of setup-only tag history; completion validation needs no lookup.
-    claimed_tags: ClaimedTags,
+    /// Setup-only slot allocation and reuse watermarks. Polling never locks it.
+    routes: Mutex<RouteAllocator>,
 }
 
 impl CompletionQueue {
@@ -155,7 +137,7 @@ impl CompletionQueue {
             ptr,
             _context: Arc::clone(context),
             _channel: channel.cloned(),
-            claimed_tags: ClaimedTags::new(),
+            routes: Mutex::new(RouteAllocator::default()),
         }))
     }
 
@@ -202,8 +184,9 @@ impl CompletionQueue {
         })
     }
 
-    pub(super) fn claim_tag(&self, tag: u32) -> Result<()> {
-        self.claimed_tags.claim(tag)
+    pub(super) fn allocate_route(self: &Arc<Self>) -> Result<RouteLease> {
+        let route = self.routes.lock().unwrap().allocate()?;
+        Ok(RouteLease::new(Arc::clone(self), route))
     }
 
     /// Acknowledges CQ events received via [`CompChannel::get_event`].
@@ -237,53 +220,57 @@ mod tests {
     use crate::*;
 
     #[test]
-    fn claimed_tags_never_reuse_a_connection_generation() {
-        let tags = super::ClaimedTags::new();
-        for tag in [0, 1, 63, 64, WRID::TAG_MAX] {
-            tags.claim(tag).unwrap();
-            assert_eq!(
-                tags.claim(tag).unwrap_err().kind,
-                ErrorKind::InvalidQueuePairConfig
-            );
-        }
-        assert!(tags.claim(WRID::TAG_MAX + 1).is_err());
-    }
-
-    #[test]
-    fn claimed_tags_are_exclusive_between_concurrent_registrars() {
-        let tags = super::ClaimedTags::new();
-        std::thread::scope(|scope| {
-            let threads: Vec<_> = (0..8)
-                .map(|_| scope.spawn(|| tags.claim(42).is_ok()))
-                .collect();
-            assert_eq!(
-                threads
-                    .into_iter()
-                    .filter_map(|thread| thread.join().ok())
-                    .filter(|claimed| *claimed)
-                    .count(),
-                1
-            );
-        });
-    }
-
-    #[test]
-    fn completion_requires_its_original_cq_qp_and_tag() {
+    fn completion_requires_its_original_cq_qp_and_route() {
         let dev = open_device();
         let cq = CompletionQueue::create(dev.context(), 16, None).unwrap();
         let other_cq = CompletionQueue::create(dev.context(), 16, None).unwrap();
+        let lease = cq.allocate_route().unwrap();
+        let route = lease.route();
+        let other_lease = cq.allocate_route().unwrap();
         // Only this module can construct a token from raw metadata. The public
         // API requires an actual provider completion, covered by the doctest.
         let wc = ibv_wc {
             qp_num: 42,
-            wr_id: WRID::recv(7, 0),
+            wr_id: WRID::recv(route.slot() as u16, lease.alloc_recv().unwrap()),
             ..Default::default()
         };
         let completion = super::Completion { cq: &cq, wc: &wc };
-        assert!(completion.belongs_to(&cq, 42, 7));
-        assert!(!completion.belongs_to(&other_cq, 42, 7));
-        assert!(!completion.belongs_to(&cq, 43, 7));
-        assert!(!completion.belongs_to(&cq, 42, 8));
+        assert!(completion.belongs_to(&cq, 42, route));
+        assert!(!completion.belongs_to(&other_cq, 42, route));
+        assert!(!completion.belongs_to(&cq, 43, route));
+        assert!(!completion.belongs_to(&cq, 42, other_lease.route()));
+
+        // A retained CQ-issued token must remain harmless when both the slot
+        // and the provider's QPN have been reused by a replacement QP.
+        drop(lease);
+        let replacement = cq.allocate_route().unwrap();
+        assert_eq!(replacement.route().slot(), route.slot());
+        assert!(!completion.belongs_to(&cq, 42, replacement.route()));
+    }
+
+    #[test]
+    fn lease_drop_preserves_both_directions_and_unused_incarnations() {
+        let dev = open_device();
+        let cq = CompletionQueue::create(dev.context(), 16, None).unwrap();
+        let lease = cq.allocate_route().unwrap();
+        let first = lease.route();
+        assert!(Arc::ptr_eq(lease.cq(), &cq));
+        for expected in 0..5 {
+            assert_eq!(lease.lock_send().unwrap().sequence(), expected);
+        }
+        assert_eq!(lease.alloc_recv().unwrap(), 0);
+        drop(lease);
+
+        let unused = cq.allocate_route().unwrap();
+        assert_eq!(unused.route().slot(), first.slot());
+        assert_eq!(unused.route().first_sequence(), 5);
+        drop(unused);
+
+        let current = cq.allocate_route().unwrap();
+        assert_eq!(current.route().slot(), first.slot());
+        assert_eq!(current.route().first_sequence(), 6);
+        assert_eq!(current.lock_send().unwrap().sequence(), 6);
+        assert_eq!(current.alloc_recv().unwrap(), 6);
     }
 
     #[test]

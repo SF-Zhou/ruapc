@@ -4,7 +4,9 @@
 use std::{collections::VecDeque, sync::Arc, time::Instant};
 
 use bytes::Bytes;
-use ruapc_rdma::{Completion, CompletionCursor, WRType, WrBuffers, ibv_send_flags, ibv_wc};
+use ruapc_rdma::{
+    Completion, CompletionCursor, CompletionRoute, WRType, WrBuffers, ibv_send_flags, ibv_wc,
+};
 
 use super::{
     BudgetGuard, RegisterConn, RingReservation, dispatch::DispatchBatch, flow::FlowControl,
@@ -71,9 +73,9 @@ impl Drop for RegisteredConnection {
 /// Field order matters for teardown: handlers holding buffers come before
 /// `socket` so buffers are released before the QP can be destroyed.
 pub(super) struct ConnState {
-    /// Generation of the occupied slot; completions tagged with another
-    /// generation belonged to a previous occupant and are dropped.
-    pub(super) generation: u8,
+    /// CQ-assigned route and sequence floor; stale completions are discarded
+    /// before they can affect a replacement connection's flow control.
+    pub(super) route: CompletionRoute,
     pub(super) flow: FlowControl,
     /// Window-blocked framed sends in FIFO order.
     pub(super) pending_sends: VecDeque<Buffer>,
@@ -101,10 +103,10 @@ pub(super) struct ConnState {
 }
 
 impl ConnState {
-    pub(super) fn new(reg: RegisterConn, generation: u8, budget: BudgetGuard) -> Self {
+    pub(super) fn new(reg: RegisterConn, budget: BudgetGuard) -> Self {
         let registration = RegisteredConnection::new(reg.state, reg.socket.conn_id);
         Self {
-            generation,
+            route: reg.socket.queue_pair.send_route(),
             flow: FlowControl::new(reg.send_window, reg.recv_submitted, Instant::now()),
             pending_sends: VecDeque::new(),
             pending_receiver: reg.pending_receiver,

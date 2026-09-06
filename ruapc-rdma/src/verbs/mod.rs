@@ -19,7 +19,9 @@ mod comp_channel;
 pub use comp_channel::CompChannel;
 
 mod completion_queue;
-pub use completion_queue::{Completion, CompletionBatch, CompletionQueue, Completions};
+pub use completion_queue::{
+    Completion, CompletionBatch, CompletionQueue, CompletionRoute, Completions,
+};
 
 mod context;
 pub use context::Context;

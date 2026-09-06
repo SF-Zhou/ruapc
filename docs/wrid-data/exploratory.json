@@ -1,0 +1,122 @@
+[
+  {
+    "excluded_from_comparison": true,
+    "reason": "binding setup error: Tokio worker thread name was not matched, workers inherited CPU 8",
+    "raw": {
+      "version": "baseline",
+      "run": 1,
+      "command": [
+        "numactl",
+        "--physcpubind=0-10",
+        "--membind=0",
+        "env",
+        "LD_PRELOAD=/tmp/ruapc-wrid-bench/pin_threads.so",
+        "/tmp/ruapc-wrid-baseline-g1D97k/target/release/deps/echo-3cf06c283b4c4119"
+      ],
+      "elapsed_s": 5.198096990585327,
+      "returncode": 0,
+      "stdout": "ruapc: end-to-end echo RPC benchmark (unified server, one port)\nserial iterations: 50000; warmup iterations: 5000; transport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\n\nRDMA\n  serial        16B:    19.39 us/op\n  serial      4096B:    22.62 us/op\n  concurrent    16B:    370.9 kops/s |   172.56 us/op (64 tasks)\n  concurrent    16B:    359.9 kops/s |  2844.89 us/op (1024 tasks)\n\nRDMA (2 endpoints)\n  concurrent    16B:    360.6 kops/s |   177.48 us/op (64 tasks)\n  concurrent    16B:    363.0 kops/s |  2821.03 us/op (1024 tasks)\n\n",
+      "stderr": "pin_threads: main -> cpu=8\npin_threads: ruapc-rdma-poll -> cpu=9\npin_threads: ruapc-rdma-poll -> cpu=10\n"
+    }
+  },
+  {
+    "excluded_from_comparison": true,
+    "reason": "binding setup error: Tokio worker thread name was not matched, workers inherited CPU 8",
+    "raw": {
+      "version": "baseline",
+      "run": 2,
+      "command": [
+        "numactl",
+        "--physcpubind=0-10",
+        "--membind=0",
+        "env",
+        "LD_PRELOAD=/tmp/ruapc-wrid-bench/pin_threads.so",
+        "/tmp/ruapc-wrid-baseline-g1D97k/target/release/deps/echo-3cf06c283b4c4119"
+      ],
+      "elapsed_s": 5.2046308517456055,
+      "returncode": 0,
+      "stdout": "ruapc: end-to-end echo RPC benchmark (unified server, one port)\nserial iterations: 50000; warmup iterations: 5000; transport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\n\nRDMA\n  serial        16B:    19.88 us/op\n  serial      4096B:    22.24 us/op\n  concurrent    16B:    365.5 kops/s |   175.12 us/op (64 tasks)\n  concurrent    16B:    365.9 kops/s |  2798.33 us/op (1024 tasks)\n\nRDMA (2 endpoints)\n  concurrent    16B:    354.9 kops/s |   180.32 us/op (64 tasks)\n  concurrent    16B:    362.8 kops/s |  2822.73 us/op (1024 tasks)\n\n",
+      "stderr": "pin_threads: main -> cpu=8\npin_threads: ruapc-rdma-poll -> cpu=9\npin_threads: ruapc-rdma-poll -> cpu=10\n"
+    }
+  },
+  {
+    "excluded_from_comparison": true,
+    "reason": "binding setup error: Tokio worker thread name was not matched, workers inherited CPU 8",
+    "raw": {
+      "version": "baseline",
+      "run": 3,
+      "command": [
+        "numactl",
+        "--physcpubind=0-10",
+        "--membind=0",
+        "env",
+        "LD_PRELOAD=/tmp/ruapc-wrid-bench/pin_threads.so",
+        "/tmp/ruapc-wrid-baseline-g1D97k/target/release/deps/echo-3cf06c283b4c4119"
+      ],
+      "elapsed_s": 5.199301242828369,
+      "returncode": 0,
+      "stdout": "ruapc: end-to-end echo RPC benchmark (unified server, one port)\nserial iterations: 50000; warmup iterations: 5000; transport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\n\nRDMA\n  serial        16B:    19.29 us/op\n  serial      4096B:    22.09 us/op\n  concurrent    16B:    370.6 kops/s |   172.67 us/op (64 tasks)\n  concurrent    16B:    351.7 kops/s |  2911.52 us/op (1024 tasks)\n\nRDMA (2 endpoints)\n  concurrent    16B:    343.9 kops/s |   186.11 us/op (64 tasks)\n  concurrent    16B:    366.0 kops/s |  2797.45 us/op (1024 tasks)\n\n",
+      "stderr": "pin_threads: main -> cpu=8\npin_threads: ruapc-rdma-poll -> cpu=9\npin_threads: ruapc-rdma-poll -> cpu=10\n"
+    }
+  },
+  {
+    "excluded_from_comparison": true,
+    "reason": "unpaired exploratory baseline before current implementation",
+    "raw": {
+      "version": "baseline",
+      "run": 1,
+      "command": [
+        "numactl",
+        "--physcpubind=0-10",
+        "--membind=0",
+        "env",
+        "LD_PRELOAD=/tmp/ruapc-wrid-bench/pin_threads.so",
+        "/tmp/ruapc-wrid-baseline-g1D97k/target/release/deps/echo-3cf06c283b4c4119"
+      ],
+      "elapsed_s": 4.174538612365723,
+      "returncode": 0,
+      "stdout": "ruapc: end-to-end echo RPC benchmark (unified server, one port)\nserial iterations: 50000; warmup iterations: 5000; transport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\n\nRDMA\n  serial        16B:    26.14 us/op\n  serial      4096B:    28.12 us/op\n  concurrent    16B:    712.5 kops/s |    89.83 us/op (64 tasks)\n  concurrent    16B:   1378.4 kops/s |   742.91 us/op (1024 tasks)\n\nRDMA (2 endpoints)\n  concurrent    16B:    676.4 kops/s |    94.62 us/op (64 tasks)\n  concurrent    16B:   1414.9 kops/s |   723.72 us/op (1024 tasks)\n\n",
+      "stderr": "pin_threads: main -> cpu=8\npin_threads: tokio-rt-worker -> cpu=0\npin_threads: tokio-rt-worker -> cpu=1\npin_threads: tokio-rt-worker -> cpu=2\npin_threads: tokio-rt-worker -> cpu=3\npin_threads: tokio-rt-worker -> cpu=4\npin_threads: tokio-rt-worker -> cpu=5\npin_threads: tokio-rt-worker -> cpu=6\npin_threads: tokio-rt-worker -> cpu=7\npin_threads: ruapc-rdma-poll -> cpu=9\npin_threads: ruapc-rdma-poll -> cpu=10\n"
+    }
+  },
+  {
+    "excluded_from_comparison": true,
+    "reason": "unpaired exploratory baseline before current implementation",
+    "raw": {
+      "version": "baseline",
+      "run": 2,
+      "command": [
+        "numactl",
+        "--physcpubind=0-10",
+        "--membind=0",
+        "env",
+        "LD_PRELOAD=/tmp/ruapc-wrid-bench/pin_threads.so",
+        "/tmp/ruapc-wrid-baseline-g1D97k/target/release/deps/echo-3cf06c283b4c4119"
+      ],
+      "elapsed_s": 4.176173686981201,
+      "returncode": 0,
+      "stdout": "ruapc: end-to-end echo RPC benchmark (unified server, one port)\nserial iterations: 50000; warmup iterations: 5000; transport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\n\nRDMA\n  serial        16B:    26.29 us/op\n  serial      4096B:    28.57 us/op\n  concurrent    16B:    731.4 kops/s |    87.50 us/op (64 tasks)\n  concurrent    16B:   1360.4 kops/s |   752.70 us/op (1024 tasks)\n\nRDMA (2 endpoints)\n  concurrent    16B:    679.3 kops/s |    94.22 us/op (64 tasks)\n  concurrent    16B:   1415.4 kops/s |   723.45 us/op (1024 tasks)\n\n",
+      "stderr": "pin_threads: main -> cpu=8\npin_threads: tokio-rt-worker -> cpu=0\npin_threads: tokio-rt-worker -> cpu=1\npin_threads: tokio-rt-worker -> cpu=2\npin_threads: tokio-rt-worker -> cpu=3\npin_threads: tokio-rt-worker -> cpu=4\npin_threads: tokio-rt-worker -> cpu=5\npin_threads: tokio-rt-worker -> cpu=6\npin_threads: tokio-rt-worker -> cpu=7\npin_threads: ruapc-rdma-poll -> cpu=9\npin_threads: ruapc-rdma-poll -> cpu=10\n"
+    }
+  },
+  {
+    "excluded_from_comparison": true,
+    "reason": "unpaired exploratory baseline before current implementation",
+    "raw": {
+      "version": "baseline",
+      "run": 3,
+      "command": [
+        "numactl",
+        "--physcpubind=0-10",
+        "--membind=0",
+        "env",
+        "LD_PRELOAD=/tmp/ruapc-wrid-bench/pin_threads.so",
+        "/tmp/ruapc-wrid-baseline-g1D97k/target/release/deps/echo-3cf06c283b4c4119"
+      ],
+      "elapsed_s": 4.182294845581055,
+      "returncode": 0,
+      "stdout": "ruapc: end-to-end echo RPC benchmark (unified server, one port)\nserial iterations: 50000; warmup iterations: 5000; transport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\n\nRDMA\n  serial        16B:    26.06 us/op\n  serial      4096B:    28.42 us/op\n  concurrent    16B:    701.3 kops/s |    91.26 us/op (64 tasks)\n  concurrent    16B:   1325.4 kops/s |   772.61 us/op (1024 tasks)\n\nRDMA (2 endpoints)\n  concurrent    16B:    666.3 kops/s |    96.05 us/op (64 tasks)\n  concurrent    16B:   1387.9 kops/s |   737.81 us/op (1024 tasks)\n\n",
+      "stderr": "pin_threads: main -> cpu=8\npin_threads: tokio-rt-worker -> cpu=0\npin_threads: tokio-rt-worker -> cpu=1\npin_threads: tokio-rt-worker -> cpu=2\npin_threads: tokio-rt-worker -> cpu=3\npin_threads: tokio-rt-worker -> cpu=4\npin_threads: tokio-rt-worker -> cpu=5\npin_threads: tokio-rt-worker -> cpu=6\npin_threads: tokio-rt-worker -> cpu=7\npin_threads: ruapc-rdma-poll -> cpu=9\npin_threads: ruapc-rdma-poll -> cpu=10\n"
+    }
+  }
+]

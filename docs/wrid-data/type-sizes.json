@@ -1,0 +1,44 @@
+{
+  "baseline": {
+    "QueuePair": {
+      "size": 184,
+      "alignment": 8
+    },
+    "CompletionQueue": {
+      "size": 40,
+      "alignment": 8
+    },
+    "CompletionCursor": {
+      "size": 8,
+      "alignment": 8
+    }
+  },
+  "initial": {
+    "QueuePair": {
+      "size": 224,
+      "alignment": 8
+    },
+    "CompletionQueue": {
+      "size": 80,
+      "alignment": 8
+    },
+    "CompletionCursor": {
+      "size": 8,
+      "alignment": 8
+    }
+  },
+  "final": {
+    "QueuePair": {
+      "size": 232,
+      "alignment": 8
+    },
+    "CompletionQueue": {
+      "size": 80,
+      "alignment": 8
+    },
+    "CompletionCursor": {
+      "size": 8,
+      "alignment": 8
+    }
+  }
+}

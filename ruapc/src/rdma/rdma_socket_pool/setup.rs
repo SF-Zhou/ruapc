@@ -336,7 +336,7 @@ impl RdmaSocketPool {
     /// Wraps a connected QueuePair, pre-posts receives and registers it with the poller.
     pub(super) fn register_socket(
         &self,
-        mut queue_pair: QueuePair,
+        queue_pair: QueuePair,
         state: &Arc<State>,
         poller: &super::super::poller::DevicePoller,
         config: &RdmaConnectionConfig,
@@ -349,9 +349,6 @@ impl RdmaSocketPool {
             .saturating_add(config.qp.max_recv_wr)
             .saturating_mul(2);
         let reservation = poller.reserve(qp_depth)?;
-        queue_pair
-            .set_wr_tag(reservation.tag())
-            .map_err(Error::from)?;
 
         let ring_bytes = config.recv_queue_len as usize * config.max_msg_size as usize;
         let (ring_reservation, ring_total) =
@@ -412,25 +409,24 @@ impl RdmaSocketPool {
             },
         ));
 
-        for posted in 0..config.recv_queue_len {
-            let stage = || {
-                format!(
-                    "pre-post receive {}/{} ({} bytes, QP {})",
-                    posted + 1,
-                    config.recv_queue_len,
-                    config.max_msg_size,
-                    socket.queue_pair.qp_num()
-                )
-            };
-            let buf = self
-                .buffer_pool
-                .allocate(config.max_msg_size as usize)
-                .map_err(|err| at_stage(&stage(), err.into()))?;
-            socket
-                .queue_pair
-                .recv(buf)
-                .map_err(|err| at_stage(&stage(), err.into()))?;
-        }
+        let receive_stage = |posted: usize| {
+            format!(
+                "pre-post receive {}/{} ({} bytes, QP {})",
+                posted + 1,
+                config.recv_queue_len,
+                config.max_msg_size,
+                socket.queue_pair.qp_num()
+            )
+        };
+        // Allocate outside the registration barrier. Only posting and inbox
+        // publication need to exclude an early completion's routing retry.
+        let receive_buffers = (0..config.recv_queue_len as usize)
+            .map(|posted| {
+                self.buffer_pool
+                    .allocate(config.max_msg_size as usize)
+                    .map_err(|err| at_stage(&receive_stage(posted), err.into()))
+            })
+            .collect::<Result<Vec<_>>>()?;
         poller.register(
             reservation,
             RegisterConn {
@@ -444,6 +440,15 @@ impl RdmaSocketPool {
                 supervisor_guard: self.task_supervisor.start_async_task(),
                 ring_reservation,
                 conn_count_guard: ConnCountGuard::acquire(&self.conn_counts, device_index),
+            },
+            || {
+                for (posted, buf) in receive_buffers.into_iter().enumerate() {
+                    socket
+                        .queue_pair
+                        .recv(buf)
+                        .map_err(|err| at_stage(&receive_stage(posted), err.into()))?;
+                }
+                Ok(())
             },
         )?;
 

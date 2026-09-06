@@ -213,17 +213,38 @@ does not fit remains pending for a later ACK.
 `CompletionQueue::poll_batch` fills private `CompletionBatch` storage and lends
 one non-cloneable token per CQE. Its borrow prevents the entries from being
 changed while a token is live. `QueuePair::complete` consumes that token and
-checks its CQ identity, QP number and permanently assigned WRID tag before
+checks its CQ identity, QP number and CQ-owned route before
 recovering SEND/RECV buffers or settling READ ownership. Copying raw metadata
 does not copy this authority. A later RC SQ completion also permits reclamation
-of earlier unsignaled SENDs. Each CQ permanently claims connection tags; core
-poller slots retire after their final generation rather than wrapping. WR
-sequence numbers also cannot wrap and authorize recovery of a newer operation.
+of earlier unsignaled SENDs.
+
+WRIDs contain 2 type bits, a 14-bit CQ route slot and a 48-bit per-direction
+sequence. The CQ allocates an exclusive route lease at QP creation, before any
+work can be posted. A shared send/receive CQ uses one lease; separate CQs each
+allocate a lease. QP destruction succeeds before either lease returns its slot.
+Reuse preserves the maximum next sequence across SQ and RQ, advancing at least
+once even for an unused lease. Every replacement therefore starts above all
+sequences allocated by earlier occupants. Sequence allocation cannot wrap;
+exhaustion permanently retires the slot. The core poller indexes an array by
+slot and checks the occupant's sequence floor before changing flow accounting.
+This replaces poller-assigned generation tags and the per-CQ claimed-tag bitmap.
+
+Initial receive posting and publication to the poller's registration inbox hold
+the same mutex. An early completion that misses its route takes that mutex,
+drains registrations and retries, even if the empty-inbox hint has not yet been
+updated. Established-route lookup does not acquire it. SEND reclamation starts
+at the current route's floor rather than scanning sequences of previous QPs.
 
 The low-level `QueuePair` submission helper owns SQ locking, WR-slot
 registration and post-failure rollback for SEND, SEND-with-immediate and
-gather SEND. Raw DMA APIs remain explicitly unsafe in the dependency; the core
-uses the owned submission and CQ-issued completion interfaces.
+gather SEND. Rollback removes ownership bookkeeping but never reuses the
+allocated WRID. `WrSlots` returns a buffer immediately when its array position
+is occupied; the submission reports `WorkRequestSlotsExhausted` instead of
+spinning on a completion that might need the posting thread to make progress.
+Raw DMA APIs remain explicitly unsafe in the dependency; the core uses the
+owned submission and CQ-issued completion interfaces. See
+[WRID allocation and completion routing](docs/wrid.md) for the allocation
+proof, bounds and validation evidence.
 
 Bootstrap and multi-NIC placement are described in
 [RDMA connection lifecycle](docs/rdma-connection.md). Peer identity is the

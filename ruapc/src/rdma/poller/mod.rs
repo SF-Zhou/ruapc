@@ -16,11 +16,11 @@
 //!
 //! # Completion routing
 //!
-//! Every work request carries a connection *tag* (poller slot index +
-//! generation) in its `wr_id`, stamped into the QP at registration time.
-//! Routing a completion is a plain `Vec` index — no `qp_num` hash lookup,
-//! and no orphan window: the slot is reserved before the first work
-//! request is posted.
+//! Every QP receives a route slot from its CQ at creation. A work request
+//! carries that slot and a sequence number that continues across slot reuse.
+//! Routing is a plain `Vec` index plus a sequence-floor check, with no QPN
+//! hash lookup or separate poller identity allocator. The QP keeps its slot
+//! reserved until destruction, including while registrations are in transit.
 //!
 //! # Zero-parse poll thread
 //!
@@ -59,25 +59,6 @@ use dispatch::{DispatchBatch, Dispatcher, MAX_DISPATCH_BATCH};
 
 use super::RdmaSocket;
 use crate::{Buffer, Error, ErrorKind, Result, State, task::TaskSupervisorGuard};
-
-/// Number of bits of a connection tag holding the slot index; the
-/// remaining [`WRID::TAG_BITS`] bits hold the slot's generation.
-const SLOT_BITS: u32 = 14;
-/// Maximum number of live connections per poller shard.
-const MAX_SLOTS: usize = 1 << SLOT_BITS;
-
-/// Packs a slot index and its generation into a `wr_id` connection tag.
-fn conn_tag(slot: u16, generation: u8) -> u32 {
-    (u32::from(generation) << SLOT_BITS) | u32::from(slot)
-}
-
-/// Splits a `wr_id` connection tag into (slot index, generation).
-fn split_tag(tag: u32) -> (usize, u8) {
-    (
-        (tag & (MAX_SLOTS as u32 - 1)) as usize,
-        (tag >> SLOT_BITS) as u8,
-    )
-}
 
 /// Wakes the poll thread out of its idle `poll(2)` sleep.
 #[derive(Clone, Debug)]
@@ -144,8 +125,8 @@ pub struct RegisterConn {
     pub conn_count_guard: super::ConnCountGuard,
 }
 
-/// State shared between registrars and the poll thread: the slot
-/// allocator, the registration inbox and the shutdown flag.
+/// State shared between registrars and the poll thread: the registration
+/// inbox and the shutdown flag. Route allocation belongs to the CQ.
 struct PollerShared {
     inner: Mutex<SharedInner>,
     /// Fast-path hint that `inner.incoming` is non-empty; written under
@@ -158,60 +139,20 @@ struct PollerShared {
 
 #[derive(Default)]
 struct SharedInner {
-    /// Freed slot indices available for reuse.
-    free_slots: Vec<u16>,
-    /// Current generation per ever-allocated slot; bumped on release so
-    /// stale completions of a previous occupant can never be attributed
-    /// to a new connection reusing the slot.
-    generations: Vec<u8>,
     /// Registered connections awaiting pickup by the poll thread.
     incoming: Vec<Incoming>,
 }
 
 struct Incoming {
-    slot: u16,
-    generation: u8,
     conn: Box<RegisterConn>,
     budget: BudgetGuard,
 }
 
-/// Releases a slot for reuse, invalidating its previous generation.
-fn release_slot(shared: &PollerShared, slot: u16) {
-    let mut inner = shared.inner.lock().unwrap();
-    let generation = &mut inner.generations[slot as usize];
-    // Tags remain reserved in the CQ for its lifetime. Retire an exhausted
-    // slot instead of making a retained completion valid for a later QP.
-    if let Some(next) = generation.checked_add(1) {
-        *generation = next;
-        inner.free_slots.push(slot);
-    }
-}
-
-/// A reserved poller slot (plus CQ budget) for a connection about to be
-/// registered. Dropping an unconsumed reservation releases both.
+/// CQ budget for a connection about to be registered. Dropping an
+/// unconsumed reservation releases the budget; the QP owns its route.
 pub struct ConnReservation {
     shared: Arc<PollerShared>,
-    slot: u16,
-    generation: u8,
-    budget: Option<BudgetGuard>,
-}
-
-impl ConnReservation {
-    /// The connection tag to stamp into the QP's work request IDs
-    /// (`QueuePair::set_wr_tag`) before posting anything.
-    pub fn tag(&self) -> u32 {
-        conn_tag(self.slot, self.generation)
-    }
-}
-
-impl Drop for ConnReservation {
-    fn drop(&mut self) {
-        // A consumed reservation (budget moved into the inbox) frees
-        // nothing; an abandoned one returns the slot.
-        if self.budget.is_some() {
-            release_slot(&self.shared, self.slot);
-        }
-    }
+    budget: BudgetGuard,
 }
 
 /// Handle to a per-device poll thread.
@@ -339,12 +280,10 @@ impl DevicePoller {
         self.waker.clone()
     }
 
-    /// Reserves a poller slot and CQ budget for a new connection.
+    /// Reserves CQ budget for a new connection.
     ///
     /// `qp_depth` is the connection's total queue depth (send + recv work
     /// requests); the reservation fails if the shared CQ cannot absorb it.
-    /// The returned reservation's [`tag`](ConnReservation::tag) must be
-    /// stamped into the QP before any work request is posted.
     pub fn reserve(&self, qp_depth: u32) -> Result<ConnReservation> {
         let budget = self.wr_budget.clone();
         if budget
@@ -368,58 +307,48 @@ impl DevicePoller {
             depth: qp_depth,
         };
 
-        let mut inner = self.shared.inner.lock().unwrap();
         if self.shared.shutdown.load(Ordering::Acquire) {
             return Err(Error::new(
                 ErrorKind::ConnectionClosed,
                 "RDMA poll thread is not running".into(),
             ));
         }
-        let slot = match inner.free_slots.pop() {
-            Some(slot) => slot,
-            None => {
-                if inner.generations.len() >= MAX_SLOTS {
-                    return Err(Error::new(
-                        ErrorKind::Overloaded,
-                        format!("poller connection slots exhausted ({MAX_SLOTS})"),
-                    ));
-                }
-                inner.generations.push(0);
-                (inner.generations.len() - 1) as u16
-            }
-        };
-        let generation = inner.generations[slot as usize];
-        drop(inner);
-
         Ok(ConnReservation {
             shared: self.shared.clone(),
-            slot,
-            generation,
-            budget: Some(budget),
+            budget,
         })
     }
 
-    /// Registers a connection under a previously reserved slot.
-    pub fn register(&self, mut reservation: ConnReservation, conn: RegisterConn) -> Result<()> {
-        let budget = reservation
-            .budget
-            .take()
-            .expect("connection reservation used twice");
+    /// Posts the initial receives and publishes their owner as one transaction.
+    /// An early CQE's routing miss waits for this transaction before retrying.
+    pub fn register(
+        &self,
+        reservation: ConnReservation,
+        conn: RegisterConn,
+        post_receives: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let qp = &conn.socket.queue_pair;
+        if !Arc::ptr_eq(&reservation.shared, &self.shared)
+            || !Arc::ptr_eq(qp.send_cq(), &self.cq)
+            || !Arc::ptr_eq(qp.recv_cq(), &self.cq)
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "connection and reservation must belong to this RDMA poller's CQ".into(),
+            ));
+        }
         {
             let mut inner = self.shared.inner.lock().unwrap();
             if self.shared.shutdown.load(Ordering::Acquire) {
-                // Put the budget back so the reservation drop frees the slot.
-                reservation.budget = Some(budget);
                 return Err(Error::new(
                     ErrorKind::ConnectionClosed,
                     "RDMA poll thread is not running".into(),
                 ));
             }
+            post_receives()?;
             inner.incoming.push(Incoming {
-                slot: reservation.slot,
-                generation: reservation.generation,
                 conn: Box::new(conn),
-                budget,
+                budget: reservation.budget,
             });
             self.shared.has_incoming.store(true, Ordering::Release);
         }
@@ -533,7 +462,7 @@ impl PollLoop {
                 if self.shared.shutdown.load(Ordering::Acquire) {
                     return Ok(());
                 }
-                self.drain_incoming();
+                self.drain_incoming(false);
                 if tracing::enabled!(tracing::Level::DEBUG)
                     && last_dump.elapsed() >= Self::DUMP_INTERVAL
                 {
@@ -635,10 +564,9 @@ impl PollLoop {
                 tracing::error!("flow control update error: {e}");
             }
             if conn.ready_to_remove() {
-                // Dropping the registration guard fails waiters and settles
-                // metrics before this slot is available to another connection.
+                // The QP keeps its route reserved even if another owner holds
+                // the socket after poller teardown.
                 self.conns[slot] = None;
-                release_slot(&self.shared, slot as u16);
             }
         }
     }
@@ -669,8 +597,8 @@ impl PollLoop {
 
     /// Moves newly registered connections from the shared inbox into their
     /// slots.
-    fn drain_incoming(&mut self) {
-        if !self.shared.has_incoming.load(Ordering::Acquire) {
+    fn drain_incoming(&mut self, routing_miss: bool) {
+        if !routing_miss && !self.shared.has_incoming.load(Ordering::Acquire) {
             return;
         }
         let drained = {
@@ -679,39 +607,34 @@ impl PollLoop {
             std::mem::take(&mut inner.incoming)
         };
         for incoming in drained {
-            let slot = incoming.slot as usize;
+            let slot = incoming.conn.socket.queue_pair.send_route().slot();
             if self.conns.len() <= slot {
                 self.conns.resize_with(slot + 1, || None);
             }
             debug_assert!(self.conns[slot].is_none(), "poller slot {slot} occupied");
-            self.conns[slot] = Some(ConnState::new(
-                *incoming.conn,
-                incoming.generation,
-                incoming.budget,
-            ));
+            self.conns[slot] = Some(ConnState::new(*incoming.conn, incoming.budget));
         }
     }
 
     fn dispatch(&mut self, wc: Completion<'_>, batch: &mut DispatchBatch) {
-        let (slot, generation) = split_tag(wc.info().wr_id.get_tag());
+        let id = wc.info().wr_id;
+        let slot = id.get_slot();
         if let Some(Some(conn)) = self.conns.get_mut(slot)
-            && conn.generation == generation
+            && conn.route.contains(id)
         {
             conn.handle_wc(wc, batch);
             return;
         }
-        // The completion may have raced its connection's registration (the
-        // receive ring is posted before the connection reaches the inbox):
-        // pull the inbox and retry.
-        self.drain_incoming();
+        // Initial receives and inbox publication hold the same mutex. Bypass
+        // the empty-inbox hint: a registrar can still be posting the ring.
+        // Normal completions never acquire this lock.
+        self.drain_incoming(true);
         if let Some(Some(conn)) = self.conns.get_mut(slot)
-            && conn.generation == generation
+            && conn.route.contains(id)
         {
             conn.handle_wc(wc, batch);
         } else {
-            tracing::warn!(
-                "dropping completion for unknown connection {slot}:{generation}: {wc:?}"
-            );
+            tracing::warn!("dropping completion for unknown connection route: {wc:?}");
         }
     }
 
@@ -826,75 +749,4 @@ impl std::fmt::Debug for DevicePollers {
 }
 
 #[cfg(test)]
-mod tests {
-    use ruapc_rdma::WRID;
-
-    use super::*;
-
-    /// The shared CQ length must be clamped to the device's `max_cqe`:
-    /// drivers reject larger requests with EINVAL (e.g. the rxe soft-RoCE
-    /// driver caps `max_cqe` at 32767, below the default `device_cq_len`).
-    #[tokio::test]
-    async fn test_cq_len_clamped_to_device_max() {
-        let device = crate::rdma::test_utils::open_rdma_device();
-        let config = PollerConfig {
-            cq_len: u32::MAX,
-            spin_us: 0,
-            dispatch_workers: 1,
-        };
-        let poller = DevicePoller::start(
-            device.context(),
-            "cq-clamp-test",
-            config,
-            Dispatcher::start(config.dispatch_workers),
-        )
-        .expect("CQ creation must succeed with a clamped length");
-        let max_cqe = device.context().query_device().unwrap().max_cqe;
-        assert!(poller.cq_capacity <= u32::try_from(max_cqe.max(1)).unwrap_or(u32::MAX));
-        assert!(poller.cq_capacity > 0);
-    }
-
-    #[test]
-    fn test_ring_reservation_accounting() {
-        let total = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (a, after_a) = RingReservation::add(&total, 16);
-        assert_eq!(after_a, 16);
-        let (b, after_b) = RingReservation::add(&total, 32);
-        assert_eq!(after_b, 48);
-        drop(a);
-        assert_eq!(total.load(Ordering::Acquire), 32);
-        drop(b);
-        assert_eq!(total.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    fn test_conn_tag_roundtrip() {
-        for (slot, generation) in [(0u16, 0u8), (1, 255), (MAX_SLOTS as u16 - 1, 42)] {
-            let tag = conn_tag(slot, generation);
-            assert!(tag <= WRID::TAG_MAX);
-            assert_eq!(split_tag(tag), (slot as usize, generation));
-        }
-    }
-
-    #[test]
-    fn exhausted_slot_generation_is_retired() {
-        let shared = PollerShared {
-            inner: Mutex::new(SharedInner {
-                generations: vec![254],
-                ..Default::default()
-            }),
-            has_incoming: AtomicBool::new(false),
-            shutdown: AtomicBool::new(false),
-        };
-        release_slot(&shared, 0);
-        {
-            let mut inner = shared.inner.lock().unwrap();
-            assert_eq!(inner.generations[0], 255);
-            assert_eq!(inner.free_slots.pop(), Some(0));
-        }
-        release_slot(&shared, 0);
-        let inner = shared.inner.lock().unwrap();
-        assert_eq!(inner.generations[0], 255);
-        assert!(inner.free_slots.is_empty());
-    }
-}
+mod tests;

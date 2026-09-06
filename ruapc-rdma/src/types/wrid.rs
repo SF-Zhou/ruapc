@@ -1,18 +1,18 @@
-//! Work request ID with type, connection tag and per-direction ID
+//! Work request ID with type, CQ route slot and per-direction sequence.
 //!
-//! The WRID (Work Request ID) encodes a [`WRType`], an opaque connection
-//! tag and a monotonic per-direction ID into a single 64-bit value:
+//! The WRID (Work Request ID) encodes a [`WRType`], a CQ-owned route slot
+//! and a monotonic per-direction sequence into a single 64-bit value:
 //!
 //! ```text
-//! | 2 bits | 22 bits | 40 bits |
-//! | type   | tag     | id      |
+//! | 2 bits | 14 bits | 48 bits  |
+//! | type   | slot    | sequence |
 //! ```
 //!
-//! The tag is opaque to this crate; `ruapc` packs a poller slot index and
-//! a generation counter into it so a completion maps back to its
-//! connection with a plain array index — no `qp_num` hash lookup.
+//! Each CQ leases slots to QPs and preserves their sequence watermark when a
+//! slot is reused. A completion maps to its QP with a plain array index; its
+//! sequence also distinguishes that QP from previous occupants of the slot.
 
-/// Work request ID with encoded type, connection tag and ID
+/// Work request ID with encoded type, CQ route slot and sequence.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WRID(u64);
@@ -34,43 +34,49 @@ pub enum WRType {
 impl WRID {
     /// Bit position of the type field.
     pub const TYPE_SHIFT: u32 = 62;
-    /// Bit position of the connection tag field.
-    pub const TAG_SHIFT: u32 = 40;
-    /// Width of the connection tag field.
-    pub const TAG_BITS: u32 = Self::TYPE_SHIFT - Self::TAG_SHIFT;
-    /// Maximum connection tag value.
-    pub const TAG_MAX: u32 = (1 << Self::TAG_BITS) - 1;
+    /// Bit position of the CQ route slot field.
+    pub const SLOT_SHIFT: u32 = 48;
+    /// Width of the CQ route slot field.
+    pub const SLOT_BITS: u32 = Self::TYPE_SHIFT - Self::SLOT_SHIFT;
+    /// Maximum CQ route slot value.
+    pub const SLOT_MAX: u16 = (1 << Self::SLOT_BITS) - 1;
     /// Mask extracting the ID field.
-    pub const ID_MASK: u64 = (1 << Self::TAG_SHIFT) - 1;
+    pub const ID_MASK: u64 = (1 << Self::SLOT_SHIFT) - 1;
 
-    /// Creates a new WRID with the specified type, connection tag and ID
-    pub fn new(wr_type: WRType, tag: u32, id: u64) -> Self {
-        assert!(tag <= Self::TAG_MAX, "tag too large");
+    /// Creates a new WRID with the specified type, CQ route slot and sequence.
+    #[inline]
+    pub fn new(wr_type: WRType, slot: u16, id: u64) -> Self {
+        assert!(slot <= Self::SLOT_MAX, "slot too large");
         assert!(id <= Self::ID_MASK, "ID too large");
-        Self(((wr_type as u64) << Self::TYPE_SHIFT) | (u64::from(tag) << Self::TAG_SHIFT) | id)
+        Self(((wr_type as u64) << Self::TYPE_SHIFT) | (u64::from(slot) << Self::SLOT_SHIFT) | id)
     }
 
     /// Creates a WRID for a receive operation
-    pub fn recv(tag: u32, id: u64) -> Self {
-        Self::new(WRType::Recv, tag, id)
+    #[inline]
+    pub fn recv(slot: u16, id: u64) -> Self {
+        Self::new(WRType::Recv, slot, id)
     }
 
     /// Creates a WRID for a send data operation
-    pub fn send_data(tag: u32, id: u64) -> Self {
-        Self::new(WRType::SendData, tag, id)
+    #[inline]
+    pub fn send_data(slot: u16, id: u64) -> Self {
+        Self::new(WRType::SendData, slot, id)
     }
 
     /// Creates a WRID for a send with immediate data operation
-    pub fn send_imm(tag: u32, id: u64) -> Self {
-        Self::new(WRType::SendImm, tag, id)
+    #[inline]
+    pub fn send_imm(slot: u16, id: u64) -> Self {
+        Self::new(WRType::SendImm, slot, id)
     }
 
     /// Creates a WRID for an RDMA read operation
-    pub fn read(tag: u32, id: u64) -> Self {
-        Self::new(WRType::Read, tag, id)
+    #[inline]
+    pub fn read(slot: u16, id: u64) -> Self {
+        Self::new(WRType::Read, slot, id)
     }
 
     /// Returns the type of the work request
+    #[inline]
     pub fn get_type(&self) -> WRType {
         match self.0 >> Self::TYPE_SHIFT {
             0 => WRType::Recv,
@@ -81,17 +87,20 @@ impl WRID {
         }
     }
 
-    /// Returns the connection tag portion of the WRID
-    pub fn get_tag(&self) -> u32 {
-        ((self.0 >> Self::TAG_SHIFT) as u32) & Self::TAG_MAX
+    /// Returns the CQ route slot as an array index.
+    #[inline]
+    pub fn get_slot(&self) -> usize {
+        ((self.0 >> Self::SLOT_SHIFT) as usize) & Self::SLOT_MAX as usize
     }
 
     /// Returns the ID portion of the WRID
+    #[inline]
     pub fn get_id(&self) -> u64 {
         self.0 & Self::ID_MASK
     }
 
     /// Returns the raw underlying `u64` value.
+    #[inline]
     pub fn raw(&self) -> u64 {
         self.0
     }
@@ -105,7 +114,7 @@ impl std::fmt::Debug for WRID {
             WRType::SendImm => "SendImm",
             WRType::Read => "Read",
         };
-        write!(f, "{name}({}:{})", self.get_tag(), self.get_id())
+        write!(f, "{name}({}:{})", self.get_slot(), self.get_id())
     }
 }
 
@@ -115,15 +124,15 @@ mod tests {
 
     #[test]
     fn test_wrid_roundtrip_all_types() {
-        for (wr_type, tag, id) in [
-            (WRType::Recv, 0u32, 0u64),
+        for (wr_type, slot, id) in [
+            (WRType::Recv, 0u16, 0u64),
             (WRType::SendData, 1, 2000),
-            (WRType::SendImm, WRID::TAG_MAX, 3000),
+            (WRType::SendImm, WRID::SLOT_MAX, 3000),
             (WRType::Read, 0x3F_0F, WRID::ID_MASK),
         ] {
-            let wrid = WRID::new(wr_type, tag, id);
+            let wrid = WRID::new(wr_type, slot, id);
             assert_eq!(wrid.get_type(), wr_type);
-            assert_eq!(wrid.get_tag(), tag);
+            assert_eq!(wrid.get_slot(), usize::from(slot));
             assert_eq!(wrid.get_id(), id);
         }
     }
@@ -134,7 +143,7 @@ mod tests {
         assert_eq!(WRID::send_data(7, 2).get_type(), WRType::SendData);
         assert_eq!(WRID::send_imm(7, 3).get_type(), WRType::SendImm);
         assert_eq!(WRID::read(7, 4).get_type(), WRType::Read);
-        assert_eq!(WRID::read(7, 4).get_tag(), 7);
+        assert_eq!(WRID::read(7, 4).get_slot(), 7);
         assert_eq!(WRID::read(7, 4).get_id(), 4);
     }
 
@@ -145,9 +154,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "tag too large")]
-    fn test_wrid_rejects_large_tag() {
-        let _ = WRID::recv(WRID::TAG_MAX + 1, 0);
+    #[should_panic(expected = "slot too large")]
+    fn test_wrid_rejects_large_slot() {
+        let _ = WRID::recv(WRID::SLOT_MAX + 1, 0);
     }
 
     #[test]
@@ -163,7 +172,7 @@ mod tests {
         let wrid = WRID::new(WRType::SendImm, 3, 9);
         assert_eq!(
             wrid.raw(),
-            (2u64 << WRID::TYPE_SHIFT) | (3u64 << WRID::TAG_SHIFT) | 9
+            (2u64 << WRID::TYPE_SHIFT) | (3u64 << WRID::SLOT_SHIFT) | 9
         );
     }
 }

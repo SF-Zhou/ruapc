@@ -1,0 +1,2017 @@
+--- a/ruapc/benches/echo.rs
++++ b/ruapc/benches/echo.rs
+@@ -29,7 +29,7 @@
+ const CONCURRENT_TASKS: [usize; 2] = [64, 1024];
+ /// Total number of requests per concurrent run, split evenly across tasks
+ /// so every concurrency level issues the same amount of work.
+-const CONCURRENT_TOTAL_OPS: usize = 256_000;
++const CONCURRENT_TOTAL_OPS: usize = 2_560_000;
+ 
+ struct BenchOptions {
+     warmup_iters: usize,
+--- a/ruapc/src/rdma/poller/conn.rs
++++ b/ruapc/src/rdma/poller/conn.rs
+@@ -4,7 +4,9 @@
+ use std::{collections::VecDeque, sync::Arc, time::Instant};
+ 
+ use bytes::Bytes;
+-use ruapc_rdma::{Completion, CompletionCursor, WRType, WrBuffers, ibv_send_flags, ibv_wc};
++use ruapc_rdma::{
++    Completion, CompletionCursor, CompletionRoute, WRType, WrBuffers, ibv_send_flags, ibv_wc,
++};
+ 
+ use super::{
+     BudgetGuard, RegisterConn, RingReservation, dispatch::DispatchBatch, flow::FlowControl,
+@@ -71,9 +73,9 @@
+ /// Field order matters for teardown: handlers holding buffers come before
+ /// `socket` so buffers are released before the QP can be destroyed.
+ pub(super) struct ConnState {
+-    /// Generation of the occupied slot; completions tagged with another
+-    /// generation belonged to a previous occupant and are dropped.
+-    pub(super) generation: u8,
++    /// CQ-assigned route and sequence floor; stale completions are discarded
++    /// before they can affect a replacement connection's flow control.
++    pub(super) route: CompletionRoute,
+     pub(super) flow: FlowControl,
+     /// Window-blocked framed sends in FIFO order.
+     pub(super) pending_sends: VecDeque<Buffer>,
+@@ -101,10 +103,10 @@
+ }
+ 
+ impl ConnState {
+-    pub(super) fn new(reg: RegisterConn, generation: u8, budget: BudgetGuard) -> Self {
++    pub(super) fn new(reg: RegisterConn, budget: BudgetGuard) -> Self {
+         let registration = RegisteredConnection::new(reg.state, reg.socket.conn_id);
+         Self {
+-            generation,
++            route: reg.socket.queue_pair.send_route(),
+             flow: FlowControl::new(reg.send_window, reg.recv_submitted, Instant::now()),
+             pending_sends: VecDeque::new(),
+             pending_receiver: reg.pending_receiver,
+--- a/ruapc/src/rdma/poller/mod.rs
++++ b/ruapc/src/rdma/poller/mod.rs
+@@ -16,11 +16,11 @@
+ //!
+ //! # Completion routing
+ //!
+-//! Every work request carries a connection *tag* (poller slot index +
+-//! generation) in its `wr_id`, stamped into the QP at registration time.
+-//! Routing a completion is a plain `Vec` index — no `qp_num` hash lookup,
+-//! and no orphan window: the slot is reserved before the first work
+-//! request is posted.
++//! Every QP receives a route slot from its CQ at creation. A work request
++//! carries that slot and a sequence number that continues across slot reuse.
++//! Routing is a plain `Vec` index plus a sequence-floor check, with no QPN
++//! hash lookup or separate poller identity allocator. The QP keeps its slot
++//! reserved until destruction, including while registrations are in transit.
+ //!
+ //! # Zero-parse poll thread
+ //!
+@@ -59,25 +59,6 @@
+ 
+ use super::RdmaSocket;
+ use crate::{Buffer, Error, ErrorKind, Result, State, task::TaskSupervisorGuard};
+-
+-/// Number of bits of a connection tag holding the slot index; the
+-/// remaining [`WRID::TAG_BITS`] bits hold the slot's generation.
+-const SLOT_BITS: u32 = 14;
+-/// Maximum number of live connections per poller shard.
+-const MAX_SLOTS: usize = 1 << SLOT_BITS;
+-
+-/// Packs a slot index and its generation into a `wr_id` connection tag.
+-fn conn_tag(slot: u16, generation: u8) -> u32 {
+-    (u32::from(generation) << SLOT_BITS) | u32::from(slot)
+-}
+-
+-/// Splits a `wr_id` connection tag into (slot index, generation).
+-fn split_tag(tag: u32) -> (usize, u8) {
+-    (
+-        (tag & (MAX_SLOTS as u32 - 1)) as usize,
+-        (tag >> SLOT_BITS) as u8,
+-    )
+-}
+ 
+ /// Wakes the poll thread out of its idle `poll(2)` sleep.
+ #[derive(Clone, Debug)]
+@@ -144,8 +125,8 @@
+     pub conn_count_guard: super::ConnCountGuard,
+ }
+ 
+-/// State shared between registrars and the poll thread: the slot
+-/// allocator, the registration inbox and the shutdown flag.
++/// State shared between registrars and the poll thread: the registration
++/// inbox and the shutdown flag. Route allocation belongs to the CQ.
+ struct PollerShared {
+     inner: Mutex<SharedInner>,
+     /// Fast-path hint that `inner.incoming` is non-empty; written under
+@@ -158,60 +139,20 @@
+ 
+ #[derive(Default)]
+ struct SharedInner {
+-    /// Freed slot indices available for reuse.
+-    free_slots: Vec<u16>,
+-    /// Current generation per ever-allocated slot; bumped on release so
+-    /// stale completions of a previous occupant can never be attributed
+-    /// to a new connection reusing the slot.
+-    generations: Vec<u8>,
+     /// Registered connections awaiting pickup by the poll thread.
+     incoming: Vec<Incoming>,
+ }
+ 
+ struct Incoming {
+-    slot: u16,
+-    generation: u8,
+     conn: Box<RegisterConn>,
+     budget: BudgetGuard,
+ }
+ 
+-/// Releases a slot for reuse, invalidating its previous generation.
+-fn release_slot(shared: &PollerShared, slot: u16) {
+-    let mut inner = shared.inner.lock().unwrap();
+-    let generation = &mut inner.generations[slot as usize];
+-    // Tags remain reserved in the CQ for its lifetime. Retire an exhausted
+-    // slot instead of making a retained completion valid for a later QP.
+-    if let Some(next) = generation.checked_add(1) {
+-        *generation = next;
+-        inner.free_slots.push(slot);
+-    }
+-}
+-
+-/// A reserved poller slot (plus CQ budget) for a connection about to be
+-/// registered. Dropping an unconsumed reservation releases both.
++/// CQ budget for a connection about to be registered. Dropping an
++/// unconsumed reservation releases the budget; the QP owns its route.
+ pub struct ConnReservation {
+     shared: Arc<PollerShared>,
+-    slot: u16,
+-    generation: u8,
+-    budget: Option<BudgetGuard>,
+-}
+-
+-impl ConnReservation {
+-    /// The connection tag to stamp into the QP's work request IDs
+-    /// (`QueuePair::set_wr_tag`) before posting anything.
+-    pub fn tag(&self) -> u32 {
+-        conn_tag(self.slot, self.generation)
+-    }
+-}
+-
+-impl Drop for ConnReservation {
+-    fn drop(&mut self) {
+-        // A consumed reservation (budget moved into the inbox) frees
+-        // nothing; an abandoned one returns the slot.
+-        if self.budget.is_some() {
+-            release_slot(&self.shared, self.slot);
+-        }
+-    }
++    budget: BudgetGuard,
+ }
+ 
+ /// Handle to a per-device poll thread.
+@@ -339,12 +280,10 @@
+         self.waker.clone()
+     }
+ 
+-    /// Reserves a poller slot and CQ budget for a new connection.
++    /// Reserves CQ budget for a new connection.
+     ///
+     /// `qp_depth` is the connection's total queue depth (send + recv work
+     /// requests); the reservation fails if the shared CQ cannot absorb it.
+-    /// The returned reservation's [`tag`](ConnReservation::tag) must be
+-    /// stamped into the QP before any work request is posted.
+     pub fn reserve(&self, qp_depth: u32) -> Result<ConnReservation> {
+         let budget = self.wr_budget.clone();
+         if budget
+@@ -368,58 +307,48 @@
+             depth: qp_depth,
+         };
+ 
+-        let mut inner = self.shared.inner.lock().unwrap();
+         if self.shared.shutdown.load(Ordering::Acquire) {
+             return Err(Error::new(
+                 ErrorKind::ConnectionClosed,
+                 "RDMA poll thread is not running".into(),
+             ));
+         }
+-        let slot = match inner.free_slots.pop() {
+-            Some(slot) => slot,
+-            None => {
+-                if inner.generations.len() >= MAX_SLOTS {
+-                    return Err(Error::new(
+-                        ErrorKind::Overloaded,
+-                        format!("poller connection slots exhausted ({MAX_SLOTS})"),
+-                    ));
+-                }
+-                inner.generations.push(0);
+-                (inner.generations.len() - 1) as u16
+-            }
+-        };
+-        let generation = inner.generations[slot as usize];
+-        drop(inner);
+-
+         Ok(ConnReservation {
+             shared: self.shared.clone(),
+-            slot,
+-            generation,
+-            budget: Some(budget),
++            budget,
+         })
+     }
+ 
+-    /// Registers a connection under a previously reserved slot.
+-    pub fn register(&self, mut reservation: ConnReservation, conn: RegisterConn) -> Result<()> {
+-        let budget = reservation
+-            .budget
+-            .take()
+-            .expect("connection reservation used twice");
++    /// Posts the initial receives and publishes their owner as one transaction.
++    /// An early CQE's routing miss waits for this transaction before retrying.
++    pub fn register(
++        &self,
++        reservation: ConnReservation,
++        conn: RegisterConn,
++        post_receives: impl FnOnce() -> Result<()>,
++    ) -> Result<()> {
++        let qp = &conn.socket.queue_pair;
++        if !Arc::ptr_eq(&reservation.shared, &self.shared)
++            || !Arc::ptr_eq(qp.send_cq(), &self.cq)
++            || !Arc::ptr_eq(qp.recv_cq(), &self.cq)
++        {
++            return Err(Error::new(
++                ErrorKind::InvalidArgument,
++                "connection and reservation must belong to this RDMA poller's CQ".into(),
++            ));
++        }
+         {
+             let mut inner = self.shared.inner.lock().unwrap();
+             if self.shared.shutdown.load(Ordering::Acquire) {
+-                // Put the budget back so the reservation drop frees the slot.
+-                reservation.budget = Some(budget);
+                 return Err(Error::new(
+                     ErrorKind::ConnectionClosed,
+                     "RDMA poll thread is not running".into(),
+                 ));
+             }
++            post_receives()?;
+             inner.incoming.push(Incoming {
+-                slot: reservation.slot,
+-                generation: reservation.generation,
+                 conn: Box::new(conn),
+-                budget,
++                budget: reservation.budget,
+             });
+             self.shared.has_incoming.store(true, Ordering::Release);
+         }
+@@ -533,7 +462,7 @@
+                 if self.shared.shutdown.load(Ordering::Acquire) {
+                     return Ok(());
+                 }
+-                self.drain_incoming();
++                self.drain_incoming(false);
+                 if tracing::enabled!(tracing::Level::DEBUG)
+                     && last_dump.elapsed() >= Self::DUMP_INTERVAL
+                 {
+@@ -635,10 +564,9 @@
+                 tracing::error!("flow control update error: {e}");
+             }
+             if conn.ready_to_remove() {
+-                // Dropping the registration guard fails waiters and settles
+-                // metrics before this slot is available to another connection.
++                // The QP keeps its route reserved even if another owner holds
++                // the socket after poller teardown.
+                 self.conns[slot] = None;
+-                release_slot(&self.shared, slot as u16);
+             }
+         }
+     }
+@@ -669,8 +597,8 @@
+ 
+     /// Moves newly registered connections from the shared inbox into their
+     /// slots.
+-    fn drain_incoming(&mut self) {
+-        if !self.shared.has_incoming.load(Ordering::Acquire) {
++    fn drain_incoming(&mut self, routing_miss: bool) {
++        if !routing_miss && !self.shared.has_incoming.load(Ordering::Acquire) {
+             return;
+         }
+         let drained = {
+@@ -679,39 +607,34 @@
+             std::mem::take(&mut inner.incoming)
+         };
+         for incoming in drained {
+-            let slot = incoming.slot as usize;
++            let slot = incoming.conn.socket.queue_pair.send_route().slot();
+             if self.conns.len() <= slot {
+                 self.conns.resize_with(slot + 1, || None);
+             }
+             debug_assert!(self.conns[slot].is_none(), "poller slot {slot} occupied");
+-            self.conns[slot] = Some(ConnState::new(
+-                *incoming.conn,
+-                incoming.generation,
+-                incoming.budget,
+-            ));
++            self.conns[slot] = Some(ConnState::new(*incoming.conn, incoming.budget));
+         }
+     }
+ 
+     fn dispatch(&mut self, wc: Completion<'_>, batch: &mut DispatchBatch) {
+-        let (slot, generation) = split_tag(wc.info().wr_id.get_tag());
++        let id = wc.info().wr_id;
++        let slot = id.get_slot();
+         if let Some(Some(conn)) = self.conns.get_mut(slot)
+-            && conn.generation == generation
++            && conn.route.contains(id)
+         {
+             conn.handle_wc(wc, batch);
+             return;
+         }
+-        // The completion may have raced its connection's registration (the
+-        // receive ring is posted before the connection reaches the inbox):
+-        // pull the inbox and retry.
+-        self.drain_incoming();
++        // Initial receives and inbox publication hold the same mutex. Bypass
++        // the empty-inbox hint: a registrar can still be posting the ring.
++        // Normal completions never acquire this lock.
++        self.drain_incoming(true);
+         if let Some(Some(conn)) = self.conns.get_mut(slot)
+-            && conn.generation == generation
++            && conn.route.contains(id)
+         {
+             conn.handle_wc(wc, batch);
+         } else {
+-            tracing::warn!(
+-                "dropping completion for unknown connection {slot}:{generation}: {wc:?}"
+-            );
++            tracing::warn!("dropping completion for unknown connection route: {wc:?}");
+         }
+     }
+ 
+@@ -826,75 +749,4 @@
+ }
+ 
+ #[cfg(test)]
+-mod tests {
+-    use ruapc_rdma::WRID;
+-
+-    use super::*;
+-
+-    /// The shared CQ length must be clamped to the device's `max_cqe`:
+-    /// drivers reject larger requests with EINVAL (e.g. the rxe soft-RoCE
+-    /// driver caps `max_cqe` at 32767, below the default `device_cq_len`).
+-    #[tokio::test]
+-    async fn test_cq_len_clamped_to_device_max() {
+-        let device = crate::rdma::test_utils::open_rdma_device();
+-        let config = PollerConfig {
+-            cq_len: u32::MAX,
+-            spin_us: 0,
+-            dispatch_workers: 1,
+-        };
+-        let poller = DevicePoller::start(
+-            device.context(),
+-            "cq-clamp-test",
+-            config,
+-            Dispatcher::start(config.dispatch_workers),
+-        )
+-        .expect("CQ creation must succeed with a clamped length");
+-        let max_cqe = device.context().query_device().unwrap().max_cqe;
+-        assert!(poller.cq_capacity <= u32::try_from(max_cqe.max(1)).unwrap_or(u32::MAX));
+-        assert!(poller.cq_capacity > 0);
+-    }
+-
+-    #[test]
+-    fn test_ring_reservation_accounting() {
+-        let total = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+-        let (a, after_a) = RingReservation::add(&total, 16);
+-        assert_eq!(after_a, 16);
+-        let (b, after_b) = RingReservation::add(&total, 32);
+-        assert_eq!(after_b, 48);
+-        drop(a);
+-        assert_eq!(total.load(Ordering::Acquire), 32);
+-        drop(b);
+-        assert_eq!(total.load(Ordering::Acquire), 0);
+-    }
+-
+-    #[test]
+-    fn test_conn_tag_roundtrip() {
+-        for (slot, generation) in [(0u16, 0u8), (1, 255), (MAX_SLOTS as u16 - 1, 42)] {
+-            let tag = conn_tag(slot, generation);
+-            assert!(tag <= WRID::TAG_MAX);
+-            assert_eq!(split_tag(tag), (slot as usize, generation));
+-        }
+-    }
+-
+-    #[test]
+-    fn exhausted_slot_generation_is_retired() {
+-        let shared = PollerShared {
+-            inner: Mutex::new(SharedInner {
+-                generations: vec![254],
+-                ..Default::default()
+-            }),
+-            has_incoming: AtomicBool::new(false),
+-            shutdown: AtomicBool::new(false),
+-        };
+-        release_slot(&shared, 0);
+-        {
+-            let mut inner = shared.inner.lock().unwrap();
+-            assert_eq!(inner.generations[0], 255);
+-            assert_eq!(inner.free_slots.pop(), Some(0));
+-        }
+-        release_slot(&shared, 0);
+-        let inner = shared.inner.lock().unwrap();
+-        assert_eq!(inner.generations[0], 255);
+-        assert!(inner.free_slots.is_empty());
+-    }
+-}
++mod tests;
+--- a/ruapc/src/rdma/poller/tests.rs
++++ b/ruapc/src/rdma/poller/tests.rs
+@@ -0,0 +1,252 @@
++use super::*;
++
++use std::sync::{atomic::AtomicUsize, mpsc};
++
++use ruapc_bufpool::Device as _;
++use ruapc_rdma::{QueuePair, ibv_qp_attr, ibv_qp_attr_mask, ibv_qp_state};
++
++use crate::rdma::{
++    ConnCountGuard, RdmaBandwidthLimiter, RdmaNicInfo, RdmaPathInfo, RdmaSocketConfig,
++};
++
++/// The shared CQ length must be clamped to the device's `max_cqe`:
++/// drivers reject larger requests with EINVAL (e.g. the rxe soft-RoCE
++/// driver caps `max_cqe` at 32767, below the default `device_cq_len`).
++#[tokio::test]
++async fn test_cq_len_clamped_to_device_max() {
++    let device = crate::rdma::test_utils::open_rdma_device();
++    let config = PollerConfig {
++        cq_len: u32::MAX,
++        spin_us: 0,
++        dispatch_workers: 1,
++    };
++    let poller = DevicePoller::start(
++        device.context(),
++        "cq-clamp-test",
++        config,
++        Dispatcher::start(config.dispatch_workers),
++    )
++    .expect("CQ creation must succeed with a clamped length");
++    let max_cqe = device.context().query_device().unwrap().max_cqe;
++    assert!(poller.cq_capacity <= u32::try_from(max_cqe.max(1)).unwrap_or(u32::MAX));
++    assert!(poller.cq_capacity > 0);
++}
++
++#[test]
++fn test_ring_reservation_accounting() {
++    let total = Arc::new(std::sync::atomic::AtomicUsize::new(0));
++    let (a, after_a) = RingReservation::add(&total, 16);
++    assert_eq!(after_a, 16);
++    let (b, after_b) = RingReservation::add(&total, 32);
++    assert_eq!(after_b, 48);
++    drop(a);
++    assert_eq!(total.load(Ordering::Acquire), 32);
++    drop(b);
++    assert_eq!(total.load(Ordering::Acquire), 0);
++}
++
++/// The test controls CQ consumption itself so it can stop a registrar after
++/// posting but before publication, without racing an independently running loop.
++fn manual_poller(context: &Arc<ruapc_rdma::Context>) -> (DevicePoller, PollLoop) {
++    let channel = CompChannel::create(context).unwrap();
++    let cq = CompletionQueue::create(context, 16, Some(&channel)).unwrap();
++    let shared = Arc::new(PollerShared {
++        inner: Mutex::new(SharedInner::default()),
++        has_incoming: AtomicBool::new(false),
++        shutdown: AtomicBool::new(false),
++    });
++    let (wake_tx, wake_rx) = UnixStream::pair().unwrap();
++    wake_tx.set_nonblocking(true).unwrap();
++    wake_rx.set_nonblocking(true).unwrap();
++    let poller = DevicePoller {
++        cq: cq.clone(),
++        shared: shared.clone(),
++        waker: PollerWaker(Arc::new(wake_tx)),
++        thread: None,
++        wr_budget: Arc::new(AtomicU32::new(0)),
++        cq_capacity: 16,
++    };
++    let poll_loop = PollLoop {
++        cq,
++        comp_channel: channel,
++        wake_rx,
++        shared,
++        dispatcher: Dispatcher::start(1),
++        spin: Duration::ZERO,
++        conns: Vec::new(),
++        unack_cq_events: 0,
++    };
++    (poller, poll_loop)
++}
++
++#[tokio::test]
++async fn early_flush_completion_waits_for_registration_and_settles_receive() {
++    let devices = crate::rdma::test_utils::make_rdma_devices();
++    let device = &devices.devices()[0];
++    let (poller, mut poll_loop) = manual_poller(device.context());
++    let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
++    let mut attrs = ruapc_rdma::ibv_qp_init_attr {
++        qp_type: ruapc_rdma::ibv_qp_type::IBV_QPT_RC,
++        cap: ruapc_rdma::ibv_qp_cap {
++            max_send_wr: 4,
++            max_recv_wr: 4,
++            max_send_sge: 1,
++            max_recv_sge: 1,
++            ..Default::default()
++        },
++        ..Default::default()
++    };
++    let qp = QueuePair::create(
++        device.pd(),
++        poller.cq(),
++        poller.cq(),
++        &mut attrs,
++        device.index(),
++    )
++    .unwrap();
++    let port = device.info().ports[0].port_num;
++    let mut init = ibv_qp_attr {
++        qp_state: ibv_qp_state::IBV_QPS_INIT,
++        port_num: port,
++        ..Default::default()
++    };
++    let mask = ibv_qp_attr_mask::IBV_QP_STATE
++        | ibv_qp_attr_mask::IBV_QP_PORT
++        | ibv_qp_attr_mask::IBV_QP_PKEY_INDEX
++        | ibv_qp_attr_mask::IBV_QP_ACCESS_FLAGS;
++    qp.modify(&mut init, mask.0 as _).unwrap();
++
++    let nic = RdmaNicInfo {
++        device: device.info().name.clone(),
++        port_num: port,
++        gid_index: 0,
++        ip: None,
++    };
++    let (pending_sender, pending_receiver) = tokio::sync::mpsc::channel(1);
++    let socket = Arc::new(RdmaSocket::new(
++        qp,
++        buffer_pool.clone(),
++        pending_sender,
++        poller.waker(),
++        RdmaSocketConfig {
++            max_msg_size: 1024,
++            send_window: 2,
++            path: RdmaPathInfo {
++                local: nic.clone(),
++                remote: nic,
++                same_connectivity_domain: true,
++            },
++            read_timeout: None,
++            read_permits: Arc::new(tokio::sync::Semaphore::new(1)),
++            bandwidth_limiter: Arc::new(RdmaBandwidthLimiter::new(
++                device.info().name.clone(),
++                port,
++                0,
++                Duration::ZERO,
++                Duration::ZERO,
++            )),
++            sq_read_cap: 1,
++        },
++    ));
++    let (state, _stop) = State::create(
++        crate::Router::default(),
++        &crate::SocketPoolConfig {
++            rdma: None,
++            ..Default::default()
++        },
++    )
++    .unwrap();
++    let supervisor = crate::TaskSupervisor::create();
++    let counts = Arc::new(vec![AtomicUsize::new(0)]);
++    let ring_total = Arc::new(AtomicUsize::new(0));
++    let registration = RegisterConn {
++        socket: socket.clone(),
++        state,
++        pending_receiver,
++        recv_submitted: 1,
++        recv_buf_size: 1024,
++        send_window: 2,
++        msg_aggregation: false,
++        supervisor_guard: supervisor.start_async_task(),
++        ring_reservation: RingReservation::add(&ring_total, 1024).0,
++        conn_count_guard: ConnCountGuard::acquire(&counts, 0),
++    };
++    let reservation = poller.reserve(8).unwrap();
++    let buffer = buffer_pool.allocate(1024).unwrap();
++    let cq = poller.cq().clone();
++    let (posted_tx, posted_rx) = mpsc::channel();
++    let (resume_tx, resume_rx) = mpsc::channel();
++    let (polled_tx, polled_rx) = mpsc::channel();
++    let (dispatched_tx, dispatched_rx) = mpsc::channel();
++    let timeout = Duration::from_secs(5);
++
++    std::thread::scope(|scope| {
++        let poller = &poller;
++        let socket = &socket;
++        let registrar = scope.spawn(move || {
++            poller.register(reservation, registration, || {
++                socket.queue_pair.recv(buffer)?;
++                // INIT -> ERR flushes a real posted receive without needing a
++                // peer or routable network. The socket is closed for teardown.
++                socket.set_error();
++                posted_tx
++                    .send(())
++                    .map_err(|error| Error::new(ErrorKind::ConnectionClosed, error.to_string()))?;
++                resume_rx
++                    .recv_timeout(timeout)
++                    .map_err(|error| Error::new(ErrorKind::Timeout, error.to_string()))?;
++                Ok(())
++            })
++        });
++        posted_rx.recv_timeout(timeout).unwrap();
++        assert!(!poller.shared.has_incoming.load(Ordering::Acquire));
++        assert!(poller.shared.inner.try_lock().is_err());
++
++        let router = scope.spawn(|| {
++            let mut storage = CompletionBatch::<1>::new();
++            let mut batch = DispatchBatch::new();
++            let deadline = Instant::now() + timeout;
++            loop {
++                if let Some(completion) = cq.poll_batch(&mut storage).unwrap().next() {
++                    assert!(completion.info().is_recv());
++                    assert_eq!(
++                        completion.info().status,
++                        ruapc_rdma::ibv_wc_status::IBV_WC_WR_FLUSH_ERR
++                    );
++                    polled_tx.send(()).unwrap();
++                    poll_loop.dispatch(completion, &mut batch);
++                    dispatched_tx.send(()).unwrap();
++                    return;
++                }
++                assert!(
++                    Instant::now() < deadline,
++                    "receive did not produce a flush CQE"
++                );
++                std::thread::yield_now();
++            }
++        });
++        polled_rx.recv_timeout(timeout).unwrap();
++        let early_dispatch = dispatched_rx.recv_timeout(Duration::from_millis(50));
++        // Always release the registrar before asserting, including when a
++        // regression lets the CQE escape through the empty-inbox fast path.
++        resume_tx.send(()).unwrap();
++        registrar.join().unwrap().unwrap();
++        router.join().unwrap();
++        assert!(matches!(
++            early_dispatch,
++            Err(mpsc::RecvTimeoutError::Timeout)
++        ));
++    });
++
++    let conn = poll_loop.conns[socket.queue_pair.send_route().slot()]
++        .as_mut()
++        .expect("the early CQE must find the newly published connection");
++    assert!(
++        conn.ready_to_remove(),
++        "the flush CQE must settle the receive ledger"
++    );
++    poll_loop.shutdown_cleanup();
++    assert_eq!(poller.wr_budget.load(Ordering::Acquire), 0);
++    assert_eq!(counts[0].load(Ordering::Acquire), 0);
++    assert_eq!(ring_total.load(Ordering::Acquire), 0);
++}
+--- a/ruapc/src/rdma/rdma_socket_pool/setup.rs
++++ b/ruapc/src/rdma/rdma_socket_pool/setup.rs
+@@ -336,7 +336,7 @@
+     /// Wraps a connected QueuePair, pre-posts receives and registers it with the poller.
+     pub(super) fn register_socket(
+         &self,
+-        mut queue_pair: QueuePair,
++        queue_pair: QueuePair,
+         state: &Arc<State>,
+         poller: &super::super::poller::DevicePoller,
+         config: &RdmaConnectionConfig,
+@@ -349,9 +349,6 @@
+             .saturating_add(config.qp.max_recv_wr)
+             .saturating_mul(2);
+         let reservation = poller.reserve(qp_depth)?;
+-        queue_pair
+-            .set_wr_tag(reservation.tag())
+-            .map_err(Error::from)?;
+ 
+         let ring_bytes = config.recv_queue_len as usize * config.max_msg_size as usize;
+         let (ring_reservation, ring_total) =
+@@ -412,25 +409,24 @@
+             },
+         ));
+ 
+-        for posted in 0..config.recv_queue_len {
+-            let stage = || {
+-                format!(
+-                    "pre-post receive {}/{} ({} bytes, QP {})",
+-                    posted + 1,
+-                    config.recv_queue_len,
+-                    config.max_msg_size,
+-                    socket.queue_pair.qp_num()
+-                )
+-            };
+-            let buf = self
+-                .buffer_pool
+-                .allocate(config.max_msg_size as usize)
+-                .map_err(|err| at_stage(&stage(), err.into()))?;
+-            socket
+-                .queue_pair
+-                .recv(buf)
+-                .map_err(|err| at_stage(&stage(), err.into()))?;
+-        }
++        let receive_stage = |posted: usize| {
++            format!(
++                "pre-post receive {}/{} ({} bytes, QP {})",
++                posted + 1,
++                config.recv_queue_len,
++                config.max_msg_size,
++                socket.queue_pair.qp_num()
++            )
++        };
++        // Allocate outside the registration barrier. Only posting and inbox
++        // publication need to exclude an early completion's routing retry.
++        let receive_buffers = (0..config.recv_queue_len as usize)
++            .map(|posted| {
++                self.buffer_pool
++                    .allocate(config.max_msg_size as usize)
++                    .map_err(|err| at_stage(&receive_stage(posted), err.into()))
++            })
++            .collect::<Result<Vec<_>>>()?;
+         poller.register(
+             reservation,
+             RegisterConn {
+@@ -445,6 +441,15 @@
+                 ring_reservation,
+                 conn_count_guard: ConnCountGuard::acquire(&self.conn_counts, device_index),
+             },
++            || {
++                for (posted, buf) in receive_buffers.into_iter().enumerate() {
++                    socket
++                        .queue_pair
++                        .recv(buf)
++                        .map_err(|err| at_stage(&receive_stage(posted), err.into()))?;
++                }
++                Ok(())
++            },
+         )?;
+ 
+         // The shutdown watcher must not retain a failed/rolled-back QP after
+--- a/ruapc-rdma/src/error.rs
++++ b/ruapc-rdma/src/error.rs
+@@ -43,6 +43,12 @@
+     IBCreateQueuePairFail,
+     /// Invalid parameters supplied when connecting a queue pair.
+     InvalidQueuePairConfig,
++    /// All completion routes on this CQ are occupied or exhausted.
++    CompletionRoutesExhausted,
++    /// This work queue exhausted its non-repeating WRID sequence space.
++    WorkRequestIdsExhausted,
++    /// A work request's buffer slot is still held by an earlier operation.
++    WorkRequestSlotsExhausted,
+     /// Completion proof belongs to a different CQ, QP or connection generation.
+     InvalidCompletion,
+     /// Invalid local ranges or ownership supplied to a READ plan.
+--- a/ruapc-rdma/src/lib.rs
++++ b/ruapc-rdma/src/lib.rs
+@@ -61,9 +61,9 @@
+ mod verbs;
+ pub use verbs::{
+     ActiveDevice, CompChannel, CompletedWork, Completion, CompletionBatch, CompletionCursor,
+-    CompletionQueue, Completions, Context, Device, DeviceList, MAX_GATHER_SGE, MemoryRegion,
+-    ProtectionDomain, QpConnectionConfig, QueuePair, ReadFailure, ReadPosting, ReadReceiver,
+-    ReadRequest, ReadSegment, ReadSge, WrBuffers,
++    CompletionQueue, CompletionRoute, Completions, Context, Device, DeviceList, MAX_GATHER_SGE,
++    MemoryRegion, ProtectionDomain, QpConnectionConfig, QueuePair, ReadFailure, ReadPosting,
++    ReadReceiver, ReadRequest, ReadSegment, ReadSge, WrBuffers,
+ };
+ 
+ #[cfg(test)]
+--- a/ruapc-rdma/src/types/wrid.rs
++++ b/ruapc-rdma/src/types/wrid.rs
+@@ -1,18 +1,18 @@
+-//! Work request ID with type, connection tag and per-direction ID
++//! Work request ID with type, CQ route slot and per-direction sequence.
+ //!
+-//! The WRID (Work Request ID) encodes a [`WRType`], an opaque connection
+-//! tag and a monotonic per-direction ID into a single 64-bit value:
++//! The WRID (Work Request ID) encodes a [`WRType`], a CQ-owned route slot
++//! and a monotonic per-direction sequence into a single 64-bit value:
+ //!
+ //! ```text
+-//! | 2 bits | 22 bits | 40 bits |
+-//! | type   | tag     | id      |
++//! | 2 bits | 14 bits | 48 bits  |
++//! | type   | slot    | sequence |
+ //! ```
+ //!
+-//! The tag is opaque to this crate; `ruapc` packs a poller slot index and
+-//! a generation counter into it so a completion maps back to its
+-//! connection with a plain array index — no `qp_num` hash lookup.
++//! Each CQ leases slots to QPs and preserves their sequence watermark when a
++//! slot is reused. A completion maps to its QP with a plain array index; its
++//! sequence also distinguishes that QP from previous occupants of the slot.
+ 
+-/// Work request ID with encoded type, connection tag and ID
++/// Work request ID with encoded type, CQ route slot and sequence.
+ #[repr(transparent)]
+ #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+ pub struct WRID(u64);
+@@ -34,43 +34,49 @@
+ impl WRID {
+     /// Bit position of the type field.
+     pub const TYPE_SHIFT: u32 = 62;
+-    /// Bit position of the connection tag field.
+-    pub const TAG_SHIFT: u32 = 40;
+-    /// Width of the connection tag field.
+-    pub const TAG_BITS: u32 = Self::TYPE_SHIFT - Self::TAG_SHIFT;
+-    /// Maximum connection tag value.
+-    pub const TAG_MAX: u32 = (1 << Self::TAG_BITS) - 1;
++    /// Bit position of the CQ route slot field.
++    pub const SLOT_SHIFT: u32 = 48;
++    /// Width of the CQ route slot field.
++    pub const SLOT_BITS: u32 = Self::TYPE_SHIFT - Self::SLOT_SHIFT;
++    /// Maximum CQ route slot value.
++    pub const SLOT_MAX: u16 = (1 << Self::SLOT_BITS) - 1;
+     /// Mask extracting the ID field.
+-    pub const ID_MASK: u64 = (1 << Self::TAG_SHIFT) - 1;
++    pub const ID_MASK: u64 = (1 << Self::SLOT_SHIFT) - 1;
+ 
+-    /// Creates a new WRID with the specified type, connection tag and ID
+-    pub fn new(wr_type: WRType, tag: u32, id: u64) -> Self {
+-        assert!(tag <= Self::TAG_MAX, "tag too large");
++    /// Creates a new WRID with the specified type, CQ route slot and sequence.
++    #[inline]
++    pub fn new(wr_type: WRType, slot: u16, id: u64) -> Self {
++        assert!(slot <= Self::SLOT_MAX, "slot too large");
+         assert!(id <= Self::ID_MASK, "ID too large");
+-        Self(((wr_type as u64) << Self::TYPE_SHIFT) | (u64::from(tag) << Self::TAG_SHIFT) | id)
++        Self(((wr_type as u64) << Self::TYPE_SHIFT) | (u64::from(slot) << Self::SLOT_SHIFT) | id)
+     }
+ 
+     /// Creates a WRID for a receive operation
+-    pub fn recv(tag: u32, id: u64) -> Self {
+-        Self::new(WRType::Recv, tag, id)
++    #[inline]
++    pub fn recv(slot: u16, id: u64) -> Self {
++        Self::new(WRType::Recv, slot, id)
+     }
+ 
+     /// Creates a WRID for a send data operation
+-    pub fn send_data(tag: u32, id: u64) -> Self {
+-        Self::new(WRType::SendData, tag, id)
++    #[inline]
++    pub fn send_data(slot: u16, id: u64) -> Self {
++        Self::new(WRType::SendData, slot, id)
+     }
+ 
+     /// Creates a WRID for a send with immediate data operation
+-    pub fn send_imm(tag: u32, id: u64) -> Self {
+-        Self::new(WRType::SendImm, tag, id)
++    #[inline]
++    pub fn send_imm(slot: u16, id: u64) -> Self {
++        Self::new(WRType::SendImm, slot, id)
+     }
+ 
+     /// Creates a WRID for an RDMA read operation
+-    pub fn read(tag: u32, id: u64) -> Self {
+-        Self::new(WRType::Read, tag, id)
++    #[inline]
++    pub fn read(slot: u16, id: u64) -> Self {
++        Self::new(WRType::Read, slot, id)
+     }
+ 
+     /// Returns the type of the work request
++    #[inline]
+     pub fn get_type(&self) -> WRType {
+         match self.0 >> Self::TYPE_SHIFT {
+             0 => WRType::Recv,
+@@ -81,17 +87,20 @@
+         }
+     }
+ 
+-    /// Returns the connection tag portion of the WRID
+-    pub fn get_tag(&self) -> u32 {
+-        ((self.0 >> Self::TAG_SHIFT) as u32) & Self::TAG_MAX
++    /// Returns the CQ route slot as an array index.
++    #[inline]
++    pub fn get_slot(&self) -> usize {
++        ((self.0 >> Self::SLOT_SHIFT) as usize) & Self::SLOT_MAX as usize
+     }
+ 
+     /// Returns the ID portion of the WRID
++    #[inline]
+     pub fn get_id(&self) -> u64 {
+         self.0 & Self::ID_MASK
+     }
+ 
+     /// Returns the raw underlying `u64` value.
++    #[inline]
+     pub fn raw(&self) -> u64 {
+         self.0
+     }
+@@ -105,7 +114,7 @@
+             WRType::SendImm => "SendImm",
+             WRType::Read => "Read",
+         };
+-        write!(f, "{name}({}:{})", self.get_tag(), self.get_id())
++        write!(f, "{name}({}:{})", self.get_slot(), self.get_id())
+     }
+ }
+ 
+@@ -115,15 +124,15 @@
+ 
+     #[test]
+     fn test_wrid_roundtrip_all_types() {
+-        for (wr_type, tag, id) in [
+-            (WRType::Recv, 0u32, 0u64),
++        for (wr_type, slot, id) in [
++            (WRType::Recv, 0u16, 0u64),
+             (WRType::SendData, 1, 2000),
+-            (WRType::SendImm, WRID::TAG_MAX, 3000),
++            (WRType::SendImm, WRID::SLOT_MAX, 3000),
+             (WRType::Read, 0x3F_0F, WRID::ID_MASK),
+         ] {
+-            let wrid = WRID::new(wr_type, tag, id);
++            let wrid = WRID::new(wr_type, slot, id);
+             assert_eq!(wrid.get_type(), wr_type);
+-            assert_eq!(wrid.get_tag(), tag);
++            assert_eq!(wrid.get_slot(), usize::from(slot));
+             assert_eq!(wrid.get_id(), id);
+         }
+     }
+@@ -134,7 +143,7 @@
+         assert_eq!(WRID::send_data(7, 2).get_type(), WRType::SendData);
+         assert_eq!(WRID::send_imm(7, 3).get_type(), WRType::SendImm);
+         assert_eq!(WRID::read(7, 4).get_type(), WRType::Read);
+-        assert_eq!(WRID::read(7, 4).get_tag(), 7);
++        assert_eq!(WRID::read(7, 4).get_slot(), 7);
+         assert_eq!(WRID::read(7, 4).get_id(), 4);
+     }
+ 
+@@ -145,9 +154,9 @@
+     }
+ 
+     #[test]
+-    #[should_panic(expected = "tag too large")]
+-    fn test_wrid_rejects_large_tag() {
+-        let _ = WRID::recv(WRID::TAG_MAX + 1, 0);
++    #[should_panic(expected = "slot too large")]
++    fn test_wrid_rejects_large_slot() {
++        let _ = WRID::recv(WRID::SLOT_MAX + 1, 0);
+     }
+ 
+     #[test]
+@@ -163,7 +172,7 @@
+         let wrid = WRID::new(WRType::SendImm, 3, 9);
+         assert_eq!(
+             wrid.raw(),
+-            (2u64 << WRID::TYPE_SHIFT) | (3u64 << WRID::TAG_SHIFT) | 9
++            (2u64 << WRID::TYPE_SHIFT) | (3u64 << WRID::SLOT_SHIFT) | 9
+         );
+     }
+ }
+--- a/ruapc-rdma/src/verbs/completion_queue/routes.rs
++++ b/ruapc-rdma/src/verbs/completion_queue/routes.rs
+@@ -0,0 +1,280 @@
++//! CQ-local route ownership and non-repeating work request sequences.
++
++use std::sync::{
++    Arc,
++    atomic::{AtomicU64, Ordering},
++};
++
++use super::CompletionQueue;
++use crate::{ErrorKind, Result, WRID};
++
++/// Identifies one QP's use of a CQ route slot.
++///
++/// A slot can be reused after QP destruction. Its next occupant starts above
++/// every sequence allocated by earlier occupants, including work requests that
++/// were never posted. The floor therefore rejects stale completions without
++/// consuming separate generation bits or retaining a record for every QP.
++///
++/// Routes are local to a CQ. Matching a route alone is not completion evidence;
++/// [`super::super::QueuePair::complete`] also requires a token from the correct
++/// CQ and checks the provider's QP number before releasing memory.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
++pub struct CompletionRoute {
++    slot: u16,
++    first_sequence: u64,
++}
++
++impl CompletionRoute {
++    /// Returns the CQ-local slot as an array index.
++    #[inline]
++    pub fn slot(self) -> usize {
++        usize::from(self.slot)
++    }
++
++    /// First sequence that can belong to this occupant of the slot.
++    #[inline]
++    pub fn first_sequence(self) -> u64 {
++        self.first_sequence
++    }
++
++    /// Whether the WRID addresses this slot and is not from an older occupant.
++    /// This does not establish that the work request was posted or completed.
++    #[inline]
++    pub fn contains(self, wrid: WRID) -> bool {
++        wrid.get_slot() == self.slot() && wrid.get_id() >= self.first_sequence
++    }
++}
++
++/// Only QP construction and destruction take the allocator's enclosing lock.
++/// Normally grows with peak simultaneous QPs; exhausted slots remain retired.
++#[derive(Default)]
++pub(super) struct RouteAllocator {
++    next_sequences: Vec<u64>,
++    free: Vec<u16>,
++}
++
++impl RouteAllocator {
++    pub(super) fn allocate(&mut self) -> Result<CompletionRoute> {
++        let slot = match self.free.pop() {
++            Some(slot) => slot,
++            None => {
++                if self.next_sequences.len() > usize::from(WRID::SLOT_MAX) {
++                    return Err(ErrorKind::CompletionRoutesExhausted.into());
++                }
++                let slot = self.next_sequences.len() as u16;
++                self.next_sequences.push(0);
++                slot
++            }
++        };
++        let first_sequence = self.next_sequences[usize::from(slot)];
++        debug_assert!(first_sequence <= WRID::ID_MASK);
++        Ok(CompletionRoute {
++            slot,
++            first_sequence,
++        })
++    }
++
++    fn release(&mut self, route: CompletionRoute, send_next: u64, recv_next: u64) {
++        // Reserve one sequence even for a QP that never allocated a WRID. This
++        // gives every lease a distinct identity for poller registration/removal.
++        let next = send_next.max(recv_next).max(route.first_sequence + 1);
++        self.next_sequences[route.slot()] = next;
++        if next <= WRID::ID_MASK {
++            self.free.push(route.slot);
++        }
++        // A slot that consumed its final sequence is permanently retired.
++    }
++}
++
++/// Holds a slot until its QP has been destroyed and all posting access is gone.
++/// The CQ owner prevents destruction of the allocator before the lease returns.
++pub(crate) struct RouteLease {
++    cq: Arc<CompletionQueue>,
++    route: CompletionRoute,
++    send_next: AtomicU64,
++    recv_next: AtomicU64,
++}
++
++impl RouteLease {
++    pub(super) fn new(cq: Arc<CompletionQueue>, route: CompletionRoute) -> Self {
++        Self {
++            cq,
++            route,
++            send_next: AtomicU64::new(route.first_sequence),
++            recv_next: AtomicU64::new(route.first_sequence),
++        }
++    }
++
++    pub(crate) fn cq(&self) -> &Arc<CompletionQueue> {
++        &self.cq
++    }
++
++    pub(crate) fn route(&self) -> CompletionRoute {
++        self.route
++    }
++
++    #[inline]
++    pub(crate) fn alloc_send(&self) -> Result<u64> {
++        allocate_sequence(&self.send_next)
++    }
++
++    #[inline]
++    pub(crate) fn alloc_recv(&self) -> Result<u64> {
++        allocate_sequence(&self.recv_next)
++    }
++}
++
++#[inline]
++fn allocate_sequence(next: &AtomicU64) -> Result<u64> {
++    next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
++        (value <= WRID::ID_MASK).then(|| value + 1)
++    })
++    .map_err(|_| ErrorKind::WorkRequestIdsExhausted.into())
++}
++
++impl Drop for RouteLease {
++    fn drop(&mut self) {
++        self.cq.routes.lock().unwrap().release(
++            self.route,
++            *self.send_next.get_mut(),
++            *self.recv_next.get_mut(),
++        );
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use std::{collections::HashSet, sync::Mutex};
++
++    use super::*;
++
++    #[test]
++    fn reuse_starts_after_both_directions_and_rejects_old_wrids() {
++        let mut allocator = RouteAllocator::default();
++        let old = allocator.allocate().unwrap();
++        allocator.release(old, 4, 12);
++        let current = allocator.allocate().unwrap();
++        assert_eq!(current.slot(), old.slot());
++        assert_eq!(current.first_sequence(), 12);
++        for sequence in 0..12 {
++            assert!(!current.contains(WRID::recv(old.slot, sequence)));
++            assert!(!current.contains(WRID::send_data(old.slot, sequence)));
++            assert!(!current.contains(WRID::send_imm(old.slot, sequence)));
++            assert!(!current.contains(WRID::read(old.slot, sequence)));
++        }
++        assert!(current.contains(WRID::read(current.slot, 12)));
++        assert!(!current.contains(WRID::read(current.slot + 1, 12)));
++    }
++
++    #[test]
++    fn unused_leases_still_have_distinct_incarnations() {
++        let mut allocator = RouteAllocator::default();
++        for sequence in 0..100 {
++            let route = allocator.allocate().unwrap();
++            assert_eq!(route.slot(), 0);
++            assert_eq!(route.first_sequence(), sequence);
++            allocator.release(route, sequence, sequence);
++        }
++        assert_eq!(allocator.next_sequences.len(), 1);
++    }
++
++    #[test]
++    fn routes_are_exclusive_and_reusable_at_capacity() {
++        let mut allocator = RouteAllocator::default();
++        let routes: Vec<_> = (0..=WRID::SLOT_MAX)
++            .map(|slot| {
++                let route = allocator.allocate().unwrap();
++                assert_eq!(route.slot(), usize::from(slot));
++                route
++            })
++            .collect();
++        assert_eq!(
++            allocator.allocate().unwrap_err().kind,
++            ErrorKind::CompletionRoutesExhausted
++        );
++        allocator.release(routes[42], 10, 20);
++        let reused = allocator.allocate().unwrap();
++        assert_eq!(reused.slot(), 42);
++        assert_eq!(reused.first_sequence(), 20);
++        assert!(allocator.allocate().is_err());
++    }
++
++    #[test]
++    fn exhausted_sequences_never_wrap_and_retire_the_route() {
++        let counter = AtomicU64::new(WRID::ID_MASK);
++        assert_eq!(allocate_sequence(&counter).unwrap(), WRID::ID_MASK);
++        for _ in 0..10 {
++            assert_eq!(
++                allocate_sequence(&counter).unwrap_err().kind,
++                ErrorKind::WorkRequestIdsExhausted
++            );
++            assert_eq!(counter.load(Ordering::Relaxed), WRID::ID_MASK + 1);
++        }
++        let counter = AtomicU64::new(u64::MAX);
++        assert!(allocate_sequence(&counter).is_err());
++        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
++
++        let mut allocator = RouteAllocator::default();
++        let old = allocator.allocate().unwrap();
++        allocator.release(old, WRID::ID_MASK, WRID::ID_MASK);
++        let last = allocator.allocate().unwrap();
++        assert_eq!(last.slot(), old.slot());
++        assert_eq!(last.first_sequence(), WRID::ID_MASK);
++        allocator.release(last, WRID::ID_MASK + 1, WRID::ID_MASK);
++        let fresh = allocator.allocate().unwrap();
++        assert_ne!(fresh.slot(), old.slot());
++        assert_eq!(fresh.first_sequence(), 0);
++    }
++
++    #[test]
++    fn concurrent_route_allocation_is_exclusive() {
++        let allocator = Mutex::new(RouteAllocator::default());
++        let routes = std::thread::scope(|scope| {
++            let threads: Vec<_> = (0..8)
++                .map(|_| {
++                    scope.spawn(|| {
++                        (0..100)
++                            .map(|_| allocator.lock().unwrap().allocate().unwrap())
++                            .collect::<Vec<_>>()
++                    })
++                })
++                .collect();
++            threads
++                .into_iter()
++                .flat_map(|thread| thread.join().unwrap())
++                .collect::<Vec<_>>()
++        });
++        assert_eq!(routes.len(), 800);
++        assert_eq!(
++            routes
++                .iter()
++                .map(|route| route.slot())
++                .collect::<HashSet<_>>()
++                .len(),
++            routes.len()
++        );
++    }
++
++    #[test]
++    fn concurrent_sequences_are_unique_including_the_exhaustion_boundary() {
++        let counter = AtomicU64::new(WRID::ID_MASK - 999);
++        let sequences = std::thread::scope(|scope| {
++            let threads: Vec<_> = (0..8)
++                .map(|_| {
++                    scope.spawn(|| {
++                        (0..200)
++                            .filter_map(|_| allocate_sequence(&counter).ok())
++                            .collect::<Vec<_>>()
++                    })
++                })
++                .collect();
++            threads
++                .into_iter()
++                .flat_map(|thread| thread.join().unwrap())
++                .collect::<Vec<_>>()
++        });
++        assert_eq!(sequences.len(), 1000);
++        assert_eq!(sequences.into_iter().collect::<HashSet<_>>().len(), 1000);
++        assert_eq!(counter.load(Ordering::Relaxed), WRID::ID_MASK + 1);
++    }
++}
+--- a/ruapc-rdma/src/verbs/completion_queue.rs
++++ b/ruapc-rdma/src/verbs/completion_queue.rs
+@@ -3,14 +3,16 @@
+ use std::{
+     os::raw::c_int,
+     ptr,
+-    sync::{
+-        Arc,
+-        atomic::{AtomicU64, Ordering},
+-    },
++    sync::{Arc, Mutex},
+ };
+ 
+ use super::{comp_channel::CompChannel, context::Context};
+-use crate::{ErrorKind, Result, WRID, ibv_wc};
++use crate::{ErrorKind, Result, ibv_wc};
++
++mod routes;
++pub use routes::CompletionRoute;
++use routes::RouteAllocator;
++pub(super) use routes::RouteLease;
+ 
+ /// Reusable stack storage for polling authenticated work completions.
+ /// Entries cannot be changed while any completion from the batch is borrowed.
+@@ -58,8 +60,13 @@
+         self.wc
+     }
+ 
+-    pub(super) fn belongs_to(&self, cq: &CompletionQueue, qp_num: u32, tag: u32) -> bool {
+-        ptr::eq(self.cq, cq) && self.wc.qp_num == qp_num && self.wc.wr_id.get_tag() == tag
++    pub(super) fn belongs_to(
++        &self,
++        cq: &CompletionQueue,
++        qp_num: u32,
++        route: CompletionRoute,
++    ) -> bool {
++        ptr::eq(self.cq, cq) && self.wc.qp_num == qp_num && route.contains(self.wc.wr_id)
+     }
+ }
+ 
+@@ -84,31 +91,6 @@
+ }
+ 
+ impl ExactSizeIterator for Completions<'_> {}
+-
+-/// A tag is never reused during the CQ's lifetime, including after QP drop.
+-/// This makes a retained completion harmless even when a provider reuses a QPN.
+-struct ClaimedTags(Box<[AtomicU64]>);
+-
+-impl ClaimedTags {
+-    fn new() -> Self {
+-        Self(
+-            (0..=(WRID::TAG_MAX as usize / 64))
+-                .map(|_| AtomicU64::new(0))
+-                .collect(),
+-        )
+-    }
+-
+-    fn claim(&self, tag: u32) -> Result<()> {
+-        if tag > WRID::TAG_MAX {
+-            return Err(ErrorKind::InvalidQueuePairConfig.into());
+-        }
+-        let mask = 1u64 << (tag % 64);
+-        if self.0[tag as usize / 64].fetch_or(mask, Ordering::Relaxed) & mask != 0 {
+-            return Err(ErrorKind::InvalidQueuePairConfig.into());
+-        }
+-        Ok(())
+-    }
+-}
+ 
+ /// A completion queue (CQ).
+ ///
+@@ -121,8 +103,8 @@
+     _context: Arc<Context>,
+     /// Prevents the completion channel from being destroyed while this CQ exists.
+     _channel: Option<Arc<CompChannel>>,
+-    /// 512 KiB of setup-only tag history; completion validation needs no lookup.
+-    claimed_tags: ClaimedTags,
++    /// Setup-only slot allocation and reuse watermarks. Polling never locks it.
++    routes: Mutex<RouteAllocator>,
+ }
+ 
+ impl CompletionQueue {
+@@ -155,7 +137,7 @@
+             ptr,
+             _context: Arc::clone(context),
+             _channel: channel.cloned(),
+-            claimed_tags: ClaimedTags::new(),
++            routes: Mutex::new(RouteAllocator::default()),
+         }))
+     }
+ 
+@@ -202,8 +184,9 @@
+         })
+     }
+ 
+-    pub(super) fn claim_tag(&self, tag: u32) -> Result<()> {
+-        self.claimed_tags.claim(tag)
++    pub(super) fn allocate_route(self: &Arc<Self>) -> Result<RouteLease> {
++        let route = self.routes.lock().unwrap().allocate()?;
++        Ok(RouteLease::new(Arc::clone(self), route))
+     }
+ 
+     /// Acknowledges CQ events received via [`CompChannel::get_event`].
+@@ -237,53 +220,57 @@
+     use crate::*;
+ 
+     #[test]
+-    fn claimed_tags_never_reuse_a_connection_generation() {
+-        let tags = super::ClaimedTags::new();
+-        for tag in [0, 1, 63, 64, WRID::TAG_MAX] {
+-            tags.claim(tag).unwrap();
+-            assert_eq!(
+-                tags.claim(tag).unwrap_err().kind,
+-                ErrorKind::InvalidQueuePairConfig
+-            );
+-        }
+-        assert!(tags.claim(WRID::TAG_MAX + 1).is_err());
+-    }
+-
+-    #[test]
+-    fn claimed_tags_are_exclusive_between_concurrent_registrars() {
+-        let tags = super::ClaimedTags::new();
+-        std::thread::scope(|scope| {
+-            let threads: Vec<_> = (0..8)
+-                .map(|_| scope.spawn(|| tags.claim(42).is_ok()))
+-                .collect();
+-            assert_eq!(
+-                threads
+-                    .into_iter()
+-                    .filter_map(|thread| thread.join().ok())
+-                    .filter(|claimed| *claimed)
+-                    .count(),
+-                1
+-            );
+-        });
+-    }
+-
+-    #[test]
+-    fn completion_requires_its_original_cq_qp_and_tag() {
++    fn completion_requires_its_original_cq_qp_and_route() {
+         let dev = open_device();
+         let cq = CompletionQueue::create(dev.context(), 16, None).unwrap();
+         let other_cq = CompletionQueue::create(dev.context(), 16, None).unwrap();
++        let lease = cq.allocate_route().unwrap();
++        let route = lease.route();
++        let other_lease = cq.allocate_route().unwrap();
+         // Only this module can construct a token from raw metadata. The public
+         // API requires an actual provider completion, covered by the doctest.
+         let wc = ibv_wc {
+             qp_num: 42,
+-            wr_id: WRID::recv(7, 0),
++            wr_id: WRID::recv(route.slot() as u16, lease.alloc_recv().unwrap()),
+             ..Default::default()
+         };
+         let completion = super::Completion { cq: &cq, wc: &wc };
+-        assert!(completion.belongs_to(&cq, 42, 7));
+-        assert!(!completion.belongs_to(&other_cq, 42, 7));
+-        assert!(!completion.belongs_to(&cq, 43, 7));
+-        assert!(!completion.belongs_to(&cq, 42, 8));
++        assert!(completion.belongs_to(&cq, 42, route));
++        assert!(!completion.belongs_to(&other_cq, 42, route));
++        assert!(!completion.belongs_to(&cq, 43, route));
++        assert!(!completion.belongs_to(&cq, 42, other_lease.route()));
++
++        // A retained CQ-issued token must remain harmless when both the slot
++        // and the provider's QPN have been reused by a replacement QP.
++        drop(lease);
++        let replacement = cq.allocate_route().unwrap();
++        assert_eq!(replacement.route().slot(), route.slot());
++        assert!(!completion.belongs_to(&cq, 42, replacement.route()));
++    }
++
++    #[test]
++    fn lease_drop_preserves_both_directions_and_unused_incarnations() {
++        let dev = open_device();
++        let cq = CompletionQueue::create(dev.context(), 16, None).unwrap();
++        let lease = cq.allocate_route().unwrap();
++        let first = lease.route();
++        assert!(Arc::ptr_eq(lease.cq(), &cq));
++        for expected in 0..5 {
++            assert_eq!(lease.alloc_send().unwrap(), expected);
++        }
++        assert_eq!(lease.alloc_recv().unwrap(), 0);
++        drop(lease);
++
++        let unused = cq.allocate_route().unwrap();
++        assert_eq!(unused.route().slot(), first.slot());
++        assert_eq!(unused.route().first_sequence(), 5);
++        drop(unused);
++
++        let current = cq.allocate_route().unwrap();
++        assert_eq!(current.route().slot(), first.slot());
++        assert_eq!(current.route().first_sequence(), 6);
++        assert_eq!(current.alloc_send().unwrap(), 6);
++        assert_eq!(current.alloc_recv().unwrap(), 6);
+     }
+ 
+     #[test]
+--- a/ruapc-rdma/src/verbs/mod.rs
++++ b/ruapc-rdma/src/verbs/mod.rs
+@@ -19,7 +19,9 @@
+ pub use comp_channel::CompChannel;
+ 
+ mod completion_queue;
+-pub use completion_queue::{Completion, CompletionBatch, CompletionQueue, Completions};
++pub use completion_queue::{
++    Completion, CompletionBatch, CompletionQueue, CompletionRoute, Completions,
++};
+ 
+ mod context;
+ pub use context::Context;
+--- a/ruapc-rdma/src/verbs/queue_pair.rs
++++ b/ruapc-rdma/src/verbs/queue_pair.rs
+@@ -10,7 +10,7 @@
+ use ruapc_bufpool::{Buffer, DeviceIndex};
+ 
+ use super::{
+-    completion_queue::{Completion, CompletionQueue},
++    completion_queue::{Completion, CompletionQueue, CompletionRoute, RouteLease},
+     protection_domain::ProtectionDomain,
+     wr_slots::WrSlots,
+ };
+@@ -53,6 +53,15 @@
+ #[derive(Debug, Default)]
+ pub struct CompletionCursor {
+     sq_swept: u64,
++}
++
++impl CompletionCursor {
++    #[inline]
++    fn sweep_to(&mut self, first_sequence: u64, completed: u64) -> std::ops::Range<u64> {
++        let start = self.sq_swept.max(first_sequence);
++        self.sq_swept = self.sq_swept.max(completed + 1);
++        start..completed
++    }
+ }
+ 
+ /// Metadata and owned buffers released by a verified completion.
+@@ -104,9 +113,11 @@
+ pub struct QueuePair {
+     ptr: *mut crate::ibv_qp,
+     _pd: Arc<ProtectionDomain>,
+-    _send_cq: Arc<CompletionQueue>,
+-    _recv_cq: Arc<CompletionQueue>,
+-    /// SEND buffers and the shared sequence counter for all SQ work requests.
++    /// CQ-owned identity and sequence space. A shared CQ uses one route for
++    /// both directions; separate CQs each allocate their own route.
++    send_route: RouteLease,
++    recv_route: Option<RouteLease>,
++    /// In-flight SEND buffers; READs share the route's SQ sequence counter.
+     send_wrs: WrSlots,
+     /// In-flight buffers of receive-queue work requests.
+     recv_wrs: WrSlots,
+@@ -122,11 +133,6 @@
+     ///
+     /// [`send`]: Self::send
+     send_signal_interval: u64,
+-    /// Opaque connection tag stamped into every [`WRID`] this QP posts, so
+-    /// completion consumers can map a `wr_id` back to the owning
+-    /// connection without a `qp_num` lookup. Must be set (via
+-    /// [`set_wr_tag`](Self::set_wr_tag)) before any work request is posted.
+-    wr_tag: u32,
+     /// Negotiated gather-list capability (`init_attr.cap.max_send_sge`
+     /// after creation).
+     max_send_sge: usize,
+@@ -164,6 +170,15 @@
+         }
+         init_attr.send_cq = send_cq.as_ptr();
+         init_attr.recv_cq = recv_cq.as_ptr();
++        // Reserve identities before creating the provider resource. Failure
++        // automatically returns the leases; successful QP destruction must
++        // precede their release so a live QP can never share a route.
++        let send_route = send_cq.allocate_route()?;
++        let recv_route = if Arc::ptr_eq(send_cq, recv_cq) {
++            None
++        } else {
++            Some(recv_cq.allocate_route()?)
++        };
+         let ptr = unsafe { crate::ruapc_ibv_create_qp(pd.as_ptr(), init_attr) };
+         if ptr.is_null() {
+             let source = std::io::Error::last_os_error();
+@@ -180,34 +195,39 @@
+         Ok(Self {
+             ptr,
+             _pd: Arc::clone(pd),
+-            _send_cq: Arc::clone(send_cq),
+-            _recv_cq: Arc::clone(recv_cq),
++            send_route,
++            recv_route,
+             send_wrs: WrSlots::new(init_attr.cap.max_send_wr),
+             recv_wrs: WrSlots::new(init_attr.cap.max_recv_wr),
+             read_state: read::ReadState::new(),
+             max_send_sge: init_attr.cap.max_send_sge as usize,
+             send_signal_interval: 1,
+-            wr_tag: u32::MAX,
+             sq_post_lock: Mutex::new(()),
+             device_index,
+         })
+     }
+ 
+-    /// Sets the connection tag embedded in every posted `wr_id`.
+-    ///
+-    /// Called exactly once, before posting. The tag must never have been used
+-    /// on either CQ, even by a destroyed QP: a retained CQE must not authorize
+-    /// reclamation on a replacement QP with the same provider-assigned QPN.
+-    pub fn set_wr_tag(&mut self, tag: u32) -> Result<()> {
+-        if self.wr_tag != u32::MAX {
+-            return Err(ErrorKind::InvalidQueuePairConfig.into());
+-        }
+-        self._send_cq.claim_tag(tag)?;
+-        if !Arc::ptr_eq(&self._send_cq, &self._recv_cq) {
+-            self._recv_cq.claim_tag(tag)?;
+-        }
+-        self.wr_tag = tag;
+-        Ok(())
++    /// This QP's send completion route, assigned at creation by its CQ.
++    pub fn send_route(&self) -> CompletionRoute {
++        self.send_route.route()
++    }
++
++    /// This QP's receive completion route. With a shared CQ it equals
++    /// [`send_route`](Self::send_route).
++    pub fn recv_route(&self) -> CompletionRoute {
++        self.receive_route().route()
++    }
++
++    pub fn send_cq(&self) -> &Arc<CompletionQueue> {
++        self.send_route.cq()
++    }
++
++    pub fn recv_cq(&self) -> &Arc<CompletionQueue> {
++        self.receive_route().cq()
++    }
++
++    fn receive_route(&self) -> &RouteLease {
++        self.recv_route.as_ref().unwrap_or(&self.send_route)
+     }
+ 
+     /// Sets the selective signaling interval for data sends.
+@@ -344,21 +364,24 @@
+         signaling: SendSignaling,
+     ) -> Result<u64> {
+         let _guard = self.sq_post_lock.lock().unwrap();
+-        let id = self.send_wrs.alloc_id();
++        let id = self.send_route.alloc_send()?;
++        let slot = self.send_route().slot() as u16;
+         let (wr_id, opcode, imm_data) = match imm {
+             Some(imm) => (
+-                WRID::send_imm(self.wr_tag, id),
++                WRID::send_imm(slot, id),
+                 crate::ibv_wr_opcode::IBV_WR_SEND_WITH_IMM,
+                 imm.to_be(),
+             ),
+             None => (
+-                WRID::send_data(self.wr_tag, id),
++                WRID::send_data(slot, id),
+                 crate::ibv_wr_opcode::IBV_WR_SEND,
+                 0,
+             ),
+         };
+         if let Some(buffers) = buffers {
+-            self.send_wrs.insert(id, buffers);
++            self.send_wrs
++                .insert(id, buffers)
++                .map_err(|_| ErrorKind::WorkRequestSlotsExhausted)?;
+         }
+         let mut wr = crate::ibv_send_wr {
+             wr_id,
+@@ -369,7 +392,15 @@
+             },
+             num_sge: sges.len() as c_int,
+             opcode,
+-            send_flags: signaling.flags(id, self.send_signal_interval, flags).0,
++            // Signaling cadence starts with this QP, independently of the
++            // route's previous occupants and their receive-queue traffic.
++            send_flags: signaling
++                .flags(
++                    id - self.send_route().first_sequence(),
++                    self.send_signal_interval,
++                    flags,
++                )
++                .0,
+             __bindgen_anon_1: crate::ibv_send_wr__bindgen_ty_1 { imm_data },
+             ..Default::default()
+         };
+@@ -427,8 +458,8 @@
+         let num_sge = sges.len() as c_int;
+ 
+         let _guard = self.sq_post_lock.lock().unwrap();
+-        let id = self.send_wrs.alloc_id();
+-        let wr_id = WRID::read(self.wr_tag, id);
++        let id = self.send_route.alloc_send()?;
++        let wr_id = WRID::read(self.send_route().slot() as u16, id);
+         register(wr_id);
+         let mut wr = crate::ibv_send_wr {
+             wr_id,
+@@ -449,12 +480,14 @@
+     }
+ 
+     pub fn recv(&self, buffer: Buffer) -> Result<()> {
+-        let id = self.recv_wrs.alloc_id();
+-        let wr_id = WRID::recv(self.wr_tag, id);
+         let addr = buffer.as_ptr() as u64;
+         let len = buffer.capacity() as u32;
+         let lkey = self.lkey(&buffer)?;
+-        self.recv_wrs.insert(id, buffer.into());
++        let id = self.receive_route().alloc_recv()?;
++        let wr_id = WRID::recv(self.recv_route().slot() as u16, id);
++        self.recv_wrs
++            .insert(id, buffer.into())
++            .map_err(|_| ErrorKind::WorkRequestSlotsExhausted)?;
+         let mut sge = crate::ibv_sge {
+             addr,
+             length: len,
+@@ -474,7 +507,7 @@
+ 
+     /// Consumes a CQ-issued completion proof and releases the completed memory.
+     ///
+-    /// Validates the CQ, QP number and permanently assigned connection tag before
++    /// Validates the CQ, QP number, route slot and incarnation's sequence floor before
+     /// accessing any ownership table. For SQ completions, RC ordering also proves
+     /// that preceding unsignaled data SENDs no longer access their buffers.
+     /// READ ownership is settled here; callers receive only completion metadata.
+@@ -485,12 +518,12 @@
+         cursor: &mut CompletionCursor,
+     ) -> Result<CompletedWork<'a>> {
+         let wc = completion.info();
+-        let cq = if wc.is_recv() {
+-            &self._recv_cq
++        let route = if wc.is_recv() {
++            self.receive_route()
+         } else {
+-            &self._send_cq
+-        };
+-        if !completion.belongs_to(cq, self.qp_num(), self.wr_tag) {
++            &self.send_route
++        };
++        if !completion.belongs_to(route.cq(), self.qp_num(), route.route()) {
+             return Err(ErrorKind::InvalidCompletion.into());
+         }
+         let id = wc.wr_id.get_id();
+@@ -498,12 +531,13 @@
+         let buffer = if wc.is_recv() {
+             self.recv_wrs.take(id)
+         } else {
+-            for swept in cursor.sq_swept..id {
++            // A recycled route can start far above zero. Never scan the
++            // sequence space of QPs that previously occupied this slot.
++            for swept in cursor.sweep_to(route.route().first_sequence(), id) {
+                 if self.send_wrs.take(swept).is_some() {
+                     swept_sends += 1;
+                 }
+             }
+-            cursor.sq_swept = cursor.sq_swept.max(id + 1);
+             if wc.wr_id.get_type() == WRType::Read {
+                 self.complete_read(wc.wr_id, wc.succ());
+             }
+@@ -635,6 +669,18 @@
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn selective_sweep_skips_previous_incarnations_and_already_completed_work() {
++        let first = 1 << 47;
++        let mut cursor = CompletionCursor::default();
++        assert_eq!(cursor.sweep_to(first, first + 2), first..first + 2);
++        assert_eq!(cursor.sweep_to(first, first + 4), first + 3..first + 4);
++        // A CQ batch may be consumed out of order. Its old token must neither
++        // rewind the cursor nor make a subsequent completion scan old IDs.
++        assert!(cursor.sweep_to(first, first + 1).is_empty());
++        assert_eq!(cursor.sweep_to(first, first + 7), first + 5..first + 7);
++    }
++
+     fn init_attr() -> crate::ibv_qp_init_attr {
+         crate::ibv_qp_init_attr {
+             qp_type: crate::ibv_qp_type::IBV_QPT_RC,
+@@ -650,7 +696,7 @@
+     }
+ 
+     #[test]
+-    fn qp_tag_is_immutable_and_survives_qp_destruction() {
++    fn qp_routes_are_automatic_and_sequence_space_survives_destruction() {
+         let device = crate::test_utils::open_device();
+         let cq = CompletionQueue::create(device.context(), 16, None).unwrap();
+         let create = || {
+@@ -663,13 +709,58 @@
+             )
+             .unwrap()
+         };
+-        let mut qp = create();
+-        qp.set_wr_tag(42).unwrap();
+-        assert!(qp.set_wr_tag(43).is_err());
++        let qp = create();
++        let old_route = qp.send_route();
++        assert_eq!(old_route, qp.recv_route());
++        assert!(Arc::ptr_eq(qp.send_cq(), &cq));
++        assert!(Arc::ptr_eq(qp.recv_cq(), &cq));
++        for _ in 0..300 {
++            qp.send_route.alloc_send().unwrap();
++        }
++        qp.receive_route().alloc_recv().unwrap();
++        let concurrent = create();
++        assert_ne!(concurrent.send_route().slot(), old_route.slot());
+         drop(qp);
+-        let mut replacement = create();
+-        assert!(replacement.set_wr_tag(42).is_err());
+-        replacement.set_wr_tag(43).unwrap();
++        let replacement = create();
++        let route = replacement.send_route();
++        assert_eq!(route.slot(), old_route.slot());
++        assert_eq!(route.first_sequence(), old_route.first_sequence() + 300);
++        assert!(!route.contains(WRID::send_data(old_route.slot() as u16, 299)));
++        assert_eq!(replacement.send_route.alloc_send().unwrap(), 300);
++        assert_eq!(replacement.receive_route().alloc_recv().unwrap(), 300);
++    }
++
++    #[test]
++    fn separate_cqs_own_independent_qp_routes() {
++        let device = crate::test_utils::open_device();
++        let send_cq = CompletionQueue::create(device.context(), 16, None).unwrap();
++        let recv_cq = CompletionQueue::create(device.context(), 16, None).unwrap();
++        let qp = QueuePair::create(
++            device.pd(),
++            &send_cq,
++            &recv_cq,
++            &mut init_attr(),
++            DeviceIndex::default(),
++        )
++        .unwrap();
++        assert!(qp.recv_route.is_some());
++        assert!(Arc::ptr_eq(qp.send_cq(), &send_cq));
++        assert!(Arc::ptr_eq(qp.recv_cq(), &recv_cq));
++        for _ in 0..7 {
++            qp.send_route.alloc_send().unwrap();
++        }
++        for _ in 0..11 {
++            qp.receive_route().alloc_recv().unwrap();
++        }
++        drop(qp);
++        assert_eq!(
++            send_cq.allocate_route().unwrap().route().first_sequence(),
++            7
++        );
++        assert_eq!(
++            recv_cq.allocate_route().unwrap().route().first_sequence(),
++            11
++        );
+     }
+ 
+     #[test]
+--- a/ruapc-rdma/src/verbs/wr_slots.rs
++++ b/ruapc-rdma/src/verbs/wr_slots.rs
+@@ -6,18 +6,18 @@
+ //!
+ //! ## Why this is safe without a lock
+ //!
+-//! - IDs are allocated from a per-direction monotonic counter, so two
+-//!   concurrent posters never target the same slot while both IDs are
+-//!   in flight (in-flight count is bounded by the queue depth, and the
+-//!   array capacity is at least twice the queue depth).
+-//! - RC queue pairs complete work requests **in order** per direction, and
+-//!   the provider only frees a hardware queue slot once its completion has
+-//!   been polled. Therefore, by the time an ID wraps around onto a slot, the
+-//!   previous occupant has already completed; the only remaining window is
+-//!   between `ibv_poll_cq` and [`WrSlots::take`], which is covered by the 2x
+-//!   capacity margin plus a bounded spin in [`WrSlots::insert`].
++//! - The owning work queue supplies non-repeating IDs. This table stores
++//!   buffers independently of ID allocation and hardware posting order.
+ //! - Each slot is guarded by an atomic tag acting as a tiny state machine:
+ //!   `EMPTY -> WRITING -> id + TAG_BASE -> EMPTY`.
++//! - Reusing an array index requires an empty slot; completing a work request
++//!   requires an exact ID match. Delayed completions cannot take a newer
++//!   request's buffer even when both IDs map to the same array index.
++//!
++//! Queue depth alone does not prevent collisions: failed posts and bufferless
++//! work requests leave gaps in the ID sequence. Insertion returns the untouched
++//! buffer on contention instead of waiting for a completion that might need to
++//! run on the posting thread itself.
+ 
+ use std::{
+     cell::UnsafeCell,
+@@ -30,7 +30,7 @@
+ const EMPTY: u64 = 0;
+ /// Slot is being written to or drained; transient state.
+ const WRITING: u64 = 1;
+-/// Occupied slots store `id + TAG_BASE`. IDs are bounded to 40 bits by
++/// Occupied slots store `id + TAG_BASE`. IDs are bounded by
+ /// [`crate::WRID`], so this never collides with `EMPTY`/`WRITING`.
+ const TAG_BASE: u64 = 2;
+ 
+@@ -48,15 +48,15 @@
+ pub(crate) struct WrSlots {
+     slots: Box<[Slot]>,
+     mask: u64,
+-    next_id: AtomicU64,
+ }
+ 
+ impl WrSlots {
+     /// Creates a slot array for a work queue of the given depth.
+     ///
+     /// Capacity is `2 * depth` rounded up to a power of two: the extra
+-    /// margin covers completions that have been polled from the CQ but whose
+-    /// buffers have not been taken yet.
++    /// margin accommodates completions that have been polled from the CQ but
++    /// whose buffers have not been taken yet. Collisions remain possible and
++    /// are reported by [`Self::insert`].
+     pub fn new(depth: u32) -> Self {
+         let cap = (depth.max(1) as usize)
+             .saturating_mul(2)
+@@ -71,44 +71,26 @@
+         Self {
+             slots,
+             mask: (cap - 1) as u64,
+-            next_id: AtomicU64::new(0),
+-        }
+-    }
+-
+-    /// Allocates the next monotonic work request ID.
+-    #[inline]
+-    pub fn alloc_id(&self) -> u64 {
+-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+-        // Never let caught panics advance this counter all the way to u64
+-        // wraparound: a reused ID could make a retained CQE reclaim new memory.
+-        if id > crate::WRID::ID_MASK {
+-            std::process::abort();
+-        }
+-        id
++        }
+     }
+ 
+     /// Stores the buffer of an about-to-be-posted work request.
+     ///
+-    /// May briefly spin if the slot's previous occupant has been polled from
+-    /// the CQ but not yet taken by the completion handler.
+-    pub fn insert(&self, id: u64, buffer: WrBuffers) {
++    /// Returns ownership immediately if another request or completion still
++    /// occupies the selected slot. No allocation or waiting occurs here.
++    pub fn insert(&self, id: u64, buffer: WrBuffers) -> Result<(), WrBuffers> {
+         let slot = &self.slots[(id & self.mask) as usize];
+-        let mut spins = 0u32;
+-        while slot
++        if slot
+             .tag
+-            .compare_exchange_weak(EMPTY, WRITING, Ordering::Acquire, Ordering::Relaxed)
++            .compare_exchange(EMPTY, WRITING, Ordering::Acquire, Ordering::Relaxed)
+             .is_err()
+         {
+-            spins += 1;
+-            if spins < 64 {
+-                std::hint::spin_loop();
+-            } else {
+-                std::thread::yield_now();
+-            }
++            return Err(buffer);
+         }
+         // SAFETY: we own the slot while its tag is `WRITING`.
+         unsafe { *slot.buffer.get() = Some(buffer) };
+         slot.tag.store(id.wrapping_add(TAG_BASE), Ordering::Release);
++        Ok(())
+     }
+ 
+     /// Takes the buffer of a completed (or failed-to-post) work request.
+@@ -137,7 +119,6 @@
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         f.debug_struct("WrSlots")
+             .field("capacity", &self.slots.len())
+-            .field("next_id", &self.next_id.load(Ordering::Relaxed))
+             .finish()
+     }
+ }
+@@ -158,10 +139,9 @@
+     fn test_insert_take_roundtrip() {
+         let pool = pool();
+         let slots = WrSlots::new(4);
+-        for _ in 0..64 {
+-            let id = slots.alloc_id();
++        for id in 0..64 {
+             let buf = pool.allocate(1024).unwrap();
+-            slots.insert(id, buf.into());
++            slots.insert(id, buf.into()).unwrap();
+             assert!(slots.take(id).is_some());
+             // Double take returns None.
+             assert!(slots.take(id).is_none());
+@@ -171,8 +151,7 @@
+     #[test]
+     fn test_take_without_insert() {
+         let slots = WrSlots::new(4);
+-        let id = slots.alloc_id();
+-        assert!(slots.take(id).is_none());
++        assert!(slots.take(0).is_none());
+     }
+ 
+     #[test]
+@@ -181,9 +160,8 @@
+         let slots = WrSlots::new(2); // capacity 4
+         // Keep up to 2 in flight while IDs wrap around the array many times.
+         let mut in_flight = std::collections::VecDeque::new();
+-        for _ in 0..1000 {
+-            let id = slots.alloc_id();
+-            slots.insert(id, pool.allocate(64).unwrap().into());
++        for id in 0..1000 {
++            slots.insert(id, pool.allocate(64).unwrap().into()).unwrap();
+             in_flight.push_back(id);
+             if in_flight.len() == 2 {
+                 let id = in_flight.pop_front().unwrap();
+@@ -193,9 +171,33 @@
+     }
+ 
+     #[test]
++    fn collision_returns_buffer_without_disturbing_the_live_request() {
++        let pool = pool();
++        let slots = WrSlots::new(2); // capacity 4
++        let live = pool.allocate(64).unwrap();
++        let live_address = live.as_ptr();
++        slots.insert(0, live.into()).unwrap();
++
++        // Failed posts or bufferless WRs can skip IDs 1..4 while ID 0 remains
++        // live. An in-flight count below queue depth does not prevent this.
++        let next = pool.allocate(64).unwrap();
++        let next_address = next.as_ptr();
++        let returned = slots.insert(4, next.into()).unwrap_err();
++        assert!(slots.take(4).is_none());
++        let live = slots.take(0).unwrap().into_single().unwrap();
++        assert_eq!(live.as_ptr(), live_address);
++
++        slots.insert(4, returned).unwrap();
++        assert!(slots.take(0).is_none(), "stale ID took a newer buffer");
++        let next = slots.take(4).unwrap().into_single().unwrap();
++        assert_eq!(next.as_ptr(), next_address);
++    }
++
++    #[test]
+     fn test_concurrent_post_and_complete() {
+         let pool = pool();
+         let slots = Arc::new(WrSlots::new(64));
++        let next_id = Arc::new(AtomicU64::new(0));
+         let (tx, rx) = std::sync::mpsc::channel::<u64>();
+ 
+         // 4 poster threads, 1 completer thread (mirrors real usage: many
+@@ -204,11 +206,16 @@
+         for _ in 0..4 {
+             let slots = Arc::clone(&slots);
+             let pool = Arc::clone(&pool);
++            let next_id = Arc::clone(&next_id);
+             let tx = tx.clone();
+             posters.push(std::thread::spawn(move || {
+                 for _ in 0..10_000 {
+-                    let id = slots.alloc_id();
+-                    slots.insert(id, pool.allocate(64).unwrap().into());
++                    let id = next_id.fetch_add(1, Ordering::Relaxed);
++                    let mut buffer = pool.allocate(64).unwrap().into();
++                    while let Err(returned) = slots.insert(id, buffer) {
++                        buffer = returned;
++                        std::thread::yield_now();
++                    }
+                     tx.send(id).unwrap();
+                 }
+             }));

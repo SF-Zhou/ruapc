@@ -1,0 +1,837 @@
+   Compiling ruapc-rdma v0.2.0-alpha.5 (/weka-hg/prod/deepseek/permanent/zhoushunfeng/private/home/ruapc/ruapc-rdma)
+   Compiling ruapc v0.2.0-alpha.5 (/weka-hg/prod/deepseek/permanent/zhoushunfeng/private/home/ruapc/ruapc)
+   Compiling ruapc-demo v0.2.0-alpha.5 (/weka-hg/prod/deepseek/permanent/zhoushunfeng/private/home/ruapc/ruapc-demo)
+   Compiling ruapc-macro v0.2.0-alpha.5 (/weka-hg/prod/deepseek/permanent/zhoushunfeng/private/home/ruapc/ruapc-macro)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 25.18s
+     Running unittests src/lib.rs (target/debug/deps/ruapc-6c1e356fcb9cfcba)
+
+running 238 tests
+test client::attempt::tests::connection_deadlines_use_their_own_budget_domain ... ok
+test client::attempt::tests::invalid_acquire_error_only_fails_over ... ok
+test client::attempt::tests::attempt_cycle_stops_at_the_attempt_budget ... ok
+test client::attempt::tests::attempt_cycle_records_failed_remote_nics_per_peer ... ok
+test client::attempt::tests::attempt_cycle_prefers_untried_endpoints_before_recycling ... ok
+test client::attempt::tests::retry_disposition_respects_failure_scope ... ok
+test client::attempt::tests::unknown_errors_do_not_penalize_endpoints ... ok
+test client::tests::test_client_debug_format ... ok
+test client::tests::test_client_serde_defaults_from_empty_object ... ok
+test client::tests::test_default_config ... ok
+test client::tests::test_client_serde_roundtrip ... ok
+test core::endpoint_state::tests::connection_failure_is_counted_once_per_connection ... ok
+test core::endpoint_state::tests::connection_only_clears_backoff_after_response ... ok
+test core::endpoint_state::tests::dead_success_does_not_clear_backoff ... ok
+test core::endpoint_state::tests::endpoint_health_observes_closed_send_channel ... ok
+test core::endpoint_state::tests::foreground_connection_suppresses_preconnect ... ok
+test core::endpoint_state::tests::observed_connection_applies_without_an_activity_span ... ok
+test core::endpoint_state::tests::selection_health_is_refreshed_after_observed_failure ... ok
+test core::endpoint_state::tests::stale_attempt_failure_does_not_penalize_replacement ... ok
+test core::endpoint_state::tests::stale_failure_does_not_clear_replacement_connection ... ok
+test core::endpoint_state::tests::stale_success_does_not_replace_live_connection ... ok
+test core::panic_guard::tests::test_catch_handler_panic_ok ... ok
+test core::panic_guard::tests::test_catch_handler_panic_string ... ok
+test core::panic_guard::tests::test_catch_handler_panic_str ... ok
+test core::state::tests::rdma_device_discovery_applies_name_policies_after_port_policy ... ok
+test core::state::tests::rdma_device_discovery_respects_down_port_policy ... ok
+test error::tests::test_error_display ... ok
+test error::tests::test_error_kind ... ok
+test error::tests::test_error_new ... ok
+test error::tests::test_error_kind_constructor ... ok
+test error::tests::test_from_io_error ... ok
+test core::router::tests::test_add_method_and_method_names ... ok
+test error::tests::test_from_rmp_serde_decode_error ... ok
+test core::router::tests::test_duplicate_wire_name_is_rejected_across_visibilities - should panic ... ok
+test core::router::tests::test_invalid_wire_method_name_is_rejected - should panic ... ok
+test error::tests::test_from_serde_json_error ... ok
+test error::tests::test_from_rmp_serde_encode_error ... ok
+test core::router::tests::test_internal_method_is_dispatchable_but_not_publicly_discoverable ... ok
+test error::tests::test_from_try_from_int_error ... ok
+test core::router::tests::test_router_debug_format ... ok
+test core::router::tests::test_router_default_has_exact_builtin_methods ... ok
+test msg::frame::tests::test_parse_message_invalid_magic_returns_error ... ok
+test msg::frame::tests::test_parse_message_incomplete_body_returns_none ... ok
+test msg::frame::tests::test_parse_message_too_long_returns_error ... ok
+test metrics::tests::test_connection_gauge_up_down ... ok
+test msg::frame::tests::test_parse_message_too_short_returns_none ... ok
+test metrics::tests::test_noop_without_recorder ... ok
+test msg::frame::tests::test_parse_message_valid_returns_body ... ok
+test metrics::tests::test_method_metrics_emission ... ok
+test metrics::tests::test_method_interning_reuses_handles ... ok
+test msg::frame::tests::test_parse_message_zero_len_body ... ok
+test msg::message::tests::test_bytesmut_sendmsg_prepare_is_noop ... ok
+test msg::message::tests::test_bytesmut_writer_write_and_flush ... ok
+test msg::message::tests::test_message_new_and_default ... ok
+test msg::message::tests::test_meta_decode_defaults_missing_timeout_to_zero ... ok
+test msg::frame::tests::encoded_frames_survive_every_split_and_concatenation ... ok
+test core::router::tests::test_build_open_api_excludes_internal_methods_and_schemas ... ok
+test msg::message::tests::test_meta_encoding_is_flag_independent ... ok
+test msg::message::tests::test_buffer_sendmsg_writer_write_and_flush ... ok
+test msg::message::tests::test_msgmeta_default ... ok
+test msg::message::tests::test_parse_meta_len_exceeds_payload_returns_error ... ok
+test msg::message::tests::test_parse_zero_meta_len_returns_error ... ok
+test msg::message::tests::test_parse_too_short_returns_error ... ok
+test msg::payload::tests::test_advance_empty_is_noop ... ok
+test msg::message::tests::test_meta_roundtrip_with_regions ... ok
+test msg::message::tests::test_serialize_parse_json_roundtrip ... ok
+test msg::message::tests::test_minimal_response_meta_roundtrip ... ok
+test msg::payload::tests::test_advance_normal ... ok
+test msg::message::tests::test_serialize_parse_msgpack_roundtrip ... ok
+test msg::payload::tests::test_deref_coercion ... ok
+test msg::payload::tests::test_deserialize_empty_payload_as_null ... ok
+test msg::payload::tests::test_deserialize_invalid_json_returns_error ... ok
+test msg::message::tests::test_msgflags_is_req_is_rsp ... ok
+test msg::payload::tests::test_deserialize_json ... ok
+test msg::payload::tests::test_empty_payload_properties ... ok
+test msg::message::tests::test_meta_decode_rejects_garbage ... ok
+test msg::payload::tests::test_deserialize_msgpack ... ok
+test msg::message::tests::test_msgflags_serde_roundtrip ... ok
+test msg::payload::tests::test_payload_into_bytes_empty ... ok
+test msg::payload::tests::test_payload_into_bytes_normal ... ok
+test msg::message::tests::test_buffer_sendmsg_serialize ... ok
+test rdma::config::tests::rdma_bandwidth_limit_validation ... ok
+test rdma::config::tests::partial_nested_config_uses_struct_defaults ... ok
+test rdma::config::tests::rejects_invalid_effective_limits ... ok
+test msg::payload::tests::test_normal_payload_from_bytes_mut ... ok
+test rdma::config::tests::rdma_subnet_domains_reject_invalid_strings ... ok
+test rdma::config::tests::rust_and_serde_defaults_are_identical ... ok
+test rdma::endpoint::tests::asymmetric_limits_are_mirrored_between_peers ... ok
+test rdma::endpoint::tests::endpoint_accepts_native_ib_without_gid_and_unicast_roce_addresses ... ok
+test rdma::endpoint::tests::endpoint_rejects_invalid_wire_values_before_qp_setup ... ok
+test rdma::endpoint::tests::prepare_response_rejects_changed_or_unmirrored_limits ... ok
+test rdma::endpoint::tests::endpoint_wire_format_rejects_unknown_mtu ... ok
+test msg::payload::tests::test_normal_payload_from_bytes ... ok
+test rdma::endpoint::tests::prepare_response_requires_correlated_nonzero_lease ... ok
+test rdma::frame::tests::test_for_each_frame_stops_on_truncation ... ok
+test rdma::frame::tests::test_for_each_frame_walks_all_frames ... ok
+test rdma::endpoint::tests::prepare_response_requires_valid_endpoint_on_selected_port_and_link ... ok
+test rdma::path::tests::test_gid_ip_link_local_and_null ... ok
+test rdma::path::tests::test_gid_ip_v4_mapped ... ok
+test rdma::endpoint::tests::receive_queue_negotiation_stays_symmetric_when_send_is_smaller ... ok
+test rdma::path::tests::test_gid_ip_v6_global ... ok
+test rdma::endpoint::tests::rejects_negotiated_limits_too_small_for_the_runtime ... ok
+test rdma::config::tests::rdma_subnet_domains_string_roundtrip ... ok
+test rdma::poller::flow::tests::ack_cadence_scales_with_the_negotiated_window ... ok
+test rdma::poller::flow::tests::credits_wait_for_both_local_completion_and_peer_ack ... ok
+test rdma::poller::flow::tests::failed_ack_posts_and_flushed_receives_do_not_block_teardown ... ok
+test rdma::poller::flow::tests::large_ack_deltas_preserve_credits_across_multiple_wire_messages ... ok
+test rdma::poller::flow::tests::standalone_acks_need_both_completion_and_confirmation_to_reuse_capacity ... ok
+test rdma::poller::tests::test_ring_reservation_accounting ... ok
+test rdma::rate_limiter::tests::bounded_wait_rejection_does_not_charge ... ok
+test rdma::rate_limiter::tests::burst_allows_multiple_requests_immediately ... ok
+test rdma::rate_limiter::tests::cost_calculation_saturates ... ok
+test rdma::rate_limiter::tests::idle_request_is_immediately_admitted ... ok
+test rdma::rate_limiter::tests::send_and_recv_budgets_are_independent ... ok
+test rdma::rate_limiter::tests::zero_rate_or_bytes_are_unlimited ... ok
+test rdma::rdma_service::tests::ethernet_advertisement_requires_a_gid ... ok
+test rdma::rdma_socket_pool::accept::tests::activation_requires_confirmation_and_receive_in_either_order ... ok
+test rdma::rdma_socket_pool::accept::tests::duplicate_commits_do_not_extend_activation_or_tombstone_deadlines ... ok
+test core::router::tests::test_build_open_api_populates_paths ... ok
+test rdma::rdma_socket_pool::accept::tests::unconfirmed_receives_do_not_extend_the_prepare_deadline ... ok
+test rdma::rdma_socket_pool::placement::gid_match_tests::test_falls_back_to_rocev1_when_remote_lacks_rocev2 ... ok
+test rdma::rdma_socket_pool::placement::gid_match_tests::test_empty_remote_gid_table_returns_none ... ok
+test rdma::rdma_socket_pool::placement::gid_match_tests::test_prefers_rocev2_over_rocev1 ... ok
+test rdma::rdma_socket_pool::placement::gid_match_tests::test_matches_same_gid_type_when_no_roce_pair ... ok
+test rdma::rdma_socket_pool::placement::gid_match_tests::test_gid_index_is_rocev2 ... ok
+test rdma::rdma_socket_pool::placement::path_selection_tests::test_addresses_share_connectivity_domain ... ok
+test rdma::rdma_socket_pool::placement::gid_match_tests::test_retains_all_compatible_gid_pairs_for_subnet_selection ... ok
+test rdma::rdma_socket_pool::placement::gid_match_tests::test_match_gid_pair_ethernet ... ok
+test rdma::rdma_socket_pool::placement::path_selection_tests::test_attempt_ids_are_nonzero_and_unique ... ok
+test rdma::rdma_socket_pool::placement::path_selection_tests::test_preconnect_backoff_is_bounded ... ok
+test rdma::rate_limiter::tests::concurrent_reservations_are_accounted_once ... ok
+test rdma::rdma_socket_pool::placement::tests::rebalance_preserves_coverage_and_threshold ... ok
+test rdma::rdma_socket_pool::placement::tests::blocked_coverage_falls_back_to_target ... ok
+test rdma::rdma_socket_pool::placement::tests::reconcile_coverage_before_target ... ok
+test rdma::rdma_socket_pool::placement::tests::required_subnet_does_not_fall_back ... ok
+test rdma::rdma_socket_pool::placement::tests::subnet_precedes_link_class ... ok
+test rdma::rdma_socket_pool::placement::tests::soft_filters_fall_back_but_hard_constraint_does_not ... ok
+test rdma::rdma_state::tests::test_acquire_at_unpublished_bound ... ok
+test rdma::rdma_state::tests::test_credit_window ... ok
+test rdma::rdma_state::tests::test_error_state ... ok
+test remote_memory::scatter::tests::test_for_each_slice_spans_segments ... ok
+test remote_memory::scatter::tests::test_layout_overflow_rejected ... ok
+test remote_memory::scatter::tests::test_layout_total_and_locate ... ok
+test remote_memory::read_source::tests::reads_cross_buffer_boundaries_and_rejects_out_of_bounds ... ok
+test remote_memory::scatter::tests::test_plan_gathers_dst_slices ... ok
+test remote_memory::scatter::tests::test_plan_total_bytes_conserved ... ok
+test remote_memory::scatter::tests::test_plan_respects_max_sge ... ok
+test remote_memory::scatter::tests::test_validate_ops_dst_overlap_rejected ... ok
+test services::memory_service::tests::test_bulk_fields_json_roundtrip ... ok
+test remote_memory::write_target::tests::test_try_into_buffers_requires_uniqueness ... ok
+test remote_memory::scatter::tests::test_plan_single_contiguous ... ok
+test remote_memory::scatter::tests::test_validate_ops_count_cap ... ok
+test remote_memory::scatter::tests::test_validate_ops_bounds ... ok
+test remote_memory::write_target::tests::dma_ownership_excludes_cpu_and_competing_writers ... ok
+test remote_memory::scatter::tests::test_plan_splits_at_src_boundary ... ok
+test sockets::config::tests::config_uses_transport_defaults ... ok
+test services::memory_service::tests::test_bulk_fields_use_msgpack_bin ... ok
+test sockets::config::tests::normalizes_http_base_path ... ok
+test remote_memory::scatter::tests::test_plan_repeated_sge_splits_advance_src_offset ... ok
+test sockets::lifecycle::tests::lifecycle_closes_once ... ok
+test sockets::endpoint::tests::endpoint_rejects_missing_or_unknown_scheme ... ok
+test remote_memory::write_target::tests::test_copy_in_spans_buffers ... ok
+test sockets::endpoint::tests::endpoint_uri_roundtrip ... ok
+test sockets::config::tests::config_serde_roundtrip ... ok
+test task::receiver::tests::test_receiver_receives_message ... ok
+test task::supervisor::tests::try_spawn_rejects_future_after_shutdown ... ok
+test task::waiter::tests::a_local_reader_keeps_owned_sources_alive_after_expiry ... ok
+test task::waiter::tests::completion_releases_memory_holds_before_waking_the_receiver ... ok
+test task::waiter::tests::test_bind_connection_missing_entry_is_noop ... ok
+test sockets::lifecycle::tests::stale_eviction_preserves_replacement ... ok
+test sockets::tcp::tcp_socket_pool::tests::test_tcp_socket_pool_debug_format ... ok
+test task::supervisor::tests::dropping_handle_does_not_stop_owner ... ok
+test sockets::lifecycle::tests::closed_connections_are_not_returned ... ok
+test rdma::rdma_socket_pool::placement::path_selection_tests::test_conn_count_guard_accounting ... ok
+test task::supervisor::tests::handle_rejects_tasks_after_shutdown ... ok
+test sockets::ws::web_socket_pool::tests::test_web_socket_pool_debug_format ... ok
+test task::supervisor::tests::try_spawn_is_cancelled_and_joined ... ok
+test sockets::connect::tests::locks_only_serialize_the_same_address ... ok
+test task::supervisor::tests::test_task_supervisor ... ok
+test rdma::rdma_socket_pool::accept::tests::receive_notification_updates_the_tracked_lease ... ok
+test rdma::rdma_socket_pool::accept::tests::lease_control_rejects_mismatched_connection_identity ... ok
+test rdma::rdma_socket_pool::accept::tests::late_commit_removes_expired_leases_at_the_expiration_boundary ... ok
+test task::waiter::tests::test_waiter_post_nonexistent_msgid ... ok
+test task::waiter::tests::test_waiter_fail_connection ... ok
+test task::waiter::tests::test_waiter_write_target_after_timeout ... ok
+test sockets::socket_pool::tests::composite_pool_lifecycle ... ok
+test task::waiter::tests::test_waiter_debug_format ... ok
+test task::waiter::tests::test_waiter_write_target_delivery ... ok
+test sockets::http::http_socket_pool::tests::unary_body_collection_precedes_waiter_and_handler_budget ... ok
+test client::request::tests::cancelling_a_pending_request_settles_its_metrics ... ok
+test core::dispatch::tests::simultaneous_arrivals_cannot_exceed_capacity ... ok
+test rdma::poller::conn::tests::registered_connection_drop_fails_its_waiters_and_settles_metrics ... ok
+test client::tests::test_ruapc_request_invalid_endpoint_returns_err ... ok
+test core::router::tests::test_dispatch_found_method_calls_func ... ok
+test core::dispatch::tests::test_handler_runs_and_metrics_settle ... ok
+test core::dispatch::tests::test_load_shedding_rejects_over_cap ... ok
+test core::router::tests::test_dispatch_method_not_found_spawns_error_response ... ok
+test rdma::rdma_device::tests::test_bandwidth_limiter_is_shared_per_port ... ok
+test client::with_buffers::tests::test_write_buffers_recoverable_after_failed_call ... ok
+test client::with_buffers::tests::forgotten_request_cannot_release_an_active_read_source ... ok
+test rdma::rdma_socket_pool::placement::path_selection_tests::test_select_local_least_connections ... ok
+test core::state::tests::rdma_devices_are_sorted_by_name ... ok
+test rdma::rdma_socket_pool::placement::path_selection_tests::test_rejects_too_short_connect_lease ... ok
+test rdma::rdma_socket_pool::placement::path_selection_tests::test_traffic_class_client_decides_server_obeys ... ok
+test rdma::rdma_device::tests::test_rdma_device_debug_format ... ok
+test core::endpoint_state::tests::endpoint_health_is_shared_across_sets ... ok
+test rdma::rdma_socket_pool::placement::path_selection_tests::test_select_respects_internal_remote_constraint ... ok
+test sockets::socket_pool::tests::rdma_is_enabled_by_default_and_can_be_disabled ... ok
+test rdma::rdma_socket_pool::placement::path_selection_tests::test_select_avoids_blacklisted_pair ... ok
+test rdma::rdma_socket_pool::placement::path_selection_tests::test_select_prefers_less_loaded_remote ... ok
+test remote_memory::context::tests::test_send_rsp_invalid_endpoint_logs_and_does_not_panic ... ok
+test rdma::rdma_socket_pool::placement::path_selection_tests::test_same_connectivity_domain_is_preferred ... ok
+test services::meta_service::tests::test_describe_filters_by_exact_service_name ... ok
+test sockets::tcp::tcp_socket::tests::closed_socket_rejects_request_after_binding_waiter ... ok
+test remote_memory::context::tests::test_remote_write_zero_total_short_circuits ... ok
+test core::dispatch::tests::test_expired_request_is_dropped ... ok
+test remote_memory::context::tests::test_remote_read_zero_len_ops_short_circuit ... ok
+test core::endpoint_state::tests::endpoint_set_deduplicates_and_tracks_transports_separately ... ok
+test rdma::rdma_device::tests::test_rdma_device_index_and_inner ... ok
+test task::waiter::tests::test_waiter ... ok
+test rdma::rdma_service::tests::test_rdma_bootstrap_prepare_non_rdma_returns_err ... ok
+test rdma::rdma_socket_pool::placement::path_selection_tests::test_select_avoids_remote_nic_before_fallback ... ok
+test core::state::tests::test_state_debug_format ... ok
+test rdma::rdma_service::tests::test_rdma_bootstrap_discover_returns_connectable_devices ... ok
+test services::meta_service::tests::test_openapi_returns_json_object ... ok
+test services::meta_service::tests::test_describe_is_sorted_and_hides_internal_services ... ok
+test remote_memory::context::tests::test_remote_spaces_missing_return_err ... ok
+test services::memory_service::tests::test_request_is_pending ... ok
+test core::state::tests::test_handle_recv_invalid_msg_type_warns_and_ok ... ok
+test remote_memory::context::tests::test_remote_read_invalid_endpoint_returns_err ... ok
+test rdma::rdma_socket_pool::placement::path_selection_tests::test_peer_advertisement_includes_connection_counts ... ok
+test remote_memory::context::tests::test_remote_write_invalid_endpoint_returns_err ... ok
+test remote_memory::context::tests::test_remote_read_rejects_out_of_bounds_ops ... ok
+test services::meta_service::tests::test_describe_method_references_resolve_in_response ... ok
+test services::memory_service::tests::test_write_inline_validation ... ok
+test remote_memory::context::tests::test_remote_read_missing_regions_recovers_buffers ... ok
+test rdma::poller::tests::test_cq_len_clamped_to_device_max ... ok
+test rdma::poller::tests::early_flush_completion_waits_for_registration_and_settles_receive ... ok
+
+test result: ok. 238 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running unittests src/bin/ruapc_info.rs (target/debug/deps/ruapc_info-d6668aeb2cc6ec7b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/test_callback.rs (target/debug/deps/test_callback-c007f7c6ff003c2f)
+
+running 2 tests
+test test_callback ... ok
+test test_callback_http ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/test_hello.rs (target/debug/deps/test_hello-65eb52c4a3dc283f)
+
+running 5 tests
+2026-09-06T07:52:27.114147Z  INFO ruapc::core::listener: start listening: 0.0.0.0:43851
+2026-09-06T07:52:27.116965Z  INFO ruapc::core::listener: stop accept loop
+test test_http ... ok
+2026-09-06T07:52:27.119555Z ERROR ruapc::core::context: invalid argument: send rsp without connected socket
+2026-09-06T07:52:27.119993Z  INFO ruapc::core::listener: start listening: 0.0.0.0:41149
+2026-09-06T07:52:27.122220Z  INFO ruapc::core::listener: start listening: 127.0.0.1:44035
+2026-09-06T07:52:27.122430Z  INFO rdma_connect{peer=0.0.0.0:41149 attempt_id=7703155609902474718 local_device=mlx5_0 local_port=1 local_gid_index=3 remote_device=mlx5_0 remote_port=1 remote_gid_index=3}: ruapc::rdma::poller: starting RDMA poll thread mlx5_0.0 (existing shards: 0)
+2026-09-06T07:52:27.123708Z  INFO ruapc::core::listener: start listening: 0.0.0.0:41537
+2026-09-06T07:52:27.124815Z  INFO ruapc::core::listener: start listening: 0.0.0.0:41783
+2026-09-06T07:52:27.125355Z  INFO ruapc::core::listener: stop accept loop
+2026-09-06T07:52:27.125393Z  INFO ruapc::rdma::poller: starting RDMA poll thread mlx5_0.0 (existing shards: 0)
+2026-09-06T07:52:27.125646Z  INFO ruapc::core::listener: stop accept loop
+test test_typed_http_with_base_path ... ok
+2026-09-06T07:52:27.128317Z  INFO rdma_connect{peer=0.0.0.0:41783 attempt_id=7703155609902474719 local_device=mlx5_0 local_port=1 local_gid_index=3 remote_device=mlx5_0 remote_port=1 remote_gid_index=3}: ruapc::rdma::poller: starting RDMA poll thread mlx5_0.0 (existing shards: 0)
+2026-09-06T07:52:27.132642Z  INFO ruapc::rdma::poller: starting RDMA poll thread mlx5_0.0 (existing shards: 0)
+2026-09-06T07:52:27.139427Z  INFO rdma_connect{peer=0.0.0.0:41149 attempt_id=7703155609902474718 local_device=mlx5_0 local_port=1 local_gid_index=3 remote_device=mlx5_0 remote_port=1 remote_gid_index=3 local_qp=8503 remote_qp=8504 conn_id=10}: ruapc::rdma::rdma_socket_pool::handshake: RDMA connection confirmed; awaiting publication elapsed_ms=17
+2026-09-06T07:52:27.145563Z  INFO rdma_connect{peer=0.0.0.0:41783 attempt_id=7703155609902474719 local_device=mlx5_0 local_port=1 local_gid_index=3 remote_device=mlx5_0 remote_port=1 remote_gid_index=3 local_qp=8505 remote_qp=8506 conn_id=12}: ruapc::rdma::rdma_socket_pool::handshake: RDMA connection confirmed; awaiting publication elapsed_ms=17
+2026-09-06T07:52:27.150778Z  INFO ruapc::core::listener: stop accept loop
+2026-09-06T07:52:27.158119Z  INFO ruapc::core::listener: start listening: 0.0.0.0:42319
+2026-09-06T07:52:27.161311Z  INFO ruapc::core::listener: stop accept loop
+2026-09-06T07:52:27.161972Z  INFO ruapc::core::listener: stop accept loop
+test test_rdma_concurrent ... ok
+2026-09-06T07:52:27.191029Z  INFO ruapc::core::listener: start listening: 0.0.0.0:34711
+2026-09-06T07:52:27.193415Z  INFO ruapc::core::listener: stop accept loop
+2026-09-06T07:52:27.222827Z  INFO ruapc::core::listener: start listening: 0.0.0.0:38937
+2026-09-06T07:52:27.223454Z  INFO rdma_connect{peer=0.0.0.0:38937 attempt_id=7703155609902474720 local_device=mlx5_0 local_port=1 local_gid_index=3 remote_device=mlx5_1 remote_port=1 remote_gid_index=3}: ruapc::rdma::poller: starting RDMA poll thread mlx5_0.0 (existing shards: 0)
+2026-09-06T07:52:27.227693Z  INFO ruapc::rdma::poller: starting RDMA poll thread mlx5_1.0 (existing shards: 0)
+test test_rdma ... ok
+2026-09-06T07:52:28.302409Z  WARN rdma_connect{peer=0.0.0.0:38937 attempt_id=7703155609902474720 local_device=mlx5_0 local_port=1 local_gid_index=3 remote_device=mlx5_1 remote_port=1 remote_gid_index=3 local_qp=8507 remote_qp=3166}: ruapc::rdma::rdma_socket_pool::handshake: RDMA connection attempt failed err=RdmaError(IBModifyQueuePairFail): RDMA connect queue pair: INIT -> RTR: ibv_modify_qp failed: qp_num=8507, target_state=IBV_QPS_RTR, attr_mask=0x129181, errno=110: Connection timed out (os error 110); connection=QpConnectionConfig { local_port_num: 1, local_gid_index: 3, pkey_index: 0, link_layer: Ethernet, path_mtu: IBV_MTU_4096, remote_qp_num: 3166, remote_gid: ::ffff:10.9.27.18, remote_lid: 0, local_psn: 10164594, remote_psn: 13770957, max_rd_atomic: 16, max_dest_rd_atomic: 16, traffic_class: 0 } error_kind=RdmaError(IBModifyQueuePairFail) elapsed_ms=1079
+2026-09-06T07:52:28.303813Z  INFO ruapc::rdma::poller: starting RDMA poll thread mlx5_0.0 (existing shards: 0)
+2026-09-06T07:52:28.314503Z  INFO rdma_connect{peer=0.0.0.0:38937 attempt_id=7703155609902474721 local_device=mlx5_0 local_port=1 local_gid_index=3 remote_device=mlx5_0 remote_port=1 remote_gid_index=3 local_qp=8508 remote_qp=8509 conn_id=21}: ruapc::rdma::rdma_socket_pool::handshake: RDMA connection confirmed; awaiting publication elapsed_ms=11
+2026-09-06T07:52:28.316402Z  INFO ruapc::core::listener: stop accept loop
+test test_hello ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.31s
+
+     Running tests/test_http_socket_pool.rs (target/debug/deps/test_http_socket_pool-d1901b767948064f)
+
+running 13 tests
+test test_http_post_request_processing ... ok
+test test_http_method_variants ... ok
+test test_http_rapidoc_html_endpoints ... ok
+test test_http_concurrent_requests ... ok
+test test_http_base_path_routes ... ok
+test test_http_edge_case_paths ... ok
+test test_http_websocket_upgrade ... ok
+test test_http_openapi_json_endpoint ... ok
+test test_http_rapidoc_js_endpoint ... ok
+test test_http_malformed_request_body ... ok
+test test_http_large_request_body ... ok
+test test_http_not_found_endpoint ... ok
+test test_unified_fragmented_http_request_not_misrouted ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests/test_production.rs (target/debug/deps/test_production-d214bdd3a80777a9)
+
+running 12 tests
+2026-09-06T07:52:29.585835Z  WARN ruapc::client::request: attempt 0 for Prod/echo failed, retrying: WebSocketConnectFailed: IO error: Connection reset by peer (os error 104)
+2026-09-06T07:52:29.586033Z  WARN ruapc::client::request: attempt 1 for Prod/echo failed, retrying: WebSocketConnectFailed: IO error: Connection reset by peer (os error 104)
+2026-09-06T07:52:29.586166Z  WARN ruapc::client::request: attempt 2 for Prod/echo failed, retrying: WebSocketConnectFailed: IO error: Connection reset by peer (os error 104)
+test test_single_endpoint_uses_full_retry_budget ... ok
+2026-09-06T07:52:29.625012Z  INFO ruapc::core::listener: start listening: 127.0.0.1:46383
+2026-09-06T07:52:29.626912Z  INFO ruapc::core::listener: start listening: 127.0.0.1:36843
+2026-09-06T07:52:29.629592Z  INFO ruapc::core::listener: start listening: 127.0.0.1:36289
+2026-09-06T07:52:29.629782Z  WARN ruapc::client::request: attempt 0 for Prod/echo failed, retrying: TcpConnectFailed: Connection refused (os error 111)
+2026-09-06T07:52:29.631028Z  INFO ruapc::core::listener: start listening: 127.0.0.1:46489
+2026-09-06T07:52:29.631377Z  INFO ruapc::core::listener: start listening: 127.0.0.1:44705
+2026-09-06T07:52:29.631406Z  INFO ruapc::core::listener: start listening: 127.0.0.1:36921
+2026-09-06T07:52:29.631738Z  INFO ruapc::core::listener: start listening: 127.0.0.1:40117
+2026-09-06T07:52:29.632014Z  INFO ruapc::core::listener: start listening: 127.0.0.1:42807
+2026-09-06T07:52:29.632474Z  INFO ruapc::core::listener: stop accept loop
+2026-09-06T07:52:29.633209Z  INFO ruapc::core::listener: stop accept loop
+2026-09-06T07:52:29.633561Z  INFO ruapc::core::listener: start listening: 127.0.0.1:37513
+2026-09-06T07:52:29.633670Z  INFO ruapc::core::listener: start listening: 127.0.0.1:39673
+2026-09-06T07:52:29.634103Z  INFO ruapc::core::listener: stop accept loop
+2026-09-06T07:52:29.634549Z  INFO ruapc::core::listener: stop accept loop
+test test_zero_connect_timeout_reuses_existing_connection ... ok
+test test_multi_address_failover ... ok
+test test_deadline_propagation ... ok
+test test_zero_connect_timeout_fails_over_to_existing_endpoint ... ok
+2026-09-06T07:52:29.685256Z  INFO ruapc::core::listener: stop accept loop
+test test_multi_address_health_and_preconnect ... ok
+test test_connection_acquire_obeys_total_deadline ... ok
+2026-09-06T07:52:29.736014Z  INFO ruapc::core::listener: stop accept loop
+test test_metrics_emission ... ok
+2026-09-06T07:52:29.932142Z  INFO ruapc::core::listener: stop accept loop
+test test_response_timeout_surfaces_and_application_retry_succeeds ... ok
+2026-09-06T07:52:30.127847Z  WARN ruapc::client::request: attempt 0 for Prod/echo failed, retrying: Timeout: connection attempt deadline expired
+2026-09-06T07:52:30.128468Z  INFO ruapc::core::listener: stop accept loop
+test test_connection_acquire_timeout_fails_over ... ok
+2026-09-06T07:52:30.627525Z  WARN ruapc::task::waiter: Waiter post failed for msgid: 0
+2026-09-06T07:52:30.632665Z  INFO ruapc::core::listener: stop accept loop
+test test_handler_runs_to_completion_after_client_timeout ... ok
+2026-09-06T07:52:31.634020Z  INFO ruapc::core::listener: stop accept loop
+test test_load_shedding ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.10s
+
+     Running tests/test_rdma_bootstrap.rs (target/debug/deps/test_rdma_bootstrap-4fead0c97a92ca46)
+
+running 2 tests
+test initial_stripe_failure_rolls_back_all_unpublished_connections ... ok
+test all_initial_stripes_survive_accept_lease_expiration ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.09s
+
+     Running tests/test_rdma_path.rs (target/debug/deps/test_rdma_path-9840399c83e146c6)
+
+running 1 test
+2026-09-06T07:52:48.810232Z  INFO ruapc::core::listener: start listening: 0.0.0.0:40779
+2026-09-06T07:52:48.811254Z  INFO rdma_connect{peer=0.0.0.0:40779 attempt_id=17007220768086505644 local_device=mlx5_0 local_port=1 local_gid_index=3 remote_device=mlx5_1 remote_port=1 remote_gid_index=3}: ruapc::rdma::poller: starting RDMA poll thread mlx5_0.0 (existing shards: 0)
+2026-09-06T07:52:48.815379Z  INFO ruapc::rdma::poller: starting RDMA poll thread mlx5_1.0 (existing shards: 0)
+2026-09-06T07:52:49.869379Z  WARN rdma_connect{peer=0.0.0.0:40779 attempt_id=17007220768086505644 local_device=mlx5_0 local_port=1 local_gid_index=3 remote_device=mlx5_1 remote_port=1 remote_gid_index=3 local_qp=8521 remote_qp=3167}: ruapc::rdma::rdma_socket_pool::handshake: RDMA connection attempt failed err=RdmaError(IBModifyQueuePairFail): RDMA connect queue pair: INIT -> RTR: ibv_modify_qp failed: qp_num=8521, target_state=IBV_QPS_RTR, attr_mask=0x129181, errno=110: Connection timed out (os error 110); connection=QpConnectionConfig { local_port_num: 1, local_gid_index: 3, pkey_index: 0, link_layer: Ethernet, path_mtu: IBV_MTU_4096, remote_qp_num: 3167, remote_gid: ::ffff:10.9.27.18, remote_lid: 0, local_psn: 5375387, remote_psn: 4662056, max_rd_atomic: 16, max_dest_rd_atomic: 16, traffic_class: 0 } error_kind=RdmaError(IBModifyQueuePairFail) elapsed_ms=1058
+2026-09-06T07:52:49.869573Z  INFO rdma_connect{peer=0.0.0.0:40779 attempt_id=17007220768086505645 local_device=mlx5_1 local_port=1 local_gid_index=3 remote_device=mlx5_1 remote_port=1 remote_gid_index=3}: ruapc::rdma::poller: starting RDMA poll thread mlx5_1.0 (existing shards: 0)
+2026-09-06T07:52:49.881855Z  INFO rdma_connect{peer=0.0.0.0:40779 attempt_id=17007220768086505645 local_device=mlx5_1 local_port=1 local_gid_index=3 remote_device=mlx5_1 remote_port=1 remote_gid_index=3 local_qp=3168 remote_qp=3169 conn_id=5}: ruapc::rdma::rdma_socket_pool::handshake: RDMA connection confirmed; awaiting publication elapsed_ms=12
+2026-09-06T07:52:49.883420Z  INFO ruapc::core::listener: stop accept loop
+test test_rdma_path_report ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.11s
+
+     Running tests/test_remote_read.rs (target/debug/deps/test_remote_read-e4d5743d5991e8cd)
+
+running 11 tests
+test test_tcp_read_multi_buffer ... ok
+test test_tcp_read_vectored_ops ... ok
+test test_tcp_read_out_of_bounds ... ok
+test test_rdma_read_out_of_bounds ... ok
+test test_tcp_read_single_buffer ... ok
+test test_rdma_read_single_buffer ... ok
+test test_tcp_read_liveness_timeout ... ok
+test test_rdma_read_liveness_timeout ... ok
+test test_rdma_read_vectored_ops ... ok
+test test_rdma_read_exceeds_device_read_budget ... ok
+test test_rdma_read_multi_buffer ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.18s
+
+     Running tests/test_remote_write.rs (target/debug/deps/test_remote_write-59ae5ca241d30a7e)
+
+running 16 tests
+test test_tcp_reply_without_transfer ... ok
+test test_custom_alias_and_error_type ... ok
+test test_tcp_no_write_returns_buffers_untouched ... ok
+test test_tcp_write_without_attached_buffers_fails ... ok
+test test_tcp_remote_write_multi_buffer ... ok
+test test_tcp_write_space_too_small_fails ... ok
+test test_tcp_remote_write ... ok
+test test_tcp_read_and_write_in_one_call ... ok
+test test_tcp_remote_write_vectored ... ok
+test test_rdma_remote_write ... ok
+test test_rdma_reply_without_transfer ... ok
+test test_rdma_read_and_write_in_one_call ... ok
+test test_tcp_remote_write_timeout ... ok
+test test_rdma_remote_write_vectored ... ok
+test test_rdma_remote_write_multi_buffer ... ok
+test test_rdma_remote_write_timeout ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.61s
+
+     Running tests/test_request_with_buffer.rs (target/debug/deps/test_request_with_buffer-18d7537144891980)
+
+running 3 tests
+test test_upload_with_read_buffer_websocket ... ok
+test test_upload_with_read_buffer_http ... ok
+test test_upload_with_read_buffer_tcp ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/test_robustness.rs (target/debug/deps/test_robustness-25809dc9de274c6f)
+
+running 4 tests
+2026-09-06T07:52:52.912871Z  INFO ruapc::core::listener: start listening: 127.0.0.1:35799
+2026-09-06T07:52:52.917949Z  INFO ruapc::core::listener: start listening: 127.0.0.1:45871
+2026-09-06T07:52:52.918456Z  INFO ruapc::core::listener: stop accept loop
+2026-09-06T07:52:52.922981Z  INFO ruapc::core::listener: start listening: 127.0.0.1:38359
+2026-09-06T07:52:52.923089Z  INFO ruapc::core::listener: start listening: 127.0.0.1:36431
+2026-09-06T07:52:52.923711Z ERROR ruapc::core::panic_guard: service handler panicked: intentional panic: boom
+2026-09-06T07:52:52.925374Z  INFO ruapc::core::listener: stop accept loop
+2026-09-06T07:52:52.933677Z  INFO ruapc::core::listener: start listening: 127.0.0.1:45871
+2026-09-06T07:52:52.937821Z  INFO ruapc::core::listener: stop accept loop
+test test_http_unary_body_size_limit ... ok
+2026-09-06T07:52:52.957367Z  INFO ruapc::core::listener: start listening: 127.0.0.1:36445
+2026-09-06T07:52:52.960612Z ERROR ruapc::core::panic_guard: service handler panicked: intentional panic: boom
+2026-09-06T07:52:52.960876Z  INFO ruapc::core::listener: stop accept loop
+test test_handler_panic_returns_error ... ok
+2026-09-06T07:52:53.035067Z  INFO ruapc::core::listener: stop accept loop
+2026-09-06T07:52:53.065294Z  INFO ruapc::core::listener: start listening: 127.0.0.1:42913
+2026-09-06T07:52:53.068437Z  INFO ruapc::core::listener: stop accept loop
+2026-09-06T07:52:53.082757Z  INFO ruapc::core::listener: start listening: 127.0.0.1:42913
+2026-09-06T07:52:53.183714Z  INFO ruapc::core::listener: stop accept loop
+2026-09-06T07:52:53.213537Z  INFO ruapc::core::listener: start listening: 127.0.0.1:37631
+2026-09-06T07:52:53.216743Z  INFO ruapc::core::listener: stop accept loop
+2026-09-06T07:52:53.224181Z  INFO ruapc::core::listener: stop accept loop
+2026-09-06T07:52:53.233159Z  INFO ruapc::core::listener: start listening: 127.0.0.1:37631
+2026-09-06T07:52:53.253412Z  INFO ruapc::core::listener: start listening: 127.0.0.1:40807
+2026-09-06T07:52:53.336125Z  INFO ruapc::core::listener: stop accept loop
+test test_pool_reconnects_after_server_restart ... ok
+2026-09-06T07:52:53.554100Z  INFO ruapc::core::listener: stop accept loop
+2026-09-06T07:52:53.584499Z  INFO ruapc::core::listener: start listening: 127.0.0.1:40019
+2026-09-06T07:52:53.885631Z  INFO ruapc::core::listener: stop accept loop
+test test_inflight_request_fails_fast_on_disconnect ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+
+     Running tests/test_verify_uuid.rs (target/debug/deps/test_verify_uuid-19c52f1772f397f5)
+
+running 1 test
+2026-09-06T07:52:53.949586Z  INFO ruapc::core::listener: start listening: 0.0.0.0:38175
+2026-09-06T07:52:54.200828Z  INFO ruapc::core::listener: stop accept loop
+2026-09-06T07:52:54.330221Z  INFO ruapc::core::listener: start listening: 0.0.0.0:35397
+2026-09-06T07:52:54.581587Z  INFO ruapc::core::listener: stop accept loop
+2026-09-06T07:52:54.712855Z  INFO ruapc::core::listener: start listening: 0.0.0.0:37179
+2026-09-06T07:52:54.715927Z  INFO rdma_connect{peer=0.0.0.0:37179 attempt_id=16323491839433786833 local_device=mlx5_0 local_port=1 local_gid_index=3 remote_device=mlx5_0 remote_port=1 remote_gid_index=3}: ruapc::rdma::poller: starting RDMA poll thread mlx5_0.0 (existing shards: 0)
+2026-09-06T07:52:54.718743Z  INFO ruapc::rdma::poller: starting RDMA poll thread mlx5_0.0 (existing shards: 0)
+2026-09-06T07:52:54.729462Z  INFO rdma_connect{peer=0.0.0.0:37179 attempt_id=16323491839433786833 local_device=mlx5_0 local_port=1 local_gid_index=3 remote_device=mlx5_0 remote_port=1 remote_gid_index=3 local_qp=8549 remote_qp=8550 conn_id=8}: ruapc::rdma::rdma_socket_pool::handshake: RDMA connection confirmed; awaiting publication elapsed_ms=13
+2026-09-06T07:52:54.964397Z  INFO ruapc::core::listener: stop accept loop
+test test_verify_message_id ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.15s
+
+     Running unittests src/lib.rs (target/debug/deps/ruapc_bufpool-121ec5fdc2fab708)
+
+running 74 tests
+test aligned::tests::impossible_sizes_are_rejected_before_allocation ... ok
+test aligned::tests::test_aligned_memory_basic ... ok
+test aligned::tests::test_aligned_memory_debug ... ok
+test aligned::tests::test_aligned_memory_mut_ptr ... ok
+test aligned::tests::test_aligned_memory_read_write ... ok
+test aligned::tests::test_aligned_memory_rounds_up ... ok
+test aligned::tests::test_aligned_memory_zero_size ... ok
+test buddy::tests::test_get_first_child ... ok
+test buddy::tests::test_buddy_block_creation ... ok
+test buddy::tests::test_get_parent ... ok
+test buddy::tests::test_get_siblings ... ok
+test buddy::tests::test_memory_address_calculation ... ok
+test buddy::tests::test_size_to_level ... ok
+test buddy::tests::test_state_index ... ok
+test buffer::tests::test_buffer_debug ... ok
+test buffer::tests::test_buffer_basic_operations ... ok
+test devices::tests::device_set_assigns_stable_indices_after_its_single_tcp_device ... ok
+test buffer::tests::test_buffer_deref ... ok
+test intrusive_list::tests::test_empty_list ... ok
+test devices::tests::safe_device_wrappers_preserve_registration_order_and_buffer_lifetime ... ok
+test intrusive_list::tests::test_push_pop_multiple ... ok
+test devices::tests::failed_registration_releases_all_completed_handles_and_memory_holds ... ok
+test intrusive_list::tests::test_push_pop_single ... ok
+test intrusive_list::tests::test_remove_head ... ok
+test intrusive_list::tests::test_remove_middle ... ok
+test intrusive_list::tests::test_remove_tail ... ok
+test pool::tests::cached_slabs_and_magazines_do_not_keep_pool_alive ... ok
+test pool::tests::failed_registration_returns_reserved_budget ... ok
+test pool::tests::live_chunk_keeps_pool_alive_until_final_drop ... ok
+test pool::tests::buffer_in_late_thread_local_drop_returns_after_cache_destruction ... ok
+test pool::tests::test_allocation_reuse ... ok
+test pool::tests::registrations_drop_before_their_backing_memory ... ok
+test pool::tests::test_allocation_sizes ... ok
+test pool::tests::test_async_allocation ... ok
+test pool::tests::test_buddy_merging ... ok
+test pool::tests::test_buddy_miss_reclaims_cached_slabs ... ok
+test pool::tests::test_buddy_splitting ... ok
+test pool::tests::test_chunks_share_slab ... ok
+test pool::tests::test_chunk_write_read_and_drop ... ok
+test pool::tests::test_coalescing_is_minimal_and_on_demand ... ok
+test pool::tests::test_clone_pool ... ok
+test pool::tests::test_demand_driven_coalescing_on_alloc ... ok
+test pool::tests::test_invalid_size ... ok
+test pool::tests::registration_keys_remain_readable_during_allocator_mutation ... ok
+test pool::tests::test_lazy_merge_keeps_nodes_below_watermark ... ok
+test pool::tests::test_memory_limit_sync ... ok
+test pool::tests::test_pool_builder_custom ... ok
+test pool::tests::test_multiple_pools ... ok
+test pool::tests::test_pool_builder_defaults ... ok
+test pool::tests::test_simple_allocation ... ok
+test pool::tests::test_pool_stats ... ok
+test pool::tests::test_slab_watermark_caches_empty_slab ... ok
+test pool::tests::test_slab_release_beyond_watermark ... ok
+test pool::tests::test_stats_consistency ... ok
+test pool::tests::test_thread_cache_roundtrip ... ok
+test pool::tests::test_zero_watermarks_restore_eager_merge ... ok
+test pool::tests::test_thread_cache_flushes_on_buddy_miss ... ok
+test pool::tests::test_thread_cache_cross_thread_free ... ok
+test aligned::tests::initial_bytes_are_zero_across_the_mapping ... ok
+test pool::tests::test_lazy_merge_randomized_stress ... ok
+test pool::tests::test_starvation_reservation_randomized_stress ... ok
+test pool::tests::test_concurrent_allocation_and_growth ... ok
+test pool::tests::test_buffer_write_read ... ok
+test pool::tests::test_async_allocation_waiting ... ok
+test pool::tests::test_waiter_triggers_merge_on_free ... ok
+test pool::tests::test_async_small_allocation_waits_and_completes ... ok
+test pool::tests::test_handoff_mixed_sizes_smallest_first ... ok
+test pool::tests::test_demand_releases_cached_slab_for_waiter ... ok
+test pool::tests::test_handoff_serves_multiple_waiters_from_one_free ... ok
+test pool::tests::test_thread_cache_demand_flush_unblocks_waiter ... ok
+test pool::tests::test_handoff_cancelled_waiter_returns_buffer ... ok
+test pool::tests::test_starving_waiter_reservation_drains_and_blocks_theft ... ok
+test pool::tests::test_cancelled_reserved_waiter_releases_absorbed_capacity ... ok
+test pool::tests::test_starving_waiter_priority_over_later_small_waiters ... ok
+
+test result: ok. 74 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running unittests src/lib.rs (target/debug/deps/ruapc_demo-175206eb6ceb9c10)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/client.rs (target/debug/deps/client-da37e21f0440619d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/remote_memory.rs (target/debug/deps/remote_memory-9a1adf7f0fe15721)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/server.rs (target/debug/deps/server-897a90e2a934044e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/tokio_bench.rs (target/debug/deps/tokio_bench-ff1a712cfc0f4fea)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/ruapc_macro-4e1fe35158007c91)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/trybuild.rs (target/debug/deps/trybuild-f8a3f32ad5b8bc18)
+
+running 1 test
+   Compiling ruapc-macro-tests v0.0.0 (/weka-hg/prod/deepseek/permanent/zhoushunfeng/private/home/ruapc/target/tests/trybuild/ruapc-macro)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.67s
+
+
+test tests/ui/pass/attributes_and_aliases.rs [should pass] ... ok
+test tests/ui/pass/basic_service.rs [should pass] ... ok
+test tests/ui/pass/named_internal_service.rs [should pass] ... ok
+test tests/ui/fail/duplicate_service_arguments.rs [should fail to compile] ... ok
+test tests/ui/fail/empty_service_name.rs [should fail to compile] ... ok
+test tests/ui/fail/invalid_signatures.rs [should fail to compile] ... ok
+test tests/ui/fail/not_async.rs [should fail to compile] ... ok
+test tests/ui/fail/on_struct.rs [should fail to compile] ... ok
+test tests/ui/fail/reserved_name.rs [should fail to compile] ... ok
+test tests/ui/fail/service_name_with_slash.rs [should fail to compile] ... ok
+test tests/ui/fail/service_name_with_whitespace.rs [should fail to compile] ... ok
+test tests/ui/fail/unknown_service_argument.rs [should fail to compile] ... ok
+test tests/ui/fail/unsupported_items.rs [should fail to compile] ... ok
+test tests/ui/fail/wrong_arity.rs [should fail to compile] ... ok
+
+
+test trybuild ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.04s
+
+     Running unittests src/lib.rs (target/debug/deps/ruapc_rdma-c049e5e2b47a1819)
+
+running 114 tests
+test error::tests::test_error_display ... ok
+test error::tests::test_error_from_kind ... ok
+test error::tests::test_error ... ok
+test fd_poll::tests::test_poll_readable ... ok
+test ffi::flags::tests::test_flag_names_and_iteration ... ok
+test ffi::flags::tests::test_flags_serde_roundtrip ... ok
+test ffi::flags::tests::test_port_cap_flags2_abi_layout ... ok
+test ffi::gid::tests::test_gid_as_bits ... ok
+test ffi::gid::tests::test_gid_as_ipv6 ... ok
+test ffi::gid::tests::test_gid_equality ... ok
+test ffi::gid::tests::test_gid_debug ... ok
+test ffi::gid::tests::test_gid_is_loopback ... ok
+test ffi::gid::tests::test_gid_null ... ok
+test ffi::gid::tests::test_gid_subnet_interface ... ok
+test ffi::gid::tests::test_gid_serialize_deserialize ... ok
+test ffi::port_attr::tests::calculates_aggregate_bandwidth ... ok
+test ffi::port_attr::tests::decodes_active_speed ... ok
+test ffi::port_attr::tests::decodes_active_width ... ok
+test ffi::wc::tests::test_wc_imm_none ... ok
+test ffi::wc::tests::test_wc_debug ... ok
+test ffi::wc::tests::test_wc_imm_some ... ok
+test ffi::wc::tests::test_wc_succ ... ok
+test ffi::wc::tests::test_wc_type_checks ... ok
+test types::device_info::tests::test_link_local_prefix_usable_for_ib_and_rocev1 ... ok
+test types::device_info::tests::test_port_bandwidth ... ok
+test types::device_info::tests::test_port_find_gid ... ok
+test types::device_info::tests::test_port_is_usable ... ok
+test types::device_info::tests::test_rocev2_link_local_gid_not_usable ... ok
+test types::device_info::tests::test_usable_keeps_index_and_type ... ok
+test types::device_info::tests::test_rocev2_routable_gids_usable ... ok
+test types::device_info::tests::test_rocev2_loopback_gid_not_usable ... ok
+test types::fw_ver::tests::test_fw_ver_deserialize ... ok
+test types::fw_ver::tests::test_fw_ver_deserialize_truncates ... ok
+test types::fw_ver::tests::test_fw_ver_display ... ok
+test types::fw_ver::tests::test_fw_ver_empty ... ok
+test types::fw_ver::tests::test_fw_ver_full_length ... ok
+test types::fw_ver::tests::test_fw_ver_serialize_deserialize_roundtrip ... ok
+test types::fw_ver::tests::test_fw_ver_serialize ... ok
+test types::guid::tests::test_guid_case_insensitive ... ok
+test types::guid::tests::test_guid_debug ... ok
+test types::guid::tests::test_guid_deserialize ... ok
+test types::guid::tests::test_guid_deserialize_invalid_format ... ok
+test types::guid::tests::test_guid_display ... ok
+test types::guid::tests::test_guid_deserialize_invalid_hex ... ok
+test types::guid::tests::test_guid_serialize ... ok
+test types::guid::tests::test_guid_serialize_deserialize_roundtrip ... ok
+test types::link_layer::tests::test_link_layer_as_str ... ok
+test types::link_layer::tests::test_link_layer_display ... ok
+test types::link_layer::tests::test_link_layer_from ... ok
+test types::link_layer::tests::test_link_layer_from_u8 ... ok
+test types::link_layer::tests::test_link_layer_is_ethernet ... ok
+test types::link_layer::tests::test_link_layer_is_infiniband ... ok
+test types::link_layer::tests::test_link_layer_to_u8 ... ok
+test types::link_layer::tests::test_link_layer_serialize_deserialize ... ok
+test types::wrid::tests::test_wrid_constructors ... ok
+test types::wrid::tests::test_wrid_debug_format ... ok
+test types::wrid::tests::test_wrid_raw_is_stable ... ok
+test types::wrid::tests::test_wrid_rejects_large_id - should panic ... ok
+test types::wrid::tests::test_wrid_roundtrip_all_types ... ok
+test types::wrid::tests::test_wrid_rejects_large_slot - should panic ... ok
+test verbs::completion_queue::routes::tests::exhausted_sequences_never_wrap_and_retire_the_route ... ok
+test verbs::completion_queue::routes::tests::send_sequence_exhaustion_never_wraps ... ok
+test verbs::completion_queue::routes::tests::reuse_starts_after_both_directions_and_rejects_old_wrids ... ok
+test verbs::completion_queue::routes::tests::unused_leases_still_have_distinct_incarnations ... ok
+test verbs::completion_queue::routes::tests::routes_are_exclusive_and_reusable_at_capacity ... ok
+test verbs::qp_connection::tests::infiniband_uses_unicast_lid_without_grh ... ok
+test verbs::wr_slots::tests::collision_returns_buffer_without_disturbing_the_live_request ... ok
+test verbs::queue_pair::read::tests::cancelled_poster_accounts_the_unposted_suffix ... ok
+test verbs::queue_pair::read::tests::unposted_cancel_recovers_memory_and_closes_receiver ... ok
+test verbs::wr_slots::tests::test_wrap_around_reuses_slots ... ok
+test verbs::queue_pair::read::tests::validates_bounds_overflow_and_cross_request_overlap ... ok
+test verbs::queue_pair::read::tests::only_last_completion_returns_owned_memory ... ok
+test verbs::queue_pair::tests::selective_sweep_skips_previous_incarnations_and_already_completed_work ... ok
+test verbs::qp_connection::tests::roce_uses_grh_and_preserves_negotiated_psns_and_read_limits ... ok
+test verbs::queue_pair::tests::signaling_preserves_flags_and_forces_window_tail_completion ... ok
+test verbs::qp_connection::tests::rejects_invalid_connection_parameters ... ok
+test verbs::wr_slots::tests::test_take_without_insert ... ok
+test verbs::queue_pair::read::tests::dropped_receiver_cannot_release_inflight_memory ... ok
+test verbs::queue_pair::tests::modify_error_reports_provider_errno_and_target_state ... ok
+test verbs::wr_slots::tests::test_insert_take_roundtrip ... ok
+test verbs::queue_pair::read::tests::partial_failure_after_early_completions_settles_once ... ok
+test verbs::queue_pair::read::tests::timeout_notifies_once_and_holds_memory_through_flush ... ok
+test verbs::completion_queue::routes::tests::send_sequence_guard_excludes_posters_until_transaction_finishes ... ok
+test verbs::completion_queue::routes::tests::concurrent_route_allocation_is_exclusive ... ok
+test verbs::completion_queue::routes::tests::concurrent_sequences_are_unique_including_the_exhaustion_boundary ... ok
+test fd_poll::tests::test_poll_timeout ... ok
+test verbs::wr_slots::tests::test_concurrent_post_and_complete ... ok
+test test_utils::tests::test_multiple_cqs_shared_context ... ok
+test verbs::completion_queue::tests::test_cq_poll_empty ... ok
+test verbs::memory_region::tests::rejects_offset_addressing_for_owned_buffer_operations ... ok
+test verbs::context::tests::test_context_query_port ... ok
+test verbs::completion_queue::tests::completion_requires_its_original_cq_qp_and_route ... ok
+test verbs::memory_region::tests::test_memory_region_debug ... ok
+test verbs::queue_pair::tests::qp_creation_rejects_unowned_resources_and_foreign_contexts ... ok
+test verbs::completion_queue::routes::tests::poisoned_send_transaction_preserves_watermark_on_lease_drop ... ok
+test verbs::comp_channel::tests::test_comp_channel_set_nonblock ... ok
+test verbs::context::tests::test_context_debug ... ok
+test verbs::device::tests::test_device_available ... ok
+test verbs::comp_channel::tests::test_comp_channel_create ... ok
+test verbs::context::tests::test_context_query_device ... ok
+test test_utils::tests::test_context_dropped_while_children_alive ... ok
+test verbs::completion_queue::tests::test_cq_req_notify ... ok
+test verbs::context::tests::test_context_query_gid ... ok
+test verbs::device::tests::test_device_debug ... ok
+test verbs::memory_region::tests::test_memory_region_memory_keeps_alive ... ok
+test verbs::protection_domain::tests::test_protection_domain_debug ... ok
+test verbs::memory_region::tests::test_memory_region_register ... ok
+test verbs::completion_queue::tests::test_cq_create_with_channel ... ok
+test verbs::protection_domain::tests::test_protection_domain_alloc ... ok
+test verbs::completion_queue::tests::test_cq_create_without_channel ... ok
+test verbs::queue_pair::tests::qp_routes_are_automatic_and_sequence_space_survives_destruction ... ok
+test verbs::device::tests::test_device_info ... ok
+test verbs::queue_pair::tests::separate_cqs_own_independent_qp_routes ... ok
+test verbs::completion_queue::tests::lease_drop_preserves_both_directions_and_unused_incarnations ... ok
+
+test result: ok. 114 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running unittests src/bin/ibv_devinfo.rs (target/debug/deps/ibv_devinfo-d927a8480d497daf)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests ruapc
+
+running 28 tests
+test ruapc/src/client/call.rs - client::call (line 5) ... ignored
+test ruapc/src/client/mod.rs - client::Client (line 23) ... ignored
+test ruapc/src/client/mod.rs - client::Client::with_read_buffers (line 96) ... ignored
+test ruapc/src/client/mod.rs - client::Client::with_write_buffers (line 121) ... ignored
+test ruapc/src/client/with_buffers.rs - client::with_buffers::ClientWithBuffers (line 38) ... ignored
+test ruapc/src/core/router/mod.rs - core::router::Router (line 53) ... ignored
+test ruapc/src/core/server.rs - core::server::Server (line 17) ... ignored
+test ruapc/src/core/context.rs - core::context::Context (line 42) - compile ... ok
+test ruapc/src/core/router/mod.rs - core::router::Router::build_open_api (line 165) - compile ... ok
+test ruapc/src/core/server.rs - core::server::Server::create (line 50) - compile ... ok
+test ruapc/src/core/router/mod.rs - core::router::Router::method_names (line 180) - compile ... ok
+test ruapc/src/core/server.rs - core::server::Server::listen (line 127) - compile ... ok
+test ruapc/src/msg/message.rs - msg::message::Message::parse (line 61) - compile ... ok
+test ruapc/src/remote_memory/context.rs - remote_memory::context::Context::remote_write (line 205) ... ignored
+test ruapc/src/remote_memory/with_buffers.rs - remote_memory::with_buffers::SentBuffers (line 16) ... ignored
+test ruapc/src/remote_memory/with_buffers.rs - remote_memory::with_buffers::WithBuffers (line 89) ... ignored
+test ruapc/src/task/supervisor.rs - task::supervisor::TaskSupervisor (line 33) - compile ... ok
+test ruapc/src/sockets/config.rs - sockets::config::SocketPoolConfig (line 15) ... ok
+test ruapc/src/error.rs - error::Result (line 298) ... ok
+test ruapc/src/error.rs - error::Error::new (line 116) ... ok
+test ruapc/src/msg/meta.rs - msg::meta::MsgMeta::is_req (line 103) ... ok
+test ruapc/src/msg/message.rs - msg::message::Message::new (line 30) ... ok
+test ruapc/src/error.rs - error::Error::kind (line 130) ... ok
+test ruapc/src/msg/payload.rs - msg::payload::Payload::is_empty (line 51) ... ok
+test ruapc/src/error.rs - error::Error (line 97) ... ok
+test ruapc/src/msg/payload.rs - msg::payload::Payload::as_slice (line 69) ... ok
+test ruapc/src/msg/meta.rs - msg::meta::MsgMeta::is_rsp (line 118) ... ok
+test ruapc/src/msg/payload.rs - msg::payload::Payload::len (line 32) ... ok
+
+test result: ok. 18 passed; 0 failed; 10 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+all doctests ran in 2.02s; merged doctests compilation took 1.98s
+   Doc-tests ruapc_bufpool
+
+running 2 tests
+test ruapc-bufpool/src/pool/builder.rs - pool::builder::BufferPoolBuilder (line 45) ... ok
+test ruapc-bufpool/src/lib.rs - (line 18) ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 1 test
+test ruapc-bufpool/src/device.rs - device::MemoryRegistrar (line 45) - compile fail ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.44s
+
+all doctests ran in 1.78s; merged doctests compilation took 1.32s
+   Doc-tests ruapc_demo
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests ruapc_macro
+
+running 3 tests
+test ruapc-macro/src/lib.rs - (line 14) ... ignored
+test ruapc-macro/src/lib.rs - (line 26) ... ignored
+test ruapc-macro/src/lib.rs - (line 53) ... ignored
+
+test result: ok. 0 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+all doctests ran in 1.26s; merged doctests compilation took 1.25s
+   Doc-tests ruapc_rdma
+
+running 2 tests
+test ruapc-rdma/src/lib.rs - (line 30) - compile ... ok
+test ruapc-rdma/src/verbs/device.rs - verbs::device::ActiveDevice (line 111) - compile ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+test ruapc-rdma/src/verbs/completion_queue.rs - verbs::completion_queue::Completion (line 45) - compile fail ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+
+all doctests ran in 2.12s; merged doctests compilation took 1.69s

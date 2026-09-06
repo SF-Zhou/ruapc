@@ -16,15 +16,16 @@ explicit DMA lifetime contracts over raw verbs.
 - **Buffer-owning work requests**: `QueuePair::send`/`recv` take ownership of a
   [`ruapc-bufpool`](../ruapc-bufpool/) `Buffer`. Poll `CompletionQueue` and recover
   buffers through `QueuePair::complete` using a CQ-issued, non-cloneable
-  `Completion` proof. Shared CQs route by the WRID tag.
+  `Completion` proof. Shared CQs route directly by the WRID slot.
 - **Lock-free SEND/RECV tracking**: buffers of those posted work requests live in
   `WrSlots`, a fixed-size atomic slot array indexed by monotonic per-direction
   IDs — no `Mutex<HashMap>` on the completion path
 - **Selective signaling** with completion-driven reclamation of unsignaled
   SEND buffers (RC send queues complete in order), plus gather-list sends and
   owned vectored RDMA READ plans (`prepare_reads` / `post_read`)
-- **Typed work request IDs**: `WRID` packs a work request type, an opaque
-  connection tag, and a per-direction sequence number into the 64-bit `wr_id`
+- **CQ-owned work request IDs**: `WRID` packs 2 type bits, 14 route-slot bits
+  and a 48-bit per-direction sequence into `wr_id`. QPs acquire their route at
+  creation; slot reuse carries sequence watermarks across QP lifetimes.
 - **Serializable device snapshots**: `DeviceInfo`/`Port`/`Gid` (and the raw
   `ibv_device_attr`/`ibv_port_attr`) implement serde + schemars; GID types are
   classified (IB / RoCE v1 / RoCE v2) and non-routable GIDs filtered out
@@ -39,15 +40,35 @@ explicit DMA lifetime contracts over raw verbs.
 
 `CompletionQueue::poll_batch` fills reusable stack storage and lends a unique
 proof for each CQE. `QueuePair::complete` validates the originating CQ, QP number
-and permanently assigned WRID tag before returning SEND/RECV buffers or settling
-READ ownership. Copying raw CQE metadata cannot authorize reclamation. Creating
+and `CompletionRoute` (slot and sequence floor) before returning SEND/RECV
+buffers or settling READ ownership. Copying raw CQE metadata cannot authorize
+reclamation. Creating
 and validating the borrowed proof needs no allocation or reference-count update;
 READ batch accounting retains its own synchronization.
 
-Each CQ keeps a 512 KiB bitmap of connection tags claimed during its lifetime.
-`set_wr_tag` accepts a tag exactly once and prevents reuse even after QP destruction,
-so a retained completion cannot release memory on a replacement QP. The core
-poller retires a slot after its 256 generations instead of wrapping its tag.
+Each CQ leases up to 16384 route slots. `QueuePair::create` acquires the lease
+before creating the provider QP; it owns the lease until QP destruction succeeds.
+`send_route()` and `recv_route()` expose immutable route metadata. A shared
+send/receive CQ uses one route, while separate CQs each allocate their own.
+The QP allocates SQ and RQ sequences independently from the lease's initial
+floor. SEND, SEND-with-immediate and READ share the SQ sequence stream. Failed
+posts never roll sequence allocation back.
+
+When a lease returns its slot, the CQ retains the maximum next sequence from
+both directions, with at least one step for a lease that never posted anything.
+The replacement starts at that watermark, so a retained completion fails its
+sequence-floor check even if the provider also reuses the QP number. There is
+no separate generation field or permanent claimed-tag bitmap. The allocator's
+mutex is used only for route acquisition and release; posting and completion
+routing do not take it. Sequence exhaustion returns `WorkRequestIdsExhausted`
+and retires the slot on release; route-capacity exhaustion returns
+`CompletionRoutesExhausted`. Neither wraps an identifier.
+
+SEND/RECV buffer tracking remains a separate bounded `WrSlots` array. A slot
+collision returns ownership to the submission path immediately and produces
+`WorkRequestSlotsExhausted`, preserving the previously posted buffer. See
+[WRID allocation and completion routing](../docs/wrid.md) for the reuse proof,
+registration ordering, memory accounting and performance evidence.
 
 `prepare_reads` takes a destination `Vec<Buffer>` and buffer-index/offset/length
 descriptors. It validates local bounds and cross-request overlap, and derives
