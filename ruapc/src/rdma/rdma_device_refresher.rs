@@ -30,7 +30,7 @@ impl RdmaDeviceRefresher {
     }
 
     fn refresh_all(devices: &crate::Devices) {
-        for dev in devices.rdma_devices() {
+        for dev in devices.devices() {
             if let Err(err) = dev.refresh_port_attrs() {
                 let info = dev.info();
                 tracing::warn!(

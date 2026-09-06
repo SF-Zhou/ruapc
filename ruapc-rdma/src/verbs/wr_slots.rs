@@ -78,7 +78,13 @@ impl WrSlots {
     /// Allocates the next monotonic work request ID.
     #[inline]
     pub fn alloc_id(&self) -> u64 {
-        self.next_id.fetch_add(1, Ordering::Relaxed)
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        // Never let caught panics advance this counter all the way to u64
+        // wraparound: a reused ID could make a retained CQE reclaim new memory.
+        if id > crate::WRID::ID_MASK {
+            std::process::abort();
+        }
+        id
     }
 
     /// Stores the buffer of an about-to-be-posted work request.
@@ -124,35 +130,6 @@ impl WrSlots {
         } else {
             None
         }
-    }
-}
-
-impl WrSlots {
-    /// Takes and drops every stored buffer, returning how many were
-    /// reclaimed.
-    ///
-    /// Intended for teardown after the owning QP has transitioned to the
-    /// error state: buffers of unsignaled work requests that completed
-    /// successfully never produce a CQE and must be reclaimed explicitly.
-    pub fn reclaim_all(&self) -> usize {
-        let mut reclaimed = 0;
-        for slot in &self.slots {
-            let tag = slot.tag.load(Ordering::Acquire);
-            if tag >= TAG_BASE
-                && slot
-                    .tag
-                    .compare_exchange(tag, WRITING, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
-            {
-                // SAFETY: we own the slot while its tag is `WRITING`.
-                let buffer = unsafe { (*slot.buffer.get()).take() };
-                slot.tag.store(EMPTY, Ordering::Release);
-                if buffer.is_some() {
-                    reclaimed += 1;
-                }
-            }
-        }
-        reclaimed
     }
 }
 

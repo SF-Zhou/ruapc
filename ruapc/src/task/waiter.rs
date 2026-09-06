@@ -1,10 +1,14 @@
 use foldhash::fast::RandomState;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
-use crate::{Error, Message, Receiver, core::WriteTarget};
+use crate::{
+    Error, Message, Receiver,
+    remote_memory::{ReadSource, WriteTarget},
+};
 
 /// The response sent through the waiter channel: the RPC response message
 /// plus the request's pinned write target (when the client attached write
@@ -27,8 +31,9 @@ pub(crate) fn next_conn_id() -> u64 {
 
 /// Entry stored in the waiter's id_map for each pending request.
 struct WaiterEntry {
-    /// Channel to send the response through.
-    sender: oneshot::Sender<WaiterResult>,
+    /// Drop the source before waking the receiver, including expiry. A caller
+    /// receiving completion may immediately try to recover its owned buffers.
+    read_source: Option<Arc<ReadSource>>,
     /// The pinned destination buffers of a request sent with
     /// `with_write_buffers`. `MemoryService::write_inline` /
     /// `read_into_target` handlers clone the `Arc` while writing, so the
@@ -36,10 +41,13 @@ struct WaiterEntry {
     /// the request expires mid-transfer. Delivered together with the
     /// response when `post` is called.
     write_target: Option<Arc<WriteTarget>>,
+    /// Drop memory holds before waking a receiver on expiry or failure. On
+    /// successful post the destination instead moves into the response.
+    sender: oneshot::Sender<WaiterResult>,
     /// Id of the connection the request was sent on (see
     /// [`Waiter::bind_connection`]); used by [`Waiter::fail_connection`] to
     /// fail pending requests eagerly when the connection dies.
-    conn_id: Option<u64>,
+    conn_id: Option<NonZeroU64>,
     /// Coarse expiry: the entry is dropped by the periodic sweep once the
     /// deadline passed, waking the waiting task with a timeout error.
     ///
@@ -76,6 +84,13 @@ pub struct WaiterCleaner<'a> {
     msgid: u64,
 }
 
+impl WaiterCleaner<'_> {
+    /// The waiter entry was removed by its completion path already.
+    pub(crate) fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
+
 impl Drop for WaiterCleaner<'_> {
     fn drop(&mut self) {
         self.waiter.remove(self.msgid);
@@ -102,6 +117,7 @@ impl Waiter {
         self.id_map.insert(
             msgid,
             WaiterEntry {
+                read_source: None,
                 sender: tx,
                 write_target: None,
                 conn_id: None,
@@ -110,7 +126,7 @@ impl Waiter {
         );
         (
             msgid,
-            Receiver::OneShotRx(
+            Receiver::new(
                 rx,
                 WaiterCleaner {
                     waiter: self,
@@ -128,6 +144,7 @@ impl Waiter {
     /// If no waiter is found (e.g., because of timeout), a warning is logged.
     pub fn post(&self, msgid: u64, result: Message) {
         if let Some((_, entry)) = self.id_map.remove(&msgid) {
+            drop(entry.read_source);
             let _ = entry.sender.send(Ok((result, entry.write_target)));
         } else {
             tracing::warn!("Waiter post failed for msgid: {}", msgid);
@@ -141,7 +158,7 @@ impl Waiter {
     /// or expired).
     pub fn bind_connection(&self, msgid: u64, conn_id: u64) {
         if let Some(mut entry) = self.id_map.get_mut(&msgid) {
-            entry.conn_id = Some(conn_id);
+            entry.conn_id = Some(NonZeroU64::new(conn_id).expect("connection IDs start at one"));
         }
     }
 
@@ -155,11 +172,13 @@ impl Waiter {
         let msgids: Vec<u64> = self
             .id_map
             .iter()
-            .filter(|entry| entry.conn_id == Some(conn_id))
+            .filter(|entry| entry.conn_id.is_some_and(|id| id.get() == conn_id))
             .map(|entry| *entry.key())
             .collect();
         for msgid in msgids {
             if let Some((_, entry)) = self.id_map.remove(&msgid) {
+                drop(entry.read_source);
+                drop(entry.write_target);
                 let _ = entry.sender.send(Err(err.clone()));
             }
         }
@@ -182,6 +201,20 @@ impl Waiter {
         if let Some(mut entry) = self.id_map.get_mut(&msgid) {
             entry.write_target = Some(target);
         }
+    }
+
+    /// Keeps owned, immutable source buffers alive independently of the caller
+    /// future. A cancelled or forgotten future cannot invalidate a local read.
+    pub(crate) fn bind_read_source(&self, msgid: u64, source: Arc<ReadSource>) {
+        if let Some(mut entry) = self.id_map.get_mut(&msgid) {
+            entry.read_source = Some(source);
+        }
+    }
+
+    pub(crate) fn read_source(&self, msgid: u64) -> Option<Arc<ReadSource>> {
+        self.id_map
+            .get(&msgid)
+            .and_then(|entry| entry.read_source.clone())
     }
 
     /// Returns a clone of the pending request's pinned write target, or
@@ -239,6 +272,130 @@ impl std::fmt::Debug for Waiter {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn completion_releases_memory_holds_before_waking_the_receiver() {
+        use std::{
+            future::Future,
+            sync::{Mutex, Weak},
+            task::{Context, Poll, Wake, Waker},
+        };
+
+        struct ObserveHolds {
+            source: Weak<ReadSource>,
+            target: Weak<WriteTarget>,
+            at_wake: Mutex<Vec<(usize, usize)>>,
+        }
+
+        impl Wake for ObserveHolds {
+            fn wake(self: Arc<Self>) {
+                // Observe synchronously inside oneshot's wake. Checking after
+                // post/expire returns would miss a receiver running before the
+                // waiter's last memory holds have been released.
+                self.at_wake
+                    .lock()
+                    .unwrap()
+                    .push((self.source.strong_count(), self.target.strong_count()));
+            }
+        }
+
+        #[derive(Clone, Copy, Debug)]
+        enum Completion {
+            Response,
+            ConnectionFailure,
+            Expiry,
+        }
+
+        let pool = ruapc_bufpool::BufferPool::new(Arc::new(ruapc_bufpool::EmptyDevices));
+        for completion in [
+            Completion::Response,
+            Completion::ConnectionFailure,
+            Completion::Expiry,
+        ] {
+            // These two owners stand in for the caller's client wrapper.
+            let source = Arc::new(ReadSource {
+                buffers: vec![pool.allocate(16).unwrap()],
+            });
+            let target = WriteTarget::new(vec![pool.allocate(16).unwrap()]).unwrap();
+            let waiter = Waiter::default();
+            let (msgid, receiver) = waiter.alloc(Duration::from_secs(1));
+            let conn_id = next_conn_id();
+            waiter.bind_connection(msgid, conn_id);
+            waiter.bind_read_source(msgid, source.clone());
+            waiter.bind_write_target(msgid, target.clone());
+
+            let observation = Arc::new(ObserveHolds {
+                source: Arc::downgrade(&source),
+                target: Arc::downgrade(&target),
+                at_wake: Mutex::new(Vec::new()),
+            });
+            let waker = Waker::from(observation.clone());
+            let mut context = Context::from_waker(&waker);
+            let mut receiving = Box::pin(receiver.recv());
+            assert!(receiving.as_mut().poll(&mut context).is_pending());
+
+            match completion {
+                Completion::Response => waiter.post(msgid, Message::default()),
+                Completion::ConnectionFailure => waiter
+                    .fail_connection(conn_id, &Error::kind(crate::ErrorKind::ConnectionClosed)),
+                Completion::Expiry => waiter.expire(Instant::now() + Duration::from_secs(2)),
+            }
+
+            // Success transfers the destination into the queued response.
+            // Both failure paths must release it before waking the caller.
+            let expected_target_holds = match completion {
+                Completion::Response => 2,
+                Completion::ConnectionFailure | Completion::Expiry => 1,
+            };
+            assert_eq!(
+                *observation.at_wake.lock().unwrap(),
+                [(1, expected_target_holds)],
+                "{completion:?} woke before releasing its memory holds"
+            );
+            let Poll::Ready(result) = receiving.as_mut().poll(&mut context) else {
+                panic!("{completion:?} woke the receiver without completing it");
+            };
+            match completion {
+                Completion::Response => {
+                    let (_, returned) = result.unwrap();
+                    assert!(Arc::ptr_eq(&returned.unwrap(), &target));
+                }
+                Completion::ConnectionFailure => {
+                    assert_eq!(result.unwrap_err().kind, crate::ErrorKind::ConnectionClosed);
+                }
+                Completion::Expiry => {
+                    assert_eq!(result.unwrap_err().kind, crate::ErrorKind::Timeout);
+                }
+            }
+            assert_eq!(Arc::strong_count(&source), 1);
+            assert_eq!(Arc::strong_count(&target), 1);
+        }
+    }
+
+    #[test]
+    fn a_local_reader_keeps_owned_sources_alive_after_expiry() {
+        let pool = ruapc_bufpool::BufferPool::new(Arc::new(ruapc_bufpool::EmptyDevices));
+        let mut buffer = pool.allocate(16).unwrap();
+        buffer.set_len(4);
+        buffer.copy_from_slice(b"data");
+        let source = Arc::new(ReadSource {
+            buffers: vec![buffer],
+        });
+        let weak = Arc::downgrade(&source);
+        let waiter = Waiter::default();
+        let (msgid, receiver) = waiter.alloc(Duration::from_secs(1));
+        waiter.bind_read_source(msgid, source);
+        let reading = waiter.read_source(msgid).unwrap();
+        waiter.expire(Instant::now() + Duration::from_secs(2));
+        assert!(waiter.read_source(msgid).is_none());
+        assert_eq!(
+            reading.read_inline(&[crate::CopyOp::new(0, 0, 4)]).unwrap(),
+            b"data"
+        );
+        drop(receiver);
+        drop(reading);
+        assert!(weak.upgrade().is_none());
+    }
 
     #[tokio::test]
     async fn test_waiter() {

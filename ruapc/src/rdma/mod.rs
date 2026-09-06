@@ -5,6 +5,8 @@ pub use config::{
     RdmaSubnetDomains, RdmaSubnetPolicy,
 };
 
+mod frame;
+
 mod endpoint;
 pub(crate) use endpoint::{
     ConnectionLease, DeviceSelection, PrepareConnectionRequest, PrepareConnectionResponse,

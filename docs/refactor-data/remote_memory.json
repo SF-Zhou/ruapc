@@ -1,0 +1,857 @@
+{
+  "raw": {
+    "ruapc-final-local-remote_memory-baseline-1.log": "ruapc: remote-memory RPC + complete-pattern verification\nserial requests; 4 runtime workers; 8 warmup iterations per case\nsetup and warmup excluded; sources and write destinations reused\ntransport: None; RDMA device: Some(\"mlx5_0\")\nTCP\n  remote_read_all    64 KiB | 512 iters |     38.69 us/op |   1615.5 MiB/s | verified\n  remote_write_all   64 KiB | 512 iters |     40.85 us/op |   1529.8 MiB/s | verified\n  remote_read_all  1024 KiB | 128 iters |    625.77 us/op |   1598.0 MiB/s | verified\n  remote_write_all 1024 KiB | 128 iters |    183.10 us/op |   5461.4 MiB/s | verified\nWS\n  remote_read_all    64 KiB | 512 iters |     46.06 us/op |   1356.9 MiB/s | verified\n  remote_write_all   64 KiB | 512 iters |     47.61 us/op |   1312.8 MiB/s | verified\n  remote_read_all  1024 KiB | 128 iters |    225.87 us/op |   4427.4 MiB/s | verified\n  remote_write_all 1024 KiB | 128 iters |    186.29 us/op |   5368.0 MiB/s | verified\nHTTP\n  remote_read_all    64 KiB | 512 iters |     52.35 us/op |   1193.9 MiB/s | verified\n  remote_write_all   64 KiB | 512 iters |     50.19 us/op |   1245.4 MiB/s | verified\n  remote_read_all  1024 KiB | 128 iters |    322.24 us/op |   3103.3 MiB/s | verified\n  remote_write_all 1024 KiB | 128 iters |    294.28 us/op |   3398.1 MiB/s | verified\nRDMA\n  remote_read_all    64 KiB | 512 iters |     38.84 us/op |   1609.1 MiB/s | verified\n  remote_write_all   64 KiB | 512 iters |     40.09 us/op |   1558.9 MiB/s | verified\n  remote_read_all  1024 KiB | 128 iters |    118.00 us/op |   8474.3 MiB/s | verified\n  remote_write_all 1024 KiB | 128 iters |     99.33 us/op |  10067.6 MiB/s | verified\n",
+    "ruapc-final-local-remote_memory-baseline-2.log": "ruapc: remote-memory RPC + complete-pattern verification\nserial requests; 4 runtime workers; 8 warmup iterations per case\nsetup and warmup excluded; sources and write destinations reused\ntransport: None; RDMA device: Some(\"mlx5_0\")\nTCP\n  remote_read_all    64 KiB | 512 iters |     37.77 us/op |   1654.7 MiB/s | verified\n  remote_write_all   64 KiB | 512 iters |     32.84 us/op |   1903.0 MiB/s | verified\n  remote_read_all  1024 KiB | 128 iters |    488.24 us/op |   2048.2 MiB/s | verified\n  remote_write_all 1024 KiB | 128 iters |    183.62 us/op |   5445.9 MiB/s | verified\nWS\n  remote_read_all    64 KiB | 512 iters |     44.36 us/op |   1409.0 MiB/s | verified\n  remote_write_all   64 KiB | 512 iters |     41.56 us/op |   1503.9 MiB/s | verified\n  remote_read_all  1024 KiB | 128 iters |    229.95 us/op |   4348.7 MiB/s | verified\n  remote_write_all 1024 KiB | 128 iters |    179.06 us/op |   5584.8 MiB/s | verified\nHTTP\n  remote_read_all    64 KiB | 512 iters |     52.75 us/op |   1184.9 MiB/s | verified\n  remote_write_all   64 KiB | 512 iters |     50.58 us/op |   1235.6 MiB/s | verified\n  remote_read_all  1024 KiB | 128 iters |    318.35 us/op |   3141.2 MiB/s | verified\n  remote_write_all 1024 KiB | 128 iters |    280.61 us/op |   3563.7 MiB/s | verified\nRDMA\n  remote_read_all    64 KiB | 512 iters |     46.83 us/op |   1334.6 MiB/s | verified\n  remote_write_all   64 KiB | 512 iters |     49.37 us/op |   1265.9 MiB/s | verified\n  remote_read_all  1024 KiB | 128 iters |     91.25 us/op |  10958.6 MiB/s | verified\n  remote_write_all 1024 KiB | 128 iters |     98.26 us/op |  10177.1 MiB/s | verified\n",
+    "ruapc-final-local-remote_memory-baseline-3.log": "ruapc: remote-memory RPC + complete-pattern verification\nserial requests; 4 runtime workers; 8 warmup iterations per case\nsetup and warmup excluded; sources and write destinations reused\ntransport: None; RDMA device: Some(\"mlx5_0\")\nTCP\n  remote_read_all    64 KiB | 512 iters |     34.14 us/op |   1830.9 MiB/s | verified\n  remote_write_all   64 KiB | 512 iters |     30.98 us/op |   2017.5 MiB/s | verified\n  remote_read_all  1024 KiB | 128 iters |    639.36 us/op |   1564.1 MiB/s | verified\n  remote_write_all 1024 KiB | 128 iters |    182.29 us/op |   5485.7 MiB/s | verified\nWS\n  remote_read_all    64 KiB | 512 iters |     45.99 us/op |   1358.9 MiB/s | verified\n  remote_write_all   64 KiB | 512 iters |     41.70 us/op |   1498.7 MiB/s | verified\n  remote_read_all  1024 KiB | 128 iters |    222.85 us/op |   4487.3 MiB/s | verified\n  remote_write_all 1024 KiB | 128 iters |    182.49 us/op |   5479.7 MiB/s | verified\nHTTP\n  remote_read_all    64 KiB | 512 iters |     53.43 us/op |   1169.8 MiB/s | verified\n  remote_write_all   64 KiB | 512 iters |     51.18 us/op |   1221.2 MiB/s | verified\n  remote_read_all  1024 KiB | 128 iters |    760.50 us/op |   1314.9 MiB/s | verified\n  remote_write_all 1024 KiB | 128 iters |    285.20 us/op |   3506.3 MiB/s | verified\nRDMA\n  remote_read_all    64 KiB | 512 iters |     39.55 us/op |   1580.2 MiB/s | verified\n  remote_write_all   64 KiB | 512 iters |     39.33 us/op |   1589.2 MiB/s | verified\n  remote_read_all  1024 KiB | 128 iters |    105.75 us/op |   9456.2 MiB/s | verified\n  remote_write_all 1024 KiB | 128 iters |     98.23 us/op |  10180.4 MiB/s | verified\n",
+    "ruapc-final-local-remote_memory-current-1.log": "ruapc: remote-memory RPC + complete-pattern verification\nserial requests; 4 runtime workers; 8 warmup iterations per case\nsetup and warmup excluded; sources and write destinations reused\ntransport: None; RDMA device: Some(\"mlx5_0\")\nTCP\n  remote_read_all    64 KiB | 512 iters |     35.99 us/op |   1736.4 MiB/s | verified\n  remote_write_all   64 KiB | 512 iters |     32.25 us/op |   1937.9 MiB/s | verified\n  remote_read_all  1024 KiB | 128 iters |    375.52 us/op |   2663.0 MiB/s | verified\n  remote_write_all 1024 KiB | 128 iters |    196.01 us/op |   5101.7 MiB/s | verified\nWS\n  remote_read_all    64 KiB | 512 iters |     68.27 us/op |    915.4 MiB/s | verified\n  remote_write_all   64 KiB | 512 iters |     57.59 us/op |   1085.3 MiB/s | verified\n  remote_read_all  1024 KiB | 128 iters |    222.46 us/op |   4495.2 MiB/s | verified\n  remote_write_all 1024 KiB | 128 iters |    188.97 us/op |   5291.8 MiB/s | verified\nHTTP\n  remote_read_all    64 KiB | 512 iters |     59.23 us/op |   1055.2 MiB/s | verified\n  remote_write_all   64 KiB | 512 iters |     49.27 us/op |   1268.5 MiB/s | verified\n  remote_read_all  1024 KiB | 128 iters |    515.31 us/op |   1940.6 MiB/s | verified\n  remote_write_all 1024 KiB | 128 iters |    280.03 us/op |   3571.1 MiB/s | verified\nRDMA\n  remote_read_all    64 KiB | 512 iters |     40.34 us/op |   1549.1 MiB/s | verified\n  remote_write_all   64 KiB | 512 iters |     38.46 us/op |   1625.2 MiB/s | verified\n  remote_read_all  1024 KiB | 128 iters |    100.94 us/op |   9907.0 MiB/s | verified\n  remote_write_all 1024 KiB | 128 iters |    250.12 us/op |   3998.1 MiB/s | verified\n",
+    "ruapc-final-local-remote_memory-current-2.log": "ruapc: remote-memory RPC + complete-pattern verification\nserial requests; 4 runtime workers; 8 warmup iterations per case\nsetup and warmup excluded; sources and write destinations reused\ntransport: None; RDMA device: Some(\"mlx5_0\")\nTCP\n  remote_read_all    64 KiB | 512 iters |     34.33 us/op |   1820.7 MiB/s | verified\n  remote_write_all   64 KiB | 512 iters |     31.42 us/op |   1989.5 MiB/s | verified\n  remote_read_all  1024 KiB | 128 iters |    377.56 us/op |   2648.6 MiB/s | verified\n  remote_write_all 1024 KiB | 128 iters |    184.86 us/op |   5409.4 MiB/s | verified\nWS\n  remote_read_all    64 KiB | 512 iters |     43.70 us/op |   1430.3 MiB/s | verified\n  remote_write_all   64 KiB | 512 iters |     41.52 us/op |   1505.2 MiB/s | verified\n  remote_read_all  1024 KiB | 128 iters |    206.06 us/op |   4853.0 MiB/s | verified\n  remote_write_all 1024 KiB | 128 iters |    185.30 us/op |   5396.6 MiB/s | verified\nHTTP\n  remote_read_all    64 KiB | 512 iters |     49.09 us/op |   1273.3 MiB/s | verified\n  remote_write_all   64 KiB | 512 iters |     47.88 us/op |   1305.4 MiB/s | verified\n  remote_read_all  1024 KiB | 128 iters |    492.64 us/op |   2029.9 MiB/s | verified\n  remote_write_all 1024 KiB | 128 iters |    281.42 us/op |   3553.4 MiB/s | verified\nRDMA\n  remote_read_all    64 KiB | 512 iters |     39.98 us/op |   1563.4 MiB/s | verified\n  remote_write_all   64 KiB | 512 iters |     39.66 us/op |   1575.9 MiB/s | verified\n  remote_read_all  1024 KiB | 128 iters |     94.65 us/op |  10565.3 MiB/s | verified\n  remote_write_all 1024 KiB | 128 iters |    122.48 us/op |   8164.8 MiB/s | verified\n",
+    "ruapc-final-local-remote_memory-current-3.log": "ruapc: remote-memory RPC + complete-pattern verification\nserial requests; 4 runtime workers; 8 warmup iterations per case\nsetup and warmup excluded; sources and write destinations reused\ntransport: None; RDMA device: Some(\"mlx5_0\")\nTCP\n  remote_read_all    64 KiB | 512 iters |     33.24 us/op |   1880.2 MiB/s | verified\n  remote_write_all   64 KiB | 512 iters |     31.14 us/op |   2007.2 MiB/s | verified\n  remote_read_all  1024 KiB | 128 iters |    383.70 us/op |   2606.2 MiB/s | verified\n  remote_write_all 1024 KiB | 128 iters |    178.55 us/op |   5600.7 MiB/s | verified\nWS\n  remote_read_all    64 KiB | 512 iters |     45.67 us/op |   1368.5 MiB/s | verified\n  remote_write_all   64 KiB | 512 iters |     41.54 us/op |   1504.7 MiB/s | verified\n  remote_read_all  1024 KiB | 128 iters |    221.84 us/op |   4507.7 MiB/s | verified\n  remote_write_all 1024 KiB | 128 iters |    197.52 us/op |   5062.8 MiB/s | verified\nHTTP\n  remote_read_all    64 KiB | 512 iters |     50.30 us/op |   1242.5 MiB/s | verified\n  remote_write_all   64 KiB | 512 iters |     48.45 us/op |   1289.9 MiB/s | verified\n  remote_read_all  1024 KiB | 128 iters |    521.44 us/op |   1917.8 MiB/s | verified\n  remote_write_all 1024 KiB | 128 iters |    284.96 us/op |   3509.3 MiB/s | verified\nRDMA\n  remote_read_all    64 KiB | 512 iters |     48.81 us/op |   1280.6 MiB/s | verified\n  remote_write_all   64 KiB | 512 iters |     48.06 us/op |   1300.4 MiB/s | verified\n  remote_read_all  1024 KiB | 128 iters |    159.55 us/op |   6267.7 MiB/s | verified\n  remote_write_all 1024 KiB | 128 iters |     99.58 us/op |  10042.4 MiB/s | verified\n"
+  },
+  "results": [
+    {
+      "transport": "TCP",
+      "operation": "remote_read_all",
+      "bytes": 65536,
+      "tasks": 1,
+      "baseline": {
+        "us_per_op": {
+          "samples": [
+            38.69,
+            37.77,
+            34.14
+          ],
+          "median": 37.77,
+          "min": 34.14,
+          "max": 38.69
+        },
+        "mib_per_second": {
+          "samples": [
+            1615.5,
+            1654.7,
+            1830.9
+          ],
+          "median": 1654.7,
+          "min": 1615.5,
+          "max": 1830.9
+        }
+      },
+      "current": {
+        "us_per_op": {
+          "samples": [
+            35.99,
+            34.33,
+            33.24
+          ],
+          "median": 34.33,
+          "min": 33.24,
+          "max": 35.99
+        },
+        "mib_per_second": {
+          "samples": [
+            1736.4,
+            1820.7,
+            1880.2
+          ],
+          "median": 1820.7,
+          "min": 1736.4,
+          "max": 1880.2
+        }
+      },
+      "median_change_percent": -9.107757479481082,
+      "comparison_metric": "us_per_op"
+    },
+    {
+      "transport": "TCP",
+      "operation": "remote_write_all",
+      "bytes": 65536,
+      "tasks": 1,
+      "baseline": {
+        "us_per_op": {
+          "samples": [
+            40.85,
+            32.84,
+            30.98
+          ],
+          "median": 32.84,
+          "min": 30.98,
+          "max": 40.85
+        },
+        "mib_per_second": {
+          "samples": [
+            1529.8,
+            1903.0,
+            2017.5
+          ],
+          "median": 1903.0,
+          "min": 1529.8,
+          "max": 2017.5
+        }
+      },
+      "current": {
+        "us_per_op": {
+          "samples": [
+            32.25,
+            31.42,
+            31.14
+          ],
+          "median": 31.42,
+          "min": 31.14,
+          "max": 32.25
+        },
+        "mib_per_second": {
+          "samples": [
+            1937.9,
+            1989.5,
+            2007.2
+          ],
+          "median": 1989.5,
+          "min": 1937.9,
+          "max": 2007.2
+        }
+      },
+      "median_change_percent": -4.323995127892822,
+      "comparison_metric": "us_per_op"
+    },
+    {
+      "transport": "TCP",
+      "operation": "remote_read_all",
+      "bytes": 1048576,
+      "tasks": 1,
+      "baseline": {
+        "us_per_op": {
+          "samples": [
+            625.77,
+            488.24,
+            639.36
+          ],
+          "median": 625.77,
+          "min": 488.24,
+          "max": 639.36
+        },
+        "mib_per_second": {
+          "samples": [
+            1598.0,
+            2048.2,
+            1564.1
+          ],
+          "median": 1598.0,
+          "min": 1564.1,
+          "max": 2048.2
+        }
+      },
+      "current": {
+        "us_per_op": {
+          "samples": [
+            375.52,
+            377.56,
+            383.7
+          ],
+          "median": 377.56,
+          "min": 375.52,
+          "max": 383.7
+        },
+        "mib_per_second": {
+          "samples": [
+            2663.0,
+            2648.6,
+            2606.2
+          ],
+          "median": 2648.6,
+          "min": 2606.2,
+          "max": 2663.0
+        }
+      },
+      "median_change_percent": -39.66473304888377,
+      "comparison_metric": "us_per_op"
+    },
+    {
+      "transport": "TCP",
+      "operation": "remote_write_all",
+      "bytes": 1048576,
+      "tasks": 1,
+      "baseline": {
+        "us_per_op": {
+          "samples": [
+            183.1,
+            183.62,
+            182.29
+          ],
+          "median": 183.1,
+          "min": 182.29,
+          "max": 183.62
+        },
+        "mib_per_second": {
+          "samples": [
+            5461.4,
+            5445.9,
+            5485.7
+          ],
+          "median": 5461.4,
+          "min": 5445.9,
+          "max": 5485.7
+        }
+      },
+      "current": {
+        "us_per_op": {
+          "samples": [
+            196.01,
+            184.86,
+            178.55
+          ],
+          "median": 184.86,
+          "min": 178.55,
+          "max": 196.01
+        },
+        "mib_per_second": {
+          "samples": [
+            5101.7,
+            5409.4,
+            5600.7
+          ],
+          "median": 5409.4,
+          "min": 5101.7,
+          "max": 5600.7
+        }
+      },
+      "median_change_percent": 0.9612233752048116,
+      "comparison_metric": "us_per_op"
+    },
+    {
+      "transport": "WS",
+      "operation": "remote_read_all",
+      "bytes": 65536,
+      "tasks": 1,
+      "baseline": {
+        "us_per_op": {
+          "samples": [
+            46.06,
+            44.36,
+            45.99
+          ],
+          "median": 45.99,
+          "min": 44.36,
+          "max": 46.06
+        },
+        "mib_per_second": {
+          "samples": [
+            1356.9,
+            1409.0,
+            1358.9
+          ],
+          "median": 1358.9,
+          "min": 1356.9,
+          "max": 1409.0
+        }
+      },
+      "current": {
+        "us_per_op": {
+          "samples": [
+            68.27,
+            43.7,
+            45.67
+          ],
+          "median": 45.67,
+          "min": 43.7,
+          "max": 68.27
+        },
+        "mib_per_second": {
+          "samples": [
+            915.4,
+            1430.3,
+            1368.5
+          ],
+          "median": 1368.5,
+          "min": 915.4,
+          "max": 1430.3
+        }
+      },
+      "median_change_percent": -0.6958034355294629,
+      "comparison_metric": "us_per_op"
+    },
+    {
+      "transport": "WS",
+      "operation": "remote_write_all",
+      "bytes": 65536,
+      "tasks": 1,
+      "baseline": {
+        "us_per_op": {
+          "samples": [
+            47.61,
+            41.56,
+            41.7
+          ],
+          "median": 41.7,
+          "min": 41.56,
+          "max": 47.61
+        },
+        "mib_per_second": {
+          "samples": [
+            1312.8,
+            1503.9,
+            1498.7
+          ],
+          "median": 1498.7,
+          "min": 1312.8,
+          "max": 1503.9
+        }
+      },
+      "current": {
+        "us_per_op": {
+          "samples": [
+            57.59,
+            41.52,
+            41.54
+          ],
+          "median": 41.54,
+          "min": 41.52,
+          "max": 57.59
+        },
+        "mib_per_second": {
+          "samples": [
+            1085.3,
+            1505.2,
+            1504.7
+          ],
+          "median": 1504.7,
+          "min": 1085.3,
+          "max": 1505.2
+        }
+      },
+      "median_change_percent": -0.3836930455635601,
+      "comparison_metric": "us_per_op"
+    },
+    {
+      "transport": "WS",
+      "operation": "remote_read_all",
+      "bytes": 1048576,
+      "tasks": 1,
+      "baseline": {
+        "us_per_op": {
+          "samples": [
+            225.87,
+            229.95,
+            222.85
+          ],
+          "median": 225.87,
+          "min": 222.85,
+          "max": 229.95
+        },
+        "mib_per_second": {
+          "samples": [
+            4427.4,
+            4348.7,
+            4487.3
+          ],
+          "median": 4427.4,
+          "min": 4348.7,
+          "max": 4487.3
+        }
+      },
+      "current": {
+        "us_per_op": {
+          "samples": [
+            222.46,
+            206.06,
+            221.84
+          ],
+          "median": 221.84,
+          "min": 206.06,
+          "max": 222.46
+        },
+        "mib_per_second": {
+          "samples": [
+            4495.2,
+            4853.0,
+            4507.7
+          ],
+          "median": 4507.7,
+          "min": 4495.2,
+          "max": 4853.0
+        }
+      },
+      "median_change_percent": -1.784212157435694,
+      "comparison_metric": "us_per_op"
+    },
+    {
+      "transport": "WS",
+      "operation": "remote_write_all",
+      "bytes": 1048576,
+      "tasks": 1,
+      "baseline": {
+        "us_per_op": {
+          "samples": [
+            186.29,
+            179.06,
+            182.49
+          ],
+          "median": 182.49,
+          "min": 179.06,
+          "max": 186.29
+        },
+        "mib_per_second": {
+          "samples": [
+            5368.0,
+            5584.8,
+            5479.7
+          ],
+          "median": 5479.7,
+          "min": 5368.0,
+          "max": 5584.8
+        }
+      },
+      "current": {
+        "us_per_op": {
+          "samples": [
+            188.97,
+            185.3,
+            197.52
+          ],
+          "median": 188.97,
+          "min": 185.3,
+          "max": 197.52
+        },
+        "mib_per_second": {
+          "samples": [
+            5291.8,
+            5396.6,
+            5062.8
+          ],
+          "median": 5291.8,
+          "min": 5062.8,
+          "max": 5396.6
+        }
+      },
+      "median_change_percent": 3.550879500246573,
+      "comparison_metric": "us_per_op"
+    },
+    {
+      "transport": "HTTP",
+      "operation": "remote_read_all",
+      "bytes": 65536,
+      "tasks": 1,
+      "baseline": {
+        "us_per_op": {
+          "samples": [
+            52.35,
+            52.75,
+            53.43
+          ],
+          "median": 52.75,
+          "min": 52.35,
+          "max": 53.43
+        },
+        "mib_per_second": {
+          "samples": [
+            1193.9,
+            1184.9,
+            1169.8
+          ],
+          "median": 1184.9,
+          "min": 1169.8,
+          "max": 1193.9
+        }
+      },
+      "current": {
+        "us_per_op": {
+          "samples": [
+            59.23,
+            49.09,
+            50.3
+          ],
+          "median": 50.3,
+          "min": 49.09,
+          "max": 59.23
+        },
+        "mib_per_second": {
+          "samples": [
+            1055.2,
+            1273.3,
+            1242.5
+          ],
+          "median": 1242.5,
+          "min": 1055.2,
+          "max": 1273.3
+        }
+      },
+      "median_change_percent": -4.644549763033179,
+      "comparison_metric": "us_per_op"
+    },
+    {
+      "transport": "HTTP",
+      "operation": "remote_write_all",
+      "bytes": 65536,
+      "tasks": 1,
+      "baseline": {
+        "us_per_op": {
+          "samples": [
+            50.19,
+            50.58,
+            51.18
+          ],
+          "median": 50.58,
+          "min": 50.19,
+          "max": 51.18
+        },
+        "mib_per_second": {
+          "samples": [
+            1245.4,
+            1235.6,
+            1221.2
+          ],
+          "median": 1235.6,
+          "min": 1221.2,
+          "max": 1245.4
+        }
+      },
+      "current": {
+        "us_per_op": {
+          "samples": [
+            49.27,
+            47.88,
+            48.45
+          ],
+          "median": 48.45,
+          "min": 47.88,
+          "max": 49.27
+        },
+        "mib_per_second": {
+          "samples": [
+            1268.5,
+            1305.4,
+            1289.9
+          ],
+          "median": 1289.9,
+          "min": 1268.5,
+          "max": 1305.4
+        }
+      },
+      "median_change_percent": -4.211150652431783,
+      "comparison_metric": "us_per_op"
+    },
+    {
+      "transport": "HTTP",
+      "operation": "remote_read_all",
+      "bytes": 1048576,
+      "tasks": 1,
+      "baseline": {
+        "us_per_op": {
+          "samples": [
+            322.24,
+            318.35,
+            760.5
+          ],
+          "median": 322.24,
+          "min": 318.35,
+          "max": 760.5
+        },
+        "mib_per_second": {
+          "samples": [
+            3103.3,
+            3141.2,
+            1314.9
+          ],
+          "median": 3103.3,
+          "min": 1314.9,
+          "max": 3141.2
+        }
+      },
+      "current": {
+        "us_per_op": {
+          "samples": [
+            515.31,
+            492.64,
+            521.44
+          ],
+          "median": 515.31,
+          "min": 492.64,
+          "max": 521.44
+        },
+        "mib_per_second": {
+          "samples": [
+            1940.6,
+            2029.9,
+            1917.8
+          ],
+          "median": 1940.6,
+          "min": 1917.8,
+          "max": 2029.9
+        }
+      },
+      "median_change_percent": 59.9149702085402,
+      "comparison_metric": "us_per_op"
+    },
+    {
+      "transport": "HTTP",
+      "operation": "remote_write_all",
+      "bytes": 1048576,
+      "tasks": 1,
+      "baseline": {
+        "us_per_op": {
+          "samples": [
+            294.28,
+            280.61,
+            285.2
+          ],
+          "median": 285.2,
+          "min": 280.61,
+          "max": 294.28
+        },
+        "mib_per_second": {
+          "samples": [
+            3398.1,
+            3563.7,
+            3506.3
+          ],
+          "median": 3506.3,
+          "min": 3398.1,
+          "max": 3563.7
+        }
+      },
+      "current": {
+        "us_per_op": {
+          "samples": [
+            280.03,
+            281.42,
+            284.96
+          ],
+          "median": 281.42,
+          "min": 280.03,
+          "max": 284.96
+        },
+        "mib_per_second": {
+          "samples": [
+            3571.1,
+            3553.4,
+            3509.3
+          ],
+          "median": 3553.4,
+          "min": 3509.3,
+          "max": 3571.1
+        }
+      },
+      "median_change_percent": -1.3253856942496367,
+      "comparison_metric": "us_per_op"
+    },
+    {
+      "transport": "RDMA",
+      "operation": "remote_read_all",
+      "bytes": 65536,
+      "tasks": 1,
+      "baseline": {
+        "us_per_op": {
+          "samples": [
+            38.84,
+            46.83,
+            39.55
+          ],
+          "median": 39.55,
+          "min": 38.84,
+          "max": 46.83
+        },
+        "mib_per_second": {
+          "samples": [
+            1609.1,
+            1334.6,
+            1580.2
+          ],
+          "median": 1580.2,
+          "min": 1334.6,
+          "max": 1609.1
+        }
+      },
+      "current": {
+        "us_per_op": {
+          "samples": [
+            40.34,
+            39.98,
+            48.81
+          ],
+          "median": 40.34,
+          "min": 39.98,
+          "max": 48.81
+        },
+        "mib_per_second": {
+          "samples": [
+            1549.1,
+            1563.4,
+            1280.6
+          ],
+          "median": 1549.1,
+          "min": 1280.6,
+          "max": 1563.4
+        }
+      },
+      "median_change_percent": 1.9974715549937017,
+      "comparison_metric": "us_per_op"
+    },
+    {
+      "transport": "RDMA",
+      "operation": "remote_write_all",
+      "bytes": 65536,
+      "tasks": 1,
+      "baseline": {
+        "us_per_op": {
+          "samples": [
+            40.09,
+            49.37,
+            39.33
+          ],
+          "median": 40.09,
+          "min": 39.33,
+          "max": 49.37
+        },
+        "mib_per_second": {
+          "samples": [
+            1558.9,
+            1265.9,
+            1589.2
+          ],
+          "median": 1558.9,
+          "min": 1265.9,
+          "max": 1589.2
+        }
+      },
+      "current": {
+        "us_per_op": {
+          "samples": [
+            38.46,
+            39.66,
+            48.06
+          ],
+          "median": 39.66,
+          "min": 38.46,
+          "max": 48.06
+        },
+        "mib_per_second": {
+          "samples": [
+            1625.2,
+            1575.9,
+            1300.4
+          ],
+          "median": 1575.9,
+          "min": 1300.4,
+          "max": 1625.2
+        }
+      },
+      "median_change_percent": -1.072586679970089,
+      "comparison_metric": "us_per_op"
+    },
+    {
+      "transport": "RDMA",
+      "operation": "remote_read_all",
+      "bytes": 1048576,
+      "tasks": 1,
+      "baseline": {
+        "us_per_op": {
+          "samples": [
+            118.0,
+            91.25,
+            105.75
+          ],
+          "median": 105.75,
+          "min": 91.25,
+          "max": 118.0
+        },
+        "mib_per_second": {
+          "samples": [
+            8474.3,
+            10958.6,
+            9456.2
+          ],
+          "median": 9456.2,
+          "min": 8474.3,
+          "max": 10958.6
+        }
+      },
+      "current": {
+        "us_per_op": {
+          "samples": [
+            100.94,
+            94.65,
+            159.55
+          ],
+          "median": 100.94,
+          "min": 94.65,
+          "max": 159.55
+        },
+        "mib_per_second": {
+          "samples": [
+            9907.0,
+            10565.3,
+            6267.7
+          ],
+          "median": 9907.0,
+          "min": 6267.7,
+          "max": 10565.3
+        }
+      },
+      "median_change_percent": -4.548463356973997,
+      "comparison_metric": "us_per_op"
+    },
+    {
+      "transport": "RDMA",
+      "operation": "remote_write_all",
+      "bytes": 1048576,
+      "tasks": 1,
+      "baseline": {
+        "us_per_op": {
+          "samples": [
+            99.33,
+            98.26,
+            98.23
+          ],
+          "median": 98.26,
+          "min": 98.23,
+          "max": 99.33
+        },
+        "mib_per_second": {
+          "samples": [
+            10067.6,
+            10177.1,
+            10180.4
+          ],
+          "median": 10177.1,
+          "min": 10067.6,
+          "max": 10180.4
+        }
+      },
+      "current": {
+        "us_per_op": {
+          "samples": [
+            250.12,
+            122.48,
+            99.58
+          ],
+          "median": 122.48,
+          "min": 99.58,
+          "max": 250.12
+        },
+        "mib_per_second": {
+          "samples": [
+            3998.1,
+            8164.8,
+            10042.4
+          ],
+          "median": 8164.8,
+          "min": 3998.1,
+          "max": 10042.4
+        }
+      },
+      "median_change_percent": 24.648890698147774,
+      "comparison_metric": "us_per_op"
+    }
+  ],
+  "placement": {
+    "cpu_ids": "0-7",
+    "numa_memory_node": 0,
+    "rdma_device": "mlx5_0"
+  },
+  "runs_per_version": 3,
+  "iterations": {
+    "warmup": 8,
+    "serial": {
+      "64KiB": 512,
+      "1MiB": 128
+    }
+  }
+}

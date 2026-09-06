@@ -1,0 +1,56 @@
+{
+  "baseline-tests": {
+    "passed": 473,
+    "failed": 0,
+    "ignored": 14
+  },
+  "refactor-tests": {
+    "passed": 498,
+    "failed": 0,
+    "ignored": 13
+  },
+  "commands": [
+    {
+      "command": "cargo build --workspace --all-features",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --workspace --all-features --no-fail-fast",
+      "status": "passed"
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check -p ruapc --no-default-features --lib",
+      "status": "passed"
+    },
+    {
+      "command": "RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps",
+      "status": "passed"
+    },
+    {
+      "command": "RUSTDOCFLAGS='-D warnings' cargo doc -p ruapc --no-default-features --no-deps",
+      "status": "passed"
+    },
+    {
+      "command": "cargo fmt --all -- --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo bench -p ruapc --bench echo --bench remote_memory --no-run --locked",
+      "status": "passed"
+    }
+  ],
+  "trybuild-cases": 14,
+  "baseline_commit": "36c8352",
+  "notes": [
+    "Final workspace suite: 498 passed, 0 failed, 13 ignored documentation examples.",
+    "After the workspace suite, only benchmark iteration controls and documentation/data changed. The final benchmark rebuilt successfully, and strict all-targets clippy plus rustfmt were rerun."
+  ]
+}

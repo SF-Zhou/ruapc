@@ -611,9 +611,8 @@ async fn run_roundtrip_test(transport: Transport) {
     let mut dst = ctx.state.buffer_pool.allocate(64 * 1024).unwrap();
     dst.set_len(payload.len());
 
-    let read_bufs = [src];
     let (written, buffers) = client
-        .with_read_buffers(&read_bufs)
+        .with_read_buffer(src)
         .with_write_buffers(vec![dst])
         .echo_reversed(&ctx, &EchoReq {})
         .await

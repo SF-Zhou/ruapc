@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use dashmap::DashMap;
 
-use crate::{AlignedMemory, Device, DeviceIndex, MemoryKey, Registration};
+use crate::{AlignedMemory, Device, DeviceIndex, MemoryKey, MemoryRegistrar, Registration};
 
 #[derive(Default)]
 struct TcpRegistry {
@@ -54,6 +54,12 @@ impl Registration for TcpMemoryRegistration {
 }
 
 impl Device for TcpDevice {
+    type Registrar = Self;
+
+    fn registrar(&self) -> &Self::Registrar {
+        self
+    }
+
     fn index(&self) -> DeviceIndex {
         self.index
     }
@@ -61,7 +67,12 @@ impl Device for TcpDevice {
     fn set_index(&mut self, idx: DeviceIndex) {
         self.index = idx;
     }
+}
 
+// SAFETY: the private registry only retains the region for registration lifetime.
+// Its only byte-access API requires the caller to prove allocation ownership and
+// read access. Dropping the handle removes the retained region from the registry.
+unsafe impl MemoryRegistrar for TcpDevice {
     fn register(&self, mem: &Arc<AlignedMemory>) -> std::io::Result<Box<dyn Registration>> {
         let id = self
             .registry
@@ -82,7 +93,14 @@ impl TcpDevice {
     /// Reads memory from a registered region by ID.
     ///
     /// This enables TCP-based remote memory reads (simulating RDMA read semantics).
-    pub fn read_memory(&self, id: u32, addr: u64, len: u64) -> std::io::Result<Vec<u8>> {
+    ///
+    /// # Safety
+    ///
+    /// The requested range must belong to a live allocation, and the caller must
+    /// prevent writes to that range until this method returns. Registration alone
+    /// only keeps the backing region alive; it does not prevent the pool from
+    /// recycling an individual allocation.
+    pub unsafe fn read_memory(&self, id: u32, addr: u64, len: u64) -> std::io::Result<Vec<u8>> {
         let entry = self.registry.map.get(&id).ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -107,7 +125,12 @@ impl TcpDevice {
         }
 
         let offset = (addr - region_start) as usize;
-        Ok(mem.as_slice()[offset..offset + len as usize].to_vec())
+        // SAFETY: bounds were checked against the live registration, and the
+        // caller guarantees this allocation remains readable during the copy.
+        // Borrow only the requested range: other allocations in the same region
+        // may legitimately be mutated concurrently.
+        let bytes = unsafe { std::slice::from_raw_parts(mem.as_ptr().add(offset), len as usize) };
+        Ok(bytes.to_vec())
     }
 }
 

@@ -121,7 +121,7 @@ impl State {
                     if !rdma_device_allowed(dev.info(), prefer_rxe, &rdma.path) {
                         continue;
                     }
-                    devices.add_rdma_device(dev);
+                    devices.push(crate::rdma::RdmaDevice::new(dev));
                 }
             }
             devices

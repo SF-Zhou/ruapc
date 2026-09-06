@@ -23,11 +23,19 @@ impl MemoryRegion {
     ///
     /// The returned `MemoryRegion` holds a clone of the `Arc`, ensuring the
     /// memory stays alive until the MR is dropped and deregistered.
+    /// Only virtual-address registration is supported: owned work requests
+    /// use buffer pointers, so offset-based addressing is rejected.
     pub fn register(
         pd: &Arc<ProtectionDomain>,
         memory: &Arc<AlignedMemory>,
         access: c_int,
     ) -> Result<Self> {
+        if access & crate::ibv_access_flags::IBV_ACCESS_ZERO_BASED.0 as c_int != 0 {
+            return Err(crate::Error::new(
+                ErrorKind::IBRegMemoryRegionFail,
+                "offset-based memory registration is unsupported".into(),
+            ));
+        }
         let ptr = unsafe {
             crate::ruapc_ibv_reg_mr(pd.as_ptr(), memory.as_mut_ptr() as _, memory.size(), access)
         };
@@ -69,7 +77,11 @@ impl MemoryRegion {
 
 impl Drop for MemoryRegion {
     fn drop(&mut self) {
-        let _ = unsafe { crate::ruapc_ibv_dereg_mr(self.ptr) };
+        // A failed deregistration must not release the backing memory while
+        // the device can still resolve this mapping.
+        if unsafe { crate::ruapc_ibv_dereg_mr(self.ptr) } != 0 {
+            std::process::abort();
+        }
     }
 }
 
@@ -104,6 +116,15 @@ mod tests {
 
     use crate::test_utils::open_device;
     use crate::*;
+
+    #[test]
+    fn rejects_offset_addressing_for_owned_buffer_operations() {
+        let dev = open_device();
+        let memory = Arc::new(AlignedMemory::new(4096).unwrap());
+        let access =
+            ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0 | ibv_access_flags::IBV_ACCESS_ZERO_BASED.0;
+        assert!(MemoryRegion::register(dev.pd(), &memory, access as _).is_err());
+    }
 
     #[test]
     fn test_memory_region_register() {

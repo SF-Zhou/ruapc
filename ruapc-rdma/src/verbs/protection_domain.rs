@@ -33,6 +33,10 @@ impl ProtectionDomain {
     pub fn as_ptr(&self) -> *mut crate::ibv_pd {
         self.ptr
     }
+
+    pub(super) fn context(&self) -> &Arc<Context> {
+        &self._context
+    }
 }
 
 impl Drop for ProtectionDomain {

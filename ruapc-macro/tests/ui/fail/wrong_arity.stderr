@@ -1,7 +1,5 @@
-error: custom attribute panicked
- --> tests/ui/fail/wrong_arity.rs:3:1
+error: RPC methods require exactly three arguments: `&self`, `&Context`, and `&Request`
+ --> tests/ui/fail/wrong_arity.rs:5:20
   |
-3 | #[ruapc::service]
-  | ^^^^^^^^^^^^^^^^^
-  |
-  = help: message: the function should be in the form `async fn func(&self, ctx: &Context, req: &Req) -> Result<Rsp>`.
+5 |     async fn hello(&self, ctx: &ruapc::Context) -> ruapc::Result<String>;
+  |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^

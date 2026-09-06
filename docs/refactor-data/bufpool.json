@@ -1,0 +1,717 @@
+{
+  "latest_tls": {
+    "description": "Latest production library: separated BuddyState and borrowed TLS shard hit path; original std mutex, original sibling scan; no parking_lot or packed mask",
+    "correctness": "71 unit tests + 2 doctests, clippy --all-targets -- -D warnings passed in isolated workspace before copying production files. Root runs final workspace checks.",
+    "source_verification": {
+      "ruapc-bufpool/src/thread_cache.rs": {
+        "sha256": "2b04fd0a1151e71adbd1430d941c0513c9ee236f1198406b482ebc7be9a83f9d",
+        "matches_validated_scratch": true
+      },
+      "ruapc-bufpool/src/pool/small.rs": {
+        "sha256": "9567130aa04dcfc18f72a6e57b5233ce30556b4ff396a14d4fe4dcbffec45e89",
+        "matches_validated_scratch": true
+      },
+      "ruapc-bufpool/src/pool/tests.rs": {
+        "sha256": "3d8aa7b259a0d6ed83fb162ab09db9246339941af9267e2b776fcaac5ab968e2",
+        "matches_validated_scratch": true
+      }
+    },
+    "full_matrix": {
+      "harness": "Identical optional-pin contention harness for original library and latest TLS library; production benchmark subsequently gained size/thread filters only",
+      "placement": "worker i = CPU 96+i, coordinator CPU112, NUMA1 memory",
+      "raw_files": {
+        "baseline": [
+          "bufpool-raw.json::ruapc-bufpool-tls-matrix-baseline-0.log",
+          "bufpool-raw.json::ruapc-bufpool-tls-matrix-baseline-1.log",
+          "bufpool-raw.json::ruapc-bufpool-tls-matrix-baseline-2.log"
+        ],
+        "tls": [
+          "bufpool-raw.json::ruapc-bufpool-tls-matrix-tls-0.log",
+          "bufpool-raw.json::ruapc-bufpool-tls-matrix-tls-1.log",
+          "bufpool-raw.json::ruapc-bufpool-tls-matrix-tls-2.log"
+        ]
+      },
+      "results": {
+        "buddy_1mib_1threads": {
+          "baseline_ns": {
+            "median": 45.6,
+            "min": 45.1,
+            "max": 46.0,
+            "samples": [
+              45.1,
+              46.0,
+              45.6
+            ]
+          },
+          "current_ns": {
+            "median": 39.8,
+            "min": 39.8,
+            "max": 39.9,
+            "samples": [
+              39.8,
+              39.9,
+              39.8
+            ]
+          },
+          "median_latency_change_percent": -12.719298245614041
+        },
+        "buddy_1mib_2threads": {
+          "baseline_ns": {
+            "median": 258.2,
+            "min": 250.9,
+            "max": 261.1,
+            "samples": [
+              258.2,
+              261.1,
+              250.9
+            ]
+          },
+          "current_ns": {
+            "median": 276.3,
+            "min": 272.3,
+            "max": 297.2,
+            "samples": [
+              276.3,
+              272.3,
+              297.2
+            ]
+          },
+          "median_latency_change_percent": 7.01006971340048
+        },
+        "buddy_1mib_4threads": {
+          "baseline_ns": {
+            "median": 713.6,
+            "min": 707.1,
+            "max": 773.1,
+            "samples": [
+              773.1,
+              713.6,
+              707.1
+            ]
+          },
+          "current_ns": {
+            "median": 728.3,
+            "min": 696.1,
+            "max": 729.0,
+            "samples": [
+              696.1,
+              728.3,
+              729.0
+            ]
+          },
+          "median_latency_change_percent": 2.059977578475336
+        },
+        "buddy_1mib_8threads": {
+          "baseline_ns": {
+            "median": 2589.4,
+            "min": 2555.0,
+            "max": 2608.6,
+            "samples": [
+              2555.0,
+              2608.6,
+              2589.4
+            ]
+          },
+          "current_ns": {
+            "median": 2343.5,
+            "min": 2298.3,
+            "max": 2396.1,
+            "samples": [
+              2343.5,
+              2298.3,
+              2396.1
+            ]
+          },
+          "median_latency_change_percent": -9.49640843438635
+        },
+        "buddy_1mib_16threads": {
+          "baseline_ns": {
+            "median": 9753.2,
+            "min": 9607.9,
+            "max": 10214.3,
+            "samples": [
+              9753.2,
+              10214.3,
+              9607.9
+            ]
+          },
+          "current_ns": {
+            "median": 8895.0,
+            "min": 8575.6,
+            "max": 9250.8,
+            "samples": [
+              8575.6,
+              8895.0,
+              9250.8
+            ]
+          },
+          "median_latency_change_percent": -8.799163351515404
+        },
+        "slab_64kib_1threads": {
+          "baseline_ns": {
+            "median": 58.6,
+            "min": 58.2,
+            "max": 58.7,
+            "samples": [
+              58.7,
+              58.6,
+              58.2
+            ]
+          },
+          "current_ns": {
+            "median": 47.5,
+            "min": 46.8,
+            "max": 47.9,
+            "samples": [
+              47.9,
+              47.5,
+              46.8
+            ]
+          },
+          "median_latency_change_percent": -18.941979522184305
+        },
+        "slab_64kib_2threads": {
+          "baseline_ns": {
+            "median": 99.3,
+            "min": 99.0,
+            "max": 99.5,
+            "samples": [
+              99.0,
+              99.3,
+              99.5
+            ]
+          },
+          "current_ns": {
+            "median": 87.1,
+            "min": 77.3,
+            "max": 90.5,
+            "samples": [
+              90.5,
+              77.3,
+              87.1
+            ]
+          },
+          "median_latency_change_percent": -12.286002014098695
+        },
+        "slab_64kib_4threads": {
+          "baseline_ns": {
+            "median": 142.6,
+            "min": 142.6,
+            "max": 143.3,
+            "samples": [
+              143.3,
+              142.6,
+              142.6
+            ]
+          },
+          "current_ns": {
+            "median": 153.4,
+            "min": 153.1,
+            "max": 153.9,
+            "samples": [
+              153.9,
+              153.4,
+              153.1
+            ]
+          },
+          "median_latency_change_percent": 7.573632538569441
+        },
+        "slab_64kib_8threads": {
+          "baseline_ns": {
+            "median": 272.3,
+            "min": 271.9,
+            "max": 272.3,
+            "samples": [
+              271.9,
+              272.3,
+              272.3
+            ]
+          },
+          "current_ns": {
+            "median": 282.8,
+            "min": 272.3,
+            "max": 283.5,
+            "samples": [
+              283.5,
+              272.3,
+              282.8
+            ]
+          },
+          "median_latency_change_percent": 3.8560411311054033
+        },
+        "slab_64kib_16threads": {
+          "baseline_ns": {
+            "median": 692.2,
+            "min": 683.3,
+            "max": 696.0,
+            "samples": [
+              692.2,
+              683.3,
+              696.0
+            ]
+          },
+          "current_ns": {
+            "median": 697.8,
+            "min": 694.6,
+            "max": 699.2,
+            "samples": [
+              699.2,
+              697.8,
+              694.6
+            ]
+          },
+          "median_latency_change_percent": 0.809014735625535
+        }
+      }
+    },
+    "single_case_first_pool": {
+      "harness": "bufpool-raw.json::ruapc-bufpool-isolated-harness.rs",
+      "placement": "same worker identities and NUMA1; fresh process and first pool for each case",
+      "results": {
+        "slab_64kib_4threads": {
+          "baseline_ns": {
+            "median": 153.3,
+            "min": 153.0,
+            "max": 153.4,
+            "samples": [
+              153.2,
+              153.1,
+              153.0,
+              153.4,
+              153.4,
+              153.3,
+              153.3,
+              153.4,
+              153.2
+            ]
+          },
+          "current_ns": {
+            "median": 153.3,
+            "min": 152.9,
+            "max": 153.5,
+            "samples": [
+              153.3,
+              152.9,
+              153.3,
+              153.2,
+              153.5,
+              153.3,
+              153.4,
+              153.0,
+              153.2
+            ]
+          },
+          "median_latency_change_percent": 0.0,
+          "allocation_metadata": {
+            "baseline": [
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3024,
+                "pool_size": 832,
+                "held_strong_count": 6
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3024,
+                "pool_size": 832,
+                "held_strong_count": 6
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3024,
+                "pool_size": 832,
+                "held_strong_count": 6
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3024,
+                "pool_size": 832,
+                "held_strong_count": 6
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3024,
+                "pool_size": 832,
+                "held_strong_count": 6
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3024,
+                "pool_size": 832,
+                "held_strong_count": 6
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3024,
+                "pool_size": 832,
+                "held_strong_count": 6
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3024,
+                "pool_size": 832,
+                "held_strong_count": 6
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3024,
+                "pool_size": 832,
+                "held_strong_count": 6
+              }
+            ],
+            "tls": [
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3024,
+                "pool_size": 832,
+                "held_strong_count": 5
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3024,
+                "pool_size": 832,
+                "held_strong_count": 5
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3024,
+                "pool_size": 832,
+                "held_strong_count": 5
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3024,
+                "pool_size": 832,
+                "held_strong_count": 5
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3024,
+                "pool_size": 832,
+                "held_strong_count": 5
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3024,
+                "pool_size": 832,
+                "held_strong_count": 5
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3024,
+                "pool_size": 832,
+                "held_strong_count": 5
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3024,
+                "pool_size": 832,
+                "held_strong_count": 5
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3024,
+                "pool_size": 832,
+                "held_strong_count": 5
+              }
+            ]
+          },
+          "raw_files": {
+            "baseline": [
+              "bufpool-raw.json::ruapc-bufpool-isolated-baseline-0.log",
+              "bufpool-raw.json::ruapc-bufpool-isolated-baseline-1.log",
+              "bufpool-raw.json::ruapc-bufpool-isolated-baseline-2.log",
+              "bufpool-raw.json::ruapc-bufpool-isolated-baseline-3.log",
+              "bufpool-raw.json::ruapc-bufpool-isolated-baseline-4.log",
+              "bufpool-raw.json::ruapc-bufpool-isolated-baseline-5.log",
+              "bufpool-raw.json::ruapc-bufpool-isolated-baseline-6.log",
+              "bufpool-raw.json::ruapc-bufpool-isolated-baseline-7.log",
+              "bufpool-raw.json::ruapc-bufpool-isolated-baseline-8.log"
+            ],
+            "tls": [
+              "bufpool-raw.json::ruapc-bufpool-isolated-tls-0.log",
+              "bufpool-raw.json::ruapc-bufpool-isolated-tls-1.log",
+              "bufpool-raw.json::ruapc-bufpool-isolated-tls-2.log",
+              "bufpool-raw.json::ruapc-bufpool-isolated-tls-3.log",
+              "bufpool-raw.json::ruapc-bufpool-isolated-tls-4.log",
+              "bufpool-raw.json::ruapc-bufpool-isolated-tls-5.log",
+              "bufpool-raw.json::ruapc-bufpool-isolated-tls-6.log",
+              "bufpool-raw.json::ruapc-bufpool-isolated-tls-7.log",
+              "bufpool-raw.json::ruapc-bufpool-isolated-tls-8.log"
+            ]
+          }
+        },
+        "buddy_1mib_2threads": {
+          "baseline_ns": {
+            "median": 330.3,
+            "min": 319.1,
+            "max": 344.3,
+            "samples": [
+              344.3,
+              329.7,
+              342.5,
+              323.6,
+              338.1,
+              319.1,
+              322.7,
+              330.3,
+              343.9
+            ]
+          },
+          "current_ns": {
+            "median": 273.5,
+            "min": 233.2,
+            "max": 284.1,
+            "samples": [
+              270.6,
+              275.1,
+              273.5,
+              271.6,
+              256.0,
+              282.1,
+              277.0,
+              233.2,
+              284.1
+            ]
+          },
+          "median_latency_change_percent": -17.196488041174696,
+          "allocation_metadata": {
+            "baseline": [
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3280,
+                "pool_size": 832,
+                "held_strong_count": 3
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3280,
+                "pool_size": 832,
+                "held_strong_count": 3
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3280,
+                "pool_size": 832,
+                "held_strong_count": 3
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3280,
+                "pool_size": 832,
+                "held_strong_count": 3
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3280,
+                "pool_size": 832,
+                "held_strong_count": 3
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3280,
+                "pool_size": 832,
+                "held_strong_count": 3
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3280,
+                "pool_size": 832,
+                "held_strong_count": 3
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3280,
+                "pool_size": 832,
+                "held_strong_count": 3
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3280,
+                "pool_size": 832,
+                "held_strong_count": 3
+              }
+            ],
+            "tls": [
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3024,
+                "pool_size": 832,
+                "held_strong_count": 3
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3024,
+                "pool_size": 832,
+                "held_strong_count": 3
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3024,
+                "pool_size": 832,
+                "held_strong_count": 3
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3024,
+                "pool_size": 832,
+                "held_strong_count": 3
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3024,
+                "pool_size": 832,
+                "held_strong_count": 3
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3024,
+                "pool_size": 832,
+                "held_strong_count": 3
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3024,
+                "pool_size": 832,
+                "held_strong_count": 3
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3024,
+                "pool_size": 832,
+                "held_strong_count": 3
+              },
+              {
+                "counter_phase64": 16,
+                "counter_phase4096": 3024,
+                "pool_size": 832,
+                "held_strong_count": 3
+              }
+            ]
+          },
+          "raw_files": {
+            "baseline": [
+              "bufpool-raw.json::ruapc-bufpool-buddy-isolated-baseline-0.log",
+              "bufpool-raw.json::ruapc-bufpool-buddy-isolated-baseline-1.log",
+              "bufpool-raw.json::ruapc-bufpool-buddy-isolated-baseline-2.log",
+              "bufpool-raw.json::ruapc-bufpool-buddy-isolated-baseline-3.log",
+              "bufpool-raw.json::ruapc-bufpool-buddy-isolated-baseline-4.log",
+              "bufpool-raw.json::ruapc-bufpool-buddy-isolated-baseline-5.log",
+              "bufpool-raw.json::ruapc-bufpool-buddy-isolated-baseline-6.log",
+              "bufpool-raw.json::ruapc-bufpool-buddy-isolated-baseline-7.log",
+              "bufpool-raw.json::ruapc-bufpool-buddy-isolated-baseline-8.log"
+            ],
+            "tls": [
+              "bufpool-raw.json::ruapc-bufpool-buddy-isolated-tls-0.log",
+              "bufpool-raw.json::ruapc-bufpool-buddy-isolated-tls-1.log",
+              "bufpool-raw.json::ruapc-bufpool-buddy-isolated-tls-2.log",
+              "bufpool-raw.json::ruapc-bufpool-buddy-isolated-tls-3.log",
+              "bufpool-raw.json::ruapc-bufpool-buddy-isolated-tls-4.log",
+              "bufpool-raw.json::ruapc-bufpool-buddy-isolated-tls-5.log",
+              "bufpool-raw.json::ruapc-bufpool-buddy-isolated-tls-6.log",
+              "bufpool-raw.json::ruapc-bufpool-buddy-isolated-tls-7.log",
+              "bufpool-raw.json::ruapc-bufpool-buddy-isolated-tls-8.log"
+            ]
+          }
+        }
+      }
+    },
+    "additional_buddy2_samples": "bufpool-raw.json::ruapc-bufpool-tls-extra-two-cores.log (6 pairs; with matrix 3 gives 9; sequential prefix yields baseline median260.5/current284.5ns)",
+    "field_offsets": {
+      "raw_evidence": "bufpool-raw.json::ruapc-bufpool-final-field-offsets.txt",
+      "relative_to": "ArcInner strong-count base",
+      "baseline_and_tls": {
+        "buddy_mutex_word": "0x180",
+        "thread_cache": "0x348",
+        "has_demand": "0x349"
+      },
+      "first_pool_cache_line_phases": {
+        "strong_counter": 16,
+        "buddy_mutex_word": 16,
+        "thread_cache": 24,
+        "has_demand": 25
+      },
+      "interpretation": "Offsets match in original and TLS binaries. Counter and mutex/flags occupy different cache lines; no field-layout change explains the observed matrix variance."
+    }
+  },
+  "pre_tls_state": {
+    "description": "Fully separated BuddyState and mmap/ownership fixes, before TLS Arc-elision optimization. Do not label these binaries latest TLS.",
+    "lazy_merge_raw_files": {
+      "baseline": [
+        "bufpool-raw.json::ruapc-bufpool-validated-lazy_merge-baseline-0.log",
+        "bufpool-raw.json::ruapc-bufpool-validated-lazy_merge-baseline-1.log",
+        "bufpool-raw.json::ruapc-bufpool-validated-lazy_merge-baseline-2.log"
+      ],
+      "state": [
+        "bufpool-raw.json::ruapc-bufpool-validated-lazy_merge-state-0.log",
+        "bufpool-raw.json::ruapc-bufpool-validated-lazy_merge-state-1.log",
+        "bufpool-raw.json::ruapc-bufpool-validated-lazy_merge-state-2.log"
+      ]
+    },
+    "lazy_merge_note": "Default lazy policy latencies improved 6.9–12.6% in this dataset. Latest TLS change executes only for <=256KiB allocations; lazy_merge benchmark allocates >=1MiB, but these logs still correspond to the preTLS binary."
+  },
+  "initialization": {
+    "description": "Before BuddyState/TLS refactors; exactly the same final AlignedMemory backend. Timings cover mmap initialization, not latest whole-library hot path.",
+    "units": "microseconds per 64MiB allocation/free pair, 64 iterations with 4 warmups",
+    "raw_files": [
+      "bufpool-raw.json::ruapc-bufpool-standard-initialization-0.log",
+      "bufpool-raw.json::ruapc-bufpool-standard-initialization-1.log",
+      "bufpool-raw.json::ruapc-bufpool-standard-initialization-2.log"
+    ],
+    "results": {
+      "system_alloc_uninitialized": {
+        "median": 3.6,
+        "min": 3.57,
+        "max": 3.66,
+        "samples": [
+          3.6,
+          3.66,
+          3.57
+        ]
+      },
+      "system_alloc_zeroed": {
+        "median": 3046.35,
+        "min": 3002.2,
+        "max": 3062.91,
+        "samples": [
+          3062.91,
+          3046.35,
+          3002.2
+        ]
+      },
+      "aligned_memory_mmap": {
+        "median": 1.32,
+        "min": 1.27,
+        "max": 1.37,
+        "samples": [
+          1.27,
+          1.32,
+          1.37
+        ]
+      },
+      "aligned_memory_first_full_write": {
+        "median": 3274.89,
+        "min": 3219.85,
+        "max": 3286.94,
+        "samples": [
+          3286.94,
+          3219.85,
+          3274.89
+        ]
+      }
+    },
+    "platform_limit": "Linux 64-bit uses mmap with lazy zero pages; other targets use alloc_zeroed, whose cold cost can be much higher. Pooled reuse does not clear bytes."
+  },
+  "interpretation": [
+    "Fixed worker full matrix retains slab4 regression (~7.6%) and buddy2 median variation; do not report universal improvement.",
+    "Identical first-pool slab4 diagnostic yields median153.3ns in both versions over9 pairs with matching size and address phases. Sequential143vs153ns is not reproduced when allocation history is controlled.",
+    "First-pool buddy2 diagnostic reverses direction (330.3ns original vs273.5ns TLS), with different page offsets. This demonstrates sensitivity to process allocation history/address placement; does not prove a universal speedup.",
+    "TLS optimization removes4 transient CacheShard Arc counter operations per allocate/free pair, adds no locks/heap allocations on hits, and materially improves uncontended and2-thread slab latency.",
+    "Production benchmark now supports RUAPC_BENCH_CPU_BASE, RUAPC_BENCH_SIZE and RUAPC_BENCH_THREADS for per-case reproduction. Diagnostic address logging exists only in /tmp harnesses."
+  ],
+  "excluded_datasets": [
+    "ruapc-bufpool-final-contention-*.log and ruapc-bufpool-final-lazy_merge-*.log are rejected parking_lot experiment comparisons, not final production data",
+    "ruapc-probe-current and its current column were stale diagnostic builds",
+    "Earlier standard/state matrices predate latest TLS and have different process placement; retain as history, not headline evidence"
+  ]
+}

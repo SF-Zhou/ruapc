@@ -49,8 +49,8 @@ tokio-tungstenite.workspace = true
 futures-util.workspace = true
 libc.workspace = true
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "forbid"
 
 [dev-dependencies]
 # Self dev-dependency: enables the `rdma` feature for this crate's own unit,
@@ -62,4 +62,8 @@ reqwest = { version = "0.12", features = ["json"] }
 
 [[bench]]
 name = "echo"
+harness = false
+
+[[bench]]
+name = "remote_memory"
 harness = false

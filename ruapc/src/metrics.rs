@@ -46,6 +46,17 @@ pub(crate) struct MethodMetrics {
 }
 
 impl MethodMetrics {
+    /// Starts accounting that settles on completion, cancellation or panic.
+    #[inline]
+    pub(crate) fn start(self) -> MethodCall {
+        self.requests.increment(1);
+        self.inflight.increment(1.0);
+        MethodCall {
+            metrics: self,
+            start: std::time::Instant::now(),
+        }
+    }
+
     fn new(side: &'static str, method: &str) -> Self {
         let method = method.to_string();
         Self {
@@ -54,6 +65,27 @@ impl MethodMetrics {
             inflight: gauge!(format!("ruapc_{side}_inflight"), "method" => method.clone()),
             latency: histogram!(format!("ruapc_{side}_latency_seconds"), "method" => method),
         }
+    }
+}
+
+/// Owns only existing facade handles; no allocation or timer registration.
+pub(crate) struct MethodCall {
+    metrics: MethodMetrics,
+    start: std::time::Instant,
+}
+
+impl MethodCall {
+    pub(crate) fn failed(&self) {
+        self.metrics.errors.increment(1);
+    }
+}
+
+impl Drop for MethodCall {
+    fn drop(&mut self) {
+        self.metrics
+            .latency
+            .record(self.start.elapsed().as_secs_f64());
+        self.metrics.inflight.decrement(1.0);
     }
 }
 

@@ -1,7 +1,5 @@
-error: custom attribute panicked
- --> tests/ui/fail/reserved_name.rs:3:1
+error: `ruapc_export` and `ruapc_request` are reserved method names
+ --> tests/ui/fail/reserved_name.rs:5:14
   |
-3 | #[ruapc::service]
-  | ^^^^^^^^^^^^^^^^^
-  |
-  = help: message: the function cannot be named `ruapc_export` or `ruapc_request`!
+5 |     async fn ruapc_export(&self, ctx: &ruapc::Context, req: &String) -> ruapc::Result<String>;
+  |              ^^^^^^^^^^^^

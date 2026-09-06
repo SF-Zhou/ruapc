@@ -23,10 +23,10 @@ use crate::{
 };
 
 /// WebSocket protocol limits aligned with the TCP transport's
-/// [`MAX_MSG_SIZE`](crate::sockets::tcp::MAX_MSG_SIZE).
+/// [`MAX_MSG_SIZE`](crate::msg::frame::MAX_MSG_SIZE).
 pub(crate) fn web_socket_config() -> tungstenite::protocol::WebSocketConfig {
     tungstenite::protocol::WebSocketConfig::default()
-        .max_message_size(Some(tcp::MAX_MSG_SIZE))
+        .max_message_size(Some(crate::msg::frame::MAX_MSG_SIZE))
         .max_frame_size(Some(16 << 20))
 }
 

@@ -21,12 +21,10 @@
 //! spoofed by an address reuse.
 
 use std::cell::RefCell;
-use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::BufferPool;
-use crate::buddy::BuddyBlock;
-use crate::slab::NUM_SLAB_CLASSES;
+use crate::slab::{NUM_SLAB_CLASSES, RawChunk};
 
 /// Maximum cached chunks per slab class (16 KiB, 64 KiB, 256 KiB): at most
 /// 2 MiB per class per thread (1 MiB for the 16 KiB class).
@@ -35,19 +33,6 @@ pub(crate) const MAG_CAP: [usize; NUM_SLAB_CLASSES] = [64, 32, 8];
 /// Number of chunks transferred from the shared slab layer on a refill
 /// (half a magazine, so a refill is not immediately undone by frees).
 pub(crate) const MAG_REFILL: [usize; NUM_SLAB_CLASSES] = [32, 16, 4];
-
-/// A cached chunk: the raw parts of a slab-chunk [`crate::Buffer`] minus the
-/// pool reference.
-#[derive(Clone, Copy)]
-pub(crate) struct RawChunk {
-    pub(crate) ptr: NonNull<u8>,
-    pub(crate) index: usize,
-    pub(crate) block: NonNull<BuddyBlock>,
-}
-
-// SAFETY: a RawChunk represents exclusive ownership of a chunk of pool
-// memory, exactly like the Buffer it was extracted from.
-unsafe impl Send for RawChunk {}
 
 /// One thread's cached chunks for one pool.
 ///
@@ -124,6 +109,52 @@ impl Drop for Registry {
 
 thread_local! {
     static REGISTRY: RefCell<Registry> = RefCell::new(Registry::default());
+}
+
+/// Borrows an existing shard for a single magazine operation. The callback must
+/// not allocate from, return buffers to, or reclaim capacity from the pool:
+/// those operations may reenter TLS. No reference escapes this borrow.
+fn with_existing_shard<T>(
+    pool: &Arc<BufferPool>,
+    operation: impl FnOnce(&CacheShard) -> T,
+) -> Option<T> {
+    REGISTRY
+        .try_with(|registry| {
+            let registry = registry.borrow();
+            registry
+                .entries
+                .iter()
+                .find(|entry| std::ptr::eq(entry.pool.as_ptr(), Arc::as_ptr(pool)))
+                .map(|entry| operation(&entry.shard))
+        })
+        .ok()
+        .flatten()
+}
+
+/// Takes a chunk without cloning the shard's Arc on a cache hit.
+pub(crate) fn pop_cached(pool: &Arc<BufferPool>, class: usize) -> Option<RawChunk> {
+    with_existing_shard(pool, |shard| shard.pop(class)).flatten()
+}
+
+/// Pushes through a borrowed shard, registering one on the first return from
+/// this thread. Overflow is handed back only after releasing the TLS borrow.
+/// During thread destruction the untouched token returns to the caller.
+pub(crate) fn push_cached(
+    pool: &Arc<BufferPool>,
+    class: usize,
+    chunk: RawChunk,
+) -> Result<Option<Vec<RawChunk>>, RawChunk> {
+    let mut chunk = Some(chunk);
+    if let Some(overflow) =
+        with_existing_shard(pool, |shard| shard.push(class, chunk.take().unwrap()))
+    {
+        return Ok(overflow);
+    }
+    let chunk = chunk.unwrap();
+    match shard_for(pool) {
+        Some(shard) => Ok(shard.push(class, chunk)),
+        None => Err(chunk),
+    }
 }
 
 /// Returns the current thread's cache shard for `pool`, registering a new

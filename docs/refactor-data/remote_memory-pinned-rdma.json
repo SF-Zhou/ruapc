@@ -1,0 +1,658 @@
+{
+  "description": "Existing long-sample binaries, RDMA only, 1000 warmups and 5000 measurements per case. CPU assignments applied externally after thread creation. All nine alternating pairs retained.",
+  "placement": {
+    "memory_node": 0,
+    "rdma_device": "mlx5_0",
+    "tokio_workers": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "main": 4,
+    "pollers": [
+      6,
+      7
+    ]
+  },
+  "thread_mappings": {
+    "ruapc-final-pinned-rdma-baseline-1.log": [
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 0
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 1
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 2
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 3
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 6
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 7
+      }
+    ],
+    "ruapc-final-pinned-rdma-current-1.log": [
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 0
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 1
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 2
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 3
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 6
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 7
+      }
+    ],
+    "ruapc-final-pinned-rdma-current-2.log": [
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 0
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 1
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 2
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 3
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 6
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 7
+      }
+    ],
+    "ruapc-final-pinned-rdma-baseline-2.log": [
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 0
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 1
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 2
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 3
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 6
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 7
+      }
+    ],
+    "ruapc-final-pinned-rdma-baseline-3.log": [
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 0
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 1
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 2
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 3
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 6
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 7
+      }
+    ],
+    "ruapc-final-pinned-rdma-current-3.log": [
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 0
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 1
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 2
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 3
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 6
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 7
+      }
+    ],
+    "ruapc-final-pinned-rdma-current-4.log": [
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 0
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 1
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 2
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 3
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 6
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 7
+      }
+    ],
+    "ruapc-final-pinned-rdma-baseline-4.log": [
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 0
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 1
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 2
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 3
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 6
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 7
+      }
+    ],
+    "ruapc-final-pinned-rdma-baseline-5.log": [
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 0
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 1
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 2
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 3
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 6
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 7
+      }
+    ],
+    "ruapc-final-pinned-rdma-current-5.log": [
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 0
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 1
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 2
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 3
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 6
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 7
+      }
+    ],
+    "ruapc-final-pinned-rdma-current-6.log": [
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 0
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 1
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 2
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 3
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 6
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 7
+      }
+    ],
+    "ruapc-final-pinned-rdma-baseline-6.log": [
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 0
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 1
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 2
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 3
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 6
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 7
+      }
+    ],
+    "ruapc-final-pinned-rdma-baseline-7.log": [
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 0
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 1
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 2
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 3
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 6
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 7
+      }
+    ],
+    "ruapc-final-pinned-rdma-current-7.log": [
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 0
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 1
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 2
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 3
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 6
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 7
+      }
+    ],
+    "ruapc-final-pinned-rdma-current-8.log": [
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 0
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 1
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 2
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 3
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 6
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 7
+      }
+    ],
+    "ruapc-final-pinned-rdma-baseline-8.log": [
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 0
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 1
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 2
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 3
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 6
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 7
+      }
+    ],
+    "ruapc-final-pinned-rdma-baseline-9.log": [
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 0
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 1
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 2
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 3
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 6
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 7
+      }
+    ],
+    "ruapc-final-pinned-rdma-current-9.log": [
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 0
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 1
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 2
+      },
+      {
+        "name": "tokio-rt-worker",
+        "cpu": 3
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 6
+      },
+      {
+        "name": "ruapc-rdma-poll",
+        "cpu": 7
+      }
+    ]
+  },
+  "results": [
+    {
+      "operation": "remote_read_all",
+      "kib": 64,
+      "baseline": {
+        "samples": [
+          40.29,
+          39.94,
+          40.72,
+          38.52,
+          39.27,
+          40.06,
+          42.5,
+          44.11,
+          43.92
+        ],
+        "median": 40.29,
+        "min": 38.52,
+        "max": 44.11
+      },
+      "current": {
+        "samples": [
+          42.05,
+          41.33,
+          40.81,
+          47.89,
+          40.86,
+          44.69,
+          49.0,
+          41.13,
+          37.98
+        ],
+        "median": 41.33,
+        "min": 37.98,
+        "max": 49.0
+      },
+      "median_latency_change_percent": 2.5812856788284932
+    },
+    {
+      "operation": "remote_write_all",
+      "kib": 64,
+      "baseline": {
+        "samples": [
+          41.64,
+          59.13,
+          44.5,
+          38.89,
+          40.07,
+          43.07,
+          43.0,
+          44.77,
+          40.2
+        ],
+        "median": 43.0,
+        "min": 38.89,
+        "max": 59.13
+      },
+      "current": {
+        "samples": [
+          41.69,
+          41.36,
+          43.92,
+          42.04,
+          39.91,
+          38.82,
+          45.18,
+          40.74,
+          41.86
+        ],
+        "median": 41.69,
+        "min": 38.82,
+        "max": 45.18
+      },
+      "median_latency_change_percent": -3.046511627906978
+    },
+    {
+      "operation": "remote_read_all",
+      "kib": 1024,
+      "baseline": {
+        "samples": [
+          138.01,
+          290.53,
+          137.01,
+          154.3,
+          210.89,
+          250.55,
+          162.4,
+          174.25,
+          161.41
+        ],
+        "median": 162.4,
+        "min": 137.01,
+        "max": 290.53
+      },
+      "current": {
+        "samples": [
+          148.34,
+          117.76,
+          148.55,
+          148.04,
+          127.41,
+          153.51,
+          323.92,
+          148.6,
+          122.41
+        ],
+        "median": 148.34,
+        "min": 117.76,
+        "max": 323.92
+      },
+      "median_latency_change_percent": -8.657635467980295
+    },
+    {
+      "operation": "remote_write_all",
+      "kib": 1024,
+      "baseline": {
+        "samples": [
+          160.54,
+          224.09,
+          228.79,
+          165.47,
+          187.31,
+          337.6,
+          324.11,
+          329.3,
+          159.18
+        ],
+        "median": 224.09,
+        "min": 159.18,
+        "max": 337.6
+      },
+      "current": {
+        "samples": [
+          148.45,
+          218.53,
+          192.39,
+          160.92,
+          204.5,
+          179.82,
+          354.23,
+          167.33,
+          180.53
+        ],
+        "median": 180.53,
+        "min": 148.45,
+        "max": 354.23
+      },
+      "median_latency_change_percent": -19.438618412245077
+    }
+  ],
+  "raw": {
+    "ruapc-final-pinned-rdma-baseline-1.log": "ruapc: remote-memory RPC + complete-pattern verification\nserial requests; 4 runtime workers; 1000 warmup iterations per case; measured override: Some(5000)\nsetup and warmup excluded; sources and write destinations reused\ntransport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\nRDMA\n  remote_read_all    64 KiB | 5000 iters |     40.29 us/op |   1551.2 MiB/s | verified\n  remote_write_all   64 KiB | 5000 iters |     41.64 us/op |   1501.1 MiB/s | verified\n  remote_read_all  1024 KiB | 5000 iters |    138.01 us/op |   7246.0 MiB/s | verified\n  remote_write_all 1024 KiB | 5000 iters |    160.54 us/op |   6229.1 MiB/s | verified\n",
+    "ruapc-final-pinned-rdma-baseline-2.log": "ruapc: remote-memory RPC + complete-pattern verification\nserial requests; 4 runtime workers; 1000 warmup iterations per case; measured override: Some(5000)\nsetup and warmup excluded; sources and write destinations reused\ntransport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\nRDMA\n  remote_read_all    64 KiB | 5000 iters |     39.94 us/op |   1565.0 MiB/s | verified\n  remote_write_all   64 KiB | 5000 iters |     59.13 us/op |   1056.9 MiB/s | verified\n  remote_read_all  1024 KiB | 5000 iters |    290.53 us/op |   3442.0 MiB/s | verified\n  remote_write_all 1024 KiB | 5000 iters |    224.09 us/op |   4462.5 MiB/s | verified\n",
+    "ruapc-final-pinned-rdma-baseline-3.log": "ruapc: remote-memory RPC + complete-pattern verification\nserial requests; 4 runtime workers; 1000 warmup iterations per case; measured override: Some(5000)\nsetup and warmup excluded; sources and write destinations reused\ntransport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\nRDMA\n  remote_read_all    64 KiB | 5000 iters |     40.72 us/op |   1534.8 MiB/s | verified\n  remote_write_all   64 KiB | 5000 iters |     44.50 us/op |   1404.5 MiB/s | verified\n  remote_read_all  1024 KiB | 5000 iters |    137.01 us/op |   7298.9 MiB/s | verified\n  remote_write_all 1024 KiB | 5000 iters |    228.79 us/op |   4370.8 MiB/s | verified\n",
+    "ruapc-final-pinned-rdma-baseline-4.log": "ruapc: remote-memory RPC + complete-pattern verification\nserial requests; 4 runtime workers; 1000 warmup iterations per case; measured override: Some(5000)\nsetup and warmup excluded; sources and write destinations reused\ntransport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\nRDMA\n  remote_read_all    64 KiB | 5000 iters |     38.52 us/op |   1622.4 MiB/s | verified\n  remote_write_all   64 KiB | 5000 iters |     38.89 us/op |   1607.0 MiB/s | verified\n  remote_read_all  1024 KiB | 5000 iters |    154.30 us/op |   6481.0 MiB/s | verified\n  remote_write_all 1024 KiB | 5000 iters |    165.47 us/op |   6043.5 MiB/s | verified\n",
+    "ruapc-final-pinned-rdma-baseline-5.log": "ruapc: remote-memory RPC + complete-pattern verification\nserial requests; 4 runtime workers; 1000 warmup iterations per case; measured override: Some(5000)\nsetup and warmup excluded; sources and write destinations reused\ntransport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\nRDMA\n  remote_read_all    64 KiB | 5000 iters |     39.27 us/op |   1591.5 MiB/s | verified\n  remote_write_all   64 KiB | 5000 iters |     40.07 us/op |   1559.6 MiB/s | verified\n  remote_read_all  1024 KiB | 5000 iters |    210.89 us/op |   4741.8 MiB/s | verified\n  remote_write_all 1024 KiB | 5000 iters |    187.31 us/op |   5338.6 MiB/s | verified\n",
+    "ruapc-final-pinned-rdma-baseline-6.log": "ruapc: remote-memory RPC + complete-pattern verification\nserial requests; 4 runtime workers; 1000 warmup iterations per case; measured override: Some(5000)\nsetup and warmup excluded; sources and write destinations reused\ntransport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\nRDMA\n  remote_read_all    64 KiB | 5000 iters |     40.06 us/op |   1560.3 MiB/s | verified\n  remote_write_all   64 KiB | 5000 iters |     43.07 us/op |   1451.2 MiB/s | verified\n  remote_read_all  1024 KiB | 5000 iters |    250.55 us/op |   3991.2 MiB/s | verified\n  remote_write_all 1024 KiB | 5000 iters |    337.60 us/op |   2962.1 MiB/s | verified\n",
+    "ruapc-final-pinned-rdma-baseline-7.log": "ruapc: remote-memory RPC + complete-pattern verification\nserial requests; 4 runtime workers; 1000 warmup iterations per case; measured override: Some(5000)\nsetup and warmup excluded; sources and write destinations reused\ntransport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\nRDMA\n  remote_read_all    64 KiB | 5000 iters |     42.50 us/op |   1470.5 MiB/s | verified\n  remote_write_all   64 KiB | 5000 iters |     43.00 us/op |   1453.6 MiB/s | verified\n  remote_read_all  1024 KiB | 5000 iters |    162.40 us/op |   6157.6 MiB/s | verified\n  remote_write_all 1024 KiB | 5000 iters |    324.11 us/op |   3085.4 MiB/s | verified\n",
+    "ruapc-final-pinned-rdma-baseline-8.log": "ruapc: remote-memory RPC + complete-pattern verification\nserial requests; 4 runtime workers; 1000 warmup iterations per case; measured override: Some(5000)\nsetup and warmup excluded; sources and write destinations reused\ntransport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\nRDMA\n  remote_read_all    64 KiB | 5000 iters |     44.11 us/op |   1416.9 MiB/s | verified\n  remote_write_all   64 KiB | 5000 iters |     44.77 us/op |   1396.0 MiB/s | verified\n  remote_read_all  1024 KiB | 5000 iters |    174.25 us/op |   5738.9 MiB/s | verified\n  remote_write_all 1024 KiB | 5000 iters |    329.30 us/op |   3036.7 MiB/s | verified\n",
+    "ruapc-final-pinned-rdma-baseline-9.log": "ruapc: remote-memory RPC + complete-pattern verification\nserial requests; 4 runtime workers; 1000 warmup iterations per case; measured override: Some(5000)\nsetup and warmup excluded; sources and write destinations reused\ntransport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\nRDMA\n  remote_read_all    64 KiB | 5000 iters |     43.92 us/op |   1423.1 MiB/s | verified\n  remote_write_all   64 KiB | 5000 iters |     40.20 us/op |   1554.7 MiB/s | verified\n  remote_read_all  1024 KiB | 5000 iters |    161.41 us/op |   6195.6 MiB/s | verified\n  remote_write_all 1024 KiB | 5000 iters |    159.18 us/op |   6282.2 MiB/s | verified\n",
+    "ruapc-final-pinned-rdma-current-1.log": "ruapc: remote-memory RPC + complete-pattern verification\nserial requests; 4 runtime workers; 1000 warmup iterations per case; measured override: Some(5000)\nsetup and warmup excluded; sources and write destinations reused\ntransport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\nRDMA\n  remote_read_all    64 KiB | 5000 iters |     42.05 us/op |   1486.4 MiB/s | verified\n  remote_write_all   64 KiB | 5000 iters |     41.69 us/op |   1499.2 MiB/s | verified\n  remote_read_all  1024 KiB | 5000 iters |    148.34 us/op |   6741.1 MiB/s | verified\n  remote_write_all 1024 KiB | 5000 iters |    148.45 us/op |   6736.4 MiB/s | verified\n",
+    "ruapc-final-pinned-rdma-current-2.log": "ruapc: remote-memory RPC + complete-pattern verification\nserial requests; 4 runtime workers; 1000 warmup iterations per case; measured override: Some(5000)\nsetup and warmup excluded; sources and write destinations reused\ntransport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\nRDMA\n  remote_read_all    64 KiB | 5000 iters |     41.33 us/op |   1512.4 MiB/s | verified\n  remote_write_all   64 KiB | 5000 iters |     41.36 us/op |   1511.0 MiB/s | verified\n  remote_read_all  1024 KiB | 5000 iters |    117.76 us/op |   8492.1 MiB/s | verified\n  remote_write_all 1024 KiB | 5000 iters |    218.53 us/op |   4576.1 MiB/s | verified\n",
+    "ruapc-final-pinned-rdma-current-3.log": "ruapc: remote-memory RPC + complete-pattern verification\nserial requests; 4 runtime workers; 1000 warmup iterations per case; measured override: Some(5000)\nsetup and warmup excluded; sources and write destinations reused\ntransport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\nRDMA\n  remote_read_all    64 KiB | 5000 iters |     40.81 us/op |   1531.5 MiB/s | verified\n  remote_write_all   64 KiB | 5000 iters |     43.92 us/op |   1423.1 MiB/s | verified\n  remote_read_all  1024 KiB | 5000 iters |    148.55 us/op |   6732.0 MiB/s | verified\n  remote_write_all 1024 KiB | 5000 iters |    192.39 us/op |   5197.7 MiB/s | verified\n",
+    "ruapc-final-pinned-rdma-current-4.log": "ruapc: remote-memory RPC + complete-pattern verification\nserial requests; 4 runtime workers; 1000 warmup iterations per case; measured override: Some(5000)\nsetup and warmup excluded; sources and write destinations reused\ntransport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\nRDMA\n  remote_read_all    64 KiB | 5000 iters |     47.89 us/op |   1305.1 MiB/s | verified\n  remote_write_all   64 KiB | 5000 iters |     42.04 us/op |   1486.7 MiB/s | verified\n  remote_read_all  1024 KiB | 5000 iters |    148.04 us/op |   6754.9 MiB/s | verified\n  remote_write_all 1024 KiB | 5000 iters |    160.92 us/op |   6214.3 MiB/s | verified\n",
+    "ruapc-final-pinned-rdma-current-5.log": "ruapc: remote-memory RPC + complete-pattern verification\nserial requests; 4 runtime workers; 1000 warmup iterations per case; measured override: Some(5000)\nsetup and warmup excluded; sources and write destinations reused\ntransport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\nRDMA\n  remote_read_all    64 KiB | 5000 iters |     40.86 us/op |   1529.8 MiB/s | verified\n  remote_write_all   64 KiB | 5000 iters |     39.91 us/op |   1566.0 MiB/s | verified\n  remote_read_all  1024 KiB | 5000 iters |    127.41 us/op |   7848.4 MiB/s | verified\n  remote_write_all 1024 KiB | 5000 iters |    204.50 us/op |   4890.0 MiB/s | verified\n",
+    "ruapc-final-pinned-rdma-current-6.log": "ruapc: remote-memory RPC + complete-pattern verification\nserial requests; 4 runtime workers; 1000 warmup iterations per case; measured override: Some(5000)\nsetup and warmup excluded; sources and write destinations reused\ntransport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\nRDMA\n  remote_read_all    64 KiB | 5000 iters |     44.69 us/op |   1398.4 MiB/s | verified\n  remote_write_all   64 KiB | 5000 iters |     38.82 us/op |   1610.0 MiB/s | verified\n  remote_read_all  1024 KiB | 5000 iters |    153.51 us/op |   6514.1 MiB/s | verified\n  remote_write_all 1024 KiB | 5000 iters |    179.82 us/op |   5561.1 MiB/s | verified\n",
+    "ruapc-final-pinned-rdma-current-7.log": "ruapc: remote-memory RPC + complete-pattern verification\nserial requests; 4 runtime workers; 1000 warmup iterations per case; measured override: Some(5000)\nsetup and warmup excluded; sources and write destinations reused\ntransport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\nRDMA\n  remote_read_all    64 KiB | 5000 iters |     49.00 us/op |   1275.5 MiB/s | verified\n  remote_write_all   64 KiB | 5000 iters |     45.18 us/op |   1383.3 MiB/s | verified\n  remote_read_all  1024 KiB | 5000 iters |    323.92 us/op |   3087.2 MiB/s | verified\n  remote_write_all 1024 KiB | 5000 iters |    354.23 us/op |   2823.0 MiB/s | verified\n",
+    "ruapc-final-pinned-rdma-current-8.log": "ruapc: remote-memory RPC + complete-pattern verification\nserial requests; 4 runtime workers; 1000 warmup iterations per case; measured override: Some(5000)\nsetup and warmup excluded; sources and write destinations reused\ntransport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\nRDMA\n  remote_read_all    64 KiB | 5000 iters |     41.13 us/op |   1519.7 MiB/s | verified\n  remote_write_all   64 KiB | 5000 iters |     40.74 us/op |   1534.0 MiB/s | verified\n  remote_read_all  1024 KiB | 5000 iters |    148.60 us/op |   6729.5 MiB/s | verified\n  remote_write_all 1024 KiB | 5000 iters |    167.33 us/op |   5976.2 MiB/s | verified\n",
+    "ruapc-final-pinned-rdma-current-9.log": "ruapc: remote-memory RPC + complete-pattern verification\nserial requests; 4 runtime workers; 1000 warmup iterations per case; measured override: Some(5000)\nsetup and warmup excluded; sources and write destinations reused\ntransport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\nRDMA\n  remote_read_all    64 KiB | 5000 iters |     37.98 us/op |   1645.5 MiB/s | verified\n  remote_write_all   64 KiB | 5000 iters |     41.86 us/op |   1493.0 MiB/s | verified\n  remote_read_all  1024 KiB | 5000 iters |    122.41 us/op |   8169.2 MiB/s | verified\n  remote_write_all 1024 KiB | 5000 iters |    180.53 us/op |   5539.1 MiB/s | verified\n"
+  }
+}

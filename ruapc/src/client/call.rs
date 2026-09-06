@@ -65,7 +65,7 @@ impl RawCall for Client {
         self.ruapc_request(
             ctx,
             req,
-            ReadAttachment::new(&[], None),
+            ReadAttachment::new(None, None),
             &mut None,
             slot,
             method_name,

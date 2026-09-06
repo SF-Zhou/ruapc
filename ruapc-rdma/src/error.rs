@@ -43,6 +43,10 @@ pub enum ErrorKind {
     IBCreateQueuePairFail,
     /// Invalid parameters supplied when connecting a queue pair.
     InvalidQueuePairConfig,
+    /// Completion proof belongs to a different CQ, QP or connection generation.
+    InvalidCompletion,
+    /// Invalid local ranges or ownership supplied to a READ plan.
+    InvalidReadPlan,
     /// Failed to modify queue pair state.
     IBModifyQueuePairFail,
     /// Failed to post receive work request.

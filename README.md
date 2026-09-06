@@ -19,12 +19,14 @@ A high-performance Rust RPC library that supports multiple transport protocols (
 | `ruapc-rdma` | Low-level FFI bindings to libibverbs with type-safe RDMA device management |
 | `ruapc-demo` | Example server/client applications |
 
+The implementation boundaries and ownership rules are documented in [DESIGN.md](DESIGN.md).
+
 ## Features
 
 - **Multiple Transport Protocols**: TCP, WebSocket, HTTP/1.1 and HTTP/2 (h2c), RDMA (optional), and a unified protocol that supports all simultaneously
 - **Reverse RPC**: Server can call back into client services over established HTTP/2 or WebSocket connections
-- **Remote Read/Write**: Bulk data moves out-of-band through registered buffers ([ruapc-bufpool](ruapc-bufpool/)) instead of inline RPC payloads — one-sided RDMA READs on RDMA, transparent reverse-RPC copies on TCP/WS/HTTP. Clients attach buffers as logical contiguous spaces; servers transfer whole spaces or vectored `CopyOp` batches with offsets. The typed `Result<WithBuffers<T>, E>` contract and client-side buffer pinning make transfers impossible to forget and memory-safe even across timeouts
-- **Multiple Serialization Formats**: JSON (default) and MessagePack support
+- **Remote Read/Write**: Bulk data moves through registered buffers ([ruapc-bufpool](ruapc-bufpool/)): one-sided RDMA READs on RDMA, transparent reverse-RPC copies on TCP/WS/HTTP. Clients attach logical contiguous spaces; servers transfer whole spaces or vectored `CopyOp` batches. Owned sources protect local CPU readers, and pinned destinations remain held through DMA completions after timeout. See the [lifetime boundaries](DESIGN.md#remote-memory)
+- **Multiple Serialization Formats**: MessagePack by default, with JSON selectable per client
 - **OpenAPI Integration**: Automatic OpenAPI 3.0 specification generation with JSON Schema support
 - **Built-in Documentation**: RapiDoc integration for interactive API documentation
 
@@ -196,15 +198,29 @@ impl BlobService for BlobImpl {
 }
 
 // ---- Client --------------------------------------------------------------
-let src = [buf_a, buf_b];              // read space: borrowed for the call
-let dst = vec![out_buf];               // write space: pinned until it resolves
-let (total, buffers) = client
-    .with_read_buffers(&src)
-    .with_write_buffers(dst)
+let src = vec![buf_a, buf_b];          // owned, immutable read space
+let dst = vec![out_buf];               // owned write destinations
+let mut transfer = client.with_read_buffers(src).with_write_buffers(dst);
+let (total, buffers) = transfer
     .transform(&ctx, &())
     .await?
-    .into_parts();                     // every attached write buffer returns
+    .into_parts();                     // completed write destinations
+
+// Shared source views remain available; the wrapper can upload them again.
+let source_len: usize = transfer.read_buffers().iter().map(Buffer::len).sum();
+// Recover ownership only when no local reader still holds the source.
+let reusable_sources: Option<Vec<Buffer>> = transfer.take_read_buffers();
 ```
+
+`with_read_buffer(Buffer)` and `with_read_buffers(Vec<Buffer>)` transfer source
+ownership into the wrapper; another call to either replaces its source list.
+Keep the wrapper to reuse an immutable source across RPCs. Cancellation cannot
+release memory still held by a local reverse-RPC reader. If
+`take_read_buffers()` returns `None`, it preserves the source so recovery can
+be retried later. Failed writes similarly expose recoverable destinations
+through `take_write_buffers()`; buffers still in use remain owned by the transfer.
+Read-source recovery is not an acknowledgement of remote one-sided DMA completion;
+see the [remote-memory lifetime boundaries](DESIGN.md#remote-memory).
 
 Run the self-contained demo over any transport:
 
@@ -235,10 +251,20 @@ cargo run --release --bin client --features rdma -- rdma://127.0.0.1:8000 --stre
 # End-to-end echo RPC benchmark: serial latency + concurrent throughput
 # for every transport (TCP / WebSocket / HTTP / RDMA) on a unified server.
 cargo bench -p ruapc --bench echo
+cargo bench -p ruapc --bench remote_memory
 
-# On NUMA machines, pin to the RDMA NIC's node for stable/better numbers:
-numactl -N 1 -m 1 cargo bench -p ruapc --bench echo
+# Example: mlx5_0 is on NUMA node 0; CPUs 0-7 are distinct cores on that node.
+# Check the local NIC/CPU topology before choosing these values.
+RUAPC_BENCH_TRANSPORT=RDMA RUAPC_BENCH_RDMA_DEVICE=mlx5_0 \
+  numactl --physcpubind=0-7 --membind=0 cargo bench -p ruapc --bench remote_memory
 ```
+
+Both RPC benchmarks accept `RUAPC_BENCH_TRANSPORT` and
+`RUAPC_BENCH_RDMA_DEVICE`; unset values preserve automatic selection. Both also
+accept `RUAPC_BENCH_SERIAL_ITERS` and `RUAPC_BENCH_WARMUP_ITERS`. Echo defaults
+to 5000 measured and 1000 warmup requests; remote memory defaults to 512/128
+measured requests for 64 KiB/1 MiB and 8 warmups. Configuration is read once
+before measurement.
 
 See [docs/benchmark.md](docs/benchmark.md) for details and reference results.
 

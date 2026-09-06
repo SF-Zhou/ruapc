@@ -4,9 +4,11 @@
 use std::{collections::VecDeque, sync::Arc, time::Instant};
 
 use bytes::Bytes;
-use ruapc_rdma::{WRType, WrBuffers, ibv_send_flags, ibv_wc};
+use ruapc_rdma::{Completion, CompletionCursor, WRType, WrBuffers, ibv_send_flags, ibv_wc};
 
-use super::{BudgetGuard, RegisterConn, RingReservation, dispatch::DispatchBatch};
+use super::{
+    BudgetGuard, RegisterConn, RingReservation, dispatch::DispatchBatch, flow::FlowControl,
+};
 use crate::{
     Buffer, Error, ErrorKind, Result, Socket, State,
     rdma::{RdmaSocket, SendPermit},
@@ -38,59 +40,30 @@ const MAX_AGG_BYTES: usize = 64 * 1024;
 /// and their volume is bounded by the send window.
 const SMALL_MSG_COPY_MAX: usize = 1024;
 
-/// Flow control configuration for RDMA operations.
-#[derive(Debug)]
-struct FlowConfig {
-    /// Number of unacknowledged receive completions before triggering an
-    /// acknowledgment.
-    ack_threshold: u32,
-    /// Maximum number of unacknowledged receive completions allowed.
-    ack_max_limit: u32,
+/// Owns the open-connection accounting and failure notification. There is one
+/// guard per registered poller connection, so normal removal and poller failure
+/// settle the same lifecycle exactly once. The guard owns the State reference
+/// the connection already needed; it adds no allocation or shared ownership.
+struct RegisteredConnection {
+    state: Arc<State>,
+    conn_id: u64,
 }
 
-impl FlowConfig {
-    /// Derives the ACK cadence from the peer's send window (both sides
-    /// compute the same negotiated value, `recv_queue_len / 2`).
-    ///
-    /// The threshold must stay below the window: the peer can never have
-    /// more than `window` unacknowledged data WRs in flight, so a larger
-    /// threshold would never fire and every credit return would wait for
-    /// the 5s keepalive ACK (a de-facto stall). Half the window keeps two
-    /// ACK batches per window worth of headroom. With the default window
-    /// (32) this reduces to the classic 16/32 cadence.
-    ///
-    /// `ack_max_limit` caps outstanding standalone ACK WRs; the receive
-    /// ring reserves its non-window half for exactly these, so the send
-    /// window is the bound.
-    fn for_window(send_window: u32) -> Self {
-        Self {
-            ack_threshold: (send_window / 2).max(1),
-            ack_max_limit: send_window.max(2),
-        }
+impl RegisteredConnection {
+    fn new(state: Arc<State>, conn_id: u64) -> Self {
+        state.metrics.connection_opened("RDMA");
+        Self { state, conn_id }
     }
 }
 
-/// Receive-side statistics for one connection; all counters are per work
-/// completion (= per receive-ring buffer), not per logical message.
-#[derive(Debug, Default)]
-pub(super) struct RecvStats {
-    submitted: u64,
-    completed: u64,
-    imm_received: u64,
-    imm_acked: u64,
-    data_received: u64,
-    data_acked: u64,
-}
-
-/// Send-side statistics for one connection; all counters are per work
-/// request.
-#[derive(Debug, Default)]
-pub(super) struct SendStats {
-    data_completed: u64,
-    data_confirmed: u64,
-    ack_submitted: u64,
-    ack_completed: u64,
-    ack_confirmed: u64,
+impl Drop for RegisteredConnection {
+    fn drop(&mut self) {
+        self.state.metrics.connection_closed("RDMA");
+        self.state.connection_closed(
+            self.conn_id,
+            &Error::new(ErrorKind::ConnectionClosed, "rdma connection closed".into()),
+        );
+    }
 }
 
 /// Per-connection state owned by the poll thread.
@@ -101,15 +74,12 @@ pub(super) struct ConnState {
     /// Generation of the occupied slot; completions tagged with another
     /// generation belonged to a previous occupant and are dropped.
     pub(super) generation: u8,
-    pub(super) recv: RecvStats,
-    pub(super) send: SendStats,
-    last_ack_timestamp: Instant,
-    flow: FlowConfig,
+    pub(super) flow: FlowControl,
     /// Window-blocked framed sends in FIFO order.
     pub(super) pending_sends: VecDeque<Buffer>,
     pending_receiver: tokio::sync::mpsc::Receiver<Buffer>,
-    /// Next send-queue id that has not been swept yet (see `sweep_sq`).
-    sq_swept: u64,
+    /// Progress of the QP-owned selective SEND reclamation.
+    completion_cursor: CompletionCursor,
     /// Negotiated receive buffer size (`max_msg_size`).
     recv_buf_size: usize,
     /// Whether to aggregate window-blocked sends.
@@ -123,7 +93,7 @@ pub(super) struct ConnState {
     /// failing the connection.
     pub(super) recv_deficit: u64,
     pub(super) socket: Arc<RdmaSocket>,
-    pub(super) state: Arc<State>,
+    registration: RegisteredConnection,
     _budget: BudgetGuard,
     _supervisor_guard: TaskSupervisorGuard,
     _ring_reservation: RingReservation,
@@ -132,25 +102,19 @@ pub(super) struct ConnState {
 
 impl ConnState {
     pub(super) fn new(reg: RegisterConn, generation: u8, budget: BudgetGuard) -> Self {
-        reg.state.metrics.connection_opened("RDMA");
+        let registration = RegisteredConnection::new(reg.state, reg.socket.conn_id);
         Self {
             generation,
-            recv: RecvStats {
-                submitted: reg.recv_submitted,
-                ..Default::default()
-            },
-            send: SendStats::default(),
-            last_ack_timestamp: Instant::now(),
-            flow: FlowConfig::for_window(reg.send_window),
+            flow: FlowControl::new(reg.send_window, reg.recv_submitted, Instant::now()),
             pending_sends: VecDeque::new(),
             pending_receiver: reg.pending_receiver,
-            sq_swept: 0,
+            completion_cursor: CompletionCursor::default(),
             recv_buf_size: reg.recv_buf_size,
             msg_aggregation: reg.msg_aggregation,
             recv_buf_cache: Vec::new(),
             recv_deficit: 0,
             socket: reg.socket,
-            state: reg.state,
+            registration,
             _budget: budget,
             _supervisor_guard: reg.supervisor_guard,
             _ring_reservation: reg.ring_reservation,
@@ -159,23 +123,24 @@ impl ConnState {
     }
 
     /// Handles one work completion for this connection.
-    pub(super) fn handle_wc(&mut self, wc: &ibv_wc, batch: &mut DispatchBatch) {
-        if !wc.is_recv() {
-            // Sweep unsignaled data sends completed before this SQ
-            // completion (RC SQs complete in post order): reclaim their
-            // buffers and count each as one completed data WR. Only plain
-            // data sends are ever unsignaled, so every swept buffer is a
-            // data WR.
-            let id = wc.wr_id.get_id();
-            for swept in self.sq_swept..id {
-                if self.socket.queue_pair.take_send_buffer(swept).is_some() {
-                    self.send.data_completed += 1;
-                }
+    pub(super) fn handle_wc(&mut self, completion: Completion<'_>, batch: &mut DispatchBatch) {
+        let completed = match self
+            .socket
+            .queue_pair
+            .complete(completion, &mut self.completion_cursor)
+        {
+            Ok(completed) => completed,
+            Err(error) => {
+                tracing::error!(%error, "completion does not belong to the routed RDMA connection");
+                self.socket.set_error();
+                return;
             }
-            self.sq_swept = self.sq_swept.max(id + 1);
+        };
+        for _ in 0..completed.swept_sends {
+            self.flow.data_completed();
         }
-
-        let buffer = self.socket.queue_pair.take_buffer(&wc.wr_id);
+        let wc = completed.wc;
+        let buffer = completed.buffer;
         let result = if wc.is_recv() {
             // Receive WRs always post a single buffer.
             self.handle_recv_completion(wc, buffer.and_then(WrBuffers::into_single), batch)
@@ -208,7 +173,7 @@ impl ConnState {
         buffer: Option<Buffer>,
         batch: &mut DispatchBatch,
     ) -> Result<()> {
-        self.recv.completed += 1;
+        self.flow.receive_completed();
 
         if !wc.succ() {
             return Err(Error::new(
@@ -221,6 +186,7 @@ impl ConnState {
         }
         if let Some(connection_id) = self.socket.take_accept_lease() {
             let _ = self
+                .registration
                 .state
                 .socket_pool
                 .rdma_receive_observed(connection_id, &self.socket);
@@ -229,15 +195,14 @@ impl ConnState {
         // Immediate data (ACK credit counters) can arrive standalone or
         // piggybacked on a data send.
         if let Some(ack) = wc.imm() {
-            self.send.data_confirmed += u64::from(ack & 0xFFFF);
-            self.send.ack_confirmed += u64::from(ack >> 16);
+            self.flow.peer_ack(ack);
         }
 
         if let Some(mut buf) = buffer {
             buf.set_len(wc.byte_len as usize);
             if buf.is_empty() {
                 // Standalone ACK: the buffer is untouched, recycle it.
-                self.recv.imm_received += 1;
+                self.flow.received_ack();
                 self.cache_recv_buf(buf);
             } else {
                 // One receive completion = one flow control credit, no
@@ -245,7 +210,7 @@ impl ConnState {
                 // stands for the receive-ring buffer, which is consumed
                 // exactly once per WC. The frames are walked and parsed by
                 // the dispatch workers, never here.
-                self.recv.data_received += 1;
+                self.flow.received_data();
                 let frames = if buf.len() <= SMALL_MSG_COPY_MAX {
                     // Copy small buffers out and recycle the receive
                     // buffer; see `SMALL_MSG_COPY_MAX` for why.
@@ -255,12 +220,16 @@ impl ConnState {
                 } else {
                     Bytes::from_owner(buf)
                 };
-                batch.push((self.state.clone(), Socket::from(&self.socket), frames));
+                batch.push((
+                    self.registration.state.clone(),
+                    Socket::from(&self.socket),
+                    frames,
+                ));
             }
         } else if wc.imm().is_some() {
-            self.recv.imm_received += 1;
+            self.flow.received_ack();
         } else {
-            self.recv.data_received += 1;
+            self.flow.received_data();
         }
 
         // Post a new recv buffer to replace the consumed one, preferring a
@@ -285,7 +254,7 @@ impl ConnState {
             .queue_pair
             .recv(new_buf)
             .map_err(|e| Error::new(ErrorKind::RdmaRecvFailed, e.to_string()))?;
-        self.recv.submitted += 1;
+        self.flow.receive_posted();
         Ok(())
     }
 
@@ -301,7 +270,7 @@ impl ConnState {
             };
             match self.socket.queue_pair.recv(buf) {
                 Ok(()) => {
-                    self.recv.submitted += 1;
+                    self.flow.receive_posted();
                     self.recv_deficit -= 1;
                 }
                 Err(e) => {
@@ -333,9 +302,6 @@ impl ConnState {
                 // taken at post time.
                 self.socket.read_permits.add_permits(1);
                 self.socket.sq_read_permits.add_permits(1);
-                if let Some((_, batch)) = self.socket.rdma_completions.remove(&wc.wr_id) {
-                    batch.complete_one(wc.succ());
-                }
                 if wc.succ() {
                     return Ok(());
                 }
@@ -345,8 +311,8 @@ impl ConnState {
             // A buffer-less immediate send is a standalone ACK; one with a
             // buffer is a data send with a piggybacked ACK, which lives in
             // the data ledger.
-            WRType::SendImm if buffer.is_none() => self.send.ack_completed += 1,
-            _ => self.send.data_completed += 1,
+            WRType::SendImm if buffer.is_none() => self.flow.ack_completed(),
+            _ => self.flow.data_completed(),
         }
 
         if wc.succ() {
@@ -384,39 +350,36 @@ impl ConnState {
         // One credit per data WR, returned once the WR completed locally
         // (buffer reclaimed) *and* the peer acknowledged the matching
         // receive completion.
-        let finished = std::cmp::min(self.send.data_completed, self.send.data_confirmed);
+        let finished = self.flow.finished_data();
+        let now = Instant::now();
 
         // Liveness diagnostics: a pending send that stays window-blocked
         // for seconds indicates a flow control stall (peer ACKs missing or
         // completion accounting gone wrong).
-        if !self.pending_sends.is_empty() && self.last_ack_timestamp.elapsed().as_secs() >= 2 {
+        if !self.pending_sends.is_empty() && self.flow.stalled(now) {
             tracing::warn!(
-                "flow stall: qp={} pending={} finished={finished} ok={} send={:?} recv={:?}",
+                "flow stall: qp={} pending={} finished={finished} ok={} flow={:?}",
                 self.socket.queue_pair.qp_num(),
                 self.pending_sends.len(),
                 self.socket.state.is_ok(),
-                self.send,
-                self.recv,
+                self.flow,
             );
         }
         // An acknowledgment overdue for seconds means the standalone-ACK
         // path is starved (the peer's send window may be stalling on it).
-        if self.recv.data_received - self.recv.data_acked >= u64::from(self.flow.ack_threshold)
-            && self.last_ack_timestamp.elapsed().as_secs() >= 2
-        {
+        if self.flow.ack_starved(now) {
             tracing::warn!(
-                "ack starvation: qp={} ok={} send={:?} recv={:?}",
+                "ack starvation: qp={} ok={} flow={:?}",
                 self.socket.queue_pair.qp_num(),
                 self.socket.state.is_ok(),
-                self.send,
-                self.recv,
+                self.flow,
             );
         }
 
         // Decide whether an ACK is due *before* flushing pending sends so it
         // can piggyback on one of them (saving a standalone WR + CQE + a
         // recv buffer cycle on the peer).
-        let mut ack = self.due_ack();
+        let mut ack = self.flow.due_ack(now);
 
         // Flush pending sends against the *unpublished* finished value:
         // the backlog spends freshly freed credits before
@@ -428,39 +391,14 @@ impl ConnState {
         // Send the standalone ACK even when the flush failed (e.g. a
         // transient allocation error): the peer's send window depends on our
         // ACKs, so skipping them would deadlock both sides.
-        if let Some(imm) = ack {
-            // Cap the number of outstanding standalone ACK work requests.
-            let ack_done = std::cmp::min(self.send.ack_completed, self.send.ack_confirmed);
-            if self.send.ack_submitted < ack_done + u64::from(self.flow.ack_max_limit) {
-                self.submit_ack(imm)?;
-                self.mark_acked();
-            }
+        if let Some(imm) = ack
+            && self.flow.can_submit_ack()
+        {
+            self.submit_ack(imm)?;
+            self.flow.mark_acked(imm, Instant::now());
         }
 
         flush_result
-    }
-
-    /// Returns the ACK immediate value if an acknowledgment is due.
-    fn due_ack(&self) -> Option<u32> {
-        let pending_data = u32::try_from(self.recv.data_received - self.recv.data_acked).unwrap();
-        let pending_imm = u32::try_from(self.recv.imm_received - self.recv.imm_acked).unwrap();
-        // The 5s timer also acts as a keepalive: on a connection whose peer
-        // is gone, the ACK send fails at the transport level and triggers
-        // teardown of the stale connection.
-        if pending_data >= self.flow.ack_threshold
-            || pending_imm >= self.flow.ack_max_limit / 2
-            || self.last_ack_timestamp.elapsed().as_secs() >= 5
-        {
-            Some((pending_imm << 16) + pending_data)
-        } else {
-            None
-        }
-    }
-    /// Records that all received completions have been acknowledged.
-    fn mark_acked(&mut self) {
-        self.recv.data_acked = self.recv.data_received;
-        self.recv.imm_acked = self.recv.imm_received;
-        self.last_ack_timestamp = Instant::now();
     }
 
     /// Flushes pending sends in FIFO order while credits are available,
@@ -479,7 +417,7 @@ impl ConnState {
     ///
     /// Aggregation needs a fallible pool allocation for the scratch
     /// buffer; when the pool is exhausted the flush falls back to a
-    /// zero-allocation *gather-list* send of the same run, keeping the
+    /// pool-allocation-free *gather-list* send of the same run, keeping the
     /// aggregation (and its per-WR credit savings) intact under memory
     /// pressure.
     fn flush_pending(&mut self, finished: u64, ack: &mut Option<u32>) -> Result<()> {
@@ -524,7 +462,7 @@ impl ConnState {
             // small frames queueing here, the sub-µs memcpy on this
             // dedicated thread is measurably cheaper than the NIC-side
             // cost of a many-SGE gather WQE (~10% peak QPS on 1 KiB
-            // echo). Under pool exhaustion, degrade to a zero-allocation
+            // echo). Under pool exhaustion, degrade to a pool-allocation-free
             // gather-list send instead of per-message WRs, so aggregation
             // (and the credits it saves) survives memory pressure.
             match self.socket.rdmabuf_pool.allocate(total) {
@@ -575,7 +513,7 @@ impl ConnState {
                         .queue_pair
                         .send_imm(buf, imm, ibv_send_flags::IBV_SEND_SIGNALED);
                 if posted.is_ok() {
-                    self.mark_acked();
+                    self.flow.mark_acked(imm, Instant::now());
                 }
                 posted.map(|_| ())
             }
@@ -602,11 +540,10 @@ impl ConnState {
     /// [`post_data`]: Self::post_data
     fn post_gather(&mut self, frames: Box<[Buffer]>, ack: &mut Option<u32>) -> Result<()> {
         let imm = ack.take();
-        let had_ack = imm.is_some();
         match self.socket.queue_pair.send_gather(frames, imm) {
             Ok(_) => {
-                if had_ack {
-                    self.mark_acked();
+                if let Some(imm) = imm {
+                    self.flow.mark_acked(imm, Instant::now());
                 }
                 Ok(())
             }
@@ -626,12 +563,10 @@ impl ConnState {
             .socket
             .queue_pair
             .send_imm_only(imm_data, ibv_send_flags::IBV_SEND_SIGNALED);
-        self.send.ack_submitted += 1;
+        self.flow.ack_posted(ret.is_ok());
         match ret {
             Ok(()) => Ok(()),
             Err(err) => {
-                self.send.ack_completed += 1;
-                self.send.ack_confirmed += 1;
                 tracing::error!("submit ack error: {err}");
                 self.socket.set_error();
                 Err(Error::new(
@@ -648,24 +583,7 @@ impl ConnState {
     /// eventually surface as flush completions — which is what releases
     /// their memory holds safely.
     pub(super) fn sweep_read_timeouts(&self, now: Instant) {
-        if self.socket.rdma_completions.is_empty() {
-            return;
-        }
-        let mut fired = false;
-        for entry in self.socket.rdma_completions.iter() {
-            let batch = entry.value();
-            if batch.expired(now)
-                && batch.fail(Error::new(
-                    ErrorKind::RdmaReadTimeout,
-                    "RDMA READ did not complete within rdma.remote_memory.read_timeout_ms; \
-                     failing the connection to flush it"
-                        .into(),
-                ))
-            {
-                fired = true;
-            }
-        }
-        if fired {
+        if self.socket.queue_pair.expire_reads(now) {
             tracing::error!(
                 "RDMA READ timeout on qp={}, moving connection to error state",
                 self.socket.queue_pair.qp_num()
@@ -680,19 +598,61 @@ impl ConnState {
     /// every outstanding work request then produces a flush CQE, so waiting
     /// for the ACK and recv counters to settle guarantees the QP finished
     /// flushing. Buffers of successfully-completed unsignaled sends never
-    /// produce a CQE and are reclaimed explicitly before removal.
+    /// produce a CQE and remain owned by the QP until it is destroyed.
     /// Outstanding RDMA READ batches also block removal: their memory
     /// holds may only be released once their (flush) completions arrived.
     pub(super) fn ready_to_remove(&mut self) -> bool {
-        if self.socket.state.is_ok()
-            || self.send.ack_submitted != self.send.ack_completed
-            || self.recv.submitted != self.recv.completed
-            || !self.pending_sends.is_empty()
-            || !self.socket.rdma_completions.is_empty()
-        {
-            return false;
-        }
-        self.socket.queue_pair.reclaim_send_buffers();
-        true
+        !self.socket.state.is_ok()
+            && self.flow.flushed()
+            && self.pending_sends.is_empty()
+            && !self.socket.queue_pair.has_pending_reads()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn registered_connection_drop_fails_its_waiters_and_settles_metrics() {
+        let config = crate::SocketPoolConfig {
+            rdma: None,
+            ..Default::default()
+        };
+        let ctx = crate::Context::create(&config).unwrap();
+        let state = &ctx.state;
+        let (id, receiver) = state.waiter.alloc(Duration::from_secs(30));
+        state.waiter.bind_connection(id, 42);
+        let (other_id, other_receiver) = state.waiter.alloc(Duration::from_secs(30));
+        state.waiter.bind_connection(other_id, 43);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshot = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            let registration = RegisteredConnection::new(state.clone(), 42);
+            assert_eq!(state.waiter.pending_count(), 2);
+            // The poller owns this guard; clearing its connection slots drops
+            // it on both ordinary removal and any provider-error exit.
+            drop(registration);
+        });
+
+        assert_eq!(
+            receiver.recv().await.unwrap_err().kind,
+            ErrorKind::ConnectionClosed
+        );
+        assert_eq!(
+            state.waiter.pending_count(),
+            1,
+            "other connections remain pending"
+        );
+        let metrics = snapshot.snapshot().into_vec();
+        let (_, _, _, value) = metrics
+            .iter()
+            .find(|(key, ..)| key.key().name() == "ruapc_connections")
+            .unwrap();
+        assert!(matches!(value, DebugValue::Gauge(value) if value.0 == 0.0));
+        drop(other_receiver);
     }
 }

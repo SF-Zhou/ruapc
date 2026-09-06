@@ -20,34 +20,19 @@ pub enum HttpSocket {
 /// Sender half of an HTTP/2 `/_rpc` bidirectional stream.
 #[derive(Clone, Debug)]
 pub struct StreamSocket {
-    inner: Arc<StreamSocketInner>,
-}
-
-#[derive(Debug)]
-pub(crate) struct StreamSocketInner {
-    sender: mpsc::Sender<Bytes>,
-    lifecycle: crate::sockets::ConnectionLifecycle,
-}
-
-impl StreamSocketInner {
-    pub(crate) fn is_closed(&self) -> bool {
-        self.lifecycle.is_closed() || self.sender.is_closed()
-    }
+    inner: Arc<crate::sockets::ChannelConnection>,
 }
 
 impl StreamSocket {
     pub(crate) fn new(sender: mpsc::Sender<Bytes>) -> Self {
         Self {
-            inner: Arc::new(StreamSocketInner {
-                sender,
-                lifecycle: crate::sockets::ConnectionLifecycle::new(),
-            }),
+            inner: Arc::new(crate::sockets::ChannelConnection::new(sender)),
         }
     }
 
     /// Unique id of the underlying connection.
     pub(crate) fn conn_id(&self) -> u64 {
-        self.inner.lifecycle.conn_id()
+        self.inner.conn_id()
     }
 
     /// Whether `other` refers to the same underlying connection.
@@ -57,7 +42,7 @@ impl StreamSocket {
 
     /// Marks the connection closed; returns `true` exactly once.
     pub(crate) fn mark_closed(&self) -> bool {
-        self.inner.lifecycle.close_once()
+        self.inner.close_once()
     }
 
     pub(crate) fn is_closed(&self) -> bool {
@@ -86,7 +71,7 @@ impl HttpSocket {
         }
     }
 
-    pub(crate) fn health(&self) -> Option<std::sync::Weak<StreamSocketInner>> {
+    pub(crate) fn health(&self) -> Option<std::sync::Weak<crate::sockets::ChannelConnection>> {
         match self {
             Self::ForResponse(_) => None,
             Self::Stream(socket) => Some(Arc::downgrade(&socket.inner)),
@@ -135,7 +120,7 @@ impl SocketTrait for HttpSocket {
             HttpSocket::ForResponse(msgid) => {
                 let mut bytes = BytesMut::new();
                 let writer = SendMsg::writer(&mut bytes);
-                let _ = serde_json::to_writer(writer, payload);
+                serde_json::to_writer(writer, payload)?;
 
                 if meta.is_rsp() {
                     let msg = Message {
@@ -152,68 +137,12 @@ impl SocketTrait for HttpSocket {
                 }
             }
             HttpSocket::Stream(stream_socket) => {
-                // Use TCP-style framing: magic + len + meta_len + meta + payload.
-                use crate::sockets::tcp::MAGIC_NUM;
+                let bytes = crate::msg::frame::encode(meta, payload)?;
 
-                struct StreamBytes(BytesMut);
-
-                impl SendMsg for StreamBytes {
-                    fn size(&self) -> usize {
-                        self.0.size()
-                    }
-
-                    fn prepare(&mut self) -> Result<()> {
-                        self.0.extend_from_slice(&MAGIC_NUM.to_be_bytes());
-                        self.0.extend_from_slice(&0u32.to_be_bytes());
-                        self.0.prepare()
-                    }
-
-                    fn finish(&mut self, meta_offset: usize, payload_offset: usize) -> Result<()> {
-                        const S: usize = std::mem::size_of::<u32>();
-                        if meta_offset < S {
-                            return Err(Error::new(
-                                ErrorKind::SerializeFailed,
-                                format!("invalid meta offset: {meta_offset}"),
-                            ));
-                        }
-                        self.0.finish(meta_offset, payload_offset)?;
-                        let total_len = u32::try_from(self.size() - meta_offset)?;
-                        self.0[meta_offset - S..meta_offset]
-                            .copy_from_slice(&total_len.to_be_bytes());
-                        Ok(())
-                    }
-
-                    fn writer(&mut self) -> impl std::io::Write {
-                        self.0.writer()
-                    }
-                }
-
-                let mut bytes = StreamBytes(BytesMut::with_capacity(512));
-                meta.serialize_to(payload, &mut bytes)?;
-
-                // Bind the pending request to this connection so it fails
-                // eagerly if the connection dies before the response arrives.
-                if meta.is_req() {
-                    state
-                        .waiter
-                        .bind_connection(meta.msgid, stream_socket.conn_id());
-                }
-
-                if stream_socket.is_closed() {
-                    return Err(Error::new(
-                        ErrorKind::ConnectionClosed,
-                        "HTTP connection is closed".into(),
-                    ));
-                }
-
-                stream_socket
-                    .inner
-                    .sender
-                    .send(bytes.0.into())
-                    .await
-                    .map_err(|e| Error::new(ErrorKind::HttpSendReqFailed, e.to_string()))?;
-
-                Ok(())
+                let sender = stream_socket.inner.prepare_send(meta, state, "HTTP")?;
+                sender.send(bytes).await.map_err(|error| {
+                    crate::Error::new(ErrorKind::HttpSendReqFailed, error.to_string())
+                })
             }
         }
     }

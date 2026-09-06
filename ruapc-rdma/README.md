@@ -2,8 +2,8 @@
 
 Low-level FFI bindings to libibverbs (RDMA verbs) with type-safe, RAII-based
 resource management. This crate is part of the [ruapc](../ruapc/) project but
-is independently usable by any application that needs a thin, safe layer over
-raw verbs.
+is independently usable by applications that need resource ownership and
+explicit DMA lifetime contracts over raw verbs.
 
 ## Features
 
@@ -14,15 +14,15 @@ raw verbs.
 - **C shim for every verbs entry point**: Rust never binds an `ibv_*` symbol
   directly (see below)
 - **Buffer-owning work requests**: `QueuePair::send`/`recv` take ownership of a
-  [`ruapc-bufpool`](../ruapc-bufpool/) `Buffer` and hand it back through the
-  matching `Completion`, so registered memory can never be recycled while the
-  NIC may still touch it
-- **Lock-free in-flight tracking**: buffers of posted work requests live in
+  [`ruapc-bufpool`](../ruapc-bufpool/) `Buffer`. Poll `CompletionQueue` and recover
+  buffers through `QueuePair::complete` using a CQ-issued, non-cloneable
+  `Completion` proof. Shared CQs route by the WRID tag.
+- **Lock-free SEND/RECV tracking**: buffers of those posted work requests live in
   `WrSlots`, a fixed-size atomic slot array indexed by monotonic per-direction
   IDs — no `Mutex<HashMap>` on the completion path
-- **Selective signaling** with automatic reclamation of unsignaled send
-  buffers (RC send queues complete in order), plus gather-list sends and
-  vectored RDMA READ (`read_sges`)
+- **Selective signaling** with completion-driven reclamation of unsignaled
+  SEND buffers (RC send queues complete in order), plus gather-list sends and
+  owned vectored RDMA READ plans (`prepare_reads` / `post_read`)
 - **Typed work request IDs**: `WRID` packs a work request type, an opaque
   connection tag, and a per-direction sequence number into the 64-bit `wr_id`
 - **Serializable device snapshots**: `DeviceInfo`/`Port`/`Gid` (and the raw
@@ -34,6 +34,48 @@ raw verbs.
   support iteration and static names without lookup tables. The Rust
   `ibv_port_cap_flags2` uses `u16` to match its only bound struct field rather
   than the standalone C enum's ABI width
+
+## DMA ownership
+
+`CompletionQueue::poll_batch` fills reusable stack storage and lends a unique
+proof for each CQE. `QueuePair::complete` validates the originating CQ, QP number
+and permanently assigned WRID tag before returning SEND/RECV buffers or settling
+READ ownership. Copying raw CQE metadata cannot authorize reclamation. Creating
+and validating the borrowed proof needs no allocation or reference-count update;
+READ batch accounting retains its own synchronization.
+
+Each CQ keeps a 512 KiB bitmap of connection tags claimed during its lifetime.
+`set_wr_tag` accepts a tag exactly once and prevents reuse even after QP destruction,
+so a retained completion cannot release memory on a replacement QP. The core
+poller retires a slot after its 256 generations instead of wrapping its tag.
+
+`prepare_reads` takes a destination `Vec<Buffer>` and buffer-index/offset/length
+descriptors. It validates local bounds and cross-request overlap, and derives
+the local addresses and keys itself. The returned non-cloneable `ReadPosting`
+cursor can post each request once, only to its preparing QP. Dropping the cursor
+accounts its unposted suffix; the QP retains already posted destinations.
+Explicit cancellation before any post can recover the vector. Timeout or
+connection failure notifies the receiver without recycling memory still visible
+to the NIC; dropping or forgetting a future cannot authorize early recovery.
+Buffers remain owned until all posted READs complete or their QP is destroyed.
+Forgetting an owner can retain resources indefinitely. Successful QP destruction
+also releases any remaining unsignaled SENDs; a provider failure to destroy a QP
+aborts the process because dropping its memory holds would permit ongoing DMA
+into recycled storage.
+
+These guarantees concern local destinations. Remote source addresses and keys
+do not carry a source-side completion lease. The RPC layer's post-READ pending
+check rejects stale results but cannot delay source recovery until an
+unobservable remote DMA completion.
+
+## Buffer-pool registration
+
+`ActiveDevice` implements `ruapc_bufpool::MemoryRegistrar` in
+`src/buffer_registration.rs`. `DeviceSet` calls this audited capability directly;
+safe application `Device` wrappers supply a registrar reference without receiving
+the backing allocation. Registration retains memory and its protection domain
+through `MemoryRegion`, but does not grant independent access to bytes owned by
+pool buffers. Queue operations separately own their DMA lifetime obligations.
 
 ## Why a C shim?
 

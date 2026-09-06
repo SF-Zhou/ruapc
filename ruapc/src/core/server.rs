@@ -76,7 +76,7 @@ impl Server {
 
     /// The server's shared state (router, socket pool, buffer pool);
     /// useful for introspection such as
-    /// [`State::rdma_path_report`](crate::State::rdma_path_report).
+    /// `State::rdma_path_report` when the `rdma` feature is enabled.
     pub fn state(&self) -> &Arc<State> {
         &self.state
     }

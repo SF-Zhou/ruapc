@@ -1,0 +1,309 @@
+//! Serial remote-memory RPC benchmark across transports.
+//!
+//! Run with: `cargo bench -p ruapc --bench remote_memory`
+//! `RUAPC_BENCH_TRANSPORT` selects one transport (`TCP`, `WS`, `HTTP`, `RDMA`).
+//! `RUAPC_BENCH_RDMA_DEVICE` restricts both peers to one named RDMA device.
+//! `RUAPC_BENCH_SERIAL_ITERS` overrides the measured iteration count for each size;
+//! `RUAPC_BENCH_WARMUP_ITERS` overrides the warmup count.
+//!
+//! Setup, registration, buffer initialization and warmup are outside timing.
+//! Read-source wrappers, server write sources and client write destinations are
+//! reused. `remote_read_all` retains its normal pool-allocation behavior.
+//! Every operation verifies the complete deterministic byte pattern; reported
+//! time includes that verification. Bulk bytes use remote memory, with only a
+//! case index and byte count in the application RPC request/response. RDMA uses
+//! one-sided reads; TCP/WS/HTTP use their inline reverse-RPC fallback.
+
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
+use ruapc::{
+    Buffer, BufferPool, Client, Context, Endpoint, ListenMode, Result, ResultWithBuffers, Router,
+    Server, SocketPoolConfig, Transport,
+};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+const WARMUP_ITERS: usize = 8;
+/// Size in bytes and measured iterations; the larger case moves more bytes.
+const CASES: [(usize, usize); 2] = [(64 * 1024, 512), (1024 * 1024, 128)];
+
+struct BenchOptions {
+    transport: Option<Transport>,
+    rdma_device: Option<String>,
+    serial_iters: Option<usize>,
+    warmup_iters: usize,
+}
+
+impl BenchOptions {
+    fn from_env() -> Self {
+        Self {
+            transport: optional_env("RUAPC_BENCH_TRANSPORT")
+                .map(|value| value.parse().expect("invalid RUAPC_BENCH_TRANSPORT")),
+            rdma_device: optional_env("RUAPC_BENCH_RDMA_DEVICE"),
+            serial_iters: positive_env("RUAPC_BENCH_SERIAL_ITERS"),
+            warmup_iters: positive_env("RUAPC_BENCH_WARMUP_ITERS").unwrap_or(WARMUP_ITERS),
+        }
+    }
+
+    fn includes(&self, transport: Transport) -> bool {
+        self.transport.is_none_or(|selected| selected == transport)
+    }
+}
+
+fn positive_env(name: &str) -> Option<usize> {
+    optional_env(name).map(|value| {
+        let count = value.parse().unwrap_or_else(|_| panic!("invalid {name}"));
+        assert!(count > 0, "{name} must be positive");
+        count
+    })
+}
+
+fn optional_env(name: &str) -> Option<String> {
+    match std::env::var(name) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => panic!("invalid {name}: {error}"),
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct BenchRequest {
+    case: usize,
+}
+
+#[ruapc::service]
+trait RemoteMemoryBench {
+    async fn probe(&self, ctx: &Context, req: &()) -> Result<()>;
+    async fn read_all(&self, ctx: &Context, req: &BenchRequest) -> Result<usize>;
+    async fn write_all(&self, ctx: &Context, req: &BenchRequest) -> ResultWithBuffers<usize>;
+}
+
+struct Case {
+    expected: Vec<u8>,
+    write_source: Mutex<Option<Vec<Buffer>>>,
+}
+
+struct BenchService {
+    cases: [Case; CASES.len()],
+}
+
+impl BenchService {
+    fn new() -> Self {
+        Self {
+            cases: CASES.map(|(size, _)| Case {
+                expected: (0..size)
+                    .map(|offset| ((offset.wrapping_mul(31) ^ (offset >> 8)) & 0xff) as u8)
+                    .collect(),
+                write_source: Mutex::new(None),
+            }),
+        }
+    }
+
+    fn initialize_sources(&self, pool: &Arc<BufferPool>) {
+        for case in &self.cases {
+            *case.write_source.lock().unwrap() = Some(make_buffers(pool, &case.expected));
+        }
+    }
+}
+
+impl RemoteMemoryBench for BenchService {
+    async fn probe(&self, _ctx: &Context, _req: &()) -> Result<()> {
+        Ok(())
+    }
+
+    async fn read_all(&self, ctx: &Context, req: &BenchRequest) -> Result<usize> {
+        let buffers = ctx.remote_read_all().await?;
+        let expected = &self.cases[req.case].expected;
+        verify(&buffers, expected);
+        Ok(expected.len())
+    }
+
+    async fn write_all(&self, ctx: &Context, req: &BenchRequest) -> ResultWithBuffers<usize> {
+        let case = &self.cases[req.case];
+        let source = case
+            .write_source
+            .lock()
+            .unwrap()
+            .take()
+            .expect("serial benchmark must have one reusable write source");
+        let mut sent = ctx.remote_write_all(source).await?;
+        *case.write_source.lock().unwrap() = Some(sent.take_buffers());
+        Ok(sent.reply(case.expected.len()))
+    }
+}
+
+fn make_buffers(pool: &Arc<BufferPool>, data: &[u8]) -> Vec<Buffer> {
+    let mut buffer = pool.allocate(data.len()).unwrap();
+    buffer.set_len(data.len());
+    buffer.copy_from_slice(data);
+    vec![buffer]
+}
+
+fn verify(buffers: &[Buffer], expected: &[u8]) {
+    let mut offset = 0;
+    for buffer in buffers {
+        let end = offset + buffer.len();
+        assert!(end <= expected.len(), "remote-memory result is too long");
+        assert!(
+            buffer.as_slice() == &expected[offset..end],
+            "remote-memory payload differs from the complete expected pattern"
+        );
+        offset = end;
+    }
+    assert_eq!(offset, expected.len(), "remote-memory result is too short");
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn report(operation: &str, size: usize, iters: usize, elapsed: Duration) {
+    let secs = elapsed.as_secs_f64();
+    let us_per_op = secs * 1e6 / iters as f64;
+    let mib_per_sec = (size * iters) as f64 / secs / (1024.0 * 1024.0);
+    println!(
+        "  {operation:<16} {:>4} KiB | {iters:>3} iters | {us_per_op:>9.2} us/op | \
+         {mib_per_sec:>8.1} MiB/s | verified",
+        size / 1024,
+    );
+}
+
+async fn bench_read(
+    ctx: &Context,
+    req: &BenchRequest,
+    expected: &[u8],
+    iters: usize,
+    warmup: usize,
+) {
+    let buffers = make_buffers(&ctx.state.buffer_pool, expected);
+    let client = Client::default();
+    let source = client.with_read_buffers(buffers);
+    for _ in 0..warmup {
+        assert_eq!(source.read_all(ctx, req).await.unwrap(), expected.len());
+    }
+    let start = Instant::now();
+    for _ in 0..iters {
+        assert_eq!(source.read_all(ctx, req).await.unwrap(), expected.len());
+    }
+    report("remote_read_all", expected.len(), iters, start.elapsed());
+}
+
+async fn bench_write(
+    ctx: &Context,
+    req: &BenchRequest,
+    expected: &[u8],
+    iters: usize,
+    warmup: usize,
+) {
+    let mut destinations = make_buffers(&ctx.state.buffer_pool, &vec![0; expected.len()]);
+    let client = Client::default();
+    for _ in 0..warmup {
+        let (written, returned) = client
+            .with_write_buffers(destinations)
+            .write_all(ctx, req)
+            .await
+            .unwrap()
+            .into_parts();
+        assert_eq!(written, expected.len());
+        verify(&returned, expected);
+        destinations = returned;
+    }
+    let start = Instant::now();
+    for _ in 0..iters {
+        let (written, returned) = client
+            .with_write_buffers(destinations)
+            .write_all(ctx, req)
+            .await
+            .unwrap()
+            .into_parts();
+        assert_eq!(written, expected.len());
+        verify(&returned, expected);
+        destinations = returned;
+    }
+    report("remote_write_all", expected.len(), iters, start.elapsed());
+}
+
+async fn run(options: BenchOptions) {
+    let service = Arc::new(BenchService::new());
+    let mut router = Router::default();
+    service.clone().ruapc_export(&mut router);
+    let config = SocketPoolConfig {
+        listen_mode: ListenMode::UNIFIED,
+        buffer_pool_memory: 512 * 1024 * 1024,
+        ..Default::default()
+    };
+    #[cfg(feature = "rdma")]
+    let config = {
+        let mut config = config;
+        if let Some(device) = &options.rdma_device {
+            config
+                .rdma
+                .get_or_insert_with(Default::default)
+                .path
+                .device_filter = vec![device.clone()];
+        }
+        config
+    };
+    let server = Server::create(router, &config).unwrap();
+    service.initialize_sources(&server.state().buffer_pool);
+    let addr = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let base_ctx = Context::create(&config).unwrap();
+
+    for transport in [
+        Transport::TCP,
+        Transport::WS,
+        Transport::HTTP,
+        #[cfg(feature = "rdma")]
+        Transport::RDMA,
+    ] {
+        if !options.includes(transport) {
+            continue;
+        }
+        println!("{transport:?}");
+        let ctx = base_ctx.with_endpoint(Endpoint::new(transport, addr));
+        let probe = Client {
+            timeout: Duration::from_secs(1),
+            connect_timeout: Duration::from_secs(5),
+            max_retries: 0,
+            ..Default::default()
+        };
+        if let Err(error) = probe.probe(&ctx, &()).await {
+            #[cfg(feature = "rdma")]
+            if transport == Transport::RDMA {
+                println!("  skipped: {error}");
+                continue;
+            }
+            panic!("{transport:?} setup failed: {error}");
+        }
+        for (case, &(size, iters)) in CASES.iter().enumerate() {
+            let request = BenchRequest { case };
+            let expected = &service.cases[case].expected;
+            assert_eq!(expected.len(), size);
+            let iters = options.serial_iters.unwrap_or(iters);
+            bench_read(&ctx, &request, expected, iters, options.warmup_iters).await;
+            bench_write(&ctx, &request, expected, iters, options.warmup_iters).await;
+        }
+    }
+    server.stop();
+    server.join().await;
+}
+
+fn main() {
+    let options = BenchOptions::from_env();
+    println!("ruapc: remote-memory RPC + complete-pattern verification");
+    println!(
+        "serial requests; 4 runtime workers; {} warmup iterations per case; measured override: {:?}",
+        options.warmup_iters, options.serial_iters,
+    );
+    println!("setup and warmup excluded; sources and write destinations reused");
+    println!(
+        "transport: {:?}; RDMA device: {:?}",
+        options.transport, options.rdma_device,
+    );
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(run(options));
+}

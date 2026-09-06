@@ -5,32 +5,22 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Context, CopyOp, Result,
     core::ContextEndpoint,
-    core::scatter::{self, SpaceLayout},
+    remote_memory::scatter::{self, SpaceLayout},
 };
 
 /// Request to read byte ranges of the client's read space (TCP/WS/HTTP
 /// fallback of `Context::remote_read`).
 ///
-/// `regions` echo the read regions the client attached to the original
-/// request (they describe the *client's own* memory, so the client can
-/// re-validate every access against its registration table). Each op's
-/// `src_offset` addresses the logical concatenation of `regions`;
-/// `dst_offset` addresses the server's local space and is opaque to the
-/// client.
-///
-/// After reading, the service verifies that the original request
-/// (identified by `request_id`) is still being awaited. If it has already timed
-/// out, the data is discarded and a Timeout error is returned, since the
-/// buffers may have been reclaimed.
+/// The request ID selects this side's owned source buffers. The peer supplies
+/// logical offsets only; a local reader keeps the source alive through copying,
+/// even if the original request is cancelled at the same time.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub(crate) struct ReadInlineRequest {
-    /// The client's read regions, in space order.
-    pub(crate) regions: Vec<RemoteBufferInfo>,
     /// The validated op batch; response bytes are the op payloads
     /// concatenated in op order.
     pub(crate) ops: Vec<CopyOp>,
     /// Message ID of the original request. Used to verify the request
-    /// is still alive after reading, ensuring the buffer data is valid.
+    /// still has an attached read source.
     pub(crate) request_id: u64,
 }
 
@@ -112,8 +102,7 @@ pub(crate) struct RequestStatusRequest {
 pub(crate) trait MemoryService {
     /// Reads byte ranges from registered memory regions (TCP fallback).
     ///
-    /// After reading, verifies the original request is still alive (not
-    /// timed out).
+    /// A local ownership lease covers copying; expired requests have no source.
     async fn read_inline(
         &self,
         ctx: &Context,
@@ -142,43 +131,17 @@ impl MemoryService for () {
         ctx: &Context,
         req: &ReadInlineRequest,
     ) -> Result<ReadInlineResponse> {
-        validate_region_addresses(&req.regions, "read_inline")?;
-        let layout = SpaceLayout::from_lens(req.regions.iter().map(|r| r.len))?;
-        // The destination space is server-local and opaque here; only the
-        // source side is checked (each region access is additionally
-        // validated against the registration table below).
-        let total = scatter::validate_ops(&req.ops, layout.total(), u64::MAX)?;
-        let mut bytes = Vec::with_capacity(usize::try_from(total).unwrap_or(0));
-        for op in &req.ops {
-            layout.for_each_slice::<crate::Error>(op.src_offset, op.len, |seg, off, len| {
-                let region = &req.regions[seg];
-                let addr = region.addr.checked_add(off).ok_or_else(|| {
-                    crate::Error::new(
-                        crate::ErrorKind::InvalidCopyOp,
-                        "read_inline: region address overflows u64".into(),
-                    )
-                })?;
-                let chunk = ctx
-                    .state
-                    .devices
-                    .tcp_device()
-                    .read_memory(region.key.lkey, addr, len)
-                    .map_err(|e| {
-                        crate::Error::new(crate::ErrorKind::InvalidArgument, e.to_string())
-                    })?;
-                bytes.extend_from_slice(&chunk);
-                Ok(())
+        let source = ctx
+            .state
+            .waiter
+            .read_source(req.request_id)
+            .ok_or_else(|| {
+                crate::Error::new(
+                    crate::ErrorKind::Timeout,
+                    "read_inline: original request is gone or has no read buffers".into(),
+                )
             })?;
-        }
-
-        // After reading, verify the original request is still alive.
-        if !ctx.state.waiter.contains_message_id(req.request_id) {
-            return Err(crate::Error::new(
-                crate::ErrorKind::Timeout,
-                "read_inline: original request has already timed out, data discarded".into(),
-            ));
-        }
-
+        let bytes = source.read_inline(&req.ops)?;
         Ok(ReadInlineResponse { bytes })
     }
 
@@ -355,7 +318,7 @@ mod tests {
         let (msgid, _rx) = ctx.state.waiter.alloc(std::time::Duration::from_secs(5));
         let mut buf = ctx.state.buffer_pool.allocate(64 * 1024).unwrap();
         buf.set_len(8);
-        let target = crate::core::WriteTarget::new(vec![buf]).unwrap();
+        let target = crate::remote_memory::WriteTarget::new(vec![buf]).unwrap();
         ctx.state.waiter.bind_write_target(msgid, target);
 
         // Length mismatch between ops and data.
@@ -386,7 +349,7 @@ mod tests {
         let target = ctx.state.waiter.write_target(msgid).unwrap();
         // The waiter entry still holds a clone, so unwrapping fails here —
         // which is exactly the pinning behavior we want.
-        assert!(crate::core::WriteTarget::try_into_buffers(target).is_none());
+        assert!(crate::remote_memory::WriteTarget::try_into_buffers(target).is_none());
     }
 
     #[tokio::test]

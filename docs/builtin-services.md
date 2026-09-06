@@ -55,11 +55,10 @@ Internal methods do not appear in any of these APIs or in OpenAPI.
 | `_ruapc.memory/read_inline` | `ReadInlineRequest` | `ReadInlineResponse` | TCP/WS/HTTP remote read; returns copied bytes inline. |
 | `_ruapc.memory/write_inline` | `WriteInlineRequest` | `()` | TCP/WS/HTTP remote write; carries copied bytes inline. |
 | `_ruapc.memory/read_into_target` | `ReadIntoTargetRequest` plus `MsgMeta.read_regions` | `()` | RDMA remote write; the client RDMA-READs into its pinned target. |
-| `_ruapc.memory/request_is_pending` | `RequestStatusRequest` | `bool` | Post-READ lifetime check for one-sided RDMA reads. |
+| `_ruapc.memory/request_is_pending` | `RequestStatusRequest` | `bool` | Post-READ request-liveness check for one-sided RDMA reads. |
 
 ```text
 ReadInlineRequest
-├─ regions: Vec<RemoteBufferInfo>
 ├─ ops: Vec<CopyOp>
 └─ request_id: u64
 
@@ -80,10 +79,15 @@ RequestStatusRequest
 ```
 
 `read_inline` and `write_inline` are separate because they move bytes in
-opposite request/response directions. `read_into_target` is also distinct: it
+opposite request/response directions. `read_inline` resolves `request_id` to an
+owned immutable source on the local waiter and validates the logical ops against
+that source; the peer does not supply memory addresses. The handler retains
+source ownership through the CPU copy, independently of the caller's future.
+`read_into_target` is also distinct: it
 starts client-side RDMA READ work and relies on pinned write buffers. The
-pending-request probe is an internal memory-lifetime primitive, not a public
-metadata API.
+pending-request probe rejects stale one-sided READ results. It is an internal
+liveness check, not a source-side acknowledgement of remote DMA completion or a
+public metadata API.
 
 ## Internal RDMA bootstrap service
 

@@ -139,15 +139,10 @@ impl ruapc_bufpool::Device for RdmaDevice {
         self.index = idx;
     }
 
-    fn register(
-        &self,
-        mem: &Arc<ruapc_bufpool::AlignedMemory>,
-    ) -> std::io::Result<Box<dyn ruapc_bufpool::Registration>> {
-        let mr = self
-            .inner
-            .register(mem)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        Ok(Box::new(mr))
+    type Registrar = ActiveDevice;
+
+    fn registrar(&self) -> &Self::Registrar {
+        &self.inner
     }
 }
 

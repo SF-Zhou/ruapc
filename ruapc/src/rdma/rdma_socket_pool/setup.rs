@@ -18,6 +18,9 @@ use crate::{Buffer, Error, ErrorKind, Result, State};
 
 /// Resources owned by one local endpoint before it is handed to the poller.
 /// Both initiator and acceptor use the same negotiation and setup sequence.
+/// Kept in a Box across the peer's prepare RPC: shared transport acquisition
+/// futures carry only that pointer instead of an entire temporary QP. The box
+/// is consumed at registration; established connections own the QP directly.
 pub(super) struct LocalConnection {
     queue_pair: QueuePair,
     pub(super) endpoint: RdmaQpEndpoint,
@@ -39,20 +42,20 @@ impl LocalConnection {
     }
 
     pub(super) fn register(
-        self,
+        self: Box<Self>,
         pool: &RdmaSocketPool,
         state: &Arc<State>,
         path: RdmaPathInfo,
     ) -> Result<Arc<RdmaSocket>> {
-        pool.register_socket(
-            self.queue_pair,
-            state,
-            &self.poller,
-            &self.config,
-            path,
-            self.device_index,
-        )
-        .map_err(|err| at_stage("register socket", err))
+        let Self {
+            queue_pair,
+            config,
+            poller,
+            device_index,
+            ..
+        } = *self;
+        pool.register_socket(queue_pair, state, &poller, &config, path, device_index)
+            .map_err(|err| at_stage("register socket", err))
     }
 }
 
@@ -69,17 +72,13 @@ impl RdmaSocketPool {
         selection: &DeviceSelection,
         peer_limits: RdmaConnectionLimits,
         traffic_class: u8,
-    ) -> Result<LocalConnection> {
-        let device = self
-            .devices
-            .rdma_devices()
-            .get(device_index)
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::InvalidArgument,
-                    format!("local RDMA device index {device_index} is unavailable"),
-                )
-            })?;
+    ) -> Result<Box<LocalConnection>> {
+        let device = self.devices.devices().get(device_index).ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidArgument,
+                format!("local RDMA device index {device_index} is unavailable"),
+            )
+        })?;
         let config = self
             .resolve_connection_config(device, peer_limits, traffic_class)
             .map_err(|err| at_stage("negotiate limits", err))?;
@@ -106,13 +105,13 @@ impl RdmaSocketPool {
             ?config,
             "RDMA local endpoint prepared"
         );
-        Ok(LocalConnection {
+        Ok(Box::new(LocalConnection {
             queue_pair,
             endpoint,
             config,
             poller,
             device_index,
-        })
+        }))
     }
 
     pub(super) fn find_device_by_name(
@@ -120,7 +119,7 @@ impl RdmaSocketPool {
         selection: &DeviceSelection,
     ) -> Result<(usize, &RdmaDevice)> {
         self.devices
-            .rdma_devices()
+            .devices()
             .iter()
             .enumerate()
             .find(|(_, device)| device.info().name.as_str() == selection.device_name)
@@ -350,7 +349,9 @@ impl RdmaSocketPool {
             .saturating_add(config.qp.max_recv_wr)
             .saturating_mul(2);
         let reservation = poller.reserve(qp_depth)?;
-        queue_pair.set_wr_tag(reservation.tag());
+        queue_pair
+            .set_wr_tag(reservation.tag())
+            .map_err(Error::from)?;
 
         let ring_bytes = config.recv_queue_len as usize * config.max_msg_size as usize;
         let (ring_reservation, ring_total) =
@@ -386,7 +387,7 @@ impl RdmaSocketPool {
             });
         let bandwidth_limiter = self
             .devices
-            .rdma_devices()
+            .devices()
             .get(device_index)
             .ok_or_else(|| {
                 Error::new(

@@ -1,7 +1,5 @@
-error: custom attribute panicked
- --> tests/ui/fail/not_async.rs:3:1
+error: RPC methods must be async
+ --> tests/ui/fail/not_async.rs:5:5
   |
-3 | #[ruapc::service]
-  | ^^^^^^^^^^^^^^^^^
-  |
-  = help: message: the function should be in the form `async fn func(&self, ctx: &Context, req: &Req) -> Result<Rsp>`.
+5 |     fn hello(&self, ctx: &ruapc::Context, req: &String) -> ruapc::Result<String>;
+  |     ^^

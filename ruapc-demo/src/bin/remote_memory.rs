@@ -1,7 +1,7 @@
 //! Self-contained demo of the remote read/write API.
 //!
 //! Starts a server in-process, then demonstrates:
-//! - **Upload**: the client attaches registered buffers via
+//! - **Upload**: the client moves registered buffers into a source wrapper via
 //!   `with_read_buffers`; the server pulls them with `remote_read_all`.
 //! - **Download**: the client pre-provides pinned destination buffers via
 //!   `with_write_buffers`; the service method returns
@@ -20,11 +20,14 @@
 //! cargo run --bin remote_memory --features rdma -- --transport rdma
 //! ```
 
-use std::str::FromStr;
 use std::sync::Arc;
 
 use clap::Parser;
-use ruapc::*;
+use ruapc::{
+    Client, Context, Endpoint, Error, ErrorKind, ListenMode, Result, Router, Server,
+    SocketPoolConfig, Transport, WithBuffers,
+};
+use ruapc_demo::app::init_tracing;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -35,10 +38,6 @@ pub struct Args {
     #[arg(long, default_value = "tcp")]
     pub transport: Transport,
 }
-
-// ==========================================================================
-// Service definition
-// ==========================================================================
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct UploadReq {
@@ -71,16 +70,23 @@ impl BlobService for BlobServiceImpl {
         // RDMA: batched one-sided RDMA READs).
         let data = ctx.remote_read_all().await?;
         let total: usize = data.iter().map(|b| b.len()).sum();
+        let preview = data
+            .first()
+            .map(|buffer| &buffer[..buffer.len().min(16)])
+            .unwrap_or_default();
         tracing::info!(
             "server: received upload '{}' ({total} bytes in {} buffer(s)): {:?}...",
             req.name,
             data.len(),
-            &data[0][..data[0].len().min(16)]
+            preview
         );
         Ok(total)
     }
 
     async fn download(&self, ctx: &Context, req: &DownloadReq) -> Result<WithBuffers<u64>> {
+        if req.len == 0 {
+            return Ok(ctx.sent_nothing().reply(0));
+        }
         // Fill a pool buffer and set its logical length.
         let mut buf = ctx
             .state
@@ -103,21 +109,11 @@ impl BlobService for BlobServiceImpl {
     }
 }
 
-// ==========================================================================
-// Main
-// ==========================================================================
-
+/// Start the example server, run both transfer directions, then shut it down.
 #[tokio::main]
-async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+async fn main() -> Result<()> {
+    init_tracing();
     let args = Args::parse();
-
-    // ---- Server ----------------------------------------------------------
     let config = SocketPoolConfig {
         listen_mode: ListenMode::UNIFIED,
         #[cfg(feature = "rdma")]
@@ -126,67 +122,97 @@ async fn main() {
     };
     let mut router = Router::default();
     Arc::new(BlobServiceImpl).ruapc_export(&mut router);
-    let server = Arc::new(Server::create(router, &config).unwrap());
-    let addr = std::net::SocketAddr::from_str("127.0.0.1:0").unwrap();
-    let addr = server.clone().listen(addr).await.unwrap();
+    let server = Arc::new(Server::create(router, &config)?);
+    let addr = server.clone().listen(([127, 0, 0, 1], 0).into()).await?;
     tracing::info!("server listening on {addr}");
 
-    // ---- Client ----------------------------------------------------------
-    let ctx = Context::create(&config)
-        .unwrap()
-        .with_endpoint(Endpoint::new(args.transport, addr));
-    let client = Client::default();
+    let result = async {
+        let ctx = Context::create(&config)?.with_endpoint(Endpoint::new(args.transport, addr));
+        let client = Client::default();
+        demonstrate_upload(&client, &ctx).await?;
+        demonstrate_download(&client, &ctx).await?;
+        tracing::info!("remote read/write demo finished successfully");
+        Ok(())
+    }
+    .await;
 
-    // Upload: fill two registered buffers, mark the valid lengths, attach
-    // them — together they form one logical read space.
+    server.stop();
+    server.join().await;
+    result
+}
+
+async fn demonstrate_upload(client: &Client, ctx: &Context) -> Result<()> {
+    // Two owned buffers form one immutable logical read space. Capacity is
+    // allocation space; set_len marks the bytes the server may read.
     let payload = b"hello remote memory!";
-    let (a, b) = payload.split_at(8);
-    let mut buf_a = ctx.state.buffer_pool.allocate(1 << 20).unwrap();
-    buf_a[..a.len()].copy_from_slice(a);
-    buf_a.set_len(a.len());
-    let mut buf_b = ctx.state.buffer_pool.allocate(1 << 20).unwrap();
-    buf_b[..b.len()].copy_from_slice(b);
-    buf_b.set_len(b.len());
-    let read_bufs = [buf_a, buf_b];
+    let (first, second) = payload.split_at(8);
+    let mut buffers = Vec::with_capacity(2);
+    for data in [first, second] {
+        let mut buffer = ctx
+            .state
+            .buffer_pool
+            .allocate(data.len())
+            .expect("failed to allocate upload buffer");
+        buffer[..data.len()].copy_from_slice(data);
+        buffer.set_len(data.len());
+        buffers.push(buffer);
+    }
 
-    let req = UploadReq {
-        name: "greeting".into(),
-    };
-    let uploaded = client
-        .with_read_buffers(&read_bufs)
-        .upload(&ctx, &req)
-        .await
-        .unwrap();
+    let source = client.with_read_buffers(buffers);
+    let uploaded = source
+        .upload(
+            ctx,
+            &UploadReq {
+                name: "greeting".into(),
+            },
+        )
+        .await?;
     tracing::info!("client: server read {uploaded} bytes from our buffers");
     assert_eq!(uploaded, payload.len());
+    // The owning wrapper can upload again without rebuilding its source.
+    // It exposes shared views while reads may still be running.
+    assert_eq!(
+        source
+            .read_buffers()
+            .iter()
+            .map(|buffer| buffer.len())
+            .sum::<usize>(),
+        payload.len()
+    );
+    Ok(())
+}
 
-    // Download: pre-provide the pinned destination buffer; the
-    // ResultWithBuffers return type means every attached buffer comes
-    // back through the method's return value — together with a response
-    // computed after the transfer (the server-side write latency).
+async fn demonstrate_download(client: &Client, ctx: &Context) -> Result<()> {
+    // The server writes one contiguous source into two pinned destination
+    // buffers. Their ownership returns together with the response value.
     let want = 4096;
-    let mut dst = ctx.state.buffer_pool.allocate(want).unwrap();
-    dst.set_len(want);
+    let mut destinations = Vec::with_capacity(2);
+    for len in [1024, want - 1024] {
+        let mut buffer = ctx
+            .state
+            .buffer_pool
+            .allocate(len)
+            .expect("failed to allocate download buffer");
+        buffer.set_len(len);
+        destinations.push(buffer);
+    }
     let (push_micros, received) = client
-        .with_write_buffers(vec![dst])
-        .download(&ctx, &DownloadReq { len: want })
-        .await
-        .unwrap()
+        .with_write_buffers(destinations)
+        .download(ctx, &DownloadReq { len: want })
+        .await?
         .into_parts();
-    let received_len: usize = received.iter().map(|b| b.len()).sum();
+    let received_len: usize = received.iter().map(|buffer| buffer.len()).sum();
     tracing::info!(
         "client: received {received_len} bytes from server \
          (server-side write took {push_micros}µs)"
     );
     assert_eq!(received_len, want);
     assert!(
-        received[0]
+        received
             .iter()
+            .flat_map(|buffer| buffer.iter())
             .enumerate()
-            .all(|(i, &b)| b == (i % 251) as u8)
+            .all(|(i, &byte)| byte == (i % 251) as u8)
     );
-
-    tracing::info!("remote read/write demo finished successfully");
-    server.stop();
-    server.join().await;
+    Ok(())
 }

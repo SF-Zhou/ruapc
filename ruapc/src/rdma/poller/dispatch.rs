@@ -6,15 +6,7 @@ use std::sync::{Arc, atomic::Ordering};
 
 use bytes::Bytes;
 
-use crate::{Error, ErrorKind, Message, Socket, State, rdma::RdmaSocket};
-
-/// Size of the per-frame header: a big-endian u32 frame length.
-///
-/// Every RDMA send is a sequence of `[4B frame_len][4B meta_len][meta]
-/// [payload]` frames — usually one. Uniform framing makes messages
-/// self-delimiting, so aggregation is plain concatenation and the receive
-/// path has a single parse loop.
-pub(crate) const FRAME_HEADER: usize = 4;
+use crate::{Message, Socket, State, rdma::frame::for_each_frame};
 
 /// One received buffer awaiting dispatch: the connection's shared state,
 /// the socket it arrived on and the raw `[4B len][message]` frames.
@@ -198,29 +190,6 @@ fn run_dispatch_batch(batch: DispatchBatch) {
     }
 }
 
-/// Walks the `[4B len][message]` frames of one received buffer, invoking
-/// `f` with each frame (a zero-copy slice of the refcounted buffer).
-pub(super) fn for_each_frame(frames: &Bytes, mut f: impl FnMut(Bytes)) {
-    let mut offset = 0;
-    while offset < frames.len() {
-        let Some(header) = frames.get(offset..offset + FRAME_HEADER) else {
-            tracing::error!("truncated frame header at {offset}");
-            return;
-        };
-        let frame_len = u32::from_be_bytes(header.try_into().unwrap()) as usize;
-        let start = offset + FRAME_HEADER;
-        let Some(end) = start
-            .checked_add(frame_len)
-            .filter(|end| *end <= frames.len())
-        else {
-            tracing::error!("truncated frame ({frame_len}B) at {offset}");
-            return;
-        };
-        f(frames.slice(start..end));
-        offset = end;
-    }
-}
-
 /// Handles one dispatched buffer: frame walk + parse + routing to the
 /// router (requests) or waiter (responses) on a runtime worker thread.
 fn dispatch_item((state, socket, frames): DispatchItem) {
@@ -232,15 +201,4 @@ fn dispatch_item((state, socket, frames): DispatchItem) {
         }
         Err(e) => tracing::error!("Failed to parse message: {e}"),
     });
-}
-
-/// Resolves every outstanding read batch of a socket with
-/// `ConnectionClosed` (without releasing their memory holds).
-pub(super) fn fail_read_batches(socket: &RdmaSocket) {
-    for entry in socket.rdma_completions.iter() {
-        entry.value().fail(Error::new(
-            ErrorKind::ConnectionClosed,
-            "rdma poll thread shut down with reads in flight".into(),
-        ));
-    }
 }
