@@ -222,8 +222,10 @@ retain the raw output and placement metadata.
 All **46 measured processes** exited successfully: six capacity probes and
 40 performance runs forming 20 pairs. The two small-CQ baseline probes
 reported their expected routing-capacity failures as structured output;
-all remaining capacity checks and every performance run passed payload and
-lifecycle checks. The [derived summary](qp-registry-data/paired-summary.json)
+all remaining capacity checks passed, as did the multiple-connection payload
+and lifecycle checks and remote-memory payload checks. Stock echo records
+successful RPC returns without asserting their contents. The
+[derived summary](qp-registry-data/paired-summary.json)
 contains every input metric and paired ratio and can be regenerated with
 [summarize.py](qp-registry-data/summarize.py).
 

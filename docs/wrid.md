@@ -330,8 +330,11 @@ starting READ is checked on the next scheduled sweep.
 
 ## Validation and performance evidence
 
-Current QPN-registry validation and measurements are recorded in
-[QP registry](qp-registry.md). The registry regressions cover cross-direction
+The initial QPN-registry validation and measurements at `b8f92fb` are recorded
+in [QP registry](qp-registry.md). The subsequent
+[maintenance optimization study](qp-registry-opt.md) evaluates connection
+storage, activation checks and timing overhead. The registry regressions cover
+cross-direction
 and failed-post watermarks, unused-lease reuse, occupied-QPN rejection,
 unchanged live-QP floors, sequence exhaustion, sparse QPNs and registration
 counts beyond the old slot bound. Completion tests cover retained tokens,

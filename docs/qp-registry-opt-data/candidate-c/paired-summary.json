@@ -1,0 +1,1102 @@
+{
+  "change_definition": "100 * (current / baseline - 1); lower is better for latency, higher for throughput",
+  "aggregation": "Each pair has equal weight; no samples or outliers are removed.",
+  "groups": {
+    "echo-long-paired.json": {
+      "artifact_sha256": "a14274d8bdd066e07c35d1962b5611228a976eb89a523acd43848ceb99c6dcee",
+      "pairs": 5,
+      "metrics": {
+        "RDMA/serial_16B_us": {
+          "baseline_median": 35.19,
+          "current_median": 34.16,
+          "paired_change_median_percent": 4.257937484617269,
+          "paired_change_min_max_percent": [
+            -4.554344789047226,
+            6.169052488070892
+          ],
+          "baseline_min_max": [
+            29.19,
+            40.63
+          ],
+          "current_min_max": [
+            28.58,
+            42.36
+          ],
+          "samples": [
+            {
+              "pair": 1,
+              "baseline": 40.63,
+              "current": 42.36,
+              "change_percent": 4.257937484617269
+            },
+            {
+              "pair": 2,
+              "current": 36.93,
+              "baseline": 35.19,
+              "change_percent": 4.944586530264283
+            },
+            {
+              "pair": 3,
+              "baseline": 35.79,
+              "current": 34.16,
+              "change_percent": -4.554344789047226
+            },
+            {
+              "pair": 4,
+              "current": 31.15,
+              "baseline": 29.34,
+              "change_percent": 6.169052488070892
+            },
+            {
+              "pair": 5,
+              "baseline": 29.19,
+              "current": 28.58,
+              "change_percent": -2.089756766015771
+            }
+          ]
+        },
+        "RDMA/serial_4096B_us": {
+          "baseline_median": 37.63,
+          "current_median": 35.87,
+          "paired_change_median_percent": 0.9035344140313484,
+          "paired_change_min_max_percent": [
+            -16.19158878504673,
+            9.499842717835815
+          ],
+          "baseline_min_max": [
+            29.85,
+            42.8
+          ],
+          "current_min_max": [
+            30.24,
+            42.77
+          ],
+          "samples": [
+            {
+              "pair": 1,
+              "baseline": 42.63,
+              "current": 42.77,
+              "change_percent": 0.3284072249589487
+            },
+            {
+              "pair": 2,
+              "current": 37.97,
+              "baseline": 37.63,
+              "change_percent": 0.9035344140313484
+            },
+            {
+              "pair": 3,
+              "baseline": 42.8,
+              "current": 35.87,
+              "change_percent": -16.19158878504673
+            },
+            {
+              "pair": 4,
+              "current": 34.81,
+              "baseline": 31.79,
+              "change_percent": 9.499842717835815
+            },
+            {
+              "pair": 5,
+              "baseline": 29.85,
+              "current": 30.24,
+              "change_percent": 1.306532663316573
+            }
+          ]
+        },
+        "RDMA/concurrent_64_kops": {
+          "baseline_median": 635.4,
+          "current_median": 679.2,
+          "paired_change_median_percent": -1.1003143755358602,
+          "paired_change_min_max_percent": [
+            -2.8465169503647525,
+            15.845518118245373
+          ],
+          "baseline_min_max": [
+            628.7,
+            699.8
+          ],
+          "current_min_max": [
+            622.8,
+            728.9
+          ],
+          "samples": [
+            {
+              "pair": 1,
+              "baseline": 628.7,
+              "current": 635.0,
+              "change_percent": 1.0020677588674864
+            },
+            {
+              "pair": 2,
+              "current": 622.8,
+              "baseline": 635.4,
+              "change_percent": -1.9830028328611915
+            },
+            {
+              "pair": 3,
+              "baseline": 699.8,
+              "current": 692.1,
+              "change_percent": -1.1003143755358602
+            },
+            {
+              "pair": 4,
+              "current": 679.2,
+              "baseline": 699.1,
+              "change_percent": -2.8465169503647525
+            },
+            {
+              "pair": 5,
+              "baseline": 629.2,
+              "current": 728.9,
+              "change_percent": 15.845518118245373
+            }
+          ]
+        },
+        "RDMA/concurrent_64_us": {
+          "baseline_median": 100.72,
+          "current_median": 94.23,
+          "paired_change_median_percent": 1.1043078941613826,
+          "paired_change_min_max_percent": [
+            -13.684624459300043,
+            2.9273620972146475
+          ],
+          "baseline_min_max": [
+            91.46,
+            101.79
+          ],
+          "current_min_max": [
+            87.8,
+            102.76
+          ],
+          "samples": [
+            {
+              "pair": 1,
+              "baseline": 101.79,
+              "current": 100.78,
+              "change_percent": -0.9922389232734141
+            },
+            {
+              "pair": 2,
+              "current": 102.76,
+              "baseline": 100.72,
+              "change_percent": 2.0254169976171577
+            },
+            {
+              "pair": 3,
+              "baseline": 91.46,
+              "current": 92.47,
+              "change_percent": 1.1043078941613826
+            },
+            {
+              "pair": 4,
+              "current": 94.23,
+              "baseline": 91.55,
+              "change_percent": 2.9273620972146475
+            },
+            {
+              "pair": 5,
+              "baseline": 101.72,
+              "current": 87.8,
+              "change_percent": -13.684624459300043
+            }
+          ]
+        },
+        "RDMA/concurrent_1024_kops": {
+          "baseline_median": 1126.8,
+          "current_median": 1196.0,
+          "paired_change_median_percent": -2.1690816961507764,
+          "paired_change_min_max_percent": [
+            -7.601977750309031,
+            24.2599556455501
+          ],
+          "baseline_min_max": [
+            1037.1,
+            1294.4
+          ],
+          "current_min_max": [
+            1100.5,
+            1288.7
+          ],
+          "samples": [
+            {
+              "pair": 1,
+              "baseline": 1126.8,
+              "current": 1119.6,
+              "change_percent": -0.6389776357827559
+            },
+            {
+              "pair": 2,
+              "current": 1100.5,
+              "baseline": 1124.9,
+              "change_percent": -2.1690816961507764
+            },
+            {
+              "pair": 3,
+              "baseline": 1294.4,
+              "current": 1196.0,
+              "change_percent": -7.601977750309031
+            },
+            {
+              "pair": 4,
+              "current": 1216.8,
+              "baseline": 1275.3,
+              "change_percent": -4.587155963302747
+            },
+            {
+              "pair": 5,
+              "baseline": 1037.1,
+              "current": 1288.7,
+              "change_percent": 24.2599556455501
+            }
+          ]
+        },
+        "RDMA/concurrent_1024_us": {
+          "baseline_median": 908.8,
+          "current_median": 856.19,
+          "paired_change_median_percent": 2.218999912118802,
+          "paired_change_min_max_percent": [
+            -19.52113760204185,
+            8.22504803316817
+          ],
+          "baseline_min_max": [
+            791.12,
+            987.34
+          ],
+          "current_min_max": [
+            794.6,
+            930.52
+          ],
+          "samples": [
+            {
+              "pair": 1,
+              "baseline": 908.8,
+              "current": 914.63,
+              "change_percent": 0.6415052816901357
+            },
+            {
+              "pair": 2,
+              "current": 930.52,
+              "baseline": 910.32,
+              "change_percent": 2.218999912118802
+            },
+            {
+              "pair": 3,
+              "baseline": 791.12,
+              "current": 856.19,
+              "change_percent": 8.22504803316817
+            },
+            {
+              "pair": 4,
+              "current": 841.57,
+              "baseline": 802.92,
+              "change_percent": 4.8136800677527125
+            },
+            {
+              "pair": 5,
+              "baseline": 987.34,
+              "current": 794.6,
+              "change_percent": -19.52113760204185
+            }
+          ]
+        },
+        "RDMA (2 endpoints)/concurrent_64_kops": {
+          "baseline_median": 637.7,
+          "current_median": 630.9,
+          "paired_change_median_percent": 0.9204470742932402,
+          "paired_change_min_max_percent": [
+            -5.695067264573995,
+            3.591030265014883
+          ],
+          "baseline_min_max": [
+            579.2,
+            669.0
+          ],
+          "current_min_max": [
+            591.1,
+            664.3
+          ],
+          "samples": [
+            {
+              "pair": 1,
+              "baseline": 608.4,
+              "current": 614.0,
+              "change_percent": 0.9204470742932402
+            },
+            {
+              "pair": 2,
+              "current": 591.1,
+              "baseline": 579.2,
+              "change_percent": 2.054558011049723
+            },
+            {
+              "pair": 3,
+              "baseline": 669.0,
+              "current": 664.3,
+              "change_percent": -0.7025411061285514
+            },
+            {
+              "pair": 4,
+              "current": 630.9,
+              "baseline": 669.0,
+              "change_percent": -5.695067264573995
+            },
+            {
+              "pair": 5,
+              "baseline": 637.7,
+              "current": 660.6,
+              "change_percent": 3.591030265014883
+            }
+          ]
+        },
+        "RDMA (2 endpoints)/concurrent_64_us": {
+          "baseline_median": 100.36,
+          "current_median": 101.45,
+          "paired_change_median_percent": -0.9220532319391572,
+          "paired_change_min_max_percent": [
+            -3.457552809884412,
+            6.052686598369239
+          ],
+          "baseline_min_max": [
+            95.66,
+            110.5
+          ],
+          "current_min_max": [
+            96.34,
+            108.28
+          ],
+          "samples": [
+            {
+              "pair": 1,
+              "baseline": 105.2,
+              "current": 104.23,
+              "change_percent": -0.9220532319391572
+            },
+            {
+              "pair": 2,
+              "current": 108.28,
+              "baseline": 110.5,
+              "change_percent": -2.0090497737556556
+            },
+            {
+              "pair": 3,
+              "baseline": 95.67,
+              "current": 96.34,
+              "change_percent": 0.7003240305215819
+            },
+            {
+              "pair": 4,
+              "current": 101.45,
+              "baseline": 95.66,
+              "change_percent": 6.052686598369239
+            },
+            {
+              "pair": 5,
+              "baseline": 100.36,
+              "current": 96.89,
+              "change_percent": -3.457552809884412
+            }
+          ]
+        },
+        "RDMA (2 endpoints)/concurrent_1024_kops": {
+          "baseline_median": 1308.4,
+          "current_median": 1338.6,
+          "paired_change_median_percent": 1.7578125,
+          "paired_change_min_max_percent": [
+            -1.7213595077644306,
+            2.9911624745071475
+          ],
+          "baseline_min_max": [
+            1176.8,
+            1365.2
+          ],
+          "current_min_max": [
+            1198.3,
+            1341.7
+          ],
+          "samples": [
+            {
+              "pair": 1,
+              "baseline": 1177.6,
+              "current": 1198.3,
+              "change_percent": 1.7578125
+            },
+            {
+              "pair": 2,
+              "current": 1212.0,
+              "baseline": 1176.8,
+              "change_percent": 2.9911624745071475
+            },
+            {
+              "pair": 3,
+              "baseline": 1315.6,
+              "current": 1338.6,
+              "change_percent": 1.7482517482517501
+            },
+            {
+              "pair": 4,
+              "current": 1341.7,
+              "baseline": 1365.2,
+              "change_percent": -1.7213595077644306
+            },
+            {
+              "pair": 5,
+              "baseline": 1308.4,
+              "current": 1339.9,
+              "change_percent": 2.4075206358911583
+            }
+          ]
+        },
+        "RDMA (2 endpoints)/concurrent_1024_us": {
+          "baseline_median": 782.62,
+          "current_median": 765.0,
+          "paired_change_median_percent": -1.728440493577299,
+          "paired_change_min_max_percent": [
+            -2.90626185086017,
+            1.7491234385207166
+          ],
+          "baseline_min_max": [
+            750.09,
+            870.19
+          ],
+          "current_min_max": [
+            763.21,
+            854.54
+          ],
+          "samples": [
+            {
+              "pair": 1,
+              "baseline": 869.57,
+              "current": 854.54,
+              "change_percent": -1.728440493577299
+            },
+            {
+              "pair": 2,
+              "current": 844.9,
+              "baseline": 870.19,
+              "change_percent": -2.90626185086017
+            },
+            {
+              "pair": 3,
+              "baseline": 778.38,
+              "current": 765.0,
+              "change_percent": -1.7189547521776039
+            },
+            {
+              "pair": 4,
+              "current": 763.21,
+              "baseline": 750.09,
+              "change_percent": 1.7491234385207166
+            },
+            {
+              "pair": 5,
+              "baseline": 782.62,
+              "current": 764.24,
+              "change_percent": -2.3485216324653058
+            }
+          ]
+        }
+      }
+    },
+    "rpc-paired.json": {
+      "artifact_sha256": "09d17aa35d28bad1fc19aacb5026a3d0085c2494cd1b8fbbe74a1cb2141e93b8",
+      "pairs": 5,
+      "metrics": {
+        "128_connections/64_tasks_qps": {
+          "baseline_median": 523944.4472819993,
+          "current_median": 521816.9922299834,
+          "paired_change_median_percent": -0.4725607510921326,
+          "paired_change_min_max_percent": [
+            -5.7795010782134115,
+            -0.30859744934783606
+          ],
+          "baseline_min_max": [
+            503948.89075077354,
+            553825.3333418973
+          ],
+          "current_min_max": [
+            501644.5423810397,
+            522288.0240662618
+          ],
+          "samples": [
+            {
+              "pair": 1,
+              "baseline": 553825.3333418973,
+              "current": 521816.9922299834,
+              "change_percent": -5.7795010782134115
+            },
+            {
+              "pair": 2,
+              "current": 516975.36742062354,
+              "baseline": 523944.4472819993,
+              "change_percent": -1.3301180874286112
+            },
+            {
+              "pair": 3,
+              "baseline": 524304.4417577834,
+              "current": 521826.7847498034,
+              "change_percent": -0.4725607510921326
+            },
+            {
+              "pair": 4,
+              "current": 501644.5423810397,
+              "baseline": 503948.89075077354,
+              "change_percent": -0.4572583474290126
+            },
+            {
+              "pair": 5,
+              "baseline": 523904.7808569978,
+              "current": 522288.0240662618,
+              "change_percent": -0.30859744934783606
+            }
+          ]
+        },
+        "128_connections/1024_tasks_qps": {
+          "baseline_median": 698276.3145189094,
+          "current_median": 700227.2561574864,
+          "paired_change_median_percent": 0.4753090652303227,
+          "paired_change_min_max_percent": [
+            -4.425432716963806,
+            1.4806001104429756
+          ],
+          "baseline_min_max": [
+            694430.0566463578,
+            717598.393945277
+          ],
+          "current_min_max": [
+            685841.5598432159,
+            711914.2587641675
+          ],
+          "samples": [
+            {
+              "pair": 1,
+              "baseline": 717598.393945277,
+              "current": 685841.5598432159,
+              "change_percent": -4.425432716963806
+            },
+            {
+              "pair": 2,
+              "current": 711914.2587641675,
+              "baseline": 703648.457740658,
+              "change_percent": 1.1747060527994568
+            },
+            {
+              "pair": 3,
+              "baseline": 697439.408640951,
+              "current": 707765.6972955618,
+              "change_percent": 1.4806001104429756
+            },
+            {
+              "pair": 4,
+              "current": 697730.745657282,
+              "baseline": 694430.0566463578,
+              "change_percent": 0.4753090652303227
+            },
+            {
+              "pair": 5,
+              "baseline": 698276.3145189094,
+              "current": 700227.2561574864,
+              "change_percent": 0.27939393016946923
+            }
+          ]
+        },
+        "256_connections/64_tasks_qps": {
+          "baseline_median": 514080.04456103663,
+          "current_median": 515854.095961298,
+          "paired_change_median_percent": 2.364042045586001,
+          "paired_change_min_max_percent": [
+            -3.7232575568824755,
+            3.7865158373995067
+          ],
+          "baseline_min_max": [
+            497133.85293355834,
+            517985.6312380319
+          ],
+          "current_min_max": [
+            494939.52045349305,
+            536539.4174685578
+          ],
+          "samples": [
+            {
+              "pair": 1,
+              "baseline": 497133.85293355834,
+              "current": 511398.67238247773,
+              "change_percent": 2.8694122045287207
+            },
+            {
+              "pair": 2,
+              "current": 515854.095961298,
+              "baseline": 503940.72532967344,
+              "change_percent": 2.364042045586001
+            },
+            {
+              "pair": 3,
+              "baseline": 517985.6312380319,
+              "current": 516253.7525033306,
+              "change_percent": -0.33434879854910005
+            },
+            {
+              "pair": 4,
+              "current": 494939.52045349305,
+              "baseline": 514080.04456103663,
+              "change_percent": -3.7232575568824755
+            },
+            {
+              "pair": 5,
+              "baseline": 516964.475721629,
+              "current": 536539.4174685578,
+              "change_percent": 3.7865158373995067
+            }
+          ]
+        },
+        "256_connections/1024_tasks_qps": {
+          "baseline_median": 681890.0110368053,
+          "current_median": 686874.9599689072,
+          "paired_change_median_percent": 1.3019865253142138,
+          "paired_change_min_max_percent": [
+            -0.6395024633655044,
+            5.0296418590611625
+          ],
+          "baseline_min_max": [
+            676199.5868629724,
+            690857.4428482627
+          ],
+          "current_min_max": [
+            686010.2541195153,
+            720405.8636061995
+          ],
+          "samples": [
+            {
+              "pair": 1,
+              "baseline": 677193.2887496625,
+              "current": 686010.2541195153,
+              "change_percent": 1.3019865253142138
+            },
+            {
+              "pair": 2,
+              "current": 686874.9599689072,
+              "baseline": 676199.5868629724,
+              "change_percent": 1.5787310896565376
+            },
+            {
+              "pair": 3,
+              "baseline": 681890.0110368053,
+              "current": 688236.8678933316,
+              "change_percent": 0.9307742823327025
+            },
+            {
+              "pair": 4,
+              "current": 686439.3924829041,
+              "baseline": 690857.4428482627,
+              "change_percent": -0.6395024633655044
+            },
+            {
+              "pair": 5,
+              "baseline": 685907.1885372219,
+              "current": 720405.8636061995,
+              "change_percent": 5.0296418590611625
+            }
+          ]
+        }
+      }
+    },
+    "remote-memory-extended-paired.json": {
+      "artifact_sha256": "a3401daf342fb59075d47ff241ac595978fe88b72578ac3054b8b2957e9e0ad4",
+      "pairs": 5,
+      "metrics": {
+        "remote_read_all/64KiB_us": {
+          "baseline_median": 78.59,
+          "current_median": 74.03,
+          "paired_change_median_percent": -5.802264919200917,
+          "paired_change_min_max_percent": [
+            -32.24831887730241,
+            -1.0336906584992422
+          ],
+          "baseline_min_max": [
+            75.61,
+            102.61
+          ],
+          "current_min_max": [
+            69.52,
+            77.55
+          ],
+          "samples": [
+            {
+              "pair": 1,
+              "baseline": 75.61,
+              "current": 72.84,
+              "change_percent": -3.6635365692368693
+            },
+            {
+              "pair": 2,
+              "current": 69.52,
+              "baseline": 102.61,
+              "change_percent": -32.24831887730241
+            },
+            {
+              "pair": 3,
+              "baseline": 83.52,
+              "current": 77.19,
+              "change_percent": -7.579022988505746
+            },
+            {
+              "pair": 4,
+              "current": 74.03,
+              "baseline": 78.59,
+              "change_percent": -5.802264919200917
+            },
+            {
+              "pair": 5,
+              "baseline": 78.36,
+              "current": 77.55,
+              "change_percent": -1.0336906584992422
+            }
+          ]
+        },
+        "remote_read_all/64KiB_mibps": {
+          "baseline_median": 795.3,
+          "current_median": 844.3,
+          "paired_change_median_percent": 6.1611970325663235,
+          "paired_change_min_max_percent": [
+            1.0406218655967914,
+            47.59481201773108
+          ],
+          "baseline_min_max": [
+            609.1,
+            826.6
+          ],
+          "current_min_max": [
+            805.9,
+            899.0
+          ],
+          "samples": [
+            {
+              "pair": 1,
+              "baseline": 826.6,
+              "current": 858.0,
+              "change_percent": 3.798693443019596
+            },
+            {
+              "pair": 2,
+              "current": 899.0,
+              "baseline": 609.1,
+              "change_percent": 47.59481201773108
+            },
+            {
+              "pair": 3,
+              "baseline": 748.3,
+              "current": 809.7,
+              "change_percent": 8.205265267940675
+            },
+            {
+              "pair": 4,
+              "current": 844.3,
+              "baseline": 795.3,
+              "change_percent": 6.1611970325663235
+            },
+            {
+              "pair": 5,
+              "baseline": 797.6,
+              "current": 805.9,
+              "change_percent": 1.0406218655967914
+            }
+          ]
+        },
+        "remote_write_all/64KiB_us": {
+          "baseline_median": 77.83,
+          "current_median": 77.45,
+          "paired_change_median_percent": -2.8780675831941327,
+          "paired_change_min_max_percent": [
+            -39.15348164806039,
+            20.593439499115274
+          ],
+          "baseline_min_max": [
+            73.47,
+            124.51
+          ],
+          "current_min_max": [
+            75.59,
+            88.6
+          ],
+          "samples": [
+            {
+              "pair": 1,
+              "baseline": 75.75,
+              "current": 86.92,
+              "change_percent": 14.74587458745875
+            },
+            {
+              "pair": 2,
+              "current": 75.76,
+              "baseline": 124.51,
+              "change_percent": -39.15348164806039
+            },
+            {
+              "pair": 3,
+              "baseline": 73.47,
+              "current": 88.6,
+              "change_percent": 20.593439499115274
+            },
+            {
+              "pair": 4,
+              "current": 75.59,
+              "baseline": 77.83,
+              "change_percent": -2.8780675831941327
+            },
+            {
+              "pair": 5,
+              "baseline": 81.3,
+              "current": 77.45,
+              "change_percent": -4.735547355473546
+            }
+          ]
+        },
+        "remote_write_all/64KiB_mibps": {
+          "baseline_median": 803.0,
+          "current_median": 807.0,
+          "paired_change_median_percent": 2.9763387297633948,
+          "paired_change_min_max_percent": [
+            -17.08005172211121,
+            64.34262948207173
+          ],
+          "baseline_min_max": [
+            502.0,
+            850.7
+          ],
+          "current_min_max": [
+            705.4,
+            826.9
+          ],
+          "samples": [
+            {
+              "pair": 1,
+              "baseline": 825.1,
+              "current": 719.0,
+              "change_percent": -12.859047388195377
+            },
+            {
+              "pair": 2,
+              "current": 825.0,
+              "baseline": 502.0,
+              "change_percent": 64.34262948207173
+            },
+            {
+              "pair": 3,
+              "baseline": 850.7,
+              "current": 705.4,
+              "change_percent": -17.08005172211121
+            },
+            {
+              "pair": 4,
+              "current": 826.9,
+              "baseline": 803.0,
+              "change_percent": 2.9763387297633948
+            },
+            {
+              "pair": 5,
+              "baseline": 768.8,
+              "current": 807.0,
+              "change_percent": 4.968782518210202
+            }
+          ]
+        },
+        "remote_read_all/1024KiB_us": {
+          "baseline_median": 198.32,
+          "current_median": 228.2,
+          "paired_change_median_percent": 13.769226055518114,
+          "paired_change_min_max_percent": [
+            -29.63342732632658,
+            52.67749092375959
+          ],
+          "baseline_min_max": [
+            158.93,
+            351.09
+          ],
+          "current_min_max": [
+            185.66,
+            302.79
+          ],
+          "samples": [
+            {
+              "pair": 1,
+              "baseline": 351.09,
+              "current": 247.05,
+              "change_percent": -29.63342732632658
+            },
+            {
+              "pair": 2,
+              "current": 228.2,
+              "baseline": 283.77,
+              "change_percent": -19.582760686471435
+            },
+            {
+              "pair": 3,
+              "baseline": 198.32,
+              "current": 302.79,
+              "change_percent": 52.67749092375959
+            },
+            {
+              "pair": 4,
+              "current": 187.36,
+              "baseline": 158.93,
+              "change_percent": 17.888378531428927
+            },
+            {
+              "pair": 5,
+              "baseline": 163.19,
+              "current": 185.66,
+              "change_percent": 13.769226055518114
+            }
+          ]
+        },
+        "remote_read_all/1024KiB_mibps": {
+          "baseline_median": 5042.3,
+          "current_median": 4382.1,
+          "paired_change_median_percent": -12.102420157644788,
+          "paired_change_min_max_percent": [
+            -34.500128909426266,
+            42.10932837130918
+          ],
+          "baseline_min_max": [
+            2848.3,
+            6291.9
+          ],
+          "current_min_max": [
+            3302.7,
+            5386.1
+          ],
+          "samples": [
+            {
+              "pair": 1,
+              "baseline": 2848.3,
+              "current": 4047.7,
+              "change_percent": 42.10932837130918
+            },
+            {
+              "pair": 2,
+              "current": 4382.1,
+              "baseline": 3523.9,
+              "change_percent": 24.353699026646613
+            },
+            {
+              "pair": 3,
+              "baseline": 5042.3,
+              "current": 3302.7,
+              "change_percent": -34.500128909426266
+            },
+            {
+              "pair": 4,
+              "current": 5337.3,
+              "baseline": 6291.9,
+              "change_percent": -15.171887665093209
+            },
+            {
+              "pair": 5,
+              "baseline": 6127.7,
+              "current": 5386.1,
+              "change_percent": -12.102420157644788
+            }
+          ]
+        },
+        "remote_write_all/1024KiB_us": {
+          "baseline_median": 252.71,
+          "current_median": 243.79,
+          "paired_change_median_percent": 1.3829733927945176,
+          "paired_change_min_max_percent": [
+            -28.855693348365286,
+            45.1584820545289
+          ],
+          "baseline_min_max": [
+            183.86,
+            354.8
+          ],
+          "current_min_max": [
+            202.33,
+            366.83
+          ],
+          "samples": [
+            {
+              "pair": 1,
+              "baseline": 354.8,
+              "current": 252.42,
+              "change_percent": -28.855693348365286
+            },
+            {
+              "pair": 2,
+              "current": 216.05,
+              "baseline": 288.04,
+              "change_percent": -24.99305651992779
+            },
+            {
+              "pair": 3,
+              "baseline": 252.71,
+              "current": 366.83,
+              "change_percent": 45.1584820545289
+            },
+            {
+              "pair": 4,
+              "current": 243.79,
+              "baseline": 183.86,
+              "change_percent": 32.59545306211247
+            },
+            {
+              "pair": 5,
+              "baseline": 199.57,
+              "current": 202.33,
+              "change_percent": 1.3829733927945176
+            }
+          ]
+        },
+        "remote_write_all/1024KiB_mibps": {
+          "baseline_median": 3957.1,
+          "current_median": 4101.8,
+          "paired_change_median_percent": -1.3650242471412222,
+          "paired_change_min_max_percent": [
+            -31.111167268959594,
+            40.560581869788884
+          ],
+          "baseline_min_max": [
+            2818.5,
+            5438.9
+          ],
+          "current_min_max": [
+            2726.0,
+            4942.5
+          ],
+          "samples": [
+            {
+              "pair": 1,
+              "baseline": 2818.5,
+              "current": 3961.7,
+              "change_percent": 40.560581869788884
+            },
+            {
+              "pair": 2,
+              "current": 4628.6,
+              "baseline": 3471.7,
+              "change_percent": 33.323731889276154
+            },
+            {
+              "pair": 3,
+              "baseline": 3957.1,
+              "current": 2726.0,
+              "change_percent": -31.111167268959594
+            },
+            {
+              "pair": 4,
+              "current": 4101.8,
+              "baseline": 5438.9,
+              "change_percent": -24.584015150122262
+            },
+            {
+              "pair": 5,
+              "baseline": 5010.9,
+              "current": 4942.5,
+              "change_percent": -1.3650242471412222
+            }
+          ]
+        }
+      }
+    }
+  }
+}

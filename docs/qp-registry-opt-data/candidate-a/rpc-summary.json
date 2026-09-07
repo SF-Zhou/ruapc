@@ -1,0 +1,166 @@
+{
+  "128_connections/64_tasks_qps": {
+    "baseline_median": 542533.5969339343,
+    "current_median": 535606.2987270603,
+    "paired_change_median_percent": -1.050500785570807,
+    "paired_change_min_max_percent": [
+      -5.267777989649181,
+      0.3823331654811968
+    ],
+    "samples": [
+      {
+        "pair": 1,
+        "baseline": 557647.2143789124,
+        "current": 559779.2846258649,
+        "change_percent": 0.3823331654811968
+      },
+      {
+        "pair": 2,
+        "baseline": 546559.5629258824,
+        "current": 517768.01856975,
+        "change_percent": -5.267777989649181
+      },
+      {
+        "pair": 3,
+        "baseline": 541292.5815484634,
+        "current": 535606.2987270603,
+        "change_percent": -1.050500785570807
+      },
+      {
+        "pair": 4,
+        "baseline": 542533.5969339343,
+        "current": 543898.6806705155,
+        "change_percent": 0.2516127562045778
+      },
+      {
+        "pair": 5,
+        "baseline": 537942.7300214425,
+        "current": 525080.8859158553,
+        "change_percent": -2.3909318572024496
+      }
+    ]
+  },
+  "128_connections/1024_tasks_qps": {
+    "baseline_median": 703526.630875244,
+    "current_median": 709438.9349667707,
+    "paired_change_median_percent": 0.8480796586567418,
+    "paired_change_min_max_percent": [
+      -1.1561813701196355,
+      1.4158627267474744
+    ],
+    "samples": [
+      {
+        "pair": 1,
+        "baseline": 746326.1501985494,
+        "current": 737697.2662896226,
+        "change_percent": -1.1561813701196355
+      },
+      {
+        "pair": 2,
+        "baseline": 699534.4869059254,
+        "current": 709438.9349667707,
+        "change_percent": 1.4158627267474744
+      },
+      {
+        "pair": 3,
+        "baseline": 700634.2168573202,
+        "current": 708837.9524643135,
+        "change_percent": 1.1709013647364985
+      },
+      {
+        "pair": 4,
+        "baseline": 703526.630875244,
+        "current": 709493.0971249301,
+        "change_percent": 0.8480796586567418
+      },
+      {
+        "pair": 5,
+        "baseline": 709662.8378939085,
+        "current": 701605.33175851,
+        "change_percent": -1.1353991931310703
+      }
+    ]
+  },
+  "256_connections/64_tasks_qps": {
+    "baseline_median": 519163.5667518255,
+    "current_median": 491811.45795146783,
+    "paired_change_median_percent": -1.4523866646520278,
+    "paired_change_min_max_percent": [
+      -5.619402604630008,
+      2.3298047589312754
+    ],
+    "samples": [
+      {
+        "pair": 1,
+        "baseline": 533530.0896713233,
+        "current": 525781.169797031,
+        "change_percent": -1.4523866646520278
+      },
+      {
+        "pair": 2,
+        "baseline": 519163.5667518255,
+        "current": 491311.24243480194,
+        "change_percent": -5.364845705811582
+      },
+      {
+        "pair": 3,
+        "baseline": 489737.38250670285,
+        "current": 491811.45795146783,
+        "change_percent": 0.42350768367913627
+      },
+      {
+        "pair": 4,
+        "baseline": 492072.30110045423,
+        "current": 503536.6249888753,
+        "change_percent": 2.3298047589312754
+      },
+      {
+        "pair": 5,
+        "baseline": 520533.36465035565,
+        "current": 491282.49919922533,
+        "change_percent": -5.619402604630008
+      }
+    ]
+  },
+  "256_connections/1024_tasks_qps": {
+    "baseline_median": 684373.0923902049,
+    "current_median": 674683.4011967893,
+    "paired_change_median_percent": 0.1945845753812403,
+    "paired_change_min_max_percent": [
+      -2.9514188383985895,
+      2.134596261877042
+    ],
+    "samples": [
+      {
+        "pair": 1,
+        "baseline": 685852.0411788074,
+        "current": 699293.1157297054,
+        "change_percent": 1.9597630019145607
+      },
+      {
+        "pair": 2,
+        "baseline": 691952.5349860864,
+        "current": 672622.7288443941,
+        "change_percent": -2.7935161971884392
+      },
+      {
+        "pair": 3,
+        "baseline": 674801.9357602401,
+        "current": 676114.9962416035,
+        "change_percent": 0.1945845753812403
+      },
+      {
+        "pair": 4,
+        "baseline": 660582.629089633,
+        "current": 674683.4011967893,
+        "change_percent": 2.134596261877042
+      },
+      {
+        "pair": 5,
+        "baseline": 684373.0923902049,
+        "current": 664174.3760164694,
+        "change_percent": -2.9514188383985895
+      }
+    ]
+  }
+}
