@@ -4,8 +4,11 @@
 //!
 //! Each connection reserves R receive credits + W data credits + A ACK
 //! credits. READs share a per-NIC semaphore H, so a CQ reserves only
-//! min(H, sum of its connections' READ limits). Credits are returned only
-//! after completion processing. No CQ-wide counter is touched per WR.
+//! min(H, sum of its connections' READ limits). While a CQ is running, credits
+//! return only after completion processing. A stopped CQ closes all admission
+//! before QP destruction refunds unpolled READ credits to the NIC; those can
+//! serve other CQs, each with its own H reserve. No CQ-wide counter is touched
+//! per WR.
 
 use std::sync::{
     Mutex,
@@ -121,6 +124,37 @@ impl CqBudget {
     }
 }
 
+/// Carries retirement evidence across bounded CQ drains. A short batch or a
+/// scheduling yield is not proof that a destroyed QP's remaining CQEs are gone.
+#[derive(Default)]
+pub(super) struct CqDrain {
+    retired: Demand,
+    batches: usize,
+}
+
+impl CqDrain {
+    /// At most 1024 completions with the poller's 64-entry batch before
+    /// returning to shutdown checks, READ deadlines and connection maintenance.
+    pub(super) const MAX_BATCHES: usize = 16;
+
+    pub(super) fn begin(&mut self, budget: &CqBudget) {
+        // Include new retirements only before the poll whose result can
+        // authorize their release. Earlier, undrained snapshots stay held.
+        self.retired.add(budget.take_retired());
+        self.batches = 0;
+    }
+
+    /// Records a poll result and returns whether this drain should continue.
+    pub(super) fn polled(&mut self, budget: &CqBudget, count: usize, capacity: usize) -> bool {
+        self.batches += 1;
+        if count == 0 {
+            budget.release_drained(std::mem::take(&mut self.retired));
+            return false;
+        }
+        count == capacity && self.batches < Self::MAX_BATCHES
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,5 +234,73 @@ mod tests {
         });
         assert_eq!(admitted.load(Ordering::Relaxed), 30);
         assert_eq!(budget.snapshot(), (512, 30));
+    }
+
+    #[test]
+    fn continuous_short_batches_yield_without_releasing_retirement() {
+        let budget = CqBudget::new(32, 0);
+        let retired = demand(32, 0);
+        assert!(budget.reserve(retired));
+        budget.retire(retired);
+        let mut drain = CqDrain::default();
+        // Each READ completion can make a permit available to a new poster;
+        // even a small queue can produce short, nonempty batches indefinitely.
+        for _ in 0..10_000 {
+            drain.begin(&budget);
+            assert!(!drain.polled(&budget, 16, 64), "maintenance must run");
+            assert_eq!(budget.snapshot(), (32, 1));
+            assert!(!budget.reserve(retired));
+        }
+        drain.begin(&budget);
+        assert!(!drain.polled(&budget, 0, 64));
+        assert_eq!(budget.snapshot(), (0, 0));
+        assert!(budget.reserve(retired));
+    }
+
+    #[test]
+    fn continuous_full_batches_have_a_scheduling_bound() {
+        let budget = CqBudget::new(16, 0);
+        let retired = demand(16, 0);
+        assert!(budget.reserve(retired));
+        budget.retire(retired);
+        let mut drain = CqDrain::default();
+        for _ in 0..3 {
+            drain.begin(&budget);
+            for _ in 1..CqDrain::MAX_BATCHES {
+                assert!(drain.polled(&budget, 64, 64));
+            }
+            assert!(!drain.polled(&budget, 64, 64), "maintenance must run");
+            assert_eq!(budget.snapshot(), (16, 1));
+        }
+        drain.begin(&budget);
+        assert!(!drain.polled(&budget, 0, 64));
+        assert_eq!(budget.snapshot(), (0, 0));
+    }
+
+    #[test]
+    fn yielding_merges_retirements_but_an_empty_poll_cannot_release_later_ones() {
+        let budget = CqBudget::new(24, 0);
+        let retired = demand(8, 0);
+        for _ in 0..3 {
+            assert!(budget.reserve(retired));
+        }
+        let mut drain = CqDrain::default();
+        budget.retire(retired);
+        drain.begin(&budget);
+        assert!(!drain.polled(&budget, 1, 64));
+        budget.retire(retired);
+        drain.begin(&budget); // Both earlier retirements are now covered.
+        budget.retire(retired); // Races the poll; not covered by its snapshot.
+        assert!(!drain.polled(&budget, 0, 64));
+        assert_eq!(budget.snapshot(), (8, 1));
+        drain.begin(&budget);
+        assert!(!drain.polled(&budget, 1, 64));
+        assert_eq!(budget.snapshot(), (8, 1));
+        drain.begin(&budget);
+        assert!(!drain.polled(&budget, 0, 64));
+        assert_eq!(budget.snapshot(), (0, 0));
+        drain.begin(&budget);
+        assert!(!drain.polled(&budget, 0, 64)); // No double refund.
+        assert_eq!(budget.snapshot(), (0, 0));
     }
 }

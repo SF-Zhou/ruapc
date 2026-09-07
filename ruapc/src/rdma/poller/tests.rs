@@ -206,6 +206,7 @@ fn manual_poller(context: &Arc<ruapc_rdma::Context>) -> (DevicePoller, PollLoop)
         spin: Duration::ZERO,
         conns: HashMap::default(),
         dirty_qps: Vec::new(),
+        drain: CqDrain::default(),
         maintenance_requested,
         unack_cq_events: 0,
     };
@@ -219,6 +220,22 @@ fn register_idle_socket(
     device: &crate::rdma::RdmaDevice,
     buffer_pool: &Arc<crate::BufferPool>,
     state: &Arc<State>,
+) -> Arc<RdmaSocket> {
+    register_idle_socket_with_read_permits(
+        poller,
+        device,
+        buffer_pool,
+        state,
+        Arc::new(tokio::sync::Semaphore::new(1)),
+    )
+}
+
+fn register_idle_socket_with_read_permits(
+    poller: &DevicePoller,
+    device: &crate::rdma::RdmaDevice,
+    buffer_pool: &Arc<crate::BufferPool>,
+    state: &Arc<State>,
+    read_permits: Arc<tokio::sync::Semaphore>,
 ) -> Arc<RdmaSocket> {
     let connection = crate::rdma::RdmaConnectionConfig {
         recv_queue_len: 2,
@@ -272,7 +289,7 @@ fn register_idle_socket(
                 same_connectivity_domain: true,
             },
             read_timeout: None,
-            read_permits: Arc::new(tokio::sync::Semaphore::new(1)),
+            read_permits,
             bandwidth_limiter: Arc::new(RdmaBandwidthLimiter::new(
                 nic.device,
                 nic.port_num,
@@ -301,6 +318,302 @@ fn register_idle_socket(
         )
         .unwrap();
     socket
+}
+
+fn connect_read_pair(device: &crate::rdma::RdmaDevice, first: &QueuePair, second: &QueuePair) {
+    let info = device.info();
+    let port = info.ports.iter().find(|p| p.is_usable()).unwrap();
+    let gid = port
+        .gids
+        .iter()
+        .find(|g| g.gid_type == ruapc_rdma::GidType::RoCEv2)
+        .or_else(|| port.gids.first())
+        .unwrap();
+    let config = |remote: &QueuePair| ruapc_rdma::QpConnectionConfig {
+        local_port_num: port.port_num,
+        local_gid_index: gid.index,
+        pkey_index: 0,
+        link_layer: port.port_attr.link_layer,
+        path_mtu: port.port_attr.active_mtu,
+        remote_qp_num: remote.qp_num(),
+        remote_gid: gid.gid,
+        remote_lid: port.port_attr.lid,
+        local_psn: 7,
+        remote_psn: 7,
+        max_rd_atomic: 1,
+        max_dest_rd_atomic: 1,
+        traffic_class: 0,
+    };
+    first.connect(&config(second)).unwrap();
+    second.connect(&config(first)).unwrap();
+}
+
+/// Consume exactly one authentic READ completion, leaving later CQEs untouched.
+async fn complete_one_read(poller: &DevicePoller, poll_loop: &mut PollLoop) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut storage = CompletionBatch::<1>::new();
+        loop {
+            if let Some(completion) = poller.cq().poll_batch(&mut storage).unwrap().next() {
+                assert!(completion.info().succ());
+                assert!(completion.info().is_read());
+                poll_loop.dispatch(completion, &mut Vec::new());
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("READ must complete on the connected QP");
+}
+
+#[tokio::test]
+async fn shutdown_returns_unpolled_read_credits_only_after_qp_destruction() {
+    use crate::remote_memory::{CopyOp, WriteTarget, scatter::SpaceLayout};
+
+    let devices = crate::rdma::test_utils::make_rdma_devices();
+    let device = &devices.devices()[0];
+    let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+    let (state, _stop) = State::create(
+        crate::Router::default(),
+        &crate::SocketPoolConfig {
+            rdma: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // Exercise an unpublished connection, an ordinary registered connection,
+    // a partially completed batch, and fully completed work (no double refund).
+    for (completed, incoming) in [(0, true), (0, false), (1, false), (2, false)] {
+        let (poller, mut poll_loop) = manual_poller(device.context());
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let socket =
+            register_idle_socket_with_read_permits(&poller, device, &pool, &state, permits.clone());
+        let peer =
+            register_idle_socket_with_read_permits(&poller, device, &pool, &state, permits.clone());
+        connect_read_pair(device, &socket.queue_pair, &peer.queue_pair);
+        if !incoming {
+            assert!(poll_loop.drain_incoming(false));
+        }
+        let mut source = pool.allocate(128).unwrap();
+        source.set_len(128);
+        source.fill(0x5a);
+        let regions = [source.remote_buffer_info(&device.index()).unwrap()];
+        let layout = SpaceLayout::from_lens([128]).unwrap();
+        let mut destination = pool.allocate(128).unwrap();
+        destination.set_len(128);
+        let target = WriteTarget::new(vec![destination]).unwrap();
+        let ops = [CopyOp::new(0, 0, 64), CopyOp::new(64, 64, 64)];
+        let mut read =
+            Box::pin(socket.read_into_target(&regions, &layout, &ops, target.clone(), None));
+        assert!(futures_util::poll!(&mut read).is_pending());
+        assert_eq!(socket.queue_pair.pending_read_count(), 1);
+        assert_eq!(permits.available_permits(), 0);
+
+        for count in 0..completed {
+            complete_one_read(&poller, &mut poll_loop).await;
+            assert_eq!(socket.queue_pair.pending_read_count(), 0);
+            if count == 0 {
+                // The second WR was waiting for the NIC credit returned by
+                // the first CQE. The semaphore has assigned that credit to
+                // its waiter already, before the future is polled again.
+                assert_eq!(permits.available_permits(), 0);
+                assert!(futures_util::poll!(&mut read).is_pending());
+                assert_eq!(socket.queue_pair.pending_read_count(), 1);
+                assert_eq!(permits.available_permits(), 0);
+            } else {
+                assert_eq!(permits.available_permits(), 1);
+            }
+        }
+        if completed == 2 {
+            tokio::time::timeout(Duration::from_secs(1), read)
+                .await
+                .expect("processed READ completions must settle their waiter")
+                .unwrap();
+            let buffers = target.take_for_read().unwrap();
+            assert_eq!(&buffers[0][..], &source[..]);
+        } else {
+            poll_loop.shutdown_cleanup();
+            let error = tokio::time::timeout(Duration::from_secs(1), read)
+                .await
+                .expect("shutdown must settle the READ waiter")
+                .unwrap_err();
+            assert_eq!(error.kind, ErrorKind::ConnectionClosed);
+            assert_eq!(socket.queue_pair.pending_read_count(), 1);
+            assert_eq!(
+                permits.available_permits(),
+                0,
+                "failing the waiter cannot end DMA"
+            );
+        }
+        poll_loop.shutdown_cleanup();
+        assert!(socket.read_credits.is_closed());
+        assert!(peer.read_credits.is_closed());
+        drop(socket);
+        assert_eq!(
+            permits.available_permits(),
+            1,
+            "QP destruction must refund only remaining READs"
+        );
+        drop(peer);
+        assert_eq!(permits.available_permits(), 1);
+        // The remote source outlives both provider QPs, including unpolled READs.
+        drop(source);
+    }
+}
+
+#[tokio::test]
+async fn shutdown_closes_live_connections_before_refunding_incoming_reads() {
+    use crate::remote_memory::{CopyOp, WriteTarget, scatter::SpaceLayout};
+    use std::task::{Context, Wake, Waker};
+
+    struct RefundProbe {
+        live: Arc<RdmaSocket>,
+        woke: AtomicBool,
+    }
+    impl Wake for RefundProbe {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            assert!(
+                self.live.read_credits.is_closed(),
+                "a stopped CQ must not admit new READs from a refund"
+            );
+            self.woke.store(true, Ordering::Release);
+        }
+    }
+
+    let devices = crate::rdma::test_utils::make_rdma_devices();
+    let device = &devices.devices()[0];
+    let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+    let (poller, mut poll_loop) = manual_poller(device.context());
+    let (state, _stop) = State::create(
+        crate::Router::default(),
+        &crate::SocketPoolConfig {
+            rdma: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let permits = Arc::new(tokio::sync::Semaphore::new(1));
+    let live =
+        register_idle_socket_with_read_permits(&poller, device, &pool, &state, permits.clone());
+    assert!(poll_loop.drain_incoming(false));
+    let incoming =
+        register_idle_socket_with_read_permits(&poller, device, &pool, &state, permits.clone());
+    connect_read_pair(device, &incoming.queue_pair, &live.queue_pair);
+    let mut source = pool.allocate(64).unwrap();
+    source.set_len(64);
+    let regions = [source.remote_buffer_info(&device.index()).unwrap()];
+    let layout = SpaceLayout::from_lens([64]).unwrap();
+    let mut destination = pool.allocate(64).unwrap();
+    destination.set_len(64);
+    let target = WriteTarget::new(vec![destination]).unwrap();
+    let ops = [CopyOp::new(0, 0, 64)];
+    let mut read = Box::pin(incoming.read_into_target(&regions, &layout, &ops, target, None));
+    assert!(futures_util::poll!(&mut read).is_pending());
+    drop(read);
+    assert_eq!(incoming.queue_pair.pending_read_count(), 1);
+    drop(incoming); // The inbox now owns the only socket reference.
+
+    let probe = Arc::new(RefundProbe {
+        live,
+        woke: AtomicBool::new(false),
+    });
+    let waker = Waker::from(probe.clone());
+    let mut context = Context::from_waker(&waker);
+    let mut waiting = Box::pin(permits.acquire());
+    assert!(std::future::Future::poll(waiting.as_mut(), &mut context).is_pending());
+    poll_loop.shutdown_cleanup();
+    assert!(
+        probe.woke.load(Ordering::Acquire),
+        "incoming QP destruction must wake the NIC waiter"
+    );
+    drop(waiting.await.unwrap());
+    assert_eq!(permits.available_permits(), 1);
+    drop(waker);
+    drop(probe);
+    drop(source);
+}
+
+#[tokio::test]
+async fn a_read_posted_after_the_shutdown_scan_does_not_wait_for_a_stopped_poller() {
+    let devices = crate::rdma::test_utils::make_rdma_devices();
+    let device = &devices.devices()[0];
+    let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+    let (poller, mut poll_loop) = manual_poller(device.context());
+    let (state, _stop) = State::create(
+        crate::Router::default(),
+        &crate::SocketPoolConfig {
+            rdma: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let permits = Arc::new(tokio::sync::Semaphore::new(1));
+    let socket =
+        register_idle_socket_with_read_permits(&poller, device, &pool, &state, permits.clone());
+    let peer =
+        register_idle_socket_with_read_permits(&poller, device, &pool, &state, permits.clone());
+    connect_read_pair(device, &socket.queue_pair, &peer.queue_pair);
+    let mut source = pool.allocate(64).unwrap();
+    source.set_len(64);
+    let remote = source.remote_buffer_info(&device.index()).unwrap();
+    let mut destination = pool.allocate(64).unwrap();
+    destination.set_len(64);
+    let (mut posting, receiver) = socket
+        .queue_pair
+        .prepare_reads(
+            vec![destination],
+            vec![ruapc_rdma::ReadRequest {
+                remote_addr: remote.addr,
+                rkey: remote.key.rkey,
+                segments: vec![ruapc_rdma::ReadSegment {
+                    buffer: 0,
+                    offset: 0,
+                    len: 64,
+                }],
+            }],
+            None,
+        )
+        .unwrap();
+    let device_permit = permits.acquire().await.unwrap();
+    assert!(socket.state.is_ok());
+    // Pause after the final health check, before publishing to the QP. The
+    // cleanup's failure scan sees no batch and will never consume another CQE.
+    poll_loop.shutdown_cleanup();
+    assert_eq!(socket.queue_pair.pending_read_count(), 0);
+    // Providers such as RXE accept WRs on an ERR QP. Publish through the real
+    // ownership map, without repeating admission or consuming its CQEs.
+    match socket.queue_pair.post_read(&mut posting) {
+        Ok(()) => {
+            device_permit.forget();
+            assert_eq!(socket.queue_pair.pending_read_count(), 1);
+            let error =
+                tokio::time::timeout(Duration::from_secs(1), socket.await_read_batch(receiver))
+                    .await
+                    .expect("late posting must not strand its waiter after shutdown")
+                    .unwrap_err();
+            assert_eq!(error.kind, ErrorKind::ConnectionClosed);
+            drop(posting);
+            assert_eq!(socket.queue_pair.pending_read_count(), 1);
+            assert_eq!(permits.available_permits(), 0);
+        }
+        Err(_) => {
+            // A provider may instead reject the late WR. Ownership must roll
+            // back and the still-unposted permit must return through RAII.
+            assert_eq!(socket.queue_pair.pending_read_count(), 0);
+            assert_eq!(posting.remaining(), 1);
+            assert_eq!(posting.cancel().unwrap()[0].len(), 64);
+            drop(device_permit);
+            assert_eq!(permits.available_permits(), 1);
+        }
+    }
+    drop(socket);
+    assert_eq!(permits.available_permits(), 1);
+    drop(peer);
+    drop(source);
 }
 
 fn mark_dirty(poll_loop: &mut PollLoop, qp_num: u32) {

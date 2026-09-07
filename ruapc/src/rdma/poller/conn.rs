@@ -302,8 +302,7 @@ impl ConnState {
                 debug_assert!(buffer.is_none(), "read WRs store no slot buffer");
                 // Return the in-flight-read permits (per-NIC + per-SQ)
                 // taken at post time.
-                self.socket.read_permits.add_permits(1);
-                self.socket.sq_read_permits.add_permits(1);
+                self.socket.read_credits.complete();
                 if wc.succ() {
                     return Ok(());
                 }
@@ -591,7 +590,7 @@ impl ConnState {
         // Avoid walking every shard of an empty READ map for every idle QP.
         // A READ starting after this check is covered by the next sweep; a
         // posted READ retains its SQ permit until completion processing.
-        if self.socket.sq_read_permits.available_permits() == self.socket.sq_read_cap {
+        if self.socket.read_credits.is_idle() {
             return;
         }
         if self.socket.queue_pair.expire_reads(now) {
@@ -619,8 +618,8 @@ impl ConnState {
         !self.socket.state.is_ok()
             && self.flow.flushed()
             && self.pending_sends.is_empty()
-            && self.socket.sq_read_permits.is_closed()
-            && self.socket.sq_read_permits.available_permits() == self.socket.sq_read_cap
+            && self.socket.read_credits.is_closed()
+            && self.socket.read_credits.is_idle()
             && !self.socket.queue_pair.has_pending_reads()
     }
 }

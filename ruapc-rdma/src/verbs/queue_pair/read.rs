@@ -358,6 +358,16 @@ impl QueuePair {
         !self.read_state.batches.is_empty()
     }
 
+    /// Number of posted READ WRs whose completions have not been processed.
+    ///
+    /// Concurrent posting and completion make this a diagnostic snapshot.
+    /// Accounting must exclude both operations before using the count, and
+    /// destroy the QP before returning credits for its unpolled WRs. The count
+    /// itself is not completion evidence and does not release DMA ownership.
+    pub fn pending_read_count(&self) -> usize {
+        self.read_state.batches.len()
+    }
+
     /// Called only after the completion path verifies CQ/QP ownership.
     pub(super) fn complete_read(&self, wr_id: WRID, success: bool) {
         if let Some((_, batch)) = self.read_state.batches.remove(&wr_id) {

@@ -197,12 +197,12 @@ posted work has settled.
 READ admission combines per-device concurrency, a per-connection SQ guard,
 negotiated atomic-read capabilities and device-port bandwidth limits. The
 poller's periodic sweep enforces READ timeouts without per-operation timers.
-Timeout fails the waiter and moves the QP to ERR; it never force-recycles DMA
-memory. Poller shutdown likewise fails receivers while leaving the QP's holds
-intact. Normal connection removal waits for pending READs and the flow ledger
-to settle. Final QP destruction precedes releasing any remaining work-request
-buffers; a provider failure to destroy the QP aborts the process, since an error
-state or failed destruction alone cannot prove that DMA has stopped.
+Timeout fails the waiter and moves the QP to ERR; neither action returns posted
+READ permits or force-recycles DMA memory. Normal connection removal waits for
+pending READs and the flow ledger to settle. Final QP destruction precedes
+releasing any remaining work-request buffers; a provider failure to destroy
+the QP aborts the process, since an error state or failed destruction alone
+cannot prove that DMA has stopped.
 
 `poller` separates CQ draining, maintenance and idle wakeup. Dispatch workers
 parse received frames away from the poll thread. `poller/flow.rs` owns the
@@ -257,13 +257,20 @@ receive-ring, data-window and capped ACK credits per QP plus shared per-NIC
 READ capacity (bounded by the QPs' combined READ limits). Setup reserves on
 the least utilized CQ shard that fits before creating a QP. The reservation
 travels with the QP through setup and socket lifetime. After QP destruction,
-only an empty CQ observed after taking a retirement snapshot returns its
-budget. This capacity retirement is separate from identity-lease retirement:
-reusing a QPN safely does not free CQ space occupied by old completions.
+only an actual empty CQ poll after taking a retirement snapshot returns its
+budget. The snapshot survives drain limits and short nonempty batches across
+poll-loop rounds. This capacity retirement is separate from identity-lease
+retirement: reusing a QPN safely does not free CQ space occupied by old
+completions.
 Connection failure cancels READ permit waiters; normal connection removal
 also waits for every per-QP READ permit to return before removing
-completion routing. Poller shutdown instead fails waiters and leaves any
-remaining DMA holds owned by the QP through destruction.
+completion routing. Fatal poller shutdown first closes READ admission on all
+incoming and live sockets and fails waiters, then releases its socket owners.
+Final socket destruction captures the QP's actual outstanding READ count and
+returns those NIC permits only after successful QP destruction. Already
+processed completions and unposted requests do not contribute to that count;
+external socket owners delay recovery. The shared NIC semaphore stays open
+for other pollers.
 
 Initial receive posting and publication to the poller's registration inbox hold
 the same mutex. An early completion that misses its QPN identity takes that mutex,
@@ -271,9 +278,11 @@ drains registrations and retries, even if the empty-inbox hint has not yet been
 updated. Established-QPN lookup does not acquire it. SEND reclamation starts
 at the current QP's immutable floor rather than scanning earlier sequence space.
 
-CQEs and new registrations schedule each touched QPN once per drain
-for immediate credit and pending-send maintenance. Only receive deficits stay
-scheduled for retries; idle keepalive/READ/teardown sweeps run every 100 ms.
+Each CQ drain processes at most 16 batches of 64 CQEs (1024 completions),
+returning to maintenance earlier on a short batch. CQEs and new registrations
+schedule each touched QPN once per drain for immediate credit and pending-send
+maintenance. Only receive deficits stay scheduled for retries; idle
+keepalive/READ/teardown sweeps run every 100 ms.
 Undirected external wakeups still trigger a full scan via a hint consumed
 before maintenance; those scans can scale with the map's retained peak capacity.
 The ordinary CQE maintenance path is O(active). The arm/re-poll path also

@@ -55,7 +55,7 @@ use std::{
 use foldhash::fast::RandomState;
 use ruapc_rdma::{CompChannel, Completion, CompletionBatch, CompletionQueue, poll_readable2};
 
-use budget::{CqBudget, Demand};
+use budget::{CqBudget, CqDrain, Demand};
 use conn::ConnState;
 use dispatch::{DispatchBatch, Dispatcher, MAX_DISPATCH_BATCH};
 
@@ -300,6 +300,7 @@ impl DevicePoller {
                         spin: Duration::from_micros(config.spin_us),
                         conns: HashMap::default(),
                         dirty_qps: Vec::new(),
+                        drain: CqDrain::default(),
                         maintenance_requested,
                         unack_cq_events: 0,
                     }
@@ -428,6 +429,8 @@ struct PollLoop {
     conns: HashMap<u32, ConnState, RandomState>,
     /// QPs needing flow maintenance, deduplicated by `ConnState::dirty`.
     dirty_qps: Vec<u32>,
+    /// Undrained retirement snapshots survive scheduling yields.
+    drain: CqDrain,
     /// Existing pending/error/activation wakeups request a full scan because
     /// those changes need not produce a CQE identifying the connection.
     maintenance_requested: Arc<AtomicBool>,
@@ -529,24 +532,23 @@ impl PollLoop {
         }
     }
 
-    /// Drain a burst completely while bounding each dispatch batch. Both the
-    /// normal drain and the arm/poll race check use the same CQE routing path.
+    /// Drain a bounded burst, then return to maintenance even under sustained
+    /// READ traffic. Both this drain and the arm/poll check route CQEs identically.
     fn drain_completions(
         &mut self,
         cq: &CompletionQueue,
         wcs: &mut CompletionBatch<64>,
         batch: &mut DispatchBatch,
     ) -> ruapc_rdma::Result<bool> {
-        let retired = self.shared.budget.take_retired();
+        self.drain.begin(&self.shared.budget);
         let mut progressed = false;
         loop {
             let count = self.poll_completions(cq, wcs, batch)?;
             progressed |= count > 0;
-            if count == 0 {
-                self.shared.budget.release_drained(retired);
-                break;
-            }
-            if retired.is_empty() && count < wcs.capacity() {
+            if !self
+                .drain
+                .polled(&self.shared.budget, count, wcs.capacity())
+            {
                 break;
             }
         }
@@ -752,7 +754,6 @@ impl PollLoop {
                 ),
             );
         }
-        drop(drained);
         for conn in self.conns.values() {
             conn.socket.set_error();
             // Nobody will poll the flush completions after this thread
@@ -761,6 +762,10 @@ impl PollLoop {
             // its QP, first) is dropped.
             conn.socket.fail_read_batches();
         }
+        // Closing every connection must precede dropping any last socket
+        // owner. QP destruction can return unconsumed READ permits; no other
+        // connection on this stopped CQ may use them to replenish its CQEs.
+        drop(drained);
         // RegisteredConnection guards notify ordinary waiters and close the
         // connection gauges exactly once, including already-failing sockets.
         self.conns.clear();

@@ -180,6 +180,11 @@ the inbox mutex or the CQ registry mutex.
 
 ## Connection maintenance at large QP counts
 
+Each CQ drain processes at most 16 batches of 64 CQEs (1024 completions).
+A short batch also returns to maintenance immediately. Continuous completion
+traffic therefore cannot indefinitely delay maintenance or shutdown checks;
+a short nonempty batch is not evidence that the CQ is empty.
+
 CQE routing and inbox registration mark a connection dirty once per drain.
 The poller maintains that compact list immediately after draining completions,
 including the arm/re-poll race path, so credit publication and pending sends
@@ -301,10 +306,11 @@ budget does not eliminate memory or hardware QP limits.
 This bound includes error and flush CQEs for unsignaled SENDs; selective
 signaling does not discount the budget. Data and ACK credits are returned
 only after local completion and peer confirmation. Every receive replacement
-follows consumption of an earlier CQE. READ permits return after completion
-processing. Thus each unpolled CQE still consumes a software credit, even if
-the provider has already recycled its queue entry. H is reserved once per CQ,
-up to its combined K, because all per-NIC READs could concentrate on that CQ.
+follows consumption of an earlier CQE. During normal polling, posted
+READ permits return after completion processing. Thus each unpolled CQE still
+consumes a software credit, even if the provider has already recycled its
+queue entry. H is reserved once per CQ, up to its combined K, because all
+per-NIC READs could concentrate on that CQ.
 Activation SENDs consume the same capped ACK credits.
 
 `poll_threads_per_device` bounds CQ shards and their dedicated OS threads.
@@ -320,9 +326,10 @@ QP-before-reservation destruction order through setup errors, handoff and
 socket teardown. Removing a poller entry does not release credits while a
 socket owner can still submit work. On destruction, the guard marks its
 budget retired and wakes the poller. The poller takes a retirement snapshot
-**before polling**, then releases only that snapshot after observing an empty
-CQ. Later retirements require a later drain. This also covers providers that
-leave CQEs behind on QP destruction, such as the
+**before polling** and retains it across drain limits and short nonempty
+batches. Only an actual empty poll after the snapshot releases its budget;
+later retirements require a new snapshot and a subsequent empty poll. This
+also covers providers that leave CQEs behind on QP destruction, such as the
 [RXE userspace provider](https://github.com/linux-rdma/rdma-core/blob/master/providers/rxe/rxe.c)
 and [kernel QP cleanup](https://github.com/torvalds/linux/blob/master/drivers/infiniband/sw/rxe/rxe_qp.c).
 
@@ -336,11 +343,21 @@ old identity can no longer authorize completion processing.
 Connection failure closes per-QP READ admission and wakes tasks waiting for
 SQ or NIC permits. Normal connection removal waits until all SQ READ permits
 have returned, covering the race between the last state check and posting.
-The NIC semaphore stays open for other connections. Poller shutdown instead
-fails outstanding waiters and releases its connection entries while the QPs
-retain any DMA holds until destruction. A stopped poller admits no new
-connections; its remaining reservations cannot be reused without completion
-evidence.
+The NIC semaphore stays open for other connections. Fatal poller shutdown
+first closes READ admission on every incoming and live socket and fails
+outstanding waiters, then releases its socket owners. Moving a QP to ERR or
+failing a waiter does not return posted READ permits or release DMA holds.
+A READ can be published after its last health check and the shutdown sweep;
+both normal and partial-post-error paths recheck socket state before awaiting
+the batch and repeat failure notification if closed, avoiding a permanent
+wait on a stopped CQ. This notification leaves the QP's READ records, permits
+and DMA holds intact.
+When the final socket owner drops, the QP's actual outstanding READ count is
+captured; only after successful QP destruction are those NIC permits returned.
+Already processed completions and unposted requests are excluded, preventing
+duplicate returns. An external socket owner delays this recovery. A stopped
+poller admits no new connections; its remaining CQ reservations cannot be
+reused without completion evidence.
 
 `rdma_path_report().completion_queues` exposes each shard's actual capacity,
 reserved entries, reserved connections, live `registered_qps`,
