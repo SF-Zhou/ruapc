@@ -76,28 +76,27 @@ mod tests {
 
     #[test]
     fn test_wc_type_checks() {
-        let wc = make_wc(WRID::new(WRType::Recv, 1), ibv_wc_status::IBV_WC_SUCCESS, 0);
-        assert!(wc.is_recv());
-        assert!(!wc.is_send_data());
-        assert!(!wc.is_send_imm());
-
-        let wc = make_wc(
-            WRID::new(WRType::SendData, 2),
-            ibv_wc_status::IBV_WC_SUCCESS,
-            0,
-        );
-        assert!(!wc.is_recv());
-        assert!(wc.is_send_data());
-        assert!(!wc.is_send_imm());
-
-        let wc = make_wc(
-            WRID::new(WRType::SendImm, 3),
-            ibv_wc_status::IBV_WC_SUCCESS,
-            0,
-        );
-        assert!(!wc.is_recv());
-        assert!(!wc.is_send_data());
-        assert!(wc.is_send_imm());
+        for kind in [
+            WRType::Recv,
+            WRType::SendData,
+            WRType::SendImm,
+            WRType::Read,
+        ] {
+            for sequence in [0, 1, WRID::MAX_SEQUENCE] {
+                for status in [
+                    ibv_wc_status::IBV_WC_SUCCESS,
+                    ibv_wc_status::IBV_WC_WR_FLUSH_ERR,
+                ] {
+                    // Error CQEs need not provide a valid opcode. Classification
+                    // must use the type bits even when every sequence bit is set.
+                    let wc = make_wc(WRID::new(kind, sequence), status, 0);
+                    assert_eq!(wc.is_recv(), kind == WRType::Recv);
+                    assert_eq!(wc.is_send_data(), kind == WRType::SendData);
+                    assert_eq!(wc.is_send_imm(), kind == WRType::SendImm);
+                    assert_eq!(wc.is_read(), kind == WRType::Read);
+                }
+            }
+        }
     }
 
     #[test]
@@ -138,7 +137,7 @@ mod tests {
             0,
         );
         let debug = format!("{:?}", wc);
-        assert!(debug.contains("Recv(0x000000000000007b)"));
+        assert!(debug.contains("Recv(0x00000000000001ec)"));
         assert!(debug.contains("IBV_WC_SUCCESS"));
     }
 }

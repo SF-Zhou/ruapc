@@ -218,7 +218,8 @@ recovering SEND/RECV buffers or settling READ ownership. Copying raw metadata
 does not copy this authority. A later RC SQ completion also permits reclamation
 of earlier unsignaled SENDs.
 
-WRIDs contain 2 type bits and a fixed 62-bit per-direction sequence. Complete
+WRIDs contain the type in bits 1..0 and a fixed per-direction sequence in
+bits 63..2: `(sequence << 2) | type`. Complete
 identity is `(CQ, hardware QPN, WRType, sequence)`; the CQE supplies its QPN,
 so different QPs can use identical numeric WRIDs. SQ and RQ allocate dense local
 sequences independently, with SEND variants and READ sharing SQ's counter.
@@ -246,6 +247,10 @@ Sequence allocation never wraps. If a lease retires with the exhausted floor
 sequence ranges. An empty registry does not reset the floor. The core poller
 uses a CQ-local QPN hash map and checks the immutable floor before dispatch;
 the QP verifies completion authority before flow accounting changes.
+Putting the type in the low bits does not permit natural sequence wrap:
+externally retained completion tokens can outlive a full sequence cycle.
+Automatic reuse needs a separate lifetime or generation protocol; see
+[the wraparound analysis](docs/wrid.md#why-the-sequence-does-not-wrap).
 
 Core CQ admission reserves `sum(R + W + A) + min(H, sum(K))` entries:
 receive-ring, data-window and capped ACK credits per QP plus shared per-NIC

@@ -10,10 +10,13 @@ old completions from matching a reused QPN without storing historical QPNs.
 ## Fixed layout and scope
 
 ```text
-| type: 2 bits | per-direction QP sequence: 62 bits |
+| per-direction QP sequence: bits 63..2 | type: bits 1..0 |
 ```
 
-`WRID::{SEQUENCE_BITS, MAX_SEQUENCE}` define the fixed bounds; `get_type()` and
+`WRID::{TYPE_BITS, SEQUENCE_BITS, MAX_SEQUENCE}` define the fixed bounds;
+encoding is `(sequence << 2) | type`, and decoding uses `raw & 3` for the type
+and `raw >> 2` for the sequence. Consecutive sequences with the same type
+therefore differ by four in the raw WRID, not one. `get_type()` and
 `sequence()` decode without consulting a CQ layout. `Completion::{qp_num,
 sequence}` exposes the QPN and sequence of an authentic CQ-issued token.
 No WRID bits are reserved for routing slots or connection generations.
@@ -228,6 +231,39 @@ never resets its floor, even after its live registry becomes empty. At one
 million allocations per second, a fresh 62-bit stream spans about 146000 years;
 this illustrates the width, not a lifetime guarantee. Failed posts consume
 sequences, and other QPs' retirements can raise a new QP's starting floor.
+
+### Why the sequence does not wrap
+
+Moving the type into the low bits does not make identity reuse safe. A
+62-bit sequence that wraps to zero repeats the complete identity when CQ,
+QPN and type also match. The API permits a CQ-issued `Completion` to remain
+borrowed while another batch is polled; draining the CQ does not revoke that
+old proof.
+
+For example, retain the token for SEND sequence zero, then consume a later
+SQ completion that sweeps and frees that SEND's buffer. If sequence zero is
+eventually reused on the same QP, submitting the retained token can take the
+new SEND's buffer before its DMA finishes. QPN reuse creates the same problem
+across QP lifetimes. Checking for an empty ownership slot before posting
+prevents overwriting a live buffer but cannot distinguish these old proofs.
+
+An in-flight work count is not a bound on sequence distance: failed posts
+also consume sequences, and a retained completion need not occupy hardware
+queue capacity. Modular ordering as in
+[RFC 1982](https://www.rfc-editor.org/rfc/rfc1982.html#section-3.2) requires
+controlling the comparison window; for a 62-bit space, its half-range is
+`2^61`. Such arithmetic alone cannot supply the missing lifetime bound.
+
+Safe automatic reuse would require a separate protocol covering live WRs,
+unpolled CQEs and borrowed completion tokens. One option is migration to
+new QPs on a new CQ identity. Another is a software generation bound to each
+issued token, with a controlled transition that cannot stamp an unpolled
+old CQE as new work. Merely recreating a QP on the same CQ, resetting an empty
+registry, or reading the current generation when an old token is consumed
+does not suffice. Neither automatic migration nor generation switching is
+implemented here; allocation still rejects exhaustion.
+
+### Buffer-slot collisions
 
 `WrSlots` is distinct from the CQ QPN registry. It stores a QP's SEND or RECV
 buffers in a power-of-two array indexed by the sequence modulo capacity; each
