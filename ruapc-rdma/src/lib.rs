@@ -61,9 +61,9 @@ pub use types::{DeviceInfo, FwVer, Gid, GidType, Guid, LinkLayer, Port, WRID, WR
 mod verbs;
 pub use verbs::{
     ActiveDevice, CompChannel, CompletedWork, Completion, CompletionBatch, CompletionCursor,
-    CompletionQueue, CompletionRoute, Completions, Context, Device, DeviceList, MAX_GATHER_SGE,
-    MemoryRegion, ProtectionDomain, QpConnectionConfig, QueuePair, ReadFailure, ReadPosting,
-    ReadReceiver, ReadRequest, ReadSegment, ReadSge, WrBuffers,
+    CompletionIdentity, CompletionQueue, Completions, Context, Device, DeviceList, MAX_GATHER_SGE,
+    MemoryRegion, ProtectionDomain, QpConnectionConfig, QpRegistryStats, QueuePair, ReadFailure,
+    ReadPosting, ReadReceiver, ReadRequest, ReadSegment, ReadSge, WrBuffers,
 };
 
 #[cfg(test)]

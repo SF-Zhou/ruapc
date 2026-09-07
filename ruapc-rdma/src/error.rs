@@ -45,13 +45,13 @@ pub enum ErrorKind {
     IBCreateQueuePairFail,
     /// Invalid parameters supplied when connecting a queue pair.
     InvalidQueuePairConfig,
-    /// All completion routes on this CQ are occupied or exhausted.
-    CompletionRoutesExhausted,
+    /// The provider QPN is still held by its previous CQ identity lease.
+    CompletionIdentityInUse,
     /// This work queue exhausted its non-repeating WRID sequence space.
     WorkRequestIdsExhausted,
     /// A work request's buffer slot is still held by an earlier operation.
     WorkRequestSlotsExhausted,
-    /// Completion proof belongs to a different CQ, QP or route incarnation.
+    /// Completion proof belongs to a different CQ, QPN or incarnation.
     InvalidCompletion,
     /// Invalid local ranges or ownership supplied to a READ plan.
     InvalidReadPlan,

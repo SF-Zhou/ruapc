@@ -5,7 +5,7 @@ use std::{collections::VecDeque, sync::Arc, time::Instant};
 
 use bytes::Bytes;
 use ruapc_rdma::{
-    Completion, CompletionCursor, CompletionRoute, WRType, WrBuffers, ibv_send_flags, ibv_wc,
+    Completion, CompletionCursor, CompletionIdentity, WRType, WrBuffers, ibv_send_flags, ibv_wc,
 };
 
 use super::{RegisterConn, RingReservation, dispatch::DispatchBatch, flow::FlowControl};
@@ -74,9 +74,9 @@ pub(super) struct ConnState {
     /// Listed once in the poller's active maintenance queue. Never shared
     /// with posting tasks and never used to authorize completion ownership.
     pub(super) dirty: bool,
-    /// CQ-assigned route and sequence floor; stale completions are discarded
+    /// CQ-assigned QP identity and sequence floor; stale completions are discarded
     /// before they can affect a replacement connection's flow control.
-    pub(super) route: CompletionRoute,
+    pub(super) identity: CompletionIdentity,
     pub(super) flow: FlowControl,
     /// Window-blocked framed sends in FIFO order.
     pub(super) pending_sends: VecDeque<Buffer>,
@@ -107,7 +107,7 @@ impl ConnState {
         let registration = RegisteredConnection::new(reg.state, reg.socket.conn_id);
         Self {
             dirty: false,
-            route: reg.socket.queue_pair.send_route(),
+            identity: reg.socket.queue_pair.send_identity(),
             flow: FlowControl::new(reg.send_window, reg.recv_submitted, Instant::now()),
             pending_sends: VecDeque::new(),
             pending_receiver: reg.pending_receiver,
@@ -614,7 +614,7 @@ impl ConnState {
     /// holds may only be released once their (flush) completions arrived.
     /// Closing READ admission and waiting for every SQ permit also covers
     /// a posting task paused before it installs its batch in the QP. Removing
-    /// its route earlier would lose that task's completion and NIC permit.
+    /// its registry entry earlier would lose that task's completion and NIC permit.
     pub(super) fn ready_to_remove(&mut self) -> bool {
         !self.socket.state.is_ok()
             && self.flow.flushed()
@@ -649,7 +649,7 @@ mod tests {
         metrics::with_local_recorder(&recorder, || {
             let registration = RegisteredConnection::new(state.clone(), 42);
             assert_eq!(state.waiter.pending_count(), 2);
-            // The poller owns this guard; clearing its connection slots drops
+            // The poller owns this guard; clearing its connection registry drops
             // it on both ordinary removal and any provider-error exit.
             drop(registration);
         });

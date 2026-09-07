@@ -15,11 +15,11 @@
 //!
 //! # Completion routing
 //!
-//! Every QP receives a route slot from its CQ at creation. A work request
-//! carries that slot and a sequence number that continues across slot reuse.
-//! Routing is a plain `Vec` index plus a sequence-floor check, with no QPN
-//! hash lookup or separate poller identity allocator. The QP keeps its slot
-//! reserved until destruction, including while registrations are in transit.
+//! Completions carry the provider's local QP number. A poll-thread-owned
+//! registry maps that number to its connection, then checks the CQ-issued
+//! identity's sequence floor before accounting credits. WRIDs have a fixed
+//! 62-bit sequence independent of CQ capacity. QP identities remain leased
+//! through destruction, including while registrations are in transit.
 //!
 //! # Zero-parse poll thread
 //!
@@ -41,6 +41,7 @@ mod dispatch;
 mod flow;
 
 use std::{
+    collections::{HashMap, hash_map::Entry},
     io::{Read as _, Write as _},
     os::unix::io::AsRawFd as _,
     os::unix::net::UnixStream,
@@ -130,7 +131,7 @@ pub struct RegisterConn {
 }
 
 /// State shared between registrars and the poll thread: the registration
-/// inbox and the shutdown flag. Route allocation belongs to the CQ.
+/// inbox and the shutdown flag. QP identity leases belong to the CQ.
 struct PollerShared {
     inner: Mutex<SharedInner>,
     budget: CqBudget,
@@ -245,9 +246,8 @@ impl DevicePoller {
         // Clamp the shared CQ length to the device's capability: e.g. the
         // rxe soft-RoCE driver caps max_cqe at 32767, well below the
         // default device_cq_len, and ibv_create_cq fails with EINVAL when
-        // asked for more. The clamped value also becomes the connection
-        // budget (`cq_capacity`), so admission control stays consistent
-        // with the actual CQ size.
+        // asked for more. The provider can round this request up; admission
+        // uses the actual returned CQ capacity below.
         let max_cqe = ctx
             .query_device()
             .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?
@@ -298,8 +298,8 @@ impl DevicePoller {
                         shared,
                         dispatcher,
                         spin: Duration::from_micros(config.spin_us),
-                        conns: Vec::new(),
-                        dirty_slots: Vec::new(),
+                        conns: HashMap::default(),
+                        dirty_qps: Vec::new(),
                         maintenance_requested,
                         unack_cq_events: 0,
                     }
@@ -424,10 +424,10 @@ struct PollLoop {
     /// Hands received buffers to the pool's dispatch worker tasks.
     dispatcher: Dispatcher,
     spin: Duration,
-    /// Connections indexed by their slot.
-    conns: Vec<Option<ConnState>>,
-    /// Slots needing flow maintenance, deduplicated by `ConnState::dirty`.
-    dirty_slots: Vec<usize>,
+    /// This CQ's connections, indexed by the provider's local QP number.
+    conns: HashMap<u32, ConnState, RandomState>,
+    /// QPs needing flow maintenance, deduplicated by `ConnState::dirty`.
+    dirty_qps: Vec<u32>,
     /// Existing pending/error/activation wakeups request a full scan because
     /// those changes need not produce a CQE identifying the connection.
     maintenance_requested: Arc<AtomicBool>,
@@ -572,7 +572,7 @@ impl PollLoop {
     }
 
     fn dump_connections(&self) {
-        for conn in self.conns.iter().flatten() {
+        for conn in self.conns.values() {
             tracing::debug!(
                 "conn dump: qp={} ok={} pending={} flow={:?}",
                 conn.socket.queue_pair.qp_num(),
@@ -583,51 +583,52 @@ impl PollLoop {
         }
     }
 
-    fn mark_dirty(&mut self, slot: usize) {
-        if let Some(conn) = self.conns[slot].as_mut()
-            && !conn.dirty
-        {
+    fn mark_dirty(conn: &mut ConnState, dirty_qps: &mut Vec<u32>) {
+        if !conn.dirty {
             conn.dirty = true;
-            self.dirty_slots.push(slot);
+            dirty_qps.push(conn.identity.qp_num());
         }
     }
 
     fn maintain_connections(&mut self, now: Instant, sweep_reads: bool, retry_receives: bool) {
         // Every old entry is covered by this scan. Rebuild only the receive
-        // deficits that need another timed attempt, without stale slot entries.
-        self.dirty_slots.clear();
-        for slot in 0..self.conns.len() {
-            if self.maintain_connection(slot, now, sweep_reads, retry_receives) {
-                self.dirty_slots.push(slot);
+        // deficits that need another timed attempt, without stale QP entries.
+        self.dirty_qps.clear();
+        self.conns.retain(|&qp_num, conn| {
+            let keep = Self::maintain_connection(conn, now, sweep_reads, retry_receives);
+            if keep && conn.dirty {
+                self.dirty_qps.push(qp_num);
             }
-        }
+            keep
+        });
     }
 
     fn maintain_dirty_connections(&mut self, now: Instant, retry_receives: bool) {
-        // Compact in place: completions cannot append slots while this same
+        // Compact in place: completions cannot append QPs while this same
         // poll thread is maintaining them, so the vector retains its allocation.
         let mut retained = 0;
-        for index in 0..self.dirty_slots.len() {
-            let slot = self.dirty_slots[index];
-            if self.maintain_connection(slot, now, false, retry_receives) {
-                self.dirty_slots[retained] = slot;
-                retained += 1;
+        for index in 0..self.dirty_qps.len() {
+            let qp_num = self.dirty_qps[index];
+            if let Entry::Occupied(mut entry) = self.conns.entry(qp_num) {
+                if !Self::maintain_connection(entry.get_mut(), now, false, retry_receives) {
+                    entry.remove();
+                } else if entry.get().dirty {
+                    self.dirty_qps[retained] = qp_num;
+                    retained += 1;
+                }
             }
         }
-        self.dirty_slots.truncate(retained);
+        self.dirty_qps.truncate(retained);
     }
 
-    /// Returns whether receive-buffer pressure requires another timed pass.
+    /// Returns whether the connection must remain registered. Receive-buffer
+    /// pressure leaves its dirty bit set for another timed pass.
     fn maintain_connection(
-        &mut self,
-        slot: usize,
+        conn: &mut ConnState,
         now: Instant,
         sweep_reads: bool,
         retry_receives: bool,
     ) -> bool {
-        let Some(conn) = self.conns[slot].as_mut() else {
-            return false;
-        };
         conn.dirty = false;
         if sweep_reads {
             conn.sweep_read_timeouts(now);
@@ -640,13 +641,12 @@ impl PollLoop {
             tracing::error!("flow control update error: {e}");
         }
         if conn.ready_to_remove() {
-            // The QP keeps its route reserved even if another owner holds
+            // The QP keeps its identity leased even if another owner holds
             // the socket after poller teardown.
-            self.conns[slot] = None;
             return false;
         }
         conn.dirty = conn.recv_deficit > 0 && conn.socket.state.is_ok();
-        conn.dirty
+        true
     }
 
     /// Sleep until a CQ notification, explicit wake, or housekeeping timeout.
@@ -655,7 +655,7 @@ impl PollLoop {
         let (cq_ready, wake_ready) = poll_readable2(
             self.comp_channel.fd().as_raw_fd(),
             self.wake_rx.as_raw_fd(),
-            if self.dirty_slots.is_empty() {
+            if self.dirty_qps.is_empty() {
                 Self::IDLE_TIMEOUT_MS
             } else {
                 // Only receive deficits survive maintenance. Recover promptly
@@ -679,8 +679,8 @@ impl PollLoop {
         Ok(cq_ready || wake_ready)
     }
 
-    /// Moves newly registered connections from the shared inbox into their
-    /// slots.
+    /// Moves newly registered connections from the shared inbox into the
+    /// provider QP-number registry.
     fn drain_incoming(&mut self, routing_miss: bool) -> bool {
         if !routing_miss && !self.shared.has_incoming.load(Ordering::Acquire) {
             return false;
@@ -692,38 +692,40 @@ impl PollLoop {
         };
         let registered = !drained.is_empty();
         for incoming in drained {
-            let slot = incoming.socket.queue_pair.send_route().slot();
-            if self.conns.len() <= slot {
-                self.conns.resize_with(slot + 1, || None);
+            let qp_num = incoming.socket.queue_pair.qp_num();
+            match self.conns.entry(qp_num) {
+                Entry::Vacant(entry) => {
+                    let mut conn = ConnState::new(incoming);
+                    Self::mark_dirty(&mut conn, &mut self.dirty_qps);
+                    entry.insert(conn);
+                }
+                Entry::Occupied(_) => panic!("poller QP {qp_num} already registered"),
             }
-            debug_assert!(self.conns[slot].is_none(), "poller slot {slot} occupied");
-            self.conns[slot] = Some(ConnState::new(incoming));
-            self.mark_dirty(slot);
         }
         registered
     }
 
     fn dispatch(&mut self, wc: Completion<'_>, batch: &mut DispatchBatch) {
         let id = wc.info().wr_id;
-        let slot = wc.slot();
-        if let Some(Some(conn)) = self.conns.get_mut(slot)
-            && conn.route.contains(id)
+        let qp_num = wc.qp_num();
+        if let Some(conn) = self.conns.get_mut(&qp_num)
+            && conn.identity.contains(qp_num, id)
         {
             conn.handle_wc(wc, batch);
-            self.mark_dirty(slot);
+            Self::mark_dirty(conn, &mut self.dirty_qps);
             return;
         }
         // Initial receives and inbox publication hold the same mutex. Bypass
         // the empty-inbox hint: a registrar can still be posting the ring.
         // Normal completions never acquire this lock.
         self.drain_incoming(true);
-        if let Some(Some(conn)) = self.conns.get_mut(slot)
-            && conn.route.contains(id)
+        if let Some(conn) = self.conns.get_mut(&qp_num)
+            && conn.identity.contains(qp_num, id)
         {
             conn.handle_wc(wc, batch);
-            self.mark_dirty(slot);
+            Self::mark_dirty(conn, &mut self.dirty_qps);
         } else {
-            tracing::warn!("dropping completion for unknown connection route: {wc:?}");
+            tracing::warn!("dropping completion for unknown or retired QP identity: {wc:?}");
         }
     }
 
@@ -751,7 +753,7 @@ impl PollLoop {
             );
         }
         drop(drained);
-        for conn in self.conns.iter().flatten() {
+        for conn in self.conns.values() {
             conn.socket.set_error();
             // Nobody will poll the flush completions after this thread
             // exits: resolve the waiting tasks now. The memory holds stay
@@ -762,7 +764,7 @@ impl PollLoop {
         // RegisteredConnection guards notify ordinary waiters and close the
         // connection gauges exactly once, including already-failing sockets.
         self.conns.clear();
-        self.dirty_slots.clear();
+        self.dirty_qps.clear();
         if self.unack_cq_events > 0 {
             self.cq.ack_events(self.unack_cq_events);
             self.unack_cq_events = 0;
@@ -851,14 +853,16 @@ impl DevicePollers {
         for (device, entry) in &inner.devices {
             for (shard, poller) in entry.shards.iter().enumerate() {
                 let (reserved, connections) = poller.shared.budget.snapshot();
+                let registry = poller.cq.qp_registry_stats();
                 result.push(super::path::RdmaCqLoad {
                     device: device.clone(),
                     shard,
                     capacity: poller.cq_capacity,
                     reserved,
                     connections,
-                    route_capacity: poller.cq.route_capacity(),
-                    sequence_bits: poller.cq.sequence_bits(),
+                    registered_qps: registry.active,
+                    next_sequence_floor: registry.next_sequence_floor,
+                    sequence_bits: ruapc_rdma::WRID::SEQUENCE_BITS,
                 });
             }
         }

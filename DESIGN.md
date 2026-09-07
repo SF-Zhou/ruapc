@@ -213,24 +213,39 @@ does not fit remains pending for a later ACK.
 `CompletionQueue::poll_batch` fills private `CompletionBatch` storage and lends
 one non-cloneable token per CQE. Its borrow prevents the entries from being
 changed while a token is live. `QueuePair::complete` consumes that token and
-checks its CQ identity, QP number and CQ-owned route before
+checks its originating CQ, hardware QPN and CQ-owned `CompletionIdentity` before
 recovering SEND/RECV buffers or settling READ ownership. Copying raw metadata
 does not copy this authority. A later RC SQ completion also permits reclamation
 of earlier unsignaled SENDs.
 
-WRIDs contain 2 type bits, a CQ-local slot with `s = ceil(log2(actual_cqe))`
-bits and a per-direction sequence using `62 - s` bits. Positive provider CQ
-capacity is at most `2^31 - 1`, so sequences have between 31 and 62 bits.
-The layout is fixed at CQ creation; completion tokens decode using their
-originating CQ. The CQ allocates an exclusive route lease at QP creation, before
-any work can be posted. A shared send/receive CQ uses one lease; separate CQs each
-allocate a lease. QP destruction succeeds before either lease returns its slot.
-Reuse preserves the maximum next sequence across SQ and RQ, advancing at least
-once even for an unused lease. Every replacement therefore starts above all
-sequences allocated by earlier occupants. Sequence allocation cannot wrap;
-exhaustion permanently retires the slot. The core poller indexes an array by
-slot and checks the occupant's sequence floor before changing flow accounting.
-This replaces poller-assigned generation tags and the per-CQ claimed-tag bitmap.
+WRIDs contain 2 type bits and a fixed 62-bit per-direction sequence. Complete
+identity is `(CQ, hardware QPN, WRType, sequence)`; the CQE supplies its QPN,
+so different QPs can use identical numeric WRIDs. SQ and RQ allocate dense local
+sequences independently, with SEND variants and READ sharing SQ's counter.
+CQ capacity no longer determines WRID width or QP registry capacity.
+
+After the provider creates a QP and assigns its QPN, the CQ registers that QPN
+before any work can be posted. A shared send/receive CQ uses one identity lease;
+separate CQs register independently. The creation guard destroys the provider
+QP before releasing any acquired leases if registration fails. An occupied-QPN
+failure never removes the previous occupant's registration. Final QP destruction
+likewise succeeds before releasing either lease or DMA memory.
+
+Each CQ keeps only live QPN-to-floor registrations and one `retired_floor`.
+A new lease starts at that floor. Retirement atomically removes the live QPN
+and advances the floor to `max(retired_floor, SQnext, RQnext, first_sequence + 1)`.
+This places reuse of the same `(CQ, QPN)` above every old allocation, including
+failed posts, without retaining a history entry for every retired QPN. Unrelated
+live QPs retain their immutable starting floors and continue operating when
+the CQ watermark increases. Registry storage is O(peak live QPs), and only
+setup, destruction and introspection acquire its mutex. No per-WR global counter
+or registry lookup is needed for posting.
+
+Sequence allocation never wraps. If a lease retires with the exhausted floor
+`2^62`, new registrations on that CQ fail; live QPs keep their remaining local
+sequence ranges. An empty registry does not reset the floor. The core poller
+uses a CQ-local QPN hash map and checks the immutable floor before dispatch;
+the QP verifies completion authority before flow accounting changes.
 
 Core CQ admission reserves `sum(R + W + A) + min(H, sum(K))` entries:
 receive-ring, data-window and capped ACK credits per QP plus shared per-NIC
@@ -238,23 +253,27 @@ READ capacity (bounded by the QPs' combined READ limits). Setup reserves on
 the least utilized CQ shard that fits before creating a QP. The reservation
 travels with the QP through setup and socket lifetime. After QP destruction,
 only an empty CQ observed after taking a retirement snapshot returns its
-budget. Connection failure cancels READ permit waiters; normal connection
-removal also waits for every per-QP READ permit to return before removing
+budget. This capacity retirement is separate from identity-lease retirement:
+reusing a QPN safely does not free CQ space occupied by old completions.
+Connection failure cancels READ permit waiters; normal connection removal
+also waits for every per-QP READ permit to return before removing
 completion routing. Poller shutdown instead fails waiters and leaves any
 remaining DMA holds owned by the QP through destruction.
 
 Initial receive posting and publication to the poller's registration inbox hold
-the same mutex. An early completion that misses its route takes that mutex,
+the same mutex. An early completion that misses its QPN identity takes that mutex,
 drains registrations and retries, even if the empty-inbox hint has not yet been
-updated. Established-route lookup does not acquire it. SEND reclamation starts
-at the current route's floor rather than scanning sequences of previous QPs.
+updated. Established-QPN lookup does not acquire it. SEND reclamation starts
+at the current QP's immutable floor rather than scanning earlier sequence space.
 
-CQEs and new registrations schedule each touched connection once per drain
+CQEs and new registrations schedule each touched QPN once per drain
 for immediate credit and pending-send maintenance. Only receive deficits stay
 scheduled for retries; idle keepalive/READ/teardown sweeps run every 100 ms.
 Undirected external wakeups still trigger a full scan via a hint consumed
-before maintenance. The arm/re-poll path also maintains touched connections
-immediately. The standalone ACK-of-ACK trigger requires at least two received
+before maintenance; those scans can scale with the map's retained peak capacity.
+The ordinary CQE maintenance path is O(active). The arm/re-poll path also
+maintains touched connections immediately. The standalone ACK-of-ACK trigger
+requires at least two received
 ACKs, avoiding self-sustaining control traffic with the minimum receive ring;
 DATA acknowledgments and keepalives can still carry a smaller pending delta.
 

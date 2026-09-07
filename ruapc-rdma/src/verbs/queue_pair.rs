@@ -6,7 +6,7 @@ pub use read::{ReadFailure, ReadPosting, ReadReceiver, ReadRequest, ReadSegment}
 use ruapc_bufpool::{Buffer, DeviceIndex};
 
 use super::{
-    completion_queue::{Completion, CompletionQueue, CompletionRoute, RouteLease},
+    completion_queue::{Completion, CompletionIdentity, CompletionQueue, IdentityLease},
     protection_domain::ProtectionDomain,
     wr_slots::WrSlots,
 };
@@ -109,11 +109,11 @@ impl SendSignaling {
 pub struct QueuePair {
     ptr: *mut crate::ibv_qp,
     _pd: Arc<ProtectionDomain>,
-    /// CQ-owned identity and sequence space. A shared CQ uses one route for
-    /// both directions; separate CQs each allocate their own route.
-    send_route: RouteLease,
-    recv_route: Option<RouteLease>,
-    /// In-flight SEND buffers; READs share the route's SQ sequence counter.
+    /// CQ-owned QPN identity and sequence space. A shared CQ uses one lease for
+    /// both directions; separate CQs each register their own identity.
+    send_identity: IdentityLease,
+    recv_identity: Option<IdentityLease>,
+    /// In-flight SEND buffers; READs share the identity's SQ sequence counter.
     send_wrs: WrSlots,
     /// In-flight buffers of receive-queue work requests.
     recv_wrs: WrSlots,
@@ -136,6 +136,43 @@ pub struct QueuePair {
     pub device_index: DeviceIndex,
 }
 
+/// Setup can register one CQ before another rejects a reused QPN. Drop must
+/// destroy the provider QP before Rust releases either registered identity.
+struct CreatingQueuePair {
+    ptr: *mut crate::ibv_qp,
+    send_identity: Option<IdentityLease>,
+    recv_identity: Option<IdentityLease>,
+}
+
+impl CreatingQueuePair {
+    fn register_identities(
+        &mut self,
+        send_cq: &Arc<CompletionQueue>,
+        recv_cq: &Arc<CompletionQueue>,
+    ) -> Result<()> {
+        let qp_num = unsafe { (*self.ptr).qp_num };
+        self.send_identity = Some(send_cq.register_qp(qp_num)?);
+        if !Arc::ptr_eq(send_cq, recv_cq) {
+            self.recv_identity = Some(recv_cq.register_qp(qp_num)?);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CreatingQueuePair {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            destroy_provider_qp(self.ptr);
+        }
+    }
+}
+
+fn destroy_provider_qp(ptr: *mut crate::ibv_qp) {
+    if unsafe { crate::ruapc_ibv_destroy_qp(ptr) } != 0 {
+        std::process::abort();
+    }
+}
+
 impl QueuePair {
     pub fn create(
         pd: &Arc<ProtectionDomain>,
@@ -156,15 +193,6 @@ impl QueuePair {
         }
         init_attr.send_cq = send_cq.as_ptr();
         init_attr.recv_cq = recv_cq.as_ptr();
-        // Reserve identities before creating the provider resource. Failure
-        // automatically returns the leases; successful QP destruction must
-        // precede their release so a live QP can never share a route.
-        let send_route = send_cq.allocate_route()?;
-        let recv_route = if Arc::ptr_eq(send_cq, recv_cq) {
-            None
-        } else {
-            Some(recv_cq.allocate_route()?)
-        };
         let ptr = unsafe { crate::ruapc_ibv_create_qp(pd.as_ptr(), init_attr) };
         if ptr.is_null() {
             let source = std::io::Error::last_os_error();
@@ -176,46 +204,59 @@ impl QueuePair {
                 ),
             ));
         }
+        // QPN identity can only be claimed after the provider assigns it.
+        // The guard destroys this QP before releasing any partial registration.
+        let mut creating = CreatingQueuePair {
+            ptr,
+            send_identity: None,
+            recv_identity: None,
+        };
+        creating.register_identities(send_cq, recv_cq)?;
         // `ibv_create_qp` updates `init_attr.cap` with the actual (possibly
         // larger) queue depths; size the slot arrays from those.
-        Ok(Self {
+        let send_wrs = WrSlots::new(init_attr.cap.max_send_wr);
+        let recv_wrs = WrSlots::new(init_attr.cap.max_recv_wr);
+        let read_state = read::ReadState::new();
+        let qp = Self {
             ptr,
             _pd: Arc::clone(pd),
-            send_route,
-            recv_route,
-            send_wrs: WrSlots::new(init_attr.cap.max_send_wr),
-            recv_wrs: WrSlots::new(init_attr.cap.max_recv_wr),
-            read_state: read::ReadState::new(),
+            send_identity: creating.send_identity.take().unwrap(),
+            recv_identity: creating.recv_identity.take(),
+            send_wrs,
+            recv_wrs,
+            read_state,
             max_send_sge: init_attr.cap.max_send_sge as usize,
             send_signal_interval: 1,
             device_index,
-        })
+        };
+        creating.ptr = ptr::null_mut();
+        Ok(qp)
     }
 
-    /// This QP's send completion route, assigned at creation by its CQ.
+    /// This QP's send completion identity, registered after provider creation.
     #[inline]
-    pub fn send_route(&self) -> CompletionRoute {
-        self.send_route.route()
+    pub fn send_identity(&self) -> CompletionIdentity {
+        self.send_identity.identity()
     }
 
-    /// This QP's receive completion route. With a shared CQ it equals
-    /// [`send_route`](Self::send_route).
+    /// This QP's receive completion identity. With a shared CQ it equals
+    /// [`send_identity`](Self::send_identity).
     #[inline]
-    pub fn recv_route(&self) -> CompletionRoute {
-        self.receive_route().route()
+    pub fn recv_identity(&self) -> CompletionIdentity {
+        self.receive_identity().identity()
     }
 
     pub fn send_cq(&self) -> &Arc<CompletionQueue> {
-        self.send_route.cq()
+        self.send_identity.cq()
     }
 
     pub fn recv_cq(&self) -> &Arc<CompletionQueue> {
-        self.receive_route().cq()
+        self.receive_identity().cq()
     }
 
     #[inline]
-    fn receive_route(&self) -> &RouteLease {
-        self.recv_route.as_ref().unwrap_or(&self.send_route)
+    fn receive_identity(&self) -> &IdentityLease {
+        self.recv_identity.as_ref().unwrap_or(&self.send_identity)
     }
 
     /// Sets the selective signaling interval for data sends.
@@ -354,9 +395,9 @@ impl QueuePair {
         // The sequence guard serializes allocation, ownership registration
         // and provider posting. SQ IDs must follow hardware post order for
         // the selective completion sweep to be safe.
-        let posting = self.send_route.lock_send()?;
+        let posting = self.send_identity.lock_send()?;
         let id = posting.sequence();
-        let route = self.send_route();
+        let route = self.send_identity();
         let (wr_id, opcode, imm_data) = match imm {
             Some(imm) => (
                 route.encode(WRType::SendImm, id),
@@ -384,10 +425,10 @@ impl QueuePair {
             num_sge: sges.len() as c_int,
             opcode,
             // Signaling cadence starts with this QP, independently of the
-            // route's previous occupants and their receive-queue traffic.
+            // QPN's previous incarnations and their receive-queue traffic.
             send_flags: signaling
                 .flags(
-                    id - self.send_route().first_sequence(),
+                    id - self.send_identity().first_sequence(),
                     self.send_signal_interval,
                     flags,
                 )
@@ -448,9 +489,9 @@ impl QueuePair {
         }
         let num_sge = sges.len() as c_int;
 
-        let posting = self.send_route.lock_send()?;
+        let posting = self.send_identity.lock_send()?;
         let id = posting.sequence();
-        let wr_id = self.send_route().encode(WRType::Read, id);
+        let wr_id = self.send_identity().encode(WRType::Read, id);
         register(wr_id);
         let mut wr = crate::ibv_send_wr {
             wr_id,
@@ -474,8 +515,8 @@ impl QueuePair {
         let addr = buffer.as_ptr() as u64;
         let len = buffer.capacity() as u32;
         let lkey = self.lkey(&buffer)?;
-        let id = self.receive_route().alloc_recv()?;
-        let wr_id = self.recv_route().encode(WRType::Recv, id);
+        let id = self.receive_identity().alloc_recv()?;
+        let wr_id = self.recv_identity().encode(WRType::Recv, id);
         self.recv_wrs
             .insert(id, buffer.into())
             .map_err(|_| ErrorKind::WorkRequestSlotsExhausted)?;
@@ -498,7 +539,7 @@ impl QueuePair {
 
     /// Consumes a CQ-issued completion proof and releases the completed memory.
     ///
-    /// Validates the CQ, QP number, route slot and incarnation's sequence floor before
+    /// Validates the CQ, QP number and incarnation's sequence floor before
     /// accessing any ownership table. For SQ completions, RC ordering also proves
     /// that preceding unsignaled data SENDs no longer access their buffers.
     /// READ ownership is settled here; callers receive only completion metadata.
@@ -510,11 +551,11 @@ impl QueuePair {
     ) -> Result<CompletedWork<'a>> {
         let wc = completion.info();
         let route = if wc.is_recv() {
-            self.receive_route()
+            self.receive_identity()
         } else {
-            &self.send_route
+            &self.send_identity
         };
-        if !completion.belongs_to(route.cq(), self.qp_num(), route.route()) {
+        if !completion.belongs_to(route.cq(), self.qp_num(), route.identity()) {
             return Err(ErrorKind::InvalidCompletion.into());
         }
         let id = completion.sequence();
@@ -522,9 +563,9 @@ impl QueuePair {
         let buffer = if wc.is_recv() {
             self.recv_wrs.take(id)
         } else {
-            // A recycled route can start far above zero. Never scan the
-            // sequence space of QPs that previously occupied this slot.
-            for swept in cursor.sweep_to(route.route().first_sequence(), id) {
+            // A replacement QP can start far above zero. Never scan the
+            // sequence space preceding this QPN incarnation.
+            for swept in cursor.sweep_to(route.identity().first_sequence(), id) {
                 if self.send_wrs.take(swept).is_some() {
                     swept_sends += 1;
                 }
@@ -640,9 +681,7 @@ impl Drop for QueuePair {
         // Field destruction releases SEND/RECV buffers, READ destinations and
         // their PD/MR ownership. If the provider cannot destroy the QP, DMA may
         // still access them; unwinding would release those holds as well.
-        if unsafe { crate::ruapc_ibv_destroy_qp(self.ptr) } != 0 {
-            std::process::abort();
-        }
+        destroy_provider_qp(self.ptr);
     }
 }
 impl std::fmt::Debug for QueuePair {
@@ -687,42 +726,75 @@ mod tests {
     }
 
     #[test]
-    fn qp_routes_are_automatic_and_sequence_space_survives_destruction() {
+    fn qp_identities_are_registered_after_creation_and_retire_after_destruction() {
         let device = crate::test_utils::open_device();
         let cq = CompletionQueue::create(device.context(), 16, None).unwrap();
-        let create = || {
-            QueuePair::create(
-                device.pd(),
-                &cq,
-                &cq,
-                &mut init_attr(),
-                DeviceIndex::default(),
-            )
-            .unwrap()
-        };
-        let qp = create();
-        let old_route = qp.send_route();
-        assert_eq!(old_route, qp.recv_route());
+        let qp = QueuePair::create(
+            device.pd(),
+            &cq,
+            &cq,
+            &mut init_attr(),
+            DeviceIndex::default(),
+        )
+        .unwrap();
+        let identity = qp.send_identity();
+        assert_eq!(identity, qp.recv_identity());
+        assert_eq!(identity.qp_num(), qp.qp_num());
         assert!(Arc::ptr_eq(qp.send_cq(), &cq));
         assert!(Arc::ptr_eq(qp.recv_cq(), &cq));
+        assert_eq!(cq.qp_registry_stats().active, 1);
         for _ in 0..300 {
-            qp.send_route.lock_send().unwrap().sequence();
+            qp.send_identity.lock_send().unwrap().sequence();
         }
-        qp.receive_route().alloc_recv().unwrap();
-        let concurrent = create();
-        assert_ne!(concurrent.send_route().slot(), old_route.slot());
+        qp.receive_identity().alloc_recv().unwrap();
         drop(qp);
-        let replacement = create();
-        let route = replacement.send_route();
-        assert_eq!(route.slot(), old_route.slot());
-        assert_eq!(route.first_sequence(), old_route.first_sequence() + 300);
-        assert!(!route.contains(old_route.encode(WRType::SendData, 299)));
-        assert_eq!(replacement.send_route.lock_send().unwrap().sequence(), 300);
-        assert_eq!(replacement.receive_route().alloc_recv().unwrap(), 300);
+        assert_eq!(cq.qp_registry_stats().active, 0);
+        assert_eq!(cq.qp_registry_stats().next_sequence_floor, 300);
+        let replacement = QueuePair::create(
+            device.pd(),
+            &cq,
+            &cq,
+            &mut init_attr(),
+            DeviceIndex::default(),
+        )
+        .unwrap();
+        assert_eq!(replacement.send_identity().first_sequence(), 300);
+        assert_eq!(
+            replacement.send_identity.lock_send().unwrap().sequence(),
+            300
+        );
+        assert_eq!(replacement.receive_identity().alloc_recv().unwrap(), 300);
     }
 
     #[test]
-    fn separate_cqs_own_independent_qp_routes() {
+    fn cq_capacity_does_not_limit_qps_with_no_posted_work() {
+        let device = crate::test_utils::open_device();
+        let cq = CompletionQueue::create(device.context(), 1, None).unwrap();
+        let qps: Vec<_> = (0..cq.capacity() + 2)
+            .map(|_| {
+                QueuePair::create(
+                    device.pd(),
+                    &cq,
+                    &cq,
+                    &mut init_attr(),
+                    DeviceIndex::default(),
+                )
+                .unwrap()
+            })
+            .collect();
+        assert!(qps.len() > cq.capacity() as usize);
+        assert_eq!(cq.qp_registry_stats().active, qps.len());
+        assert!(
+            qps.iter()
+                .all(|qp| qp.send_identity().first_sequence() == 0)
+        );
+        drop(qps);
+        assert_eq!(cq.qp_registry_stats().active, 0);
+        assert_eq!(cq.qp_registry_stats().next_sequence_floor, 1);
+    }
+
+    #[test]
+    fn separate_cqs_preserve_independent_retired_floors() {
         let device = crate::test_utils::open_device();
         let send_cq = CompletionQueue::create(device.context(), 16, None).unwrap();
         let recv_cq = CompletionQueue::create(device.context(), 1024, None).unwrap();
@@ -734,26 +806,64 @@ mod tests {
             DeviceIndex::default(),
         )
         .unwrap();
-        assert!(qp.recv_route.is_some());
+        assert!(qp.recv_identity.is_some());
         assert!(Arc::ptr_eq(qp.send_cq(), &send_cq));
         assert!(Arc::ptr_eq(qp.recv_cq(), &recv_cq));
-        assert_eq!(qp.send_route().sequence_bits(), send_cq.sequence_bits());
-        assert_eq!(qp.recv_route().sequence_bits(), recv_cq.sequence_bits());
         for _ in 0..7 {
-            qp.send_route.lock_send().unwrap().sequence();
+            qp.send_identity.lock_send().unwrap().sequence();
         }
         for _ in 0..11 {
-            qp.receive_route().alloc_recv().unwrap();
+            qp.receive_identity().alloc_recv().unwrap();
         }
         drop(qp);
+        assert_eq!(send_cq.qp_registry_stats().next_sequence_floor, 7);
+        assert_eq!(recv_cq.qp_registry_stats().next_sequence_floor, 11);
+        let next = QueuePair::create(
+            device.pd(),
+            &send_cq,
+            &recv_cq,
+            &mut init_attr(),
+            DeviceIndex::default(),
+        )
+        .unwrap();
+        assert_eq!(next.send_identity().first_sequence(), 7);
+        assert_eq!(next.recv_identity().first_sequence(), 11);
+    }
+
+    #[test]
+    fn failed_second_cq_registration_releases_only_its_own_partial_lease() {
+        let device = crate::test_utils::open_device();
+        let send_cq = CompletionQueue::create(device.context(), 16, None).unwrap();
+        let recv_cq = CompletionQueue::create(device.context(), 16, None).unwrap();
+        let mut attrs = init_attr();
+        attrs.send_cq = send_cq.as_ptr();
+        attrs.recv_cq = recv_cq.as_ptr();
+        let ptr = unsafe { crate::ruapc_ibv_create_qp(device.pd().as_ptr(), &mut attrs) };
+        assert!(!ptr.is_null());
+        let qp_num = unsafe { (*ptr).qp_num };
+        let mut creating = CreatingQueuePair {
+            ptr,
+            send_identity: None,
+            recv_identity: None,
+        };
+        // Model provider QPN reuse before the previous Rust lease was released.
+        let old = recv_cq.register_qp(qp_num).unwrap();
         assert_eq!(
-            send_cq.allocate_route().unwrap().route().first_sequence(),
-            7
+            creating
+                .register_identities(&send_cq, &recv_cq)
+                .unwrap_err()
+                .kind,
+            ErrorKind::CompletionIdentityInUse
         );
-        assert_eq!(
-            recv_cq.allocate_route().unwrap().route().first_sequence(),
-            11
-        );
+        assert_eq!(send_cq.qp_registry_stats().active, 1);
+        assert_eq!(recv_cq.qp_registry_stats().active, 1);
+        drop(creating); // Its Drop destroys the provider QP before its fields.
+        assert_eq!(send_cq.qp_registry_stats().active, 0);
+        assert_eq!(send_cq.qp_registry_stats().next_sequence_floor, 1);
+        assert_eq!(recv_cq.qp_registry_stats().active, 1);
+        assert_eq!(old.lock_send().unwrap().sequence(), 0);
+        drop(old);
+        assert_eq!(recv_cq.qp_registry_stats().next_sequence_floor, 1);
     }
 
     #[test]

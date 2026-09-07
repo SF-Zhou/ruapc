@@ -9,10 +9,10 @@ use std::{
 use super::{comp_channel::CompChannel, context::Context};
 use crate::{ErrorKind, Result, ibv_wc};
 
-mod routes;
-pub use routes::CompletionRoute;
-pub(super) use routes::RouteLease;
-use routes::{RouteAllocator, WrIdLayout};
+mod identities;
+pub(super) use identities::IdentityLease;
+use identities::IdentityRegistry;
+pub use identities::{CompletionIdentity, QpRegistryStats};
 
 /// Reusable stack storage for polling authenticated work completions.
 /// Entries cannot be changed while any completion from the batch is borrowed.
@@ -60,16 +60,16 @@ impl<'a> Completion<'a> {
         self.wc
     }
 
-    /// Decodes the route slot using this completion's originating CQ.
+    /// Hardware QPN reported by the originating CQ, including error CQEs.
     #[inline]
-    pub fn slot(&self) -> usize {
-        self.cq.layout.slot(self.wc.wr_id)
+    pub fn qp_num(&self) -> u32 {
+        self.wc.qp_num
     }
 
-    /// Decodes the work-queue sequence using this completion's originating CQ.
+    /// Sequence in the originating QP's send or receive stream.
     #[inline]
     pub fn sequence(&self) -> u64 {
-        self.cq.layout.sequence(self.wc.wr_id)
+        self.wc.wr_id.sequence()
     }
 
     #[inline]
@@ -77,9 +77,9 @@ impl<'a> Completion<'a> {
         &self,
         cq: &CompletionQueue,
         qp_num: u32,
-        route: CompletionRoute,
+        identity: CompletionIdentity,
     ) -> bool {
-        ptr::eq(self.cq, cq) && self.wc.qp_num == qp_num && route.contains(self.wc.wr_id)
+        ptr::eq(self.cq, cq) && self.wc.qp_num == qp_num && identity.contains(qp_num, self.wc.wr_id)
     }
 }
 
@@ -116,10 +116,9 @@ pub struct CompletionQueue {
     _context: Arc<Context>,
     /// Prevents the completion channel from being destroyed while this CQ exists.
     _channel: Option<Arc<CompChannel>>,
-    /// Fixed at CQ creation; changing it could reinterpret retained completions.
-    layout: WrIdLayout,
-    /// Setup-only slot allocation and reuse watermarks. Polling never locks it.
-    routes: Mutex<RouteAllocator>,
+    capacity: u32,
+    /// Setup-only QPN leases and retired sequence floor. Polling never locks it.
+    identities: Mutex<IdentityRegistry>,
 }
 
 impl CompletionQueue {
@@ -151,8 +150,8 @@ impl CompletionQueue {
         if ptr.is_null() {
             return Err(ErrorKind::IBCreateCompQueueFail.with_errno());
         }
-        // Providers can round the requested capacity up. Use the returned
-        // capacity both as the route limit and to choose the immutable layout.
+        // Providers can round the requested capacity up. Expose the returned
+        // capacity for completion-credit admission; it does not limit QPNs.
         let actual_capacity = unsafe { (*ptr).cqe };
         if actual_capacity < cq_size {
             let _ = unsafe { crate::ruapc_ibv_destroy_cq(ptr) };
@@ -161,13 +160,12 @@ impl CompletionQueue {
                 format!("provider CQ capacity {actual_capacity} is below requested {cq_size}"),
             ));
         }
-        let layout = WrIdLayout::new(actual_capacity as u32);
         Ok(Arc::new(Self {
             ptr,
             _context: Arc::clone(context),
             _channel: channel.cloned(),
-            layout,
-            routes: Mutex::new(RouteAllocator::new(layout)),
+            capacity: actual_capacity as u32,
+            identities: Mutex::new(IdentityRegistry::default()),
         }))
     }
 
@@ -178,21 +176,13 @@ impl CompletionQueue {
 
     /// Actual CQE capacity returned by the provider, at least the requested size.
     pub fn capacity(&self) -> u32 {
-        self.layout.capacity()
+        self.capacity
     }
 
-    /// Number of CQ-local route positions available to QPs.
-    ///
-    /// Equals [`Self::capacity`]. Exhausted sequence spaces retire positions;
-    /// the layout is never resized or reinterpreted during this CQ's lifetime.
-    pub fn route_capacity(&self) -> u32 {
-        self.layout.capacity()
-    }
-
-    /// Work-queue sequence width after reserving two type bits and enough
-    /// route bits for every position in [`Self::route_capacity`].
-    pub fn sequence_bits(&self) -> u32 {
-        self.layout.sequence_bits()
+    /// Samples active QPN leases and the sequence floor for new QPs.
+    /// This setup-only lock is not used while posting or completing WRs.
+    pub fn qp_registry_stats(&self) -> QpRegistryStats {
+        self.identities.lock().unwrap().stats()
     }
 
     pub(super) fn context(&self) -> &Arc<Context> {
@@ -233,9 +223,9 @@ impl CompletionQueue {
         })
     }
 
-    pub(super) fn allocate_route(self: &Arc<Self>) -> Result<RouteLease> {
-        let route = self.routes.lock().unwrap().allocate()?;
-        Ok(RouteLease::new(Arc::clone(self), route))
+    pub(super) fn register_qp(self: &Arc<Self>, qp_num: u32) -> Result<IdentityLease> {
+        let identity = self.identities.lock().unwrap().register(qp_num)?;
+        Ok(IdentityLease::new(Arc::clone(self), identity))
     }
 
     /// Acknowledges CQ events received via [`CompChannel::get_event`].
@@ -255,7 +245,7 @@ impl std::fmt::Debug for CompletionQueue {
         f.debug_struct("CompletionQueue")
             .field("ptr", &self.ptr)
             .field("capacity", &self.capacity())
-            .field("sequence_bits", &self.sequence_bits())
+            .field("qp_registry", &self.qp_registry_stats())
             .finish()
     }
 }
@@ -271,13 +261,13 @@ mod tests {
     use crate::*;
 
     #[test]
-    fn completion_requires_its_original_cq_qp_and_route() {
+    fn completion_requires_its_original_cq_qpn_and_incarnation() {
         let dev = open_device();
         let cq = CompletionQueue::create(dev.context(), 16, None).unwrap();
         let other_cq = CompletionQueue::create(dev.context(), 16, None).unwrap();
-        let lease = cq.allocate_route().unwrap();
-        let route = lease.route();
-        let other_lease = cq.allocate_route().unwrap();
+        let lease = cq.register_qp(42).unwrap();
+        let route = lease.identity();
+        let other_lease = cq.register_qp(43).unwrap();
         // Only this module can construct a token from raw metadata. The public
         // API requires an actual provider completion, covered by the doctest.
         let wc = ibv_wc {
@@ -286,27 +276,29 @@ mod tests {
             ..Default::default()
         };
         let completion = super::Completion { cq: &cq, wc: &wc };
-        assert_eq!(completion.slot(), route.slot());
+        assert_eq!(completion.qp_num(), route.qp_num());
         assert_eq!(completion.sequence(), route.first_sequence());
         assert!(completion.belongs_to(&cq, 42, route));
         assert!(!completion.belongs_to(&other_cq, 42, route));
         assert!(!completion.belongs_to(&cq, 43, route));
-        assert!(!completion.belongs_to(&cq, 42, other_lease.route()));
+        assert!(!completion.belongs_to(&cq, 42, other_lease.identity()));
 
-        // A retained CQ-issued token must remain harmless when both the slot
-        // and the provider's QPN have been reused by a replacement QP.
+        // A retained CQ-issued token must remain harmless after QPN reuse.
+        // Polling another batch to empty cannot invalidate this borrowed token.
         drop(lease);
-        let replacement = cq.allocate_route().unwrap();
-        assert_eq!(replacement.route().slot(), route.slot());
-        assert!(!completion.belongs_to(&cq, 42, replacement.route()));
+        let mut empty = CompletionBatch::<1>::new();
+        assert_eq!(cq.poll_batch(&mut empty).unwrap().len(), 0);
+        let replacement = cq.register_qp(42).unwrap();
+        assert_eq!(replacement.identity().qp_num(), route.qp_num());
+        assert!(!completion.belongs_to(&cq, 42, replacement.identity()));
     }
 
     #[test]
     fn lease_drop_preserves_both_directions_and_unused_incarnations() {
         let dev = open_device();
         let cq = CompletionQueue::create(dev.context(), 16, None).unwrap();
-        let lease = cq.allocate_route().unwrap();
-        let first = lease.route();
+        let lease = cq.register_qp(42).unwrap();
+        let first = lease.identity();
         assert!(Arc::ptr_eq(lease.cq(), &cq));
         for expected in 0..5 {
             assert_eq!(lease.lock_send().unwrap().sequence(), expected);
@@ -314,14 +306,14 @@ mod tests {
         assert_eq!(lease.alloc_recv().unwrap(), 0);
         drop(lease);
 
-        let unused = cq.allocate_route().unwrap();
-        assert_eq!(unused.route().slot(), first.slot());
-        assert_eq!(unused.route().first_sequence(), 5);
+        let unused = cq.register_qp(42).unwrap();
+        assert_eq!(unused.identity().qp_num(), first.qp_num());
+        assert_eq!(unused.identity().first_sequence(), 5);
         drop(unused);
 
-        let current = cq.allocate_route().unwrap();
-        assert_eq!(current.route().slot(), first.slot());
-        assert_eq!(current.route().first_sequence(), 6);
+        let current = cq.register_qp(42).unwrap();
+        assert_eq!(current.identity().qp_num(), first.qp_num());
+        assert_eq!(current.identity().first_sequence(), 6);
         assert_eq!(current.lock_send().unwrap().sequence(), 6);
         assert_eq!(current.alloc_recv().unwrap(), 6);
     }
@@ -334,9 +326,7 @@ mod tests {
         assert!(!cq.as_ptr().is_null());
         assert!(cq.capacity() >= 16);
         assert_eq!(cq.capacity(), unsafe { (*cq.as_ptr()).cqe as u32 });
-        assert_eq!(cq.route_capacity(), cq.capacity());
-        let slot_bits = u32::BITS - (cq.capacity() - 1).leading_zeros();
-        assert_eq!(cq.sequence_bits(), 62 - slot_bits);
+        assert_eq!(cq.qp_registry_stats(), QpRegistryStats::default());
     }
 
     #[test]
@@ -353,41 +343,23 @@ mod tests {
     }
 
     #[test]
-    fn token_decoding_uses_its_originating_cq_layout() {
+    fn fixed_sequence_decoding_does_not_replace_cq_authentication() {
         let dev = open_device();
         let cq = CompletionQueue::create(dev.context(), 16, None).unwrap();
         let other_cq = CompletionQueue::create(dev.context(), 1024, None).unwrap();
-        let first = cq.allocate_route().unwrap();
-        let second = cq.allocate_route().unwrap();
-        let route = second.route();
-        let sequence = route.max_sequence();
+        let lease = cq.register_qp(42).unwrap();
+        let other_lease = other_cq.register_qp(42).unwrap();
         let wc = ibv_wc {
             qp_num: 42,
-            wr_id: route.encode(WRType::Read, sequence),
+            wr_id: lease.identity().encode(WRType::Read, WRID::MAX_SEQUENCE),
             ..Default::default()
         };
         let token = super::Completion { cq: &cq, wc: &wc };
-        assert_eq!(token.slot(), 1);
-        assert_eq!(token.sequence(), sequence);
-        assert!(token.belongs_to(&cq, 42, route));
-        assert!(!token.belongs_to(&other_cq, 42, route));
-        assert!(!token.belongs_to(&cq, 42, first.route()));
-
-        // Equal raw bits need not describe equal slot/sequence pairs on two
-        // CQs. The token chooses its own decoder without accepting caller input.
-        let other = super::Completion {
-            cq: &other_cq,
-            wc: &wc,
-        };
-        assert_eq!(other.slot(), other_cq.layout.slot(wc.wr_id));
-        assert_eq!(other.sequence(), other_cq.layout.sequence(wc.wr_id));
-        if cq.sequence_bits() != other_cq.sequence_bits() {
-            assert_ne!(
-                (token.slot(), token.sequence()),
-                (other.slot(), other.sequence())
-            );
-        }
-        assert!(!other.belongs_to(&cq, 42, route));
+        assert_eq!(token.qp_num(), 42);
+        assert_eq!(token.sequence(), WRID::MAX_SEQUENCE);
+        assert!(token.belongs_to(&cq, 42, lease.identity()));
+        assert!(!token.belongs_to(&other_cq, 42, other_lease.identity()));
+        assert_eq!(lease.identity(), other_lease.identity());
     }
 
     #[test]

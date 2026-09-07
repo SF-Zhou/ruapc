@@ -20,7 +20,7 @@ pub use comp_channel::CompChannel;
 
 mod completion_queue;
 pub use completion_queue::{
-    Completion, CompletionBatch, CompletionQueue, CompletionRoute, Completions,
+    Completion, CompletionBatch, CompletionIdentity, CompletionQueue, Completions, QpRegistryStats,
 };
 
 mod context;

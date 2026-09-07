@@ -30,8 +30,7 @@ use super::queue_pair::WrBuffers;
 const EMPTY: u64 = 0;
 /// Slot is being written to or drained; transient state.
 const WRITING: u64 = 1;
-/// Occupied slots store `id + TAG_BASE`. CQ layouts use at most 62 sequence
-/// bits, so this never overflows or collides with `EMPTY`/`WRITING`.
+/// Occupied slots store `id + TAG_BASE`. WRIDs use 62 sequence bits, so this never overflows or collides with `EMPTY`/`WRITING`.
 const TAG_BASE: u64 = 2;
 
 struct Slot {

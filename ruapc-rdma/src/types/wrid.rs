@@ -1,15 +1,14 @@
-//! CQ-specific work request identities with two fixed work-type bits.
+//! Fixed-width work request identities, scoped by the CQ and hardware QPN.
 //!
 //! ```text
-//! | type: 2 bits | CQ route slot: s bits | sequence: 62 - s bits |
+//! | type: 2 bits | per-direction QP sequence: 62 bits |
 //! ```
 //!
-//! Each CQ fixes `s` from its actual capacity at creation. A WRID therefore
-//! cannot decode its own slot or sequence: use the originating CQ's
-//! [`crate::Completion::slot`] and [`crate::Completion::sequence`] instead.
-//! CQ-owned route leases preserve sequence watermarks across QP lifetimes.
+//! A WRID need not be unique across QPs: CQ-issued completions also identify
+//! their hardware QPN. CQ-owned leases preserve sequence floors across QPN
+//! reuse without reserving any WRID bits for connection routing.
 
-/// A work request identity. Only its type is independent of its originating CQ.
+/// A work request identity within one hardware QP number and originating CQ.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WRID(u64);
@@ -32,14 +31,16 @@ pub enum WRType {
 }
 
 impl WRID {
-    /// Bit position of the type field, independent of CQ layout.
-    pub const TYPE_SHIFT: u32 = 62;
-    pub(crate) const PAYLOAD_MASK: u64 = (1 << Self::TYPE_SHIFT) - 1;
+    /// Sequence width, independent of CQ capacity and connection count.
+    pub const SEQUENCE_BITS: u32 = 62;
+    /// Largest sequence that can be allocated without repeating an identity.
+    pub const MAX_SEQUENCE: u64 = (1 << Self::SEQUENCE_BITS) - 1;
+    pub const TYPE_SHIFT: u32 = Self::SEQUENCE_BITS;
 
-    /// Called with the prefix and sequence validated by the CQ route allocator.
+    /// Called with a sequence reserved by the QP's CQ-owned identity lease.
     #[inline]
     pub(crate) fn new(wr_type: WRType, payload: u64) -> Self {
-        debug_assert!(payload <= Self::PAYLOAD_MASK);
+        debug_assert!(payload <= Self::MAX_SEQUENCE);
         Self(((wr_type as u64) << Self::TYPE_SHIFT) | payload)
     }
 
@@ -60,11 +61,16 @@ impl WRID {
     pub fn raw(&self) -> u64 {
         self.0
     }
+
+    /// Returns the sequence in its QP's send or receive stream.
+    #[inline]
+    pub fn sequence(self) -> u64 {
+        self.0 & Self::MAX_SEQUENCE
+    }
 }
 
 impl std::fmt::Debug for WRID {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Slot/sequence formatting would require the originating CQ's layout.
         write!(f, "{:?}({:#018x})", self.get_type(), self.0)
     }
 }
@@ -74,17 +80,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn type_and_payload_roundtrip_without_assuming_a_cq_layout() {
+    fn type_and_sequence_roundtrip_at_fixed_width_boundaries() {
         for wr_type in [
             WRType::Recv,
             WRType::SendData,
             WRType::SendImm,
             WRType::Read,
         ] {
-            for payload in [0, 1, WRID::PAYLOAD_MASK] {
+            for payload in [0, 1, (1 << 42) - 1, 1 << 42, WRID::MAX_SEQUENCE] {
                 let wrid = WRID::new(wr_type, payload);
                 assert_eq!(wrid.get_type(), wr_type);
-                assert_eq!(wrid.raw() & WRID::PAYLOAD_MASK, payload);
+                assert_eq!(wrid.sequence(), payload);
                 assert_eq!(wrid.raw(), ((wr_type as u64) << WRID::TYPE_SHIFT) | payload);
             }
         }

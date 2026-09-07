@@ -204,8 +204,8 @@ fn manual_poller(context: &Arc<ruapc_rdma::Context>) -> (DevicePoller, PollLoop)
         shared,
         dispatcher: Dispatcher::start(1),
         spin: Duration::ZERO,
-        conns: Vec::new(),
-        dirty_slots: Vec::new(),
+        conns: HashMap::default(),
+        dirty_qps: Vec::new(),
         maintenance_requested,
         unack_cq_events: 0,
     };
@@ -303,8 +303,15 @@ fn register_idle_socket(
     socket
 }
 
+fn mark_dirty(poll_loop: &mut PollLoop, qp_num: u32) {
+    PollLoop::mark_dirty(
+        poll_loop.conns.get_mut(&qp_num).unwrap(),
+        &mut poll_loop.dirty_qps,
+    );
+}
+
 #[tokio::test]
-async fn dirty_maintenance_is_bounded_and_survives_slot_reuse() {
+async fn dirty_maintenance_is_bounded_and_survives_replacement() {
     let devices = crate::rdma::test_utils::make_rdma_devices();
     let device = &devices.devices()[0];
     let (poller, mut poll_loop) = manual_poller(device.context());
@@ -319,12 +326,12 @@ async fn dirty_maintenance_is_bounded_and_survives_slot_reuse() {
     .unwrap();
     let first = register_idle_socket(&poller, device, &buffer_pool, &state);
     let second = register_idle_socket(&poller, device, &buffer_pool, &state);
-    let first_slot = first.queue_pair.send_route().slot();
-    let second_slot = second.queue_pair.send_route().slot();
+    let first_qp = first.queue_pair.qp_num();
+    let second_qp = second.queue_pair.qp_num();
     assert!(poll_loop.drain_incoming(false));
-    assert_eq!(poll_loop.dirty_slots.len(), 2);
+    assert_eq!(poll_loop.dirty_qps.len(), 2);
     poll_loop.maintain_dirty_connections(Instant::now(), false);
-    assert!(poll_loop.dirty_slots.is_empty());
+    assert!(poll_loop.dirty_qps.is_empty());
 
     // A pending send on an unrelated connection must stay untouched when
     // only the first connection has completion work. Exhaust its window
@@ -337,57 +344,131 @@ async fn dirty_maintenance_is_bounded_and_survives_slot_reuse() {
         .pending_sender
         .try_send(buffer_pool.allocate(64).unwrap())
         .unwrap();
-    poll_loop.mark_dirty(first_slot);
-    poll_loop.mark_dirty(first_slot);
-    assert_eq!(poll_loop.dirty_slots, [first_slot]);
+    mark_dirty(&mut poll_loop, first_qp);
+    mark_dirty(&mut poll_loop, first_qp);
+    assert_eq!(poll_loop.dirty_qps, [first_qp]);
     poll_loop.maintain_dirty_connections(Instant::now(), false);
-    assert!(
-        poll_loop.conns[second_slot]
-            .as_ref()
-            .unwrap()
-            .pending_sends
-            .is_empty()
-    );
+    assert!(poll_loop.conns[&second_qp].pending_sends.is_empty());
     poll_loop.maintain_connections(Instant::now(), false, false);
-    assert_eq!(
-        poll_loop.conns[second_slot]
-            .as_ref()
-            .unwrap()
-            .pending_sends
-            .len(),
-        1
-    );
+    assert_eq!(poll_loop.conns[&second_qp].pending_sends.len(), 1);
     assert!(
-        poll_loop.dirty_slots.is_empty(),
+        poll_loop.dirty_qps.is_empty(),
         "a full window must not force retry polling"
     );
 
     // A receive allocation deficit stays listed once across both kinds of
     // maintenance, including more CQEs before the next timed retry.
-    poll_loop.conns[first_slot].as_mut().unwrap().recv_deficit = 1;
-    poll_loop.mark_dirty(first_slot);
+    poll_loop.conns.get_mut(&first_qp).unwrap().recv_deficit = 1;
+    mark_dirty(&mut poll_loop, first_qp);
     poll_loop.maintain_dirty_connections(Instant::now(), false);
-    poll_loop.mark_dirty(first_slot);
-    assert_eq!(poll_loop.dirty_slots, [first_slot]);
+    mark_dirty(&mut poll_loop, first_qp);
+    assert_eq!(poll_loop.dirty_qps, [first_qp]);
     poll_loop.maintain_connections(Instant::now(), false, false);
-    assert_eq!(poll_loop.dirty_slots, [first_slot]);
-    poll_loop.conns[first_slot].as_mut().unwrap().recv_deficit = 0;
+    assert_eq!(poll_loop.dirty_qps, [first_qp]);
+    poll_loop.conns.get_mut(&first_qp).unwrap().recv_deficit = 0;
 
     first.set_error();
     poll_loop.maintain_dirty_connections(Instant::now(), false);
-    assert!(poll_loop.conns[first_slot].is_none());
-    assert!(poll_loop.dirty_slots.is_empty());
+    assert!(!poll_loop.conns.contains_key(&first_qp));
+    assert!(poll_loop.dirty_qps.is_empty());
     drop(first);
     poll_loop
         .drain_completions(poller.cq(), &mut CompletionBatch::new(), &mut Vec::new())
         .unwrap();
     let replacement = register_idle_socket(&poller, device, &buffer_pool, &state);
-    assert_eq!(replacement.queue_pair.send_route().slot(), first_slot);
+    let replacement_qp = replacement.queue_pair.qp_num();
     assert!(poll_loop.drain_incoming(false));
-    assert_eq!(poll_loop.dirty_slots, [first_slot]);
+    assert_eq!(poll_loop.dirty_qps, [replacement_qp]);
     poll_loop.maintain_dirty_connections(Instant::now(), false);
-    assert!(!poll_loop.conns[first_slot].as_ref().unwrap().dirty);
-    assert!(poll_loop.dirty_slots.is_empty());
+    assert!(!poll_loop.conns[&replacement_qp].dirty);
+    assert!(poll_loop.dirty_qps.is_empty());
+    poll_loop.shutdown_cleanup();
+}
+
+#[tokio::test]
+async fn identical_wrids_are_routed_by_their_provider_qp_numbers() {
+    let devices = crate::rdma::test_utils::make_rdma_devices();
+    let device = &devices.devices()[0];
+    let (poller, mut poll_loop) = manual_poller(device.context());
+    let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+    let (state, _stop) = State::create(
+        crate::Router::default(),
+        &crate::SocketPoolConfig {
+            rdma: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let sockets = [
+        register_idle_socket(&poller, device, &pool, &state),
+        register_idle_socket(&poller, device, &pool, &state),
+    ];
+    assert_ne!(
+        sockets[0].queue_pair.qp_num(),
+        sockets[1].queue_pair.qp_num()
+    );
+    assert_eq!(
+        sockets[0].queue_pair.recv_identity().first_sequence(),
+        sockets[1].queue_pair.recv_identity().first_sequence()
+    );
+
+    for socket in &sockets {
+        let mut init = ibv_qp_attr {
+            qp_state: ibv_qp_state::IBV_QPS_INIT,
+            port_num: device.info().ports[0].port_num,
+            ..Default::default()
+        };
+        let mask = ibv_qp_attr_mask::IBV_QP_STATE
+            | ibv_qp_attr_mask::IBV_QP_PORT
+            | ibv_qp_attr_mask::IBV_QP_PKEY_INDEX
+            | ibv_qp_attr_mask::IBV_QP_ACCESS_FLAGS;
+        socket.queue_pair.modify(&mut init, mask.0 as _).unwrap();
+        socket.queue_pair.recv(pool.allocate(64).unwrap()).unwrap();
+        socket.set_error();
+    }
+    // This manual poller has consumed nothing yet. Account for each real
+    // receive before publishing the connections to its local registry.
+    for incoming in &mut poller.shared.inner.lock().unwrap().incoming {
+        incoming.recv_submitted = 1;
+    }
+    assert!(poll_loop.drain_incoming(false));
+    let mut seen = std::collections::HashSet::new();
+    let mut wrid = None;
+    let mut storage = CompletionBatch::<8>::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while seen.len() < sockets.len() {
+        for completion in poller.cq().poll_batch(&mut storage).unwrap() {
+            assert!(completion.info().is_recv());
+            assert_eq!(
+                completion.info().status,
+                ruapc_rdma::ibv_wc_status::IBV_WC_WR_FLUSH_ERR
+            );
+            if let Some(first) = wrid {
+                assert_eq!(completion.info().wr_id, first);
+            } else {
+                wrid = Some(completion.info().wr_id);
+            }
+            assert!(seen.insert(completion.qp_num()));
+            poll_loop.dispatch(completion, &mut Vec::new());
+        }
+        assert!(
+            Instant::now() < deadline,
+            "both receive flushes must arrive"
+        );
+        std::thread::yield_now();
+    }
+    for socket in &sockets {
+        assert!(
+            poll_loop
+                .conns
+                .get_mut(&socket.queue_pair.qp_num())
+                .unwrap()
+                .ready_to_remove()
+        );
+    }
+    poll_loop.maintain_dirty_connections(Instant::now(), false);
+    assert!(poll_loop.conns.is_empty());
+    assert!(poll_loop.dirty_qps.is_empty());
     poll_loop.shutdown_cleanup();
 }
 
@@ -557,8 +638,9 @@ async fn early_flush_completion_waits_for_registration_and_settles_receive() {
         ));
     });
 
-    let conn = poll_loop.conns[socket.queue_pair.send_route().slot()]
-        .as_mut()
+    let conn = poll_loop
+        .conns
+        .get_mut(&socket.queue_pair.qp_num())
         .expect("the early CQE must find the newly published connection");
     assert!(
         conn.ready_to_remove(),
