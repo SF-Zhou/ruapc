@@ -1,0 +1,4 @@
+   Compiling ruapc v0.2.0-alpha.5 (/tmp/ruapc-capacity-baseline-khu5EK/ruapc)
+    Finished `bench` profile [optimized] target(s) in 3.01s
+  Executable benches/capacity_qps.rs (/tmp/ruapc-capacity-baseline-target/release/deps/capacity_qps-34e6a9e2f12a0dd9)
+  Executable benches/capacity_rpc.rs (/tmp/ruapc-capacity-baseline-target/release/deps/capacity_rpc-51ceadf7a9fc6891)

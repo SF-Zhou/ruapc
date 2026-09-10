@@ -1,0 +1,474 @@
+{
+  "kind": "echo",
+  "started_utc": "2026-09-06T14:58:56.535654+00:00",
+  "environment": {
+    "TOKIO_WORKER_THREADS": "8",
+    "RUAPC_BENCH_TRANSPORT": "RDMA",
+    "RUAPC_BENCH_RDMA_DEVICE": "mlx5_0",
+    "RUAPC_BENCH_WARMUP_ITERS": "5000",
+    "RUAPC_BENCH_SERIAL_ITERS": "50000"
+  },
+  "placement": {
+    "runtime_workers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "main": 8,
+    "pollers": [
+      9,
+      10
+    ],
+    "numa_memory_node": 0
+  },
+  "binaries": {
+    "baseline": {
+      "path": "/tmp/ruapc-capacity-bench/echo-baseline-long",
+      "sha256": "921e695adf673760c2e20241fd2ec8ccd656f24435ec1fa8a7062d9648a9b7a9"
+    },
+    "current": {
+      "path": "/tmp/ruapc-capacity-bench/echo-after-long",
+      "sha256": "234bf2e34a7087a1464bfb2476908c235bfe0dac4f723f23b02e63e94d163643"
+    }
+  },
+  "pin_library": {
+    "path": "/tmp/ruapc-capacity-bench/pin_threads.so",
+    "sha256": "622ca4da965983cf41e791a5c62d6a64780f30ee1de1a80cb1212bbd18931b38"
+  },
+  "machine": {
+    "uname": "Linux zhoushunfeng-15223326-0 6.8.0-60-generic #63-Ubuntu SMP PREEMPT_DYNAMIC Tue Apr 15 19:04:15 UTC 2025 x86_64 x86_64 x86_64 GNU/Linux",
+    "cpu": "AMD EPYC 9655 96-Core Processor",
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)"
+  },
+  "pairs": 5,
+  "runs": [
+    {
+      "pair": 1,
+      "version": "baseline",
+      "command": [
+        "numactl",
+        "--physcpubind=0-10",
+        "--membind=0",
+        "env",
+        "LD_PRELOAD=/tmp/ruapc-capacity-bench/pin_threads.so",
+        "/tmp/ruapc-capacity-bench/echo-baseline-long"
+      ],
+      "elapsed_s": 14.665694697003346,
+      "returncode": 0,
+      "stdout": "ruapc: end-to-end echo RPC benchmark (unified server, one port)\nserial iterations: 50000; warmup iterations: 5000; transport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\n\nRDMA\n  serial        16B:    30.36 us/op\n  serial      4096B:    31.19 us/op\n  concurrent    16B:    697.1 kops/s |    91.81 us/op (64 tasks)\n  concurrent    16B:   1354.8 kops/s |   755.84 us/op (1024 tasks)\n\nRDMA (2 endpoints)\n  concurrent    16B:    668.7 kops/s |    95.71 us/op (64 tasks)\n  concurrent    16B:   1408.1 kops/s |   727.23 us/op (1024 tasks)\n\n",
+      "stderr": "pin_threads: main -> cpu=8\npin_threads: tokio-rt-worker -> cpu=1\npin_threads: tokio-rt-worker -> cpu=2\npin_threads: tokio-rt-worker -> cpu=0\npin_threads: tokio-rt-worker -> cpu=3\npin_threads: tokio-rt-worker -> cpu=4\npin_threads: tokio-rt-worker -> cpu=5\npin_threads: tokio-rt-worker -> cpu=6\npin_threads: tokio-rt-worker -> cpu=7\npin_threads: ruapc-rdma-poll -> cpu=9\npin_threads: ruapc-rdma-poll -> cpu=10\n",
+      "metrics": {
+        "RDMA/serial_16B_us": 30.36,
+        "RDMA/serial_4096B_us": 31.19,
+        "RDMA/concurrent_64_kops": 697.1,
+        "RDMA/concurrent_64_us": 91.81,
+        "RDMA/concurrent_1024_kops": 1354.8,
+        "RDMA/concurrent_1024_us": 755.84,
+        "RDMA (2 endpoints)/concurrent_64_kops": 668.7,
+        "RDMA (2 endpoints)/concurrent_64_us": 95.71,
+        "RDMA (2 endpoints)/concurrent_1024_kops": 1408.1,
+        "RDMA (2 endpoints)/concurrent_1024_us": 727.23
+      }
+    },
+    {
+      "pair": 1,
+      "version": "current",
+      "command": [
+        "numactl",
+        "--physcpubind=0-10",
+        "--membind=0",
+        "env",
+        "LD_PRELOAD=/tmp/ruapc-capacity-bench/pin_threads.so",
+        "/tmp/ruapc-capacity-bench/echo-after-long"
+      ],
+      "elapsed_s": 14.534198881010525,
+      "returncode": 0,
+      "stdout": "ruapc: end-to-end echo RPC benchmark (unified server, one port)\nserial iterations: 50000; warmup iterations: 5000; transport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\n\nRDMA\n  serial        16B:    28.40 us/op\n  serial      4096B:    31.64 us/op\n  concurrent    16B:    695.1 kops/s |    92.08 us/op (64 tasks)\n  concurrent    16B:   1380.0 kops/s |   742.01 us/op (1024 tasks)\n\nRDMA (2 endpoints)\n  concurrent    16B:    667.8 kops/s |    95.84 us/op (64 tasks)\n  concurrent    16B:   1428.0 kops/s |   717.08 us/op (1024 tasks)\n\n",
+      "stderr": "pin_threads: main -> cpu=8\npin_threads: tokio-rt-worker -> cpu=0\npin_threads: tokio-rt-worker -> cpu=1\npin_threads: tokio-rt-worker -> cpu=2\npin_threads: tokio-rt-worker -> cpu=4\npin_threads: tokio-rt-worker -> cpu=5\npin_threads: tokio-rt-worker -> cpu=6\npin_threads: tokio-rt-worker -> cpu=7\npin_threads: tokio-rt-worker -> cpu=3\npin_threads: ruapc-rdma-poll -> cpu=9\npin_threads: ruapc-rdma-poll -> cpu=10\n",
+      "metrics": {
+        "RDMA/serial_16B_us": 28.4,
+        "RDMA/serial_4096B_us": 31.64,
+        "RDMA/concurrent_64_kops": 695.1,
+        "RDMA/concurrent_64_us": 92.08,
+        "RDMA/concurrent_1024_kops": 1380.0,
+        "RDMA/concurrent_1024_us": 742.01,
+        "RDMA (2 endpoints)/concurrent_64_kops": 667.8,
+        "RDMA (2 endpoints)/concurrent_64_us": 95.84,
+        "RDMA (2 endpoints)/concurrent_1024_kops": 1428.0,
+        "RDMA (2 endpoints)/concurrent_1024_us": 717.08
+      }
+    },
+    {
+      "pair": 2,
+      "version": "current",
+      "command": [
+        "numactl",
+        "--physcpubind=0-10",
+        "--membind=0",
+        "env",
+        "LD_PRELOAD=/tmp/ruapc-capacity-bench/pin_threads.so",
+        "/tmp/ruapc-capacity-bench/echo-after-long"
+      ],
+      "elapsed_s": 14.454478326020762,
+      "returncode": 0,
+      "stdout": "ruapc: end-to-end echo RPC benchmark (unified server, one port)\nserial iterations: 50000; warmup iterations: 5000; transport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\n\nRDMA\n  serial        16B:    27.26 us/op\n  serial      4096B:    31.44 us/op\n  concurrent    16B:    700.6 kops/s |    91.35 us/op (64 tasks)\n  concurrent    16B:   1373.2 kops/s |   745.68 us/op (1024 tasks)\n\nRDMA (2 endpoints)\n  concurrent    16B:    663.8 kops/s |    96.42 us/op (64 tasks)\n  concurrent    16B:   1433.0 kops/s |   714.60 us/op (1024 tasks)\n\n",
+      "stderr": "pin_threads: main -> cpu=8\npin_threads: tokio-rt-worker -> cpu=0\npin_threads: tokio-rt-worker -> cpu=1\npin_threads: tokio-rt-worker -> cpu=2\npin_threads: tokio-rt-worker -> cpu=3\npin_threads: tokio-rt-worker -> cpu=4\npin_threads: tokio-rt-worker -> cpu=5\npin_threads: tokio-rt-worker -> cpu=6\npin_threads: tokio-rt-worker -> cpu=7\npin_threads: ruapc-rdma-poll -> cpu=9\npin_threads: ruapc-rdma-poll -> cpu=10\n",
+      "metrics": {
+        "RDMA/serial_16B_us": 27.26,
+        "RDMA/serial_4096B_us": 31.44,
+        "RDMA/concurrent_64_kops": 700.6,
+        "RDMA/concurrent_64_us": 91.35,
+        "RDMA/concurrent_1024_kops": 1373.2,
+        "RDMA/concurrent_1024_us": 745.68,
+        "RDMA (2 endpoints)/concurrent_64_kops": 663.8,
+        "RDMA (2 endpoints)/concurrent_64_us": 96.42,
+        "RDMA (2 endpoints)/concurrent_1024_kops": 1433.0,
+        "RDMA (2 endpoints)/concurrent_1024_us": 714.6
+      }
+    },
+    {
+      "pair": 2,
+      "version": "baseline",
+      "command": [
+        "numactl",
+        "--physcpubind=0-10",
+        "--membind=0",
+        "env",
+        "LD_PRELOAD=/tmp/ruapc-capacity-bench/pin_threads.so",
+        "/tmp/ruapc-capacity-bench/echo-baseline-long"
+      ],
+      "elapsed_s": 14.330259779992048,
+      "returncode": 0,
+      "stdout": "ruapc: end-to-end echo RPC benchmark (unified server, one port)\nserial iterations: 50000; warmup iterations: 5000; transport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\n\nRDMA\n  serial        16B:    27.28 us/op\n  serial      4096B:    30.24 us/op\n  concurrent    16B:    697.5 kops/s |    91.76 us/op (64 tasks)\n  concurrent    16B:   1392.9 kops/s |   735.14 us/op (1024 tasks)\n\nRDMA (2 endpoints)\n  concurrent    16B:    673.2 kops/s |    95.07 us/op (64 tasks)\n  concurrent    16B:   1444.2 kops/s |   709.02 us/op (1024 tasks)\n\n",
+      "stderr": "pin_threads: main -> cpu=8\npin_threads: tokio-rt-worker -> cpu=0\npin_threads: tokio-rt-worker -> cpu=1\npin_threads: tokio-rt-worker -> cpu=2\npin_threads: tokio-rt-worker -> cpu=3\npin_threads: tokio-rt-worker -> cpu=4\npin_threads: tokio-rt-worker -> cpu=5\npin_threads: tokio-rt-worker -> cpu=6\npin_threads: tokio-rt-worker -> cpu=7\npin_threads: ruapc-rdma-poll -> cpu=9\npin_threads: ruapc-rdma-poll -> cpu=10\n",
+      "metrics": {
+        "RDMA/serial_16B_us": 27.28,
+        "RDMA/serial_4096B_us": 30.24,
+        "RDMA/concurrent_64_kops": 697.5,
+        "RDMA/concurrent_64_us": 91.76,
+        "RDMA/concurrent_1024_kops": 1392.9,
+        "RDMA/concurrent_1024_us": 735.14,
+        "RDMA (2 endpoints)/concurrent_64_kops": 673.2,
+        "RDMA (2 endpoints)/concurrent_64_us": 95.07,
+        "RDMA (2 endpoints)/concurrent_1024_kops": 1444.2,
+        "RDMA (2 endpoints)/concurrent_1024_us": 709.02
+      }
+    },
+    {
+      "pair": 3,
+      "version": "baseline",
+      "command": [
+        "numactl",
+        "--physcpubind=0-10",
+        "--membind=0",
+        "env",
+        "LD_PRELOAD=/tmp/ruapc-capacity-bench/pin_threads.so",
+        "/tmp/ruapc-capacity-bench/echo-baseline-long"
+      ],
+      "elapsed_s": 14.725959039991722,
+      "returncode": 0,
+      "stdout": "ruapc: end-to-end echo RPC benchmark (unified server, one port)\nserial iterations: 50000; warmup iterations: 5000; transport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\n\nRDMA\n  serial        16B:    28.38 us/op\n  serial      4096B:    31.17 us/op\n  concurrent    16B:    690.3 kops/s |    92.72 us/op (64 tasks)\n  concurrent    16B:   1337.3 kops/s |   765.73 us/op (1024 tasks)\n\nRDMA (2 endpoints)\n  concurrent    16B:    664.7 kops/s |    96.29 us/op (64 tasks)\n  concurrent    16B:   1342.2 kops/s |   762.92 us/op (1024 tasks)\n\n",
+      "stderr": "pin_threads: main -> cpu=8\npin_threads: tokio-rt-worker -> cpu=0\npin_threads: tokio-rt-worker -> cpu=1\npin_threads: tokio-rt-worker -> cpu=2\npin_threads: tokio-rt-worker -> cpu=3\npin_threads: tokio-rt-worker -> cpu=4\npin_threads: tokio-rt-worker -> cpu=5\npin_threads: tokio-rt-worker -> cpu=6\npin_threads: tokio-rt-worker -> cpu=7\npin_threads: ruapc-rdma-poll -> cpu=9\npin_threads: ruapc-rdma-poll -> cpu=10\n",
+      "metrics": {
+        "RDMA/serial_16B_us": 28.38,
+        "RDMA/serial_4096B_us": 31.17,
+        "RDMA/concurrent_64_kops": 690.3,
+        "RDMA/concurrent_64_us": 92.72,
+        "RDMA/concurrent_1024_kops": 1337.3,
+        "RDMA/concurrent_1024_us": 765.73,
+        "RDMA (2 endpoints)/concurrent_64_kops": 664.7,
+        "RDMA (2 endpoints)/concurrent_64_us": 96.29,
+        "RDMA (2 endpoints)/concurrent_1024_kops": 1342.2,
+        "RDMA (2 endpoints)/concurrent_1024_us": 762.92
+      }
+    },
+    {
+      "pair": 3,
+      "version": "current",
+      "command": [
+        "numactl",
+        "--physcpubind=0-10",
+        "--membind=0",
+        "env",
+        "LD_PRELOAD=/tmp/ruapc-capacity-bench/pin_threads.so",
+        "/tmp/ruapc-capacity-bench/echo-after-long"
+      ],
+      "elapsed_s": 14.782510098011699,
+      "returncode": 0,
+      "stdout": "ruapc: end-to-end echo RPC benchmark (unified server, one port)\nserial iterations: 50000; warmup iterations: 5000; transport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\n\nRDMA\n  serial        16B:    27.16 us/op\n  serial      4096B:    30.43 us/op\n  concurrent    16B:    676.6 kops/s |    94.59 us/op (64 tasks)\n  concurrent    16B:   1301.3 kops/s |   786.89 us/op (1024 tasks)\n\nRDMA (2 endpoints)\n  concurrent    16B:    653.0 kops/s |    98.00 us/op (64 tasks)\n  concurrent    16B:   1377.6 kops/s |   743.33 us/op (1024 tasks)\n\n",
+      "stderr": "pin_threads: main -> cpu=8\npin_threads: tokio-rt-worker -> cpu=0\npin_threads: tokio-rt-worker -> cpu=1\npin_threads: tokio-rt-worker -> cpu=2\npin_threads: tokio-rt-worker -> cpu=3\npin_threads: tokio-rt-worker -> cpu=4\npin_threads: tokio-rt-worker -> cpu=5\npin_threads: tokio-rt-worker -> cpu=6\npin_threads: tokio-rt-worker -> cpu=7\npin_threads: ruapc-rdma-poll -> cpu=9\npin_threads: ruapc-rdma-poll -> cpu=10\n",
+      "metrics": {
+        "RDMA/serial_16B_us": 27.16,
+        "RDMA/serial_4096B_us": 30.43,
+        "RDMA/concurrent_64_kops": 676.6,
+        "RDMA/concurrent_64_us": 94.59,
+        "RDMA/concurrent_1024_kops": 1301.3,
+        "RDMA/concurrent_1024_us": 786.89,
+        "RDMA (2 endpoints)/concurrent_64_kops": 653.0,
+        "RDMA (2 endpoints)/concurrent_64_us": 98.0,
+        "RDMA (2 endpoints)/concurrent_1024_kops": 1377.6,
+        "RDMA (2 endpoints)/concurrent_1024_us": 743.33
+      }
+    },
+    {
+      "pair": 4,
+      "version": "current",
+      "command": [
+        "numactl",
+        "--physcpubind=0-10",
+        "--membind=0",
+        "env",
+        "LD_PRELOAD=/tmp/ruapc-capacity-bench/pin_threads.so",
+        "/tmp/ruapc-capacity-bench/echo-after-long"
+      ],
+      "elapsed_s": 14.78081258898601,
+      "returncode": 0,
+      "stdout": "ruapc: end-to-end echo RPC benchmark (unified server, one port)\nserial iterations: 50000; warmup iterations: 5000; transport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\n\nRDMA\n  serial        16B:    28.60 us/op\n  serial      4096B:    31.22 us/op\n  concurrent    16B:    683.1 kops/s |    93.70 us/op (64 tasks)\n  concurrent    16B:   1284.3 kops/s |   797.31 us/op (1024 tasks)\n\nRDMA (2 endpoints)\n  concurrent    16B:    664.3 kops/s |    96.34 us/op (64 tasks)\n  concurrent    16B:   1412.6 kops/s |   724.91 us/op (1024 tasks)\n\n",
+      "stderr": "pin_threads: main -> cpu=8\npin_threads: tokio-rt-worker -> cpu=0\npin_threads: tokio-rt-worker -> cpu=1\npin_threads: tokio-rt-worker -> cpu=2\npin_threads: tokio-rt-worker -> cpu=3\npin_threads: tokio-rt-worker -> cpu=4\npin_threads: tokio-rt-worker -> cpu=5\npin_threads: tokio-rt-worker -> cpu=6\npin_threads: tokio-rt-worker -> cpu=7\npin_threads: ruapc-rdma-poll -> cpu=9\npin_threads: ruapc-rdma-poll -> cpu=10\n",
+      "metrics": {
+        "RDMA/serial_16B_us": 28.6,
+        "RDMA/serial_4096B_us": 31.22,
+        "RDMA/concurrent_64_kops": 683.1,
+        "RDMA/concurrent_64_us": 93.7,
+        "RDMA/concurrent_1024_kops": 1284.3,
+        "RDMA/concurrent_1024_us": 797.31,
+        "RDMA (2 endpoints)/concurrent_64_kops": 664.3,
+        "RDMA (2 endpoints)/concurrent_64_us": 96.34,
+        "RDMA (2 endpoints)/concurrent_1024_kops": 1412.6,
+        "RDMA (2 endpoints)/concurrent_1024_us": 724.91
+      }
+    },
+    {
+      "pair": 4,
+      "version": "baseline",
+      "command": [
+        "numactl",
+        "--physcpubind=0-10",
+        "--membind=0",
+        "env",
+        "LD_PRELOAD=/tmp/ruapc-capacity-bench/pin_threads.so",
+        "/tmp/ruapc-capacity-bench/echo-baseline-long"
+      ],
+      "elapsed_s": 15.276952482992783,
+      "returncode": 0,
+      "stdout": "ruapc: end-to-end echo RPC benchmark (unified server, one port)\nserial iterations: 50000; warmup iterations: 5000; transport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\n\nRDMA\n  serial        16B:    30.48 us/op\n  serial      4096B:    29.55 us/op\n  concurrent    16B:    601.0 kops/s |   106.49 us/op (64 tasks)\n  concurrent    16B:   1283.2 kops/s |   798.00 us/op (1024 tasks)\n\nRDMA (2 endpoints)\n  concurrent    16B:    668.6 kops/s |    95.72 us/op (64 tasks)\n  concurrent    16B:   1412.3 kops/s |   725.05 us/op (1024 tasks)\n\n",
+      "stderr": "pin_threads: main -> cpu=8\npin_threads: tokio-rt-worker -> cpu=0\npin_threads: tokio-rt-worker -> cpu=1\npin_threads: tokio-rt-worker -> cpu=2\npin_threads: tokio-rt-worker -> cpu=3\npin_threads: tokio-rt-worker -> cpu=4\npin_threads: tokio-rt-worker -> cpu=5\npin_threads: tokio-rt-worker -> cpu=6\npin_threads: tokio-rt-worker -> cpu=7\npin_threads: ruapc-rdma-poll -> cpu=9\npin_threads: ruapc-rdma-poll -> cpu=10\n",
+      "metrics": {
+        "RDMA/serial_16B_us": 30.48,
+        "RDMA/serial_4096B_us": 29.55,
+        "RDMA/concurrent_64_kops": 601.0,
+        "RDMA/concurrent_64_us": 106.49,
+        "RDMA/concurrent_1024_kops": 1283.2,
+        "RDMA/concurrent_1024_us": 798.0,
+        "RDMA (2 endpoints)/concurrent_64_kops": 668.6,
+        "RDMA (2 endpoints)/concurrent_64_us": 95.72,
+        "RDMA (2 endpoints)/concurrent_1024_kops": 1412.3,
+        "RDMA (2 endpoints)/concurrent_1024_us": 725.05
+      }
+    },
+    {
+      "pair": 5,
+      "version": "baseline",
+      "command": [
+        "numactl",
+        "--physcpubind=0-10",
+        "--membind=0",
+        "env",
+        "LD_PRELOAD=/tmp/ruapc-capacity-bench/pin_threads.so",
+        "/tmp/ruapc-capacity-bench/echo-baseline-long"
+      ],
+      "elapsed_s": 14.549244533001911,
+      "returncode": 0,
+      "stdout": "ruapc: end-to-end echo RPC benchmark (unified server, one port)\nserial iterations: 50000; warmup iterations: 5000; transport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\n\nRDMA\n  serial        16B:    27.48 us/op\n  serial      4096B:    29.97 us/op\n  concurrent    16B:    690.6 kops/s |    92.67 us/op (64 tasks)\n  concurrent    16B:   1329.6 kops/s |   770.14 us/op (1024 tasks)\n\nRDMA (2 endpoints)\n  concurrent    16B:    664.0 kops/s |    96.38 us/op (64 tasks)\n  concurrent    16B:   1409.9 kops/s |   726.28 us/op (1024 tasks)\n\n",
+      "stderr": "pin_threads: main -> cpu=8\npin_threads: tokio-rt-worker -> cpu=0\npin_threads: tokio-rt-worker -> cpu=2\npin_threads: tokio-rt-worker -> cpu=3\npin_threads: tokio-rt-worker -> cpu=1\npin_threads: tokio-rt-worker -> cpu=4\npin_threads: tokio-rt-worker -> cpu=5\npin_threads: tokio-rt-worker -> cpu=6\npin_threads: tokio-rt-worker -> cpu=7\npin_threads: ruapc-rdma-poll -> cpu=9\npin_threads: ruapc-rdma-poll -> cpu=10\n",
+      "metrics": {
+        "RDMA/serial_16B_us": 27.48,
+        "RDMA/serial_4096B_us": 29.97,
+        "RDMA/concurrent_64_kops": 690.6,
+        "RDMA/concurrent_64_us": 92.67,
+        "RDMA/concurrent_1024_kops": 1329.6,
+        "RDMA/concurrent_1024_us": 770.14,
+        "RDMA (2 endpoints)/concurrent_64_kops": 664.0,
+        "RDMA (2 endpoints)/concurrent_64_us": 96.38,
+        "RDMA (2 endpoints)/concurrent_1024_kops": 1409.9,
+        "RDMA (2 endpoints)/concurrent_1024_us": 726.28
+      }
+    },
+    {
+      "pair": 5,
+      "version": "current",
+      "command": [
+        "numactl",
+        "--physcpubind=0-10",
+        "--membind=0",
+        "env",
+        "LD_PRELOAD=/tmp/ruapc-capacity-bench/pin_threads.so",
+        "/tmp/ruapc-capacity-bench/echo-after-long"
+      ],
+      "elapsed_s": 14.5853029039572,
+      "returncode": 0,
+      "stdout": "ruapc: end-to-end echo RPC benchmark (unified server, one port)\nserial iterations: 50000; warmup iterations: 5000; transport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\n\nRDMA\n  serial        16B:    27.50 us/op\n  serial      4096B:    30.45 us/op\n  concurrent    16B:    692.5 kops/s |    92.42 us/op (64 tasks)\n  concurrent    16B:   1322.2 kops/s |   774.48 us/op (1024 tasks)\n\nRDMA (2 endpoints)\n  concurrent    16B:    662.1 kops/s |    96.66 us/op (64 tasks)\n  concurrent    16B:   1404.3 kops/s |   729.18 us/op (1024 tasks)\n\n",
+      "stderr": "pin_threads: main -> cpu=8\npin_threads: tokio-rt-worker -> cpu=0\npin_threads: tokio-rt-worker -> cpu=1\npin_threads: tokio-rt-worker -> cpu=2\npin_threads: tokio-rt-worker -> cpu=3\npin_threads: tokio-rt-worker -> cpu=4\npin_threads: tokio-rt-worker -> cpu=5\npin_threads: tokio-rt-worker -> cpu=6\npin_threads: tokio-rt-worker -> cpu=7\npin_threads: ruapc-rdma-poll -> cpu=9\npin_threads: ruapc-rdma-poll -> cpu=10\n",
+      "metrics": {
+        "RDMA/serial_16B_us": 27.5,
+        "RDMA/serial_4096B_us": 30.45,
+        "RDMA/concurrent_64_kops": 692.5,
+        "RDMA/concurrent_64_us": 92.42,
+        "RDMA/concurrent_1024_kops": 1322.2,
+        "RDMA/concurrent_1024_us": 774.48,
+        "RDMA (2 endpoints)/concurrent_64_kops": 662.1,
+        "RDMA (2 endpoints)/concurrent_64_us": 96.66,
+        "RDMA (2 endpoints)/concurrent_1024_kops": 1404.3,
+        "RDMA (2 endpoints)/concurrent_1024_us": 729.18
+      }
+    }
+  ],
+  "summary": {
+    "RDMA/serial_16B_us": {
+      "baseline_median": 28.38,
+      "current_median": 27.5,
+      "median_change_percent": -3.100775193798444,
+      "paired_ratio_median_change_percent": -4.298801973220579,
+      "baseline_min_max": [
+        27.28,
+        30.48
+      ],
+      "current_min_max": [
+        27.16,
+        28.6
+      ]
+    },
+    "RDMA/serial_4096B_us": {
+      "baseline_median": 30.24,
+      "current_median": 31.22,
+      "median_change_percent": 3.240740740740744,
+      "paired_ratio_median_change_percent": 1.60160160160161,
+      "baseline_min_max": [
+        29.55,
+        31.19
+      ],
+      "current_min_max": [
+        30.43,
+        31.64
+      ]
+    },
+    "RDMA/concurrent_64_kops": {
+      "baseline_median": 690.6,
+      "current_median": 692.5,
+      "median_change_percent": 0.2751230813785144,
+      "paired_ratio_median_change_percent": 0.2751230813785144,
+      "baseline_min_max": [
+        601.0,
+        697.5
+      ],
+      "current_min_max": [
+        676.6,
+        700.6
+      ]
+    },
+    "RDMA/concurrent_64_us": {
+      "baseline_median": 92.67,
+      "current_median": 92.42,
+      "median_change_percent": -0.26977446854429266,
+      "paired_ratio_median_change_percent": -0.26977446854429266,
+      "baseline_min_max": [
+        91.76,
+        106.49
+      ],
+      "current_min_max": [
+        91.35,
+        94.59
+      ]
+    },
+    "RDMA/concurrent_1024_kops": {
+      "baseline_median": 1337.3,
+      "current_median": 1322.2,
+      "median_change_percent": -1.129140806101836,
+      "paired_ratio_median_change_percent": -0.5565583634175586,
+      "baseline_min_max": [
+        1283.2,
+        1392.9
+      ],
+      "current_min_max": [
+        1284.3,
+        1380.0
+      ]
+    },
+    "RDMA/concurrent_1024_us": {
+      "baseline_median": 765.73,
+      "current_median": 774.48,
+      "median_change_percent": 1.1427004296553633,
+      "paired_ratio_median_change_percent": 0.5635339029267383,
+      "baseline_min_max": [
+        735.14,
+        798.0
+      ],
+      "current_min_max": [
+        742.01,
+        797.31
+      ]
+    },
+    "RDMA (2 endpoints)/concurrent_64_kops": {
+      "baseline_median": 668.6,
+      "current_median": 663.8,
+      "median_change_percent": -0.7179180376907124,
+      "paired_ratio_median_change_percent": -0.6431349087645977,
+      "baseline_min_max": [
+        664.0,
+        673.2
+      ],
+      "current_min_max": [
+        653.0,
+        667.8
+      ]
+    },
+    "RDMA (2 endpoints)/concurrent_64_us": {
+      "baseline_median": 95.72,
+      "current_median": 96.42,
+      "median_change_percent": 0.7312996239030589,
+      "paired_ratio_median_change_percent": 0.6477225240284268,
+      "baseline_min_max": [
+        95.07,
+        96.38
+      ],
+      "current_min_max": [
+        95.84,
+        98.0
+      ]
+    },
+    "RDMA (2 endpoints)/concurrent_1024_kops": {
+      "baseline_median": 1409.9,
+      "current_median": 1412.6,
+      "median_change_percent": 0.1915029434711446,
+      "paired_ratio_median_change_percent": 0.021241945762229264,
+      "baseline_min_max": [
+        1342.2,
+        1444.2
+      ],
+      "current_min_max": [
+        1377.6,
+        1433.0
+      ]
+    },
+    "RDMA (2 endpoints)/concurrent_1024_us": {
+      "baseline_median": 726.28,
+      "current_median": 724.91,
+      "median_change_percent": -0.1886324833397568,
+      "paired_ratio_median_change_percent": -0.019309013171509015,
+      "baseline_min_max": [
+        709.02,
+        762.92
+      ],
+      "current_min_max": [
+        714.6,
+        743.33
+      ]
+    }
+  },
+  "completed_utc": "2026-09-06T15:01:23.302585+00:00"
+}

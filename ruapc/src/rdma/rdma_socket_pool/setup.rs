@@ -22,7 +22,7 @@ use crate::{Buffer, Error, ErrorKind, Result, State};
 /// futures carry only that pointer instead of an entire temporary QP. The box
 /// is consumed at registration; established connections own the QP directly.
 pub(super) struct LocalConnection {
-    queue_pair: QueuePair,
+    queue_pair: super::super::poller::ReservedQueuePair,
     pub(super) endpoint: RdmaQpEndpoint,
     pub(super) config: RdmaConnectionConfig,
     poller: Arc<super::super::poller::DevicePoller>,
@@ -82,17 +82,19 @@ impl RdmaSocketPool {
         let config = self
             .resolve_connection_config(device, peer_limits, traffic_class)
             .map_err(|err| at_stage("negotiate limits", err))?;
-        let poller = self
+        let (poller, reservation) = self
             .pollers
-            .get_or_start(
+            .reserve(
                 device,
                 self.poller_config(),
                 self.config.polling.poll_threads_per_device,
+                &config,
             )
-            .map_err(|err| at_stage("start completion poller", err))?;
+            .map_err(|err| at_stage("reserve completion capacity", err))?;
         let queue_pair = self
             .create_queue_pair(device, &config, &poller)
             .map_err(|err| at_stage("create queue pair", err))?;
+        let queue_pair = reservation.bind(queue_pair);
         let endpoint = self
             .build_endpoint(&queue_pair, device, selection.port_num, selection.gid_index)
             .map_err(|err| at_stage("build local endpoint", err))?;
@@ -336,23 +338,13 @@ impl RdmaSocketPool {
     /// Wraps a connected QueuePair, pre-posts receives and registers it with the poller.
     pub(super) fn register_socket(
         &self,
-        mut queue_pair: QueuePair,
+        queue_pair: super::super::poller::ReservedQueuePair,
         state: &Arc<State>,
         poller: &super::super::poller::DevicePoller,
         config: &RdmaConnectionConfig,
         path: RdmaPathInfo,
         device_index: usize,
     ) -> Result<Arc<RdmaSocket>> {
-        let qp_depth = config
-            .qp
-            .max_send_wr
-            .saturating_add(config.qp.max_recv_wr)
-            .saturating_mul(2);
-        let reservation = poller.reserve(qp_depth)?;
-        queue_pair
-            .set_wr_tag(reservation.tag())
-            .map_err(Error::from)?;
-
         let ring_bytes = config.recv_queue_len as usize * config.max_msg_size as usize;
         let (ring_reservation, ring_total) =
             super::super::poller::RingReservation::add(&self.ring_bytes, ring_bytes);
@@ -412,27 +404,25 @@ impl RdmaSocketPool {
             },
         ));
 
-        for posted in 0..config.recv_queue_len {
-            let stage = || {
-                format!(
-                    "pre-post receive {}/{} ({} bytes, QP {})",
-                    posted + 1,
-                    config.recv_queue_len,
-                    config.max_msg_size,
-                    socket.queue_pair.qp_num()
-                )
-            };
-            let buf = self
-                .buffer_pool
-                .allocate(config.max_msg_size as usize)
-                .map_err(|err| at_stage(&stage(), err.into()))?;
-            socket
-                .queue_pair
-                .recv(buf)
-                .map_err(|err| at_stage(&stage(), err.into()))?;
-        }
+        let receive_stage = |posted: usize| {
+            format!(
+                "pre-post receive {}/{} ({} bytes, QP {})",
+                posted + 1,
+                config.recv_queue_len,
+                config.max_msg_size,
+                socket.queue_pair.qp_num()
+            )
+        };
+        // Allocate outside the registration barrier. Only posting and inbox
+        // publication need to exclude an early completion's routing retry.
+        let receive_buffers = (0..config.recv_queue_len as usize)
+            .map(|posted| {
+                self.buffer_pool
+                    .allocate(config.max_msg_size as usize)
+                    .map_err(|err| at_stage(&receive_stage(posted), err.into()))
+            })
+            .collect::<Result<Vec<_>>>()?;
         poller.register(
-            reservation,
             RegisterConn {
                 socket: socket.clone(),
                 state: state.clone(),
@@ -444,6 +434,15 @@ impl RdmaSocketPool {
                 supervisor_guard: self.task_supervisor.start_async_task(),
                 ring_reservation,
                 conn_count_guard: ConnCountGuard::acquire(&self.conn_counts, device_index),
+            },
+            || {
+                for (posted, buf) in receive_buffers.into_iter().enumerate() {
+                    socket
+                        .queue_pair
+                        .recv(buf)
+                        .map_err(|err| at_stage(&receive_stage(posted), err.into()))?;
+                }
+                Ok(())
             },
         )?;
 

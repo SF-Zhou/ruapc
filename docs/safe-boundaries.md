@@ -1,8 +1,14 @@
 # Core safety boundaries and validation
 
-This change follows the workspace refactor committed through `1d35f32`.
+This report records the safety-boundary change that followed the workspace
+refactor committed through `1d35f32`.
 The earlier refactor's evidence remains in [refactoring.md](refactoring.md).
-This report compares the safety-boundary changes against that committed version.
+The test counts, binary measurements and performance tables below compare that
+historical safety-boundary implementation against that committed version. They
+do not validate the subsequent WRID allocator. That allocator replaces the
+claimed-tag bitmap with CQ-owned route leases and sequence watermarks; its
+design and separate evidence are in [wrid.md](wrid.md). In the tables below,
+“Current” means the historical implementation measured for this report.
 
 ## Responsibilities
 
@@ -14,9 +20,11 @@ This report compares the safety-boundary changes against that committed version.
   application `Device` wrappers provide a registrar reference without receiving
   backing memory. `ruapc-rdma::ActiveDevice` owns the RDMA registrar implementation.
 - `ruapc-rdma::CompletionQueue` lends non-cloneable completion proofs from private
-  reusable stack storage. The QP validates CQ, QPN and a permanently reserved tag
-  before returning completed SEND/RECV buffers or settling a READ. Raw metadata
-  and caller-supplied WR IDs do not authorize reclamation.
+  reusable stack storage. The QP validates CQ, QPN and its completion route
+  before returning completed SEND/RECV buffers or settling a READ. The original
+  permanently reserved tag has since been replaced by a leased slot and a
+  sequence floor that advances on reuse. Raw metadata and caller-supplied WR
+  IDs do not authorize reclamation.
 - `ruapc-rdma::QueuePair` accepts actual destination buffers and a READ plan of
   buffer indices, offsets and lengths. It validates local bounds, overflow,
   gather limits and global destination overlap, then derives addresses and keys
@@ -39,10 +47,10 @@ protect local reverse-RPC CPU copies, and the existing post-READ pending check
 rejects expired results, but this change does not introduce a remote DMA source
 lease. See [the ownership invariants](../DESIGN.md#remote-memory).
 
-## Correctness and structural checks
+## Historical correctness and structural checks
 
-The final workspace suite passes **511 tests, zero failures**, with 13 ignored
-documentation examples. Coverage includes destination overlap and overflow,
+The archived safety-boundary workspace suite passed **511 tests, zero failures**,
+with 13 ignored documentation examples. Coverage includes destination overlap and overflow,
 partial submission and cancelled posting cursors, dropped receivers, timeout
 notification versus final flush, exclusive write targets, registration order and
 rollback, immutable completion tags, generation exhaustion, and rejected QP/MR
@@ -67,8 +75,10 @@ proof validation. READ accounting retains the existing per-WR map/Arc and
 per-batch oneshot/mutex mechanisms. Restoring a checked-out write target adds one
 short mutex acquisition to its completed RDMA write path.
 
-The implementation accepts small connection-level memory costs: a 512 KiB
-per-CQ tag history prevents reuse, and a temporary `Box<LocalConnection>` holds
+The measured implementation used a 512 KiB per-CQ tag history to prevent reuse.
+The subsequent [WRID allocator](wrid.md#memory-and-capacity) replaces this bitmap
+with a dynamic slot-watermark table and free list; the measurements in this
+report predate that replacement. A temporary `Box<LocalConnection>` holds
 the local handshake resources across peer negotiation. Registration consumes the
 box and moves its QP directly into the established connection; READ bookkeeping
 remains inline in that QP. This keeps temporary connection state out of every

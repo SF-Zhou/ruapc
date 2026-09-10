@@ -1,23 +1,23 @@
-//! Work request ID with type, connection tag and per-direction ID
-//!
-//! The WRID (Work Request ID) encodes a [`WRType`], an opaque connection
-//! tag and a monotonic per-direction ID into a single 64-bit value:
+//! Fixed-width work request identities, scoped by the CQ and hardware QPN.
 //!
 //! ```text
-//! | 2 bits | 22 bits | 40 bits |
-//! | type   | tag     | id      |
+//! 63                                           2 1             0
+//! | per-direction QP sequence: 62 bits           | type: 2 bits |
 //! ```
 //!
-//! The tag is opaque to this crate; `ruapc` packs a poller slot index and
-//! a generation counter into it so a completion maps back to its
-//! connection with a plain array index — no `qp_num` hash lookup.
+//! A WRID need not be unique across QPs: CQ-issued completions also identify
+//! their hardware QPN. CQ-owned leases preserve sequence floors across QPN
+//! reuse without reserving any WRID bits for connection routing.
 
-/// Work request ID with encoded type, connection tag and ID
+/// A work request identity within one hardware QP number and originating CQ.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WRID(u64);
 
-/// Work request type encoded in a [`WRID`]
+/// Work request type encoded in a [`WRID`].
+///
+/// The type remains available even for error CQEs, whose provider opcode need
+/// not be valid. SEND variants and READ share one SQ sequence stream.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WRType {
@@ -32,47 +32,25 @@ pub enum WRType {
 }
 
 impl WRID {
-    /// Bit position of the type field.
-    pub const TYPE_SHIFT: u32 = 62;
-    /// Bit position of the connection tag field.
-    pub const TAG_SHIFT: u32 = 40;
-    /// Width of the connection tag field.
-    pub const TAG_BITS: u32 = Self::TYPE_SHIFT - Self::TAG_SHIFT;
-    /// Maximum connection tag value.
-    pub const TAG_MAX: u32 = (1 << Self::TAG_BITS) - 1;
-    /// Mask extracting the ID field.
-    pub const ID_MASK: u64 = (1 << Self::TAG_SHIFT) - 1;
+    /// Type width in the least significant bits.
+    pub const TYPE_BITS: u32 = 2;
+    /// Sequence width, independent of CQ capacity and connection count.
+    pub const SEQUENCE_BITS: u32 = u64::BITS - Self::TYPE_BITS;
+    /// Largest sequence that can be allocated without repeating an identity.
+    pub const MAX_SEQUENCE: u64 = (1 << Self::SEQUENCE_BITS) - 1;
+    const TYPE_MASK: u64 = (1 << Self::TYPE_BITS) - 1;
 
-    /// Creates a new WRID with the specified type, connection tag and ID
-    pub fn new(wr_type: WRType, tag: u32, id: u64) -> Self {
-        assert!(tag <= Self::TAG_MAX, "tag too large");
-        assert!(id <= Self::ID_MASK, "ID too large");
-        Self(((wr_type as u64) << Self::TYPE_SHIFT) | (u64::from(tag) << Self::TAG_SHIFT) | id)
+    /// Called with a sequence reserved by the QP's CQ-owned identity lease.
+    #[inline]
+    pub(crate) fn new(wr_type: WRType, sequence: u64) -> Self {
+        debug_assert!(sequence <= Self::MAX_SEQUENCE);
+        Self((sequence << Self::TYPE_BITS) | wr_type as u64)
     }
 
-    /// Creates a WRID for a receive operation
-    pub fn recv(tag: u32, id: u64) -> Self {
-        Self::new(WRType::Recv, tag, id)
-    }
-
-    /// Creates a WRID for a send data operation
-    pub fn send_data(tag: u32, id: u64) -> Self {
-        Self::new(WRType::SendData, tag, id)
-    }
-
-    /// Creates a WRID for a send with immediate data operation
-    pub fn send_imm(tag: u32, id: u64) -> Self {
-        Self::new(WRType::SendImm, tag, id)
-    }
-
-    /// Creates a WRID for an RDMA read operation
-    pub fn read(tag: u32, id: u64) -> Self {
-        Self::new(WRType::Read, tag, id)
-    }
-
-    /// Returns the type of the work request
+    /// Returns the type of the work request.
+    #[inline]
     pub fn get_type(&self) -> WRType {
-        match self.0 >> Self::TYPE_SHIFT {
+        match self.0 & Self::TYPE_MASK {
             0 => WRType::Recv,
             1 => WRType::SendData,
             2 => WRType::SendImm,
@@ -81,31 +59,22 @@ impl WRID {
         }
     }
 
-    /// Returns the connection tag portion of the WRID
-    pub fn get_tag(&self) -> u32 {
-        ((self.0 >> Self::TAG_SHIFT) as u32) & Self::TAG_MAX
-    }
-
-    /// Returns the ID portion of the WRID
-    pub fn get_id(&self) -> u64 {
-        self.0 & Self::ID_MASK
-    }
-
     /// Returns the raw underlying `u64` value.
+    #[inline]
     pub fn raw(&self) -> u64 {
         self.0
+    }
+
+    /// Returns the sequence in its QP's send or receive stream.
+    #[inline]
+    pub fn sequence(self) -> u64 {
+        self.0 >> Self::TYPE_BITS
     }
 }
 
 impl std::fmt::Debug for WRID {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self.get_type() {
-            WRType::Recv => "Recv",
-            WRType::SendData => "SendData",
-            WRType::SendImm => "SendImm",
-            WRType::Read => "Read",
-        };
-        write!(f, "{name}({}:{})", self.get_tag(), self.get_id())
+        write!(f, "{:?}({:#018x})", self.get_type(), self.0)
     }
 }
 
@@ -114,56 +83,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_wrid_roundtrip_all_types() {
-        for (wr_type, tag, id) in [
-            (WRType::Recv, 0u32, 0u64),
-            (WRType::SendData, 1, 2000),
-            (WRType::SendImm, WRID::TAG_MAX, 3000),
-            (WRType::Read, 0x3F_0F, WRID::ID_MASK),
+    fn type_and_sequence_roundtrip_at_fixed_width_boundaries() {
+        for wr_type in [
+            WRType::Recv,
+            WRType::SendData,
+            WRType::SendImm,
+            WRType::Read,
         ] {
-            let wrid = WRID::new(wr_type, tag, id);
-            assert_eq!(wrid.get_type(), wr_type);
-            assert_eq!(wrid.get_tag(), tag);
-            assert_eq!(wrid.get_id(), id);
+            for sequence in [
+                0,
+                1,
+                (1 << 42) - 1,
+                1 << 42,
+                (1 << 61) - 1,
+                1 << 61,
+                WRID::MAX_SEQUENCE - 1,
+                WRID::MAX_SEQUENCE,
+            ] {
+                let wrid = WRID::new(wr_type, sequence);
+                assert_eq!(wrid.get_type(), wr_type);
+                assert_eq!(wrid.sequence(), sequence);
+            }
         }
     }
 
     #[test]
-    fn test_wrid_constructors() {
-        assert_eq!(WRID::recv(7, 1).get_type(), WRType::Recv);
-        assert_eq!(WRID::send_data(7, 2).get_type(), WRType::SendData);
-        assert_eq!(WRID::send_imm(7, 3).get_type(), WRType::SendImm);
-        assert_eq!(WRID::read(7, 4).get_type(), WRType::Read);
-        assert_eq!(WRID::read(7, 4).get_tag(), 7);
-        assert_eq!(WRID::read(7, 4).get_id(), 4);
+    fn raw_identity_places_type_below_the_full_sequence() {
+        assert_eq!(WRID::TYPE_BITS, 2);
+        assert_eq!(WRID::SEQUENCE_BITS, 62);
+        assert_eq!(WRID::MAX_SEQUENCE, 0x3fff_ffff_ffff_ffff);
+        for (wr_type, zero_raw, one_raw, max_raw) in [
+            (WRType::Recv, 0, 4, 0xffff_ffff_ffff_fffc),
+            (WRType::SendData, 1, 5, 0xffff_ffff_ffff_fffd),
+            (WRType::SendImm, 2, 6, 0xffff_ffff_ffff_fffe),
+            (WRType::Read, 3, 7, 0xffff_ffff_ffff_ffff),
+        ] {
+            for (sequence, raw) in [(0, zero_raw), (1, one_raw), (WRID::MAX_SEQUENCE, max_raw)] {
+                assert_eq!(WRID::new(wr_type, sequence).raw(), raw);
+                let decoded = WRID(raw);
+                assert_eq!(decoded.get_type(), wr_type);
+                assert_eq!(decoded.sequence(), sequence);
+            }
+        }
     }
 
     #[test]
-    #[should_panic(expected = "ID too large")]
-    fn test_wrid_rejects_large_id() {
-        let _ = WRID::recv(0, WRID::ID_MASK + 1);
-    }
-
-    #[test]
-    #[should_panic(expected = "tag too large")]
-    fn test_wrid_rejects_large_tag() {
-        let _ = WRID::recv(WRID::TAG_MAX + 1, 0);
-    }
-
-    #[test]
-    fn test_wrid_debug_format() {
-        let wrid = WRID::recv(5, 0x1234);
-        assert_eq!(format!("{wrid:?}"), "Recv(5:4660)");
-        let wrid = WRID::send_data(0, 0x5678);
-        assert_eq!(format!("{wrid:?}"), "SendData(0:22136)");
-    }
-
-    #[test]
-    fn test_wrid_raw_is_stable() {
-        let wrid = WRID::new(WRType::SendImm, 3, 9);
-        assert_eq!(
-            wrid.raw(),
-            (2u64 << WRID::TYPE_SHIFT) | (3u64 << WRID::TAG_SHIFT) | 9
-        );
+    fn debug_prints_raw_identity_without_guessing_the_layout() {
+        for (wr_type, sequence, expected) in [
+            (WRType::Recv, 123, "Recv(0x00000000000001ec)"),
+            (WRType::SendData, 0, "SendData(0x0000000000000001)"),
+            (WRType::SendImm, 1, "SendImm(0x0000000000000006)"),
+            (WRType::Read, WRID::MAX_SEQUENCE, "Read(0xffffffffffffffff)"),
+        ] {
+            assert_eq!(format!("{:?}", WRID::new(wr_type, sequence)), expected);
+        }
     }
 }

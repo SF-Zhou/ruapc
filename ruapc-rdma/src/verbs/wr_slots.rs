@@ -6,18 +6,18 @@
 //!
 //! ## Why this is safe without a lock
 //!
-//! - IDs are allocated from a per-direction monotonic counter, so two
-//!   concurrent posters never target the same slot while both IDs are
-//!   in flight (in-flight count is bounded by the queue depth, and the
-//!   array capacity is at least twice the queue depth).
-//! - RC queue pairs complete work requests **in order** per direction, and
-//!   the provider only frees a hardware queue slot once its completion has
-//!   been polled. Therefore, by the time an ID wraps around onto a slot, the
-//!   previous occupant has already completed; the only remaining window is
-//!   between `ibv_poll_cq` and [`WrSlots::take`], which is covered by the 2x
-//!   capacity margin plus a bounded spin in [`WrSlots::insert`].
+//! - The owning work queue supplies non-repeating IDs. This table stores
+//!   buffers independently of ID allocation and hardware posting order.
 //! - Each slot is guarded by an atomic tag acting as a tiny state machine:
 //!   `EMPTY -> WRITING -> id + TAG_BASE -> EMPTY`.
+//! - Reusing an array index requires an empty slot; completing a work request
+//!   requires an exact ID match. Delayed completions cannot take a newer
+//!   request's buffer even when both IDs map to the same array index.
+//!
+//! Queue depth alone does not prevent collisions: failed posts and bufferless
+//! work requests leave gaps in the ID sequence. Insertion returns the untouched
+//! buffer on contention instead of waiting for a completion that might need to
+//! run on the posting thread itself.
 
 use std::{
     cell::UnsafeCell,
@@ -30,8 +30,7 @@ use super::queue_pair::WrBuffers;
 const EMPTY: u64 = 0;
 /// Slot is being written to or drained; transient state.
 const WRITING: u64 = 1;
-/// Occupied slots store `id + TAG_BASE`. IDs are bounded to 40 bits by
-/// [`crate::WRID`], so this never collides with `EMPTY`/`WRITING`.
+/// Occupied slots store `id + TAG_BASE`. WRIDs use 62 sequence bits, so this never overflows or collides with `EMPTY`/`WRITING`.
 const TAG_BASE: u64 = 2;
 
 struct Slot {
@@ -48,15 +47,15 @@ unsafe impl Sync for Slot {}
 pub(crate) struct WrSlots {
     slots: Box<[Slot]>,
     mask: u64,
-    next_id: AtomicU64,
 }
 
 impl WrSlots {
     /// Creates a slot array for a work queue of the given depth.
     ///
     /// Capacity is `2 * depth` rounded up to a power of two: the extra
-    /// margin covers completions that have been polled from the CQ but whose
-    /// buffers have not been taken yet.
+    /// margin accommodates completions that have been polled from the CQ but
+    /// whose buffers have not been taken yet. Collisions remain possible and
+    /// are reported by [`Self::insert`].
     pub fn new(depth: u32) -> Self {
         let cap = (depth.max(1) as usize)
             .saturating_mul(2)
@@ -71,44 +70,26 @@ impl WrSlots {
         Self {
             slots,
             mask: (cap - 1) as u64,
-            next_id: AtomicU64::new(0),
         }
-    }
-
-    /// Allocates the next monotonic work request ID.
-    #[inline]
-    pub fn alloc_id(&self) -> u64 {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        // Never let caught panics advance this counter all the way to u64
-        // wraparound: a reused ID could make a retained CQE reclaim new memory.
-        if id > crate::WRID::ID_MASK {
-            std::process::abort();
-        }
-        id
     }
 
     /// Stores the buffer of an about-to-be-posted work request.
     ///
-    /// May briefly spin if the slot's previous occupant has been polled from
-    /// the CQ but not yet taken by the completion handler.
-    pub fn insert(&self, id: u64, buffer: WrBuffers) {
+    /// Returns ownership immediately if another request or completion still
+    /// occupies the selected slot. No allocation or waiting occurs here.
+    pub fn insert(&self, id: u64, buffer: WrBuffers) -> Result<(), WrBuffers> {
         let slot = &self.slots[(id & self.mask) as usize];
-        let mut spins = 0u32;
-        while slot
+        if slot
             .tag
-            .compare_exchange_weak(EMPTY, WRITING, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(EMPTY, WRITING, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            spins += 1;
-            if spins < 64 {
-                std::hint::spin_loop();
-            } else {
-                std::thread::yield_now();
-            }
+            return Err(buffer);
         }
         // SAFETY: we own the slot while its tag is `WRITING`.
         unsafe { *slot.buffer.get() = Some(buffer) };
         slot.tag.store(id.wrapping_add(TAG_BASE), Ordering::Release);
+        Ok(())
     }
 
     /// Takes the buffer of a completed (or failed-to-post) work request.
@@ -137,7 +118,6 @@ impl std::fmt::Debug for WrSlots {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WrSlots")
             .field("capacity", &self.slots.len())
-            .field("next_id", &self.next_id.load(Ordering::Relaxed))
             .finish()
     }
 }
@@ -158,10 +138,9 @@ mod tests {
     fn test_insert_take_roundtrip() {
         let pool = pool();
         let slots = WrSlots::new(4);
-        for _ in 0..64 {
-            let id = slots.alloc_id();
+        for id in 0..64 {
             let buf = pool.allocate(1024).unwrap();
-            slots.insert(id, buf.into());
+            slots.insert(id, buf.into()).unwrap();
             assert!(slots.take(id).is_some());
             // Double take returns None.
             assert!(slots.take(id).is_none());
@@ -171,8 +150,7 @@ mod tests {
     #[test]
     fn test_take_without_insert() {
         let slots = WrSlots::new(4);
-        let id = slots.alloc_id();
-        assert!(slots.take(id).is_none());
+        assert!(slots.take(0).is_none());
     }
 
     #[test]
@@ -181,9 +159,8 @@ mod tests {
         let slots = WrSlots::new(2); // capacity 4
         // Keep up to 2 in flight while IDs wrap around the array many times.
         let mut in_flight = std::collections::VecDeque::new();
-        for _ in 0..1000 {
-            let id = slots.alloc_id();
-            slots.insert(id, pool.allocate(64).unwrap().into());
+        for id in 0..1000 {
+            slots.insert(id, pool.allocate(64).unwrap().into()).unwrap();
             in_flight.push_back(id);
             if in_flight.len() == 2 {
                 let id = in_flight.pop_front().unwrap();
@@ -193,9 +170,33 @@ mod tests {
     }
 
     #[test]
+    fn collision_returns_buffer_without_disturbing_the_live_request() {
+        let pool = pool();
+        let slots = WrSlots::new(2); // capacity 4
+        let live = pool.allocate(64).unwrap();
+        let live_address = live.as_ptr();
+        slots.insert(0, live.into()).unwrap();
+
+        // Failed posts or bufferless WRs can skip IDs 1..4 while ID 0 remains
+        // live. An in-flight count below queue depth does not prevent this.
+        let next = pool.allocate(64).unwrap();
+        let next_address = next.as_ptr();
+        let returned = slots.insert(4, next.into()).unwrap_err();
+        assert!(slots.take(4).is_none());
+        let live = slots.take(0).unwrap().into_single().unwrap();
+        assert_eq!(live.as_ptr(), live_address);
+
+        slots.insert(4, returned).unwrap();
+        assert!(slots.take(0).is_none(), "stale ID took a newer buffer");
+        let next = slots.take(4).unwrap().into_single().unwrap();
+        assert_eq!(next.as_ptr(), next_address);
+    }
+
+    #[test]
     fn test_concurrent_post_and_complete() {
         let pool = pool();
         let slots = Arc::new(WrSlots::new(64));
+        let next_id = Arc::new(AtomicU64::new(0));
         let (tx, rx) = std::sync::mpsc::channel::<u64>();
 
         // 4 poster threads, 1 completer thread (mirrors real usage: many
@@ -204,11 +205,16 @@ mod tests {
         for _ in 0..4 {
             let slots = Arc::clone(&slots);
             let pool = Arc::clone(&pool);
+            let next_id = Arc::clone(&next_id);
             let tx = tx.clone();
             posters.push(std::thread::spawn(move || {
                 for _ in 0..10_000 {
-                    let id = slots.alloc_id();
-                    slots.insert(id, pool.allocate(64).unwrap().into());
+                    let id = next_id.fetch_add(1, Ordering::Relaxed);
+                    let mut buffer = pool.allocate(64).unwrap().into();
+                    while let Err(returned) = slots.insert(id, buffer) {
+                        buffer = returned;
+                        std::thread::yield_now();
+                    }
                     tx.send(id).unwrap();
                 }
             }));

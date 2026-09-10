@@ -1,0 +1,158 @@
+{
+  "runs": [
+    {
+      "started_utc": "2026-09-06T15:35:24.990005+00:00",
+      "completed_utc": "2026-09-06T15:36:22.861733+00:00",
+      "binary": "/tmp/ruapc-capacity-bench/capacity-rpc-large-trace-final",
+      "binary_sha256": "9563b763419b95b18c3e06d615dd247e8cc6420cecb91aa9139214fb588f4f62",
+      "pin_library_sha256": "622ca4da965983cf41e791a5c62d6a64780f30ee1de1a80cb1212bbd18931b38",
+      "environment": {
+        "RUAPC_CAPACITY_RECV": "2",
+        "RUAPC_CAPACITY_POOL_GIB": "2",
+        "RUAPC_BENCH_RDMA_DEVICE": "mlx5_0"
+      },
+      "returncode": 0,
+      "timed_out": false,
+      "elapsed_s": 57.88166069803992,
+      "artifact": "rpc-20000-r2-trace.json.gz",
+      "events": [
+        {
+          "cq_requested": 524288,
+          "error": null,
+          "memory": {
+            "locked_kib": 0,
+            "rss_kib": 4410876
+          },
+          "phase": "connected",
+          "requested_connections": 20000,
+          "setup_s": 32.934990868,
+          "client": {
+            "paths": 20000,
+            "healthy": 20000,
+            "completion_queues": [
+              {
+                "capacity": 1048575,
+                "connections": 20000,
+                "device": "mlx5_0",
+                "reserved": 100032,
+                "route_capacity": 1048575,
+                "sequence_bits": 42,
+                "shard": 0
+              }
+            ]
+          },
+          "server": {
+            "paths": 20000,
+            "healthy": 20000,
+            "completion_queues": [
+              {
+                "capacity": 1048575,
+                "connections": 20000,
+                "device": "mlx5_0",
+                "reserved": 100032,
+                "route_capacity": 1048575,
+                "sequence_bits": 42,
+                "shard": 0
+              }
+            ]
+          }
+        },
+        {
+          "connections": 20000,
+          "elapsed_s": 1.340869783,
+          "memory": {
+            "locked_kib": 0,
+            "rss_kib": 4410876
+          },
+          "operations": 40000,
+          "phase": "warmup_verified"
+        },
+        {
+          "elapsed_s": 17.836191402,
+          "memory": {
+            "locked_kib": 0,
+            "rss_kib": 4410876
+          },
+          "phase": "stopped"
+        }
+      ]
+    },
+    {
+      "started_utc": "2026-09-06T15:36:23.514570+00:00",
+      "completed_utc": "2026-09-06T15:37:22.028475+00:00",
+      "binary": "/tmp/ruapc-capacity-bench/capacity-rpc-large-trace-final",
+      "binary_sha256": "9563b763419b95b18c3e06d615dd247e8cc6420cecb91aa9139214fb588f4f62",
+      "pin_library_sha256": "622ca4da965983cf41e791a5c62d6a64780f30ee1de1a80cb1212bbd18931b38",
+      "environment": {
+        "RUAPC_CAPACITY_RECV": "8",
+        "RUAPC_CAPACITY_POOL_GIB": "4",
+        "RUAPC_BENCH_RDMA_DEVICE": "mlx5_0"
+      },
+      "returncode": 0,
+      "timed_out": false,
+      "elapsed_s": 58.5238125739852,
+      "artifact": "rpc-20000-r8-trace.json.gz",
+      "events": [
+        {
+          "cq_requested": 524288,
+          "error": null,
+          "memory": {
+            "locked_kib": 0,
+            "rss_kib": 8344348
+          },
+          "phase": "connected",
+          "requested_connections": 20000,
+          "setup_s": 33.421268262,
+          "client": {
+            "paths": 20000,
+            "healthy": 20000,
+            "completion_queues": [
+              {
+                "capacity": 1048575,
+                "connections": 20000,
+                "device": "mlx5_0",
+                "reserved": 320032,
+                "route_capacity": 1048575,
+                "sequence_bits": 42,
+                "shard": 0
+              }
+            ]
+          },
+          "server": {
+            "paths": 20000,
+            "healthy": 20000,
+            "completion_queues": [
+              {
+                "capacity": 1048575,
+                "connections": 20000,
+                "device": "mlx5_0",
+                "reserved": 320032,
+                "route_capacity": 1048575,
+                "sequence_bits": 42,
+                "shard": 0
+              }
+            ]
+          }
+        },
+        {
+          "connections": 20000,
+          "elapsed_s": 1.6527255269999999,
+          "memory": {
+            "locked_kib": 0,
+            "rss_kib": 8870408
+          },
+          "operations": 40000,
+          "phase": "warmup_verified"
+        },
+        {
+          "elapsed_s": 17.942253918,
+          "memory": {
+            "locked_kib": 0,
+            "rss_kib": 8870408
+          },
+          "phase": "stopped"
+        }
+      ]
+    }
+  ]
+}

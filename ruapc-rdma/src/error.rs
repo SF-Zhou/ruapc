@@ -33,6 +33,8 @@ pub enum ErrorKind {
     IBGetCompQueueEventFail,
     /// Failed to create completion queue.
     IBCreateCompQueueFail,
+    /// A completion queue requires a positive CQE capacity.
+    InvalidCompletionQueueConfig,
     /// Failed to request notification on completion queue.
     IBReqNotifyCompQueueFail,
     /// Failed to poll completion queue.
@@ -43,7 +45,13 @@ pub enum ErrorKind {
     IBCreateQueuePairFail,
     /// Invalid parameters supplied when connecting a queue pair.
     InvalidQueuePairConfig,
-    /// Completion proof belongs to a different CQ, QP or connection generation.
+    /// The provider QPN is still held by its previous CQ identity lease.
+    CompletionIdentityInUse,
+    /// This work queue exhausted its non-repeating WRID sequence space.
+    WorkRequestIdsExhausted,
+    /// A work request's buffer slot is still held by an earlier operation.
+    WorkRequestSlotsExhausted,
+    /// Completion proof belongs to a different CQ, QPN or incarnation.
     InvalidCompletion,
     /// Invalid local ranges or ownership supplied to a READ plan.
     InvalidReadPlan,

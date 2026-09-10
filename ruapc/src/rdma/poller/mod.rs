@@ -1,8 +1,7 @@
 //! Dedicated per-device RDMA completion poll thread
 //!
-//! Each RDMA device gets one shared completion queue (send + recv for
-//! every connection on that device) and one dedicated OS thread that polls
-//! it:
+//! Each RDMA device has configurable CQ shards, each with a dedicated OS
+//! poll thread. Admission selects a shard by available completion credits:
 //!
 //! - **Busy phase**: after any completion, the thread keeps polling the CQ
 //!   for a configurable spin window (`poll_spin_us`), eliminating the
@@ -16,11 +15,11 @@
 //!
 //! # Completion routing
 //!
-//! Every work request carries a connection *tag* (poller slot index +
-//! generation) in its `wr_id`, stamped into the QP at registration time.
-//! Routing a completion is a plain `Vec` index — no `qp_num` hash lookup,
-//! and no orphan window: the slot is reserved before the first work
-//! request is posted.
+//! Completions carry the provider's local QP number. A poll-thread-owned
+//! registry maps that number to its connection, then checks the CQ-issued
+//! identity's sequence floor before accounting credits. WRIDs have a fixed
+//! 62-bit sequence independent of CQ capacity. QP identities remain leased
+//! through destruction, including while registrations are in transit.
 //!
 //! # Zero-parse poll thread
 //!
@@ -36,17 +35,19 @@
 //! when every worker is saturated does it degrade to spawning a one-shot
 //! task per batch, so it still never blocks.
 
+mod budget;
 mod conn;
 mod dispatch;
 mod flow;
 
 use std::{
+    collections::{HashMap, hash_map::Entry},
     io::{Read as _, Write as _},
     os::unix::io::AsRawFd as _,
     os::unix::net::UnixStream,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -54,39 +55,24 @@ use std::{
 use foldhash::fast::RandomState;
 use ruapc_rdma::{CompChannel, Completion, CompletionBatch, CompletionQueue, poll_readable2};
 
+use budget::{CqBudget, CqDrain, Demand};
 use conn::ConnState;
 use dispatch::{DispatchBatch, Dispatcher, MAX_DISPATCH_BATCH};
 
 use super::RdmaSocket;
 use crate::{Buffer, Error, ErrorKind, Result, State, task::TaskSupervisorGuard};
 
-/// Number of bits of a connection tag holding the slot index; the
-/// remaining [`WRID::TAG_BITS`] bits hold the slot's generation.
-const SLOT_BITS: u32 = 14;
-/// Maximum number of live connections per poller shard.
-const MAX_SLOTS: usize = 1 << SLOT_BITS;
-
-/// Packs a slot index and its generation into a `wr_id` connection tag.
-fn conn_tag(slot: u16, generation: u8) -> u32 {
-    (u32::from(generation) << SLOT_BITS) | u32::from(slot)
-}
-
-/// Splits a `wr_id` connection tag into (slot index, generation).
-fn split_tag(tag: u32) -> (usize, u8) {
-    (
-        (tag & (MAX_SLOTS as u32 - 1)) as usize,
-        (tag >> SLOT_BITS) as u8,
-    )
-}
-
 /// Wakes the poll thread out of its idle `poll(2)` sleep.
 #[derive(Clone, Debug)]
-pub struct PollerWaker(Arc<UnixStream>);
+pub struct PollerWaker(Arc<UnixStream>, Arc<AtomicBool>);
 
 impl PollerWaker {
     /// Wakes the poll thread. Best-effort: if the pipe is full the thread is
     /// already scheduled to wake up.
     pub fn wake(&self) {
+        // Publish before the pipe write. The poll thread consumes this hint
+        // before maintenance, so a concurrent wake schedules another pass.
+        self.1.store(true, Ordering::Release);
         let _ = (&*self.0).write(&[1u8]);
     }
 }
@@ -144,10 +130,11 @@ pub struct RegisterConn {
     pub conn_count_guard: super::ConnCountGuard,
 }
 
-/// State shared between registrars and the poll thread: the slot
-/// allocator, the registration inbox and the shutdown flag.
+/// State shared between registrars and the poll thread: the registration
+/// inbox and the shutdown flag. QP identity leases belong to the CQ.
 struct PollerShared {
     inner: Mutex<SharedInner>,
+    budget: CqBudget,
     /// Fast-path hint that `inner.incoming` is non-empty; written under
     /// the `inner` lock, read lock-free by the poll thread.
     has_incoming: AtomicBool,
@@ -156,61 +143,58 @@ struct PollerShared {
     shutdown: AtomicBool,
 }
 
-#[derive(Default)]
-struct SharedInner {
-    /// Freed slot indices available for reuse.
-    free_slots: Vec<u16>,
-    /// Current generation per ever-allocated slot; bumped on release so
-    /// stale completions of a previous occupant can never be attributed
-    /// to a new connection reusing the slot.
-    generations: Vec<u8>,
-    /// Registered connections awaiting pickup by the poll thread.
-    incoming: Vec<Incoming>,
-}
-
-struct Incoming {
-    slot: u16,
-    generation: u8,
-    conn: Box<RegisterConn>,
-    budget: BudgetGuard,
-}
-
-/// Releases a slot for reuse, invalidating its previous generation.
-fn release_slot(shared: &PollerShared, slot: u16) {
-    let mut inner = shared.inner.lock().unwrap();
-    let generation = &mut inner.generations[slot as usize];
-    // Tags remain reserved in the CQ for its lifetime. Retire an exhausted
-    // slot instead of making a retained completion valid for a later QP.
-    if let Some(next) = generation.checked_add(1) {
-        *generation = next;
-        inner.free_slots.push(slot);
+impl std::fmt::Debug for PollerShared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PollerShared")
+            .field("budget", &self.budget)
+            .finish_non_exhaustive()
     }
 }
 
-/// A reserved poller slot (plus CQ budget) for a connection about to be
-/// registered. Dropping an unconsumed reservation releases both.
-pub struct ConnReservation {
+#[derive(Default)]
+struct SharedInner {
+    /// Registered connections awaiting pickup by the poll thread.
+    incoming: Vec<RegisterConn>,
+}
+
+/// CQ credits owned from before QP creation through destruction. Owners
+/// must declare their QP field before this guard, so QP destruction precedes
+/// retirement. A poll-to-empty after retirement authorizes credit reuse.
+#[derive(Debug)]
+pub(crate) struct ConnReservation {
     shared: Arc<PollerShared>,
-    slot: u16,
-    generation: u8,
-    budget: Option<BudgetGuard>,
+    demand: Demand,
+    waker: PollerWaker,
+}
+
+/// This wrapper preserves destruction order even on setup errors and when
+/// moved between the handshake and the socket. Do not split its fields.
+#[derive(Debug)]
+pub(crate) struct ReservedQueuePair {
+    qp: ruapc_rdma::QueuePair,
+    reservation: ConnReservation,
+}
+
+impl std::ops::Deref for ReservedQueuePair {
+    type Target = ruapc_rdma::QueuePair;
+    fn deref(&self) -> &Self::Target {
+        &self.qp
+    }
 }
 
 impl ConnReservation {
-    /// The connection tag to stamp into the QP's work request IDs
-    /// (`QueuePair::set_wr_tag`) before posting anything.
-    pub fn tag(&self) -> u32 {
-        conn_tag(self.slot, self.generation)
+    pub(crate) fn bind(self, qp: ruapc_rdma::QueuePair) -> ReservedQueuePair {
+        ReservedQueuePair {
+            qp,
+            reservation: self,
+        }
     }
 }
 
 impl Drop for ConnReservation {
     fn drop(&mut self) {
-        // A consumed reservation (budget moved into the inbox) frees
-        // nothing; an abandoned one returns the slot.
-        if self.budget.is_some() {
-            release_slot(&self.shared, self.slot);
-        }
+        self.shared.budget.retire(self.demand);
+        self.waker.wake();
     }
 }
 
@@ -224,8 +208,6 @@ pub struct DevicePoller {
     shared: Arc<PollerShared>,
     waker: PollerWaker,
     thread: Option<std::thread::JoinHandle<()>>,
-    /// Sum of (send + recv) queue depths registered on the shared CQ.
-    wr_budget: Arc<AtomicU32>,
     cq_capacity: u32,
 }
 
@@ -234,6 +216,8 @@ pub struct DevicePoller {
 pub struct PollerConfig {
     /// Shared CQ capacity (entries).
     pub cq_len: u32,
+    /// Per-NIC READ limit, shared by all connections.
+    pub read_limit: u32,
     /// Busy-poll window after the last completion, in microseconds.
     /// `0` disables spinning (pure event-driven mode).
     pub spin_us: u64,
@@ -262,9 +246,8 @@ impl DevicePoller {
         // Clamp the shared CQ length to the device's capability: e.g. the
         // rxe soft-RoCE driver caps max_cqe at 32767, well below the
         // default device_cq_len, and ibv_create_cq fails with EINVAL when
-        // asked for more. The clamped value also becomes the connection
-        // budget (`cq_capacity`), so admission control stays consistent
-        // with the actual CQ size.
+        // asked for more. The provider can round this request up; admission
+        // uses the actual returned CQ capacity below.
         let max_cqe = ctx
             .query_device()
             .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?
@@ -280,6 +263,7 @@ impl DevicePoller {
         let cq = CompletionQueue::create(ctx, cq_len as _, Some(&comp_channel))
             .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
 
+        let cq_capacity = cq.capacity();
         let (wake_tx, wake_rx) =
             UnixStream::pair().map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
         wake_tx
@@ -291,15 +275,18 @@ impl DevicePoller {
 
         let shared = Arc::new(PollerShared {
             inner: Mutex::new(SharedInner::default()),
+            budget: CqBudget::new(cq_capacity, config.read_limit),
             has_incoming: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
         });
+        let maintenance_requested = Arc::new(AtomicBool::new(false));
         let handle = tokio::runtime::Handle::current();
 
         let thread = {
             let cq = cq.clone();
             let comp_channel = comp_channel.clone();
             let shared = shared.clone();
+            let maintenance_requested = maintenance_requested.clone();
             std::thread::Builder::new()
                 .name(format!("ruapc-rdma-poll-{device_name}"))
                 .spawn(move || {
@@ -311,7 +298,10 @@ impl DevicePoller {
                         shared,
                         dispatcher,
                         spin: Duration::from_micros(config.spin_us),
-                        conns: Vec::new(),
+                        conns: HashMap::default(),
+                        dirty_qps: Vec::new(),
+                        drain: CqDrain::default(),
+                        maintenance_requested,
                         unack_cq_events: 0,
                     }
                     .run();
@@ -322,10 +312,9 @@ impl DevicePoller {
         Ok(Self {
             cq,
             shared,
-            waker: PollerWaker(Arc::new(wake_tx)),
+            waker: PollerWaker(Arc::new(wake_tx), maintenance_requested),
             thread: Some(thread),
-            wr_budget: Arc::new(AtomicU32::new(0)),
-            cq_capacity: cq_len,
+            cq_capacity,
         })
     }
 
@@ -339,103 +328,62 @@ impl DevicePoller {
         self.waker.clone()
     }
 
-    /// Reserves a poller slot and CQ budget for a new connection.
-    ///
-    /// `qp_depth` is the connection's total queue depth (send + recv work
-    /// requests); the reservation fails if the shared CQ cannot absorb it.
-    /// The returned reservation's [`tag`](ConnReservation::tag) must be
-    /// stamped into the QP before any work request is posted.
-    pub fn reserve(&self, qp_depth: u32) -> Result<ConnReservation> {
-        let budget = self.wr_budget.clone();
-        if budget
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(qp_depth)
-                    .filter(|total| *total <= self.cq_capacity)
-            })
-            .is_err()
-        {
-            return Err(Error::new(
-                ErrorKind::Overloaded,
-                format!(
-                    "shared CQ capacity exhausted: {} + {qp_depth} > {} (raise rdma.polling.device_cq_len)",
-                    budget.load(Ordering::Acquire),
-                    self.cq_capacity
-                ),
-            ));
-        }
-        let budget = BudgetGuard {
-            budget,
-            depth: qp_depth,
-        };
-
-        let mut inner = self.shared.inner.lock().unwrap();
+    /// Reserve before creating a QP, including connections still negotiating.
+    fn reserve(&self, demand: Demand) -> Result<ConnReservation> {
         if self.shared.shutdown.load(Ordering::Acquire) {
             return Err(Error::new(
                 ErrorKind::ConnectionClosed,
                 "RDMA poll thread is not running".into(),
             ));
         }
-        let slot = match inner.free_slots.pop() {
-            Some(slot) => slot,
-            None => {
-                if inner.generations.len() >= MAX_SLOTS {
-                    return Err(Error::new(
-                        ErrorKind::Overloaded,
-                        format!("poller connection slots exhausted ({MAX_SLOTS})"),
-                    ));
-                }
-                inner.generations.push(0);
-                (inner.generations.len() - 1) as u16
-            }
-        };
-        let generation = inner.generations[slot as usize];
-        drop(inner);
-
+        if !self.shared.budget.reserve(demand) {
+            return Err(Error::new(
+                ErrorKind::Overloaded,
+                format!(
+                    "shared CQ capacity exhausted: {} of {} entries reserved; connection needs {demand:?}",
+                    self.shared.budget.snapshot().0,
+                    self.cq_capacity
+                ),
+            ));
+        }
         Ok(ConnReservation {
             shared: self.shared.clone(),
-            slot,
-            generation,
-            budget: Some(budget),
+            demand,
+            waker: self.waker(),
         })
     }
 
-    /// Registers a connection under a previously reserved slot.
-    pub fn register(&self, mut reservation: ConnReservation, conn: RegisterConn) -> Result<()> {
-        let budget = reservation
-            .budget
-            .take()
-            .expect("connection reservation used twice");
+    /// Posts the initial receives and publishes their owner as one transaction.
+    /// An early CQE's routing miss waits for this transaction before retrying.
+    pub fn register(
+        &self,
+        conn: RegisterConn,
+        post_receives: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let qp = &conn.socket.queue_pair;
+        if !Arc::ptr_eq(&conn.socket.queue_pair.reservation.shared, &self.shared)
+            || !Arc::ptr_eq(qp.send_cq(), &self.cq)
+            || !Arc::ptr_eq(qp.recv_cq(), &self.cq)
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "connection and reservation must belong to this RDMA poller's CQ".into(),
+            ));
+        }
         {
             let mut inner = self.shared.inner.lock().unwrap();
             if self.shared.shutdown.load(Ordering::Acquire) {
-                // Put the budget back so the reservation drop frees the slot.
-                reservation.budget = Some(budget);
                 return Err(Error::new(
                     ErrorKind::ConnectionClosed,
                     "RDMA poll thread is not running".into(),
                 ));
             }
-            inner.incoming.push(Incoming {
-                slot: reservation.slot,
-                generation: reservation.generation,
-                conn: Box::new(conn),
-                budget,
-            });
+            post_receives()?;
+            inner.incoming.push(conn);
             self.shared.has_incoming.store(true, Ordering::Release);
         }
         self.waker.wake();
         Ok(())
-    }
-}
-
-struct BudgetGuard {
-    budget: Arc<AtomicU32>,
-    depth: u32,
-}
-
-impl Drop for BudgetGuard {
-    fn drop(&mut self) {
-        self.budget.fetch_sub(self.depth, Ordering::AcqRel);
     }
 }
 
@@ -463,7 +411,7 @@ impl std::fmt::Debug for DevicePoller {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DevicePoller")
             .field("cq_capacity", &self.cq_capacity)
-            .field("wr_budget", &self.wr_budget.load(Ordering::Acquire))
+            .field("cq_reserved", &self.shared.budget.snapshot())
             .finish()
     }
 }
@@ -477,8 +425,15 @@ struct PollLoop {
     /// Hands received buffers to the pool's dispatch worker tasks.
     dispatcher: Dispatcher,
     spin: Duration,
-    /// Connections indexed by their slot.
-    conns: Vec<Option<ConnState>>,
+    /// This CQ's connections, indexed by the provider's local QP number.
+    conns: HashMap<u32, ConnState, RandomState>,
+    /// QPs needing flow maintenance, deduplicated by `ConnState::dirty`.
+    dirty_qps: Vec<u32>,
+    /// Undrained retirement snapshots survive scheduling yields.
+    drain: CqDrain,
+    /// Existing pending/error/activation wakeups request a full scan because
+    /// those changes need not produce a CQE identifying the connection.
+    maintenance_requested: Arc<AtomicBool>,
     unack_cq_events: u32,
 }
 
@@ -491,16 +446,13 @@ impl PollLoop {
     /// Acknowledge CQ events in batches to amortize the syscall-free ack.
     const ACK_EVENTS_BATCH: u32 = 1024;
 
-    /// Housekeeping cadence when no completions arrive. Housekeeping is
-    /// O(connections) (pending drain, flow control, teardown checks and
-    /// their clock reads), so it must not run on every spin iteration.
-    const HOUSEKEEPING_INTERVAL: Duration = Duration::from_micros(100);
+    /// Retry receive-buffer allocation during pool pressure while busy. Idle
+    /// polling uses a 1 ms timeout, preserving `poll_spin_us = 0` semantics.
+    const RECEIVE_RETRY_INTERVAL: Duration = Duration::from_micros(100);
 
-    /// Cadence of the RDMA READ timeout sweep. Coarse on purpose: read
-    /// timeouts are measured in seconds, and per-request timers are
-    /// deliberately avoided (a background scan of the small in-flight
-    /// read maps costs nearly nothing).
-    const READ_SWEEP_INTERVAL: Duration = Duration::from_millis(100);
+    /// Full scans cover idle keepalives, READ deadlines and error teardown.
+    /// Their second-scale timers do not need a scan after every CQ drain.
+    const HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(100);
 
     fn run(mut self) {
         if let Err(error) = self.run_until_shutdown() {
@@ -519,32 +471,39 @@ impl PollLoop {
         let mut batch: DispatchBatch = Vec::new();
         let mut spin_until = Instant::now();
         let mut next_housekeeping = Instant::now();
-        let mut next_read_sweep = Instant::now();
+        let mut next_receive_retry = Instant::now();
         let mut last_dump = Instant::now();
 
         loop {
             let progressed = self.drain_completions(&cq, &mut wcs, &mut batch)?;
 
-            // This O(connections) pass runs after progress or at the periodic
-            // cadence, never on every empty iteration of the spin window.
             let now = Instant::now();
-            if progressed || now >= next_housekeeping {
-                next_housekeeping = now + Self::HOUSEKEEPING_INTERVAL;
-                if self.shared.shutdown.load(Ordering::Acquire) {
-                    return Ok(());
+            if self.shared.shutdown.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            // Consume before touching connections: wakeups racing maintenance
+            // remain set for the next loop, even when their pipe bytes coalesce.
+            let requested = self.maintenance_requested.load(Ordering::Acquire)
+                && self.maintenance_requested.swap(false, Ordering::AcqRel);
+            let registered = self.drain_incoming(false);
+            let housekeeping = now >= next_housekeeping;
+            let retry_receives = now >= next_receive_retry;
+            if retry_receives {
+                next_receive_retry = now + Self::RECEIVE_RETRY_INTERVAL;
+            }
+            if housekeeping || requested {
+                if housekeeping {
+                    next_housekeeping = now + Self::HOUSEKEEPING_INTERVAL;
                 }
-                self.drain_incoming();
-                if tracing::enabled!(tracing::Level::DEBUG)
-                    && last_dump.elapsed() >= Self::DUMP_INTERVAL
-                {
-                    last_dump = Instant::now();
-                    self.dump_connections();
-                }
-                let sweep_reads = now >= next_read_sweep;
-                if sweep_reads {
-                    next_read_sweep = now + Self::READ_SWEEP_INTERVAL;
-                }
-                self.maintain_connections(now, sweep_reads);
+                self.maintain_connections(now, housekeeping, retry_receives);
+            } else if progressed || registered || retry_receives {
+                self.maintain_dirty_connections(now, retry_receives);
+            }
+            if tracing::enabled!(tracing::Level::DEBUG)
+                && now.duration_since(last_dump) >= Self::DUMP_INTERVAL
+            {
+                last_dump = now;
+                self.dump_connections();
             }
 
             if progressed {
@@ -561,6 +520,9 @@ impl PollLoop {
             self.cq.req_notify(false)?;
             if self.poll_completions(&cq, &mut wcs, &mut batch)? > 0 {
                 self.dispatcher.flush(&mut batch);
+                // These CQEs were polled outside the normal drain. Maintain
+                // their credits now, even if the next drain finds an empty CQ.
+                self.maintain_dirty_connections(Instant::now(), false);
                 spin_until = Instant::now() + self.spin;
                 continue;
             }
@@ -570,19 +532,23 @@ impl PollLoop {
         }
     }
 
-    /// Drain a burst completely while bounding each dispatch batch. Both the
-    /// normal drain and the arm/poll race check use the same CQE routing path.
+    /// Drain a bounded burst, then return to maintenance even under sustained
+    /// READ traffic. Both this drain and the arm/poll check route CQEs identically.
     fn drain_completions(
         &mut self,
         cq: &CompletionQueue,
         wcs: &mut CompletionBatch<64>,
         batch: &mut DispatchBatch,
     ) -> ruapc_rdma::Result<bool> {
+        self.drain.begin(&self.shared.budget);
         let mut progressed = false;
         loop {
             let count = self.poll_completions(cq, wcs, batch)?;
             progressed |= count > 0;
-            if count < wcs.capacity() {
+            if !self
+                .drain
+                .polled(&self.shared.budget, count, wcs.capacity())
+            {
                 break;
             }
         }
@@ -608,7 +574,7 @@ impl PollLoop {
     }
 
     fn dump_connections(&self) {
-        for conn in self.conns.iter().flatten() {
+        for conn in self.conns.values() {
             tracing::debug!(
                 "conn dump: qp={} ok={} pending={} flow={:?}",
                 conn.socket.queue_pair.qp_num(),
@@ -619,28 +585,70 @@ impl PollLoop {
         }
     }
 
-    fn maintain_connections(&mut self, now: Instant, sweep_reads: bool) {
-        for slot in 0..self.conns.len() {
-            let Some(conn) = self.conns[slot].as_mut() else {
-                continue;
-            };
-            if sweep_reads {
-                conn.sweep_read_timeouts(now);
+    fn mark_dirty(conn: &mut ConnState, dirty_qps: &mut Vec<u32>) {
+        if !conn.dirty {
+            conn.dirty = true;
+            dirty_qps.push(conn.identity.qp_num());
+        }
+    }
+
+    fn maintain_connections(&mut self, now: Instant, sweep_reads: bool, retry_receives: bool) {
+        // Every old entry is covered by this scan. Rebuild only the receive
+        // deficits that need another timed attempt, without stale QP entries.
+        self.dirty_qps.clear();
+        self.conns.retain(|&qp_num, conn| {
+            let keep = Self::maintain_connection(conn, now, sweep_reads, retry_receives);
+            if keep && conn.dirty {
+                self.dirty_qps.push(qp_num);
             }
-            conn.drain_pending();
-            if conn.recv_deficit > 0 {
-                conn.retry_recv_deficit();
-            }
-            if let Err(e) = conn.update_flow_control() {
-                tracing::error!("flow control update error: {e}");
-            }
-            if conn.ready_to_remove() {
-                // Dropping the registration guard fails waiters and settles
-                // metrics before this slot is available to another connection.
-                self.conns[slot] = None;
-                release_slot(&self.shared, slot as u16);
+            keep
+        });
+    }
+
+    fn maintain_dirty_connections(&mut self, now: Instant, retry_receives: bool) {
+        // Compact in place: completions cannot append QPs while this same
+        // poll thread is maintaining them, so the vector retains its allocation.
+        let mut retained = 0;
+        for index in 0..self.dirty_qps.len() {
+            let qp_num = self.dirty_qps[index];
+            if let Entry::Occupied(mut entry) = self.conns.entry(qp_num) {
+                if !Self::maintain_connection(entry.get_mut(), now, false, retry_receives) {
+                    entry.remove();
+                } else if entry.get().dirty {
+                    self.dirty_qps[retained] = qp_num;
+                    retained += 1;
+                }
             }
         }
+        self.dirty_qps.truncate(retained);
+    }
+
+    /// Returns whether the connection must remain registered. Receive-buffer
+    /// pressure leaves its dirty bit set for another timed pass.
+    fn maintain_connection(
+        conn: &mut ConnState,
+        now: Instant,
+        sweep_reads: bool,
+        retry_receives: bool,
+    ) -> bool {
+        conn.dirty = false;
+        if sweep_reads {
+            conn.sweep_read_timeouts(now);
+        }
+        conn.drain_pending();
+        if retry_receives && conn.recv_deficit > 0 && conn.socket.state.is_ok() {
+            conn.retry_recv_deficit();
+        }
+        if let Err(e) = conn.update_flow_control() {
+            tracing::error!("flow control update error: {e}");
+        }
+        if conn.ready_to_remove() {
+            // The QP keeps its identity leased even if another owner holds
+            // the socket after poller teardown.
+            return false;
+        }
+        conn.dirty = conn.recv_deficit > 0 && conn.socket.state.is_ok();
+        true
     }
 
     /// Sleep until a CQ notification, explicit wake, or housekeeping timeout.
@@ -649,7 +657,13 @@ impl PollLoop {
         let (cq_ready, wake_ready) = poll_readable2(
             self.comp_channel.fd().as_raw_fd(),
             self.wake_rx.as_raw_fd(),
-            Self::IDLE_TIMEOUT_MS,
+            if self.dirty_qps.is_empty() {
+                Self::IDLE_TIMEOUT_MS
+            } else {
+                // Only receive deficits survive maintenance. Recover promptly
+                // without busy-spinning when the buffer pool remains full.
+                1
+            },
         )?;
         if cq_ready {
             while self.comp_channel.get_event().is_ok() {
@@ -667,51 +681,53 @@ impl PollLoop {
         Ok(cq_ready || wake_ready)
     }
 
-    /// Moves newly registered connections from the shared inbox into their
-    /// slots.
-    fn drain_incoming(&mut self) {
-        if !self.shared.has_incoming.load(Ordering::Acquire) {
-            return;
+    /// Moves newly registered connections from the shared inbox into the
+    /// provider QP-number registry.
+    fn drain_incoming(&mut self, routing_miss: bool) -> bool {
+        if !routing_miss && !self.shared.has_incoming.load(Ordering::Acquire) {
+            return false;
         }
         let drained = {
             let mut inner = self.shared.inner.lock().unwrap();
             self.shared.has_incoming.store(false, Ordering::Release);
             std::mem::take(&mut inner.incoming)
         };
+        let registered = !drained.is_empty();
         for incoming in drained {
-            let slot = incoming.slot as usize;
-            if self.conns.len() <= slot {
-                self.conns.resize_with(slot + 1, || None);
+            let qp_num = incoming.socket.queue_pair.qp_num();
+            match self.conns.entry(qp_num) {
+                Entry::Vacant(entry) => {
+                    let mut conn = ConnState::new(incoming);
+                    Self::mark_dirty(&mut conn, &mut self.dirty_qps);
+                    entry.insert(conn);
+                }
+                Entry::Occupied(_) => panic!("poller QP {qp_num} already registered"),
             }
-            debug_assert!(self.conns[slot].is_none(), "poller slot {slot} occupied");
-            self.conns[slot] = Some(ConnState::new(
-                *incoming.conn,
-                incoming.generation,
-                incoming.budget,
-            ));
         }
+        registered
     }
 
     fn dispatch(&mut self, wc: Completion<'_>, batch: &mut DispatchBatch) {
-        let (slot, generation) = split_tag(wc.info().wr_id.get_tag());
-        if let Some(Some(conn)) = self.conns.get_mut(slot)
-            && conn.generation == generation
+        let id = wc.info().wr_id;
+        let qp_num = wc.qp_num();
+        if let Some(conn) = self.conns.get_mut(&qp_num)
+            && conn.identity.contains(qp_num, id)
         {
             conn.handle_wc(wc, batch);
+            Self::mark_dirty(conn, &mut self.dirty_qps);
             return;
         }
-        // The completion may have raced its connection's registration (the
-        // receive ring is posted before the connection reaches the inbox):
-        // pull the inbox and retry.
-        self.drain_incoming();
-        if let Some(Some(conn)) = self.conns.get_mut(slot)
-            && conn.generation == generation
+        // Initial receives and inbox publication hold the same mutex. Bypass
+        // the empty-inbox hint: a registrar can still be posting the ring.
+        // Normal completions never acquire this lock.
+        self.drain_incoming(true);
+        if let Some(conn) = self.conns.get_mut(&qp_num)
+            && conn.identity.contains(qp_num, id)
         {
             conn.handle_wc(wc, batch);
+            Self::mark_dirty(conn, &mut self.dirty_qps);
         } else {
-            tracing::warn!(
-                "dropping completion for unknown connection {slot}:{generation}: {wc:?}"
-            );
+            tracing::warn!("dropping completion for unknown or retired QP identity: {wc:?}");
         }
     }
 
@@ -726,20 +742,19 @@ impl PollLoop {
             std::mem::take(&mut inner.incoming)
         };
         for incoming in &drained {
-            incoming.conn.socket.set_error();
-            incoming.conn.socket.fail_read_batches();
+            incoming.socket.set_error();
+            incoming.socket.fail_read_batches();
             // Inbox entries have not opened their metric registration yet,
             // but a sender may already have bound a waiter to the socket.
-            incoming.conn.state.connection_closed(
-                incoming.conn.socket.conn_id,
+            incoming.state.connection_closed(
+                incoming.socket.conn_id,
                 &Error::new(
                     ErrorKind::ConnectionClosed,
                     "rdma poll thread stopped".into(),
                 ),
             );
         }
-        drop(drained);
-        for conn in self.conns.iter().flatten() {
+        for conn in self.conns.values() {
             conn.socket.set_error();
             // Nobody will poll the flush completions after this thread
             // exits: resolve the waiting tasks now. The memory holds stay
@@ -747,9 +762,14 @@ impl PollLoop {
             // its QP, first) is dropped.
             conn.socket.fail_read_batches();
         }
+        // Closing every connection must precede dropping any last socket
+        // owner. QP destruction can return unconsumed READ permits; no other
+        // connection on this stopped CQ may use them to replenish its CQEs.
+        drop(drained);
         // RegisteredConnection guards notify ordinary waiters and close the
         // connection gauges exactly once, including already-failing sockets.
         self.conns.clear();
+        self.dirty_qps.clear();
         if self.unack_cq_events > 0 {
             self.cq.ack_events(self.unack_cq_events);
             self.unack_cq_events = 0;
@@ -757,20 +777,16 @@ impl PollLoop {
     }
 }
 
-/// Lazily-created poller shards, keyed by device name.
-///
-/// A device may run several (shared CQ + poll thread) shards; connections
-/// are assigned round-robin so their completion processing spreads across
-/// cores. All shards share one [`Dispatcher`] (created with the first
-/// shard), so the pool runs a single fixed set of dispatch worker tasks.
+/// Lazily-created CQ/poll-thread shards, keyed by device name. Connections
+/// reserve completion credits on the least utilized shard that can admit
+/// them, before QP creation or peer negotiation. All shards share one fixed
+/// dispatcher worker pool; the configured thread count bounds CPU usage.
 #[derive(Default)]
 pub struct DevicePollers(Mutex<PollersInner>);
 
 #[derive(Default)]
 struct PollersInner {
     devices: std::collections::HashMap<String, DeviceShards, RandomState>,
-    /// Shared dispatch worker pool; started lazily so worker tasks only
-    /// exist once RDMA is actually used (and inside a runtime).
     dispatcher: Option<Dispatcher>,
 }
 
@@ -781,41 +797,118 @@ struct DeviceShards {
 }
 
 impl DevicePollers {
-    /// Returns a poller shard for the given device (round-robin across
-    /// `shard_count` shards), starting it if necessary.
-    pub fn get_or_start(
+    /// Select and reserve as one setup operation. Creating each configured
+    /// shard lazily spreads even a small number of connections across cores.
+    pub(crate) fn reserve(
         &self,
         device: &super::RdmaDevice,
         config: PollerConfig,
         shard_count: u32,
-    ) -> Result<Arc<DevicePoller>> {
+        connection: &super::RdmaConnectionConfig,
+    ) -> Result<(Arc<DevicePoller>, ConnReservation)> {
         let name = device.info().name.clone();
-        debug_assert!(shard_count > 0);
-        let shard_count = shard_count as usize;
+        let demand = Demand::connection(connection);
         let mut inner = self.0.lock().unwrap();
         let dispatcher = inner
             .dispatcher
             .get_or_insert_with(|| Dispatcher::start(config.dispatch_workers))
             .clone();
         let entry = inner.devices.entry(name.clone()).or_default();
-        let index = entry.next % shard_count;
-        entry.next = entry.next.wrapping_add(1);
-        if let Some(poller) = entry.shards.get(index) {
-            return Ok(poller.clone());
+        if entry.shards.len() < shard_count as usize {
+            let index = entry.shards.len();
+            match DevicePoller::start(
+                device.context(),
+                &format!("{name}.{index}"),
+                config,
+                dispatcher,
+            ) {
+                Ok(poller) => {
+                    tracing::info!(
+                        device = name,
+                        shard = index,
+                        capacity = poller.cq_capacity,
+                        "started RDMA CQ shard"
+                    );
+                    entry.shards.push(Arc::new(poller));
+                }
+                Err(error) if !entry.shards.is_empty() => {
+                    // An optional new thread/CQ is not required if an existing
+                    // shard has room (e.g. provider CQ resources exhausted).
+                    return entry.reserve(demand).map_err(|admission| {
+                        Error::new(
+                            admission.kind,
+                            format!(
+                                "RDMA device {name}: {}; new shard failed: {error}",
+                                admission.msg
+                            ),
+                        )
+                    });
+                }
+                Err(error) => return Err(error),
+            }
         }
-        debug_assert_eq!(index, entry.shards.len());
-        tracing::info!(
-            "starting RDMA poll thread {name}.{index} (existing shards: {})",
-            entry.shards.len()
-        );
-        let poller = Arc::new(DevicePoller::start(
-            device.context(),
-            &format!("{name}.{index}"),
-            config,
-            dispatcher,
-        )?);
-        entry.shards.push(poller.clone());
-        Ok(poller)
+        entry
+            .reserve(demand)
+            .map_err(|err| Error::new(err.kind, format!("RDMA device {name}: {}", err.msg)))
+    }
+
+    pub(crate) fn report(&self) -> Vec<super::path::RdmaCqLoad> {
+        let inner = self.0.lock().unwrap();
+        let mut result = Vec::new();
+        for (device, entry) in &inner.devices {
+            for (shard, poller) in entry.shards.iter().enumerate() {
+                let (reserved, connections) = poller.shared.budget.snapshot();
+                let registry = poller.cq.qp_registry_stats();
+                result.push(super::path::RdmaCqLoad {
+                    device: device.clone(),
+                    shard,
+                    capacity: poller.cq_capacity,
+                    reserved,
+                    connections,
+                    registered_qps: registry.active,
+                    next_sequence_floor: registry.next_sequence_floor,
+                    sequence_bits: ruapc_rdma::WRID::SEQUENCE_BITS,
+                });
+            }
+        }
+        result.sort_by(|a, b| (&a.device, a.shard).cmp(&(&b.device, b.shard)));
+        result
+    }
+}
+
+impl DeviceShards {
+    fn reserve(&mut self, demand: Demand) -> Result<(Arc<DevicePoller>, ConnReservation)> {
+        let count = self.shards.len();
+        let start = self.next % count;
+        self.next = self.next.wrapping_add(1);
+        let mut candidates: Vec<_> = (0..count).map(|offset| (start + offset) % count).collect();
+        // Stable sort rotates equally utilized shards. Recheck admission
+        // under each budget's mutex; a reclamation can race these snapshots.
+        let loads: Vec<_> = self
+            .shards
+            .iter()
+            .map(|p| p.shared.budget.snapshot().0)
+            .collect();
+        candidates.sort_by(|&a, &b| {
+            (u64::from(loads[a]) * u64::from(self.shards[b].cq_capacity))
+                .cmp(&(u64::from(loads[b]) * u64::from(self.shards[a].cq_capacity)))
+        });
+        let mut error = None;
+        for index in candidates {
+            let poller = &self.shards[index];
+            match poller.reserve(demand) {
+                Ok(reservation) => return Ok((poller.clone(), reservation)),
+                Err(err) => error = Some(err),
+            }
+        }
+        let error = error.expect("at least one configured CQ shard");
+        Err(Error::new(
+            error.kind,
+            format!(
+                "all {count} RDMA CQ shards unavailable: {}; raise rdma.polling.device_cq_len or poll_threads_per_device",
+                error.msg
+            ),
+        ))
     }
 }
 
@@ -826,75 +919,4 @@ impl std::fmt::Debug for DevicePollers {
 }
 
 #[cfg(test)]
-mod tests {
-    use ruapc_rdma::WRID;
-
-    use super::*;
-
-    /// The shared CQ length must be clamped to the device's `max_cqe`:
-    /// drivers reject larger requests with EINVAL (e.g. the rxe soft-RoCE
-    /// driver caps `max_cqe` at 32767, below the default `device_cq_len`).
-    #[tokio::test]
-    async fn test_cq_len_clamped_to_device_max() {
-        let device = crate::rdma::test_utils::open_rdma_device();
-        let config = PollerConfig {
-            cq_len: u32::MAX,
-            spin_us: 0,
-            dispatch_workers: 1,
-        };
-        let poller = DevicePoller::start(
-            device.context(),
-            "cq-clamp-test",
-            config,
-            Dispatcher::start(config.dispatch_workers),
-        )
-        .expect("CQ creation must succeed with a clamped length");
-        let max_cqe = device.context().query_device().unwrap().max_cqe;
-        assert!(poller.cq_capacity <= u32::try_from(max_cqe.max(1)).unwrap_or(u32::MAX));
-        assert!(poller.cq_capacity > 0);
-    }
-
-    #[test]
-    fn test_ring_reservation_accounting() {
-        let total = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (a, after_a) = RingReservation::add(&total, 16);
-        assert_eq!(after_a, 16);
-        let (b, after_b) = RingReservation::add(&total, 32);
-        assert_eq!(after_b, 48);
-        drop(a);
-        assert_eq!(total.load(Ordering::Acquire), 32);
-        drop(b);
-        assert_eq!(total.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    fn test_conn_tag_roundtrip() {
-        for (slot, generation) in [(0u16, 0u8), (1, 255), (MAX_SLOTS as u16 - 1, 42)] {
-            let tag = conn_tag(slot, generation);
-            assert!(tag <= WRID::TAG_MAX);
-            assert_eq!(split_tag(tag), (slot as usize, generation));
-        }
-    }
-
-    #[test]
-    fn exhausted_slot_generation_is_retired() {
-        let shared = PollerShared {
-            inner: Mutex::new(SharedInner {
-                generations: vec![254],
-                ..Default::default()
-            }),
-            has_incoming: AtomicBool::new(false),
-            shutdown: AtomicBool::new(false),
-        };
-        release_slot(&shared, 0);
-        {
-            let mut inner = shared.inner.lock().unwrap();
-            assert_eq!(inner.generations[0], 255);
-            assert_eq!(inner.free_slots.pop(), Some(0));
-        }
-        release_slot(&shared, 0);
-        let inner = shared.inner.lock().unwrap();
-        assert_eq!(inner.generations[0], 255);
-        assert!(inner.free_slots.is_empty());
-    }
-}
+mod tests;

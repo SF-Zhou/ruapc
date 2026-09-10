@@ -76,41 +76,52 @@ mod tests {
 
     #[test]
     fn test_wc_type_checks() {
-        let wc = make_wc(WRID::recv(0, 1), ibv_wc_status::IBV_WC_SUCCESS, 0);
-        assert!(wc.is_recv());
-        assert!(!wc.is_send_data());
-        assert!(!wc.is_send_imm());
-
-        let wc = make_wc(WRID::send_data(0, 2), ibv_wc_status::IBV_WC_SUCCESS, 0);
-        assert!(!wc.is_recv());
-        assert!(wc.is_send_data());
-        assert!(!wc.is_send_imm());
-
-        let wc = make_wc(WRID::send_imm(0, 3), ibv_wc_status::IBV_WC_SUCCESS, 0);
-        assert!(!wc.is_recv());
-        assert!(!wc.is_send_data());
-        assert!(wc.is_send_imm());
+        for kind in [
+            WRType::Recv,
+            WRType::SendData,
+            WRType::SendImm,
+            WRType::Read,
+        ] {
+            for sequence in [0, 1, WRID::MAX_SEQUENCE] {
+                for status in [
+                    ibv_wc_status::IBV_WC_SUCCESS,
+                    ibv_wc_status::IBV_WC_WR_FLUSH_ERR,
+                ] {
+                    // Error CQEs need not provide a valid opcode. Classification
+                    // must use the type bits even when every sequence bit is set.
+                    let wc = make_wc(WRID::new(kind, sequence), status, 0);
+                    assert_eq!(wc.is_recv(), kind == WRType::Recv);
+                    assert_eq!(wc.is_send_data(), kind == WRType::SendData);
+                    assert_eq!(wc.is_send_imm(), kind == WRType::SendImm);
+                    assert_eq!(wc.is_read(), kind == WRType::Read);
+                }
+            }
+        }
     }
 
     #[test]
     fn test_wc_succ() {
-        let wc = make_wc(WRID::recv(0, 0), ibv_wc_status::IBV_WC_SUCCESS, 0);
+        let wc = make_wc(WRID::new(WRType::Recv, 0), ibv_wc_status::IBV_WC_SUCCESS, 0);
         assert!(wc.succ());
 
-        let wc = make_wc(WRID::recv(0, 0), ibv_wc_status::IBV_WC_LOC_LEN_ERR, 0);
+        let wc = make_wc(
+            WRID::new(WRType::Recv, 0),
+            ibv_wc_status::IBV_WC_LOC_LEN_ERR,
+            0,
+        );
         assert!(!wc.succ());
     }
 
     #[test]
     fn test_wc_imm_none() {
-        let wc = make_wc(WRID::recv(0, 0), ibv_wc_status::IBV_WC_SUCCESS, 0);
+        let wc = make_wc(WRID::new(WRType::Recv, 0), ibv_wc_status::IBV_WC_SUCCESS, 0);
         assert_eq!(wc.imm(), None);
     }
 
     #[test]
     fn test_wc_imm_some() {
         let mut wc = make_wc(
-            WRID::recv(0, 0),
+            WRID::new(WRType::Recv, 0),
             ibv_wc_status::IBV_WC_SUCCESS,
             ibv_wc_flags::IBV_WC_WITH_IMM.0,
         );
@@ -120,9 +131,13 @@ mod tests {
 
     #[test]
     fn test_wc_debug() {
-        let wc = make_wc(WRID::recv(0, 123), ibv_wc_status::IBV_WC_SUCCESS, 0);
+        let wc = make_wc(
+            WRID::new(WRType::Recv, 123),
+            ibv_wc_status::IBV_WC_SUCCESS,
+            0,
+        );
         let debug = format!("{:?}", wc);
-        assert!(debug.contains("Recv(0:123)"));
+        assert!(debug.contains("Recv(0x00000000000001ec)"));
         assert!(debug.contains("IBV_WC_SUCCESS"));
     }
 }

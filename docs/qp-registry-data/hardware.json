@@ -1,0 +1,27 @@
+{
+  "device": "mlx5_0",
+  "command": "ibv_devinfo -d mlx5_0 -v",
+  "caps": {
+    "max_qp": 131072,
+    "max_qp_wr": 32768,
+    "max_cq": 16777216,
+    "max_cqe": 4194303,
+    "max_sge": 30,
+    "max_mr": 16777216,
+    "max_pd": 8388608,
+    "max_qp_rd_atom": 16,
+    "max_qp_init_rd_atom": 16,
+    "max_srq": 8388608,
+    "max_srq_wr": 32767
+  },
+  "numa_node": 0,
+  "link_layer": "Ethernet",
+  "port_rate": "200 Gb/sec (2X NDR)",
+  "port_state": "4: ACTIVE",
+  "container_memory_limit_bytes": 137438953472,
+  "container_memory_current_bytes": 63982436352,
+  "cpu": "AMD EPYC 9655 96-Core Processor",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+  "recorded_at_utc": "2026-09-07T02:46:22.717207+00:00",
+  "raw_query_sha256": "392f64d59e36f6b79d8ff531a250e4b9bd67eac33ffcd20b664f95b64023a648"
+}

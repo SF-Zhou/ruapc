@@ -42,6 +42,12 @@ pub(super) struct FlowControl {
 }
 
 impl FlowControl {
+    /// Standalone ACKs, including connection activation, share this limit.
+    /// CQ admission reserves the same count for success and flush CQEs.
+    pub(super) fn ack_limit(send_window: u32) -> u32 {
+        send_window.max(2)
+    }
+
     pub(super) fn new(send_window: u32, recv_submitted: u64, now: Instant) -> Self {
         Self {
             recv: RecvStats {
@@ -51,7 +57,7 @@ impl FlowControl {
             send: SendStats::default(),
             last_ack: now,
             ack_threshold: u64::from((send_window / 2).max(1)).min(ACK_COUNTER_MAX),
-            ack_limit: u64::from(send_window.max(2)),
+            ack_limit: u64::from(Self::ack_limit(send_window)),
         }
     }
 
@@ -108,7 +114,11 @@ impl FlowControl {
         let data = self.pending_data();
         let acks = self.recv.ack_received - self.recv.ack_acked;
         if data >= self.ack_threshold
-            || acks >= (self.ack_limit / 2).min(ACK_COUNTER_MAX)
+            // A threshold of one makes every standalone ACK generate another
+            // ACK indefinitely, even after a single activation and no data.
+            // Batch at least two; data credit and keepalive triggers still
+            // publish smaller pending ACK deltas when they need to send.
+            || acks >= (self.ack_limit / 2).clamp(2, ACK_COUNTER_MAX)
             || now.duration_since(self.last_ack) >= ACK_KEEPALIVE
         {
             Some(((acks.min(ACK_COUNTER_MAX) as u32) << 16) | data.min(ACK_COUNTER_MAX) as u32)
@@ -182,15 +192,81 @@ mod tests {
     }
 
     #[test]
+    fn single_activation_does_not_start_standalone_ack_ping_pong() {
+        let now = Instant::now();
+        let mut peers = [FlowControl::new(1, 2, now), FlowControl::new(1, 2, now)];
+        peers[0].ack_posted(true);
+        peers[0].ack_completed();
+        let mut messages = std::collections::VecDeque::from([(0, 0)]);
+        let mut delivered = 0;
+        while let Some((sender, imm)) = messages.pop_front() {
+            delivered += 1;
+            assert!(delivered <= 4, "pure ACK traffic did not converge");
+            let receiver = 1 - sender;
+            let flow = &mut peers[receiver];
+            flow.received_ack();
+            flow.peer_ack(imm);
+            if let Some(reply) = flow.due_ack(now)
+                && flow.can_submit_ack()
+            {
+                flow.ack_posted(true);
+                flow.ack_completed();
+                flow.mark_acked(reply, now);
+                messages.push_back((receiver, reply));
+            }
+        }
+        assert_eq!(delivered, 1);
+        assert!(peers.iter().all(FlowControl::can_submit_ack));
+    }
+
+    #[test]
+    fn one_entry_data_window_is_acknowledged_without_waiting_for_a_second_ack() {
+        let now = Instant::now();
+        let mut client = FlowControl::new(1, 2, now);
+        let mut server = FlowControl::new(1, 2, now);
+        client.ack_posted(true);
+        client.ack_completed();
+        server.received_ack();
+        assert_eq!(server.due_ack(now), None);
+
+        // The first data message must return its window credit immediately,
+        // carrying the pending activation confirmation in the same ACK.
+        server.received_data();
+        let ack = server.due_ack(now).expect("the one-entry window is full");
+        assert_eq!(ack, (1 << 16) | 1);
+        assert!(server.can_submit_ack());
+        server.ack_posted(true);
+        server.mark_acked(ack, now);
+        client.data_completed();
+        client.peer_ack(ack);
+        assert_eq!(client.finished_data(), 1);
+        assert_eq!(server.due_ack(now), None);
+        for _ in 0..2 {
+            assert!(
+                client.can_submit_ack(),
+                "activation credit was not restored"
+            );
+            client.ack_posted(true);
+        }
+        assert!(!client.can_submit_ack());
+    }
+
+    #[test]
     fn standalone_acks_need_both_completion_and_confirmation_to_reuse_capacity() {
-        let mut flow = FlowControl::new(2, 0, Instant::now());
-        flow.ack_posted(true);
-        flow.ack_posted(true);
-        assert!(!flow.can_submit_ack());
-        flow.ack_completed();
-        assert!(!flow.can_submit_ack());
-        flow.peer_ack(1 << 16);
-        assert!(flow.can_submit_ack());
+        for window in [1, 2, 4, 8, 32, 128] {
+            let mut flow = FlowControl::new(window, 0, Instant::now());
+            for _ in 0..FlowControl::ack_limit(window) {
+                assert!(flow.can_submit_ack());
+                flow.ack_posted(true);
+            }
+            assert!(!flow.can_submit_ack());
+            flow.ack_completed();
+            assert!(!flow.can_submit_ack());
+            flow.peer_ack(1 << 16);
+            assert!(flow.can_submit_ack());
+            flow.ack_posted(true);
+            assert!(!flow.can_submit_ack());
+        }
     }
 
     #[test]

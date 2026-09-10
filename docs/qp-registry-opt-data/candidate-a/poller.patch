@@ -1,0 +1,434 @@
+diff --git a/ruapc/src/rdma/poller/conn.rs b/ruapc/src/rdma/poller/conn.rs
+index f1a5444..96bed08 100644
+--- a/ruapc/src/rdma/poller/conn.rs
++++ b/ruapc/src/rdma/poller/conn.rs
+@@ -1,7 +1,7 @@
+ //! Per-connection state owned by the poll thread: flow control, pending
+ //! sends, receive-ring accounting and teardown readiness.
+ 
+-use std::{collections::VecDeque, sync::Arc, time::Instant};
++use std::{collections::VecDeque, num::NonZeroUsize, sync::Arc, time::Instant};
+ 
+ use bytes::Bytes;
+ use ruapc_rdma::{
+@@ -71,9 +71,10 @@ impl Drop for RegisteredConnection {
+ /// Field order matters for teardown: handlers holding buffers come before
+ /// `socket` so buffers are released before the QP can be destroyed.
+ pub(super) struct ConnState {
+-    /// Listed once in the poller's active maintenance queue. Never shared
+-    /// with posting tasks and never used to authorize completion ownership.
+-    pub(super) dirty: bool,
++    /// Position plus one in the poller's maintenance queue, when listed.
++    /// Repairs the queue after dense storage moves this connection. Never
++    /// shared with posting tasks or used to authorize completion ownership.
++    pub(super) dirty: Option<NonZeroUsize>,
+     /// CQ-assigned QP identity and sequence floor; stale completions are discarded
+     /// before they can affect a replacement connection's flow control.
+     pub(super) identity: CompletionIdentity,
+@@ -106,7 +107,7 @@ impl ConnState {
+     pub(super) fn new(reg: RegisterConn) -> Self {
+         let registration = RegisteredConnection::new(reg.state, reg.socket.conn_id);
+         Self {
+-            dirty: false,
++            dirty: None,
+             identity: reg.socket.queue_pair.send_identity(),
+             flow: FlowControl::new(reg.send_window, reg.recv_submitted, Instant::now()),
+             pending_sends: VecDeque::new(),
+diff --git a/ruapc/src/rdma/poller/mod.rs b/ruapc/src/rdma/poller/mod.rs
+index 1a19a91..57bbe08 100644
+--- a/ruapc/src/rdma/poller/mod.rs
++++ b/ruapc/src/rdma/poller/mod.rs
+@@ -41,8 +41,8 @@ mod dispatch;
+ mod flow;
+ 
+ use std::{
+-    collections::{HashMap, hash_map::Entry},
+     io::{Read as _, Write as _},
++    num::NonZeroUsize,
+     os::unix::io::AsRawFd as _,
+     os::unix::net::UnixStream,
+     sync::{
+@@ -53,6 +53,7 @@ use std::{
+ };
+ 
+ use foldhash::fast::RandomState;
++use indexmap::{IndexMap, map::Entry};
+ use ruapc_rdma::{CompChannel, Completion, CompletionBatch, CompletionQueue, poll_readable2};
+ 
+ use budget::{CqBudget, Demand};
+@@ -298,8 +299,8 @@ impl DevicePoller {
+                         shared,
+                         dispatcher,
+                         spin: Duration::from_micros(config.spin_us),
+-                        conns: HashMap::default(),
+-                        dirty_qps: Vec::new(),
++                        conns: IndexMap::default(),
++                        dirty_indices: Vec::new(),
+                         maintenance_requested,
+                         unack_cq_events: 0,
+                     }
+@@ -424,10 +425,12 @@ struct PollLoop {
+     /// Hands received buffers to the pool's dispatch worker tasks.
+     dispatcher: Dispatcher,
+     spin: Duration,
+-    /// This CQ's connections, indexed by the provider's local QP number.
+-    conns: HashMap<u32, ConnState, RandomState>,
+-    /// QPs needing flow maintenance, deduplicated by `ConnState::dirty`.
+-    dirty_qps: Vec<u32>,
++    /// A small QPN index table routes into contiguous connection storage.
++    /// These local indices are never encoded in WRIDs or completion tokens.
++    conns: IndexMap<u32, ConnState, RandomState>,
++    /// Dense indices needing maintenance. Each connection records its queue
++    /// position so moving a connection can repair its entry without hashing.
++    dirty_indices: Vec<usize>,
+     /// Existing pending/error/activation wakeups request a full scan because
+     /// those changes need not produce a CQE identifying the connection.
+     maintenance_requested: Arc<AtomicBool>,
+@@ -583,53 +586,72 @@ impl PollLoop {
+         }
+     }
+ 
+-    fn mark_dirty(conn: &mut ConnState, dirty_qps: &mut Vec<u32>) {
+-        if !conn.dirty {
+-            conn.dirty = true;
+-            dirty_qps.push(conn.identity.qp_num());
++    fn mark_dirty(index: usize, conn: &mut ConnState, dirty_indices: &mut Vec<usize>) {
++        if conn.dirty.is_none() {
++            conn.dirty = NonZeroUsize::new(dirty_indices.len() + 1);
++            dirty_indices.push(index);
+         }
+     }
+ 
+     fn maintain_connections(&mut self, now: Instant, sweep_reads: bool, retry_receives: bool) {
+-        // Every old entry is covered by this scan. Rebuild only the receive
+-        // deficits that need another timed attempt, without stale QP entries.
+-        self.dirty_qps.clear();
+-        self.conns.retain(|&qp_num, conn| {
+-            let keep = Self::maintain_connection(conn, now, sweep_reads, retry_receives);
+-            if keep && conn.dirty {
+-                self.dirty_qps.push(qp_num);
++        // Rebuild the queue while visiting only live, contiguous entries.
++        // A removal moves the unvisited tail into this index; process it next.
++        // Previously visited indices (and their new queue entries) stay fixed.
++        self.dirty_indices.clear();
++        let mut index = 0;
++        while let Some((_, conn)) = self.conns.get_index_mut(index) {
++            if Self::maintain_connection(conn, now, sweep_reads, retry_receives) {
++                if conn.recv_deficit > 0 && conn.socket.state.is_ok() {
++                    Self::mark_dirty(index, conn, &mut self.dirty_indices);
++                }
++                index += 1;
++            } else {
++                drop(self.conns.swap_remove_index(index));
+             }
+-            keep
+-        });
++        }
+     }
+ 
+     fn maintain_dirty_connections(&mut self, now: Instant, retry_receives: bool) {
+-        // Compact in place: completions cannot append QPs while this same
+-        // poll thread is maintaining them, so the vector retains its allocation.
++        // Finish all index-based visits before moving any connection. Compact
++        // the queue and update its reverse positions for retained deficits.
+         let mut retained = 0;
+-        for index in 0..self.dirty_qps.len() {
+-            let qp_num = self.dirty_qps[index];
+-            if let Entry::Occupied(mut entry) = self.conns.entry(qp_num) {
+-                if !Self::maintain_connection(entry.get_mut(), now, false, retry_receives) {
+-                    entry.remove();
+-                } else if entry.get().dirty {
+-                    self.dirty_qps[retained] = qp_num;
+-                    retained += 1;
+-                }
++        let mut removed = Vec::new();
++        for position in 0..self.dirty_indices.len() {
++            let index = self.dirty_indices[position];
++            let (_, conn) = self.conns.get_index_mut(index).unwrap();
++            if !Self::maintain_connection(conn, now, false, retry_receives) {
++                removed.push(index);
++            } else if conn.recv_deficit > 0 && conn.socket.state.is_ok() {
++                conn.dirty = NonZeroUsize::new(retained + 1);
++                self.dirty_indices[retained] = index;
++                retained += 1;
++            }
++        }
++        self.dirty_indices.truncate(retained);
++
++        // Descending removal leaves the other original removal indices valid.
++        // A surviving tail may move repeatedly; its queue position stays fixed
++        // and lets each move update exactly one entry, with no QPN lookup.
++        removed.sort_unstable();
++        for index in removed.into_iter().rev() {
++            drop(self.conns.swap_remove_index(index));
++            if let Some((_, moved)) = self.conns.get_index(index)
++                && let Some(position) = moved.dirty
++            {
++                self.dirty_indices[position.get() - 1] = index;
+             }
+         }
+-        self.dirty_qps.truncate(retained);
+     }
+ 
+-    /// Returns whether the connection must remain registered. Receive-buffer
+-    /// pressure leaves its dirty bit set for another timed pass.
++    /// Returns whether the connection must remain registered. Callers requeue
++    /// surviving receive deficits after assigning their new queue positions.
+     fn maintain_connection(
+         conn: &mut ConnState,
+         now: Instant,
+         sweep_reads: bool,
+         retry_receives: bool,
+     ) -> bool {
+-        conn.dirty = false;
++        conn.dirty = None;
+         if sweep_reads {
+             conn.sweep_read_timeouts(now);
+         }
+@@ -645,7 +667,6 @@ impl PollLoop {
+             // the socket after poller teardown.
+             return false;
+         }
+-        conn.dirty = conn.recv_deficit > 0 && conn.socket.state.is_ok();
+         true
+     }
+ 
+@@ -655,7 +676,7 @@ impl PollLoop {
+         let (cq_ready, wake_ready) = poll_readable2(
+             self.comp_channel.fd().as_raw_fd(),
+             self.wake_rx.as_raw_fd(),
+-            if self.dirty_qps.is_empty() {
++            if self.dirty_indices.is_empty() {
+                 Self::IDLE_TIMEOUT_MS
+             } else {
+                 // Only receive deficits survive maintenance. Recover promptly
+@@ -696,7 +717,7 @@ impl PollLoop {
+             match self.conns.entry(qp_num) {
+                 Entry::Vacant(entry) => {
+                     let mut conn = ConnState::new(incoming);
+-                    Self::mark_dirty(&mut conn, &mut self.dirty_qps);
++                    Self::mark_dirty(entry.index(), &mut conn, &mut self.dirty_indices);
+                     entry.insert(conn);
+                 }
+                 Entry::Occupied(_) => panic!("poller QP {qp_num} already registered"),
+@@ -708,22 +729,22 @@ impl PollLoop {
+     fn dispatch(&mut self, wc: Completion<'_>, batch: &mut DispatchBatch) {
+         let id = wc.info().wr_id;
+         let qp_num = wc.qp_num();
+-        if let Some(conn) = self.conns.get_mut(&qp_num)
++        if let Some((index, _, conn)) = self.conns.get_full_mut(&qp_num)
+             && conn.identity.contains(qp_num, id)
+         {
+             conn.handle_wc(wc, batch);
+-            Self::mark_dirty(conn, &mut self.dirty_qps);
++            Self::mark_dirty(index, conn, &mut self.dirty_indices);
+             return;
+         }
+         // Initial receives and inbox publication hold the same mutex. Bypass
+         // the empty-inbox hint: a registrar can still be posting the ring.
+         // Normal completions never acquire this lock.
+         self.drain_incoming(true);
+-        if let Some(conn) = self.conns.get_mut(&qp_num)
++        if let Some((index, _, conn)) = self.conns.get_full_mut(&qp_num)
+             && conn.identity.contains(qp_num, id)
+         {
+             conn.handle_wc(wc, batch);
+-            Self::mark_dirty(conn, &mut self.dirty_qps);
++            Self::mark_dirty(index, conn, &mut self.dirty_indices);
+         } else {
+             tracing::warn!("dropping completion for unknown or retired QP identity: {wc:?}");
+         }
+@@ -764,7 +785,7 @@ impl PollLoop {
+         // RegisteredConnection guards notify ordinary waiters and close the
+         // connection gauges exactly once, including already-failing sockets.
+         self.conns.clear();
+-        self.dirty_qps.clear();
++        self.dirty_indices.clear();
+         if self.unack_cq_events > 0 {
+             self.cq.ack_events(self.unack_cq_events);
+             self.unack_cq_events = 0;
+diff --git a/ruapc/src/rdma/poller/tests.rs b/ruapc/src/rdma/poller/tests.rs
+index 6ab31af..0a45753 100644
+--- a/ruapc/src/rdma/poller/tests.rs
++++ b/ruapc/src/rdma/poller/tests.rs
+@@ -204,8 +204,8 @@ fn manual_poller(context: &Arc<ruapc_rdma::Context>) -> (DevicePoller, PollLoop)
+         shared,
+         dispatcher: Dispatcher::start(1),
+         spin: Duration::ZERO,
+-        conns: HashMap::default(),
+-        dirty_qps: Vec::new(),
++        conns: IndexMap::default(),
++        dirty_indices: Vec::new(),
+         maintenance_requested,
+         unack_cq_events: 0,
+     };
+@@ -304,10 +304,8 @@ fn register_idle_socket(
+ }
+ 
+ fn mark_dirty(poll_loop: &mut PollLoop, qp_num: u32) {
+-    PollLoop::mark_dirty(
+-        poll_loop.conns.get_mut(&qp_num).unwrap(),
+-        &mut poll_loop.dirty_qps,
+-    );
++    let (index, _, conn) = poll_loop.conns.get_full_mut(&qp_num).unwrap();
++    PollLoop::mark_dirty(index, conn, &mut poll_loop.dirty_indices);
+ }
+ 
+ #[tokio::test]
+@@ -329,9 +327,9 @@ async fn dirty_maintenance_is_bounded_and_survives_replacement() {
+     let first_qp = first.queue_pair.qp_num();
+     let second_qp = second.queue_pair.qp_num();
+     assert!(poll_loop.drain_incoming(false));
+-    assert_eq!(poll_loop.dirty_qps.len(), 2);
++    assert_eq!(poll_loop.dirty_indices.len(), 2);
+     poll_loop.maintain_dirty_connections(Instant::now(), false);
+-    assert!(poll_loop.dirty_qps.is_empty());
++    assert!(poll_loop.dirty_indices.is_empty());
+ 
+     // A pending send on an unrelated connection must stay untouched when
+     // only the first connection has completion work. Exhaust its window
+@@ -346,13 +344,16 @@ async fn dirty_maintenance_is_bounded_and_survives_replacement() {
+         .unwrap();
+     mark_dirty(&mut poll_loop, first_qp);
+     mark_dirty(&mut poll_loop, first_qp);
+-    assert_eq!(poll_loop.dirty_qps, [first_qp]);
++    assert_eq!(
++        poll_loop.dirty_indices,
++        [poll_loop.conns.get_index_of(&first_qp).unwrap()]
++    );
+     poll_loop.maintain_dirty_connections(Instant::now(), false);
+     assert!(poll_loop.conns[&second_qp].pending_sends.is_empty());
+     poll_loop.maintain_connections(Instant::now(), false, false);
+     assert_eq!(poll_loop.conns[&second_qp].pending_sends.len(), 1);
+     assert!(
+-        poll_loop.dirty_qps.is_empty(),
++        poll_loop.dirty_indices.is_empty(),
+         "a full window must not force retry polling"
+     );
+ 
+@@ -362,15 +363,21 @@ async fn dirty_maintenance_is_bounded_and_survives_replacement() {
+     mark_dirty(&mut poll_loop, first_qp);
+     poll_loop.maintain_dirty_connections(Instant::now(), false);
+     mark_dirty(&mut poll_loop, first_qp);
+-    assert_eq!(poll_loop.dirty_qps, [first_qp]);
++    assert_eq!(
++        poll_loop.dirty_indices,
++        [poll_loop.conns.get_index_of(&first_qp).unwrap()]
++    );
+     poll_loop.maintain_connections(Instant::now(), false, false);
+-    assert_eq!(poll_loop.dirty_qps, [first_qp]);
++    assert_eq!(
++        poll_loop.dirty_indices,
++        [poll_loop.conns.get_index_of(&first_qp).unwrap()]
++    );
+     poll_loop.conns.get_mut(&first_qp).unwrap().recv_deficit = 0;
+ 
+     first.set_error();
+     poll_loop.maintain_dirty_connections(Instant::now(), false);
+     assert!(!poll_loop.conns.contains_key(&first_qp));
+-    assert!(poll_loop.dirty_qps.is_empty());
++    assert!(poll_loop.dirty_indices.is_empty());
+     drop(first);
+     poll_loop
+         .drain_completions(poller.cq(), &mut CompletionBatch::new(), &mut Vec::new())
+@@ -378,13 +385,88 @@ async fn dirty_maintenance_is_bounded_and_survives_replacement() {
+     let replacement = register_idle_socket(&poller, device, &buffer_pool, &state);
+     let replacement_qp = replacement.queue_pair.qp_num();
+     assert!(poll_loop.drain_incoming(false));
+-    assert_eq!(poll_loop.dirty_qps, [replacement_qp]);
++    assert_eq!(
++        poll_loop.dirty_indices,
++        [poll_loop.conns.get_index_of(&replacement_qp).unwrap()]
++    );
+     poll_loop.maintain_dirty_connections(Instant::now(), false);
+-    assert!(!poll_loop.conns[&replacement_qp].dirty);
+-    assert!(poll_loop.dirty_qps.is_empty());
++    assert!(poll_loop.conns[&replacement_qp].dirty.is_none());
++    assert!(poll_loop.dirty_indices.is_empty());
+     poll_loop.shutdown_cleanup();
+ }
+ 
++#[tokio::test]
++async fn moving_connections_preserves_pending_maintenance() {
++    let devices = crate::rdma::test_utils::make_rdma_devices();
++    let device = &devices.devices()[0];
++    let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
++    let (state, _stop) = State::create(
++        crate::Router::default(),
++        &crate::SocketPoolConfig {
++            rdma: None,
++            ..Default::default()
++        },
++    )
++    .unwrap();
++    for full_scan in [false, true] {
++        for survivor_needs_retry in [false, true] {
++            let (poller, mut poll_loop) = manual_poller(device.context());
++            let sockets = [
++                register_idle_socket(&poller, device, &pool, &state),
++                register_idle_socket(&poller, device, &pool, &state),
++                register_idle_socket(&poller, device, &pool, &state),
++            ];
++            poll_loop.drain_incoming(false);
++            poll_loop.maintain_dirty_connections(Instant::now(), false);
++            let qpns = sockets.each_ref().map(|socket| socket.queue_pair.qp_num());
++            for socket in &sockets[..2] {
++                socket.set_error();
++            }
++            if survivor_needs_retry {
++                poll_loop.conns.get_mut(&qpns[2]).unwrap().recv_deficit = 1;
++            }
++            // Queue order differs from storage order. Removing indices 1 then
++            // 0 moves the tail twice, after its queue position was compacted.
++            for qp_num in [qpns[1], qpns[2], qpns[0]] {
++                mark_dirty(&mut poll_loop, qp_num);
++            }
++            if full_scan {
++                poll_loop.maintain_connections(Instant::now(), false, false);
++            } else {
++                poll_loop.maintain_dirty_connections(Instant::now(), false);
++            }
++            assert_eq!(poll_loop.conns.len(), 1);
++            assert_eq!(poll_loop.conns.get_index_of(&qpns[2]), Some(0));
++            if survivor_needs_retry {
++                assert_eq!(poll_loop.dirty_indices, [0]);
++                assert_eq!(poll_loop.conns[&qpns[2]].dirty, NonZeroUsize::new(1));
++            } else {
++                assert!(poll_loop.dirty_indices.is_empty());
++                assert!(poll_loop.conns[&qpns[2]].dirty.is_none());
++            }
++
++            // New work must find and maintain the moved connection exactly
++            // once. Block its send window so this needs no invented CQEs.
++            assert!(matches!(
++                sockets[2].state.try_acquire(),
++                crate::rdma::SendPermit::Granted { .. }
++            ));
++            sockets[2]
++                .pending_sender
++                .try_send(pool.allocate(64).unwrap())
++                .unwrap();
++            mark_dirty(&mut poll_loop, qpns[2]);
++            mark_dirty(&mut poll_loop, qpns[2]);
++            assert_eq!(poll_loop.dirty_indices, [0]);
++            poll_loop.conns.get_mut(&qpns[2]).unwrap().recv_deficit = 0;
++            poll_loop.maintain_dirty_connections(Instant::now(), false);
++            assert_eq!(poll_loop.conns[&qpns[2]].pending_sends.len(), 1);
++            assert!(poll_loop.dirty_indices.is_empty());
++            poll_loop.shutdown_cleanup();
++        }
++    }
++}
++
+ #[tokio::test]
+ async fn identical_wrids_are_routed_by_their_provider_qp_numbers() {
+     let devices = crate::rdma::test_utils::make_rdma_devices();
+@@ -468,7 +550,7 @@ async fn identical_wrids_are_routed_by_their_provider_qp_numbers() {
+     }
+     poll_loop.maintain_dirty_connections(Instant::now(), false);
+     assert!(poll_loop.conns.is_empty());
+-    assert!(poll_loop.dirty_qps.is_empty());
++    assert!(poll_loop.dirty_indices.is_empty());
+     poll_loop.shutdown_cleanup();
+ }
+ 

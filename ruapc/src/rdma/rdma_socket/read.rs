@@ -7,11 +7,13 @@ use std::{
 };
 
 use ruapc_bufpool::RemoteBufferInfo;
-use ruapc_rdma::{ReadFailure, ReadPosting, ReadRequest, ReadSegment};
+use ruapc_rdma::{ReadFailure, ReadPosting, ReadReceiver, ReadRequest, ReadSegment};
+use tokio::sync::{Notify, Semaphore, SemaphorePermit};
 
 use super::RdmaSocket;
 use crate::{
     Buffer, Context, CopyOp, Error, ErrorKind, RemoteIoError, RemoteSpace, Result,
+    rdma::RdmaState,
     remote_memory::{
         WriteTarget,
         scatter::{self, SpaceLayout},
@@ -80,6 +82,49 @@ fn completion_error(reason: ReadFailure) -> Error {
     }
 }
 
+fn read_closed_error() -> Error {
+    Error::new(
+        ErrorKind::ConnectionClosed,
+        "RDMA connection closed before READ posting".into(),
+    )
+}
+
+async fn acquire_read_permits<'a>(
+    state: &RdmaState,
+    sq: &'a Semaphore,
+    device: &'a Semaphore,
+    closed: &Notify,
+) -> Result<(SemaphorePermit<'a>, SemaphorePermit<'a>)> {
+    if !state.is_ok() {
+        return Err(read_closed_error());
+    }
+    // Uncontended reads need only the existing semaphore operations. A
+    // closure waiter is registered only when either resource is exhausted.
+    if let Ok(sq_permit) = sq.try_acquire()
+        && let Ok(device_permit) = device.try_acquire()
+    {
+        return Ok((sq_permit, device_permit));
+    }
+    let notified = closed.notified();
+    tokio::pin!(notified);
+    // Register before checking state so closure cannot fall between that
+    // check and the first poll of a blocked semaphore acquisition.
+    notified.as_mut().enable();
+    if !state.is_ok() {
+        return Err(read_closed_error());
+    }
+    tokio::select! {
+        biased;
+        _ = &mut notified => Err(read_closed_error()),
+        permits = async {
+            // A congested connection must not reserve the whole NIC's capacity.
+            let sq_permit = sq.acquire().await.map_err(|_| read_closed_error())?;
+            let device_permit = device.acquire().await.map_err(|_| read_closed_error())?;
+            Ok((sq_permit, device_permit))
+        } => permits,
+    }
+}
+
 impl RdmaSocket {
     pub(crate) fn fail_read_batches(&self) {
         self.queue_pair.fail_pending_reads();
@@ -94,6 +139,9 @@ impl RdmaSocket {
         local: Vec<Buffer>,
         request_remaining: Option<Duration>,
     ) -> std::result::Result<Vec<Buffer>, (Error, Option<Vec<Buffer>>)> {
+        if !self.state.is_ok() {
+            return Err((read_closed_error(), Some(local)));
+        }
         let bytes = reads
             .iter()
             .flat_map(|read| &read.segments)
@@ -119,31 +167,48 @@ impl RdmaSocket {
                 // Drop accounts the unposted suffix before flushing the QP.
                 drop(posting);
                 self.set_error();
-                let _ = receiver.await;
+                let _ = self.await_read_batch(receiver).await;
                 return Err((error, None));
             }
         }
-        let result = receiver.await;
+        let result = self.await_read_batch(receiver).await;
         // Retain the posting owner's Arc until notification so the runtime
         // task, rather than the CQ poller, normally destroys the batch.
         drop(posting);
-        match result {
+        result.map_err(|error| (error, None))
+    }
+
+    /// Waits after posting finishes or its unposted suffix has been cancelled.
+    pub(crate) async fn await_read_batch(&self, receiver: ReadReceiver) -> Result<Vec<Buffer>> {
+        // A task may pass its final health check, then publish the WR only
+        // after shutdown has scanned the READ map. Recheck only once per
+        // batch, after publication, so that late work receives a failure even
+        // when no poller remains. If shutdown scans after publication instead,
+        // it finds the entry itself; the map's shard locks order both cases.
+        // Failure notification leaves the DMA holds in the QP.
+        if !self.state.is_ok() {
+            self.fail_read_batches();
+        }
+        match receiver.await {
             Ok(Ok(buffers)) => Ok(buffers),
-            Ok(Err(reason)) => Err((completion_error(reason), None)),
-            Err(_) => Err((completion_error(ReadFailure::Cancelled), None)),
+            Ok(Err(reason)) => Err(completion_error(reason)),
+            Err(_) => Err(completion_error(ReadFailure::Cancelled)),
         }
     }
 
     async fn post_read(&self, posting: &mut ReadPosting) -> Result<()> {
-        let permits_closed =
-            |_| Error::new(ErrorKind::RdmaSendFailed, "RDMA read permits closed".into());
-        // A congested connection must not reserve the whole device's capacity.
-        let sq_permit = self
-            .sq_read_permits
-            .acquire()
-            .await
-            .map_err(permits_closed)?;
-        let device_permit = self.read_permits.acquire().await.map_err(permits_closed)?;
+        let (sq_permit, device_permit) = acquire_read_permits(
+            &self.state,
+            &self.read_credits.sq,
+            &self.read_credits.device,
+            &self.read_credits.closed,
+        )
+        .await?;
+        if !self.state.is_ok() {
+            return Err(read_closed_error());
+        }
+        // The held SQ permit keeps the completion route registered even if
+        // closing the connection races this final check and the actual post.
         self.queue_pair.post_read(posting).map_err(plan_error)?;
         sq_permit.forget();
         device_permit.forget();
@@ -272,5 +337,186 @@ impl RdmaSocket {
             }),
             Err(e) => Err(RemoteIoError::new(e, buffers)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::ReadCredits;
+    use super::*;
+
+    async fn retain_posted_credits(state: &RdmaState, credits: &ReadCredits) {
+        let (sq, device) =
+            acquire_read_permits(state, &credits.sq, &credits.device, &credits.closed)
+                .await
+                .unwrap();
+        sq.forget();
+        device.forget();
+    }
+
+    #[tokio::test]
+    async fn completion_before_post_returns_does_not_double_return_credits() {
+        let state = RdmaState::new(4);
+        let device = Arc::new(Semaphore::new(2));
+        let credits = ReadCredits::new(device.clone(), 2);
+        let (sq_permit, device_permit) =
+            acquire_read_permits(&state, &credits.sq, &credits.device, &credits.closed)
+                .await
+                .unwrap();
+        assert_eq!(device.available_permits(), 1);
+        assert_eq!(credits.sq.available_permits(), 1);
+
+        // A poll thread can process the CQE while the posting thread still
+        // holds both permits, before the provider call returns to post_read.
+        credits.complete();
+        assert_eq!(device.available_permits(), 2);
+        assert_eq!(credits.sq.available_permits(), 2);
+        sq_permit.forget();
+        device_permit.forget();
+        assert!(credits.is_idle());
+        assert_eq!(device.available_permits(), 2);
+        drop(credits);
+        assert_eq!(device.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn completion_after_closing_admission_returns_both_credits_once() {
+        let state = RdmaState::new(4);
+        let device = Arc::new(Semaphore::new(2));
+        let credits = ReadCredits::new(device.clone(), 2);
+        retain_posted_credits(&state, &credits).await;
+        assert_eq!(device.available_permits(), 1);
+        assert!(!credits.is_idle());
+
+        credits.close();
+        assert!(credits.is_closed());
+        credits.complete();
+        assert!(credits.is_idle());
+        assert_eq!(device.available_permits(), 2);
+        drop(credits);
+        assert_eq!(device.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn destruction_refunds_only_unpolled_reads_and_preserves_other_qp_usage() {
+        let state = RdmaState::new(4);
+        let device = Arc::new(Semaphore::new(4));
+        let other_qp_read = device.acquire().await.unwrap();
+        let mut credits = ReadCredits::new(device.clone(), 2);
+        retain_posted_credits(&state, &credits).await;
+        retain_posted_credits(&state, &credits).await;
+        assert_eq!(device.available_permits(), 1);
+
+        credits.complete();
+        assert_eq!(device.available_permits(), 2);
+        // Model the exclusive QP snapshot: one of the two posted WRs still
+        // lacks a processed CQE. Merely recording it must not refund anything.
+        credits.unpolled_on_drop = 1;
+        assert_eq!(device.available_permits(), 2);
+        drop(credits);
+        assert_eq!(device.available_permits(), 3);
+        drop(other_qp_read);
+        assert_eq!(device.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn forgetting_an_unposted_nic_waiter_does_not_invent_credit() {
+        let state = RdmaState::new(4);
+        let device = Arc::new(Semaphore::new(1));
+        let other_qp_read = device.acquire().await.unwrap();
+        let credits = ReadCredits::new(device.clone(), 2);
+        let mut acquiring = Box::pin(acquire_read_permits(
+            &state,
+            &credits.sq,
+            &credits.device,
+            &credits.closed,
+        ));
+        assert!(futures_util::poll!(&mut acquiring).is_pending());
+        assert_eq!(credits.sq.available_permits(), 1);
+        assert_eq!(device.available_permits(), 0);
+
+        // Forgetting ends the borrow without releasing the held SQ permit.
+        // No READ was posted, so the QP's final pending count remains zero.
+        std::mem::forget(acquiring);
+        drop(credits);
+        assert_eq!(device.available_permits(), 0);
+        // Prevent the intentionally leaked waiter from taking the unrelated
+        // read's returned permit. Leaking a future may retain resources, but
+        // must not make more NIC credit available than was originally issued.
+        device.close();
+        drop(other_qp_read);
+        assert_eq!(device.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn closing_read_admission_wakes_a_task_waiting_for_sq_capacity() {
+        let state = RdmaState::new(4);
+        let sq = Semaphore::new(1);
+        let device = Semaphore::new(2);
+        let closed = Notify::new();
+        let outstanding = sq.acquire().await.unwrap();
+        let acquiring = acquire_read_permits(&state, &sq, &device, &closed);
+        tokio::pin!(acquiring);
+        assert!(futures_util::poll!(&mut acquiring).is_pending());
+        assert_eq!(device.available_permits(), 2);
+
+        state.set_error();
+        sq.close();
+        closed.notify_waiters();
+        assert_eq!(
+            acquiring.await.unwrap_err().kind,
+            ErrorKind::ConnectionClosed
+        );
+        assert_eq!(sq.available_permits(), 0);
+        drop(outstanding);
+        assert_eq!(sq.available_permits(), 1);
+        assert_eq!(device.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn closing_read_admission_releases_sq_capacity_while_device_is_full() {
+        let state = RdmaState::new(4);
+        let sq = Semaphore::new(2);
+        let device = Semaphore::new(1);
+        let closed = Notify::new();
+        let unrelated_read = device.acquire().await.unwrap();
+        let acquiring = acquire_read_permits(&state, &sq, &device, &closed);
+        tokio::pin!(acquiring);
+        assert!(futures_util::poll!(&mut acquiring).is_pending());
+        assert_eq!(sq.available_permits(), 1);
+
+        state.set_error();
+        sq.close();
+        closed.notify_waiters();
+        assert_eq!(
+            acquiring.await.unwrap_err().kind,
+            ErrorKind::ConnectionClosed
+        );
+        assert_eq!(sq.available_permits(), 2);
+        assert_eq!(device.available_permits(), 0);
+        assert!(!device.is_closed());
+        drop(unrelated_read);
+        assert_eq!(device.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn closure_before_registering_a_waiter_rejects_without_taking_permits() {
+        let state = RdmaState::new(4);
+        let sq = Semaphore::new(2);
+        let device = Semaphore::new(2);
+        let closed = Notify::new();
+        state.set_error();
+        sq.close();
+        closed.notify_waiters();
+
+        assert_eq!(
+            acquire_read_permits(&state, &sq, &device, &closed)
+                .await
+                .unwrap_err()
+                .kind,
+            ErrorKind::ConnectionClosed
+        );
+        assert_eq!(sq.available_permits(), 2);
+        assert_eq!(device.available_permits(), 2);
     }
 }

@@ -1,0 +1,484 @@
+{
+  "pairs": 5,
+  "iterations": 10000,
+  "warmup": 1000,
+  "description": "Separate one-MiB directions; full verification retained. Remote await includes admission, DMA completion and internal RPC, not pure hardware DMA time.",
+  "binaries": {
+    "baseline": {
+      "path": "/tmp/ruapc-capacity-bench/remote-diagnostic-baseline",
+      "sha256": "2b8a3c14f9f0345cd459ba058d1660830956a21e2b8f33f344888ee7e2231d56"
+    },
+    "current": {
+      "path": "/tmp/ruapc-capacity-bench/remote-diagnostic-final",
+      "sha256": "b0cc2f824e4bbd00d8de6ff635526435aa61c96bd8ac831592eb6db5da0cc48b"
+    }
+  },
+  "runs": [
+    {
+      "direction": "read",
+      "pair": 1,
+      "version": "baseline",
+      "artifact": "remote-diagnostic-read-baseline-1.json",
+      "metrics": {
+        "iterations": 10000,
+        "operation": "remote_read_all",
+        "phase": "diagnostic",
+        "remote_await_us_per_op": 71.1725234,
+        "size": 1048576,
+        "verify_us_per_op": 37.314675300000005,
+        "wall_us_per_op": 205.7519794
+      },
+      "all_phases_process_user_cpu_s": 3.5182559999998375,
+      "all_phases_process_system_cpu_s": 0.3586010000000215,
+      "all_phases_voluntary_context_switches": 139676,
+      "all_phases_involuntary_context_switches": 15
+    },
+    {
+      "direction": "read",
+      "pair": 1,
+      "version": "current",
+      "artifact": "remote-diagnostic-read-current-1.json",
+      "metrics": {
+        "iterations": 10000,
+        "operation": "remote_read_all",
+        "phase": "diagnostic",
+        "remote_await_us_per_op": 63.5300078,
+        "size": 1048576,
+        "verify_us_per_op": 37.5455156,
+        "wall_us_per_op": 212.62626699999998
+      },
+      "all_phases_process_user_cpu_s": 3.4792429999999968,
+      "all_phases_process_system_cpu_s": 0.35430900000000065,
+      "all_phases_voluntary_context_switches": 137715,
+      "all_phases_involuntary_context_switches": 12
+    },
+    {
+      "direction": "read",
+      "pair": 2,
+      "version": "current",
+      "artifact": "remote-diagnostic-read-current-2.json",
+      "metrics": {
+        "iterations": 10000,
+        "operation": "remote_read_all",
+        "phase": "diagnostic",
+        "remote_await_us_per_op": 62.0721755,
+        "size": 1048576,
+        "verify_us_per_op": 37.8925782,
+        "wall_us_per_op": 204.23537050000002
+      },
+      "all_phases_process_user_cpu_s": 3.4844809999999597,
+      "all_phases_process_system_cpu_s": 0.3450469999999939,
+      "all_phases_voluntary_context_switches": 137074,
+      "all_phases_involuntary_context_switches": 18
+    },
+    {
+      "direction": "read",
+      "pair": 2,
+      "version": "baseline",
+      "artifact": "remote-diagnostic-read-baseline-2.json",
+      "metrics": {
+        "iterations": 10000,
+        "operation": "remote_read_all",
+        "phase": "diagnostic",
+        "remote_await_us_per_op": 69.6997705,
+        "size": 1048576,
+        "verify_us_per_op": 37.7680998,
+        "wall_us_per_op": 231.23109039999997
+      },
+      "all_phases_process_user_cpu_s": 3.4442850000000362,
+      "all_phases_process_system_cpu_s": 0.37611100000000874,
+      "all_phases_voluntary_context_switches": 141978,
+      "all_phases_involuntary_context_switches": 19
+    },
+    {
+      "direction": "read",
+      "pair": 3,
+      "version": "baseline",
+      "artifact": "remote-diagnostic-read-baseline-3.json",
+      "metrics": {
+        "iterations": 10000,
+        "operation": "remote_read_all",
+        "phase": "diagnostic",
+        "remote_await_us_per_op": 61.1028485,
+        "size": 1048576,
+        "verify_us_per_op": 37.668087899999996,
+        "wall_us_per_op": 187.9379444
+      },
+      "all_phases_process_user_cpu_s": 3.468458000000055,
+      "all_phases_process_system_cpu_s": 0.3468329999999753,
+      "all_phases_voluntary_context_switches": 136838,
+      "all_phases_involuntary_context_switches": 17
+    },
+    {
+      "direction": "read",
+      "pair": 3,
+      "version": "current",
+      "artifact": "remote-diagnostic-read-current-3.json",
+      "metrics": {
+        "iterations": 10000,
+        "operation": "remote_read_all",
+        "phase": "diagnostic",
+        "remote_await_us_per_op": 67.61348029999999,
+        "size": 1048576,
+        "verify_us_per_op": 37.4561048,
+        "wall_us_per_op": 188.38749510000002
+      },
+      "all_phases_process_user_cpu_s": 3.5270450000000437,
+      "all_phases_process_system_cpu_s": 0.38313700000000495,
+      "all_phases_voluntary_context_switches": 138918,
+      "all_phases_involuntary_context_switches": 19
+    },
+    {
+      "direction": "read",
+      "pair": 4,
+      "version": "current",
+      "artifact": "remote-diagnostic-read-current-4.json",
+      "metrics": {
+        "iterations": 10000,
+        "operation": "remote_read_all",
+        "phase": "diagnostic",
+        "remote_await_us_per_op": 68.1278619,
+        "size": 1048576,
+        "verify_us_per_op": 37.6772262,
+        "wall_us_per_op": 223.8387977
+      },
+      "all_phases_process_user_cpu_s": 3.52474200000006,
+      "all_phases_process_system_cpu_s": 0.36716499999999996,
+      "all_phases_voluntary_context_switches": 137821,
+      "all_phases_involuntary_context_switches": 22
+    },
+    {
+      "direction": "read",
+      "pair": 4,
+      "version": "baseline",
+      "artifact": "remote-diagnostic-read-baseline-4.json",
+      "metrics": {
+        "iterations": 10000,
+        "operation": "remote_read_all",
+        "phase": "diagnostic",
+        "remote_await_us_per_op": 79.5935386,
+        "size": 1048576,
+        "verify_us_per_op": 37.4688935,
+        "wall_us_per_op": 199.5012081
+      },
+      "all_phases_process_user_cpu_s": 3.430468000000019,
+      "all_phases_process_system_cpu_s": 0.37242299999999773,
+      "all_phases_voluntary_context_switches": 142660,
+      "all_phases_involuntary_context_switches": 20
+    },
+    {
+      "direction": "read",
+      "pair": 5,
+      "version": "baseline",
+      "artifact": "remote-diagnostic-read-baseline-5.json",
+      "metrics": {
+        "iterations": 10000,
+        "operation": "remote_read_all",
+        "phase": "diagnostic",
+        "remote_await_us_per_op": 65.8895134,
+        "size": 1048576,
+        "verify_us_per_op": 37.5664796,
+        "wall_us_per_op": 217.45424419999998
+      },
+      "all_phases_process_user_cpu_s": 3.4744029999999384,
+      "all_phases_process_system_cpu_s": 0.3673310000000072,
+      "all_phases_voluntary_context_switches": 136872,
+      "all_phases_involuntary_context_switches": 19
+    },
+    {
+      "direction": "read",
+      "pair": 5,
+      "version": "current",
+      "artifact": "remote-diagnostic-read-current-5.json",
+      "metrics": {
+        "iterations": 10000,
+        "operation": "remote_read_all",
+        "phase": "diagnostic",
+        "remote_await_us_per_op": 61.536716399999996,
+        "size": 1048576,
+        "verify_us_per_op": 37.95271760000001,
+        "wall_us_per_op": 196.52725700000002
+      },
+      "all_phases_process_user_cpu_s": 3.464825000000019,
+      "all_phases_process_system_cpu_s": 0.3825820000000135,
+      "all_phases_voluntary_context_switches": 136677,
+      "all_phases_involuntary_context_switches": 10
+    },
+    {
+      "direction": "write",
+      "pair": 1,
+      "version": "baseline",
+      "artifact": "remote-diagnostic-write-baseline-1.json",
+      "metrics": {
+        "iterations": 10000,
+        "operation": "remote_write_all",
+        "phase": "diagnostic",
+        "remote_await_us_per_op": 108.1484996,
+        "size": 1048576,
+        "verify_us_per_op": 37.6916241,
+        "wall_us_per_op": 348.8808006
+      },
+      "all_phases_process_user_cpu_s": 3.331578000000036,
+      "all_phases_process_system_cpu_s": 0.37658299999998235,
+      "all_phases_voluntary_context_switches": 143968,
+      "all_phases_involuntary_context_switches": 20
+    },
+    {
+      "direction": "write",
+      "pair": 1,
+      "version": "current",
+      "artifact": "remote-diagnostic-write-current-1.json",
+      "metrics": {
+        "iterations": 10000,
+        "operation": "remote_write_all",
+        "phase": "diagnostic",
+        "remote_await_us_per_op": 77.3830974,
+        "size": 1048576,
+        "verify_us_per_op": 37.4354735,
+        "wall_us_per_op": 233.2512898
+      },
+      "all_phases_process_user_cpu_s": 3.2716429999998127,
+      "all_phases_process_system_cpu_s": 0.39811400000002095,
+      "all_phases_voluntary_context_switches": 143332,
+      "all_phases_involuntary_context_switches": 12
+    },
+    {
+      "direction": "write",
+      "pair": 2,
+      "version": "current",
+      "artifact": "remote-diagnostic-write-current-2.json",
+      "metrics": {
+        "iterations": 10000,
+        "operation": "remote_write_all",
+        "phase": "diagnostic",
+        "remote_await_us_per_op": 76.02116550000001,
+        "size": 1048576,
+        "verify_us_per_op": 37.5670053,
+        "wall_us_per_op": 235.0219709
+      },
+      "all_phases_process_user_cpu_s": 3.3311700000001565,
+      "all_phases_process_system_cpu_s": 0.40503899999998794,
+      "all_phases_voluntary_context_switches": 143379,
+      "all_phases_involuntary_context_switches": 13
+    },
+    {
+      "direction": "write",
+      "pair": 2,
+      "version": "baseline",
+      "artifact": "remote-diagnostic-write-baseline-2.json",
+      "metrics": {
+        "iterations": 10000,
+        "operation": "remote_write_all",
+        "phase": "diagnostic",
+        "remote_await_us_per_op": 78.7331983,
+        "size": 1048576,
+        "verify_us_per_op": 37.579871700000005,
+        "wall_us_per_op": 242.14513989999998
+      },
+      "all_phases_process_user_cpu_s": 3.346806000000015,
+      "all_phases_process_system_cpu_s": 0.3519279999999867,
+      "all_phases_voluntary_context_switches": 143123,
+      "all_phases_involuntary_context_switches": 10
+    },
+    {
+      "direction": "write",
+      "pair": 3,
+      "version": "baseline",
+      "artifact": "remote-diagnostic-write-baseline-3.json",
+      "metrics": {
+        "iterations": 10000,
+        "operation": "remote_write_all",
+        "phase": "diagnostic",
+        "remote_await_us_per_op": 88.8835852,
+        "size": 1048576,
+        "verify_us_per_op": 37.4222401,
+        "wall_us_per_op": 251.4029335
+      },
+      "all_phases_process_user_cpu_s": 3.3726950000000215,
+      "all_phases_process_system_cpu_s": 0.4003500000000031,
+      "all_phases_voluntary_context_switches": 143158,
+      "all_phases_involuntary_context_switches": 13
+    },
+    {
+      "direction": "write",
+      "pair": 3,
+      "version": "current",
+      "artifact": "remote-diagnostic-write-current-3.json",
+      "metrics": {
+        "iterations": 10000,
+        "operation": "remote_write_all",
+        "phase": "diagnostic",
+        "remote_await_us_per_op": 73.4279724,
+        "size": 1048576,
+        "verify_us_per_op": 37.6584813,
+        "wall_us_per_op": 233.6980218
+      },
+      "all_phases_process_user_cpu_s": 3.314956999999822,
+      "all_phases_process_system_cpu_s": 0.37631600000000276,
+      "all_phases_voluntary_context_switches": 143042,
+      "all_phases_involuntary_context_switches": 10
+    },
+    {
+      "direction": "write",
+      "pair": 4,
+      "version": "current",
+      "artifact": "remote-diagnostic-write-current-4.json",
+      "metrics": {
+        "iterations": 10000,
+        "operation": "remote_write_all",
+        "phase": "diagnostic",
+        "remote_await_us_per_op": 73.3155998,
+        "size": 1048576,
+        "verify_us_per_op": 37.5512111,
+        "wall_us_per_op": 225.34005700000003
+      },
+      "all_phases_process_user_cpu_s": 3.3496920000000046,
+      "all_phases_process_system_cpu_s": 0.3630330000000015,
+      "all_phases_voluntary_context_switches": 143215,
+      "all_phases_involuntary_context_switches": 12
+    },
+    {
+      "direction": "write",
+      "pair": 4,
+      "version": "baseline",
+      "artifact": "remote-diagnostic-write-baseline-4.json",
+      "metrics": {
+        "iterations": 10000,
+        "operation": "remote_write_all",
+        "phase": "diagnostic",
+        "remote_await_us_per_op": 82.3711725,
+        "size": 1048576,
+        "verify_us_per_op": 37.5549009,
+        "wall_us_per_op": 252.8049165
+      },
+      "all_phases_process_user_cpu_s": 3.3303860000000896,
+      "all_phases_process_system_cpu_s": 0.38642600000000016,
+      "all_phases_voluntary_context_switches": 143370,
+      "all_phases_involuntary_context_switches": 12
+    },
+    {
+      "direction": "write",
+      "pair": 5,
+      "version": "baseline",
+      "artifact": "remote-diagnostic-write-baseline-5.json",
+      "metrics": {
+        "iterations": 10000,
+        "operation": "remote_write_all",
+        "phase": "diagnostic",
+        "remote_await_us_per_op": 137.5843091,
+        "size": 1048576,
+        "verify_us_per_op": 37.6262008,
+        "wall_us_per_op": 415.06540309999997
+      },
+      "all_phases_process_user_cpu_s": 3.4849179999998796,
+      "all_phases_process_system_cpu_s": 0.3322830000000181,
+      "all_phases_voluntary_context_switches": 143509,
+      "all_phases_involuntary_context_switches": 15
+    },
+    {
+      "direction": "write",
+      "pair": 5,
+      "version": "current",
+      "artifact": "remote-diagnostic-write-current-5.json",
+      "metrics": {
+        "iterations": 10000,
+        "operation": "remote_write_all",
+        "phase": "diagnostic",
+        "remote_await_us_per_op": 139.8365845,
+        "size": 1048576,
+        "verify_us_per_op": 38.126495000000006,
+        "wall_us_per_op": 401.9610129
+      },
+      "all_phases_process_user_cpu_s": 3.3684370000000854,
+      "all_phases_process_system_cpu_s": 0.41709299999999416,
+      "all_phases_voluntary_context_switches": 144001,
+      "all_phases_involuntary_context_switches": 17
+    }
+  ],
+  "summary": {
+    "read/wall_us_per_op": {
+      "baseline_median": 205.7519794,
+      "current_median": 204.23537050000002,
+      "median_change_percent": -0.7371053753274293,
+      "paired_ratio_median_change_percent": 0.23920166916544527,
+      "baseline_min_max": [
+        187.9379444,
+        231.23109039999997
+      ],
+      "current_min_max": [
+        188.38749510000002,
+        223.8387977
+      ]
+    },
+    "read/verify_us_per_op": {
+      "baseline_median": 37.5664796,
+      "current_median": 37.6772262,
+      "median_change_percent": 0.2948016454541458,
+      "paired_ratio_median_change_percent": 0.556015084886341,
+      "baseline_min_max": [
+        37.314675300000005,
+        37.7680998
+      ],
+      "current_min_max": [
+        37.4561048,
+        37.95271760000001
+      ]
+    },
+    "read/remote_await_us_per_op": {
+      "baseline_median": 69.6997705,
+      "current_median": 63.5300078,
+      "median_change_percent": -8.851912503786508,
+      "paired_ratio_median_change_percent": -10.738014102785066,
+      "baseline_min_max": [
+        61.1028485,
+        79.5935386
+      ],
+      "current_min_max": [
+        61.536716399999996,
+        68.1278619
+      ]
+    },
+    "write/wall_us_per_op": {
+      "baseline_median": 252.8049165,
+      "current_median": 233.6980218,
+      "median_change_percent": -7.557960092125027,
+      "paired_ratio_median_change_percent": -7.042444355566757,
+      "baseline_min_max": [
+        242.14513989999998,
+        415.06540309999997
+      ],
+      "current_min_max": [
+        225.34005700000003,
+        401.9610129
+      ]
+    },
+    "write/verify_us_per_op": {
+      "baseline_median": 37.579871700000005,
+      "current_median": 37.5670053,
+      "median_change_percent": -0.03423747718650505,
+      "paired_ratio_median_change_percent": -0.009825082510062089,
+      "baseline_min_max": [
+        37.4222401,
+        37.6916241
+      ],
+      "current_min_max": [
+        37.4354735,
+        38.126495000000006
+      ]
+    },
+    "write/remote_await_us_per_op": {
+      "baseline_median": 88.8835852,
+      "current_median": 76.02116550000001,
+      "median_change_percent": -14.471085601529033,
+      "paired_ratio_median_change_percent": -10.993618793031024,
+      "baseline_min_max": [
+        78.7331983,
+        137.5843091
+      ],
+      "current_min_max": [
+        73.3155998,
+        139.8365845
+      ]
+    }
+  }
+}

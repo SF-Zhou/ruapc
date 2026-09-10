@@ -1,0 +1,385 @@
+{
+  "binary": "/tmp/ruapc-capacity-bench/capacity-qps-baseline",
+  "binary_sha256": "c7a98d9eb860a57a19b34bf0700c46352a7dbfc584ebe8c637addad485ab98a3",
+  "environment": {
+    "RUAPC_CAPACITY_QPS": "20000",
+    "RUAPC_BENCH_RDMA_DEVICE": "mlx5_0"
+  },
+  "command": [
+    "numactl",
+    "--physcpubind=0-10",
+    "--membind=0",
+    "env",
+    "LD_PRELOAD=/tmp/ruapc-capacity-bench/pin_threads.so",
+    "/tmp/ruapc-capacity-bench/capacity-qps-baseline"
+  ],
+  "returncode": 0,
+  "elapsed_s": 7.629107830987778,
+  "stdout": "{\"elapsed_s\":0.075574252,\"live_qps\":512,\"memory\":{\"cgroup_bytes\":45341892608,\"locked_kib\":0,\"rss_kib\":35340},\"phase\":\"progress\"}\n{\"elapsed_s\":0.155249835,\"live_qps\":1024,\"memory\":{\"cgroup_bytes\":45347581952,\"locked_kib\":0,\"rss_kib\":41484},\"phase\":\"progress\"}\n{\"elapsed_s\":0.229506866,\"live_qps\":1536,\"memory\":{\"cgroup_bytes\":45355368448,\"locked_kib\":0,\"rss_kib\":44556},\"phase\":\"progress\"}\n{\"elapsed_s\":0.303648834,\"live_qps\":2048,\"memory\":{\"cgroup_bytes\":45364273152,\"locked_kib\":0,\"rss_kib\":47628},\"phase\":\"progress\"}\n{\"elapsed_s\":0.378201713,\"live_qps\":2560,\"memory\":{\"cgroup_bytes\":45371428864,\"locked_kib\":0,\"rss_kib\":53772},\"phase\":\"progress\"}\n{\"elapsed_s\":0.451964988,\"live_qps\":3072,\"memory\":{\"cgroup_bytes\":45381640192,\"locked_kib\":0,\"rss_kib\":60392},\"phase\":\"progress\"}\n{\"elapsed_s\":0.526151783,\"live_qps\":3584,\"memory\":{\"cgroup_bytes\":45389824000,\"locked_kib\":0,\"rss_kib\":63464},\"phase\":\"progress\"}\n{\"elapsed_s\":0.600482907,\"live_qps\":4096,\"memory\":{\"cgroup_bytes\":45398753280,\"locked_kib\":0,\"rss_kib\":69608},\"phase\":\"progress\"}\n{\"elapsed_s\":0.674122575,\"live_qps\":4608,\"memory\":{\"cgroup_bytes\":45406711808,\"locked_kib\":0,\"rss_kib\":72680},\"phase\":\"progress\"}\n{\"elapsed_s\":0.74663544,\"live_qps\":5120,\"memory\":{\"cgroup_bytes\":45415497728,\"locked_kib\":0,\"rss_kib\":75752},\"phase\":\"progress\"}\n{\"elapsed_s\":0.819518655,\"live_qps\":5632,\"memory\":{\"cgroup_bytes\":45424652288,\"locked_kib\":0,\"rss_kib\":81896},\"phase\":\"progress\"}\n{\"elapsed_s\":0.892601642,\"live_qps\":6144,\"memory\":{\"cgroup_bytes\":45434052608,\"locked_kib\":0,\"rss_kib\":84968},\"phase\":\"progress\"}\n{\"elapsed_s\":0.965407379,\"live_qps\":6656,\"memory\":{\"cgroup_bytes\":45441695744,\"locked_kib\":0,\"rss_kib\":88040},\"phase\":\"progress\"}\n{\"elapsed_s\":1.037918311,\"live_qps\":7168,\"memory\":{\"cgroup_bytes\":45451051008,\"locked_kib\":0,\"rss_kib\":94184},\"phase\":\"progress\"}\n{\"elapsed_s\":1.110583717,\"live_qps\":7680,\"memory\":{\"cgroup_bytes\":45460393984,\"locked_kib\":0,\"rss_kib\":97256},\"phase\":\"progress\"}\n{\"elapsed_s\":1.183969111,\"live_qps\":8192,\"memory\":{\"cgroup_bytes\":45482008576,\"locked_kib\":0,\"rss_kib\":100328},\"phase\":\"progress\"}\n{\"elapsed_s\":1.2560434329999999,\"live_qps\":8704,\"memory\":{\"cgroup_bytes\":45483384832,\"locked_kib\":0,\"rss_kib\":106472},\"phase\":\"progress\"}\n{\"elapsed_s\":1.328537099,\"live_qps\":9216,\"memory\":{\"cgroup_bytes\":45487976448,\"locked_kib\":0,\"rss_kib\":109544},\"phase\":\"progress\"}\n{\"elapsed_s\":1.4005543839999999,\"live_qps\":9728,\"memory\":{\"cgroup_bytes\":45495185408,\"locked_kib\":0,\"rss_kib\":112616},\"phase\":\"progress\"}\n{\"elapsed_s\":1.473100429,\"live_qps\":10240,\"memory\":{\"cgroup_bytes\":45503524864,\"locked_kib\":0,\"rss_kib\":118760},\"phase\":\"progress\"}\n{\"elapsed_s\":1.5645817979999999,\"live_qps\":10752,\"memory\":{\"cgroup_bytes\":45510574080,\"locked_kib\":0,\"rss_kib\":121832},\"phase\":\"progress\"}\n{\"elapsed_s\":1.664018102,\"live_qps\":11264,\"memory\":{\"cgroup_bytes\":45518307328,\"locked_kib\":0,\"rss_kib\":124904},\"phase\":\"progress\"}\n{\"elapsed_s\":1.762826117,\"live_qps\":11776,\"memory\":{\"cgroup_bytes\":45526261760,\"locked_kib\":0,\"rss_kib\":131048},\"phase\":\"progress\"}\n{\"elapsed_s\":1.862166746,\"live_qps\":12288,\"memory\":{\"cgroup_bytes\":45535133696,\"locked_kib\":0,\"rss_kib\":134120},\"phase\":\"progress\"}\n{\"elapsed_s\":1.9604697770000001,\"live_qps\":12800,\"memory\":{\"cgroup_bytes\":45543264256,\"locked_kib\":0,\"rss_kib\":140264},\"phase\":\"progress\"}\n{\"elapsed_s\":2.060865231,\"live_qps\":13312,\"memory\":{\"cgroup_bytes\":45551726592,\"locked_kib\":0,\"rss_kib\":143336},\"phase\":\"progress\"}\n{\"elapsed_s\":2.159599874,\"live_qps\":13824,\"memory\":{\"cgroup_bytes\":45560893440,\"locked_kib\":0,\"rss_kib\":146408},\"phase\":\"progress\"}\n{\"elapsed_s\":2.2587,\"live_qps\":14336,\"memory\":{\"cgroup_bytes\":45569626112,\"locked_kib\":0,\"rss_kib\":152552},\"phase\":\"progress\"}\n{\"elapsed_s\":2.357643369,\"live_qps\":14848,\"memory\":{\"cgroup_bytes\":45578276864,\"locked_kib\":0,\"rss_kib\":155624},\"phase\":\"progress\"}\n{\"elapsed_s\":2.456835544,\"live_qps\":15360,\"memory\":{\"cgroup_bytes\":45587427328,\"locked_kib\":0,\"rss_kib\":161768},\"phase\":\"progress\"}\n{\"elapsed_s\":2.555887547,\"live_qps\":15872,\"memory\":{\"cgroup_bytes\":45596160000,\"locked_kib\":0,\"rss_kib\":164840},\"phase\":\"progress\"}\n{\"elapsed_s\":2.6551773,\"live_qps\":16384,\"memory\":{\"cgroup_bytes\":45604069376,\"locked_kib\":0,\"rss_kib\":167912},\"phase\":\"progress\"}\n{\"actual_qp_cap\":{\"recv_sge\":1,\"recv_wr\":4,\"send_sge\":1,\"send_wr\":4},\"all_share_one_cq\":true,\"cq_requested\":262144,\"device\":\"mlx5_0\",\"elapsed_s\":2.655255148,\"failure\":{\"at_index\":16384,\"kind\":\"CompletionRoutesExhausted\",\"message\":\"CompletionRoutesExhausted\"},\"live_qps\":16384,\"max_slot\":16383,\"memory_after\":{\"cgroup_bytes\":45604069376,\"locked_kib\":0,\"rss_kib\":167912},\"memory_before\":{\"cgroup_bytes\":45301919744,\"locked_kib\":0,\"rss_kib\":0},\"phase\":\"created\",\"requested_depth\":4,\"requested_qps\":20000}\n{\"destroyed_qps\":16384,\"elapsed_s\":4.93002428,\"memory\":{\"cgroup_bytes\":45429706752,\"locked_kib\":0,\"rss_kib\":135980},\"phase\":\"dropped\"}\n",
+  "stderr": "pin_threads: main -> cpu=8\n",
+  "events": [
+    {
+      "elapsed_s": 0.075574252,
+      "live_qps": 512,
+      "memory": {
+        "cgroup_bytes": 45341892608,
+        "locked_kib": 0,
+        "rss_kib": 35340
+      },
+      "phase": "progress"
+    },
+    {
+      "elapsed_s": 0.155249835,
+      "live_qps": 1024,
+      "memory": {
+        "cgroup_bytes": 45347581952,
+        "locked_kib": 0,
+        "rss_kib": 41484
+      },
+      "phase": "progress"
+    },
+    {
+      "elapsed_s": 0.229506866,
+      "live_qps": 1536,
+      "memory": {
+        "cgroup_bytes": 45355368448,
+        "locked_kib": 0,
+        "rss_kib": 44556
+      },
+      "phase": "progress"
+    },
+    {
+      "elapsed_s": 0.303648834,
+      "live_qps": 2048,
+      "memory": {
+        "cgroup_bytes": 45364273152,
+        "locked_kib": 0,
+        "rss_kib": 47628
+      },
+      "phase": "progress"
+    },
+    {
+      "elapsed_s": 0.378201713,
+      "live_qps": 2560,
+      "memory": {
+        "cgroup_bytes": 45371428864,
+        "locked_kib": 0,
+        "rss_kib": 53772
+      },
+      "phase": "progress"
+    },
+    {
+      "elapsed_s": 0.451964988,
+      "live_qps": 3072,
+      "memory": {
+        "cgroup_bytes": 45381640192,
+        "locked_kib": 0,
+        "rss_kib": 60392
+      },
+      "phase": "progress"
+    },
+    {
+      "elapsed_s": 0.526151783,
+      "live_qps": 3584,
+      "memory": {
+        "cgroup_bytes": 45389824000,
+        "locked_kib": 0,
+        "rss_kib": 63464
+      },
+      "phase": "progress"
+    },
+    {
+      "elapsed_s": 0.600482907,
+      "live_qps": 4096,
+      "memory": {
+        "cgroup_bytes": 45398753280,
+        "locked_kib": 0,
+        "rss_kib": 69608
+      },
+      "phase": "progress"
+    },
+    {
+      "elapsed_s": 0.674122575,
+      "live_qps": 4608,
+      "memory": {
+        "cgroup_bytes": 45406711808,
+        "locked_kib": 0,
+        "rss_kib": 72680
+      },
+      "phase": "progress"
+    },
+    {
+      "elapsed_s": 0.74663544,
+      "live_qps": 5120,
+      "memory": {
+        "cgroup_bytes": 45415497728,
+        "locked_kib": 0,
+        "rss_kib": 75752
+      },
+      "phase": "progress"
+    },
+    {
+      "elapsed_s": 0.819518655,
+      "live_qps": 5632,
+      "memory": {
+        "cgroup_bytes": 45424652288,
+        "locked_kib": 0,
+        "rss_kib": 81896
+      },
+      "phase": "progress"
+    },
+    {
+      "elapsed_s": 0.892601642,
+      "live_qps": 6144,
+      "memory": {
+        "cgroup_bytes": 45434052608,
+        "locked_kib": 0,
+        "rss_kib": 84968
+      },
+      "phase": "progress"
+    },
+    {
+      "elapsed_s": 0.965407379,
+      "live_qps": 6656,
+      "memory": {
+        "cgroup_bytes": 45441695744,
+        "locked_kib": 0,
+        "rss_kib": 88040
+      },
+      "phase": "progress"
+    },
+    {
+      "elapsed_s": 1.037918311,
+      "live_qps": 7168,
+      "memory": {
+        "cgroup_bytes": 45451051008,
+        "locked_kib": 0,
+        "rss_kib": 94184
+      },
+      "phase": "progress"
+    },
+    {
+      "elapsed_s": 1.110583717,
+      "live_qps": 7680,
+      "memory": {
+        "cgroup_bytes": 45460393984,
+        "locked_kib": 0,
+        "rss_kib": 97256
+      },
+      "phase": "progress"
+    },
+    {
+      "elapsed_s": 1.183969111,
+      "live_qps": 8192,
+      "memory": {
+        "cgroup_bytes": 45482008576,
+        "locked_kib": 0,
+        "rss_kib": 100328
+      },
+      "phase": "progress"
+    },
+    {
+      "elapsed_s": 1.2560434329999999,
+      "live_qps": 8704,
+      "memory": {
+        "cgroup_bytes": 45483384832,
+        "locked_kib": 0,
+        "rss_kib": 106472
+      },
+      "phase": "progress"
+    },
+    {
+      "elapsed_s": 1.328537099,
+      "live_qps": 9216,
+      "memory": {
+        "cgroup_bytes": 45487976448,
+        "locked_kib": 0,
+        "rss_kib": 109544
+      },
+      "phase": "progress"
+    },
+    {
+      "elapsed_s": 1.4005543839999999,
+      "live_qps": 9728,
+      "memory": {
+        "cgroup_bytes": 45495185408,
+        "locked_kib": 0,
+        "rss_kib": 112616
+      },
+      "phase": "progress"
+    },
+    {
+      "elapsed_s": 1.473100429,
+      "live_qps": 10240,
+      "memory": {
+        "cgroup_bytes": 45503524864,
+        "locked_kib": 0,
+        "rss_kib": 118760
+      },
+      "phase": "progress"
+    },
+    {
+      "elapsed_s": 1.5645817979999999,
+      "live_qps": 10752,
+      "memory": {
+        "cgroup_bytes": 45510574080,
+        "locked_kib": 0,
+        "rss_kib": 121832
+      },
+      "phase": "progress"
+    },
+    {
+      "elapsed_s": 1.664018102,
+      "live_qps": 11264,
+      "memory": {
+        "cgroup_bytes": 45518307328,
+        "locked_kib": 0,
+        "rss_kib": 124904
+      },
+      "phase": "progress"
+    },
+    {
+      "elapsed_s": 1.762826117,
+      "live_qps": 11776,
+      "memory": {
+        "cgroup_bytes": 45526261760,
+        "locked_kib": 0,
+        "rss_kib": 131048
+      },
+      "phase": "progress"
+    },
+    {
+      "elapsed_s": 1.862166746,
+      "live_qps": 12288,
+      "memory": {
+        "cgroup_bytes": 45535133696,
+        "locked_kib": 0,
+        "rss_kib": 134120
+      },
+      "phase": "progress"
+    },
+    {
+      "elapsed_s": 1.9604697770000001,
+      "live_qps": 12800,
+      "memory": {
+        "cgroup_bytes": 45543264256,
+        "locked_kib": 0,
+        "rss_kib": 140264
+      },
+      "phase": "progress"
+    },
+    {
+      "elapsed_s": 2.060865231,
+      "live_qps": 13312,
+      "memory": {
+        "cgroup_bytes": 45551726592,
+        "locked_kib": 0,
+        "rss_kib": 143336
+      },
+      "phase": "progress"
+    },
+    {
+      "elapsed_s": 2.159599874,
+      "live_qps": 13824,
+      "memory": {
+        "cgroup_bytes": 45560893440,
+        "locked_kib": 0,
+        "rss_kib": 146408
+      },
+      "phase": "progress"
+    },
+    {
+      "elapsed_s": 2.2587,
+      "live_qps": 14336,
+      "memory": {
+        "cgroup_bytes": 45569626112,
+        "locked_kib": 0,
+        "rss_kib": 152552
+      },
+      "phase": "progress"
+    },
+    {
+      "elapsed_s": 2.357643369,
+      "live_qps": 14848,
+      "memory": {
+        "cgroup_bytes": 45578276864,
+        "locked_kib": 0,
+        "rss_kib": 155624
+      },
+      "phase": "progress"
+    },
+    {
+      "elapsed_s": 2.456835544,
+      "live_qps": 15360,
+      "memory": {
+        "cgroup_bytes": 45587427328,
+        "locked_kib": 0,
+        "rss_kib": 161768
+      },
+      "phase": "progress"
+    },
+    {
+      "elapsed_s": 2.555887547,
+      "live_qps": 15872,
+      "memory": {
+        "cgroup_bytes": 45596160000,
+        "locked_kib": 0,
+        "rss_kib": 164840
+      },
+      "phase": "progress"
+    },
+    {
+      "elapsed_s": 2.6551773,
+      "live_qps": 16384,
+      "memory": {
+        "cgroup_bytes": 45604069376,
+        "locked_kib": 0,
+        "rss_kib": 167912
+      },
+      "phase": "progress"
+    },
+    {
+      "actual_qp_cap": {
+        "recv_sge": 1,
+        "recv_wr": 4,
+        "send_sge": 1,
+        "send_wr": 4
+      },
+      "all_share_one_cq": true,
+      "cq_requested": 262144,
+      "device": "mlx5_0",
+      "elapsed_s": 2.655255148,
+      "failure": {
+        "at_index": 16384,
+        "kind": "CompletionRoutesExhausted",
+        "message": "CompletionRoutesExhausted"
+      },
+      "live_qps": 16384,
+      "max_slot": 16383,
+      "memory_after": {
+        "cgroup_bytes": 45604069376,
+        "locked_kib": 0,
+        "rss_kib": 167912
+      },
+      "memory_before": {
+        "cgroup_bytes": 45301919744,
+        "locked_kib": 0,
+        "rss_kib": 0
+      },
+      "phase": "created",
+      "requested_depth": 4,
+      "requested_qps": 20000
+    },
+    {
+      "destroyed_qps": 16384,
+      "elapsed_s": 4.93002428,
+      "memory": {
+        "cgroup_bytes": 45429706752,
+        "locked_kib": 0,
+        "rss_kib": 135980
+      },
+      "phase": "dropped"
+    }
+  ],
+  "completed_utc": "2026-09-06T14:26:28.298630+00:00"
+}

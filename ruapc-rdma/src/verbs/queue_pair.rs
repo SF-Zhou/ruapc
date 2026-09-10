@@ -1,8 +1,4 @@
-use std::{
-    os::raw::c_int,
-    ptr,
-    sync::{Arc, Mutex},
-};
+use std::{os::raw::c_int, ptr, sync::Arc};
 
 mod read;
 pub use read::{ReadFailure, ReadPosting, ReadReceiver, ReadRequest, ReadSegment};
@@ -10,7 +6,7 @@ pub use read::{ReadFailure, ReadPosting, ReadReceiver, ReadRequest, ReadSegment}
 use ruapc_bufpool::{Buffer, DeviceIndex};
 
 use super::{
-    completion_queue::{Completion, CompletionQueue},
+    completion_queue::{Completion, CompletionIdentity, CompletionQueue, IdentityLease},
     protection_domain::ProtectionDomain,
     wr_slots::WrSlots,
 };
@@ -53,6 +49,15 @@ impl From<Buffer> for WrBuffers {
 #[derive(Debug, Default)]
 pub struct CompletionCursor {
     sq_swept: u64,
+}
+
+impl CompletionCursor {
+    #[inline]
+    fn sweep_to(&mut self, first_sequence: u64, completed: u64) -> std::ops::Range<u64> {
+        let start = self.sq_swept.max(first_sequence);
+        self.sq_swept = self.sq_swept.max(completed + 1);
+        start..completed
+    }
 }
 
 /// Metadata and owned buffers released by a verified completion.
@@ -104,9 +109,11 @@ impl SendSignaling {
 pub struct QueuePair {
     ptr: *mut crate::ibv_qp,
     _pd: Arc<ProtectionDomain>,
-    _send_cq: Arc<CompletionQueue>,
-    _recv_cq: Arc<CompletionQueue>,
-    /// SEND buffers and the shared sequence counter for all SQ work requests.
+    /// CQ-owned QPN identity and sequence space. A shared CQ uses one lease for
+    /// both directions; separate CQs each register their own identity.
+    send_identity: IdentityLease,
+    recv_identity: Option<IdentityLease>,
+    /// In-flight SEND buffers; READs share the identity's SQ sequence counter.
     send_wrs: WrSlots,
     /// In-flight buffers of receive-queue work requests.
     recv_wrs: WrSlots,
@@ -115,33 +122,55 @@ pub struct QueuePair {
     /// Selective signaling interval for data sends posted via [`send`].
     ///
     /// `0` or `1` signals every work request. With interval `N > 1`, only
-    /// data sends whose SQ id is a multiple of `N` carry
+    /// data sends whose SQ sequence offset from this QP's first sequence is
+    /// a multiple of `N` carry
     /// `IBV_SEND_SIGNALED`; completions of the unsignaled ones are inferred
     /// from later signaled completions (RC SQs complete in order) and their
     /// buffers are reclaimed by [`complete`](Self::complete).
     ///
     /// [`send`]: Self::send
     send_signal_interval: u64,
-    /// Opaque connection tag stamped into every [`WRID`] this QP posts, so
-    /// completion consumers can map a `wr_id` back to the owning
-    /// connection without a `qp_num` lookup. Must be set (via
-    /// [`set_wr_tag`](Self::set_wr_tag)) before any work request is posted.
-    wr_tag: u32,
     /// Negotiated gather-list capability (`init_attr.cap.max_send_sge`
     /// after creation).
     max_send_sge: usize,
-    /// Serializes send-queue posts so that SQ ids are allocated in post
-    /// order.
-    ///
-    /// Selective signaling infers completion of unsignaled sends from later
-    /// signaled completions, which requires the SQ id order to match the
-    /// hardware post order exactly. Without this lock, two concurrent
-    /// posters could allocate ids in one order and post in the other,
-    /// letting the completion sweep reclaim the buffer of a still-in-flight
-    /// work request. SEND buffer reclamation does not acquire this lock;
-    /// READ completion separately synchronizes its batch accounting.
-    sq_post_lock: Mutex<()>,
     pub device_index: DeviceIndex,
+}
+
+/// Setup can register one CQ before another rejects a reused QPN. Drop must
+/// destroy the provider QP before Rust releases either registered identity.
+struct CreatingQueuePair {
+    ptr: *mut crate::ibv_qp,
+    send_identity: Option<IdentityLease>,
+    recv_identity: Option<IdentityLease>,
+}
+
+impl CreatingQueuePair {
+    fn register_identities(
+        &mut self,
+        send_cq: &Arc<CompletionQueue>,
+        recv_cq: &Arc<CompletionQueue>,
+    ) -> Result<()> {
+        let qp_num = unsafe { (*self.ptr).qp_num };
+        self.send_identity = Some(send_cq.register_qp(qp_num)?);
+        if !Arc::ptr_eq(send_cq, recv_cq) {
+            self.recv_identity = Some(recv_cq.register_qp(qp_num)?);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CreatingQueuePair {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            destroy_provider_qp(self.ptr);
+        }
+    }
+}
+
+fn destroy_provider_qp(ptr: *mut crate::ibv_qp) {
+    if unsafe { crate::ruapc_ibv_destroy_qp(ptr) } != 0 {
+        std::process::abort();
+    }
 }
 
 impl QueuePair {
@@ -175,39 +204,59 @@ impl QueuePair {
                 ),
             ));
         }
+        // QPN identity can only be claimed after the provider assigns it.
+        // The guard destroys this QP before releasing any partial registration.
+        let mut creating = CreatingQueuePair {
+            ptr,
+            send_identity: None,
+            recv_identity: None,
+        };
+        creating.register_identities(send_cq, recv_cq)?;
         // `ibv_create_qp` updates `init_attr.cap` with the actual (possibly
         // larger) queue depths; size the slot arrays from those.
-        Ok(Self {
+        let send_wrs = WrSlots::new(init_attr.cap.max_send_wr);
+        let recv_wrs = WrSlots::new(init_attr.cap.max_recv_wr);
+        let read_state = read::ReadState::new();
+        let qp = Self {
             ptr,
             _pd: Arc::clone(pd),
-            _send_cq: Arc::clone(send_cq),
-            _recv_cq: Arc::clone(recv_cq),
-            send_wrs: WrSlots::new(init_attr.cap.max_send_wr),
-            recv_wrs: WrSlots::new(init_attr.cap.max_recv_wr),
-            read_state: read::ReadState::new(),
+            send_identity: creating.send_identity.take().unwrap(),
+            recv_identity: creating.recv_identity.take(),
+            send_wrs,
+            recv_wrs,
+            read_state,
             max_send_sge: init_attr.cap.max_send_sge as usize,
             send_signal_interval: 1,
-            wr_tag: u32::MAX,
-            sq_post_lock: Mutex::new(()),
             device_index,
-        })
+        };
+        creating.ptr = ptr::null_mut();
+        Ok(qp)
     }
 
-    /// Sets the connection tag embedded in every posted `wr_id`.
-    ///
-    /// Called exactly once, before posting. The tag must never have been used
-    /// on either CQ, even by a destroyed QP: a retained CQE must not authorize
-    /// reclamation on a replacement QP with the same provider-assigned QPN.
-    pub fn set_wr_tag(&mut self, tag: u32) -> Result<()> {
-        if self.wr_tag != u32::MAX {
-            return Err(ErrorKind::InvalidQueuePairConfig.into());
-        }
-        self._send_cq.claim_tag(tag)?;
-        if !Arc::ptr_eq(&self._send_cq, &self._recv_cq) {
-            self._recv_cq.claim_tag(tag)?;
-        }
-        self.wr_tag = tag;
-        Ok(())
+    /// This QP's send completion identity, registered after provider creation.
+    #[inline]
+    pub fn send_identity(&self) -> CompletionIdentity {
+        self.send_identity.identity()
+    }
+
+    /// This QP's receive completion identity. With a shared CQ it equals
+    /// [`send_identity`](Self::send_identity).
+    #[inline]
+    pub fn recv_identity(&self) -> CompletionIdentity {
+        self.receive_identity().identity()
+    }
+
+    pub fn send_cq(&self) -> &Arc<CompletionQueue> {
+        self.send_identity.cq()
+    }
+
+    pub fn recv_cq(&self) -> &Arc<CompletionQueue> {
+        self.receive_identity().cq()
+    }
+
+    #[inline]
+    fn receive_identity(&self) -> &IdentityLease {
+        self.recv_identity.as_ref().unwrap_or(&self.send_identity)
     }
 
     /// Sets the selective signaling interval for data sends.
@@ -343,22 +392,28 @@ impl QueuePair {
         flags: crate::ibv_send_flags,
         signaling: SendSignaling,
     ) -> Result<u64> {
-        let _guard = self.sq_post_lock.lock().unwrap();
-        let id = self.send_wrs.alloc_id();
+        // The sequence guard serializes allocation, ownership registration
+        // and provider posting. SQ IDs must follow hardware post order for
+        // the selective completion sweep to be safe.
+        let posting = self.send_identity.lock_send()?;
+        let id = posting.sequence();
+        let route = self.send_identity();
         let (wr_id, opcode, imm_data) = match imm {
             Some(imm) => (
-                WRID::send_imm(self.wr_tag, id),
+                route.encode(WRType::SendImm, id),
                 crate::ibv_wr_opcode::IBV_WR_SEND_WITH_IMM,
                 imm.to_be(),
             ),
             None => (
-                WRID::send_data(self.wr_tag, id),
+                route.encode(WRType::SendData, id),
                 crate::ibv_wr_opcode::IBV_WR_SEND,
                 0,
             ),
         };
         if let Some(buffers) = buffers {
-            self.send_wrs.insert(id, buffers);
+            self.send_wrs
+                .insert(id, buffers)
+                .map_err(|_| ErrorKind::WorkRequestSlotsExhausted)?;
         }
         let mut wr = crate::ibv_send_wr {
             wr_id,
@@ -369,7 +424,15 @@ impl QueuePair {
             },
             num_sge: sges.len() as c_int,
             opcode,
-            send_flags: signaling.flags(id, self.send_signal_interval, flags).0,
+            // Signaling cadence starts with this QP, independently of the
+            // QPN's previous incarnations and their receive-queue traffic.
+            send_flags: signaling
+                .flags(
+                    id - self.send_identity().first_sequence(),
+                    self.send_signal_interval,
+                    flags,
+                )
+                .0,
             __bindgen_anon_1: crate::ibv_send_wr__bindgen_ty_1 { imm_data },
             ..Default::default()
         };
@@ -426,9 +489,9 @@ impl QueuePair {
         }
         let num_sge = sges.len() as c_int;
 
-        let _guard = self.sq_post_lock.lock().unwrap();
-        let id = self.send_wrs.alloc_id();
-        let wr_id = WRID::read(self.wr_tag, id);
+        let posting = self.send_identity.lock_send()?;
+        let id = posting.sequence();
+        let wr_id = self.send_identity().encode(WRType::Read, id);
         register(wr_id);
         let mut wr = crate::ibv_send_wr {
             wr_id,
@@ -449,12 +512,14 @@ impl QueuePair {
     }
 
     pub fn recv(&self, buffer: Buffer) -> Result<()> {
-        let id = self.recv_wrs.alloc_id();
-        let wr_id = WRID::recv(self.wr_tag, id);
         let addr = buffer.as_ptr() as u64;
         let len = buffer.capacity() as u32;
         let lkey = self.lkey(&buffer)?;
-        self.recv_wrs.insert(id, buffer.into());
+        let id = self.receive_identity().alloc_recv()?;
+        let wr_id = self.recv_identity().encode(WRType::Recv, id);
+        self.recv_wrs
+            .insert(id, buffer.into())
+            .map_err(|_| ErrorKind::WorkRequestSlotsExhausted)?;
         let mut sge = crate::ibv_sge {
             addr,
             length: len,
@@ -474,7 +539,7 @@ impl QueuePair {
 
     /// Consumes a CQ-issued completion proof and releases the completed memory.
     ///
-    /// Validates the CQ, QP number and permanently assigned connection tag before
+    /// Validates the CQ, QP number and incarnation's sequence floor before
     /// accessing any ownership table. For SQ completions, RC ordering also proves
     /// that preceding unsignaled data SENDs no longer access their buffers.
     /// READ ownership is settled here; callers receive only completion metadata.
@@ -485,25 +550,26 @@ impl QueuePair {
         cursor: &mut CompletionCursor,
     ) -> Result<CompletedWork<'a>> {
         let wc = completion.info();
-        let cq = if wc.is_recv() {
-            &self._recv_cq
+        let route = if wc.is_recv() {
+            self.receive_identity()
         } else {
-            &self._send_cq
+            &self.send_identity
         };
-        if !completion.belongs_to(cq, self.qp_num(), self.wr_tag) {
+        if !completion.belongs_to(route.cq(), self.qp_num(), route.identity()) {
             return Err(ErrorKind::InvalidCompletion.into());
         }
-        let id = wc.wr_id.get_id();
+        let id = completion.sequence();
         let mut swept_sends = 0;
         let buffer = if wc.is_recv() {
             self.recv_wrs.take(id)
         } else {
-            for swept in cursor.sq_swept..id {
+            // A replacement QP can start far above zero. Never scan the
+            // sequence space preceding this QPN incarnation.
+            for swept in cursor.sweep_to(route.identity().first_sequence(), id) {
                 if self.send_wrs.take(swept).is_some() {
                     swept_sends += 1;
                 }
             }
-            cursor.sq_swept = cursor.sq_swept.max(id + 1);
             if wc.wr_id.get_type() == WRType::Read {
                 self.complete_read(wc.wr_id, wc.succ());
             }
@@ -615,9 +681,7 @@ impl Drop for QueuePair {
         // Field destruction releases SEND/RECV buffers, READ destinations and
         // their PD/MR ownership. If the provider cannot destroy the QP, DMA may
         // still access them; unwinding would release those holds as well.
-        if unsafe { crate::ruapc_ibv_destroy_qp(self.ptr) } != 0 {
-            std::process::abort();
-        }
+        destroy_provider_qp(self.ptr);
     }
 }
 impl std::fmt::Debug for QueuePair {
@@ -635,6 +699,18 @@ unsafe impl Sync for QueuePair {}
 mod tests {
     use super::*;
 
+    #[test]
+    fn selective_sweep_skips_previous_incarnations_and_already_completed_work() {
+        let first = 1 << 47;
+        let mut cursor = CompletionCursor::default();
+        assert_eq!(cursor.sweep_to(first, first + 2), first..first + 2);
+        assert_eq!(cursor.sweep_to(first, first + 4), first + 3..first + 4);
+        // A CQ batch may be consumed out of order. Its old token must neither
+        // rewind the cursor nor make a subsequent completion scan old IDs.
+        assert!(cursor.sweep_to(first, first + 1).is_empty());
+        assert_eq!(cursor.sweep_to(first, first + 7), first + 5..first + 7);
+    }
+
     fn init_attr() -> crate::ibv_qp_init_attr {
         crate::ibv_qp_init_attr {
             qp_type: crate::ibv_qp_type::IBV_QPT_RC,
@@ -650,26 +726,144 @@ mod tests {
     }
 
     #[test]
-    fn qp_tag_is_immutable_and_survives_qp_destruction() {
+    fn qp_identities_are_registered_after_creation_and_retire_after_destruction() {
         let device = crate::test_utils::open_device();
         let cq = CompletionQueue::create(device.context(), 16, None).unwrap();
-        let create = || {
-            QueuePair::create(
-                device.pd(),
-                &cq,
-                &cq,
-                &mut init_attr(),
-                DeviceIndex::default(),
-            )
-            .unwrap()
-        };
-        let mut qp = create();
-        qp.set_wr_tag(42).unwrap();
-        assert!(qp.set_wr_tag(43).is_err());
+        let qp = QueuePair::create(
+            device.pd(),
+            &cq,
+            &cq,
+            &mut init_attr(),
+            DeviceIndex::default(),
+        )
+        .unwrap();
+        let identity = qp.send_identity();
+        assert_eq!(identity, qp.recv_identity());
+        assert_eq!(identity.qp_num(), qp.qp_num());
+        assert!(Arc::ptr_eq(qp.send_cq(), &cq));
+        assert!(Arc::ptr_eq(qp.recv_cq(), &cq));
+        assert_eq!(cq.qp_registry_stats().active, 1);
+        for _ in 0..300 {
+            qp.send_identity.lock_send().unwrap().sequence();
+        }
+        qp.receive_identity().alloc_recv().unwrap();
         drop(qp);
-        let mut replacement = create();
-        assert!(replacement.set_wr_tag(42).is_err());
-        replacement.set_wr_tag(43).unwrap();
+        assert_eq!(cq.qp_registry_stats().active, 0);
+        assert_eq!(cq.qp_registry_stats().next_sequence_floor, 300);
+        let replacement = QueuePair::create(
+            device.pd(),
+            &cq,
+            &cq,
+            &mut init_attr(),
+            DeviceIndex::default(),
+        )
+        .unwrap();
+        assert_eq!(replacement.send_identity().first_sequence(), 300);
+        assert_eq!(
+            replacement.send_identity.lock_send().unwrap().sequence(),
+            300
+        );
+        assert_eq!(replacement.receive_identity().alloc_recv().unwrap(), 300);
+    }
+
+    #[test]
+    fn cq_capacity_does_not_limit_qps_with_no_posted_work() {
+        let device = crate::test_utils::open_device();
+        let cq = CompletionQueue::create(device.context(), 1, None).unwrap();
+        let qps: Vec<_> = (0..cq.capacity() + 2)
+            .map(|_| {
+                QueuePair::create(
+                    device.pd(),
+                    &cq,
+                    &cq,
+                    &mut init_attr(),
+                    DeviceIndex::default(),
+                )
+                .unwrap()
+            })
+            .collect();
+        assert!(qps.len() > cq.capacity() as usize);
+        assert_eq!(cq.qp_registry_stats().active, qps.len());
+        assert!(
+            qps.iter()
+                .all(|qp| qp.send_identity().first_sequence() == 0)
+        );
+        drop(qps);
+        assert_eq!(cq.qp_registry_stats().active, 0);
+        assert_eq!(cq.qp_registry_stats().next_sequence_floor, 1);
+    }
+
+    #[test]
+    fn separate_cqs_preserve_independent_retired_floors() {
+        let device = crate::test_utils::open_device();
+        let send_cq = CompletionQueue::create(device.context(), 16, None).unwrap();
+        let recv_cq = CompletionQueue::create(device.context(), 1024, None).unwrap();
+        let qp = QueuePair::create(
+            device.pd(),
+            &send_cq,
+            &recv_cq,
+            &mut init_attr(),
+            DeviceIndex::default(),
+        )
+        .unwrap();
+        assert!(qp.recv_identity.is_some());
+        assert!(Arc::ptr_eq(qp.send_cq(), &send_cq));
+        assert!(Arc::ptr_eq(qp.recv_cq(), &recv_cq));
+        for _ in 0..7 {
+            qp.send_identity.lock_send().unwrap().sequence();
+        }
+        for _ in 0..11 {
+            qp.receive_identity().alloc_recv().unwrap();
+        }
+        drop(qp);
+        assert_eq!(send_cq.qp_registry_stats().next_sequence_floor, 7);
+        assert_eq!(recv_cq.qp_registry_stats().next_sequence_floor, 11);
+        let next = QueuePair::create(
+            device.pd(),
+            &send_cq,
+            &recv_cq,
+            &mut init_attr(),
+            DeviceIndex::default(),
+        )
+        .unwrap();
+        assert_eq!(next.send_identity().first_sequence(), 7);
+        assert_eq!(next.recv_identity().first_sequence(), 11);
+    }
+
+    #[test]
+    fn failed_second_cq_registration_releases_only_its_own_partial_lease() {
+        let device = crate::test_utils::open_device();
+        let send_cq = CompletionQueue::create(device.context(), 16, None).unwrap();
+        let recv_cq = CompletionQueue::create(device.context(), 16, None).unwrap();
+        let mut attrs = init_attr();
+        attrs.send_cq = send_cq.as_ptr();
+        attrs.recv_cq = recv_cq.as_ptr();
+        let ptr = unsafe { crate::ruapc_ibv_create_qp(device.pd().as_ptr(), &mut attrs) };
+        assert!(!ptr.is_null());
+        let qp_num = unsafe { (*ptr).qp_num };
+        let mut creating = CreatingQueuePair {
+            ptr,
+            send_identity: None,
+            recv_identity: None,
+        };
+        // Model provider QPN reuse before the previous Rust lease was released.
+        let old = recv_cq.register_qp(qp_num).unwrap();
+        assert_eq!(
+            creating
+                .register_identities(&send_cq, &recv_cq)
+                .unwrap_err()
+                .kind,
+            ErrorKind::CompletionIdentityInUse
+        );
+        assert_eq!(send_cq.qp_registry_stats().active, 1);
+        assert_eq!(recv_cq.qp_registry_stats().active, 1);
+        drop(creating); // Its Drop destroys the provider QP before its fields.
+        assert_eq!(send_cq.qp_registry_stats().active, 0);
+        assert_eq!(send_cq.qp_registry_stats().next_sequence_floor, 1);
+        assert_eq!(recv_cq.qp_registry_stats().active, 1);
+        assert_eq!(old.lock_send().unwrap().sequence(), 0);
+        drop(old);
+        assert_eq!(recv_cq.qp_registry_stats().next_sequence_floor, 1);
     }
 
     #[test]

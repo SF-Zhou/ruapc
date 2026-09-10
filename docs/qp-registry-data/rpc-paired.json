@@ -1,0 +1,318 @@
+{
+  "pairs": 5,
+  "connections": [
+    128,
+    256
+  ],
+  "concurrent_total_ops": 2560000,
+  "runs": [
+    {
+      "connections": 128,
+      "pair": 1,
+      "version": "baseline",
+      "artifact": "rpc-128-baseline-1.json.gz",
+      "sha256": "7c2d0cd4cea37413fad896bb2397a7b2ffdc49c9e2db118fdd0242e90cd8be06",
+      "uncompressed_sha256": "de8aa1154a9c7659bf9c63ffcd89fd4128ac07111d8d900a1deee8e50cdd910a",
+      "qps": {
+        "64": 568700.3854370861,
+        "1024": 752277.9180324369
+      }
+    },
+    {
+      "connections": 128,
+      "pair": 1,
+      "version": "current",
+      "artifact": "rpc-128-current-1.json.gz",
+      "sha256": "93ca5d13b167ddd8c8d9533c55eb748bbdc81fd72fe80076006b57accf7ad496",
+      "uncompressed_sha256": "5e3fd0e0877ad43627e44e5b7b0130118d8c28d418eea4b820adea599959b2fb",
+      "qps": {
+        "64": 580801.2932658837,
+        "1024": 740840.8837357088
+      }
+    },
+    {
+      "connections": 128,
+      "pair": 2,
+      "version": "current",
+      "artifact": "rpc-128-current-2.json.gz",
+      "sha256": "ace6f7d3cdfa7f6fc7b2d14393fab680de9df5ac62b20c996e08d6965f4245f9",
+      "uncompressed_sha256": "8e7a0baf262c8d830530350effc35f7e9e9303690922e0644c0a4815b2a0a9d2",
+      "qps": {
+        "64": 566802.719836505,
+        "1024": 745783.6308187424
+      }
+    },
+    {
+      "connections": 128,
+      "pair": 2,
+      "version": "baseline",
+      "artifact": "rpc-128-baseline-2.json.gz",
+      "sha256": "adf0236cd674187b64b7708ffe9d9866a372e246551e2faf3c6558a5f788492e",
+      "uncompressed_sha256": "5df9f4bef9ec34ca03a8f573b1e4d6ff3c2d32c2a4ed52c7b8964fe11662b0b8",
+      "qps": {
+        "64": 520839.4270656193,
+        "1024": 759226.2185844016
+      }
+    },
+    {
+      "connections": 128,
+      "pair": 3,
+      "version": "baseline",
+      "artifact": "rpc-128-baseline-3.json.gz",
+      "sha256": "6a0d0d3c9949f3d390efdca33588e638a6e59e510576ea706e9ab8ec01663a71",
+      "uncompressed_sha256": "9b071dd5160356579ff74f2f9999a1bee685a10312bd44699bfc9bd11fa210ac",
+      "qps": {
+        "64": 572412.7225389932,
+        "1024": 756336.275022225
+      }
+    },
+    {
+      "connections": 128,
+      "pair": 3,
+      "version": "current",
+      "artifact": "rpc-128-current-3.json.gz",
+      "sha256": "87cf6631bbafbd777abf71ed7473374e928218fdb87e0c1b67fcfbf38bd483fc",
+      "uncompressed_sha256": "c63f09bb5e7414a4f4913796ae18bc45feaa424d607b540a4b9c76b2e12c0ae2",
+      "qps": {
+        "64": 579225.2271686384,
+        "1024": 754045.3061612675
+      }
+    },
+    {
+      "connections": 128,
+      "pair": 4,
+      "version": "current",
+      "artifact": "rpc-128-current-4.json.gz",
+      "sha256": "8bc2ab02fafda0626cacdce0b0da57106481eaf9c73e34b6f88e4a2ea4913215",
+      "uncompressed_sha256": "4b74818be34557294597822679059974e17ca8298895e6c4d6468c17c1e9d0bb",
+      "qps": {
+        "64": 571527.3781788395,
+        "1024": 748385.6769160653
+      }
+    },
+    {
+      "connections": 128,
+      "pair": 4,
+      "version": "baseline",
+      "artifact": "rpc-128-baseline-4.json.gz",
+      "sha256": "30c5440727a23b3d2a7cbf85b6ae6e6971ca999653e84a778bd6b1548d928d89",
+      "uncompressed_sha256": "8bd15a3ef20f8d543b971cd608236e369ed994259ccfb6242ca4dfeb9cce215e",
+      "qps": {
+        "64": 572146.7633786218,
+        "1024": 761696.6079040645
+      }
+    },
+    {
+      "connections": 128,
+      "pair": 5,
+      "version": "baseline",
+      "artifact": "rpc-128-baseline-5.json.gz",
+      "sha256": "e183b83ab322f0e65c8273598ac8c8504647f5a94215e431d00f5db957156581",
+      "uncompressed_sha256": "56d7a7fdb0b73dd8a186db64dd2a55732749a39be5ba9c9eea40337715abd2fe",
+      "qps": {
+        "64": 573487.1188027761,
+        "1024": 746023.0286777206
+      }
+    },
+    {
+      "connections": 128,
+      "pair": 5,
+      "version": "current",
+      "artifact": "rpc-128-current-5.json.gz",
+      "sha256": "859ae8536803b86787d951ec07ff68edbfd9bcee43a99fb2e6255e980746ad52",
+      "uncompressed_sha256": "5108d57d4229b946948de7450da02b8b4f16b8eea4e2d8c15f3d47193bf8106c",
+      "qps": {
+        "64": 561094.4996344775,
+        "1024": 741692.2812896671
+      }
+    },
+    {
+      "connections": 256,
+      "pair": 1,
+      "version": "baseline",
+      "artifact": "rpc-256-baseline-1.json.gz",
+      "sha256": "9e4dc62696d3ee71631a12c6fda458835eaabb1f8149036530faaf5b25c6c92e",
+      "uncompressed_sha256": "ff17e8e7841e903cce5cf2e21919b6d77646fda888cf1308570719e14e661960",
+      "qps": {
+        "64": 544706.7955643976,
+        "1024": 746849.620986858
+      }
+    },
+    {
+      "connections": 256,
+      "pair": 1,
+      "version": "current",
+      "artifact": "rpc-256-current-1.json.gz",
+      "sha256": "795162be59c47d70e8e527123c41bd3efffb6795fe1e328b0922d3cefdd03e31",
+      "uncompressed_sha256": "0618dd47ef8cccd8c159dc0ab7474050fa5d1ee5ec860ea54fbe78d7f9f5b9a7",
+      "qps": {
+        "64": 551389.0400356574,
+        "1024": 741705.5236436303
+      }
+    },
+    {
+      "connections": 256,
+      "pair": 2,
+      "version": "current",
+      "artifact": "rpc-256-current-2.json.gz",
+      "sha256": "28f4a149d24ac689ce05f5c50149e37781f9b34cf59249f7e4d249c34acfdaee",
+      "uncompressed_sha256": "0dcd3e4b4c7b6c2aded2e045f2c3bc5f50ad05c0b41e75c1a0c6d77c3da2991c",
+      "qps": {
+        "64": 545255.6765357633,
+        "1024": 727779.312949901
+      }
+    },
+    {
+      "connections": 256,
+      "pair": 2,
+      "version": "baseline",
+      "artifact": "rpc-256-baseline-2.json.gz",
+      "sha256": "94edda8495e230b1dbc3e057bbb56a30ec9a7afef4642d204b3c8490cc5c6a15",
+      "uncompressed_sha256": "7f1b8987a90dba741af48d6006e315a2dbfe18b1f908bebe8b21214dcd5a6d59",
+      "qps": {
+        "64": 541313.6287548966,
+        "1024": 757388.3951698627
+      }
+    },
+    {
+      "connections": 256,
+      "pair": 3,
+      "version": "baseline",
+      "artifact": "rpc-256-baseline-3.json.gz",
+      "sha256": "8c6301ef8316fbe4a384f2ffe99b8f5b972c16bd0965e0137c8c8ebe4fc2e9b6",
+      "uncompressed_sha256": "009388cacf5dddcf1627d2546147663ada3829bca19b9e09efae013ac2d46c40",
+      "qps": {
+        "64": 541116.446570004,
+        "1024": 750732.4282666815
+      }
+    },
+    {
+      "connections": 256,
+      "pair": 3,
+      "version": "current",
+      "artifact": "rpc-256-current-3.json.gz",
+      "sha256": "94aafbdfbe2134142f586f586a9183416ec1a9189a4f7669d83e879c3840a3cd",
+      "uncompressed_sha256": "b0f6ecb62e08a7fbd9915e6108add974bcf6e4416332236cf41be70781f7c68e",
+      "qps": {
+        "64": 556347.5264011393,
+        "1024": 723141.9716659242
+      }
+    },
+    {
+      "connections": 256,
+      "pair": 4,
+      "version": "current",
+      "artifact": "rpc-256-current-4.json.gz",
+      "sha256": "e18e52c2e13fa157dd29c74f155223d18c99ddd282e71c333fcef5c5e77c3d91",
+      "uncompressed_sha256": "777769e14b7985bce2a94d68e6b15e5b17472b3e0550d6362f3027cbc489186b",
+      "qps": {
+        "64": 547972.3523957302,
+        "1024": 706449.7905547464
+      }
+    },
+    {
+      "connections": 256,
+      "pair": 4,
+      "version": "baseline",
+      "artifact": "rpc-256-baseline-4.json.gz",
+      "sha256": "2564d2011591179d6865c9c9bc26f3316fcf9fd8acffb752330b19afd5a7a726",
+      "uncompressed_sha256": "6064b90fc2e5fd8d0023c091574f5ad096b4f7816db929c9aab1caabf7fc38c6",
+      "qps": {
+        "64": 559975.823148831,
+        "1024": 753043.7011556661
+      }
+    },
+    {
+      "connections": 256,
+      "pair": 5,
+      "version": "baseline",
+      "artifact": "rpc-256-baseline-5.json.gz",
+      "sha256": "678d7cddef9d07e0410a0e063be450c28957c8bc2cabfcd5b2e7f81510c0592a",
+      "uncompressed_sha256": "b5b11ddd335475bbbab455e39090a19de2500d8496de6ccd13e02e825b95858e",
+      "qps": {
+        "64": 543205.6772301084,
+        "1024": 767450.440558253
+      }
+    },
+    {
+      "connections": 256,
+      "pair": 5,
+      "version": "current",
+      "artifact": "rpc-256-current-5.json.gz",
+      "sha256": "4a8a53b0ff7080bc63b77b273d2c5848504b9110b0cf34a4064992894015b1a4",
+      "uncompressed_sha256": "3a0d2e8f68aa1cc5de563ba41b936864411fafd9141949ba92d72191ef2e2cc4",
+      "qps": {
+        "64": 549547.9301411057,
+        "1024": 735593.1268722918
+      }
+    }
+  ],
+  "binaries": {
+    "baseline": {
+      "path": "/tmp/ruapc-qp-registry-bench/capacity-rpc-baseline",
+      "sha256": "fa8a8425b328b0f4b478180f323df2b92e8bd49440965d458517c66b17e4b0e8"
+    },
+    "current": {
+      "path": "/tmp/ruapc-qp-registry-bench/capacity-rpc-current",
+      "sha256": "3f000786e584444fc2bf07cf250ddadaf641dc03d15ae15de6078a5976ba0963"
+    }
+  },
+  "summary": {
+    "128_connections/64_tasks": {
+      "baseline_median_qps": 572146.7633786218,
+      "current_median_qps": 571527.3781788395,
+      "median_change_percent": -0.1082563494940958,
+      "paired_ratio_median_change_percent": 1.1901385768344985,
+      "baseline_min_max": [
+        520839.4270656193,
+        573487.1188027761
+      ],
+      "current_min_max": [
+        561094.4996344775,
+        580801.2932658837
+      ]
+    },
+    "128_connections/1024_tasks": {
+      "baseline_median_qps": 756336.275022225,
+      "current_median_qps": 745783.6308187424,
+      "median_change_percent": -1.3952317972812378,
+      "paired_ratio_median_change_percent": -1.5203203527017428,
+      "baseline_min_max": [
+        746023.0286777206,
+        761696.6079040645
+      ],
+      "current_min_max": [
+        740840.8837357088,
+        754045.3061612675
+      ]
+    },
+    "256_connections/64_tasks": {
+      "baseline_median_qps": 543205.6772301084,
+      "current_median_qps": 549547.9301411057,
+      "median_change_percent": 1.16756012995618,
+      "paired_ratio_median_change_percent": 1.16756012995618,
+      "baseline_min_max": [
+        541116.446570004,
+        559975.823148831
+      ],
+      "current_min_max": [
+        545255.6765357633,
+        556347.5264011393
+      ]
+    },
+    "256_connections/1024_tasks": {
+      "baseline_median_qps": 753043.7011556661,
+      "current_median_qps": 727779.312949901,
+      "median_change_percent": -3.3549697271211376,
+      "paired_ratio_median_change_percent": -3.9093657110129243,
+      "baseline_min_max": [
+        746849.620986858,
+        767450.440558253
+      ],
+      "current_min_max": [
+        706449.7905547464,
+        741705.5236436303
+      ]
+    }
+  }
+}

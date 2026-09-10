@@ -31,7 +31,10 @@ pub(super) struct ReadState {
 impl ReadState {
     pub(super) fn new() -> Self {
         Self {
-            batches: dashmap::DashMap::new(),
+            // One QP serializes SQ posting and has one CQ completion consumer.
+            // Sizing this local table by the host CPU count wastes hundreds of
+            // empty lock shards per connection on large machines.
+            batches: dashmap::DashMap::with_shard_amount(4),
             owner: next_owner(),
         }
     }
@@ -353,6 +356,16 @@ impl QueuePair {
 
     pub fn has_pending_reads(&self) -> bool {
         !self.read_state.batches.is_empty()
+    }
+
+    /// Number of posted READ WRs whose completions have not been processed.
+    ///
+    /// Concurrent posting and completion make this a diagnostic snapshot.
+    /// Accounting must exclude both operations before using the count, and
+    /// destroy the QP before returning credits for its unpolled WRs. The count
+    /// itself is not completion evidence and does not release DMA ownership.
+    pub fn pending_read_count(&self) -> usize {
+        self.read_state.batches.len()
     }
 
     /// Called only after the completion path verifies CQ/QP ownership.

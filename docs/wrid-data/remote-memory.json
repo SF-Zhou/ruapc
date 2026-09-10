@@ -1,0 +1,322 @@
+{
+  "kind": "remote_memory",
+  "started_utc": "2026-09-06T07:45:17.517515+00:00",
+  "environment": {
+    "TOKIO_WORKER_THREADS": "4",
+    "RUAPC_BENCH_TRANSPORT": "RDMA",
+    "RUAPC_BENCH_RDMA_DEVICE": "mlx5_0",
+    "RUAPC_BENCH_WARMUP_ITERS": "1000",
+    "RUAPC_BENCH_SERIAL_ITERS": "5000"
+  },
+  "placement": {
+    "runtime_workers": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "main": 8,
+    "pollers": [
+      9,
+      10
+    ],
+    "numa_memory_node": 0
+  },
+  "binaries": {
+    "baseline": {
+      "path": "/tmp/ruapc-wrid-bench/remote-memory-baseline",
+      "sha256": "94a35c5aa2bce929c5d6df9c660253b67de61035525516f6fbe850abd374d08d"
+    },
+    "current": {
+      "path": "/tmp/ruapc-wrid-bench/remote-memory-current",
+      "sha256": "c61e4515a8d75932f4297c306f5f2dda2bfc18683e0f50248737dc07114aee28"
+    }
+  },
+  "pin_library": {
+    "path": "/tmp/ruapc-wrid-bench/pin_threads.so",
+    "sha256": "622ca4da965983cf41e791a5c62d6a64780f30ee1de1a80cb1212bbd18931b38"
+  },
+  "machine": {
+    "uname": "Linux zhoushunfeng-15223326-0 6.8.0-60-generic #63-Ubuntu SMP PREEMPT_DYNAMIC Tue Apr 15 19:04:15 UTC 2025 x86_64 x86_64 x86_64 GNU/Linux",
+    "cpu": "AMD EPYC 9655 96-Core Processor",
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)"
+  },
+  "pairs": 3,
+  "runs": [
+    {
+      "pair": 1,
+      "version": "baseline",
+      "command": [
+        "numactl",
+        "--physcpubind=0-10",
+        "--membind=0",
+        "env",
+        "LD_PRELOAD=/tmp/ruapc-wrid-bench/pin_threads.so",
+        "/tmp/ruapc-wrid-bench/remote-memory-baseline"
+      ],
+      "elapsed_s": 3.267792562022805,
+      "returncode": 0,
+      "stdout": "ruapc: remote-memory RPC + complete-pattern verification\nserial requests; 4 runtime workers; 1000 warmup iterations per case; measured override: Some(5000)\nsetup and warmup excluded; sources and write destinations reused\ntransport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\nRDMA\n  remote_read_all    64 KiB | 5000 iters |     71.79 us/op |    870.6 MiB/s | verified\n  remote_write_all   64 KiB | 5000 iters |     65.28 us/op |    957.4 MiB/s | verified\n  remote_read_all  1024 KiB | 5000 iters |    177.70 us/op |   5627.4 MiB/s | verified\n  remote_write_all 1024 KiB | 5000 iters |    221.57 us/op |   4513.2 MiB/s | verified\n",
+      "stderr": "pin_threads: main -> cpu=8\npin_threads: tokio-rt-worker -> cpu=0\npin_threads: tokio-rt-worker -> cpu=2\npin_threads: tokio-rt-worker -> cpu=3\npin_threads: tokio-rt-worker -> cpu=1\npin_threads: ruapc-rdma-poll -> cpu=9\npin_threads: ruapc-rdma-poll -> cpu=10\n",
+      "metrics": {
+        "remote_read_all/64KiB_us": 71.79,
+        "remote_read_all/64KiB_mibps": 870.6,
+        "remote_write_all/64KiB_us": 65.28,
+        "remote_write_all/64KiB_mibps": 957.4,
+        "remote_read_all/1024KiB_us": 177.7,
+        "remote_read_all/1024KiB_mibps": 5627.4,
+        "remote_write_all/1024KiB_us": 221.57,
+        "remote_write_all/1024KiB_mibps": 4513.2
+      }
+    },
+    {
+      "pair": 1,
+      "version": "current",
+      "command": [
+        "numactl",
+        "--physcpubind=0-10",
+        "--membind=0",
+        "env",
+        "LD_PRELOAD=/tmp/ruapc-wrid-bench/pin_threads.so",
+        "/tmp/ruapc-wrid-bench/remote-memory-current"
+      ],
+      "elapsed_s": 3.118446561973542,
+      "returncode": 0,
+      "stdout": "ruapc: remote-memory RPC + complete-pattern verification\nserial requests; 4 runtime workers; 1000 warmup iterations per case; measured override: Some(5000)\nsetup and warmup excluded; sources and write destinations reused\ntransport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\nRDMA\n  remote_read_all    64 KiB | 5000 iters |     63.89 us/op |    978.2 MiB/s | verified\n  remote_write_all   64 KiB | 5000 iters |     64.58 us/op |    967.9 MiB/s | verified\n  remote_read_all  1024 KiB | 5000 iters |    173.52 us/op |   5763.0 MiB/s | verified\n  remote_write_all 1024 KiB | 5000 iters |    193.81 us/op |   5159.7 MiB/s | verified\n",
+      "stderr": "pin_threads: main -> cpu=8\npin_threads: tokio-rt-worker -> cpu=0\npin_threads: tokio-rt-worker -> cpu=1\npin_threads: tokio-rt-worker -> cpu=2\npin_threads: tokio-rt-worker -> cpu=3\npin_threads: ruapc-rdma-poll -> cpu=9\npin_threads: ruapc-rdma-poll -> cpu=10\n",
+      "metrics": {
+        "remote_read_all/64KiB_us": 63.89,
+        "remote_read_all/64KiB_mibps": 978.2,
+        "remote_write_all/64KiB_us": 64.58,
+        "remote_write_all/64KiB_mibps": 967.9,
+        "remote_read_all/1024KiB_us": 173.52,
+        "remote_read_all/1024KiB_mibps": 5763.0,
+        "remote_write_all/1024KiB_us": 193.81,
+        "remote_write_all/1024KiB_mibps": 5159.7
+      }
+    },
+    {
+      "pair": 2,
+      "version": "current",
+      "command": [
+        "numactl",
+        "--physcpubind=0-10",
+        "--membind=0",
+        "env",
+        "LD_PRELOAD=/tmp/ruapc-wrid-bench/pin_threads.so",
+        "/tmp/ruapc-wrid-bench/remote-memory-current"
+      ],
+      "elapsed_s": 3.0748213499900885,
+      "returncode": 0,
+      "stdout": "ruapc: remote-memory RPC + complete-pattern verification\nserial requests; 4 runtime workers; 1000 warmup iterations per case; measured override: Some(5000)\nsetup and warmup excluded; sources and write destinations reused\ntransport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\nRDMA\n  remote_read_all    64 KiB | 5000 iters |     62.52 us/op |    999.6 MiB/s | verified\n  remote_write_all   64 KiB | 5000 iters |     63.73 us/op |    980.7 MiB/s | verified\n  remote_read_all  1024 KiB | 5000 iters |    189.55 us/op |   5275.6 MiB/s | verified\n  remote_write_all 1024 KiB | 5000 iters |    186.29 us/op |   5368.0 MiB/s | verified\n",
+      "stderr": "pin_threads: main -> cpu=8\npin_threads: tokio-rt-worker -> cpu=0\npin_threads: tokio-rt-worker -> cpu=1\npin_threads: tokio-rt-worker -> cpu=2\npin_threads: tokio-rt-worker -> cpu=3\npin_threads: ruapc-rdma-poll -> cpu=9\npin_threads: ruapc-rdma-poll -> cpu=10\n",
+      "metrics": {
+        "remote_read_all/64KiB_us": 62.52,
+        "remote_read_all/64KiB_mibps": 999.6,
+        "remote_write_all/64KiB_us": 63.73,
+        "remote_write_all/64KiB_mibps": 980.7,
+        "remote_read_all/1024KiB_us": 189.55,
+        "remote_read_all/1024KiB_mibps": 5275.6,
+        "remote_write_all/1024KiB_us": 186.29,
+        "remote_write_all/1024KiB_mibps": 5368.0
+      }
+    },
+    {
+      "pair": 2,
+      "version": "baseline",
+      "command": [
+        "numactl",
+        "--physcpubind=0-10",
+        "--membind=0",
+        "env",
+        "LD_PRELOAD=/tmp/ruapc-wrid-bench/pin_threads.so",
+        "/tmp/ruapc-wrid-bench/remote-memory-baseline"
+      ],
+      "elapsed_s": 2.8102701129973866,
+      "returncode": 0,
+      "stdout": "ruapc: remote-memory RPC + complete-pattern verification\nserial requests; 4 runtime workers; 1000 warmup iterations per case; measured override: Some(5000)\nsetup and warmup excluded; sources and write destinations reused\ntransport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\nRDMA\n  remote_read_all    64 KiB | 5000 iters |     63.37 us/op |    986.2 MiB/s | verified\n  remote_write_all   64 KiB | 5000 iters |     65.54 us/op |    953.7 MiB/s | verified\n  remote_read_all  1024 KiB | 5000 iters |    143.73 us/op |   6957.6 MiB/s | verified\n  remote_write_all 1024 KiB | 5000 iters |    181.15 us/op |   5520.3 MiB/s | verified\n",
+      "stderr": "pin_threads: main -> cpu=8\npin_threads: tokio-rt-worker -> cpu=0\npin_threads: tokio-rt-worker -> cpu=1\npin_threads: tokio-rt-worker -> cpu=2\npin_threads: tokio-rt-worker -> cpu=3\npin_threads: ruapc-rdma-poll -> cpu=9\npin_threads: ruapc-rdma-poll -> cpu=10\n",
+      "metrics": {
+        "remote_read_all/64KiB_us": 63.37,
+        "remote_read_all/64KiB_mibps": 986.2,
+        "remote_write_all/64KiB_us": 65.54,
+        "remote_write_all/64KiB_mibps": 953.7,
+        "remote_read_all/1024KiB_us": 143.73,
+        "remote_read_all/1024KiB_mibps": 6957.6,
+        "remote_write_all/1024KiB_us": 181.15,
+        "remote_write_all/1024KiB_mibps": 5520.3
+      }
+    },
+    {
+      "pair": 3,
+      "version": "baseline",
+      "command": [
+        "numactl",
+        "--physcpubind=0-10",
+        "--membind=0",
+        "env",
+        "LD_PRELOAD=/tmp/ruapc-wrid-bench/pin_threads.so",
+        "/tmp/ruapc-wrid-bench/remote-memory-baseline"
+      ],
+      "elapsed_s": 4.657193955034018,
+      "returncode": 0,
+      "stdout": "ruapc: remote-memory RPC + complete-pattern verification\nserial requests; 4 runtime workers; 1000 warmup iterations per case; measured override: Some(5000)\nsetup and warmup excluded; sources and write destinations reused\ntransport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\nRDMA\n  remote_read_all    64 KiB | 5000 iters |     64.19 us/op |    973.6 MiB/s | verified\n  remote_write_all   64 KiB | 5000 iters |     65.01 us/op |    961.5 MiB/s | verified\n  remote_read_all  1024 KiB | 5000 iters |    283.48 us/op |   3527.6 MiB/s | verified\n  remote_write_all 1024 KiB | 5000 iters |    367.17 us/op |   2723.5 MiB/s | verified\n",
+      "stderr": "pin_threads: main -> cpu=8\npin_threads: tokio-rt-worker -> cpu=0\npin_threads: tokio-rt-worker -> cpu=1\npin_threads: tokio-rt-worker -> cpu=2\npin_threads: tokio-rt-worker -> cpu=3\npin_threads: ruapc-rdma-poll -> cpu=9\npin_threads: ruapc-rdma-poll -> cpu=10\n",
+      "metrics": {
+        "remote_read_all/64KiB_us": 64.19,
+        "remote_read_all/64KiB_mibps": 973.6,
+        "remote_write_all/64KiB_us": 65.01,
+        "remote_write_all/64KiB_mibps": 961.5,
+        "remote_read_all/1024KiB_us": 283.48,
+        "remote_read_all/1024KiB_mibps": 3527.6,
+        "remote_write_all/1024KiB_us": 367.17,
+        "remote_write_all/1024KiB_mibps": 2723.5
+      }
+    },
+    {
+      "pair": 3,
+      "version": "current",
+      "command": [
+        "numactl",
+        "--physcpubind=0-10",
+        "--membind=0",
+        "env",
+        "LD_PRELOAD=/tmp/ruapc-wrid-bench/pin_threads.so",
+        "/tmp/ruapc-wrid-bench/remote-memory-current"
+      ],
+      "elapsed_s": 4.302773354982492,
+      "returncode": 0,
+      "stdout": "ruapc: remote-memory RPC + complete-pattern verification\nserial requests; 4 runtime workers; 1000 warmup iterations per case; measured override: Some(5000)\nsetup and warmup excluded; sources and write destinations reused\ntransport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\nRDMA\n  remote_read_all    64 KiB | 5000 iters |     66.10 us/op |    945.5 MiB/s | verified\n  remote_write_all   64 KiB | 5000 iters |     64.31 us/op |    971.9 MiB/s | verified\n  remote_read_all  1024 KiB | 5000 iters |    295.67 us/op |   3382.2 MiB/s | verified\n  remote_write_all 1024 KiB | 5000 iters |    243.51 us/op |   4106.7 MiB/s | verified\n",
+      "stderr": "pin_threads: main -> cpu=8\npin_threads: tokio-rt-worker -> cpu=0\npin_threads: tokio-rt-worker -> cpu=1\npin_threads: tokio-rt-worker -> cpu=2\npin_threads: tokio-rt-worker -> cpu=3\npin_threads: ruapc-rdma-poll -> cpu=9\npin_threads: ruapc-rdma-poll -> cpu=10\n",
+      "metrics": {
+        "remote_read_all/64KiB_us": 66.1,
+        "remote_read_all/64KiB_mibps": 945.5,
+        "remote_write_all/64KiB_us": 64.31,
+        "remote_write_all/64KiB_mibps": 971.9,
+        "remote_read_all/1024KiB_us": 295.67,
+        "remote_read_all/1024KiB_mibps": 3382.2,
+        "remote_write_all/1024KiB_us": 243.51,
+        "remote_write_all/1024KiB_mibps": 4106.7
+      }
+    }
+  ],
+  "summary": {
+    "remote_read_all/64KiB_us": {
+      "baseline_median": 64.19,
+      "current_median": 63.89,
+      "median_change_percent": -0.46736251752609315,
+      "paired_ratio_median_change_percent": -1.3413287044342637,
+      "baseline_min_max": [
+        63.37,
+        71.79
+      ],
+      "current_min_max": [
+        62.52,
+        66.1
+      ]
+    },
+    "remote_read_all/64KiB_mibps": {
+      "baseline_median": 973.6,
+      "current_median": 978.2,
+      "median_change_percent": 0.4724732949876742,
+      "paired_ratio_median_change_percent": 1.3587507604948312,
+      "baseline_min_max": [
+        870.6,
+        986.2
+      ],
+      "current_min_max": [
+        945.5,
+        999.6
+      ]
+    },
+    "remote_write_all/64KiB_us": {
+      "baseline_median": 65.28,
+      "current_median": 64.31,
+      "median_change_percent": -1.485906862745101,
+      "paired_ratio_median_change_percent": -1.0767574219350928,
+      "baseline_min_max": [
+        65.01,
+        65.54
+      ],
+      "current_min_max": [
+        63.73,
+        64.58
+      ]
+    },
+    "remote_write_all/64KiB_mibps": {
+      "baseline_median": 957.4,
+      "current_median": 971.9,
+      "median_change_percent": 1.5145184875704931,
+      "paired_ratio_median_change_percent": 1.0967202841027701,
+      "baseline_min_max": [
+        953.7,
+        961.5
+      ],
+      "current_min_max": [
+        967.9,
+        980.7
+      ]
+    },
+    "remote_read_all/1024KiB_us": {
+      "baseline_median": 177.7,
+      "current_median": 189.55,
+      "median_change_percent": 6.668542487338214,
+      "paired_ratio_median_change_percent": 4.300126993085929,
+      "baseline_min_max": [
+        143.73,
+        283.48
+      ],
+      "current_min_max": [
+        173.52,
+        295.67
+      ]
+    },
+    "remote_read_all/1024KiB_mibps": {
+      "baseline_median": 5627.4,
+      "current_median": 5275.6,
+      "median_change_percent": -6.251554892134903,
+      "paired_ratio_median_change_percent": -4.121782515024385,
+      "baseline_min_max": [
+        3527.6,
+        6957.6
+      ],
+      "current_min_max": [
+        3382.2,
+        5763.0
+      ]
+    },
+    "remote_write_all/1024KiB_us": {
+      "baseline_median": 221.57,
+      "current_median": 193.81,
+      "median_change_percent": -12.52877194566051,
+      "paired_ratio_median_change_percent": -12.52877194566051,
+      "baseline_min_max": [
+        181.15,
+        367.17
+      ],
+      "current_min_max": [
+        186.29,
+        243.51
+      ]
+    },
+    "remote_write_all/1024KiB_mibps": {
+      "baseline_median": 4513.2,
+      "current_median": 5159.7,
+      "median_change_percent": 14.324647700079773,
+      "paired_ratio_median_change_percent": 14.324647700079773,
+      "baseline_min_max": [
+        2723.5,
+        5520.3
+      ],
+      "current_min_max": [
+        4106.7,
+        5368.0
+      ]
+    }
+  },
+  "completed_utc": "2026-09-06T07:45:38.824142+00:00",
+  "implementation_stage": "initial",
+  "baseline_commit": "642a7d9efd6c51c298a541b42e144ff96591ae50",
+  "cargo_lock_sha256": "7dbb7e683d392a9af3240344ddf9bd9b9a2409c67d6700f870f0223459de3bd6",
+  "benchmark_source_sha256": "da33df24275b23612632986f16f871d0a814cf191f366d84c4cc042ede0faf07"
+}

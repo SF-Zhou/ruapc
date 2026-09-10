@@ -15,8 +15,8 @@ pub(crate) use endpoint::{
 
 mod path;
 pub use path::{
-    RdmaConnDirection, RdmaDeviceLoad, RdmaNicInfo, RdmaPathEntry, RdmaPathInfo, RdmaPathReport,
-    StripePhase,
+    RdmaConnDirection, RdmaCqLoad, RdmaDeviceLoad, RdmaNicInfo, RdmaPathEntry, RdmaPathInfo,
+    RdmaPathReport, StripePhase,
 };
 
 mod rate_limiter;

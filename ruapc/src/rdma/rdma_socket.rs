@@ -8,16 +8,19 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use ruapc_rdma::{QueuePair, ibv_send_flags};
+use ruapc_rdma::ibv_send_flags;
 use serde::Serialize;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::{Notify, Semaphore, mpsc::Sender};
 
 use super::{RdmaBandwidthLimiter, RdmaPathInfo, RdmaState, SendPermit};
 use crate::{
     Buffer, BufferPool, Context, CopyOp, Error, RemoteIoError, RemoteSpace, SocketTrait, State,
     error::{ErrorKind, Result},
     msg::MsgMeta,
-    rdma::{frame::FramedBuffer, poller::PollerWaker},
+    rdma::{
+        frame::FramedBuffer,
+        poller::{PollerWaker, ReservedQueuePair},
+    },
 };
 
 pub(crate) struct RdmaSocketConfig {
@@ -30,10 +33,71 @@ pub(crate) struct RdmaSocketConfig {
     pub(crate) sq_read_cap: u32,
 }
 
+/// Owns this QP's READ admission and its share of the NIC-wide limit.
+///
+/// The socket must declare this owner after its QP. Normal completions return
+/// both permits immediately; final destruction returns only the NIC permits
+/// for WRs whose completions were never processed, after destroying the QP.
+#[derive(Debug)]
+pub(crate) struct ReadCredits {
+    device: Arc<Semaphore>,
+    sq: Semaphore,
+    cap: usize,
+    closed: Notify,
+    /// Captured from the QP during exclusive socket destruction. SQ occupancy
+    /// is insufficient: an unposted task may hold SQ capacity while awaiting
+    /// the NIC, and forgetting that future need not keep the socket alive.
+    unpolled_on_drop: usize,
+}
+
+impl ReadCredits {
+    fn new(device: Arc<Semaphore>, cap: u32) -> Self {
+        let cap = cap.max(1) as usize;
+        Self {
+            device,
+            sq: Semaphore::new(cap),
+            cap,
+            closed: Notify::new(),
+            unpolled_on_drop: 0,
+        }
+    }
+
+    /// Called once for each authentic READ completion, including errors.
+    pub(crate) fn complete(&self) {
+        self.device.add_permits(1);
+        self.sq.add_permits(1);
+    }
+
+    pub(crate) fn close(&self) {
+        self.sq.close();
+        self.closed.notify_waiters();
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.sq.is_closed()
+    }
+
+    pub(crate) fn is_idle(&self) -> bool {
+        self.sq.available_permits() == self.cap
+    }
+}
+
+impl Drop for ReadCredits {
+    fn drop(&mut self) {
+        // The QP's successful destruction has ended DMA. Forgotten unposted
+        // futures may leak their own permits, but must never invent NIC credit.
+        if self.unpolled_on_drop != 0 {
+            self.device.add_permits(self.unpolled_on_drop);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct RdmaSocket {
     /// The QP owns posted memory through completion and successful destruction.
-    pub(crate) queue_pair: QueuePair,
+    pub(crate) queue_pair: ReservedQueuePair,
+    /// Field order ensures unpolled READ permits return only after QP destruction.
+    pub(crate) read_credits: ReadCredits,
     pub(crate) rdmabuf_pool: Arc<BufferPool>,
     pub(crate) state: RdmaState,
     /// Window-blocked framed sends, flushed by the poll thread once
@@ -55,20 +119,8 @@ pub struct RdmaSocket {
     activation_requested: AtomicBool,
     /// Server-side accept lease notified by the first successful receive.
     accept_lease_id: AtomicU64,
-    /// Bounds in-flight RDMA READ work requests per *local NIC*: shared
-    /// by every connection of the pool on this device
-    /// (`rdma.remote_memory.max_inflight_read_wrs`) — the congestion control knob for
-    /// read traffic, covering both server-side `remote_read` and
-    /// client-side `read_into_target`. Permits are forgotten on post and re-added by
-    /// the poll thread per completion.
-    pub(crate) read_permits: Arc<tokio::sync::Semaphore>,
     /// Shared bandwidth shaper for the local RDMA port.
     bandwidth_limiter: Arc<RdmaBandwidthLimiter>,
-    /// Per-connection safety cap (`qp.max_send_wr / 2`, not a policy
-    /// knob): the send queue is shared with regular sends, and the
-    /// device-wide read budget landing on a single QP must not overflow
-    /// it. Accounted exactly like `read_permits`.
-    pub(crate) sq_read_permits: tokio::sync::Semaphore,
     /// Software deadline for RDMA READ completions; `None` disables the
     /// timeout. Enforced by the poll thread's periodic sweep, not by
     /// per-operation timers.
@@ -77,7 +129,7 @@ pub struct RdmaSocket {
 
 impl RdmaSocket {
     pub(crate) fn new(
-        queue_pair: QueuePair,
+        queue_pair: ReservedQueuePair,
         rdmabuf_pool: Arc<BufferPool>,
         pending_sender: Sender<Buffer>,
         poller_waker: PollerWaker,
@@ -85,6 +137,7 @@ impl RdmaSocket {
     ) -> Self {
         Self {
             queue_pair,
+            read_credits: ReadCredits::new(config.read_permits, config.sq_read_cap),
             rdmabuf_pool,
             state: RdmaState::new(config.send_window.max(1)),
             pending_sender,
@@ -95,9 +148,7 @@ impl RdmaSocket {
             peer_health: std::sync::OnceLock::new(),
             activation_requested: AtomicBool::new(false),
             accept_lease_id: AtomicU64::new(0),
-            read_permits: config.read_permits,
             bandwidth_limiter: config.bandwidth_limiter,
-            sq_read_permits: tokio::sync::Semaphore::new(config.sq_read_cap.max(1) as usize),
             read_timeout: config.read_timeout,
         }
     }
@@ -168,6 +219,7 @@ impl RdmaSocket {
         if !self.state.set_error() {
             return;
         }
+        self.read_credits.close();
         let mut attr = ruapc_rdma::ibv_qp_attr {
             qp_state: ruapc_rdma::ibv_qp_state::IBV_QPS_ERR,
             ..Default::default()
@@ -192,6 +244,15 @@ impl RdmaSocket {
         self.bandwidth_limiter
             .reserve_send(bytes, request_remaining)
             .await
+    }
+}
+
+impl Drop for RdmaSocket {
+    fn drop(&mut self) {
+        // No posting or completion can still execute through this socket.
+        // Snapshot only: refunding here would release admission before the QP
+        // is destroyed. Fields then drop in order: QP, followed by credits.
+        self.read_credits.unpolled_on_drop = self.queue_pair.pending_read_count();
     }
 }
 

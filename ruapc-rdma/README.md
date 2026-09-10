@@ -16,15 +16,18 @@ explicit DMA lifetime contracts over raw verbs.
 - **Buffer-owning work requests**: `QueuePair::send`/`recv` take ownership of a
   [`ruapc-bufpool`](../ruapc-bufpool/) `Buffer`. Poll `CompletionQueue` and recover
   buffers through `QueuePair::complete` using a CQ-issued, non-cloneable
-  `Completion` proof. Shared CQs route by the WRID tag.
+  `Completion` proof. Shared CQs identify the owning QP through the CQE's
+  hardware QPN.
 - **Lock-free SEND/RECV tracking**: buffers of those posted work requests live in
   `WrSlots`, a fixed-size atomic slot array indexed by monotonic per-direction
   IDs — no `Mutex<HashMap>` on the completion path
 - **Selective signaling** with completion-driven reclamation of unsignaled
   SEND buffers (RC send queues complete in order), plus gather-list sends and
   owned vectored RDMA READ plans (`prepare_reads` / `post_read`)
-- **Typed work request IDs**: `WRID` packs a work request type, an opaque
-  connection tag, and a per-direction sequence number into the 64-bit `wr_id`
+- **CQ-owned work request identities**: `WRID` packs 2 type bits and a fixed
+  62-bit per-direction QP sequence. The CQ leases each hardware QPN and
+  advances a shared retirement floor before allowing QPN reuse. WR posting
+  needs no global sequence counter.
 - **Serializable device snapshots**: `DeviceInfo`/`Port`/`Gid` (and the raw
   `ibv_device_attr`/`ibv_port_attr`) implement serde + schemars; GID types are
   classified (IB / RoCE v1 / RoCE v2) and non-routable GIDs filtered out
@@ -38,16 +41,57 @@ explicit DMA lifetime contracts over raw verbs.
 ## DMA ownership
 
 `CompletionQueue::poll_batch` fills reusable stack storage and lends a unique
-proof for each CQE. `QueuePair::complete` validates the originating CQ, QP number
-and permanently assigned WRID tag before returning SEND/RECV buffers or settling
-READ ownership. Copying raw CQE metadata cannot authorize reclamation. Creating
-and validating the borrowed proof needs no allocation or reference-count update;
-READ batch accounting retains its own synchronization.
+proof for each CQE. `QueuePair::complete` validates the originating CQ, hardware
+QPN and `CompletionIdentity` sequence floor before returning SEND/RECV buffers
+or settling READ ownership. Copying raw CQE metadata cannot authorize
+reclamation. Creating and validating the borrowed proof needs no allocation or
+reference-count update; READ batch accounting retains its own synchronization.
 
-Each CQ keeps a 512 KiB bitmap of connection tags claimed during its lifetime.
-`set_wr_tag` accepts a tag exactly once and prevents reuse even after QP destruction,
-so a retained completion cannot release memory on a replacement QP. The core
-poller retires a slot after its 256 generations instead of wrapping its tag.
+The complete work identity includes the originating CQ, QPN, WR type and
+sequence. Different live QPs may use the same WRID. The fixed layout leaves
+62 sequence bits regardless of CQ capacity or connection count; it has no
+connection-slot field. `WRID::{raw, get_type, sequence}` exposes metadata,
+while `Completion::{qp_num, sequence}` exposes CQ-issued metadata with its
+borrowed proof. Error CQEs still carry QPN and WRID, so the type encoded in
+WRID remains usable when the provider opcode is not valid.
+
+`CompletionQueue::capacity()` reports the actual provider CQE capacity. It is
+not a limit on registered QPNs: applications must separately bound outstanding
+completions to avoid CQ overflow. `qp_registry_stats()` samples active QPN
+leases and the sequence floor for future registrations; it does not run on the
+posting or completion path.
+
+`QueuePair::create` registers the hardware QPN after provider creation and owns
+its CQ lease until successful provider destruction. `send_identity()` and
+`recv_identity()` expose immutable identity metadata. Shared send/receive CQs
+use one lease; separate CQs register independent identities. SQ and RQ allocate
+sequences independently from their identity's initial floor. SEND,
+SEND-with-immediate and READ share SQ's stream. Failed posts never roll
+sequence allocation back.
+
+The CQ retains only its live-QPN registry and a shared retirement floor. When
+a QP is destroyed, the floor advances to the maximum of its previous value,
+both next sequence counters, and the retiring identity's initial floor plus
+one. The QPN is then removed under the same lock. Even an unused QP advances
+the floor, and a retained token cannot match a replacement QPN. Registry memory
+therefore scales with peak live QPs rather than historical QPN churn. The lock
+is used only for registration, retirement and explicit statistics; posting
+continues to use the existing per-QP SQ mutex and RQ counter.
+
+A provider may reuse a QPN after destruction but before the old Rust lease has
+returned its watermark. Registration then fails with `CompletionIdentityInUse`
+and destroys the newly created QP before releasing any partial registrations;
+it never removes the old lease. Sequence allocation fails with
+`WorkRequestIdsExhausted` at the 62-bit limit. If retirement advances the CQ's
+shared floor beyond that limit, future QP registration also fails. Identifiers
+never wrap. Clearing a CQ does not authorize resetting the floor because callers
+may still retain previously polled completion tokens.
+
+SEND/RECV buffer tracking remains a separate bounded `WrSlots` array. A slot
+collision returns ownership to the submission path immediately and produces
+`WorkRequestSlotsExhausted`, preserving the previously posted buffer. See
+[WRID allocation and completion routing](../docs/wrid.md) for the reuse proof,
+registration ordering, memory accounting and performance evidence.
 
 `prepare_reads` takes a destination `Vec<Buffer>` and buffer-index/offset/length
 descriptors. It validates local bounds and cross-request overlap, and derives

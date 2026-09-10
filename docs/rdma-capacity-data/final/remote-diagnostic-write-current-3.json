@@ -1,0 +1,38 @@
+{
+  "started_utc": "2026-09-06T15:45:01.932498+00:00",
+  "completed_utc": "2026-09-06T15:45:04.563205+00:00",
+  "binary": "/tmp/ruapc-capacity-bench/remote-diagnostic-final",
+  "binary_sha256": "b0cc2f824e4bbd00d8de6ff635526435aa61c96bd8ac831592eb6db5da0cc48b",
+  "pin_library_sha256": "622ca4da965983cf41e791a5c62d6a64780f30ee1de1a80cb1212bbd18931b38",
+  "environment": {
+    "RUAPC_BENCH_TRANSPORT": "RDMA",
+    "RUAPC_BENCH_SERIAL_ITERS": "10000",
+    "RUAPC_BENCH_WARMUP_ITERS": "1000",
+    "RUAPC_DIAG_DIRECTION": "write",
+    "RUAPC_BENCH_RDMA_DEVICE": "mlx5_0"
+  },
+  "command": [
+    "numactl",
+    "--physcpubind=0-10",
+    "--membind=0",
+    "env",
+    "LD_PRELOAD=/tmp/ruapc-capacity-bench/pin_threads.so",
+    "/tmp/ruapc-capacity-bench/remote-diagnostic-final"
+  ],
+  "returncode": 0,
+  "timed_out": false,
+  "elapsed_s": 2.6411007519927807,
+  "stdout": "ruapc: remote-memory RPC + complete-pattern verification\nserial requests; 4 runtime workers; 1000 warmup iterations per case; measured override: Some(10000)\nsetup and warmup excluded; sources and write destinations reused\ntransport: Some(RDMA); RDMA device: Some(\"mlx5_0\")\nRDMA\n{\"iterations\":10000,\"operation\":\"remote_write_all\",\"phase\":\"diagnostic\",\"remote_await_us_per_op\":73.4279724,\"size\":1048576,\"verify_us_per_op\":37.6584813,\"wall_us_per_op\":233.6980218}\n  remote_write_all 1024 KiB | 10000 iters |    233.70 us/op |   4279.0 MiB/s | verified\n",
+  "stderr": "pin_threads: main -> cpu=8\npin_threads: tokio-rt-worker -> cpu=0\npin_threads: tokio-rt-worker -> cpu=1\npin_threads: tokio-rt-worker -> cpu=2\npin_threads: tokio-rt-worker -> cpu=3\npin_threads: ruapc-rdma-poll -> cpu=9\npin_threads: ruapc-rdma-poll -> cpu=10\n",
+  "events": [
+    {
+      "iterations": 10000,
+      "operation": "remote_write_all",
+      "phase": "diagnostic",
+      "remote_await_us_per_op": 73.4279724,
+      "size": 1048576,
+      "verify_us_per_op": 37.6584813,
+      "wall_us_per_op": 233.6980218
+    }
+  ]
+}

@@ -89,9 +89,9 @@ async fn initial_stripe_failure_rolls_back_all_unpublished_connections() {
     let (server, address) = start_server(&server_config).await;
     let mut client_config = server_config.clone();
     let rdma = client_config.rdma.as_mut().unwrap();
-    // register_socket reserves twice the combined SQ/RQ depth per stripe.
-    rdma.polling.device_cq_len =
-        2 * (rdma.connection.qp.max_send_wr + rdma.connection.qp.max_recv_wr);
+    // One stripe needs R4 + W2 + A2 + min(H32, K8) = 16 CQEs.
+    // Request 16: providers may round to 31, still below two stripes' 32.
+    rdma.polling.device_cq_len = 16;
     let context = Context::create(&client_config)
         .unwrap()
         .with_endpoint(Endpoint::new(Transport::RDMA, address));
@@ -102,9 +102,9 @@ async fn initial_stripe_failure_rolls_back_all_unpublished_connections() {
     let error = client.ping(&context, &7).await.unwrap_err();
     assert_eq!(error.kind, ErrorKind::Overloaded, "{error}");
     for expected in [
-        "register socket",
+        "reserve completion capacity",
         "shared CQ capacity exhausted",
-        "64 + 64 > 64",
+        "all 1 RDMA CQ shards unavailable",
         "attempt",
         &address.to_string(),
     ] {
