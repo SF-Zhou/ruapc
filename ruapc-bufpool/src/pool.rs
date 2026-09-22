@@ -34,7 +34,7 @@ enum AllocationStep {
     Wait(oneshot::Receiver<Buffer>),
 }
 
-/// A high-performance memory pool using buddy memory allocation.
+/// Registered memory pool with slab and buddy size classes.
 ///
 /// Manages registered 64 MiB blocks. Small allocations use 16 KiB, 64 KiB,
 /// and 256 KiB slabs; larger allocations use 1 MiB, 4 MiB, 16 MiB, and 64 MiB
@@ -87,20 +87,19 @@ impl BufferPool {
     /// Allocates a buffer of at least the specified size.
     ///
     /// The returned buffer may be larger than requested, rounded up to the
-    /// nearest size class (16 KiB, 64 KiB, 256 KiB, 1 MiB, 4 MiB, 16 MiB, or
-    /// 64 MiB). Sizes up to 256 KiB are served by the slab layer; larger
-    /// sizes by the buddy allocator.
+    /// nearest size class (16 KiB through 64 MiB; see [`BufferPool`]). Its
+    /// initial logical length equals that capacity. Set the length explicitly
+    /// before exposing a partially filled buffer; reused bytes are not cleared.
     ///
     /// If the pool needs to grow, the 64 MiB block creation and device
-    /// registration (potentially milliseconds for RDMA) happen *outside*
-    /// the pool mutex, so concurrent allocations and frees are not stalled.
+    /// registration run on the calling thread, outside the pool mutex.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - `size` is 0 or exceeds 64 MiB
     /// - Memory limit has been reached
-    /// - Underlying allocator fails
+    /// - Backing allocation or device registration fails
     pub fn allocate(self: &Arc<Self>, size: usize) -> Result<Buffer> {
         if let Some(class) = size_to_class(size) {
             if let Some(buffer) = self.try_take_chunk_fast(class) {
@@ -145,7 +144,7 @@ impl BufferPool {
     ///
     /// Returns an error if:
     /// - `size` is 0 or exceeds 64 MiB
-    /// - Underlying allocator fails
+    /// - Backing allocation or device registration fails
     pub async fn async_allocate(self: &Arc<Self>, size: usize) -> Result<Buffer> {
         if let Some(class) = size_to_class(size) {
             if let Some(buffer) = self.try_take_chunk_fast(class) {
@@ -180,8 +179,8 @@ impl BufferPool {
         }
     }
 
-    /// Shared slow transition: reclaim cached capacity, grow, then (if allowed)
-    /// queue a waiter. The last capacity check and registration share a lock.
+    /// Reclaims cached capacity, reserves growth, or queues a waiter.
+    /// The final capacity check and waiter registration share a lock.
     fn prepare_allocation(self: &Arc<Self>, level: usize, wait: bool) -> Result<AllocationStep> {
         self.reclaim_cached_capacity();
 
@@ -251,7 +250,8 @@ impl BufferPool {
         self.max_memory
     }
 
-    /// Returns the number of free buffers at each level.
+    /// Free-list buddy nodes in size order: 1, 4, 16, and 64 MiB.
+    /// Excludes deferred merges and memory owned by the slab layer.
     pub fn free_counts(&self) -> [usize; NUM_LEVELS] {
         let inner = self.inner.lock().expect("BufferPool mutex poisoned");
         std::array::from_fn(|i| inner.free_lists[i].len())
@@ -267,8 +267,8 @@ impl BufferPool {
         std::array::from_fn(|i| inner.pending_lists[i].len())
     }
 
-    /// Returns the number of free chunks in each slab size class
-    /// (16 KiB, 64 KiB, 256 KiB).
+    /// Free chunks in shared slabs, ordered as 16 KiB, 64 KiB, and 256 KiB.
+    /// Excludes chunks retained in thread caches.
     pub fn slab_free_counts(&self) -> [usize; NUM_SLAB_CLASSES] {
         std::array::from_fn(|class| {
             self.slab_classes[class]

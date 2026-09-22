@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn test_parse_message_too_long_returns_error() {
         let mut buf = BytesMut::new();
-        // len = MAX_MSG_SIZE - 8 + 1 means S + len == MAX_MSG_SIZE which triggers the error.
+        // The complete frame would exceed MAX_MSG_SIZE.
         let too_long = (MAX_MSG_SIZE - std::mem::size_of::<u64>() + 1) as u32;
         buf.extend_from_slice(&make_header(MAGIC_NUM, too_long));
         let result = parse_message(&mut buf);

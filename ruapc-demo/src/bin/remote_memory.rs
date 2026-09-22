@@ -5,15 +5,15 @@
 //!   `with_read_buffers`; the server pulls them with `remote_read_all`.
 //! - **Download**: the client pre-provides pinned destination buffers via
 //!   `with_write_buffers`; the service method returns
-//!   `ResultWithBuffers<T>`, the server writes into the client's buffers
-//!   with `remote_write_all`, and every buffer comes back through the
-//!   method's return value.
+//!   `Result<WithBuffers<T>>`. The server fills the destinations with
+//!   `remote_write_all`; successful calls return available buffers when
+//!   their target is uniquely held.
 //!
 //! Both directions treat multiple buffers as one logical contiguous
 //! space; servers can also issue vectored transfers with explicit
 //! offsets (`Context::remote_read` / `remote_write` with `CopyOp`s).
 //!
-//! Works identically over TCP / WS / HTTP / RDMA:
+//! TCP / WS / HTTP use inline reverse RPCs; RDMA uses one-sided READs:
 //!
 //! ```sh
 //! cargo run --bin remote_memory -- --transport tcp
@@ -54,10 +54,7 @@ trait BlobService {
     /// Client attaches buffers; server reads them and reports their size.
     async fn upload(&self, ctx: &Context, req: &UploadReq) -> Result<usize>;
 
-    /// Server fills the client's pinned write buffers and reports the
-    /// write latency (in microseconds) as the response — computed *after*
-    /// the transfer, which the `remote_write` + `SentBuffers::reply`
-    /// two-step allows.
+    /// Fills the client's pinned destinations and reports transfer time in microseconds.
     async fn download(&self, ctx: &Context, req: &DownloadReq) -> Result<WithBuffers<u64>>;
 }
 
@@ -65,9 +62,7 @@ struct BlobServiceImpl;
 
 impl BlobService for BlobServiceImpl {
     async fn upload(&self, ctx: &Context, req: &UploadReq) -> Result<usize> {
-        // One call: allocates right-sized local buffers and transfers
-        // exactly the client's logical data (TCP: reverse RPC copy,
-        // RDMA: batched one-sided RDMA READs).
+        // Allocate destinations for the client's complete logical read space.
         let data = ctx.remote_read_all().await?;
         let total: usize = data.iter().map(|b| b.len()).sum();
         let preview = data

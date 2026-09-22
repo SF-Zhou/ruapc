@@ -11,11 +11,9 @@
 //! - **metrics** — per-method request counters, in-flight gauges and
 //!   latency histograms.
 //!
-//! Once a handler starts it always runs to completion: there is no
-//! mid-flight cancellation. Aborting arbitrary user code at await points
-//! risks breaking application invariants, and a cancel signal is inherently
-//! unreliable — deadline checks (`Context::is_expired`) inside long-running
-//! handlers are the supported way to stop wasted work.
+//! Deadline expiry does not cancel a running handler: dropping user futures
+//! at await points can break application invariants. Long-running handlers
+//! should check [`Context::is_expired`] to stop cooperatively.
 
 use std::sync::atomic::Ordering;
 

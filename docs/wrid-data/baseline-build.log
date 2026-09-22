@@ -1,4 +1,0 @@
-   Compiling ruapc v0.2.0-alpha.5 (/tmp/ruapc-wrid-baseline-g1D97k/ruapc)
-    Finished `bench` profile [optimized] target(s) in 3.50s
-  Executable benches/echo.rs (target/release/deps/echo-3cf06c283b4c4119)
-  Executable benches/remote_memory.rs (target/release/deps/remote_memory-747d67d7cd0b06b0)

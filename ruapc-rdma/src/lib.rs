@@ -11,7 +11,8 @@
 //!   take ownership of a [`ruapc_bufpool::Buffer`]. Poll [`CompletionQueue`] and
 //!   pass CQ-issued [`Completion`] proofs to [`QueuePair::complete`] to recover
 //!   finished buffers. [`QueuePair::prepare_reads`] owns READ destinations
-//!   until all posted requests complete.
+//!   through completion or successful QP destruction; failures cannot release
+//!   destinations while the NIC may still access them.
 //! - **Type-safe bindings**: Generated FFI types have custom Rust wrappers
 //!   (`FwVer`, `Guid`, `WRID`, `LinkLayer`) substituted at build time.
 //!   Every verbs entry point is routed through a C shim compiled against the

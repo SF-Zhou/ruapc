@@ -5,269 +5,213 @@
 [![crates.io](https://img.shields.io/crates/v/ruapc.svg)](https://crates.io/crates/ruapc)
 [![stability-wip](https://img.shields.io/badge/stability-wip-lightgrey.svg)](https://github.com/mkenney/software-guides/blob/master/STABILITY-BADGES.md#work-in-progress)
 
-A high-performance Rust RPC library that supports multiple transport protocols (TCP, WebSocket, HTTP, RDMA) with unified API, and OpenAPI integration.
+A Rust RPC library with a shared service API for TCP, WebSocket, HTTP and optional RDMA.
 
 <img src="docs/logo.png" alt="RuaPC" width="256" height="256">
 
-## Workspace
+- `#[service]` generates typed clients, server dispatch and OpenAPI schemas.
+- A unified listener accepts TCP, WebSocket and HTTP on one port, including RDMA bootstrap when enabled.
+- Persistent TCP, WebSocket, HTTP/2 and RDMA connections support reverse RPC.
+- Remote read/write transfers use RDMA READs or inline reverse RPC over the other transports.
+- Payloads use MessagePack by default; clients can select JSON. HTTP POST endpoints accept JSON.
+- RapiDoc serves interactive documentation; metrics use the `metrics` facade with an application-provided recorder.
 
-| Crate | Description |
-|---|---|
-| `ruapc` | Core library: server, client, router, socket abstractions, message format |
-| `ruapc-bufpool` | Buddy allocator + slab buffer pool with device registration (transport-independent) |
-| `ruapc-macro` | Proc macro `#[service]` for service definition and code generation |
-| `ruapc-rdma` | Low-level FFI bindings to libibverbs with type-safe RDMA device management |
-| `ruapc-demo` | Example server/client applications |
-
-The implementation boundaries and ownership rules are documented in [DESIGN.md](DESIGN.md).
-
-## Features
-
-- **Multiple Transport Protocols**: TCP, WebSocket, HTTP/1.1 and HTTP/2 (h2c), RDMA (optional), and a unified protocol that supports all simultaneously
-- **Reverse RPC**: Server can call back into client services over established HTTP/2 or WebSocket connections
-- **Remote Read/Write**: Bulk data moves through registered buffers ([ruapc-bufpool](ruapc-bufpool/)): one-sided RDMA READs on RDMA, transparent reverse-RPC copies on TCP/WS/HTTP. Clients attach logical contiguous spaces; servers transfer whole spaces or vectored `CopyOp` batches. Owned sources protect local CPU readers, and pinned destinations remain held through DMA completions after timeout. See the [lifetime boundaries](DESIGN.md#remote-memory)
-- **Multiple Serialization Formats**: MessagePack by default, with JSON selectable per client
-- **OpenAPI Integration**: Automatic OpenAPI 3.0 specification generation with JSON Schema support
-- **Built-in Documentation**: RapiDoc integration for interactive API documentation
-
-## Cargo Features
-
-RDMA support is **not** enabled by default (it requires `libibverbs-dev` at build time). Enable it explicitly:
-
-```toml
-[dependencies]
-ruapc = { version = "0.2.0-alpha.5", features = ["rdma"] }
-```
+See the [documentation index](docs/README.md), [architecture](DESIGN.md) and [contribution guide](CONTRIBUTING.md).
 
 ## Example
 
-Define service:
+Add the dependencies below. TCP, WebSocket and HTTP require no RDMA libraries.
+
+```toml
+[dependencies]
+ruapc = "0.2.0-alpha.5"
+schemars = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+This program registers an echo service, makes a TCP call and shuts down the server:
 
 ```rust
-use ruapc::{Context, Result};
+use std::sync::Arc;
+
+use ruapc::{Client, Context, Endpoint, Result, Router, Server, SocketPoolConfig};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Debug, Clone, JsonSchema)]
-pub struct Request(pub String);
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct Request(String);
 
 #[ruapc::service]
-pub trait EchoService {
-    async fn echo(&self, c: &Context, r: &Request) -> Result<String>;
+trait EchoService {
+    async fn echo(&self, ctx: &Context, request: &Request) -> Result<String>;
 }
-```
 
-Start server:
+struct Echo;
 
-```rust
-use ruapc::*;
-use ruapc_demo::{EchoService, Request};
-use std::{net::SocketAddr, str::FromStr, sync::Arc};
-
-struct DemoImpl;
-
-impl EchoService for DemoImpl {
-    async fn echo(&self, _c: &Context, r: &Request) -> Result<String> {
-        Ok(r.0.clone())
+impl EchoService for Echo {
+    async fn echo(&self, _ctx: &Context, request: &Request) -> Result<String> {
+        Ok(request.0.clone())
     }
 }
 
 #[tokio::main]
-async fn main() {
-    let demo = Arc::new(DemoImpl);
+async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let config = SocketPoolConfig::default();
     let mut router = Router::default();
-    EchoService::ruapc_export(demo.clone(), &mut router);
-    let server = Server::create(router, &SocketPoolConfig::default()).unwrap();
+    EchoService::ruapc_export(Arc::new(Echo), &mut router);
+    let server = Server::create(router, &config)?;
+    let addr = server.listen("127.0.0.1:0".parse()?).await?;
 
-    let server = Arc::new(server);
-    let addr = SocketAddr::from_str("127.0.0.1:8000").unwrap();
-    let addr = server.listen(addr).await.unwrap();
-    println!("Serving on {addr}...");
-    server.join().await
+    let ctx = Context::create(&config)?.with_endpoint(Endpoint::tcp(addr));
+    let response = Client::default().echo(&ctx, &Request("Rua!".into())).await?;
+    assert_eq!(response, "Rua!");
+
+    server.stop();
+    server.join().await;
+    Ok(())
 }
 ```
 
-Make a request:
+The default listener accepts TCP. Use `ListenMode::UNIFIED` to accept the other
+protocols, and select the outbound transport in the endpoint, for example
+`"ws://127.0.0.1:8000".parse::<Endpoint>()?`.
 
-```rust
-use ruapc::*;
-use ruapc_demo::{EchoService, Request};
+## Run the demos
 
-#[tokio::main]
-async fn main() {
-    let endpoint: Endpoint = "tcp://127.0.0.1:8000".parse().unwrap();
-    let ctx = Context::create(&SocketPoolConfig::default())
-        .unwrap()
-        .with_endpoint(endpoint);
-    let client = Client::default();
-
-    let rsp = client.echo(&ctx, &Request("Rua!".into())).await;
-    println!("echo rsp: {:?}", rsp);
-}
-```
-
-## Quick Start
-
-You can directly execute the demo programs provided in ruapc-demo:
-
-### Server
+From this repository, start the server and run a client in another terminal:
 
 ```bash
-# Start the server with unified protocol (supports TCP, WebSocket, and HTTP simultaneously)
-cargo run --release --bin server -- --listen-mode unified
-
-# Or start with specific protocol
-cargo run --release --bin server -- --listen-mode tcp
-cargo run --release --bin server -- --listen-mode ws
-cargo run --release --bin server -- --listen-mode http
-cargo run --release --bin server -- --listen-mode http --http-base-path /api/v1
+cargo run -p ruapc-demo --release --bin server -- --listen-mode unified
+cargo run -p ruapc-demo --release --bin client -- tcp://127.0.0.1:8000
 ```
 
-### Client
+The client also accepts `ws://` and `http://`. Add
+`--stress --coroutines 128 --secs 10` for a load test. The demo client uses JSON
+unless `--use-msgpack` is passed; the library's `Client::default()` uses MessagePack.
+
+HTTP methods and reflection are available without a typed client:
 
 ```bash
-# Stress testing with different protocols
-cargo run --release --bin client -- tcp://127.0.0.1:8000 --stress --coroutines 128 --secs 10
-cargo run --release --bin client -- ws://127.0.0.1:8000 --stress --coroutines 128 --secs 10
-cargo run --release --bin client -- http://127.0.0.1:8000 --stress --coroutines 128 --secs 10
+curl -s -H 'content-type: application/json' -d '"hello HTTP"' \
+  http://127.0.0.1:8000/EchoService/echo
+# {"Ok":"hello HTTP"}
 
-# Or use curl to send HTTP requests.
-curl -s -X POST -d '"hello HTTP"' http://0.0.0.0:8000/EchoService/echo | json_pp
-#> {
-#>    "Ok" : "hello HTTP"
-#> }
-curl -s -X POST -H 'content-type: application/json' -d '{}' \
-  http://0.0.0.0:8000/_ruapc.meta/describe \
-  | jq '.Ok.services | map({name, methods: [.methods[].name]})'
-#> [
-#>   {"name":"EchoService","methods":["echo"]},
-#>   {"name":"GreetService","methods":["greet"]},
-#>   {"name":"_ruapc.meta","methods":["describe","openapi"]}
-#> ]
-
-# Access interactive API documentation
-open http://0.0.0.0:8000/rapidoc
+curl -s -H 'content-type: application/json' -d '{}' \
+  http://127.0.0.1:8000/_ruapc.meta/describe
 ```
 
-HTTP endpoints can be mounted under a base path on both the server and typed
-HTTP clients by using the same socket pool configuration:
+Open `http://127.0.0.1:8000/rapidoc` for interactive documentation.
+Ordinary HTTP POST calls do not support reverse RPC; RuaPC's typed HTTP client
+uses an HTTP/2 bidirectional stream.
+
+For a base path, pass `--http-base-path /api/v1` to the demo server. Set the same
+`SocketPoolConfig.http_base_path` on typed HTTP clients. RPC routes, the HTTP/2
+stream and documentation then live at `/api/v1/ServiceName/method`,
+`/api/v1/_rpc` and `/api/v1/rapidoc`. See [built-in services](docs/builtin-services.md)
+for reflection and internal control methods.
+
+## Remote read/write
+
+Clients attach owned buffers; servers address their concatenated logical lengths
+with `CopyOp { src_offset, dst_offset, len }`. Set each buffer's `len()` to the
+intended transfer length: pool allocations initially expose their full size class.
+
+For example, a service can read the client's source and copy it into the client's
+write space, whose total logical length must cover the transfer:
 
 ```rust
-let config = SocketPoolConfig {
-    listen_mode: ListenMode::HTTP,
-    http_base_path: "/api/v1".into(),
-    ..Default::default()
-};
-```
-
-This exposes RPC methods at `/api/v1/ServiceName/method`, the HTTP/2 RPC
-stream at `/api/v1/_rpc`, and API documentation at `/api/v1/rapidoc`.
-
-See [Built-in RPC services](docs/builtin-services.md) for the public reflection
-contract and the internal remote-memory/RDMA control interfaces.
-
-### Remote Read/Write
-
-Bulk data travels out-of-band through registered buffers, in both
-directions and over any transport. The client attaches buffers to a call;
-the server reads or writes them by offset:
-
-```rust
-use ruapc::*;
+use ruapc::{Context, Result, WithBuffers};
 
 #[ruapc::service]
 trait BlobService {
-    /// Reads the client's buffers, writes the result back into the
-    /// client's pre-pinned buffers, and replies with the byte count.
-    async fn transform(&self, ctx: &Context, req: &()) -> Result<WithBuffers<u64>>;
+    async fn copy(&self, ctx: &Context, req: &()) -> Result<WithBuffers<u64>>;
 }
 
-// ---- Server handler -----------------------------------------------------
-impl BlobService for BlobImpl {
-    async fn transform(&self, ctx: &Context, _req: &()) -> Result<WithBuffers<u64>> {
-        // Pull the client's read space (RDMA READ, or reverse-RPC on TCP).
-        let data = ctx.remote_read_all().await?;
-        let out = process(data, &ctx.state.buffer_pool);
+struct Blob;
 
-        // Write into the client's pinned buffers; vectored ops with
-        // explicit offsets are available via ctx.remote_write(&ops, bufs).
-        let total: u64 = out.iter().map(|b| b.len() as u64).sum();
-        let sent = ctx.remote_write_all(out).await?;
-        Ok(sent.reply(total)) // response is built *after* the transfer
+impl BlobService for Blob {
+    async fn copy(&self, ctx: &Context, _req: &()) -> Result<WithBuffers<u64>> {
+        let data = ctx.remote_read_all().await?;
+        let total = data.iter().map(|buffer| buffer.len() as u64).sum();
+        let sent = ctx.remote_write_all(data).await?;
+        Ok(sent.reply(total))
     }
 }
+```
 
-// ---- Client --------------------------------------------------------------
-let src = vec![buf_a, buf_b];          // owned, immutable read space
-let dst = vec![out_buf];               // owned write destinations
+After registering the service, call it with allocated source and destination buffers:
+
+```rust,ignore
 let mut transfer = client.with_read_buffers(src).with_write_buffers(dst);
-let (total, buffers) = transfer
-    .transform(&ctx, &())
-    .await?
-    .into_parts();                     // completed write destinations
-
-// Shared source views remain available; the wrapper can upload them again.
-let source_len: usize = transfer.read_buffers().iter().map(Buffer::len).sum();
-// Recover ownership only when no local reader still holds the source.
-let reusable_sources: Option<Vec<Buffer>> = transfer.take_read_buffers();
+let (total, buffers) = transfer.copy(&ctx, &()).await?.into_parts();
+let reusable_sources = transfer.take_read_buffers();
 ```
 
-`with_read_buffer(Buffer)` and `with_read_buffers(Vec<Buffer>)` transfer source
-ownership into the wrapper; another call to either replaces its source list.
-Keep the wrapper to reuse an immutable source across RPCs. Cancellation cannot
-release memory still held by a local reverse-RPC reader. If
-`take_read_buffers()` returns `None`, it preserves the source so recovery can
-be retried later. Failed writes similarly expose recoverable destinations
-through `take_write_buffers()`; buffers still in use remain owned by the transfer.
-Read-source recovery is not an acknowledgement of remote one-sided DMA completion;
-see the [remote-memory lifetime boundaries](DESIGN.md#remote-memory).
+Read attachments can be reused across calls; attaching another source replaces
+them. `read_buffers()` provides shared views, and `take_read_buffers()` returns
+ownership only when no local reader or pending request holds the source. A `None`
+result preserves the source for a later attempt.
 
-Run the self-contained demo over any transport:
+Successful `WithBuffers` responses return available write destinations. After a
+failed call, `take_write_buffers()` recovers only buffers already returned to the
+wrapper. Cancelled or failed DMA can make recovery unavailable even after the QP
+eventually recycles its memory. Posted destinations remain held until completion
+or successful QP destruction. Read-source recovery does not prove that remote
+one-sided DMA has completed; see the [safety boundaries](docs/safe-boundaries.md).
+
+The [remote-memory demo](ruapc-demo/src/bin/remote_memory.rs) includes allocation,
+service registration and data verification:
 
 ```bash
-cargo run --bin remote_memory -- --transport tcp
-cargo run --bin remote_memory --features rdma -- --transport rdma
+cargo run -p ruapc-demo --bin remote_memory -- --transport tcp
+cargo run -p ruapc-demo --bin remote_memory --features rdma -- --transport rdma
 ```
 
-### RDMA Support
+## RDMA
 
-See [RDMA connection establishment](docs/rdma-connection.md) (中文) for the
-bootstrap sequence, parameter negotiation, connection leases, and diagnostics.
+Enable the `rdma` Cargo feature explicitly:
+
+```toml
+ruapc = { version = "0.2.0-alpha.5", features = ["rdma"] }
+```
+
+Building requires a C compiler, `pkg-config`, libclang and the libibverbs development
+package (`libibverbs-dev` on Debian/Ubuntu). Running requires a usable RDMA device
+and sufficient locked-memory allowance. With the feature enabled,
+`SocketPoolConfig::default()` initializes RDMA; set `config.rdma = None` to disable
+it for a particular context. RDMA servers require TCP or UNIFIED listen mode for
+bootstrap.
 
 ```bash
-# Make sure the process has unlimited memory lock limit.
 sudo prlimit --pid $$ -l=unlimited
-
-# Start the server with RDMA
-cargo run --release --bin server --features rdma -- --listen-mode unified
-
-# Stress testing with RDMA
-cargo run --release --bin client --features rdma -- rdma://127.0.0.1:8000 --stress --coroutines 128
+cargo run -p ruapc-demo --release --bin server --features rdma -- --listen-mode unified
+# In another terminal with a sufficient locked-memory limit:
+cargo run -p ruapc-demo --release --bin client --features rdma -- rdma://127.0.0.1:8000
 ```
 
-### Benchmark
+See [RDMA connection establishment](docs/rdma-connection.md) for configuration,
+path selection and diagnostics.
+
+## Benchmarks and workspace
 
 ```bash
-# End-to-end echo RPC benchmark: serial latency + concurrent throughput
-# for every transport (TCP / WebSocket / HTTP / RDMA) on a unified server.
 cargo bench -p ruapc --bench echo
 cargo bench -p ruapc --bench remote_memory
-
-# Example: mlx5_0 is on NUMA node 0; CPUs 0-7 are distinct cores on that node.
-# Check the local NIC/CPU topology before choosing these values.
-RUAPC_BENCH_TRANSPORT=RDMA RUAPC_BENCH_RDMA_DEVICE=mlx5_0 \
-  numactl --physcpubind=0-7 --membind=0 cargo bench -p ruapc --bench remote_memory
 ```
 
-Both RPC benchmarks accept `RUAPC_BENCH_TRANSPORT` and
-`RUAPC_BENCH_RDMA_DEVICE`; unset values preserve automatic selection. Both also
-accept `RUAPC_BENCH_SERIAL_ITERS` and `RUAPC_BENCH_WARMUP_ITERS`. Echo defaults
-to 5000 measured and 1000 warmup requests; remote memory defaults to 512/128
-measured requests for 64 KiB/1 MiB and 8 warmups. Configuration is read once
-before measurement.
+Repository tests and RPC benchmarks enable RDMA through a development dependency.
+See [benchmark instructions](docs/benchmark.md) for prerequisites, workload controls
+and reproducible comparisons.
 
-See [docs/benchmark.md](docs/benchmark.md) for details and reference results.
+| Crate | Responsibility |
+| --- | --- |
+| `ruapc` | Clients, servers, routing, transports and remote-memory API |
+| [`ruapc-bufpool`](ruapc-bufpool/README.md) | Buddy/slab allocation and device registration |
+| `ruapc-macro` | `#[service]` code generation |
+| [`ruapc-rdma`](ruapc-rdma/README.md) | libibverbs bindings and owned work requests |
+| `ruapc-demo` | Example programs; not published |
 
 ## License
 
-This project is dual-licensed under the [MIT License](LICENSE-MIT) and [Apache License 2.0](LICENSE-APACHE).
+Dual-licensed under [MIT](LICENSE-MIT) and [Apache-2.0](LICENSE-APACHE).

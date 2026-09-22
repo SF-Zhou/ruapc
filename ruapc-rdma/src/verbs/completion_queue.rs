@@ -107,7 +107,7 @@ impl ExactSizeIterator for Completions<'_> {}
 
 /// A completion queue (CQ).
 ///
-/// Holds work completions from send/recv operations. Maintains shared
+/// Holds work completions from SEND, RECV and READ operations. Maintains shared
 /// references to the [`Context`] and optional [`CompChannel`] to ensure
 /// they outlive this CQ.
 pub struct CompletionQueue {

@@ -1,4 +1,4 @@
-//! Dedicated per-device RDMA completion poll thread
+//! RDMA completion polling, with one OS thread per CQ shard.
 //!
 //! Each RDMA device has configurable CQ shards, each with a dedicated OS
 //! poll thread. Admission selects a shard by available completion credits:
@@ -28,12 +28,10 @@
 //! regardless of how many messages the buffer carries), so received
 //! buffers accumulate into per-drain batches that are routed to a fixed
 //! pool of long-lived dispatch worker tasks (`rdma.polling.dispatch_workers`),
-//! each owning one SPSC queue; the workers walk the `[4B len][message]`
+//! each receiving through a Tokio mpsc queue; workers walk `[4B len][message]`
 //! frames and parse them on tokio worker threads. Routing is sticky
-//! (spill on pressure, see [`Dispatcher`]), the enqueue is a non-blocking
-//! push, and the poll thread issues no `tokio::spawn` on this path. Only
-//! when every worker is saturated does it degrade to spawning a one-shot
-//! task per batch, so it still never blocks.
+//! (spill on pressure, see [`Dispatcher`]) and queue sends never wait.
+//! When every worker is saturated, a one-shot task handles the batch.
 
 mod budget;
 mod conn;
@@ -451,7 +449,6 @@ impl PollLoop {
     const RECEIVE_RETRY_INTERVAL: Duration = Duration::from_micros(100);
 
     /// Full scans cover idle keepalives, READ deadlines and error teardown.
-    /// Their second-scale timers do not need a scan after every CQ drain.
     const HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(100);
 
     fn run(mut self) {

@@ -1,209 +1,123 @@
 # ruapc-rdma
 
-Low-level FFI bindings to libibverbs (RDMA verbs) with type-safe, RAII-based
-resource management. This crate is part of the [ruapc](../ruapc/) project but
-is independently usable by applications that need resource ownership and
-explicit DMA lifetime contracts over raw verbs.
+libibverbs bindings with RAII resources and buffer-owning work requests.
+Part of [RuaPC](../README.md), usable independently for low-level verbs operations.
+RPC bootstrap, path selection, flow control and poll threads live in `ruapc`.
 
-## Features
+## Requirements and discovery
 
-- **RAII resource wrappers**: `Context`, `ProtectionDomain`, `CompletionQueue`,
-  `CompChannel`, `MemoryRegion`, and `QueuePair` free their verbs resources on
-  drop; `Arc` ownership chains guarantee parents outlive children regardless of
-  user drop order
-- **C shim for every verbs entry point**: Rust never binds an `ibv_*` symbol
-  directly (see below)
-- **Buffer-owning work requests**: `QueuePair::send`/`recv` take ownership of a
-  [`ruapc-bufpool`](../ruapc-bufpool/) `Buffer`. Poll `CompletionQueue` and recover
-  buffers through `QueuePair::complete` using a CQ-issued, non-cloneable
-  `Completion` proof. Shared CQs identify the owning QP through the CQE's
-  hardware QPN.
-- **Lock-free SEND/RECV tracking**: buffers of those posted work requests live in
-  `WrSlots`, a fixed-size atomic slot array indexed by monotonic per-direction
-  IDs — no `Mutex<HashMap>` on the completion path
-- **Selective signaling** with completion-driven reclamation of unsignaled
-  SEND buffers (RC send queues complete in order), plus gather-list sends and
-  owned vectored RDMA READ plans (`prepare_reads` / `post_read`)
-- **CQ-owned work request identities**: `WRID` packs 2 type bits and a fixed
-  62-bit per-direction QP sequence. The CQ leases each hardware QPN and
-  advances a shared retirement floor before allowing QPN reuse. WR posting
-  needs no global sequence counter.
-- **Serializable device snapshots**: `DeviceInfo`/`Port`/`Gid` (and the raw
-  `ibv_device_attr`/`ibv_port_attr`) implement serde + schemars; GID types are
-  classified (IB / RoCE v1 / RoCE v2) and non-routable GIDs filtered out
-- **Typed capability flags**: bindgen emits `ibv_device_cap_flags`,
-  `ibv_port_cap_flags`, and `ibv_port_cap_flags2` as serializable `enumflags2`
-  enums and uses `BitFlags` directly in device/port attributes; combinations
-  support iteration and static names without lookup tables. The Rust
-  `ibv_port_cap_flags2` uses `u16` to match its only bound struct field rather
-  than the standalone C enum's ABI width
-
-## DMA ownership
-
-`CompletionQueue::poll_batch` fills reusable stack storage and lends a unique
-proof for each CQE. `QueuePair::complete` validates the originating CQ, hardware
-QPN and `CompletionIdentity` sequence floor before returning SEND/RECV buffers
-or settling READ ownership. Copying raw CQE metadata cannot authorize
-reclamation. Creating and validating the borrowed proof needs no allocation or
-reference-count update; READ batch accounting retains its own synchronization.
-
-The complete work identity includes the originating CQ, QPN, WR type and
-sequence. Different live QPs may use the same WRID. The fixed layout leaves
-62 sequence bits regardless of CQ capacity or connection count; it has no
-connection-slot field. `WRID::{raw, get_type, sequence}` exposes metadata,
-while `Completion::{qp_num, sequence}` exposes CQ-issued metadata with its
-borrowed proof. Error CQEs still carry QPN and WRID, so the type encoded in
-WRID remains usable when the provider opcode is not valid.
-
-`CompletionQueue::capacity()` reports the actual provider CQE capacity. It is
-not a limit on registered QPNs: applications must separately bound outstanding
-completions to avoid CQ overflow. `qp_registry_stats()` samples active QPN
-leases and the sequence floor for future registrations; it does not run on the
-posting or completion path.
-
-`QueuePair::create` registers the hardware QPN after provider creation and owns
-its CQ lease until successful provider destruction. `send_identity()` and
-`recv_identity()` expose immutable identity metadata. Shared send/receive CQs
-use one lease; separate CQs register independent identities. SQ and RQ allocate
-sequences independently from their identity's initial floor. SEND,
-SEND-with-immediate and READ share SQ's stream. Failed posts never roll
-sequence allocation back.
-
-The CQ retains only its live-QPN registry and a shared retirement floor. When
-a QP is destroyed, the floor advances to the maximum of its previous value,
-both next sequence counters, and the retiring identity's initial floor plus
-one. The QPN is then removed under the same lock. Even an unused QP advances
-the floor, and a retained token cannot match a replacement QPN. Registry memory
-therefore scales with peak live QPs rather than historical QPN churn. The lock
-is used only for registration, retirement and explicit statistics; posting
-continues to use the existing per-QP SQ mutex and RQ counter.
-
-A provider may reuse a QPN after destruction but before the old Rust lease has
-returned its watermark. Registration then fails with `CompletionIdentityInUse`
-and destroys the newly created QP before releasing any partial registrations;
-it never removes the old lease. Sequence allocation fails with
-`WorkRequestIdsExhausted` at the 62-bit limit. If retirement advances the CQ's
-shared floor beyond that limit, future QP registration also fails. Identifiers
-never wrap. Clearing a CQ does not authorize resetting the floor because callers
-may still retain previously polled completion tokens.
-
-SEND/RECV buffer tracking remains a separate bounded `WrSlots` array. A slot
-collision returns ownership to the submission path immediately and produces
-`WorkRequestSlotsExhausted`, preserving the previously posted buffer. See
-[WRID allocation and completion routing](../docs/wrid.md) for the reuse proof,
-registration ordering, memory accounting and performance evidence.
-
-`prepare_reads` takes a destination `Vec<Buffer>` and buffer-index/offset/length
-descriptors. It validates local bounds and cross-request overlap, and derives
-the local addresses and keys itself. The returned non-cloneable `ReadPosting`
-cursor can post each request once, only to its preparing QP. Dropping the cursor
-accounts its unposted suffix; the QP retains already posted destinations.
-Explicit cancellation before any post can recover the vector. Timeout or
-connection failure notifies the receiver without recycling memory still visible
-to the NIC; dropping or forgetting a future cannot authorize early recovery.
-Buffers remain owned until all posted READs complete or their QP is destroyed.
-Forgetting an owner can retain resources indefinitely. Successful QP destruction
-also releases any remaining unsignaled SENDs; a provider failure to destroy a QP
-aborts the process because dropping its memory holds would permit ongoing DMA
-into recycled storage.
-
-These guarantees concern local destinations. Remote source addresses and keys
-do not carry a source-side completion lease. The RPC layer's post-READ pending
-check rejects stale results but cannot delay source recovery until an
-unobservable remote DMA completion.
-
-## Buffer-pool registration
-
-`ActiveDevice` implements `ruapc_bufpool::MemoryRegistrar` in
-`src/buffer_registration.rs`. `DeviceSet` calls this audited capability directly;
-safe application `Device` wrappers supply a registrar reference without receiving
-the backing allocation. Registration retains memory and its protection domain
-through `MemoryRegion`, but does not grant independent access to bytes owned by
-pool buffers. Queue operations separately own their DMA lifetime obligations.
-
-## Why a C shim?
-
-rdma-core evolves its ABI by keeping old exported symbols for already-compiled
-binaries and redirecting newly compiled code to new semantics via function-like
-macros or static inline wrappers in `<infiniband/verbs.h>` (`ibv_query_port`
-and `ibv_reg_mr` both started life as plain functions and were later
-macro-wrapped this way). bindgen binds exported symbols directly, so it would
-silently keep the frozen legacy semantics forever — no compile error, just
-subtly wrong behavior.
-
-Instead, `build.rs` compiles `src/shim.c`, a C translation unit that wraps
-*every* verbs entry point used by this crate (`ruapc_ibv_*`), against the
-locally installed header. This guarantees "freshly compiled against this
-platform's rdma-core" semantics for each call, and the C compiler type-checks
-each wrapper against the real prototypes. The cost is one direct call per
-invocation — not measurable even on the hottest path (empty `ibv_poll_cq` on
-mlx5: 9.79 ns/op with and without the shim).
-
-## Architecture
-
-```text
-Context (ibv_context)
-  ├─ ProtectionDomain (ibv_pd)
-  │    ├─ MemoryRegion (ibv_mr)      ← pins Arc<AlignedMemory>
-  │    └─ QueuePair (ibv_qp)         ← + send CQ + recv CQ, WrSlots
-  ├─ CompChannel (ibv_comp_channel)  ← event fd for poll(2)/epoll
-  └─ CompletionQueue (ibv_cq)        ← + optional CompChannel
-```
-
-Source layout:
-
-- `src/shim.{h,c}` — C wrappers for all verbs entry points
-- `build.rs` — pkg-config probe, shim compilation, bindgen with custom type
-  substitutions (`FwVer`, `Guid`, `WRID`, `LinkLayer`) and typed flag derives
-- `src/ffi/` — included bindgen output plus extensions on generated types
-  (`ibv_gid` ↔ IPv6, `ibv_wc` helpers, typed flag accessors, pthread wrappers)
-- `src/types/` — crate-defined value types (`DeviceInfo`, `Guid`, `WRID`, ...)
-- `src/verbs/` — the RAII resource wrappers listed above
-- `src/bin/ibv_devinfo.rs` — reimplementation of the classic `ibv_devinfo`
-
-## Usage
+Build on Linux with a C compiler, `pkg-config`, libclang and the libibverbs
+development package (`libibverbs-dev` on Debian/Ubuntu). An RDMA NIC or Soft-RoCE
+device is needed to run device operations and hardware tests, not to build.
+Memory registration also needs sufficient locked-memory allowance.
 
 ```rust,no_run
-// Discover and open all usable RDMA devices (context + PD per device).
-let devices = ruapc_rdma::ActiveDevice::available()?;
-for dev in &devices {
-    let info = dev.info();
-    println!("{}: guid={} ports={}", info.name, info.guid, info.ports.len());
-    for port in &info.ports {
-        for flag in port.port_attr.port_cap_flags {
-            println!("  port {}: {}", port.port_num, flag.name());
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    for device in ruapc_rdma::ActiveDevice::available()? {
+        let info = device.info();
+        println!("{}: guid={} ports={}", info.name, info.guid, info.ports.len());
+        for port in &info.ports {
+            for flag in port.port_attr.port_cap_flags {
+                println!("  port {}: {}", port.port_num, flag.name());
+            }
         }
     }
+    Ok(())
 }
-# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Higher-level connection management (bootstrap over TCP, QP negotiation,
-multi-NIC path selection, completion poll threads) lives in the
-[`ruapc`](../ruapc/) crate's `rdma` module; this crate deliberately stays a
-thin verbs layer.
-
-### `ibv_devinfo` binary
-
-A drop-in style reimplementation of the classic tool, useful for checking
-what this crate sees on a host:
+Inspect devices with the bundled `ibv_devinfo` implementation:
 
 ```bash
 cargo run -p ruapc-rdma --features bin --bin ibv_devinfo -- -v
 ```
 
-## Requirements
+Device snapshots support serde and JSON Schema. Capability masks use typed
+`enumflags2::BitFlags`; GIDs are classified as IB, RoCE v1 or RoCE v2.
 
-- Linux with `libibverbs-dev` (rdma-core) and `pkg-config` installed
-- libclang (for bindgen)
-- An RDMA-capable NIC — or a Soft-RoCE (`rdma_rxe`) device — is only needed at
-  runtime and for tests, not to build
+## Resources and completions
 
-## Testing
+```text
+Context
+  ├─ ProtectionDomain
+  │    ├─ MemoryRegion → retains backing memory
+  │    └─ QueuePair    → retains send/receive CQs and work requests
+  ├─ CompChannel
+  └─ CompletionQueue  → retains an optional completion channel
+```
+
+Ownership through `Arc` keeps parent resources alive until their children are
+dropped. `QueuePair::send` and `recv` take ownership of pool buffers, and
+`prepare_reads` takes ownership of READ destinations. The crate also supports
+gather-list sends and selective signaling; a signaled completion can reclaim
+preceding unsignaled SENDs.
+
+Use `CompletionQueue::poll_batch` with reusable `CompletionBatch` storage and
+pass each CQ-issued `Completion` to `QueuePair::complete`. The borrowed proof
+is non-cloneable and checked against the originating CQ, hardware QPN and QP
+sequence floor. Raw metadata from `CompletionQueue::poll` cannot authorize
+buffer recovery. Applications sharing a CQ route completions by `qp_num()`.
+
+WRIDs encode a two-bit type and a 62-bit sequence. SQ and RQ use independent
+sequences; SEND variants and READ share SQ. CQ-owned QPN leases and a retirement
+floor prevent completions from a destroyed QP from releasing a replacement's
+buffers. Sequences never wrap. Posting uses per-QP counters; the registry lock
+is limited to registration, retirement and explicit statistics.
+
+`CompletionQueue::capacity()` reports the provider's CQE capacity, not a QP
+count limit. Applications must bound outstanding completions themselves.
+SEND/RECV buffers use a separate bounded slot array; slot exhaustion rejects
+the new submission without replacing an existing buffer. See
+[WRID and completion identity](../docs/wrid.md) and
+[QP registry and CQ capacity](../docs/qp-registry.md) for the full invariants.
+
+## READ lifetime
+
+`prepare_reads` validates destination buffer indices, bounds and overlap, then
+resolves local addresses and registration keys internally. Its non-cloneable
+`ReadPosting` cursor posts each request once, only to the preparing QP. Dropping
+the cursor accounts for its unposted suffix while the QP retains posted work.
+Explicit cancellation before any post can recover the destination vector.
+
+Timeout or connection failure can notify a receiver before DMA has stopped.
+Posted destinations remain owned until all posted READs complete or the provider
+successfully destroys the QP. Dropping or forgetting a future cannot release
+them early; forgetting an owner can retain resources indefinitely. Destruction
+also releases remaining unsignaled SENDs. Failure to destroy a QP aborts the
+process before memory still accessible to DMA can be released.
+
+These guarantees cover local destinations. Remote addresses and keys do not
+provide a source-side completion lease. The RPC layer's post-READ pending check
+rejects stale results but cannot delay source recovery until remote DMA has
+completed. See [safety boundaries](../docs/safe-boundaries.md).
+
+## Registration and FFI
+
+`ActiveDevice` implements `ruapc_bufpool::MemoryRegistrar` in
+`src/buffer_registration.rs`. Safe `Device` wrappers supply that audited
+registrar without receiving pool backing memory. `MemoryRegion` retains memory
+and its protection domain; registration grants no independent access to bytes
+owned by pool buffers. Queue operations enforce their own DMA lifetimes.
+
+`build.rs` compiles `src/shim.c` against the installed `<infiniband/verbs.h>` and
+generates bindings with bindgen. Every verbs entry point used by the crate goes
+through a `ruapc_ibv_*` C wrapper so header macros and static inline functions
+are applied. This avoids accidentally binding only a legacy exported symbol.
+
+| Module | Responsibility |
+| --- | --- |
+| `src/shim.{h,c}`, `build.rs` | C wrappers, build detection and binding generation |
+| `src/ffi/` | Generated bindings and extensions |
+| `src/types/` | Device snapshots, identifiers and other value types |
+| `src/verbs/` | Resource wrappers, posting and completion ownership |
+| `src/bin/ibv_devinfo.rs` | Device inspection CLI |
+
+## Tests
 
 ```bash
 cargo test -p ruapc-rdma
 ```
 
-Most tests open a real device. On machines with multiple devices, setting
-`RUAPC_PREFER_RXE=1` restricts tests to a Soft-RoCE `rxe*` device (used by CI).
+Device tests open real devices. Setting `RUAPC_PREFER_RXE=1` restricts their
+selection to Soft-RoCE devices named `rxe*`, as in CI. See
+[CONTRIBUTING.md](../CONTRIBUTING.md) for setup and workspace checks.

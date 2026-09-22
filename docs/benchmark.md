@@ -1,4 +1,4 @@
-# Echo RPC Benchmark
+# Benchmarks
 
 End-to-end echo RPC benchmark: a single UNIFIED server serves all
 protocols on one port, and each transport (TCP / WebSocket / HTTP / RDMA)
@@ -8,6 +8,7 @@ is measured with the same client-side workload:
 - **concurrent**: closed-loop throughput at 64 and 1024 tasks (16 B payload,
   256k total requests per run, split evenly across tasks)
 
+RDMA also runs the concurrent cases across two endpoints on the same server.
 Source: [`ruapc/benches/echo.rs`](../ruapc/benches/echo.rs).
 
 ## How to Run
@@ -51,13 +52,13 @@ RUAPC_BENCH_TRANSPORT=RDMA RUAPC_BENCH_RDMA_DEVICE=mlx5_0 \
 
 Notes:
 
-- RDMA requires `libibverbs-dev` and a usable RDMA device; the benchmark
-  reports RDMA as skipped otherwise. Make sure the memory-lock limit is
-  unlimited: `sudo prlimit --pid $$ -l=unlimited`.
-- The benchmark enlarges the shared buffer pool to 1 GiB
-  (`SocketPoolConfig.buffer_pool_memory`); the 256 MiB default is exhausted
-  by per-request send buffers at 1024 closed-loop tasks, and allocation
-  waits would show up as artificial latency/timeouts.
+- Building `ruapc` benchmarks requires the libibverbs development package
+  because the self dev-dependency enables RDMA. Echo skips transports whose
+  probes fail; `remote_memory` skips only failed RDMA probes and aborts on
+  TCP/WS/HTTP probe failure. RDMA measurements require a usable device and
+  sufficient locked-memory allowance; see [build requirements](../CONTRIBUTING.md).
+- Echo uses a 1 GiB buffer pool; remote memory uses 512 MiB. Keep these limits
+  identical across compared versions so allocation pressure is comparable.
 
 ## Remote memory and allocation
 
@@ -85,35 +86,20 @@ for the machine and bind memory to the corresponding NUMA node. A process-wide
 CPU mask alone allows workers to move between cache clusters, which can produce
 large differences in short lock benchmarks.
 
-Compare identical harnesses and dependency locks, run versions sequentially in
-alternating order, and retain every sample, including skipped transports.
-The [workspace refactoring report](refactoring.md) records the current comparison
-against commit `36c8352`, including task-allocation sizes and raw measurements.
+## Comparing results
 
-## Previously recorded sample
+Use identical benchmark sources and dependency locks. Build both versions
+before sampling, then run them sequentially in alternating order on the same
+CPU cores, NUMA node and RDMA device. Retain every sample and every skip; a
+successful process exit alone does not mean all transports were measured.
 
-This sample uses a different compiler and CPU placement from the refactoring
-comparison linked above.
+Echo checks RPC success and consumes response values with `black_box`; it does
+not compare response contents. Concurrent timing includes task creation and
+reports aggregate throughput. Its `us/op` is elapsed wall time divided by
+requests per task, not a measured latency distribution. Remote-memory timing
+includes full-payload verification and normal `remote_read_all` allocation.
 
-Environment:
-
-- Intel Xeon 6966P-C, 2 NUMA nodes, 384 logical CPUs; Linux 6.8.0
-- RDMA: Mellanox mlx5 (loopback through the local NIC); benchmark pinned to
-  the NIC's NUMA node with `numactl -N 1 -m 1`
-- rustc 1.99.0-nightly (2026-07-13), `bench` profile
-- Client and server share one process and one tokio runtime; numbers
-  include both sides' work
-
-| Transport | Serial 16B | Serial 4KiB | 64 tasks | 1024 tasks |
-|---|---:|---:|---:|---:|
-| TCP  | 31.8 us/op | 34.9 us/op | 264 kops/s (243 us/op) | 281 kops/s (3.6 ms/op) |
-| WS   | 44.4 us/op | 48.0 us/op | 149 kops/s (429 us/op) | 153 kops/s (6.7 ms/op) |
-| HTTP | 36.9 us/op | 42.7 us/op | 113 kops/s (567 us/op) | 111 kops/s (9.2 ms/op) |
-| RDMA | 33.1 us/op | 38.3 us/op | 401 kops/s (160 us/op) | 417 kops/s (2.5 ms/op) |
-
-`us/op` in the concurrent rows is the average per-request latency observed
-by each closed-loop task (queueing included).
-
-Without NUMA pinning, RDMA drops to ~270 kops/s @64 / ~226 kops/s @1024 on
-the same machine with high run-to-run variance; the other transports are
-mostly unaffected.
+Record the source revision, toolchain, build profile, dependency lock, hardware,
+thread placement, workload settings and raw output outside `docs/`. Report
+variation across repeated runs with any comparison. Historical machine-specific
+samples are available in Git history; they are not current performance claims.

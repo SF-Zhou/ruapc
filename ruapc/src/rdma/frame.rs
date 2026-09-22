@@ -11,13 +11,9 @@ use bytes::Bytes;
 /// path has a single parse loop.
 pub(crate) const FRAME_HEADER: usize = 4;
 
-/// Serializes a message as one wire frame: `[4B frame_len][4B meta_len]
-/// [meta][payload]`.
-///
-/// Every RDMA send is a sequence of such frames (usually one). The frame
-/// header makes messages self-delimiting, so the poll thread can aggregate
-/// window-blocked sends by plain concatenation and the receive side always
-/// walks the same frame loop — no aggregation magic, no special cases.
+/// Serializes `[frame_len][meta_len][meta][payload]`; both lengths are
+/// big-endian u32s. `frame_len` excludes its own four-byte prefix, allowing
+/// complete frames to be concatenated into one SEND.
 pub(super) struct FramedBuffer<'a>(pub(super) &'a mut Buffer);
 
 impl crate::msg::SendMsg for FramedBuffer<'_> {

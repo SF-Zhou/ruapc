@@ -119,9 +119,7 @@ impl Buffer {
     /// Creates a zero-length buffer that owns no memory.
     ///
     /// Unlike a buffer allocated via [`BufferPool::allocate`](crate::BufferPool::allocate),
-    /// this buffer has capacity 0 and no backing memory — it is a pure
-    /// sentinel. Intended for `Context::remote_write` paths that have no
-    /// payload to transfer (the write short-circuits to a no-op).
+    /// this sentinel has capacity 0 and no backing memory.
     ///
     /// The returned buffer has `len() == 0`, `capacity() == 0`, and
     /// `is_empty() == true`. Calling `memory_key()` or
@@ -292,14 +290,14 @@ impl Buffer {
 
     /// Returns the remote buffer info for RDMA-style operations.
     ///
-    /// The advertised `len` is the buffer's logical length (`self.len()`),
-    /// i.e. the number of valid data bytes a remote peer should transfer.
+    /// The advertised `len` is the logical length (`self.len()`), defining
+    /// the range available to remote operations.
     /// Callers that fill a buffer partially must call [`set_len`](Self::set_len)
     /// before exporting it, otherwise the whole allocation is advertised.
     ///
     /// # Errors
     ///
-    /// Returns an error if the device index is not registered.
+    /// Returns an error for an unregistered device index or an empty sentinel.
     pub fn remote_buffer_info(
         &self,
         device_index: &impl AsDeviceIndex,

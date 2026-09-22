@@ -2,7 +2,7 @@
 
 RuaPC 通过 **TCP 上的 `_ruapc.rdma` 内部 RPC** 完成设备发现、QP 参数交换和连接确认，再由 RDMA 数据面完成激活。peer 的身份是 bootstrap TCP 地址；每条 stripe 独立选择本地和远端的设备、端口及 GID。
 
-当前 bootstrap 协议版本为 **2**。`discover` 返回的版本必须完全一致，没有旧版本兼容分支。RPC 字段清单见 [内置服务](builtin-services.md#internal-rdma-bootstrap-service)。
+bootstrap 协议版本为 **2**，`discover` 返回的版本必须一致。RPC 字段清单见 [内置服务](builtin-services.md)；CQ 资源预留见 [RDMA 容量](rdma-capacity.md)。
 
 ## 模块职责
 
@@ -17,7 +17,7 @@ RuaPC 通过 **TCP 上的 `_ruapc.rdma` 内部 RPC** 完成设备发现、QP 参
 | `ruapc/src/rdma/rdma_socket_pool/handshake.rs` | 单条连接的 prepare → 交换 → 本地连接/注册 → commit，以及发布前的回滚所有权。 |
 | `ruapc/src/rdma/rdma_socket_pool/setup.rs` | 两端共用的资源协商、poller/QP 创建、端点生成、QP 连接和 socket 注册。 |
 | `ruapc/src/rdma/rdma_socket_pool/accept.rs` | 接收端 prepare/commit/cancel、lease 状态机和过期清理。 |
-| `ruapc-rdma/src/verbs/qp_connection.rs`、`queue_pair.rs` | `QpConnectionConfig` 验证、verbs 属性生成及 RESET → INIT → RTR → RTS。 |
+| `ruapc-rdma/src/verbs/qp_connection.rs`、`ruapc-rdma/src/verbs/queue_pair.rs` | 连接参数验证、verbs 属性生成及 RESET → INIT → RTR → RTS。 |
 | `ruapc/src/rdma/poller/conn.rs` | 异步发送激活包、观察成功接收、处理 completion 错误。 |
 
 ## 完整时序
@@ -56,9 +56,38 @@ sequenceDiagram
     A->>A: Confirmed → Active，保留幂等记录
 ```
 
-QP 到 RTS 只表示 NIC 接受了本地配置，**并不验证远端可达**。TCP commit 也只确认发起端持有本地 QP；无路由等问题可能到激活 SEND 的 completion 才出现。发布和 acquire 返回均不等待数据面激活完成。接收端以首次成功接收为依据，激活包或正常流量都可以触发该事件。
+QP 到 RTS 表示 NIC 接受了本地配置，**不保证远端可达**。TCP commit 确认发起端持有本地 QP；无路由等问题可能到激活 SEND 的 completion 才出现。发布和 acquire 返回均不等待数据面激活。接收端以首次成功接收为依据，激活包或正常流量都可触发。
 
-路径选择只使用设备信息和策略：连接域匹配、链路类别、本地连接数及远端 advertisement 中的负载。一次握手失败后可尝试其他候选；本地 QP 连接失败会将该 peer 的 NIC 对记录为 30 秒失败路径。advertisement 缓存也为 30 秒；prepare RPC、prepare 响应验证或路径枚举失败会使缓存失效，供后续发现刷新。
+一次握手失败后可尝试其他候选；本地 QP 连接失败会将该 peer 的 NIC 对记录为 30 秒失败路径。advertisement 缓存也为 30 秒；prepare RPC、prepare 响应验证或路径枚举失败会使缓存失效，供后续发现刷新。
+
+## 路径策略与维护
+
+以下配置均位于 `SocketPoolConfig.rdma`。设备集合在创建 context 时确定；需要不同策略时创建独立 context。
+
+| `path` 配置 | 行为 |
+|---|---|
+| `device_filter` | 非空时仅保留所列本地设备。 |
+| `device_exclude` | 排除所列设备，优先于 `device_filter`。 |
+| `allow_down_ports` | 默认 `false`；启用后保留含 DOWN 端口的设备，供恢复后使用，DOWN 端口本身仍不可选。 |
+| `subnets` | CIDR 二维列表；每个内层列表是一个连接域，两端 NIC 地址分别落在该域的任意 CIDR 中即匹配。 |
+| `subnet_policy` | 默认 `prefer`：有匹配路径时优先，否则回退；`require`：只允许匹配路径，空域配置也无法匹配。 |
+
+连接域策略只由连接发起端执行；接收端不按自己的 `subnets` 再匹配。
+在候选路径中先应用连接域策略，再按 InfiniBand、RoCE v2、其他 RoCE 的顺序选择链路类别，最后比较负载。
+远端 NIC 随机选两个候选并取较轻者，负载使用 advertisement 的连接数加本端已有健康 stripe 数；
+随后在能连接该远端的本地 NIC 中选连接数最少者，本地计数包括出站和入站连接。
+这些规则筛选候选，不能证明网络可达。
+
+`maintenance.interval_ms` 默认 5000，按 0.5–1.5 倍抖动运行；设为 0 关闭连接池维护。
+设备属性由独立任务每 15 秒刷新，维护据此关闭本地端口已失效的连接并清理死亡 stripe。
+对仍有连接或近期使用的 peer，先补足每个远端 NIC 的覆盖，再补足连接总目标：
+`peers.min_connections_per_remote_nic` 和 `peers.connections_per_peer` 均默认 1，
+补连受 `peers.preconnect_max_per_peer`（默认 16）和失败退避限制。
+维护逐步平衡负载；改善达到 `maintenance.rebalance_threshold`（默认 2）时才考虑迁移，
+先建立并发布替代连接，再把旧连接移入 draining，经过 `maintenance.drain_timeout_ms`（默认 10000）的宽限期关闭。
+
+`State::rdma_path_report()`（服务端可经 `Server::state()` 访问）返回每条路径的 NIC 对、方向、QP、健康和 active/draining 阶段，以及各设备连接数和 CQ 预算。
+实现见 `rdma_socket_pool/placement.rs`、`maintenance.rs`、`report.rs`；CQ 字段见 [RDMA 容量](rdma-capacity.md#introspection-and-implementation)。
 
 ## 参数协商与验证
 
@@ -85,7 +114,7 @@ message = min(L.max_msg_size, R.max_msg_size)
 | `traffic_class` | 由发起端选择，接收端沿用。 |
 | `attempt_id`、`accepted_connection_id` | 均非零，响应 attempt 必须匹配请求；共同定位一次接收端连接。 |
 
-SGE 上限、P_Key index、选择性 signaling 和 CQ 配置留在各端本地；其中 CQ 按设备共享，不参与连接级 wire 协商。lease 标识用于关联生命周期，不是认证凭据；bootstrap 服务假定控制面可信。
+SGE 上限、P_Key index、选择性 signaling 和 CQ 配置留在各端本地；CQ 按设备分片，不参与连接级 wire 协商。lease 标识关联生命周期，不是认证凭据；bootstrap 服务假定控制面可信。
 
 ## Lease 状态与期限
 
@@ -127,4 +156,4 @@ prepare 返回属于本次尝试的有效 lease 后，`BootstrapRollback` 持有
 | `RDMA work completion failed; closing connection` | `conn_id`、QP、路径、WR ID、completion status、`vendor_err`；可达性问题常从首次激活 SEND 暴露。 |
 | `rdma_bootstrap_cancel` span | 未发布连接回滚；若 peer cleanup 失败，后续依赖接收端 lease 过期。 |
 
-阶段包装保留原始 `ErrorKind`；QP verbs 错误通过 `RdmaError` 保留底层类别，CQ 容量或连接槽不足返回 `Overloaded`。排查时先找首个阶段或 completion 失败，再检查其后的关闭与 lease 日志；后续 flush completion 不重复记录错误。
+阶段包装保留原始 `ErrorKind`；QP verbs 错误通过 `RdmaError` 保留底层类别，CQ 预算不足返回 `Overloaded`。先查首个阶段或 completion 失败，再查关闭与 lease 日志；后续 flush completion 不重复记录错误。QP 身份、完成证据与资源释放顺序见 [WRID 所有权](wrid.md)。

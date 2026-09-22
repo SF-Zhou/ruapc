@@ -280,8 +280,8 @@ impl RdmaSocket {
             .await
             .map_err(|(error, buffers)| RemoteIoError::new(error, buffers))?;
 
-        // A one-sided READ cannot acknowledge source lifetime to the peer.
-        // Reject data from a request that expired before the read completed.
+        // Reject results from expired requests. This check is not a remote
+        // completion lease and cannot keep the peer's source alive during DMA.
         let request = RequestStatusRequest {
             request_id: ctx.msg_meta.msgid,
         };
@@ -308,11 +308,9 @@ impl RdmaSocket {
         ops: &[CopyOp],
         local: Vec<Buffer>,
     ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
-        // The reverse RPC lets the client own the destination through completion:
-        // send a reverse `read_into_target` RPC advertising our source buffers as read
-        // regions; the client executes RDMA READs into its pinned write
-        // target. The request owns the source buffers through ReadSource;
-        // they are recovered only after local readers release their holds.
+        // The client READs into its owned, pinned target. ReadSource retains
+        // our source through the reverse RPC and local inline readers, but
+        // cannot observe remote DMA still running after a failed/cancelled RPC.
         let req = ReadIntoTargetRequest {
             request_id: ctx.msg_meta.msgid,
             ops: ops.to_vec(),

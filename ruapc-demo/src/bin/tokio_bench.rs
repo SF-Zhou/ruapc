@@ -1,4 +1,4 @@
-//! Pure-tokio ceiling benchmark for the server message path.
+//! Synthetic Tokio dispatch benchmark.
 //!
 //! Measures how many messages per second the tokio runtime itself can move
 //! through the shapes used by the ruapc server, with **no RDMA, no TCP, no
@@ -7,13 +7,11 @@
 //! a counter (simulating a synchronous response post). The difference
 //! between modes isolates where the runtime overhead is:
 //!
-//! - `direct`: the producer thread spawns one task per message straight
-//!   into the runtime (tokio's remote-inject path with its shared lock).
-//!   This is the architecture ruapc had *before* the per-shard dispatcher.
+//! - `direct`: the producer thread spawns one task per message into the runtime.
 //! - `spawn`:  producer sends batches over an unbounded channel to a
 //!   long-lived dispatcher task, which spawns one task per message
-//!   (worker-local queue, work-stealable). This mirrors the current
-//!   server: per-shard dispatcher + per-request spawn.
+//!   (worker-local queue, work-stealable). This models batch dispatch followed
+//!   by per-request spawning; it does not reproduce the production worker pool.
 //! - `chunk`:  the dispatcher spawns one task per chunk of messages and
 //!   the chunk task handles its messages inline — one spawn amortized
 //!   over `--chunk` requests.
@@ -33,11 +31,9 @@
 //!   spawned as its own task — a local, in-runtime spawn paid only by
 //!   suspending handlers — so pool slots are never held across awaits.
 //!
-//! `--handler-spin-ns` adds busy-work per message to model a real handler
-//! (deserialize + user logic + response serialization). With 0 the numbers
-//! are pure runtime overhead; with ~1000-2000ns they approximate the 32B
-//! echo cost, letting the result be compared against RDMA bench QPS to
-//! decide whether tokio or the transport is the bottleneck.
+//! `--handler-spin-ns` adds busy-work per message. Zero isolates dispatch and
+//! scheduling costs; nonzero values model CPU work without reproducing
+//! serialization, transport or application behavior.
 //!
 //! `--heavy-frac` enables a mixed load: that fraction of messages (picked
 //! pseudo-randomly) spins `--heavy-spin-ns` instead, modeling user handlers

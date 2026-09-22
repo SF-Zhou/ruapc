@@ -114,18 +114,18 @@ impl Context {
     /// (destination). Each [`CopyOp`] copies `len` bytes from
     /// `src_offset` (client space) to `dst_offset` (local space).
     ///
-    /// The batch is validated before anything is transferred: bounds,
-    /// overflow, op count, and non-overlapping destination ranges. On RDMA
-    /// the ops are fragmented into one-sided RDMA READ work requests
-    /// (contiguous remote range + local scatter-gather list) executed
-    /// concurrently; on TCP/WS/HTTP a reverse
-    /// `MemoryService::read_inline` RPC
-    /// moves the bytes inline.
+    /// Nonempty transfers validate bounds, overflow, operation count, and
+    /// destination overlap before copying. An empty batch or one containing
+    /// only zero-length operations returns `local` without validation or I/O.
+    /// RDMA uses one-sided READs; TCP/WS/HTTP use a reverse inline-copy RPC.
     ///
-    /// Returns the same buffers, now filled at the ops' destination
-    /// ranges. On failure they are handed back inside [`RemoteIoError`]
-    /// whenever they survived the operation; propagating with `?` converts
-    /// to [`Error`] and drops them back to the pool.
+    /// Returns the same buffers with the requested ranges filled. Failures
+    /// return recoverable buffers in [`RemoteIoError`]; in-flight RDMA can
+    /// retain them beyond the call. Converting the error with `?` to [`Error`]
+    /// drops any returned buffers.
+    ///
+    /// RDMA checks source-request liveness after READ completion. This rejects
+    /// stale results but does not make source recovery wait for remote DMA.
     pub async fn remote_read(
         &self,
         ops: &[CopyOp],
@@ -186,16 +186,13 @@ impl Context {
     /// copies `len` bytes from `src_offset` (local space) to `dst_offset`
     /// (client space).
     ///
-    /// The batch is validated before anything is transferred (bounds,
-    /// overflow, op count, non-overlapping destination ranges; overlap
-    /// across *separate* `remote_write` calls is the caller's
-    /// responsibility). No one-sided RDMA WRITE is used: on RDMA the
-    /// server sends a reverse `MemoryService::read_into_target` RPC
-    /// advertising `local`
-    /// as readable regions, and the *client* executes the RDMA READs into
-    /// its pinned buffers — their lifetime is anchored client-side, which
-    /// makes the transfer safe against client timeouts. On TCP the data
-    /// travels inline via `MemoryService::write_inline`.
+    /// Nonempty transfers validate bounds, overflow, operation count, and
+    /// destination overlap within the batch. Callers coordinate writes across
+    /// separate calls. RDMA sends a reverse `read_into_target` RPC: the client
+    /// RDMA-READs `local` into destinations owned by its QP until completion or
+    /// QP destruction. TCP/WS/HTTP send the bytes in a `write_inline` RPC.
+    /// Source recovery has the remote-DMA limitation described by
+    /// [`Client::with_read_buffers`](crate::Client::with_read_buffers).
     ///
     /// The transfer happens *here*, inside the handler, so its latency and
     /// errors are directly observable. Pair the witness with a response
@@ -208,9 +205,9 @@ impl Context {
     /// Ok(sent.reply(Stats { push_micros: t0.elapsed().as_micros() as u64 }))
     /// ```
     ///
-    /// A batch moving zero bytes short-circuits without touching the
-    /// network. On failure the local buffers are handed back inside
-    /// [`RemoteIoError`] whenever they survived the operation.
+    /// An empty batch or one containing only zero-length operations returns
+    /// a witness without validation or I/O. Failures return recoverable local
+    /// buffers in [`RemoteIoError`].
     pub async fn remote_write(
         &self,
         ops: &[CopyOp],

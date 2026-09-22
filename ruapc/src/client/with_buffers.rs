@@ -25,13 +25,11 @@ use super::{Client, ReadAttachment};
 ///
 /// # Write buffers
 ///
-/// The attached write buffers form the request's *write space*; ownership
-/// moves into the call, the memory stays pinned until the call resolves,
-/// and the server writes into it via
-/// [`Context::remote_write`](crate::Context::remote_write). Methods
-/// returning `Result<WithBuffers<T>, E>` deliver all of them back through
-/// the return value; after a failed call, recover them with
-/// [`take_write_buffers`](Self::take_write_buffers).
+/// The next call consumes the attached write space, which the server fills
+/// via [`Context::remote_write`]. In-flight RDMA retains destination ownership
+/// through completion or QP destruction, even after the call ends. Methods
+/// returning `Result<WithBuffers<T>, E>` return available, uniquely held
+/// buffers; after failure, use [`take_write_buffers`](Self::take_write_buffers).
 ///
 /// # Examples
 ///
@@ -87,8 +85,9 @@ impl<'a> ClientWithBuffers<'a> {
     }
 
     /// Recovers the source buffers when no pending request or local reader
-    /// still holds them. On `None`, the wrapper retains its source so the
-    /// caller can retry after those operations finish.
+    /// still holds them. On `None`, the wrapper retains its source for a later
+    /// attempt. This checks local ownership only; remote one-sided RDMA
+    /// completion is not observable here.
     pub fn take_read_buffers(&mut self) -> Option<Vec<Buffer>> {
         match Arc::try_unwrap(self.read_source.take()?) {
             Ok(source) => Some(source.buffers),
@@ -114,11 +113,12 @@ impl<'a> ClientWithBuffers<'a> {
         self
     }
 
-    /// Recovers the attached write buffers after a *failed* call (they are
-    /// consumed by a successful one and returned through its
-    /// `WithBuffers` result instead). Returns `None` when nothing is
-    /// recoverable — e.g. a transfer is still in flight; the buffers then
-    /// drop back to the pool once it finishes.
+    /// Takes an unused write-buffer set or one recovered after a failed call.
+    ///
+    /// Returns `None` if no set is available. Cancellation or a failed DMA
+    /// transfer can leave no recoverable set even after the QP eventually
+    /// returns its buffers to the pool. Successful plain `Result<T, E>` calls
+    /// also consume the set; use `WithBuffers<T>` to receive it in the result.
     pub fn take_write_buffers(&self) -> Option<Vec<Buffer>> {
         self.write_buffers.lock().unwrap().take()
     }

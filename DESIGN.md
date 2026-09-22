@@ -64,8 +64,8 @@ inherits the deadline but starts with fresh message metadata.
    the message. Once sent, the client awaits exactly one result: an ambiguous
    timeout or connection loss is never retried automatically.
 6. The server reserves in-flight capacity atomically, rejects overload and
-   drops expired requests before invoking a handler. Once started, a handler
-   runs to completion; long-running handlers can inspect `Context::is_expired`.
+   drops expired requests before invoking a handler. Deadline expiry does not
+   cancel a running handler; long-running handlers can inspect `Context::is_expired`.
 7. Response, connection failure or the periodic expiry sweep removes the
    waiter. Unary HTTP creates its waiter only after the complete request body
    arrives, matching framed transports. Cancelling a pending receive removes
@@ -74,8 +74,10 @@ inherits the deadline but starts with fresh message metadata.
    panic, without registering a timer for each request.
 
 Connection teardown is idempotent. A stale connection may evict only itself,
-never a replacement stored under the same peer address. RDMA additionally
-waits for outstanding DMA ownership to settle before removal.
+never a replacement stored under the same peer address. Normal RDMA poller
+removal also waits for pending READs and flow credits to settle. Fatal shutdown
+releases the poller's socket owners; QPs retained elsewhere keep their DMA holds
+until completion or successful destruction.
 
 ## Message ownership and framing
 
@@ -95,6 +97,9 @@ its bytes.
 | WebSocket binary message | `[meta_len: 4B][meta][payload]` |
 | RDMA receive buffer | One or more `[frame_len: 4B][meta_len: 4B][meta][payload]` frames |
 | Unary HTTP | JSON request/response bodies with routing supplied by the URL |
+
+Lengths are big-endian `u32`s. `body_len` and `frame_len` both count the
+`meta_len` prefix, metadata and payload, excluding their outer headers.
 
 TCP and HTTP/2 share `msg/frame.rs`, including the send/receive size limit and
 incremental parser. Incomplete frames remain buffered; complete bodies are
@@ -169,142 +174,34 @@ remove the source-side limitation.
 
 ## RDMA execution
 
-`ruapc/src/rdma/rdma_socket.rs` owns connection identity, its QP and message
-sending. `rdma_socket/read.rs` translates logical copy operations into remote
+`rdma/rdma_socket/read.rs` translates logical copy operations into remote
 ranges and local buffer-index/offset/length descriptors, applies admission
-limits and awaits results. It never supplies local raw addresses or keys.
+limits and awaits results. `ruapc-rdma` validates the concrete plan and owns
+posted destination buffers. Cancellation accounts for unposted work; timeout
+fails the receiver and moves the QP to ERR without releasing posted memory.
 
-`ruapc-rdma/src/verbs/queue_pair/read.rs` owns READ preparation and completion
-lifetime. Its private bookkeeping is inline in the QP. The connection handshake
-keeps its temporary `LocalConnection` in a box across peer negotiation, then
-moves the QP directly into the established socket. RPC client futures therefore
-do not carry the entire temporary QP during connection acquisition.
-`QueuePair::prepare_reads` consumes the destination `Vec<Buffer>`,
-validates bounds, overflow, scatter limits and destination overlap across all
-requests, then resolves addresses and keys from those owned buffers. The
-non-cloneable `ReadPosting` cursor is bound to the preparing QP and advances
-once per successful post. The QP records its private batch hold before the NIC
-can observe a work request and rolls that record back if posting fails.
+The CQ poll thread routes completion tokens and batches received buffers; a
+shared pool of dispatch workers parses frames and invokes routing away from
+the poll thread. Saturated workers fall back to one spawned dispatch task per
+batch. Flow control reuses a data SEND credit only after both local completion
+and the peer's receive acknowledgment.
 
-Dropping a posting cursor accounts the unposted suffix. Already posted work
-retains memory independently of the posting task and result receiver. Explicit
-cancellation before the first successful post can recover the buffers; after
-posting, neither dropping a future nor notifying an error releases them early.
-Forgetting an owner can retain memory indefinitely. Successful completion of
-the whole batch returns the vector; failed batches recycle it only after their
-posted work has settled.
+Completion identity is `(CQ, hardware QPN, WRType, sequence)`. WRIDs contain
+2 type bits and 62 sequence bits; SQ and RQ allocate independently, with SEND
+and READ sharing SQ. CQ-owned QPN leases prevent reuse from authorizing stale
+completions. Sequences never wrap, and QP destruction precedes release of
+leases or DMA memory. CQ capacity reservations retire separately, after an
+empty poll following a retirement snapshot.
 
-READ admission combines per-device concurrency, a per-connection SQ guard,
-negotiated atomic-read capabilities and device-port bandwidth limits. The
-poller's periodic sweep enforces READ timeouts without per-operation timers.
-Timeout fails the waiter and moves the QP to ERR; neither action returns posted
-READ permits or force-recycles DMA memory. Normal connection removal waits for
-pending READs and the flow ledger to settle. Final QP destruction precedes
-releasing any remaining work-request buffers; a provider failure to destroy
-the QP aborts the process, since an error state or failed destruction alone
-cannot prove that DMA has stopped.
+The detailed contracts have one reference each:
 
-`poller` separates CQ draining, maintenance and idle wakeup. Dispatch workers
-parse received frames away from the poll thread. `poller/flow.rs` owns the
-credit ledger: a data SEND window credit is reusable only after local completion
-and remote receive acknowledgement. ACK fields have explicit bounds; credit that
-does not fit remains pending for a later ACK.
-
-`CompletionQueue::poll_batch` fills private `CompletionBatch` storage and lends
-one non-cloneable token per CQE. Its borrow prevents the entries from being
-changed while a token is live. `QueuePair::complete` consumes that token and
-checks its originating CQ, hardware QPN and CQ-owned `CompletionIdentity` before
-recovering SEND/RECV buffers or settling READ ownership. Copying raw metadata
-does not copy this authority. A later RC SQ completion also permits reclamation
-of earlier unsignaled SENDs.
-
-WRIDs contain the type in bits 1..0 and a fixed per-direction sequence in
-bits 63..2: `(sequence << 2) | type`. Complete
-identity is `(CQ, hardware QPN, WRType, sequence)`; the CQE supplies its QPN,
-so different QPs can use identical numeric WRIDs. SQ and RQ allocate dense local
-sequences independently, with SEND variants and READ sharing SQ's counter.
-CQ capacity no longer determines WRID width or QP registry capacity.
-
-After the provider creates a QP and assigns its QPN, the CQ registers that QPN
-before any work can be posted. A shared send/receive CQ uses one identity lease;
-separate CQs register independently. The creation guard destroys the provider
-QP before releasing any acquired leases if registration fails. An occupied-QPN
-failure never removes the previous occupant's registration. Final QP destruction
-likewise succeeds before releasing either lease or DMA memory.
-
-Each CQ keeps only live QPN-to-floor registrations and one `retired_floor`.
-A new lease starts at that floor. Retirement atomically removes the live QPN
-and advances the floor to `max(retired_floor, SQnext, RQnext, first_sequence + 1)`.
-This places reuse of the same `(CQ, QPN)` above every old allocation, including
-failed posts, without retaining a history entry for every retired QPN. Unrelated
-live QPs retain their immutable starting floors and continue operating when
-the CQ watermark increases. Registry storage is O(peak live QPs), and only
-setup, destruction and introspection acquire its mutex. No per-WR global counter
-or registry lookup is needed for posting.
-
-Sequence allocation never wraps. If a lease retires with the exhausted floor
-`2^62`, new registrations on that CQ fail; live QPs keep their remaining local
-sequence ranges. An empty registry does not reset the floor. The core poller
-uses a CQ-local QPN hash map and checks the immutable floor before dispatch;
-the QP verifies completion authority before flow accounting changes.
-Putting the type in the low bits does not permit natural sequence wrap:
-externally retained completion tokens can outlive a full sequence cycle.
-Automatic reuse needs a separate lifetime or generation protocol; see
-[the wraparound analysis](docs/wrid.md#why-the-sequence-does-not-wrap).
-
-Core CQ admission reserves `sum(R + W + A) + min(H, sum(K))` entries:
-receive-ring, data-window and capped ACK credits per QP plus shared per-NIC
-READ capacity (bounded by the QPs' combined READ limits). Setup reserves on
-the least utilized CQ shard that fits before creating a QP. The reservation
-travels with the QP through setup and socket lifetime. After QP destruction,
-only an actual empty CQ poll after taking a retirement snapshot returns its
-budget. The snapshot survives drain limits and short nonempty batches across
-poll-loop rounds. This capacity retirement is separate from identity-lease
-retirement: reusing a QPN safely does not free CQ space occupied by old
-completions.
-Connection failure cancels READ permit waiters; normal connection removal
-also waits for every per-QP READ permit to return before removing
-completion routing. Fatal poller shutdown first closes READ admission on all
-incoming and live sockets and fails waiters, then releases its socket owners.
-Final socket destruction captures the QP's actual outstanding READ count and
-returns those NIC permits only after successful QP destruction. Already
-processed completions and unposted requests do not contribute to that count;
-external socket owners delay recovery. The shared NIC semaphore stays open
-for other pollers.
-
-Initial receive posting and publication to the poller's registration inbox hold
-the same mutex. An early completion that misses its QPN identity takes that mutex,
-drains registrations and retries, even if the empty-inbox hint has not yet been
-updated. Established-QPN lookup does not acquire it. SEND reclamation starts
-at the current QP's immutable floor rather than scanning earlier sequence space.
-
-Each CQ drain processes at most 16 batches of 64 CQEs (1024 completions),
-returning to maintenance earlier on a short batch. CQEs and new registrations
-schedule each touched QPN once per drain for immediate credit and pending-send
-maintenance. Only receive deficits stay scheduled for retries; idle
-keepalive/READ/teardown sweeps run every 100 ms.
-Undirected external wakeups still trigger a full scan via a hint consumed
-before maintenance; those scans can scale with the map's retained peak capacity.
-The ordinary CQE maintenance path is O(active). The arm/re-poll path also
-maintains touched connections immediately. The standalone ACK-of-ACK trigger
-requires at least two received
-ACKs, avoiding self-sustaining control traffic with the minimum receive ring;
-DATA acknowledgments and keepalives can still carry a smaller pending delta.
-
-The low-level `QueuePair` submission helper owns SQ locking, WR-slot
-registration and post-failure rollback for SEND, SEND-with-immediate and
-gather SEND. Rollback removes ownership bookkeeping but never reuses the
-allocated WRID. `WrSlots` returns a buffer immediately when its array position
-is occupied; the submission reports `WorkRequestSlotsExhausted` instead of
-spinning on a completion that might need the posting thread to make progress.
-Raw DMA APIs remain explicitly unsafe in the dependency; the core uses the
-owned submission and CQ-issued completion interfaces. See
-[WRID allocation and completion routing](docs/wrid.md) for the allocation
-proof, bounds and validation evidence.
-
-Bootstrap and multi-NIC placement are described in
-[RDMA connection lifecycle](docs/rdma-connection.md). Peer identity is the
-bootstrap address; the local/remote NIC pair belongs to each connection.
+- [Connection lifecycle](docs/rdma-connection.md): bootstrap, path selection
+  and publication to the poller.
+- [Completion identity](docs/wrid.md): owned posting, QPN leases, buffer
+  recovery and [sequence exhaustion](docs/wrid.md#why-the-sequence-does-not-wrap).
+- [RDMA capacity](docs/rdma-capacity.md): CQ credit budgets, READ limits,
+  timeout and shutdown.
+- [QP registry](docs/qp-registry.md): CQ routing, bounded drains and maintenance.
 
 ## Buffer-pool ownership
 
@@ -333,8 +230,8 @@ must set its logical length to the bytes they intend to expose. Mutable
 access to an `AlignedMemory` slice requires an exclusive borrow.
 
 Device registrations are destroyed before their backing memory. Growth
-failure restores reserved budget and wakes eligible waiters; cancellation
-passes reserved capacity to another waiter or returns it to the allocator.
+failure restores reserved budget; cancellation passes reserved capacity to
+another waiter or returns it to the allocator.
 
 `ruapc::Devices` is a type alias for `ruapc_bufpool::DeviceSet<RdmaDevice>`
 with RDMA enabled, or `DeviceSet` for stream transports. `DeviceSet` assigns
@@ -376,7 +273,6 @@ checks and performance measurements serve different purposes: tests establish
 lifetime/protocol behavior, while release benchmarks compare equivalent
 workloads on the same machine, dependency lock and CPU/memory placement.
 
-The end-to-end workload is documented in [docs/benchmark.md](docs/benchmark.md).
-Buffer-pool benchmarks cover contention, merging and initial allocation.
-[Refactoring validation](docs/refactoring.md) records the comparison for this
-restructure and its environmental limits.
+[Benchmarks](docs/benchmark.md) cover echo, remote memory, buffer-pool
+contention, merging and initial allocation. The [documentation index](docs/README.md)
+links the current design references.
