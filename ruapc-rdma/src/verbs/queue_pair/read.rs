@@ -1,5 +1,5 @@
-//! Owned RDMA READ plans. Only the QP's observed completion path can return
-//! destination buffers; cancellation and deadlines retain them until then.
+//! Owned RDMA READ plans. Posted destinations stay held through completion
+//! or successful QP destruction; failure notification does not release them.
 
 use std::sync::{
     Arc, Mutex,
@@ -31,9 +31,8 @@ pub(super) struct ReadState {
 impl ReadState {
     pub(super) fn new() -> Self {
         Self {
-            // One QP serializes SQ posting and has one CQ completion consumer.
-            // Sizing this local table by the host CPU count wastes hundreds of
-            // empty lock shards per connection on large machines.
+            // A fixed shard count bounds idle per-QP storage independently
+            // of host CPU count; SQ posting is already serialized.
             batches: dashmap::DashMap::with_shard_amount(4),
             owner: next_owner(),
         }
@@ -72,7 +71,8 @@ pub enum ReadFailure {
     Cancelled,
 }
 
-/// Receives the buffers only after every posted READ has completed.
+/// Returns buffers after every READ succeeds, or a failure without buffers.
+/// Failure notification may precede completion; the QP retains DMA ownership.
 pub type ReadReceiver = oneshot::Receiver<std::result::Result<Vec<Buffer>, ReadFailure>>;
 
 /// A validated batch's exclusive posting cursor. Each request can be posted
@@ -91,8 +91,8 @@ impl ReadPosting {
         self.reads.len() - self.next
     }
 
-    /// Recovers buffers only if no request reached the NIC. Otherwise their
-    /// ownership remains with completions, even if the receiver is dropped.
+    /// Recovers buffers only if no request reached the NIC. Otherwise the QP
+    /// retains them through completion or destruction, even without a receiver.
     pub fn cancel(mut self) -> Option<Vec<Buffer>> {
         if self.next == 0 {
             self.next = self.reads.len();

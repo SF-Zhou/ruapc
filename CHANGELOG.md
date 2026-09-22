@@ -37,8 +37,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - **BREAKING**: Raw-ID buffer reclamation methods `QueuePair::take_buffer`,
   `take_send_buffer` and `reclaim_send_buffers` are replaced by `complete`,
   which consumes a non-cloneable `Completion` from
-  `CompletionQueue::poll_batch` and checks CQ/QP/tag identity. `set_wr_tag` now
-  returns a result and permits one assignment, with no tag reuse on either CQ.
+  `CompletionQueue::poll_batch` and checks CQ, QPN and sequence identity.
+  CQ-owned QPN leases and retirement floors replace caller-assigned tags;
+  WRIDs use 2 type bits and 62 sequence bits, independent of CQ capacity.
   QP creation requires an RC QP, matching PD/CQ contexts, and no external SRQ
   or raw context pointer.
 - **BREAKING**: `MemoryRegion::register` rejects offset-based addressing;
@@ -51,7 +52,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   explicit unsafe contracts. `QueuePair::poll_send` / `poll_recv` and unchecked
   public task registration were removed; unsupported service declarations now
   produce explicit macro diagnostics. See the
-  [API migration notes](docs/refactoring.md#api-changes).
+  [safety boundaries](docs/safe-boundaries.md).
 - **BREAKING**: Read attachments take ownership through
   `with_read_buffer(Buffer)` / `with_read_buffers(Vec<Buffer>)`; setting an
   attachment replaces the source list. Wrappers reuse immutable sources across
@@ -86,8 +87,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   target is checked out, preventing concurrent CPU/NIC access to the same
   destination. Cancelled or failed transfers can leave the target empty while
   the QP retains and eventually recycles its buffers.
-- Completion tags and WR sequence numbers no longer wrap and allow stale CQEs
-  to reclaim newer work. If the provider fails to destroy a QP or deregister
+- QPN retirement floors and non-wrapping WR sequences prevent stale CQEs
+  from reclaiming newer work. If the provider fails to destroy a QP or deregister
   memory, the process aborts rather than releasing memory that DMA may still access.
 
 ### Removed

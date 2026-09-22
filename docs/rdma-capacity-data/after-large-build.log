@@ -1,3 +1,0 @@
-   Compiling ruapc v0.2.0-alpha.5 (/tmp/ruapc-capacity-after/ruapc)
-    Finished `bench` profile [optimized] target(s) in 3.17s
-  Executable benches/capacity_rpc_large.rs (/tmp/ruapc-capacity-after-target/release/deps/capacity_rpc_large-f3e2770ae6423d4f)

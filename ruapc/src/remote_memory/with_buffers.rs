@@ -2,8 +2,8 @@
 
 use crate::Buffer;
 
-/// Witness that data has been transferred into the client's pre-pinned
-/// write buffers (or that there was provably nothing to transfer).
+/// A completed remote-write result, or an explicit no-transfer result from
+/// [`Context::sent_nothing`](crate::Context::sent_nothing).
 ///
 /// Returned by [`Context::remote_write`](crate::Context::remote_write)
 /// after the transfer completed; the server-side source buffers ride
@@ -68,17 +68,14 @@ impl SentBuffers {
 /// works — detection is by type, not by name) makes the buffer transfer
 /// part of the method's contract on both sides:
 ///
-/// - **Server**: `WithBuffers` can only be produced by a completed
-///   [`Context::remote_write`] + [`SentBuffers::reply`] (or the explicit
-///   [`Context::sent_nothing`](crate::Context::sent_nothing) for paths
-///   with no payload). The transfer happens inside the handler —
-///   measurable, retryable, impossible to forget.
-/// - **Client**: the caller pre-provides the destination buffers with
-///   [`Client::with_write_buffers`](crate::Client::with_write_buffers);
-///   the generated method returns `Result<WithBuffers<T>, E>` carrying
-///   *all* of those buffers back, whether or not the server wrote into
-///   them. A call made without attached write buffers yields an empty
-///   buffer list.
+/// - **Server**: construct a reply with [`SentBuffers::reply`] after awaiting
+///   [`Context::remote_write`], or use
+///   [`Context::sent_nothing`](crate::Context::sent_nothing) for a no-transfer
+///   response. The witness does not establish how much of the target was filled.
+/// - **Client**: attach destinations with
+///   [`Client::with_write_buffers`](crate::Client::with_write_buffers). The
+///   response returns the set when the target is available and uniquely held;
+///   otherwise its buffer list is empty, as for a call without destinations.
 ///
 /// On the wire the response is just `T` (`WithBuffers` serializes
 /// transparently); the data travels out-of-band through the internal
@@ -114,19 +111,13 @@ impl SentBuffers {
 pub struct WithBuffers<T> {
     /// The response payload carried on the wire.
     rsp: T,
-    /// Client side: every buffer the caller attached via
-    /// `with_write_buffers`, returned after the call. Server side: empty
-    /// (the source buffers were released by `reply`).
+    /// Client-side recovered destinations; empty on the server, where `reply`
+    /// releases source buffers.
     buffers: Vec<Buffer>,
 }
 
 impl<T> WithBuffers<T> {
-    /// Crate-internal constructor.
-    ///
-    /// Deliberately not public: on the server it is only reachable through
-    /// a completed transfer (`SentBuffers::reply`), and on the client
-    /// through the generated call glue — which is what makes the value a
-    /// witness of the contract being fulfilled.
+    /// Used by `SentBuffers::reply` and generated client call glue.
     pub(crate) fn assemble(rsp: T, buffers: Vec<Buffer>) -> Self {
         Self { rsp, buffers }
     }
@@ -156,8 +147,8 @@ impl<T> WithBuffers<T> {
     }
 }
 
-/// Serializes transparently as the inner response value; the buffers never
-/// travel inline (data is transferred out-of-band via `remote_write`).
+/// Serializes as the inner response value; buffer contents use the separate
+/// remote-memory protocol, including inline reverse RPCs on TCP/WS/HTTP.
 impl<T: serde::Serialize> serde::Serialize for WithBuffers<T> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.rsp.serialize(serializer)

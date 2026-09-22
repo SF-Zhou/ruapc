@@ -46,10 +46,9 @@ pub(super) struct Reservation {
 /// Free nodes inside the subtree are *absorbed*: unlinked from the free
 /// lists (invisible to regular allocation) while keeping their `Free` state
 /// as an "absorbed" marker. Frees inside the subtree are intercepted before
-/// the regular merge path. Since live buffers inside are eventually dropped
-/// and absorbed capacity can never be re-allocated, `collected` grows
-/// monotonically until the subtree is whole — this is the progress
-/// guarantee that makes starvation impossible.
+/// the regular merge path. Absorbed capacity cannot be reallocated, so
+/// `collected` grows monotonically. The reservation can complete once all
+/// live buffers inside the subtree have been returned.
 pub(super) struct ReservedSubtree {
     /// The block containing the reserved subtree.
     block: NonNull<BuddyBlock>,

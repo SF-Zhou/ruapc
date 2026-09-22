@@ -52,12 +52,8 @@ pub(crate) struct WriteInlineRequest {
     pub(crate) ops: Vec<CopyOp>,
     /// Op payloads, concatenated in op order.
     ///
-    /// `serde_bytes` routes the field through serde's byte-string channel:
-    /// MessagePack encodes it as a `bin` chunk (header + memcpy) instead of
-    /// a per-element integer array — this is the difference between an RPC
-    /// framework moving bulk data and one serializing a million tiny ints.
-    /// (Internal reverse RPCs always use MessagePack; the JSON fallback
-    /// still works, as an integer array.)
+    /// `serde_bytes` uses a MessagePack `bin` value instead of per-byte
+    /// integers. JSON represents the same field as an integer array.
     #[serde(with = "serde_bytes")]
     #[schemars(with = "Vec<u8>")]
     pub(crate) bytes: Vec<u8>,
@@ -81,28 +77,19 @@ pub(crate) struct ReadIntoTargetRequest {
     pub(crate) ops: Vec<CopyOp>,
 }
 
-/// Identifies an original request whose client-owned memory may be accessed.
+/// Identifies the original request for a post-READ liveness check.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub(crate) struct RequestStatusRequest {
     /// Message ID of the original request.
     pub(crate) request_id: u64,
 }
 
-/// Built-in service for remote memory operations.
-///
-/// Provides methods for:
-/// - `read_inline`: peer reads ranges of this side's registered memory (reverse
-///   RPC, data inline in the response)
-/// - `write_inline`: peer writes ranges of this side's pinned write buffers (data
-///   inline in the request)
-/// - `read_into_target`: peer asks this side to RDMA-READ from its memory into this
-///   side's pinned write buffers
-/// - `request_is_pending`: verifies that client-owned memory is still live
+/// Internal reverse RPCs for inline copies, client-side RDMA READs, and
+/// source-request liveness checks.
 #[ruapc_macro::service(name = "_ruapc.memory", internal)]
 pub(crate) trait MemoryService {
-    /// Reads byte ranges from registered memory regions (TCP fallback).
-    ///
-    /// A local ownership lease covers copying; expired requests have no source.
+    /// Reads the original request's owned source (TCP/WS/HTTP fallback).
+    /// A local `Arc` retains the source throughout the CPU copy.
     async fn read_inline(
         &self,
         ctx: &Context,
@@ -110,7 +97,7 @@ pub(crate) trait MemoryService {
     ) -> Result<ReadInlineResponse>;
 
     /// Receives data pushed by the server into the pinned write target
-    /// (TCP fallback).
+    /// (TCP/WS/HTTP fallback).
     async fn write_inline(&self, ctx: &Context, req: &WriteInlineRequest) -> Result<()>;
 
     /// Executes RDMA READs from the server's advertised regions
@@ -120,8 +107,8 @@ pub(crate) trait MemoryService {
 
     /// Reports whether the original request is still pending on this peer.
     ///
-    /// One-sided RDMA READ uses this after completion because the owner of
-    /// the source buffers cannot otherwise observe that they were accessed.
+    /// RDMA uses this to reject stale READ results. It neither acknowledges
+    /// remote DMA completion nor delays source-buffer recovery.
     async fn request_is_pending(&self, ctx: &Context, req: &RequestStatusRequest) -> Result<bool>;
 }
 
@@ -200,10 +187,9 @@ impl MemoryService for () {
         let src_layout = SpaceLayout::from_lens(regions.iter().map(|r| r.len))?;
         scatter::validate_ops(&req.ops, src_layout.total(), target.total_len())?;
 
-        // The `Arc<WriteTarget>` clone keeps the destination memory alive
-        // for the whole transfer, even if the original request expires
-        // mid-flight — no post-transfer liveness check is needed on this
-        // side (and the server holds its source buffers across the await).
+        // The RDMA path moves destinations from this target into the QP.
+        // Request expiry or handler cancellation cannot release posted DMA
+        // memory; only completion or successful QP destruction can do that.
         match &ctx.endpoint {
             ContextEndpoint::Connected(socket) => {
                 socket

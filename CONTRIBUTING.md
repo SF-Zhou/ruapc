@@ -1,24 +1,26 @@
 # Contributing to RuaPC
 
-## Getting Started
+Install stable Rust, a C compiler, `pkg-config`, libclang and the libibverbs
+development package (`libibverbs-dev` on Debian/Ubuntu). Workspace tests enable
+RDMA even though downstream `ruapc` users can leave the feature disabled.
 
-1. Fork and clone the repository
-2. Install stable Rust (via [rustup](https://rustup.rs))
-3. Install a C compiler, pkg-config, libclang for bindgen, and the libibverbs
-   development package. Workspace tests enable RDMA even though downstream
-   `ruapc` users can disable that feature.
-4. Build: `cargo build --workspace --all-features`
-5. Test: `cargo test --workspace --all-features`
+## Workflow
 
-## Development Workflow
+Create a branch from `main`, make the change, and run:
 
-1. Create a feature branch from `main`
-2. Make your changes
-3. Run `cargo fmt` and `cargo clippy --workspace --all-targets --all-features -- -D warnings` — ensure zero warnings
-4. Run `cargo test --workspace --all-features` — ensure all tests pass
-5. Submit a pull request targeting `main`
+```bash
+cargo build --workspace --all-features
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+```
 
-Also check the optional-feature boundary and generated documentation:
+Run `cargo fmt --all` to apply formatting. Add tests for changed behavior and
+target pull requests at `main`. All CI checks must pass before merging.
+[CI](.github/workflows/rust.yml) checks formatting, release clippy and test coverage
+on Linux x86-64 and ARM64 with Soft-RoCE.
+
+Check feature boundaries and documentation when public APIs, features or rustdoc change:
 
 ```bash
 cargo check -p ruapc --no-default-features --lib
@@ -26,34 +28,42 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
 RUSTDOCFLAGS="-D warnings" cargo doc -p ruapc --no-default-features --no-deps
 ```
 
-Read [DESIGN.md](DESIGN.md) for module responsibilities and lifetime invariants.
-When changing allocation, serialization, dispatch or RDMA posting, compare
-release benchmarks against a saved baseline using the same `Cargo.lock`, CPU
-placement and workload. Keep benchmark processes sequential and distinguish
-repeatable changes from run-to-run noise. See [docs/benchmark.md](docs/benchmark.md).
+## Design and validation
 
-For remote-memory changes, account for cancellation and forgotten futures:
-background CPU copies must hold owned sources, and posted DMA work must retain
-its destination through every completion. A Rust borrow or a post-transfer
-liveness probe alone does not establish those ownership guarantees. Read-source
-recovery is conditional and must preserve the source when readers still hold it.
+Read [DESIGN.md](DESIGN.md) for module responsibilities and ownership rules, and
+the [documentation index](docs/README.md) for transport details.
 
-## Code Style
+Changes to allocation, serialization, dispatch or RDMA posting need release
+benchmark comparisons with the same lockfile, CPU/NUMA placement and workload.
+Run benchmarks sequentially and repeat measurements to separate changes from
+noise. See [benchmark instructions](docs/benchmark.md).
 
-- Follow standard Rust conventions
-- Run `cargo fmt` before committing
-- Run `cargo clippy --workspace --all-targets --all-features -- -D warnings` and resolve all warnings
-- Add tests for new functionality
+For remote-memory changes, validate cancellation, failure and forgotten futures.
+Local CPU readers must retain their sources; posted DMA destinations must stay
+owned until completion or successful QP destruction. A Rust borrow or a
+post-transfer liveness probe cannot replace that ownership. Source recovery
+does not establish remote one-sided completion. See [safety boundaries](docs/safe-boundaries.md).
 
-## RDMA Development
+## RDMA tests
 
-RDMA features require `libibverbs-dev`. For testing without physical RDMA hardware, use the `rxe` (Soft-RoCE) kernel module:
+Tests that open devices need a working RDMA NIC or Soft-RoCE device. For Soft-RoCE,
+replace `eth0` with an active Ethernet interface on the test host:
 
 ```bash
 sudo modprobe rdma_rxe
-sudo rdma link add rxe_0 type rxe netdev lo
+sudo rdma link add rxe_0 type rxe netdev eth0
+sudo prlimit --pid $$ -l=unlimited
+RUAPC_PREFER_RXE=1 cargo test --workspace --all-features
+```
+
+`RUAPC_PREFER_RXE` restricts test device selection to names beginning with `rxe`;
+it does not create a device. Without RDMA hardware, allocator and macro tests
+can be run independently:
+
+```bash
+cargo test -p ruapc-bufpool -p ruapc-macro
 ```
 
 ## License
 
-By contributing, you agree that your contributions will be dual-licensed under MIT and Apache-2.0.
+Contributions are dual-licensed under MIT and Apache-2.0.

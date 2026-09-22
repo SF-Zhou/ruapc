@@ -44,19 +44,9 @@ impl<'a> ReadAttachment<'a> {
 }
 
 impl Client {
-    /// Makes an RPC request to a remote service.
-    ///
-    /// # Arguments
-    ///
-    /// * `ctx` - The RPC context containing connection information
-    /// * `req` - The request payload to send
-    /// * `read_attachment` - Registered buffers forming the request's read
-    ///   space and an optional override for the expected bytes read by the peer.
-    /// * `write_target` - Pinned destination buffers forming the request's
-    ///   write space; taken (and consumed) on success.
-    /// * `write_buffers_slot` - Optional slot receiving all write buffers
-    ///   back once the response arrived.
-    /// * `method_name` - The name of the RPC method to invoke
+    /// Executes one logical call, including pre-wire retries and metrics.
+    /// `write_buffers_slot` receives the target only if it is available and
+    /// uniquely held when the response arrives.
     pub(crate) async fn ruapc_request<Req, Rsp, E>(
         &self,
         ctx: &Context,
@@ -130,11 +120,8 @@ impl Client {
                 method_name,
             )
             .await?;
-        // 3. recv the single response (fails with Timeout once the waiter
-        // entry expires). Ambiguous waiting-phase failures are surfaced to
-        // the caller instead of being retried: the request may have
-        // executed, and only the application knows whether re-issuing it
-        // is safe.
+        // Never retry after send: a missing response cannot tell us whether
+        // the peer executed the request.
         let (response, returned_target) = match sent.receiver.recv().await {
             Ok(response) => response,
             Err(err) => {
@@ -152,11 +139,8 @@ impl Client {
         {
             state.record_request_success(conn_id);
         }
-        // Hand every attached write buffer back to the caller. Dropping
-        // our own clone first makes the returned target unique in the
-        // normal case; a remote-memory handler racing the response keeps the
-        // buffers alive until it finishes, after which they fall back to
-        // the pool.
+        // Drop our clone before trying to recover the target. A handler still
+        // holding it, or DMA still owning its buffers, prevents recovery.
         drop(write_target.take());
         if let Some(slot) = write_buffers_slot {
             *slot = returned_target

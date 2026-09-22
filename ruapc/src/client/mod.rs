@@ -12,11 +12,7 @@ use std::time::Duration;
 mod request;
 pub(crate) use request::ReadAttachment;
 
-/// RPC client configuration and request handler.
-///
-/// The `Client` struct is used to make RPC requests to remote services.
-/// It handles connection management, request serialization, and response
-/// deserialization with configurable timeout and serialization format.
+/// Configuration shared by generated RPC client methods.
 ///
 /// # Examples
 ///
@@ -46,16 +42,12 @@ pub struct Client {
     /// Whether to use MessagePack serialization. Default is true.
     /// When false, JSON serialization is used.
     pub use_msgpack: bool,
-    /// Maximum number of retries for failures that occur *before the
-    /// request reaches the wire* (connection acquire or send-queue
-    /// failures) — always safe, even for non-idempotent methods. With a
-    /// multi-endpoint context (`Context::with_endpoints`) each retry moves
-    /// to the next endpoint, cycling back to the first when the retry
-    /// budget exceeds the endpoint count. Waiting-phase failures (timeout,
-    /// connection closed mid-flight) are never retried automatically:
-    /// whether a request is safe to re-issue after an ambiguous outcome is
-    /// application knowledge, so that retry loop belongs to the caller.
-    /// Default is 2.
+    /// Retry limit for pre-wire connection or send-queue failures. Default: 2.
+    ///
+    /// With [`Context::with_endpoints`](crate::Context::with_endpoints), retries
+    /// prefer untried endpoints, ranked by current health, and may cycle once
+    /// all candidates have been tried. Timeouts and connection failures while
+    /// waiting for a response are never retried: the request may have executed.
     pub max_retries: u32,
 }
 
@@ -87,9 +79,10 @@ impl Client {
     ///
     /// Each buffer contributes its logical length (`Buffer::len()`): call
     /// `set_len` after filling so the space covers exactly the valid data
-    /// bytes. Ownership moves into the wrapper; pending reads retain the
-    /// immutable source even if the request is cancelled. The wrapper can be
-    /// reused, or its buffers recovered with `take_read_buffers`.
+    /// bytes. The wrapper, pending requests, and local inline readers share
+    /// the immutable source. Reuse the wrapper or recover its buffers with
+    /// [`ClientWithBuffers::take_read_buffers`]. This ownership protects local
+    /// CPU copies; it does not track completion of remote one-sided RDMA reads.
     ///
     /// # Examples
     ///
@@ -103,18 +96,15 @@ impl Client {
     /// Creates a [`ClientWithBuffers`] wrapper attaching *write* buffers
     /// to requests.
     ///
-    /// Ownership of the buffers moves into the request: they are pinned
-    /// (registered memory held alive) until the call resolves, forming the
-    /// request's *write space* — a logically contiguous concatenation the
-    /// server can write into with
-    /// [`Context::remote_write`](crate::Context::remote_write). Each
-    /// buffer contributes its logical length (`Buffer::len()`); set it to
-    /// the receivable size before attaching.
+    /// The buffers form a logical write space for
+    /// [`Context::remote_write`](crate::Context::remote_write). Set each
+    /// buffer's logical length to its receivable size before attaching.
+    /// The next call consumes the set; in-flight RDMA retains destination
+    /// ownership even if that call times out or is cancelled.
     ///
-    /// All buffers come back through the call's return value when the
-    /// method's return type is `Result<WithBuffers<T>, E>`; after a failed
-    /// call they can be recovered with
-    /// [`ClientWithBuffers::take_write_buffers`].
+    /// A `Result<WithBuffers<T>, E>` response returns the buffers when the
+    /// target is available and uniquely held. After failure, recover any
+    /// available set with [`ClientWithBuffers::take_write_buffers`].
     ///
     /// # Examples
     ///

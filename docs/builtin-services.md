@@ -1,191 +1,84 @@
 # Built-in RPC services
 
-RuaPC uses the `_ruapc.*` wire-service namespace for framework services and
-reserves it by convention. Application services keep their trait name by
-default, or can select an independent wire name with
+RuaPC reserves `_ruapc.*` for framework services by convention. Application
+services default to their Rust trait name or choose a wire name with
 `#[ruapc::service(name = "...")]`.
 
-All RPC responses use RuaPC's serialized `Result<T, Error>` envelope. A `()`
-request is JSON `null` (and MessagePack `nil`). Method names below are the exact
-wire names.
+The built-in methods below return serialized `Result<T, Error>` envelopes.
+A `()` request is JSON `null` or MessagePack `nil`.
 
-## Public reflection service
+## Public reflection: `_ruapc.meta`
 
-`ReflectionService` is part of the public Rust API and is registered as
-`_ruapc.meta`.
+| Method | Request | Success value |
+|---|---|---|
+| `_ruapc.meta/describe` | `DescribeRequest` | `ServerDescription` |
+| `_ruapc.meta/openapi` | `()` | `serde_json::Value` |
 
-| Method | Request | Success value | Purpose |
-|---|---|---|---|
-| `_ruapc.meta/describe` | `DescribeRequest` | `ServerDescription` | Returns a sorted, optionally filtered catalog of public services and their schemas. |
-| `_ruapc.meta/openapi` | `()` | `serde_json::Value` | Returns the complete OpenAPI 3.0 document for public methods. |
+`describe` returns public services and methods sorted by name, their request
+and response schemas, the RuaPC version, and reflection protocol version **1**.
+`DescribeRequest.service` filters by exact wire-service name; `None` selects
+all public services. Response schemas include the `Result` envelope. Root-level
+`components` resolves their `#/components/...` references. `openapi` returns
+the full public OpenAPI 3.0 document.
 
-The structured description types are:
+`ReflectionService` and its response types are public Rust APIs. In-process,
+use `Router::method_names()`, `method_schemas()`, or `is_public_method()` for
+the same visibility rules. See [reflection types and handlers](../ruapc/src/services/meta_service.rs).
 
-```text
-DescribeRequest
-└─ service: Option<String>       exact wire-service filter; None means all
+## Internal remote memory: `_ruapc.memory`
 
-ServerDescription
-├─ protocol_version: u32         reflection contract version
-├─ ruapc_version: String         serving crate version
-├─ services: Vec<ServiceDescription>
-└─ components: serde_json::Value OpenAPI components used by schema $refs
-
-ServiceDescription
-├─ name: String                  wire-service name
-└─ methods: Vec<MethodDescription>
-
-MethodDescription
-├─ name: String                  service-local method name
-├─ request_schema: Schema
-└─ response_schema: Schema       includes the Result envelope
-```
-
-`Router::method_names()` and `Router::method_schemas()` expose the same public
-view in-process. `Router::is_public_method()` is useful at protocol boundaries.
-Internal methods do not appear in any of these APIs or in OpenAPI.
-
-## Internal remote-memory service
-
-`_ruapc.memory` implements reverse RPCs used by `Context::remote_read` and
-`Context::remote_write`. Its trait and data types are crate-private.
+These reverse RPCs implement `Context::remote_read` and `remote_write`.
+Their Rust trait and request types are crate-private.
 
 | Method | Request | Success value | Data path |
 |---|---|---|---|
-| `_ruapc.memory/read_inline` | `ReadInlineRequest` | `ReadInlineResponse` | TCP/WS/HTTP remote read; returns copied bytes inline. |
-| `_ruapc.memory/write_inline` | `WriteInlineRequest` | `()` | TCP/WS/HTTP remote write; carries copied bytes inline. |
-| `_ruapc.memory/read_into_target` | `ReadIntoTargetRequest` plus `MsgMeta.read_regions` | `()` | RDMA remote write; the client RDMA-READs into its pinned target. |
-| `_ruapc.memory/request_is_pending` | `RequestStatusRequest` | `bool` | Post-READ request-liveness check for one-sided RDMA reads. |
+| `_ruapc.memory/read_inline` | Original request ID and `CopyOp` batch | Bytes in operation order | TCP/WS/HTTP read; data in response. |
+| `_ruapc.memory/write_inline` | Original request ID, `CopyOp` batch, bytes | `()` | TCP/WS/HTTP write; data in request. |
+| `_ruapc.memory/read_into_target` | Original request ID and `CopyOp` batch; source in `MsgMeta.read_regions` | `()` | Client RDMA-READs server buffers into its pinned target. |
+| `_ruapc.memory/request_is_pending` | Original request ID | `bool` | Post-READ source-request liveness check. |
 
-```text
-ReadInlineRequest
-├─ ops: Vec<CopyOp>
-└─ request_id: u64
+`read_inline` resolves the request ID to an owned source and validates logical
+offsets; peer-provided addresses cannot select local allocations. The handler
+retains the source through its CPU copy. Inline byte fields use MessagePack
+`bin` encoding.
 
-ReadInlineResponse
-└─ bytes: Vec<u8>
+`read_into_target` moves the client destinations into a QP-owned READ plan;
+CPU copies and competing DMA cannot access that target until buffers return.
+The pending-request probe rejects stale one-sided READ results. It does not
+acknowledge remote DMA completion or make source recovery wait for it.
+See [request types and handlers](../ruapc/src/services/memory_service.rs) and
+[ownership boundaries](safe-boundaries.md).
 
-WriteInlineRequest
-├─ request_id: u64
-├─ ops: Vec<CopyOp>
-└─ bytes: Vec<u8>
+## Internal RDMA bootstrap: `_ruapc.rdma`
 
-ReadIntoTargetRequest
-├─ request_id: u64
-└─ ops: Vec<CopyOp>
-
-RequestStatusRequest
-└─ request_id: u64
-```
-
-`read_inline` and `write_inline` are separate because they move bytes in
-opposite request/response directions. `read_inline` resolves `request_id` to an
-owned immutable source on the local waiter and validates the logical ops against
-that source; the peer does not supply memory addresses. The handler retains
-source ownership through the CPU copy, independently of the caller's future.
-`read_into_target` is also distinct: it
-starts client-side RDMA READ work and relies on pinned write buffers. The
-pending-request probe rejects stale one-sided READ results. It is an internal
-liveness check, not a source-side acknowledgement of remote DMA completion or a
-public metadata API.
-
-## Internal RDMA bootstrap service
-
-When the `rdma` feature is enabled, `_ruapc.rdma` is used over a TCP bootstrap
-connection to discover paths and establish queue pairs. The current bootstrap
-protocol version is **2**; peers must advertise exactly this version. There is
-no compatibility branch for older versions. See [RDMA connection establishment](rdma-connection.md)
-for the sequence, negotiation, leases, rollback, and diagnostic logs.
+With the `rdma` feature, a TCP bootstrap connection discovers devices and
+establishes queue pairs. Peers must advertise bootstrap protocol version **2**.
 
 | Method | Request | Success value | Purpose |
 |---|---|---|---|
-| `_ruapc.rdma/discover` | `()` | `RdmaPeerAdvertisement` | Advertises the protocol version and currently connectable devices. |
-| `_ruapc.rdma/prepare_connection` | `PrepareConnectionRequest` | `PrepareConnectionResponse` | Creates the acceptor QP and returns its endpoint, lease, and actual limits. |
-| `_ruapc.rdma/commit_connection` | `ConnectionLease` | `()` | Idempotently confirms that the initiator retained the QP. |
-| `_ruapc.rdma/cancel_connection` | `ConnectionLease` | `()` | Best-effort cleanup when setup cannot complete. |
+| `_ruapc.rdma/discover` | `()` | `RdmaPeerAdvertisement` | Protocol version and currently connectable devices. |
+| `_ruapc.rdma/prepare_connection` | `PrepareConnectionRequest` | `PrepareConnectionResponse` | Acceptor QP endpoint, lease, and actual limits. |
+| `_ruapc.rdma/commit_connection` | `ConnectionLease` | `()` | Idempotently confirms initiator ownership. |
+| `_ruapc.rdma/cancel_connection` | `ConnectionLease` | `()` | Best-effort rollback. |
 
-```text
-RdmaPeerAdvertisement
-├─ protocol_version: u32
-└─ devices: Vec<RdmaDeviceInfo>
-   ├─ name: String
-   ├─ active_connections: u32
-   ├─ limits: RdmaConnectionLimits
-   └─ ports: Vec<RdmaPortInfo>
+The advertisement carries device load, directional connection limits, ports,
+and GIDs. Prepare selects a device/port/GID and exchanges QP endpoints and
+resolved limits. A lease identifies the attempt and accepted connection.
+Local send limits match peer receive limits and vice versa; mismatched resolved
+limits fail setup. Scatter/gather limits stay local, and CQs are shared rather
+than negotiated per connection.
 
-RdmaPortInfo
-├─ port_num: u8
-├─ link_layer: LinkLayer
-└─ gids: Vec<Gid>
-
-Gid
-├─ index: u8
-├─ gid: ibv_gid
-└─ gid_type: GidType
-
-RdmaConnectionLimits             owner's directional limits
-├─ max_send_wr: u32
-├─ max_recv_wr: u32
-├─ recv_queue_len: u32
-└─ max_msg_size: u32
-
-RdmaQpEndpoint
-├─ qp_num: u32
-├─ port_num: u8
-├─ gid_index: u8
-├─ lid: u16
-├─ gid: ibv_gid
-├─ link_layer: LinkLayer
-├─ active_mtu: ibv_mtu
-├─ psn: u32
-└─ rd_atomic_cap: u8
-
-DeviceSelection
-├─ device_name: String
-├─ port_num: u8
-└─ gid_index: u8
-
-PrepareConnectionRequest
-├─ attempt_id: u64
-├─ endpoint: RdmaQpEndpoint
-├─ source_device: String
-├─ same_connectivity_domain: bool
-├─ target: DeviceSelection
-├─ limits: RdmaConnectionLimits  initiator's resolved limits
-└─ traffic_class: u8
-
-PrepareConnectionResponse
-├─ endpoint: RdmaQpEndpoint
-├─ lease: ConnectionLease
-└─ limits: RdmaConnectionLimits  acceptor's actual resolved limits
-
-ConnectionLease
-├─ attempt_id: u64
-└─ accepted_connection_id: u64
-```
-
-Limits cross directions during negotiation: local send is capped by peer
-receive, and local receive is capped by peer send. Scatter/gather limits are
-local QP properties and are therefore not sent on the wire. Completion queues
-are shared per device, so there is no per-connection CQ field either. Devices
-with no currently usable advertised port are omitted even when discovery keeps
-a DOWN device locally for later port refresh.
-
-The prepare response must exactly mirror the initiator's resolved send/receive
-limits and match its receive-ring length and message-size limit. Changed
-capabilities since discovery therefore fail setup instead of leaving the peers
-with inconsistent runtime settings. Commit confirms ownership; activation also
-requires a successful data-plane receive and completes asynchronously after
-stripe publication.
+Commit records ownership; activation also requires a successful data-plane
+receive. See [RDMA connection establishment](rdma-connection.md) for the
+sequence and [bootstrap wire types](../ruapc/src/rdma/rdma_service.rs) for fields.
 
 ## Exposure rules
 
 | Entry point | Public methods | Internal methods |
 |---|---:|---:|
-| Framed peer RPC (TCP/WS/HTTP stream/RDMA) | yes | yes |
+| Framed peer RPC: TCP/WS/HTTP stream/RDMA | yes | yes |
 | Unary HTTP `/Service/method` | yes | no (404) |
-| OpenAPI and reflection | yes | no |
+| Reflection and OpenAPI | yes | no |
 
-`#[ruapc::service(internal)]` marks a dispatchable service as internal. Router
-registration rejects duplicate wire method names instead of replacing the
-existing handler.
+`#[ruapc::service(internal)]` selects these internal visibility rules.
+Registration rejects duplicate wire method names instead of replacing handlers.

@@ -11,12 +11,7 @@ use crate::{
     msg::{MsgFlags, MsgMeta},
 };
 
-/// Socket endpoint information for RPC contexts.
-///
-/// Represents the connection endpoint for an RPC operation, which can be:
-/// - Invalid: No endpoint specified
-/// - Connected: An existing socket connection
-/// - Endpoints: One or more equivalent transport-bearing destinations
+/// An established connection or equivalent destinations for an RPC.
 #[derive(Clone, Debug, Default)]
 pub(crate) enum ContextEndpoint {
     /// No valid endpoint (default state).
@@ -30,10 +25,8 @@ pub(crate) enum ContextEndpoint {
 
 /// RPC context carrying request metadata and connection information.
 ///
-/// The `Context` is passed to all RPC service methods and contains:
-/// - Shared state (router, socket pool, etc.)
-/// - Connection endpoint information
-/// - Lifecycle management through drop guards
+/// Handlers use it to access shared state, inspect their deadline, and issue
+/// nested or reverse RPCs. Clones share state and connection lifetime guards.
 ///
 /// # Examples
 ///
@@ -121,24 +114,24 @@ impl Context {
         }
     }
 
-    /// Deadline of the request being handled, if the client sent a time
-    /// budget.
+    /// Deadline derived from the incoming time budget; client-created contexts
+    /// have none. A missing or zero wire budget expires on arrival.
     #[must_use]
     pub fn deadline(&self) -> Option<std::time::Instant> {
         self.deadline
     }
 
     /// Remaining time budget of the request being handled. Returns
-    /// `Duration::ZERO` when the deadline already passed and `None` when
-    /// the request carries no budget.
+    /// `Duration::ZERO` after the deadline and `None` for a context without
+    /// an inherited or incoming request deadline.
     #[must_use]
     pub fn remaining_time(&self) -> Option<std::time::Duration> {
         self.deadline
             .map(|d| d.saturating_duration_since(std::time::Instant::now()))
     }
 
-    /// Whether the request's deadline has passed. Handlers of long-running
-    /// methods can poll this to stop work the client no longer waits for.
+    /// Whether the local request deadline has passed. Running handlers are
+    /// not cancelled on expiry; poll this to stop work cooperatively.
     #[must_use]
     pub fn is_expired(&self) -> bool {
         self.remaining_time() == Some(std::time::Duration::ZERO)

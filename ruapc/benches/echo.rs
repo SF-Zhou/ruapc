@@ -152,9 +152,7 @@ async fn run(options: BenchOptions) {
 
     let config = SocketPoolConfig {
         listen_mode: ListenMode::UNIFIED,
-        // The default pool (256 MiB) is sized for regular workloads; at
-        // 1024 closed-loop tasks the per-request send buffers exhaust it
-        // and allocation waits show up as artificial latency/timeouts.
+        // Leave buffer headroom for the highest-concurrency case.
         buffer_pool_memory: 1 << 30,
         ..Default::default()
     };

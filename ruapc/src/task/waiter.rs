@@ -34,12 +34,8 @@ struct WaiterEntry {
     /// Drop the source before waking the receiver, including expiry. A caller
     /// receiving completion may immediately try to recover its owned buffers.
     read_source: Option<Arc<ReadSource>>,
-    /// The pinned destination buffers of a request sent with
-    /// `with_write_buffers`. `MemoryService::write_inline` /
-    /// `read_into_target` handlers clone the `Arc` while writing, so the
-    /// memory outlives the entry even if
-    /// the request expires mid-transfer. Delivered together with the
-    /// response when `post` is called.
+    /// Destination target shared with reverse-RPC writers and returned with
+    /// the response. During RDMA, the QP owns its buffers and the target is empty.
     write_target: Option<Arc<WriteTarget>>,
     /// Drop memory holds before waking a receiver on expiry or failure. On
     /// successful post the destination instead moves into the response.
@@ -51,19 +47,14 @@ struct WaiterEntry {
     /// Coarse expiry: the entry is dropped by the periodic sweep once the
     /// deadline passed, waking the waiting task with a timeout error.
     ///
-    /// Per-request `tokio::time::timeout` is deliberately avoided: at
-    /// hundreds of thousands of requests per second the timer wheel
-    /// registration/cancellation lock becomes a process-wide bottleneck.
-    /// RPC timeouts don't need millisecond precision; the sweep interval
-    /// adds at most [`Waiter::SWEEP_INTERVAL`] of slack.
+    /// A shared sweep avoids per-request timer registration. Expiry is
+    /// checked every [`Waiter::SWEEP_INTERVAL`], subject to scheduler delay.
     deadline: Instant,
 }
 
 /// Response waiter for correlating RPC requests with responses.
 ///
-/// The `Waiter` provides a mechanism for asynchronous RPC calls to wait for
-/// their responses. It assigns unique message IDs to requests and stores
-/// channels that will receive the corresponding responses.
+/// Assigns message IDs and stores one response channel per pending request.
 ///
 /// A request's pinned write target (attached via `bind_write_target`) is
 /// stored alongside the channel sender and delivered together with the
@@ -98,19 +89,9 @@ impl Drop for WaiterCleaner<'_> {
 }
 
 impl Waiter {
-    /// Allocates a new message ID and receiver for waiting on a response.
-    ///
-    /// This method:
-    /// 1. Generates a unique message ID
-    /// 2. Creates a oneshot channel for the response
-    /// 3. Stores the sender in the internal map
-    /// 4. Returns the ID and a receiver with automatic cleanup
-    ///
-    /// # Returns
-    ///
-    /// Returns a tuple of (message_id, receiver). The receiver will automatically
-    /// clean up the waiter entry when dropped. The entry expires `timeout`
-    /// after allocation (with up to [`Self::SWEEP_INTERVAL`] of slack).
+    /// Allocates a message ID and a receiver that removes its entry on drop.
+    /// The deadline is `timeout` after allocation; the periodic sweep observes
+    /// expiry at [`Self::SWEEP_INTERVAL`], subject to scheduler delay.
     pub(crate) fn alloc(&self, timeout: Duration) -> (u64, Receiver<'_>) {
         let msgid = self.index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
@@ -218,10 +199,8 @@ impl Waiter {
     }
 
     /// Returns a clone of the pending request's pinned write target, or
-    /// `None` when the request completed/expired or attached no write
-    /// buffers. `MemoryService::write_inline` / `read_into_target` handlers
-    /// hold this clone while writing, which keeps the memory alive across
-    /// the transfer.
+    /// `None` when the entry was removed or no buffers were attached. Writers
+    /// share this target; RDMA moves its buffers into QP ownership.
     pub(crate) fn write_target(&self, msgid: u64) -> Option<Arc<WriteTarget>> {
         self.id_map
             .get(&msgid)
@@ -232,7 +211,7 @@ impl Waiter {
         self.id_map.remove(&msgid);
     }
 
-    /// Interval of the expiry sweep; bounds the timeout slack.
+    /// Nominal expiry-sweep interval; scheduling can delay a sweep further.
     pub const SWEEP_INTERVAL: Duration = Duration::from_millis(50);
 
     /// Drops all entries whose deadline has passed; their waiting tasks wake

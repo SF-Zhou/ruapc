@@ -1,3 +1,0 @@
-   Compiling ruapc v0.2.0-alpha.5 (/tmp/ruapc-capacity-baseline-khu5EK/ruapc)
-    Finished `bench` profile [optimized] target(s) in 3.99s
-  Executable benches/remote_memory_diagnostic.rs (/tmp/ruapc-capacity-baseline-target/release/deps/remote_memory_diagnostic-6de0cbab04c27b63)

@@ -12,38 +12,20 @@ use crate::{Message, Socket, State, rdma::frame::for_each_frame};
 /// the socket it arrived on and the raw `[4B len][message]` frames.
 type DispatchItem = (Arc<State>, Socket, Bytes);
 
-/// Received buffers of one completion batch, dispatched together. Handing
-/// batches (instead of single buffers) to the queue amortizes the enqueue
-/// and — more importantly — the worker wakeup over an entire CQ drain:
-/// per-buffer enqueueing measurably collapses throughput because nearly
-/// every message then pays one parked-task wakeup.
+/// Received buffers dispatched together to amortize queueing and worker wakeups.
 pub(super) type DispatchBatch = Vec<DispatchItem>;
 
 /// Flush threshold for a dispatch batch (bounds latency and memory).
 pub(super) const MAX_DISPATCH_BATCH: usize = 256;
 
-/// Batches a sticky worker may have queued before the router spills to
-/// the next worker.
-///
-/// Queueing a backlog on the current (busy, hence running and cache-hot)
-/// worker is cheaper than engaging another one: a drained worker is a
-/// parked task, and waking it is a cross-thread wake through tokio's
-/// remote-injection path — benchmarks show eager spilling (threshold 4)
-/// quadruples context switches and costs ~30% QPS at high load. Spilling
-/// only under real pressure keeps one hot worker per poll thread in the
-/// common case — wakeups coalesce exactly as they would with a dedicated
-/// dispatcher task — while still growing parallelism when a worker
-/// genuinely falls behind (a threshold of 16 batches is multiple
-/// milliseconds of parse backlog).
+/// Prefer the home worker below this backlog; spill to share heavier loads.
 const SPILL_BACKLOG: usize = 16;
 
-/// Batches queued per worker before the dispatcher considers it saturated
-/// and moves on (ultimately to the one-shot spawn fallback). Bounds the
-/// standing backlog per worker without a bounded channel.
+/// Fall back to spawning when every worker reaches this backlog. This is a
+/// routing threshold, not a hard limit: pollers can enqueue concurrently.
 const MAX_WORKER_BACKLOG: usize = 32;
 
-/// One dispatch worker endpoint: an SPSC queue plus the number of batches
-/// sent to it that it has not finished processing yet.
+/// One worker's mpsc queue and unfinished-batch count, shared by the pollers.
 struct DispatchWorker {
     tx: tokio::sync::mpsc::UnboundedSender<DispatchBatch>,
     /// Incremented by the sender before each send, decremented by the
@@ -52,45 +34,18 @@ struct DispatchWorker {
     backlog: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-/// Hands received buffers from the poll threads to a fixed pool of
-/// long-lived dispatch worker tasks, each owning one SPSC queue.
+/// Hands received buffers to a fixed pool of Tokio tasks for parsing and
+/// dispatch, keeping that work off the CQ poll threads.
 ///
-/// Dispatching (frame walk, parse, request spawn / response oneshot wake)
-/// from the poll thread would serialize that work on the shard and — for
-/// spawns — go through tokio's remote-injection path, whose shared lock
-/// becomes the global throughput ceiling. Spawning a task per batch has
-/// the same problem: every spawn from the poll thread is a remote inject
-/// plus a task allocation.
-///
-/// Routing is *home worker + spill on pressure* — not blind round-robin,
-/// and deliberately not a shared MPMC queue:
-///
-/// - Each poll thread has a private home worker; while it keeps up
-///   (backlog below [`SPILL_BACKLOG`]) it receives every batch: it stays
-///   cache-hot, and its wakeups coalesce exactly like a dedicated
-///   dispatcher task's would (a send to a busy worker is just a
-///   lock-free push, no wake at all).
-/// - Only when it falls genuinely behind do batches spill to the next
-///   worker, so parallelism grows with load instead of rotating every
-///   batch through a different cold, parked task. (A shared MPMC queue
-///   does the opposite — each send wakes the longest-parked consumer —
-///   which benchmarked 20-30% slower at high load.)
-/// - With every worker past the spill threshold, batches queue (bounded
-///   by [`MAX_WORKER_BACKLOG`]) on the least-loaded worker; only beyond
-///   that does the poll thread degrade to a one-shot `tokio::spawn` per
-///   batch, so it never blocks and no buffer is dropped.
+/// Try the home worker first, then scan for a worker below [`SPILL_BACKLOG`].
+/// If none qualifies, use the least loaded below [`MAX_WORKER_BACKLOG`], or
+/// spawn a one-shot task when all are saturated. Queue sends never wait;
+/// sending to a stopped worker drops that batch.
 pub(crate) struct Dispatcher {
     workers: Arc<[DispatchWorker]>,
-    /// This clone's *home* worker. Every batch is offered to the home
-    /// worker first and only spills forward for that single batch, so a
-    /// poll thread always returns to its own worker once a burst is over.
-    /// A *sticky cursor* that moves on spill was measurably worse: two
-    /// poll threads whose cursors land on the same worker herd there —
-    /// both then spill in lockstep and keep sharing one worker, halving
-    /// dispatch throughput.
+    /// First worker tried for every batch; spilling does not change it.
     home: usize,
-    /// Hands every clone a distinct home, so poll threads stick to
-    /// *different* workers instead of piling onto the same one.
+    /// Assigns clone homes round-robin; homes repeat after `workers.len()`.
     next_home: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -152,7 +107,7 @@ impl Dispatcher {
             }
         }
 
-        // Every worker is backlogged: queue (bounded) on the least loaded.
+        // Every worker is backlogged: try the least loaded below the threshold.
         let (idx, backlog) = self
             .workers
             .iter()
@@ -165,7 +120,7 @@ impl Dispatcher {
             return;
         }
 
-        // Workers saturated beyond the backlog cap: fall back to a
+        // Workers saturated beyond the backlog threshold: fall back to a
         // one-shot task doing the same work rather than blocking.
         tokio::spawn(async move { run_dispatch_batch(batch) });
     }

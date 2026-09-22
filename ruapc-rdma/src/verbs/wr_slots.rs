@@ -1,7 +1,6 @@
 //! Lock-free slot array for in-flight work request buffers
 //!
-//! Replaces a `Mutex<HashMap>` on the hot path. Buffers of posted work
-//! requests are stored in a fixed-size power-of-two slot array indexed by
+//! Buffers of posted work requests occupy a power-of-two slot array indexed by
 //! `id % capacity`.
 //!
 //! ## Why this is safe without a lock
@@ -9,7 +8,7 @@
 //! - The owning work queue supplies non-repeating IDs. This table stores
 //!   buffers independently of ID allocation and hardware posting order.
 //! - Each slot is guarded by an atomic tag acting as a tiny state machine:
-//!   `EMPTY -> WRITING -> id + TAG_BASE -> EMPTY`.
+//!   `EMPTY -> WRITING -> id + TAG_BASE -> WRITING -> EMPTY`.
 //! - Reusing an array index requires an empty slot; completing a work request
 //!   requires an exact ID match. Delayed completions cannot take a newer
 //!   request's buffer even when both IDs map to the same array index.
@@ -30,7 +29,8 @@ use super::queue_pair::WrBuffers;
 const EMPTY: u64 = 0;
 /// Slot is being written to or drained; transient state.
 const WRITING: u64 = 1;
-/// Occupied slots store `id + TAG_BASE`. WRIDs use 62 sequence bits, so this never overflows or collides with `EMPTY`/`WRITING`.
+/// Occupied slots store `sequence + TAG_BASE`. The 62-bit sequence cannot
+/// overflow this addition or collide with `EMPTY`/`WRITING`.
 const TAG_BASE: u64 = 2;
 
 struct Slot {

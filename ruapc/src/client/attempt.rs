@@ -428,9 +428,8 @@ async fn acquire_existing_direct(
         .await
 }
 
-/// Whether `err` indicates connection-level trouble (as opposed to a
-/// request-level problem): only these penalize endpoint health and are
-/// safe to retry blindly.
+/// Connection-level errors used for endpoint health and pre-wire retries.
+/// Classification alone does not make a failure after send safe to retry.
 pub(super) fn is_connection_failure(err: &Error) -> bool {
     let common = matches!(
         err.kind,

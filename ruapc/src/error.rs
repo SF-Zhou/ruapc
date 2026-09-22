@@ -1,10 +1,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Error kinds representing different failure scenarios in RPC operations.
-///
-/// This enum categorizes errors that can occur during RPC communication,
-/// serialization/deserialization, and protocol-specific operations.
+/// Request, serialization, and transport failure categories.
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
 pub enum ErrorKind {
     /// Request or response timeout.
@@ -16,8 +13,8 @@ pub enum ErrorKind {
     NotConnected,
     /// Local buffer capacity is too small for the requested transfer.
     BufferTooSmall,
-    /// The transfer finished, but an active reader still owns the source
-    /// buffers and prevents their return to the caller.
+    /// An active reader prevents source recovery, or an in-flight DMA
+    /// operation owns a write target needed by another transfer.
     BuffersInUse,
     /// The request carries no memory regions for the attempted operation
     /// (client did not attach buffers via `with_read_buffers` /
@@ -26,9 +23,9 @@ pub enum ErrorKind {
     /// A `CopyOp` batch failed validation: out of bounds, arithmetic
     /// overflow, overlapping destination ranges, or too many ops/regions.
     InvalidCopyOp,
-    /// An RDMA READ did not complete within `rdma.remote_memory.read_timeout_ms`; the
-    /// connection is moved to the error state so the NIC flushes the
-    /// outstanding work requests (releasing their buffers safely).
+    /// An RDMA READ exceeded `rdma.remote_memory.read_timeout_ms`.
+    /// The QP moves to ERR; posted memory remains held until all completions
+    /// arrive or QP destruction succeeds.
     RdmaReadTimeout,
     /// The local NIC bandwidth limiter could not admit an RDMA transfer
     /// within `rdma.remote_memory.bandwidth_limit_max_wait_ms`.
@@ -86,11 +83,7 @@ pub enum ErrorKind {
     Unknown(String),
 }
 
-/// RPC error type containing error kind and optional message.
-///
-/// This is the primary error type used throughout the RuaPC library.
-/// It combines an error kind for categorization with an optional message
-/// for additional context.
+/// RPC failure category and diagnostic message, which may be empty.
 ///
 /// # Examples
 ///
@@ -214,14 +207,11 @@ impl std::fmt::Display for Error {
 
 /// Error from a remote read/write operation.
 ///
-/// Remote read/write consume the local buffers by value; on failure they
-/// are handed back here whenever they survived the operation, so callers
-/// can reuse them (e.g. to retry) instead of losing them to the pool.
-///
-/// The buffers are `None` when an active reader or hardware operation still
-/// owns them (e.g. RDMA READs whose completions have not arrived). They return
-/// to the pool after the last holder releases them; recovery never forces an
-/// in-flight allocation back into circulation.
+/// Remote reads and writes consume local buffers. This error returns them
+/// when ownership is recoverable. `None` can mean an active reader or DMA
+/// still owns them, or that a failed operation has already recycled them.
+/// Posted destinations remain owned until completion or QP destruction;
+/// error recovery cannot release them early.
 ///
 /// Converting into [`Error`] (e.g. via the `?` operator) drops any
 /// recovered buffers back to the pool.

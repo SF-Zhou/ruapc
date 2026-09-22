@@ -34,8 +34,7 @@ use crate::{Buffer, Client, ClientWithBuffers, Context, Error, WithBuffers};
 /// [`ClientWithBuffers`]; used by the generated call glue.
 #[doc(hidden)]
 pub trait RawCall {
-    /// Sends a request; when `slot` is provided, the write buffers
-    /// attached to the request are delivered into it after the call.
+    /// Sends a request and places any recovered write buffers in `slot`.
     async fn ruapc_raw_call<Req, Rsp, E>(
         &self,
         ctx: &Context,
@@ -149,9 +148,7 @@ where
         let result: std::result::Result<T, E> = client
             .ruapc_raw_call(ctx, req, Some(&mut slot), method_name)
             .await;
-        // Every buffer the caller attached via `with_write_buffers` comes
-        // back in `slot`; a call without attached write buffers yields an
-        // empty list.
+        // `slot` is empty if no buffers were attached or recovery was unavailable.
         result.map(|rsp| WithBuffers::assemble(rsp, slot))
     }
 }

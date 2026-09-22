@@ -19,25 +19,10 @@ use crate::{
 /// only add head-of-line latency for the packed messages.
 const MAX_AGG_BYTES: usize = 64 * 1024;
 
-/// Messages up to this size are copied out of the receive buffer so the
-/// buffer recycles immediately into the repost cache instead of traveling
-/// (zero-copy) into the dispatched message.
-///
-/// Two reasons:
-/// - **Starvation immunity**: zero-copy dispatch holds the receive buffer
-///   until user code drops the response/request, and the repost must
-///   allocate a fresh buffer from the shared pool. Under pool exhaustion
-///   that allocation fails, the receive ring shrinks, and once it empties
-///   the connection can no longer receive ACKs or responses — the freed
-///   capacity the pool is waiting for never arrives (deadlock spiral).
-///   With copy-out the ring sustains itself with zero pool traffic.
-/// - **Cost**: copying <= 1 KiB (~50ns) is cheaper than the pool
-///   allocate/free round-trip it replaces, and the copy replaces a
-///   16 KiB+ registered chunk held for the message's lifetime with a
-///   right-sized heap allocation.
-///
-/// Large messages keep the zero-copy path: their copy cost would dominate
-/// and their volume is bounded by the send window.
+/// Copy received frame batches up to this size and cache the registered
+/// buffer for reposting. This keeps small messages from holding receive-ring
+/// memory while handlers run. Larger batches retain the zero-copy path and
+/// require another pool buffer for reposting; pool pressure can shrink the ring.
 const SMALL_MSG_COPY_MAX: usize = 1024;
 
 /// Owns the open-connection accounting and failure notification. There is one
@@ -462,13 +447,8 @@ impl ConnState {
                 continue;
             }
 
-            // Copy the run into one contiguous send: for the typically
-            // small frames queueing here, the sub-µs memcpy on this
-            // dedicated thread is measurably cheaper than the NIC-side
-            // cost of a many-SGE gather WQE (~10% peak QPS on 1 KiB
-            // echo). Under pool exhaustion, degrade to a pool-allocation-free
-            // gather-list send instead of per-message WRs, so aggregation
-            // (and the credits it saves) survives memory pressure.
+            // Prefer one contiguous SGE. If the pool cannot allocate it,
+            // gather existing buffers to preserve aggregation's credit savings.
             match self.socket.rdmabuf_pool.allocate(total) {
                 Ok(mut agg) => {
                     agg.set_len(0);
@@ -581,11 +561,8 @@ impl ConnState {
         }
     }
 
-    /// Fails read batches that exceeded their deadline; a NIC stuck on an
-    /// RDMA READ must not park the caller forever. Failing the connection
-    /// moves the QP to the error state, so the outstanding reads
-    /// eventually surface as flush completions — which is what releases
-    /// their memory holds safely.
+    /// Fails expired READ waiters and moves the QP to ERR. Posted memory and
+    /// permits stay held until completion processing or successful QP destruction.
     pub(super) fn sweep_read_timeouts(&self, now: Instant) {
         // Avoid walking every shard of an empty READ map for every idle QP.
         // A READ starting after this check is covered by the next sweep; a
@@ -604,16 +581,12 @@ impl ConnState {
 
     /// Whether this connection can be torn down.
     ///
-    /// Only true after the socket entered the error state (QP moved to ERR):
-    /// every outstanding work request then produces a flush CQE, so waiting
-    /// for the ACK and recv counters to settle guarantees the QP finished
-    /// flushing. Buffers of successfully-completed unsignaled sends never
-    /// produce a CQE and remain owned by the QP until it is destroyed.
-    /// Outstanding RDMA READ batches also block removal: their memory
-    /// holds may only be released once their (flush) completions arrived.
-    /// Closing READ admission and waiting for every SQ permit also covers
-    /// a posting task paused before it installs its batch in the QP. Removing
-    /// its registry entry earlier would lose that task's completion and NIC permit.
+    /// Requires error state, settled ACK/receive counters, no pending sends,
+    /// and closed, idle READ admission with no pending batches. Waiting for
+    /// every SQ permit covers posters paused before registering their batch;
+    /// earlier removal would lose their completions and NIC permits.
+    /// Successfully completed unsignaled SENDs may still own buffers until
+    /// the QP is destroyed.
     pub(super) fn ready_to_remove(&mut self) -> bool {
         !self.socket.state.is_ok()
             && self.flow.flushed()

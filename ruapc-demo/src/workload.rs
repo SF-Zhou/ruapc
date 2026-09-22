@@ -94,9 +94,8 @@ impl<'a> Workload<'a> {
                         verify_crc(crc, expected_crc)
                     }
                     Err(error) => {
-                        // An in-flight transfer may retain its buffers after
-                        // timeout. Allocate replacements on the next call if
-                        // they are not yet safe to reclaim.
+                        // A failed transfer may leave the target empty even
+                        // after DMA settles. Allocate replacements if needed.
                         *buffers = call.take_write_buffers();
                         Err(error)
                     }

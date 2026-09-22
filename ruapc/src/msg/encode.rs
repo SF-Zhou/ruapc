@@ -6,32 +6,16 @@ use bytes::BytesMut;
 use serde::Serialize;
 use std::io::Write;
 
-/// Trait for types that can send serialized messages.
-///
-/// Implementors of this trait can be used as message targets for serialization.
-/// The trait provides methods for preparing the message buffer, writing data,
-/// and finalizing the message with proper length prefixes.
+/// Transport-owned storage with framing hooks for direct serialization.
 pub(crate) trait SendMsg {
     /// Returns the current size of the message buffer.
     fn size(&self) -> usize;
 
-    /// Prepares the message buffer for writing.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if preparation fails.
+    /// Prepares storage and any transport-specific header.
     fn prepare(&mut self) -> Result<()>;
 
-    /// Finalizes the message by updating length prefixes.
-    ///
-    /// # Arguments
-    ///
-    /// * `meta_offset` - Offset where metadata length is stored
-    /// * `payload_offset` - Offset where payload begins
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if finalization fails.
+    /// Backfills lengths: `meta_offset` points to the metadata length prefix,
+    /// and `payload_offset` marks the first payload byte.
     fn finish(&mut self, meta_offset: usize, payload_offset: usize) -> Result<()>;
 
     /// Returns a writer for appending data to the message.
@@ -39,30 +23,8 @@ pub(crate) trait SendMsg {
 }
 
 impl MsgMeta {
-    /// Serializes the metadata and payload into a message buffer.
-    ///
-    /// This method handles the complete serialization process:
-    /// 1. Writes a 4-byte length prefix for the metadata
-    /// 2. Serializes the metadata (always MessagePack)
-    /// 3. Serializes the payload (JSON or MessagePack based on flags)
-    /// 4. Updates the length prefix with the actual metadata size
-    ///
-    /// # Type Parameters
-    ///
-    /// * `M` - The message buffer type implementing `SendMsg`
-    /// * `P` - The payload type to serialize
-    ///
-    /// # Arguments
-    ///
-    /// * `payload` - The data to serialize as the message payload
-    /// * `msg` - The message buffer to write to
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - Buffer preparation fails
-    /// - Serialization fails
-    /// - Message finalization fails
+    /// Writes named-field MessagePack metadata and a flag-selected payload,
+    /// then backfills lengths. Propagates storage, encoding and framing errors.
     pub(crate) fn serialize_to<M: SendMsg, P: Serialize>(
         &self,
         payload: &P,
@@ -70,16 +32,13 @@ impl MsgMeta {
     ) -> Result<()> {
         msg.prepare()?;
 
-        // serialize meta (compact binary layout; the `UseMessagePack` flag
-        // only affects the payload).
         let meta_offset = msg.size();
-        // reserve for meta len.
+        // Reserve the metadata length; `finish` backfills it after encoding.
         msg.writer()
             .write_all(&0u32.to_be_bytes())
             .map_err(|e| Error::new(ErrorKind::SerializeFailed, e.to_string()))?;
         self.encode_to(msg.writer())?;
 
-        // serialize payload.
         let payload_offset = msg.size();
         if self.flags.contains(MsgFlags::UseMessagePack) {
             rmp_serde::encode::write_named(&mut msg.writer(), payload)?;

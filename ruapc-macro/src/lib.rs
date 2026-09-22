@@ -1,15 +1,7 @@
-//! # RuaPC Procedural Macros
+//! RPC service declarations, router registration, and client implementations.
 //!
-//! This crate provides procedural macros for the RuaPC RPC library.
-//!
-//! ## `#[service]` Macro
-//!
-//! The `#[service]` macro is used to define RPC service traits. It generates:
-//! - Server-side dispatch code for handling requests
-//! - Client-side implementation for making requests
-//! - Method registration with the router
-//!
-//! ### Example
+//! `#[service]` generates `ruapc_export` and implements the service trait for
+//! `ruapc::Client` and `ruapc::ClientWithBuffers`.
 //!
 //! ```rust,ignore
 //! #[ruapc::service]
@@ -18,10 +10,11 @@
 //! }
 //! ```
 //!
-//! The service name defaults to the Rust trait name. Use `name = "..."` to
-//! choose a stable wire name independently of the Rust API, and use
-//! `internal` for control-plane services that must remain dispatchable but
-//! hidden from public discovery and OpenAPI output:
+//! ## Names and visibility
+//!
+//! The wire name defaults to the Rust trait name. `name = "..."` overrides it;
+//! `internal` excludes the service from unary HTTP, reflection, and OpenAPI
+//! while allowing framed peer RPCs:
 //!
 //! ```rust,ignore
 //! #[ruapc::service(name = "Control", internal)]
@@ -30,76 +23,40 @@
 //! }
 //! ```
 //!
-//! A configured name must be non-empty, have no leading or trailing
-//! whitespace, and cannot contain `/`, which is reserved as the separator in
-//! wire method names such as `Control/ping`.
+//! Names must be nonempty, have no leading or trailing whitespace, and exclude
+//! `/`, the separator in wire method names such as `Control/ping`.
 //!
-//! ### Requirements
+//! ## Method contract
 //!
-//! Service methods must follow this signature:
-//! - `async fn method_name(&self, ctx: &Context, req: &RequestType) -> Result<ResponseType>`
-//! - Three parameters: `&self`, `&Context`, and a request reference
-//! - Return type must be `Result<T>` where T is the response type
+//! Traits contain only async method declarations with `&self`, `&Context`,
+//! and `&Request` arguments and an explicit result type. Generic parameters,
+//! where clauses, default bodies, and unsafe traits or methods are unsupported.
+//! Return types may be `Result<T, E>` or aliases, including `ruapc::Result<T>`.
+//! The generated call traits enforce serialization, schema, and error bounds.
 //!
-//! ### `Result<WithBuffers<T>, E>` Return Type
+//! Methods become `fn -> impl Future<Output = ...> + Send`. Implementations
+//! may still use `async fn`; the compiler checks that their futures are `Send`.
 //!
-//! Declaring a method whose return type is `Result<WithBuffers<T>, E>`
-//! makes the out-of-band buffer transfer part of the method's contract on
-//! both sides. The contract is recognized by the *type system* (trait
-//! dispatch inside `ruapc`), not by this macro, so any type alias (e.g.
-//! `ruapc::ResultWithBuffers<T>` or a user-defined alias fixing a custom
-//! error type) works:
+//! ## Responses with buffers
+//!
+//! `Result<WithBuffers<T>, E>` returns a response plus recovered client write
+//! buffers. Type aliases such as `ruapc::ResultWithBuffers<T>` work because
+//! dispatch uses the underlying type, not its spelling.
+//!
+//! The handler awaits `ctx.remote_write` or `ctx.remote_write_all`, then calls
+//! `SentBuffers::reply` to form its response. `ctx.sent_nothing().reply(...)`
+//! handles paths with no transfer. The client attaches destination buffers:
 //!
 //! ```rust,ignore
-//! #[ruapc::service]
-//! pub trait BlobService {
-//!     async fn download(&self, ctx: &Context, req: &DownloadReq) -> Result<WithBuffers<()>>;
-//! }
-//!
-//! // Server handler: `WithBuffers` can only be produced by a completed
-//! // `ctx.remote_write` (via the returned `SentBuffers` witness). The
-//! // transfer happens inside the handler — observable, impossible to
-//! // forget. For code paths with no payload, `ctx.sent_nothing()` costs
-//! // nothing:
-//! async fn download(&self, ctx: &Context, req: &DownloadReq) -> Result<WithBuffers<()>> {
-//!     let bufs = /* fill pool buffers, set_len */;
-//!     let sent = ctx.remote_write_all(bufs).await?;
-//!     Ok(sent.reply(()))
-//! }
-//!
-//! // Client provides the destination buffers and receives them all back
-//! // as part of the same signature:
 //! let (rsp, buffers) = client
-//!     .with_write_buffers(bufs)
+//!     .with_write_buffers(destinations)
 //!     .download(&ctx, &req)
 //!     .await?
 //!     .into_parts();
 //! ```
 //!
-//! ### Generated Code
-//!
-//! The macro generates:
-//! 1. A `ruapc_export` method for registering the service with a router
-//! 2. Client trait implementations on `Client` and `ClientWithBuffers`, with
-//!    one uniform body per method; plain vs. buffer-carrying calls are
-//!    dispatched by return type through `ruapc`'s call glue traits
-//! 3. Proper error handling and message serialization
-//!
-//! Each `async fn` in the trait is desugared to
-//! `fn -> impl Future<Output = ...> + Send` (return-position `impl Trait`
-//! in traits, stable since Rust 1.75), which makes the `Send` requirement
-//! part of every method signature without nightly-only
-//! `return_type_notation` bounds. Implementations keep writing plain
-//! `async fn`; the compiler verifies at the impl site that the returned
-//! future is `Send`.
-//!
-//! The generated `Client` / `ClientWithBuffers` impls also spell out the
-//! `fn -> impl Future + Send` form instead of using `async fn`, so that
-//! resolving a client call only consults signatures and never has to prove
-//! the client bodies' futures `Send`. This keeps the `Send` proof acyclic
-//! for transports whose connection setup recursively performs RPCs through
-//! these client methods (e.g. the RDMA pool's `discover`/`prepare_connection`
-//! calls), which would otherwise be rejected with a query cycle (E0391).
+//! Recovery requires an available, uniquely held target. See
+//! `ruapc::ClientWithBuffers` for cancellation and in-flight DMA behavior.
 
 mod args;
 mod expand;

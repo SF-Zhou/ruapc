@@ -6,11 +6,7 @@ use ruapc_bufpool::RemoteBufferInfo;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 
-/// Message flags for RPC communication.
-///
-/// Flags control message behavior and serialization format:
-/// - `IsReq`: Indicates this is a request (vs. response)
-/// - `UseMessagePack`: Use MessagePack instead of JSON for serialization
+/// Request/response markers and payload-format selection.
 #[derive(Deserialize, Serialize, Debug, Default, PartialEq, Eq, Clone, Copy)]
 #[repr(transparent)]
 #[serde(transparent)]
@@ -22,28 +18,17 @@ bitflags! {
         const IsReq = 1;
         /// Message is a response.
         const IsRsp = 2;
-        /// Use MessagePack serialization format.
+        /// Encode the payload as MessagePack; otherwise use JSON.
         const UseMessagePack = 4;
     }
 }
 
-/// Message metadata containing routing and control information.
+/// Routing, request identity, memory regions, and time budget.
 ///
-/// The metadata is serialized at the beginning of each message and contains:
-/// - Method name for routing
-/// - Flags controlling message behavior
-/// - Message ID for request/response correlation
-///
-/// # Wire encoding
-///
-/// The whole struct is MessagePack-encoded with field names
-/// ([`rmp_serde::encode::write_named`]), *regardless* of the
-/// `UseMessagePack` flag — the flag only selects the payload format. The
-/// meta encoding cannot depend on a flag stored inside itself, and a fixed
-/// format keeps decoding self-contained. Named encoding makes the meta
-/// extensible: new fields are added with `#[serde(default)]` (+
-/// `skip_serializing_if` to keep them free when absent) and old peers
-/// ignore them.
+/// Always encoded as named-field MessagePack. [`MsgFlags::UseMessagePack`]
+/// selects only the payload format: metadata must be decodable before reading
+/// that flag. New fields use `#[serde(default)]` for missing values and
+/// `skip_serializing_if` where appropriate; unknown fields are ignored.
 #[derive(Deserialize, Serialize, Debug, Default, PartialEq, Eq, Clone)]
 pub struct MsgMeta {
     /// The fully qualified method name (e.g., "ServiceName/method_name").
@@ -65,8 +50,8 @@ pub struct MsgMeta {
     pub read_regions: Vec<RemoteBufferInfo>,
     /// Regions of the sender's registered memory the receiver may *write*
     /// (through the internal remote-memory protocol). In order, they form one logical
-    /// contiguous space. Attached by `Client::with_write_buffers`; the
-    /// buffers stay pinned client-side until the request resolves.
+    /// contiguous space. Attached by `Client::with_write_buffers`; active RDMA
+    /// retains the destination even if the request has already resolved.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub write_regions: Vec<RemoteBufferInfo>,
     /// Remaining time budget of the request in milliseconds, set by the
@@ -84,8 +69,7 @@ fn is_zero(value: &u32) -> bool {
 }
 
 impl MsgMeta {
-    /// Encodes the metadata (MessagePack, named fields — see the type-level
-    /// docs for the rationale).
+    /// Encodes named-field MessagePack metadata.
     pub(super) fn encode_to<W: Write>(&self, mut w: W) -> Result<()> {
         rmp_serde::encode::write_named(&mut w, self)?;
         Ok(())

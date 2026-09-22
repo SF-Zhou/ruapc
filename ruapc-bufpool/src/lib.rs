@@ -1,17 +1,13 @@
-//! # ruapc-bufpool
+//! Registered buffer pool with slab and buddy allocation.
 //!
-//! A high-performance memory pool using buddy memory allocation algorithm for efficient
-//! fixed-size buffer management. This crate is part of the [ruapc](https://github.com/SF-Zhou/ruapc) project.
+//! Allocations use 16 KiB, 64 KiB, and 256 KiB slab chunks or 1 MiB, 4 MiB,
+//! 16 MiB, and 64 MiB buddy nodes. Small allocations use reclaimable thread
+//! caches by default. [`Buffer`] returns its allocation to the pool on drop.
 //!
-//! ## Features
-//!
-//! - **Buddy Memory Allocation**: Supports allocation of 1MiB, 4MiB, 16MiB, and 64MiB buffers
-//! - **Both Sync and Async APIs**: Designed for tokio environments with async-first design
-//! - **Automatic Memory Reclamation**: Buffers are automatically returned to the pool on drop
-//! - **Memory Limits**: Configurable maximum memory usage with async waiting when limits are reached
-//! - **Aligned Memory**: Zero-initialized blocks with 2 MiB alignment on 64-bit targets
-//! - **O(1) Buddy Merging**: Intrusive doubly-linked list with O(1) free/merge operations
-//! - **Device Registration**: Support for registering memory with devices (RDMA, TCP)
+//! New blocks are zero-initialized and registered with the configured devices;
+//! reused buffers retain their contents. [`BufferPool::allocate`] fails when
+//! capacity is unavailable, while [`BufferPool::async_allocate`] can wait for
+//! a returned buffer. Growth and device registration run on the calling thread.
 //!
 //! ## Example
 //!
