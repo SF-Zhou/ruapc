@@ -24,7 +24,7 @@ Add the dependencies below. TCP, WebSocket and HTTP require no RDMA libraries.
 
 ```toml
 [dependencies]
-ruapc = "0.2.0-alpha.5"
+ruapc = "0.2.0-alpha.6"
 schemars = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
@@ -173,7 +173,7 @@ cargo run -p ruapc-demo --bin remote_memory --features rdma -- --transport rdma
 Enable the `rdma` Cargo feature explicitly:
 
 ```toml
-ruapc = { version = "0.2.0-alpha.5", features = ["rdma"] }
+ruapc = { version = "0.2.0-alpha.6", features = ["rdma"] }
 ```
 
 Building requires a C compiler, `pkg-config`, libclang and the libibverbs development

@@ -6,7 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.2.0-alpha.6] - 2026-10-13
+
 ### Added
+- Large RDMA requests and responses use READ rendezvous with completion
+  confirmation before dispatch, without enlarging receive buffers.
+  `rdma.connection.max_large_msg_size` defaults to 64 MiB; zero or a peer
+  without this capability disables the extension.
+  `rdma.connection.max_inflight_large_bytes` bounds source and destination
+  storage independently, defaulting to 128 MiB per connection.
 - Owned RDMA READ submission through `QueuePair::prepare_reads` / `post_read`.
   Plans take destination buffers and buffer-index/offset/length descriptors,
   validate bounds and cross-request overlap, and return a non-cloneable posting
@@ -21,6 +29,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - `rdma.path.allow_down_ports` (default `false`) can retain devices whose ports
   are currently DOWN during discovery, allowing the port refresher to make them
   available after the link becomes active.
+- `ruapc-rdma` exposes nominal port link bandwidth through
+  `Port::bandwidth_bps()` and helpers on `ibv_port_attr`.
 - Per-port, per-direction RDMA remote read/write bandwidth shaping based on a lock-free GCRA.
   `rdma.remote_memory.bandwidth_limit_ratio` defaults to 95% of the port's reported link
   bandwidth, `bandwidth_limit_burst_ms` controls burst tolerance, and
@@ -74,6 +84,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   `method_names()` and `method_schemas()` expose public methods only.
 - **BREAKING**: `RdmaSocketPoolConfig` is grouped into `connection`, `polling`,
   `path`, `peers`, `maintenance`, and `remote_memory` sub-configurations.
+  RDMA configuration and path-report types now live under `ruapc::rdma`.
+- RDMA connection admission reserves completion credits against actual CQ
+  capacity and balances connections across shards by reserved load. Credits
+  remain reserved until QP destruction and a subsequent empty CQ poll.
 - `SocketPoolConfig::buffer_pool_memory` now defaults explicitly to
   `DEFAULT_BUFFER_POOL_MEMORY` (256 MiB); zero is rejected instead of acting as
   an implicit default.
@@ -82,6 +96,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   to disable them explicitly.
 
 ### Fixed
+- RDMA shutdown serializes QP error transitions with receive reposting and
+  stops dispatching or reposting on closed connections, preventing
+  `Server::join()` from hanging on Soft-RoCE after successful transfers.
+- Bounded CQ drains keep connection maintenance and shutdown responsive
+  under sustained traffic; minimum receive rings no longer trigger endless
+  ACK-only exchanges.
 - Write targets move their buffers into owned RDMA READ plans for the entire
   transfer. CPU copies and competing READs now return `BuffersInUse` while the
   target is checked out, preventing concurrent CPU/NIC access to the same
