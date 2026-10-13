@@ -13,10 +13,10 @@ use aliasable::boxed::AliasableBox;
 use tokio::sync::oneshot;
 
 use crate::AlignedMemory;
-use crate::buddy::{BuddyBlock, NUM_LEVELS, SIZE_64MIB, size_to_level};
+use crate::buddy::{BuddyBlock, LEVEL_SIZES, NUM_LEVELS, SIZE_64MIB, size_to_level};
 use crate::buffer::Buffer;
 use crate::devices::Devices;
-use crate::slab::{NUM_SLAB_CLASSES, SlabClass, size_to_class};
+use crate::slab::{NUM_SLAB_CLASSES, SLAB_CLASS_SIZES, SlabClass, size_to_class};
 use crate::thread_cache::CacheShard;
 
 mod allocator;
@@ -71,6 +71,37 @@ impl BufferPool {
         BufferPoolBuilder::new(devices).build()
     }
 
+    /// Returns the capacity of a buffer allocated for `size` bytes.
+    ///
+    /// Uses the same size classes as [`Self::allocate`] and
+    /// [`Self::async_allocate`], allowing callers to reserve a byte budget
+    /// before allocating. This query does not allocate or reserve memory and
+    /// does not check whether a pool has available capacity. Pool growth and
+    /// registration overhead are separate from the returned buffer capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] if `size` is zero or exceeds 64 MiB,
+    /// matching the size validation performed by the allocation methods.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ruapc_bufpool::BufferPool;
+    ///
+    /// assert_eq!(BufferPool::allocation_capacity(1).unwrap(), 16 * 1024);
+    /// assert_eq!(BufferPool::allocation_capacity(256 * 1024 + 1).unwrap(), 1024 * 1024);
+    /// assert!(BufferPool::allocation_capacity(0).is_err());
+    /// ```
+    pub fn allocation_capacity(size: usize) -> Result<usize> {
+        if let Some(class) = size_to_class(size) {
+            return Ok(SLAB_CLASS_SIZES[class]);
+        }
+        size_to_level(size)
+            .map(|level| LEVEL_SIZES[level])
+            .ok_or_else(|| invalid_size_error(size))
+    }
+
     /// Returns a buffer to the pool.
     ///
     /// Called automatically when a [`Buffer`] is dropped.
@@ -90,6 +121,7 @@ impl BufferPool {
     /// nearest size class (16 KiB through 64 MiB; see [`BufferPool`]). Its
     /// initial logical length equals that capacity. Set the length explicitly
     /// before exposing a partially filled buffer; reused bytes are not cleared.
+    /// [`Self::allocation_capacity`] reports that capacity before allocation.
     ///
     /// If the pool needs to grow, the 64 MiB block creation and device
     /// registration run on the calling thread, outside the pool mutex.

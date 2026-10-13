@@ -411,7 +411,7 @@ impl ConnState {
     /// pressure.
     fn flush_pending(&mut self, finished: u64, ack: &mut Option<u32>) -> Result<()> {
         let agg_cap = self.recv_buf_size.min(MAX_AGG_BYTES);
-        while !self.pending_sends.is_empty() {
+        while self.socket.has_large_controls() || !self.pending_sends.is_empty() {
             match self.socket.state.try_acquire_at(finished) {
                 // Pending flushes are always posted signaled (see
                 // `post_data`), so the tail flag needs no handling here.
@@ -421,6 +421,21 @@ impl ConnState {
                     self.pending_sends.clear();
                     break;
                 }
+            }
+
+            // Finish controls have a separate bounded queue. They consume the
+            // same accounted SEND credits, but cannot sit behind an arbitrary
+            // business backlog while pinning a peer's source buffers.
+            if self.socket.has_large_controls()
+                && let Some(control) = self.socket.take_large_control()
+            {
+                self.post_data(control, ack)?;
+                continue;
+            }
+            if self.pending_sends.is_empty() {
+                // Closure may clear the control queue after the loop check.
+                self.socket.set_error();
+                break;
             }
 
             // Determine the FIFO run that fits one aggregate. The first
@@ -564,6 +579,7 @@ impl ConnState {
     /// Fails expired READ waiters and moves the QP to ERR. Posted memory and
     /// permits stay held until completion processing or successful QP destruction.
     pub(super) fn sweep_read_timeouts(&self, now: Instant) {
+        self.socket.sweep_large_transfers(now);
         // Avoid walking every shard of an empty READ map for every idle QP.
         // A READ starting after this check is covered by the next sweep; a
         // posted READ retains its SQ permit until completion processing.

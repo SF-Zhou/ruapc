@@ -687,6 +687,7 @@ mod path_selection_tests {
             max_recv_wr: 64,
             recv_queue_len: 8,
             max_msg_size: 64 * 1024,
+            max_large_msg_size: 64 * 1024 * 1024,
         }
     }
 

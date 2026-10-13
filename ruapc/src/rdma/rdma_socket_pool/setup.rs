@@ -150,6 +150,7 @@ impl RdmaSocketPool {
             },
             recv_queue_len: negotiated.recv_queue_len,
             max_msg_size: negotiated.max_msg_size,
+            max_large_msg_size: negotiated.max_large_msg_size,
             traffic_class,
         })
     }
@@ -190,6 +191,7 @@ impl RdmaSocketPool {
                 .min(self.config.connection.qp.max_recv_wr)
                 .min(info.device_attr.max_qp_wr as u32),
             max_msg_size: self.config.connection.max_msg_size,
+            max_large_msg_size: self.config.connection.max_large_msg_size,
             traffic_class: self.config.connection.traffic_class,
         }
     }
@@ -395,6 +397,8 @@ impl RdmaSocketPool {
             poller.waker(),
             RdmaSocketConfig {
                 max_msg_size: config.max_msg_size as usize,
+                max_large_msg_size: config.max_large_msg_size as usize,
+                max_inflight_large_bytes: self.config.connection.max_inflight_large_bytes as usize,
                 send_window,
                 path,
                 read_timeout,

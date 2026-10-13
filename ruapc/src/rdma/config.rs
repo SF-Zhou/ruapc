@@ -37,6 +37,14 @@ pub struct RdmaConnectionTuningConfig {
     pub send_signal_interval: u32,
     /// Maximum inline RPC message size. Must be at least 16 KiB.
     pub max_msg_size: u32,
+    /// Maximum complete serialized message transferred with RDMA READ.
+    /// Zero disables large messages. Otherwise this must cover `max_msg_size`
+    /// and must not exceed 64 MiB, the maximum single pool allocation.
+    pub max_large_msg_size: u32,
+    /// Per-connection byte budget for large messages, applied independently
+    /// to outgoing sources and incoming destinations. Must be nonzero and
+    /// cover `max_large_msg_size`; this setting is not negotiated.
+    pub max_inflight_large_bytes: u32,
     pub msg_aggregation: bool,
     /// GRH traffic class selected by the connection initiator.
     pub traffic_class: u8,
@@ -50,6 +58,8 @@ impl Default for RdmaConnectionTuningConfig {
             pkey_index: 0,
             send_signal_interval: 8,
             max_msg_size: 256 * 1024,
+            max_large_msg_size: Self::MAX_LARGE_MSG_SIZE,
+            max_inflight_large_bytes: 128 * 1024 * 1024,
             msg_aggregation: true,
             traffic_class: 0,
         }
@@ -59,6 +69,7 @@ impl Default for RdmaConnectionTuningConfig {
 impl RdmaConnectionTuningConfig {
     pub const MIN_RECV_QUEUE_LEN: u32 = 2;
     pub const MIN_MAX_MSG_SIZE: u32 = 16 * 1024;
+    pub const MAX_LARGE_MSG_SIZE: u32 = 64 * 1024 * 1024;
 
     fn validate(&self) -> crate::Result<()> {
         if self.qp.max_send_wr < Self::MIN_RECV_QUEUE_LEN {
@@ -93,6 +104,20 @@ impl RdmaConnectionTuningConfig {
                 "rdma.connection.max_msg_size must be at least {}",
                 Self::MIN_MAX_MSG_SIZE
             )));
+        }
+        if self.max_large_msg_size != 0
+            && !(self.max_msg_size..=Self::MAX_LARGE_MSG_SIZE).contains(&self.max_large_msg_size)
+        {
+            return Err(invalid_config(
+                "rdma.connection.max_large_msg_size must be zero or between max_msg_size and 64 MiB",
+            ));
+        }
+        if self.max_inflight_large_bytes == 0
+            || self.max_inflight_large_bytes < self.max_large_msg_size
+        {
+            return Err(invalid_config(
+                "rdma.connection.max_inflight_large_bytes must be nonzero and cover max_large_msg_size",
+            ));
         }
         Ok(())
     }
@@ -441,6 +466,49 @@ mod tests {
                 ..Default::default()
             }
         );
+    }
+
+    #[test]
+    fn large_message_limits_and_byte_budgets_are_validated() {
+        let defaults = RdmaConnectionTuningConfig::default();
+        assert_eq!(defaults.max_large_msg_size, 64 * 1024 * 1024);
+        assert_eq!(defaults.max_inflight_large_bytes, 128 * 1024 * 1024);
+        defaults.validate().unwrap();
+
+        for config in [
+            RdmaConnectionTuningConfig {
+                max_large_msg_size: defaults.max_msg_size - 1,
+                ..defaults.clone()
+            },
+            RdmaConnectionTuningConfig {
+                max_large_msg_size: RdmaConnectionTuningConfig::MAX_LARGE_MSG_SIZE + 1,
+                ..defaults.clone()
+            },
+            RdmaConnectionTuningConfig {
+                max_inflight_large_bytes: 0,
+                ..defaults.clone()
+            },
+            RdmaConnectionTuningConfig {
+                max_inflight_large_bytes: defaults.max_large_msg_size - 1,
+                ..defaults.clone()
+            },
+        ] {
+            assert!(config.validate().is_err());
+        }
+
+        RdmaConnectionTuningConfig {
+            max_large_msg_size: 0,
+            max_inflight_large_bytes: 1,
+            ..defaults.clone()
+        }
+        .validate()
+        .unwrap();
+        RdmaConnectionTuningConfig {
+            max_inflight_large_bytes: defaults.max_large_msg_size,
+            ..defaults
+        }
+        .validate()
+        .unwrap();
     }
 
     #[test]

@@ -17,7 +17,7 @@ static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 
 pub(super) fn next_owner() -> u64 {
     NEXT_OWNER
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .expect("QP read identity exhausted")
 }
 

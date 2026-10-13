@@ -79,6 +79,7 @@ impl RdmaDeviceInfo {
                 max_recv_wr,
                 recv_queue_len: config.connection.recv_queue_len.min(max_recv_wr),
                 max_msg_size: config.connection.max_msg_size,
+                max_large_msg_size: config.connection.max_large_msg_size,
             },
             ports,
         })
@@ -296,6 +297,7 @@ mod tests {
                 max_recv_wr: 64,
                 recv_queue_len: 64,
                 max_msg_size: 1024 * 1024,
+                max_large_msg_size: 0,
             },
             traffic_class: 0,
         };

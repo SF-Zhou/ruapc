@@ -180,7 +180,7 @@ fn lock_send_sequence(next: &Mutex<u64>) -> Result<SendSequenceGuard<'_>> {
 
 #[inline]
 fn allocate_sequence(next: &AtomicU64) -> Result<u64> {
-    next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+    next.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
         (value <= WRID::MAX_SEQUENCE).then(|| value + 1)
     })
     .map_err(|_| ErrorKind::WorkRequestIdsExhausted.into())

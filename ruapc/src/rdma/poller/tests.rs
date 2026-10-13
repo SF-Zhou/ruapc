@@ -92,6 +92,7 @@ async fn shard_admission_tries_other_queues_and_reclaims_failed_setup() {
     let connection = |recv_queue_len, max_send_wr| crate::rdma::RdmaConnectionConfig {
         recv_queue_len,
         max_msg_size: 1024,
+        max_large_msg_size: 0,
         traffic_class: 0,
         qp: crate::rdma::RdmaQueuePairConfig {
             max_send_wr,
@@ -152,6 +153,7 @@ async fn failed_new_shard_does_not_hide_existing_capacity() {
     let connection = crate::rdma::RdmaConnectionConfig {
         recv_queue_len: 2,
         max_msg_size: 1024,
+        max_large_msg_size: 0,
         traffic_class: 0,
         qp: crate::rdma::RdmaQueuePairConfig::default(),
     };
@@ -240,6 +242,7 @@ fn register_idle_socket_with_read_permits(
     let connection = crate::rdma::RdmaConnectionConfig {
         recv_queue_len: 2,
         max_msg_size: 1024,
+        max_large_msg_size: 0,
         traffic_class: 0,
         qp: crate::rdma::RdmaQueuePairConfig {
             max_send_wr: 4,
@@ -282,6 +285,8 @@ fn register_idle_socket_with_read_permits(
         poller.waker(),
         RdmaSocketConfig {
             max_msg_size: 1024,
+            max_large_msg_size: 0,
+            max_inflight_large_bytes: 128 << 20,
             send_window: 1,
             path: RdmaPathInfo {
                 local: nic.clone(),
@@ -835,6 +840,7 @@ async fn early_flush_completion_waits_for_registration_and_settles_receive() {
                 qp: crate::rdma::RdmaQueuePairConfig::default(),
                 recv_queue_len: 1,
                 max_msg_size: 1024,
+                max_large_msg_size: 0,
                 traffic_class: 0,
             }))
             .unwrap()
@@ -844,6 +850,8 @@ async fn early_flush_completion_waits_for_registration_and_settles_receive() {
         poller.waker(),
         RdmaSocketConfig {
             max_msg_size: 1024,
+            max_large_msg_size: 0,
+            max_inflight_large_bytes: 128 << 20,
             send_window: 2,
             path: RdmaPathInfo {
                 local: nic.clone(),
