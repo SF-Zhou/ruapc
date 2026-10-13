@@ -60,6 +60,21 @@ use dispatch::{DispatchBatch, Dispatcher, MAX_DISPATCH_BATCH};
 use super::RdmaSocket;
 use crate::{Buffer, Error, ErrorKind, Result, State, task::TaskSupervisorGuard};
 
+/// Only the poll thread may move a registered QP to ERR: receive posting and
+/// the provider flush must not race. Initial receive publication uses the
+/// inbox mutex; established receives are posted by this thread alone.
+fn set_qp_error(socket: &RdmaSocket) {
+    let mut attr = ruapc_rdma::ibv_qp_attr {
+        qp_state: ruapc_rdma::ibv_qp_state::IBV_QPS_ERR,
+        ..Default::default()
+    };
+    let mask = ruapc_rdma::ibv_qp_attr_mask::IBV_QP_STATE;
+    if let Err(err) = socket.queue_pair.modify(&mut attr, mask.0 as _) {
+        tracing::warn!(conn_id = socket.conn_id, local_qp = socket.queue_pair.qp_num(), %err,
+            "failed to move RDMA queue pair to ERR");
+    }
+}
+
 /// Wakes the poll thread out of its idle `poll(2)` sleep.
 #[derive(Clone, Debug)]
 pub struct PollerWaker(Arc<UnixStream>, Arc<AtomicBool>);
@@ -740,6 +755,7 @@ impl PollLoop {
         };
         for incoming in &drained {
             incoming.socket.set_error();
+            set_qp_error(&incoming.socket);
             incoming.socket.fail_read_batches();
             // Inbox entries have not opened their metric registration yet,
             // but a sender may already have bound a waiter to the socket.
@@ -751,8 +767,9 @@ impl PollLoop {
                 ),
             );
         }
-        for conn in self.conns.values() {
+        for conn in self.conns.values_mut() {
             conn.socket.set_error();
+            conn.start_error_flush();
             // Nobody will poll the flush completions after this thread
             // exits: resolve the waiting tasks now. The memory holds stay
             // parked in the batches and are released when the socket (and

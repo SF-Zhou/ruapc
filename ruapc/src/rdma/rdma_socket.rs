@@ -198,17 +198,9 @@ impl RdmaSocket {
         }
         self.read_credits.close();
         self.large.close();
-        let mut attr = ruapc_rdma::ibv_qp_attr {
-            qp_state: ruapc_rdma::ibv_qp_state::IBV_QPS_ERR,
-            ..Default::default()
-        };
-        let mask = ruapc_rdma::ibv_qp_attr_mask::IBV_QP_STATE;
-        if let Err(err) = self.queue_pair.modify(&mut attr, mask.0 as _) {
-            tracing::warn!(conn_id = self.conn_id, local_qp = self.queue_pair.qp_num(), %err,
-                "failed to move RDMA queue pair to ERR");
-        }
-        // Ensure the poll thread notices the error even when the QP had no
-        // outstanding work requests to flush.
+        // The poll thread moves the QP to ERR, serialized with receive
+        // reposting. A receive posted after the provider's ERR flush can
+        // otherwise remain outstanding indefinitely (notably on RXE).
         self.poller_waker.wake();
     }
 
