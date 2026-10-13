@@ -126,6 +126,26 @@ async fn acquire_read_permits<'a>(
 }
 
 impl RdmaSocket {
+    /// Transport payload READs use the same owned plans and completion evidence
+    /// as remote memory, with a separate private finish protocol for the source.
+    pub(super) async fn read_payload(
+        &self,
+        regions: &[RemoteBufferInfo],
+        buffer: Buffer,
+        remaining: Option<Duration>,
+    ) -> Result<Buffer> {
+        let src = SpaceLayout::from_lens(regions.iter().map(|region| region.len))?;
+        let dst = SpaceLayout::from_lens([buffer.len() as u64])?;
+        let ops = [CopyOp::new(0, 0, buffer.len() as u64)];
+        scatter::validate_ops(&ops, src.total(), dst.total())?;
+        let reads = build_planned_reads(regions, &src, &dst, &ops, self.queue_pair.gather_limit())?;
+        let mut buffers = self
+            .execute_reads(reads, vec![buffer], remaining)
+            .await
+            .map_err(|(error, _)| error)?;
+        Ok(buffers.pop().expect("one owned payload destination"))
+    }
+
     pub(crate) fn fail_read_batches(&self) {
         self.queue_pair.fail_pending_reads();
     }

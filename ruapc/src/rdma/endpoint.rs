@@ -129,8 +129,16 @@ pub struct RdmaConnectionLimits {
     pub max_recv_wr: u32,
     /// Number of receive buffers the endpoint can pre-post.
     pub recv_queue_len: u32,
-    /// Maximum serialized message size accepted by the endpoint.
+    /// Maximum serialized inline message size accepted by the endpoint.
     pub max_msg_size: u32,
+    /// Maximum complete serialized message accepted through RDMA READ.
+    /// Missing or zero means that only inline messages are supported.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub max_large_msg_size: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 impl RdmaConnectionLimits {
@@ -151,6 +159,7 @@ impl RdmaConnectionLimits {
                 .min(max_send_wr)
                 .min(max_recv_wr),
             max_msg_size: self.max_msg_size.min(peer.max_msg_size),
+            max_large_msg_size: self.max_large_msg_size.min(peer.max_large_msg_size),
         };
         negotiated.validate()?;
         Ok(negotiated)
@@ -186,6 +195,15 @@ impl RdmaConnectionLimits {
                 ),
             ));
         }
+        if self.max_large_msg_size != 0
+            && !(self.max_msg_size..=RdmaConnectionTuningConfig::MAX_LARGE_MSG_SIZE)
+                .contains(&self.max_large_msg_size)
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "RDMA max_large_msg_size must be zero or between max_msg_size and 64 MiB".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -196,6 +214,7 @@ pub(crate) struct RdmaConnectionConfig {
     pub qp: RdmaQueuePairConfig,
     pub recv_queue_len: u32,
     pub max_msg_size: u32,
+    pub max_large_msg_size: u32,
     /// GRH traffic class selected by the connection initiator.
     pub traffic_class: u8,
 }
@@ -207,6 +226,7 @@ impl From<RdmaConnectionConfig> for RdmaConnectionLimits {
             max_recv_wr: config.qp.max_recv_wr,
             recv_queue_len: config.recv_queue_len,
             max_msg_size: config.max_msg_size,
+            max_large_msg_size: config.max_large_msg_size,
         }
     }
 }
@@ -295,6 +315,7 @@ impl PrepareConnectionResponse {
             max_recv_wr: request.limits.max_send_wr,
             recv_queue_len: request.limits.recv_queue_len,
             max_msg_size: request.limits.max_msg_size,
+            max_large_msg_size: request.limits.max_large_msg_size,
         };
         if self.limits != expected {
             return Err(Error::new(
@@ -343,6 +364,7 @@ mod tests {
                 max_recv_wr: 4,
                 recv_queue_len: 4,
                 max_msg_size: 64 * 1024,
+                max_large_msg_size: 64 * 1024 * 1024,
             },
             traffic_class: 0,
         };
@@ -560,6 +582,14 @@ mod tests {
                 max_msg_size: 32 * 1024,
                 ..response.limits
             },
+            RdmaConnectionLimits {
+                max_large_msg_size: 32 * 1024 * 1024,
+                ..response.limits
+            },
+            RdmaConnectionLimits {
+                max_large_msg_size: 0,
+                ..response.limits
+            },
         ] {
             let err = PrepareConnectionResponse { limits, ..response }
                 .validate_for(&request)
@@ -576,12 +606,14 @@ mod tests {
             max_recv_wr: 24,
             recv_queue_len: 20,
             max_msg_size: 256 * 1024,
+            max_large_msg_size: 64 * 1024 * 1024,
         };
         let acceptor = RdmaConnectionLimits {
             max_send_wr: 4,
             max_recv_wr: 80,
             recv_queue_len: 8,
             max_msg_size: 64 * 1024,
+            max_large_msg_size: 16 * 1024 * 1024,
         };
 
         let initiator_resolved = initiator.negotiate(acceptor).unwrap();
@@ -595,6 +627,8 @@ mod tests {
         assert_eq!(acceptor_resolved.recv_queue_len, 4);
         assert_eq!(initiator_resolved.max_msg_size, 64 * 1024);
         assert_eq!(acceptor_resolved.max_msg_size, 64 * 1024);
+        assert_eq!(initiator_resolved.max_large_msg_size, 16 * 1024 * 1024);
+        assert_eq!(acceptor_resolved.max_large_msg_size, 16 * 1024 * 1024);
     }
 
     #[test]
@@ -604,12 +638,14 @@ mod tests {
             max_recv_wr: 96,
             recv_queue_len: 20,
             max_msg_size: 256 * 1024,
+            max_large_msg_size: 64 * 1024 * 1024,
         };
         let acceptor = RdmaConnectionLimits {
             max_send_wr: 80,
             max_recv_wr: 24,
             recv_queue_len: 20,
             max_msg_size: 64 * 1024,
+            max_large_msg_size: 64 * 1024 * 1024,
         };
 
         let initiator_resolved = initiator.negotiate(acceptor).unwrap();
@@ -630,6 +666,7 @@ mod tests {
             max_recv_wr: 64,
             recv_queue_len: 8,
             max_msg_size: 256 * 1024,
+            max_large_msg_size: 64 * 1024 * 1024,
         };
 
         for peer in [
@@ -653,5 +690,67 @@ mod tests {
             let err = local.negotiate(peer).unwrap_err();
             assert_eq!(err.kind, ErrorKind::InvalidArgument);
         }
+    }
+
+    #[test]
+    fn legacy_messagepack_limits_disable_large_messages_in_both_directions() {
+        #[derive(Deserialize, Serialize, Debug, PartialEq, Eq)]
+        struct LegacyLimits {
+            max_send_wr: u32,
+            max_recv_wr: u32,
+            recv_queue_len: u32,
+            max_msg_size: u32,
+        }
+
+        let legacy = LegacyLimits {
+            max_send_wr: 32,
+            max_recv_wr: 64,
+            recv_queue_len: 8,
+            max_msg_size: 64 * 1024,
+        };
+        let encoded = rmp_serde::to_vec_named(&legacy).unwrap();
+        let old_peer: RdmaConnectionLimits = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(old_peer.max_large_msg_size, 0);
+        // Zero remains absent on the wire, so legacy named-field metadata
+        // is reproduced exactly when large messages are disabled.
+        assert_eq!(rmp_serde::to_vec_named(&old_peer).unwrap(), encoded);
+
+        let new_peer = RdmaConnectionLimits {
+            max_large_msg_size: RdmaConnectionTuningConfig::MAX_LARGE_MSG_SIZE,
+            ..old_peer
+        };
+        let old_decoded: LegacyLimits =
+            rmp_serde::from_slice(&rmp_serde::to_vec_named(&new_peer).unwrap()).unwrap();
+        assert_eq!(old_decoded, legacy);
+
+        for (initiator, acceptor) in [(old_peer, new_peer), (new_peer, old_peer)] {
+            let resolved = initiator.negotiate(acceptor).unwrap();
+            assert_eq!(resolved.max_large_msg_size, 0);
+            assert_eq!(acceptor.negotiate(resolved).unwrap().max_large_msg_size, 0);
+        }
+    }
+
+    #[test]
+    fn large_message_limits_must_fit_the_pool_and_cover_inline_messages() {
+        let limits = prepared_connection().0.limits;
+        for max_large_msg_size in [
+            limits.max_msg_size - 1,
+            RdmaConnectionTuningConfig::MAX_LARGE_MSG_SIZE + 1,
+        ] {
+            assert!(
+                RdmaConnectionLimits {
+                    max_large_msg_size,
+                    ..limits
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        RdmaConnectionLimits {
+            max_large_msg_size: 0,
+            ..limits
+        }
+        .validate()
+        .unwrap();
     }
 }

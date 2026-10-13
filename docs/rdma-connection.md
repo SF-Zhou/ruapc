@@ -98,14 +98,19 @@ send = min(L.max_send_wr, R.max_recv_wr)
 recv = min(L.max_recv_wr, R.max_send_wr)
 ring = min(L.recv_queue_len, R.recv_queue_len, send, recv)
 message = min(L.max_msg_size, R.max_msg_size)
+large_message = min(L.max_large_msg_size, R.max_large_msg_size)
 ```
 
-`PrepareConnectionRequest.limits` 携带这组已解析的值。接收端按自身当前能力再次协商，并通过 `PrepareConnectionResponse.limits` 返回实际配置。发起端要求接收端的 `max_send_wr` 等于自己的 `max_recv_wr`、反向亦然，且 `recv_queue_len`、`max_msg_size` 完全一致；若发现后能力已改变，握手失败并回滚，避免两端使用不同的缓冲大小或流控窗口。
+`PrepareConnectionRequest.limits` 携带这组已解析的值。接收端按自身当前能力再次协商，并通过 `PrepareConnectionResponse.limits` 返回实际配置。发起端要求接收端的 `max_send_wr` 等于自己的 `max_recv_wr`、反向亦然，且 `recv_queue_len`、`max_msg_size`、`max_large_msg_size` 完全一致；若发现后能力已改变，握手失败并回滚，避免两端使用不同的缓冲大小、消息能力或流控窗口。
+
+`max_large_msg_size` 是完整序列化消息的上限，包含 metadata 和 framing，不只计算用户 payload。该字段以可选 named-field MessagePack 字段交换，缺省为 0，值为 0 时不序列化。与未提供该字段的旧 peer 协商时结果为 0，仅使用原有 inline 消息；bootstrap 协议版本保持不变。
 
 | 字段 | 规则 |
 |---|---|
 | `recv_queue_len` | 至少 2，且不超过协商后的任一方向 WR 数；发送信用窗口为其一半。 |
-| `max_msg_size` | 两端取小，至少 16 KiB。 |
+| `max_msg_size` | 单次 SEND 的 inline 消息上限，两端取小，至少 16 KiB；本地默认 256 KiB。决定每项预投递接收缓冲大小。 |
+| `max_large_msg_size` | 通过 RDMA READ 传输的完整序列化消息上限，两端取小；本地默认 64 MiB。0 禁用，否则至少为 `max_msg_size` 且不超过单个 pool allocation 的 64 MiB 上限。 |
+| `max_inflight_large_bytes` | 本地每连接的大消息字节预算，默认 128 MiB，发送源和接收目标分别计数，不参与 wire 协商。必须非零，且至少为本地 `max_large_msg_size`。 |
 | `qp_num`、`psn` | 24 位；QP 号必须非零，PSN 按 QP 随机生成，可以为零。 |
 | `port_num`、`gid_index` | 端口从 1 开始；prepare 响应必须对应请求中的目标端口和 GID index。 |
 | `link_layer`、`lid`、`gid` | 两端链路类型一致；IB 使用有效单播 LID，可无 GID；RoCE 使用非零单播 GID。 |

@@ -45,7 +45,39 @@ See [completion identity](wrid.md) for QPN reuse and sequence exhaustion, and
 [capacity](rdma-capacity.md) for READ permits and CQ retirement. Moving a QP to
 ERR or failing a waiter does not by itself release DMA memory or posted permits.
 
-## Read-source limitation
+## Large-payload source ownership
+
+Large RDMA requests and responses use transport-owned serialized source
+buffers and a private offer/finish protocol. Publishing an offer installs the
+immutable source in its connection's transfer table in the same synchronous
+step that accepts the offer into the send queue. A send failure before that
+step is safe to retry. Once accepted, cancellation, request expiry and
+connection failure cannot trigger an automatic retry or return the source.
+
+The receiving connection validates the advertised length, region bounds and
+allocation budget before posting an owned READ plan. It sends finish only
+after every READ has completed successfully, or after deciding to post none
+for an unwanted request or response. The source accepts finish only through
+that connection's private RDMA dispatcher. It releases the corresponding
+source and replies whether the message remains valid. Request validity checks
+the pending waiter on that exact connection and its deadline. The receiver
+dispatches only after a positive reply and another request-deadline check.
+
+Transfer IDs are connection-scoped and never wrap. Receiver replay tracking
+persists for the connection's lifetime, including after completed transfers
+leave the active table. Controls cannot be invoked through application RPCs,
+HTTP endpoints or `State::handle_recv`.
+
+Cancelling a receive task, abandoning a posted READ, or failing confirmation
+moves the connection to ERR. Unconfirmed sources remain owned until provider
+QP destruction succeeds; `RdmaSocket` destroys its QP before its transfer
+table. Posted destinations separately remain held by the verbs-owned plan
+until completions settle or the QP is destroyed. Transfer cleanup deadlines
+close a connection rather than releasing memory on a timer. As with the
+existing RDMA memory interface, peers must honor the advertised-memory
+protocol; a remote peer's access to registration keys is a trust boundary.
+
+## Application read-source limitation
 
 An immutable `ReadSource` is shared by the client wrapper, pending requests and
 inline reverse-RPC readers. This keeps memory alive during local CPU copies.
@@ -57,12 +89,16 @@ timeout or cancellation, the source cannot observe when the peer's already
 posted one-sided READ finishes. The post-READ `request_is_pending` check rejects
 expired results but does not delay source recovery until remote completion.
 Destination ownership does not resolve this source-side limitation.
+The same limitation applies to server sources advertised by `remote_write`.
+The large-payload protocol above owns separate serialized buffers and does
+not change either application source contract.
 
 ## Validation
 
 Run the checks in [CONTRIBUTING.md](../CONTRIBUTING.md). Relevant tests cover
 registration rollback, overlap and overflow, partial posting, cancelled READs,
-completion identity, exclusive write targets and buffer recovery. Compile-fail
+completion identity, exclusive write targets, large-payload framing and
+confirmation, and buffer recovery. Compile-fail
 rustdoc examples check that safe callers cannot construct completion proofs or
 implement an unaudited registrar. Tests exercise these contracts; they do not
 constitute a proof of soundness or a performance guarantee.

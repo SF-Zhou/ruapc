@@ -66,6 +66,42 @@ fn test_allocation_sizes() {
 }
 
 #[test]
+fn allocation_capacity_matches_real_buffers_at_size_class_boundaries() {
+    let pool = test_pool();
+    let capacities = [
+        16 * 1024,
+        64 * 1024,
+        256 * 1024,
+        1024 * 1024,
+        4 * 1024 * 1024,
+        16 * 1024 * 1024,
+        64 * 1024 * 1024,
+    ];
+    let mut previous = 0;
+    for capacity in capacities {
+        for size in [previous + 1, capacity - 1, capacity] {
+            assert_eq!(BufferPool::allocation_capacity(size).unwrap(), capacity);
+            let buffer = pool.allocate(size).unwrap();
+            assert_eq!(buffer.capacity(), capacity, "allocation for {size} bytes");
+        }
+        previous = capacity;
+    }
+}
+
+#[test]
+fn allocation_capacity_rejects_the_same_sizes_as_allocate() {
+    let pool = test_pool();
+    for size in [0, SIZE_64MIB + 1, usize::MAX] {
+        let predicted = BufferPool::allocation_capacity(size).unwrap_err();
+        let allocated = pool.allocate(size).unwrap_err();
+        assert_eq!(predicted.kind(), ErrorKind::InvalidInput);
+        assert_eq!(predicted.kind(), allocated.kind());
+        assert_eq!(predicted.to_string(), allocated.to_string());
+    }
+    assert_eq!(pool.allocated_memory(), 0);
+}
+
+#[test]
 fn test_allocation_reuse() {
     let pool = test_pool_with_max(SIZE_64MIB);
 

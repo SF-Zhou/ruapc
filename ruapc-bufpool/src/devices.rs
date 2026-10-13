@@ -24,7 +24,7 @@ pub struct DeviceSet<D: Device = TcpDevice> {
 impl<D: Device> Default for DeviceSet<D> {
     fn default() -> Self {
         let magic = NEXT_MAGIC
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
             .expect("device collection identifiers exhausted");

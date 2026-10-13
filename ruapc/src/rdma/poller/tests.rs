@@ -92,6 +92,7 @@ async fn shard_admission_tries_other_queues_and_reclaims_failed_setup() {
     let connection = |recv_queue_len, max_send_wr| crate::rdma::RdmaConnectionConfig {
         recv_queue_len,
         max_msg_size: 1024,
+        max_large_msg_size: 0,
         traffic_class: 0,
         qp: crate::rdma::RdmaQueuePairConfig {
             max_send_wr,
@@ -152,6 +153,7 @@ async fn failed_new_shard_does_not_hide_existing_capacity() {
     let connection = crate::rdma::RdmaConnectionConfig {
         recv_queue_len: 2,
         max_msg_size: 1024,
+        max_large_msg_size: 0,
         traffic_class: 0,
         qp: crate::rdma::RdmaQueuePairConfig::default(),
     };
@@ -240,6 +242,7 @@ fn register_idle_socket_with_read_permits(
     let connection = crate::rdma::RdmaConnectionConfig {
         recv_queue_len: 2,
         max_msg_size: 1024,
+        max_large_msg_size: 0,
         traffic_class: 0,
         qp: crate::rdma::RdmaQueuePairConfig {
             max_send_wr: 4,
@@ -282,6 +285,8 @@ fn register_idle_socket_with_read_permits(
         poller.waker(),
         RdmaSocketConfig {
             max_msg_size: 1024,
+            max_large_msg_size: 0,
+            max_inflight_large_bytes: 128 << 20,
             send_window: 1,
             path: RdmaPathInfo {
                 local: nic.clone(),
@@ -364,6 +369,160 @@ async fn complete_one_read(poller: &DevicePoller, poll_loop: &mut PollLoop) {
     })
     .await
     .expect("READ must complete on the connected QP");
+}
+
+#[tokio::test]
+async fn successful_receive_queued_before_close_is_not_reposted() {
+    let devices = crate::rdma::test_utils::make_rdma_devices();
+    let device = &devices.devices()[0];
+    let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+    let (poller, mut poll_loop) = manual_poller(device.context());
+    let (state, _stop) = State::create(
+        crate::Router::default(),
+        &crate::SocketPoolConfig {
+            rdma: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let socket = register_idle_socket(&poller, device, &pool, &state);
+    let peer = register_idle_socket(&poller, device, &pool, &state);
+    connect_read_pair(device, &socket.queue_pair, &peer.queue_pair);
+    assert!(poll_loop.drain_incoming(false));
+    socket.queue_pair.recv(pool.allocate(64).unwrap()).unwrap();
+    poll_loop
+        .conns
+        .get_mut(&socket.queue_pair.qp_num())
+        .unwrap()
+        .flow
+        .receive_posted();
+    let mut message = pool.allocate(64).unwrap();
+    message.set_len(64);
+    message.fill(0x5a);
+    peer.queue_pair
+        .send_signaled(message, ruapc_rdma::ibv_send_flags::IBV_SEND_SIGNALED)
+        .unwrap();
+
+    let cq = poller.cq().clone();
+    let mut storage = CompletionBatch::<1>::new();
+    let mut batch = DispatchBatch::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(completion) = cq.poll_batch(&mut storage).unwrap().next() {
+                assert!(completion.info().succ());
+                if completion.info().is_recv() {
+                    assert_eq!(completion.qp_num(), socket.queue_pair.qp_num());
+                    // The provider has completed a receive, but shutdown wins
+                    // before the poller consumes its CQ-issued proof. An ERR
+                    // transition must not be followed by a new receive post.
+                    socket.set_error();
+                    poll_loop.dispatch(completion, &mut batch);
+                    break;
+                }
+                poll_loop.dispatch(completion, &mut batch);
+            } else {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+    })
+    .await
+    .expect("the connected peer must produce a successful receive");
+
+    let conn = poll_loop
+        .conns
+        .get_mut(&socket.queue_pair.qp_num())
+        .unwrap();
+    assert!(
+        conn.flow.flushed(),
+        "a successful CQE consumed after closure must not replenish the receive ring"
+    );
+    assert!(
+        batch.is_empty(),
+        "closed connections must not dispatch messages"
+    );
+    conn.update_flow_control().unwrap();
+    assert!(conn.ready_to_remove());
+    poll_loop.maintain_connections(Instant::now(), false, false);
+    assert!(!poll_loop.conns.contains_key(&socket.queue_pair.qp_num()));
+    poll_loop.shutdown_cleanup();
+}
+
+#[tokio::test]
+async fn close_between_receive_health_check_and_post_is_flushed_by_poller() {
+    let devices = crate::rdma::test_utils::make_rdma_devices();
+    let device = &devices.devices()[0];
+    let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+    let (poller, mut poll_loop) = manual_poller(device.context());
+    let (state, _stop) = State::create(
+        crate::Router::default(),
+        &crate::SocketPoolConfig {
+            rdma: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let socket = register_idle_socket(&poller, device, &pool, &state);
+    let peer = register_idle_socket(&poller, device, &pool, &state);
+    connect_read_pair(device, &socket.queue_pair, &peer.queue_pair);
+    assert!(poll_loop.drain_incoming(false));
+
+    // Reproduce the interleaving without a timing-dependent race: the poller
+    // has checked health when another task requests closure. Its in-progress
+    // receive post must still precede the provider's ERR transition.
+    assert!(socket.state.is_ok());
+    socket.set_error();
+    assert!(
+        !poll_loop
+            .conns
+            .get_mut(&socket.queue_pair.qp_num())
+            .unwrap()
+            .ready_to_remove(),
+        "software closure cannot remove the QP before requesting its provider flush"
+    );
+    socket.queue_pair.recv(pool.allocate(64).unwrap()).unwrap();
+    let conn = poll_loop
+        .conns
+        .get_mut(&socket.queue_pair.qp_num())
+        .unwrap();
+    conn.flow.receive_posted();
+    assert!(!conn.ready_to_remove());
+    conn.update_flow_control().unwrap();
+    assert!(
+        !conn.ready_to_remove(),
+        "the posted receive still needs its CQE"
+    );
+
+    let cq = poller.cq().clone();
+    let mut storage = CompletionBatch::<1>::new();
+    let mut batch = DispatchBatch::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(completion) = cq.poll_batch(&mut storage).unwrap().next() {
+                assert_eq!(completion.qp_num(), socket.queue_pair.qp_num());
+                assert!(completion.info().is_recv());
+                assert_eq!(
+                    completion.info().status,
+                    ruapc_rdma::ibv_wc_status::IBV_WC_WR_FLUSH_ERR
+                );
+                poll_loop.dispatch(completion, &mut batch);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("poller closure must flush the receive admitted before its ERR transition");
+
+    let conn = poll_loop
+        .conns
+        .get_mut(&socket.queue_pair.qp_num())
+        .unwrap();
+    assert!(conn.flow.flushed());
+    assert!(conn.ready_to_remove());
+    assert!(batch.is_empty());
+    poll_loop.maintain_connections(Instant::now(), false, false);
+    assert!(!poll_loop.conns.contains_key(&socket.queue_pair.qp_num()));
+    poll_loop.shutdown_cleanup();
 }
 
 #[tokio::test]
@@ -745,6 +904,8 @@ async fn identical_wrids_are_routed_by_their_provider_qp_numbers() {
         incoming.recv_submitted = 1;
     }
     assert!(poll_loop.drain_incoming(false));
+    // The poller owns provider ERR transitions, after receive posting ends.
+    poll_loop.maintain_connections(Instant::now(), false, false);
     let mut seen = std::collections::HashSet::new();
     let mut wrid = None;
     let mut storage = CompletionBatch::<8>::new();
@@ -835,6 +996,7 @@ async fn early_flush_completion_waits_for_registration_and_settles_receive() {
                 qp: crate::rdma::RdmaQueuePairConfig::default(),
                 recv_queue_len: 1,
                 max_msg_size: 1024,
+                max_large_msg_size: 0,
                 traffic_class: 0,
             }))
             .unwrap()
@@ -844,6 +1006,8 @@ async fn early_flush_completion_waits_for_registration_and_settles_receive() {
         poller.waker(),
         RdmaSocketConfig {
             max_msg_size: 1024,
+            max_large_msg_size: 0,
+            max_inflight_large_bytes: 128 << 20,
             send_window: 2,
             path: RdmaPathInfo {
                 local: nic.clone(),
@@ -902,6 +1066,7 @@ async fn early_flush_completion_waits_for_registration_and_settles_receive() {
                 // INIT -> ERR flushes a real posted receive without needing a
                 // peer or routable network. The socket is closed for teardown.
                 socket.set_error();
+                set_qp_error(socket);
                 posted_tx
                     .send(())
                     .map_err(|error| Error::new(ErrorKind::ConnectionClosed, error.to_string()))?;
@@ -955,6 +1120,7 @@ async fn early_flush_completion_waits_for_registration_and_settles_receive() {
         .conns
         .get_mut(&socket.queue_pair.qp_num())
         .expect("the early CQE must find the newly published connection");
+    conn.start_error_flush();
     assert!(
         conn.ready_to_remove(),
         "the flush CQE must settle the receive ledger"

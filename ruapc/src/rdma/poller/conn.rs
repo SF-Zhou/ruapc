@@ -59,6 +59,10 @@ pub(super) struct ConnState {
     /// Listed once in the poller's active maintenance queue. Never shared
     /// with posting tasks and never used to authorize completion ownership.
     pub(super) dirty: bool,
+    /// Only the poll thread requests provider ERR, after any receive repost
+    /// already in progress. Software closure alone does not start that flush.
+    /// Records the transition attempt, never evidence of DMA completion.
+    qp_error_requested: bool,
     /// CQ-assigned QP identity and sequence floor; stale completions are discarded
     /// before they can affect a replacement connection's flow control.
     pub(super) identity: CompletionIdentity,
@@ -92,6 +96,7 @@ impl ConnState {
         let registration = RegisteredConnection::new(reg.state, reg.socket.conn_id);
         Self {
             dirty: false,
+            qp_error_requested: false,
             identity: reg.socket.queue_pair.send_identity(),
             flow: FlowControl::new(reg.send_window, reg.recv_submitted, Instant::now()),
             pending_sends: VecDeque::new(),
@@ -170,6 +175,11 @@ impl ConnState {
                     wc.status, wc.vendor_err
                 ),
             ));
+        }
+        if !self.socket.state.is_ok() {
+            // A successful CQE can have been queued before closure. Settle
+            // its receive count without dispatching or replenishing the RQ.
+            return Ok(());
         }
         if let Some(connection_id) = self.socket.take_accept_lease() {
             let _ = self
@@ -322,6 +332,7 @@ impl ConnState {
     /// and emits acknowledgments when thresholds are reached.
     pub(super) fn update_flow_control(&mut self) -> Result<()> {
         if !self.socket.state.is_ok() {
+            self.start_error_flush();
             // Pending sends never acquired a credit; just drop them.
             self.pending_sends.clear();
             return Ok(());
@@ -411,7 +422,7 @@ impl ConnState {
     /// pressure.
     fn flush_pending(&mut self, finished: u64, ack: &mut Option<u32>) -> Result<()> {
         let agg_cap = self.recv_buf_size.min(MAX_AGG_BYTES);
-        while !self.pending_sends.is_empty() {
+        while self.socket.has_large_controls() || !self.pending_sends.is_empty() {
             match self.socket.state.try_acquire_at(finished) {
                 // Pending flushes are always posted signaled (see
                 // `post_data`), so the tail flag needs no handling here.
@@ -421,6 +432,21 @@ impl ConnState {
                     self.pending_sends.clear();
                     break;
                 }
+            }
+
+            // Finish controls have a separate bounded queue. They consume the
+            // same accounted SEND credits, but cannot sit behind an arbitrary
+            // business backlog while pinning a peer's source buffers.
+            if self.socket.has_large_controls()
+                && let Some(control) = self.socket.take_large_control()
+            {
+                self.post_data(control, ack)?;
+                continue;
+            }
+            if self.pending_sends.is_empty() {
+                // Closure may clear the control queue after the loop check.
+                self.socket.set_error();
+                break;
             }
 
             // Determine the FIFO run that fits one aggregate. The first
@@ -564,6 +590,7 @@ impl ConnState {
     /// Fails expired READ waiters and moves the QP to ERR. Posted memory and
     /// permits stay held until completion processing or successful QP destruction.
     pub(super) fn sweep_read_timeouts(&self, now: Instant) {
+        self.socket.sweep_large_transfers(now);
         // Avoid walking every shard of an empty READ map for every idle QP.
         // A READ starting after this check is covered by the next sweep; a
         // posted READ retains its SQ permit until completion processing.
@@ -579,16 +606,25 @@ impl ConnState {
         }
     }
 
+    /// Starts the provider flush on the thread that owns receive reposting.
+    pub(super) fn start_error_flush(&mut self) {
+        if !self.qp_error_requested {
+            self.qp_error_requested = true;
+            super::set_qp_error(&self.socket);
+        }
+    }
+
     /// Whether this connection can be torn down.
     ///
-    /// Requires error state, settled ACK/receive counters, no pending sends,
-    /// and closed, idle READ admission with no pending batches. Waiting for
-    /// every SQ permit covers posters paused before registering their batch;
+    /// Requires a provider ERR request, settled ACK/receive counters, no
+    /// pending sends, and closed, idle READ admission with no pending batches.
+    /// Waiting for every SQ permit covers posters paused before registering their batch;
     /// earlier removal would lose their completions and NIC permits.
     /// Successfully completed unsignaled SENDs may still own buffers until
     /// the QP is destroyed.
     pub(super) fn ready_to_remove(&mut self) -> bool {
         !self.socket.state.is_ok()
+            && self.qp_error_requested
             && self.flow.flushed()
             && self.pending_sends.is_empty()
             && self.socket.read_credits.is_closed()

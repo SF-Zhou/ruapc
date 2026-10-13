@@ -1,5 +1,7 @@
 //! Connection state and the RDMA socket send path.
 
+mod encode;
+mod large;
 mod read;
 
 use std::sync::{
@@ -17,14 +19,13 @@ use crate::{
     Buffer, BufferPool, Context, CopyOp, Error, RemoteIoError, RemoteSpace, SocketTrait, State,
     error::{ErrorKind, Result},
     msg::MsgMeta,
-    rdma::{
-        frame::FramedBuffer,
-        poller::{PollerWaker, ReservedQueuePair},
-    },
+    rdma::poller::{PollerWaker, ReservedQueuePair},
 };
 
 pub(crate) struct RdmaSocketConfig {
     pub(crate) max_msg_size: usize,
+    pub(crate) max_large_msg_size: usize,
+    pub(crate) max_inflight_large_bytes: usize,
     pub(crate) send_window: u32,
     pub(crate) path: RdmaPathInfo,
     pub(crate) read_timeout: Option<Duration>,
@@ -96,6 +97,9 @@ impl Drop for ReadCredits {
 pub struct RdmaSocket {
     /// The QP owns posted memory through completion and successful destruction.
     pub(crate) queue_pair: ReservedQueuePair,
+    // The provider QP must be destroyed before unconfirmed remote READ
+    // sources are released. Never move this field ahead of queue_pair.
+    large: large::LargeTransfers,
     /// Field order ensures unpolled READ permits return only after QP destruction.
     pub(crate) read_credits: ReadCredits,
     pub(crate) rdmabuf_pool: Arc<BufferPool>,
@@ -108,6 +112,7 @@ pub struct RdmaSocket {
     /// Negotiated maximum serialized message size (= the peer's receive
     /// buffer size).
     pub(crate) max_msg_size: usize,
+    max_large_msg_size: usize,
     /// The (local NIC, remote NIC) pair this connection runs on.
     pub(crate) path: RdmaPathInfo,
     /// Process-wide unique connection id (see [`crate::task::next_conn_id`]).
@@ -137,12 +142,14 @@ impl RdmaSocket {
     ) -> Self {
         Self {
             queue_pair,
+            large: large::LargeTransfers::new(config.max_inflight_large_bytes),
             read_credits: ReadCredits::new(config.read_permits, config.sq_read_cap),
             rdmabuf_pool,
             state: RdmaState::new(config.send_window.max(1)),
             pending_sender,
             poller_waker,
             max_msg_size: config.max_msg_size,
+            max_large_msg_size: config.max_large_msg_size,
             path: config.path,
             conn_id: crate::task::next_conn_id(),
             peer_health: std::sync::OnceLock::new(),
@@ -185,52 +192,15 @@ impl RdmaSocket {
         }
     }
 
-    /// Serializes a message into a right-sized framed buffer.
-    ///
-    /// The serialized size is unknown upfront, so try increasingly larger
-    /// buffers (4 KiB → 64 KiB → 256 KiB → negotiated `max_msg_size`).
-    /// Typical RPC messages fit the first rung; larger payloads should use
-    /// the remote read/write paths.
-    fn serialize_msg<P: Serialize>(&self, meta: &MsgMeta, payload: &P) -> Result<Buffer> {
-        let mut last_err = None;
-        for size in [4 * 1024, 64 * 1024, 256 * 1024, self.max_msg_size] {
-            let size = size.min(self.max_msg_size);
-            let mut buf = self.rdmabuf_pool.allocate(size)?;
-            match meta.serialize_to(payload, &mut FramedBuffer(&mut buf)) {
-                Ok(()) => return Ok(buf),
-                Err(e) => last_err = Some(e),
-            }
-            if size == self.max_msg_size {
-                break;
-            }
-        }
-        Err(last_err.unwrap_or_else(|| {
-            Error::new(
-                ErrorKind::SerializeFailed,
-                format!(
-                    "message exceeds negotiated max_msg_size ({}); use remote read/write for large payloads",
-                    self.max_msg_size
-                ),
-            )
-        }))
-    }
-
     pub fn set_error(&self) {
         if !self.state.set_error() {
             return;
         }
         self.read_credits.close();
-        let mut attr = ruapc_rdma::ibv_qp_attr {
-            qp_state: ruapc_rdma::ibv_qp_state::IBV_QPS_ERR,
-            ..Default::default()
-        };
-        let mask = ruapc_rdma::ibv_qp_attr_mask::IBV_QP_STATE;
-        if let Err(err) = self.queue_pair.modify(&mut attr, mask.0 as _) {
-            tracing::warn!(conn_id = self.conn_id, local_qp = self.queue_pair.qp_num(), %err,
-                "failed to move RDMA queue pair to ERR");
-        }
-        // Ensure the poll thread notices the error even when the QP had no
-        // outstanding work requests to flush.
+        self.large.close();
+        // The poll thread moves the QP to ERR, serialized with receive
+        // reposting. A receive posted after the provider's ERR flush can
+        // otherwise remain outstanding indefinitely (notably on RXE).
         self.poller_waker.wake();
     }
 
@@ -251,7 +221,7 @@ impl Drop for RdmaSocket {
     fn drop(&mut self) {
         // No posting or completion can still execute through this socket.
         // Snapshot only: refunding here would release admission before the QP
-        // is destroyed. Fields then drop in order: QP, followed by credits.
+        // is destroyed. Fields then drop in order: QP, large transfers, credits.
         self.read_credits.unpolled_on_drop = self.queue_pair.pending_read_count();
     }
 }
@@ -263,7 +233,7 @@ impl SocketTrait for RdmaSocket {
         payload: &P,
         state: &Arc<State>,
     ) -> Result<()> {
-        let buf = self.serialize_msg(meta, payload)?;
+        let encoded = self.serialize_msg(meta, payload)?;
 
         // Bind the pending request to this connection so it fails eagerly
         // if the connection dies before the response arrives.
@@ -271,6 +241,37 @@ impl SocketTrait for RdmaSocket {
             state.waiter.bind_connection(meta.msgid, self.conn_id);
         }
 
+        if encoded.buffer.len() > self.max_msg_size {
+            // Keep the rendezvous state out of every inline send's future.
+            return Box::pin(self.send_large(meta, encoded, state)).await;
+        }
+        self.send_buffer(encoded.buffer).await
+    }
+
+    async fn remote_read(
+        &self,
+        ctx: &Context,
+        ops: &[CopyOp],
+        local: Vec<Buffer>,
+        remote: &RemoteSpace<'_>,
+    ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
+        self.read_remote(ctx, ops, local, remote).await
+    }
+
+    async fn remote_write(
+        &self,
+        ctx: &Context,
+        ops: &[CopyOp],
+        local: Vec<Buffer>,
+    ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
+        self.write_remote(ctx, ops, local).await
+    }
+}
+
+impl RdmaSocket {
+    /// On error no bytes have been accepted. After success all subsequent
+    /// failures belong to the connection/waiter, never the retryable send path.
+    async fn send_buffer(&self, buf: Buffer) -> Result<()> {
         match self.state.try_acquire() {
             SendPermit::Granted { window_tail } => {
                 // Invariant: a fully consumed send window must contain at
@@ -304,24 +305,5 @@ impl SocketTrait for RdmaSocket {
             }
             SendPermit::Error => Err(ErrorKind::RdmaSendFailed.into()),
         }
-    }
-
-    async fn remote_read(
-        &self,
-        ctx: &Context,
-        ops: &[CopyOp],
-        local: Vec<Buffer>,
-        remote: &RemoteSpace<'_>,
-    ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
-        self.read_remote(ctx, ops, local, remote).await
-    }
-
-    async fn remote_write(
-        &self,
-        ctx: &Context,
-        ops: &[CopyOp],
-        local: Vec<Buffer>,
-    ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
-        self.write_remote(ctx, ops, local).await
     }
 }

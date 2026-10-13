@@ -170,6 +170,21 @@ impl Waiter {
         self.id_map.contains_key(&msgid)
     }
 
+    /// Exact connection and deadline check for private payload confirmation.
+    #[cfg(feature = "rdma")]
+    pub(crate) fn pending_on_connection(&self, msgid: u64, conn_id: u64) -> bool {
+        self.deadline_on_connection(msgid, conn_id)
+            .is_some_and(|deadline| deadline > Instant::now())
+    }
+
+    #[cfg(feature = "rdma")]
+    pub(crate) fn deadline_on_connection(&self, msgid: u64, conn_id: u64) -> Option<Instant> {
+        self.id_map
+            .get(&msgid)
+            .filter(|entry| entry.conn_id.is_some_and(|id| id.get() == conn_id))
+            .map(|entry| entry.deadline)
+    }
+
     /// Number of requests currently waiting for a response.
     pub fn pending_count(&self) -> usize {
         self.id_map.len()

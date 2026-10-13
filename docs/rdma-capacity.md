@@ -47,6 +47,47 @@ window one. DATA acknowledgments and keepalives may carry a smaller ACK
 delta. This prevents an activation ACK from starting an endless pure-ACK
 exchange on the minimum receive ring.
 
+## Large-payload admission and cleanup
+
+`rdma.connection.max_msg_size` continues to size each posted receive buffer;
+large payload support does not enlarge the receive ring. The negotiated
+`max_large_msg_size` bounds a complete serialized message, including metadata
+and the ordinary eight bytes of RDMA framing. It defaults to 64 MiB, the
+maximum single pool allocation. Zero disables large messages; nonzero values
+must cover the inline limit. Both peers take the smaller advertised limit,
+and a peer omitting the field negotiates zero.
+
+`rdma.connection.max_inflight_large_bytes` defaults to 128 MiB per connection
+and applies independently to outgoing source storage and incoming destination
+storage. It is local rather than negotiated, must be nonzero, and must cover
+the configured large-message limit. Accounting uses allocation capacity,
+including buffers retained after READ completion until their payload owner
+is dropped. If a READ fails or its receive task is cancelled before recovering
+the destination, its byte reservation remains quarantined until QP destruction;
+failing a waiter does not return that budget. Serialization growth reserves its
+replacement allocation while the previous large allocation is still charged, so a budget equal to the
+message-size limit can reject a growing message before that limit is reached.
+The default budget allows one maximum-size message to grow with both
+allocations present. Payload READs use the existing per-connection and NIC READ
+permits and bandwidth admission. Descriptors and confirmations consume normal
+data SEND credits, so they do not add a separate CQ-credit class.
+
+Each connection admits at most 128 active outgoing and 128 active incoming
+transfers. Finish and finish-reply controls use a separate bounded queue of
+256 messages; the poller services it before queued business messages.
+Confirmation bypasses application handler admission so a handler waiting
+for a large callback cannot block its own completion. Receiver replay
+tracking retains compressed transfer-ID intervals for the connection's
+lifetime; more than 128 disjoint intervals closes the connection.
+
+An independent 30-second transfer cleanup deadline bounds retained offers and
+READ/confirmation tasks, including when the business request has expired.
+READs also remain subject to `rdma.remote_memory.read_timeout_ms`. Exceeding a
+transfer deadline or failing a receiving transfer closes the connection;
+unconfirmed sources remain held until QP destruction. A confirmed expired
+request can release its serialized source while declining dispatch. See
+[large-payload ownership](safe-boundaries.md#large-payload-source-ownership).
+
 ## CQ shards and admission
 
 `rdma.polling.poll_threads_per_device` bounds CQ shards, each with one OS
@@ -108,7 +149,7 @@ and already processed completions are excluded. External socket owners delay
 this recovery. A stopped CQ admits no new connections and cannot reuse its
 remaining reservations without an empty-poll proof.
 
-Destination ownership and the separate remote-source lifetime limitation are
+Destination ownership and the separate application remote-source lifetime limitation are
 documented in [WRID ownership](wrid.md#read-ownership-and-source-lifetime).
 
 ## Introspection and implementation

@@ -84,6 +84,21 @@ Small received frame batches (up to 1 KiB total) are copied out so registered
 receive buffers can be reused promptly; larger batches retain the zero-copy path.
 This reduces receive-pool pressure without moving parsing onto the poller.
 
+## Closing a connection
+
+Closing a socket marks it failed, closes READ admission and wakes the poller.
+The poll thread performs the provider QP transition to ERR, serialized with
+receive reposting. A repost already in progress therefore precedes the ERR
+flush. Posting a receive after that flush can leave it without a completion
+on providers such as Soft-RoCE, preventing teardown.
+
+Successful receive completions queued before closure still settle their
+receive counts, but do not dispatch messages or replenish the receive ring.
+Removal requires the provider ERR request and the existing completion and
+READ-admission checks. Poller shutdown also requests ERR for incoming and
+registered connections. ERR itself never releases posted memory or permits;
+completion evidence or successful QP destruction remains necessary.
+
 ## Implementation and regression coverage
 
 [Poller routing](../ruapc/src/rdma/poller/mod.rs),

@@ -49,6 +49,10 @@ acknowledge remote DMA completion or make source recovery wait for it.
 See [request types and handlers](../ruapc/src/services/memory_service.rs) and
 [ownership boundaries](safe-boundaries.md).
 
+Large serialized RDMA request/response payloads use separate private transport
+controls, described below. Their source-completion contract does not change
+the lifetime limitation of these application attachment operations.
+
 ## Internal RDMA bootstrap: `_ruapc.rdma`
 
 With the `rdma` feature, a TCP bootstrap connection discovers devices and
@@ -67,10 +71,35 @@ resolved limits. A lease identifies the attempt and accepted connection.
 Local send limits match peer receive limits and vice versa; mismatched resolved
 limits fail setup. Scatter/gather limits stay local, and CQs are shared rather
 than negotiated per connection.
+The optional `max_large_msg_size` limit advertises support for large-payload
+READs; a missing or zero value disables that path without changing bootstrap
+protocol version 2.
 
 Commit records ownership; activation also requires a successful data-plane
 receive. See [RDMA connection establishment](rdma-connection.md) for the
 sequence and [bootstrap wire types](../ruapc/src/rdma/rdma_service.rs) for fields.
+
+## Private RDMA payload controls
+
+An RDMA connection with large-payload support carries three transport frame
+types in addition to ordinary RPC messages:
+
+| Control | Fields | Purpose |
+|---|---|---|
+| Offer | Transfer ID, serialized payload length, payload regions, original metadata | Advertise immutable transport-owned source bytes for READ. |
+| Finish | Transfer ID | Confirm that all payload READs completed, or that none was posted. |
+| Finish reply | Transfer ID, completion-validity boolean | Permit dispatch only while the source request remains valid. |
+
+These controls are named-field MessagePack frames parsed directly by the
+connection's RDMA dispatcher. They are not service methods: application
+routing, reflection, unary HTTP and the `_ruapc.memory` interface cannot
+invoke them. Original application read/write attachment regions stay in
+the metadata; the offer's payload regions occupy a separate field.
+
+Controls bypass handler admission and use a bounded queue for finish/reply
+progress. See [message framing](../DESIGN.md#message-ownership-and-framing),
+[source ownership](safe-boundaries.md#large-payload-source-ownership) and
+[capacity](rdma-capacity.md#large-payload-admission-and-cleanup).
 
 ## Exposure rules
 

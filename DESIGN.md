@@ -95,17 +95,41 @@ its bytes.
 |---|---|
 | TCP, HTTP/2 bidirectional stream | `[RUA!: 4B][body_len: 4B][meta_len: 4B][meta][payload]` |
 | WebSocket binary message | `[meta_len: 4B][meta][payload]` |
-| RDMA receive buffer | One or more `[frame_len: 4B][meta_len: 4B][meta][payload]` frames |
+| RDMA inline message | `[frame_len: 4B][meta_len: 4B][meta][payload]` |
+| RDMA large-payload control | `[0: 4B][control_len: 4B][kind: 1B][named MessagePack body]` |
 | Unary HTTP | JSON request/response bodies with routing supplied by the URL |
 
 Lengths are big-endian `u32`s. `body_len` and `frame_len` both count the
 `meta_len` prefix, metadata and payload, excluding their outer headers.
+`control_len` counts the kind byte and control body. Control kinds are offer
+(1), finish (2), and finish reply (3). Both RDMA frame forms can be aggregated
+in one receive buffer.
 
 TCP and HTTP/2 share `msg/frame.rs`, including the send/receive size limit and
 incremental parser. Incomplete frames remain buffered; complete bodies are
 split out without copying. RDMA framing lives in `rdma/frame.rs` and is
 independent of the polling machinery. Aggregated RDMA frames consume one
 receive credit for the entire SEND, irrespective of message count.
+
+RDMA peers negotiate `max_large_msg_size` separately from the inline receive
+buffer size, `max_msg_size`. A missing or zero large-message limit disables
+the extension. `rdma/rdma_socket/encode.rs` serializes each message once,
+growing registered storage as needed. Messages fitting the inline limit keep
+their existing wire format. Larger requests and responses send an offer with
+the original metadata and separate payload regions, then the receiver READs
+the serialized payload into owned registered storage. Application attachment
+regions in the original metadata remain unchanged.
+
+`rdma/rdma_socket/large.rs` retains each published source until a finish
+control on that connection proves that the receiver has completed its READs
+or posted none. The receiver waits for the source's finish reply before
+dispatching the message. Request confirmation checks its original waiter,
+connection identity and deadline; expiry rejects dispatch without releasing
+an unconfirmed source. Transfer IDs never wrap or repeat on a connection.
+Finish controls use a bounded queue ahead of queued business messages and
+bypass handler admission, while consuming normal SEND credits. See
+[source ownership](docs/safe-boundaries.md#large-payload-source-ownership) and
+[transfer budgets](docs/rdma-capacity.md#large-payload-admission-and-cleanup).
 
 ## Remote memory
 
@@ -163,7 +187,7 @@ available destinations with `take_write_buffers()`; any remaining transfer keeps
 its buffers until it finishes. This contract is based on types, not the spelling
 of an alias.
 
-Read-source ownership covers local CPU readers. It is not a remote DMA completion
+Application read-source ownership covers local CPU readers. It is not a remote DMA completion
 lease: after source-side timeout or cancellation, the source side cannot observe
 when an already posted one-sided READ finishes. The existing post-READ
 `request_is_pending` check rejects data for an expired request, but does not
@@ -171,6 +195,9 @@ acknowledge remote completion before source recovery or reuse. Destination-side
 READ batches separately retain their memory until every posted completion arrives
 or their QP is successfully destroyed. Local destination ownership does not
 remove the source-side limitation.
+The private large-payload finish protocol applies only to transport-owned
+serialized messages; it does not extend the lifetime contract of application
+read attachments or `remote_write` sources.
 
 ## RDMA execution
 

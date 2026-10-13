@@ -174,6 +174,7 @@ mod tests {
             qp: crate::rdma::RdmaQueuePairConfig::default(),
             recv_queue_len: 8,
             max_msg_size: 262_144,
+            max_large_msg_size: 0,
             traffic_class: 0,
         };
         let demand = Demand::connection(&config);
