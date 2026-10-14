@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+### Added
+- `Error::local_failure()` exposes process-local TCP connect and response-wait
+  evidence that never crosses serialization or implies an unexecuted write.
+  See [Local failure evidence](docs/local-failures.md).
+
+### Changed
+- **BREAKING**: `Error` has a private evidence field; external construction must
+  use `Error::new` or `Error::kind`. RPC wire formats and error variants remain
+  unchanged.
+
+### Fixed
+- TCP teardown cancels both I/O loops and treats zero-byte writes as failures.
+  Connection coalescing no longer holds a map guard while awaiting a mutex.
+- Unknown incoming method names do not create server metric-cache entries or
+  recorder handles; registered methods retain overload and failure accounting.
+
 ## [0.2.0-alpha.6] - 2026-10-13
 
 ### Added

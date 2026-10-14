@@ -131,6 +131,15 @@ impl Client {
                 {
                     state.record_connection_failure(conn_id);
                 }
+                // Receiver cancellation also uses Timeout internally. Only an
+                // actually elapsed response budget supplies timeout evidence.
+                let err = if !matches!(err.kind, ErrorKind::Timeout)
+                    || std::time::Instant::now() >= sent.response_deadline
+                {
+                    err.with_local_failure(crate::LocalFailure::ResponseWait)
+                } else {
+                    err
+                };
                 return Err(err.into());
             }
         };
@@ -347,6 +356,7 @@ impl Client {
         Ok(SentRequest {
             receiver,
             conn_id: socket.conn_id(),
+            response_deadline,
         })
     }
 
@@ -385,6 +395,7 @@ impl Client {
 struct SentRequest<'a> {
     receiver: crate::Receiver<'a>,
     conn_id: Option<u64>,
+    response_deadline: std::time::Instant,
 }
 
 #[cfg(test)]

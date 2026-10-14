@@ -12,19 +12,40 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub struct TcpSocket {
-    inner: Arc<crate::sockets::ChannelConnection>,
+    inner: Arc<TcpConnection>,
+}
+
+#[derive(Debug)]
+pub(crate) struct TcpConnection {
+    channel: crate::sockets::ChannelConnection,
+    // Keep cancellation under the socket's Arc so per-request clones do not
+    // clone and release a token, which takes its internal mutex.
+    closed: tokio_util::sync::CancellationToken,
+}
+
+impl TcpConnection {
+    pub(crate) fn is_closed(&self) -> bool {
+        self.channel.is_closed()
+    }
 }
 
 impl TcpSocket {
     pub fn new(stream: mpsc::Sender<Bytes>) -> Self {
         Self {
-            inner: Arc::new(crate::sockets::ChannelConnection::new(stream)),
+            inner: Arc::new(TcpConnection {
+                channel: crate::sockets::ChannelConnection::new(stream),
+                closed: tokio_util::sync::CancellationToken::new(),
+            }),
         }
+    }
+
+    pub(crate) async fn closed(&self) {
+        self.inner.closed.cancelled().await;
     }
 
     /// Unique id of the underlying connection.
     pub(crate) fn conn_id(&self) -> u64 {
-        self.inner.conn_id()
+        self.inner.channel.conn_id()
     }
 
     /// Whether `other` refers to the same underlying connection.
@@ -35,14 +56,16 @@ impl TcpSocket {
     /// Marks the connection closed; returns `true` exactly once (the send
     /// and recv loops both report failures — teardown must run once).
     pub(crate) fn mark_closed(&self) -> bool {
-        self.inner.close_once()
+        let first = self.inner.channel.close_once();
+        self.inner.closed.cancel();
+        first
     }
 
     pub(crate) fn is_closed(&self) -> bool {
         self.inner.is_closed()
     }
 
-    pub(crate) fn health(&self) -> std::sync::Weak<crate::sockets::ChannelConnection> {
+    pub(crate) fn health(&self) -> std::sync::Weak<TcpConnection> {
         Arc::downgrade(&self.inner)
     }
 }
@@ -66,7 +89,7 @@ impl SocketTrait for TcpSocket {
     ) -> Result<()> {
         let bytes = crate::msg::frame::encode(meta, payload)?;
 
-        let sender = self.inner.prepare_send(meta, state, "TCP")?;
+        let sender = self.inner.channel.prepare_send(meta, state, "TCP")?;
         sender
             .send(bytes)
             .await
@@ -80,6 +103,22 @@ mod tests {
 
     use super::*;
     use crate::{Context, MsgFlags, SocketPoolConfig};
+
+    #[test]
+    fn health_observer_does_not_keep_connection_alive() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let socket = crate::Socket::TCP(TcpSocket::new(sender));
+        let health = socket.health().unwrap();
+        let cloned = socket.clone();
+        assert!(health.same_scope(&cloned.health().unwrap()));
+        assert!(health.is_connected());
+
+        drop(socket);
+        assert!(health.is_connected());
+        drop(cloned);
+        assert!(!health.is_connected());
+        assert!(receiver.is_closed());
+    }
 
     #[tokio::test]
     async fn closed_socket_rejects_request_after_binding_waiter() {

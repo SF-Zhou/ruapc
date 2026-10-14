@@ -79,6 +79,20 @@ removal also waits for pending READs and flow credits to settle. Fatal shutdown
 releases the poller's socket owners; QPs retained elsewhere keep their DMA holds
 until completion or successful destruction.
 
+Either TCP I/O loop ending cancels its sibling, and a zero-byte write fails
+instead of spinning. The close signal lives in shared TCP connection state,
+so cloning a socket only clones its shared owner. Connection coalescing releases
+its map guard before awaiting the per-address mutex. Server error accounting
+validates the method against the router before interning metric handles;
+unknown wire names cannot enter the cache, and successful requests keep one
+method-metrics lookup.
+
+`Error::local_failure()` distinguishes locally observed TCP connect and response
+wait failures from peer-supplied error kinds. The evidence is never serialized
+and never establishes that an accepted request was unexecuted. See
+[Local failure evidence](docs/local-failures.md) for failure provenance and
+constructor compatibility.
+
 ## Message ownership and framing
 
 `msg/meta.rs` defines routing fields and payload-format flags. Metadata is

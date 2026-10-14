@@ -202,6 +202,13 @@ impl Router {
         self.methods.keys().map(String::as_str)
     }
 
+    /// Returns the configured name of a dispatchable public or internal method.
+    pub(crate) fn registered_method_name(&self, name: &str) -> Option<&str> {
+        self.methods
+            .get_key_value(name)
+            .map(|(name, _)| name.as_str())
+    }
+
     /// Returns the schemas of all publicly discoverable methods.
     pub fn method_schemas(&self) -> impl Iterator<Item = (&str, &MethodSchema)> {
         self.methods.iter().filter_map(|(name, method)| {

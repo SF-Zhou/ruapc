@@ -162,13 +162,16 @@ impl Context {
         Rsp: Serialize,
         E: std::error::Error + From<Error> + Serialize,
     {
-        // Error accounting for the method being handled (server side).
-        if rsp.is_err() && !self.msg_meta.method.is_empty() {
-            self.state
-                .metrics
-                .server_method(&self.msg_meta.method)
-                .errors
-                .increment(1);
+        // Only configured names can allocate server metric handles. Checking
+        // here keeps successful dispatch to one metric-cache lookup while
+        // counting even a known method's first-call overload or decode error.
+        if rsp.is_err()
+            && let Some(name) = self
+                .state
+                .router
+                .registered_method_name(&self.msg_meta.method)
+        {
+            self.state.metrics.server_method(name).errors.increment(1);
         }
 
         // Responses are correlated by msgid alone: drop the request's method

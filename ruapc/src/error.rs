@@ -83,6 +83,19 @@ pub enum ErrorKind {
     Unknown(String),
 }
 
+/// Local transport evidence, never serialized or accepted from a peer.
+///
+/// This identifies an observed local stage, not whether an application ran.
+/// In particular, `ResponseWait` must never imply that a write was not executed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalFailure {
+    /// Actual TCP connect returned this operating-system error category.
+    TcpConnect(std::io::ErrorKind),
+    /// The transport accepted the request and waiting for its response failed.
+    /// Inspect the accompanying error kind; local shutdown can also close it.
+    ResponseWait,
+}
+
 /// RPC failure category and diagnostic message, which may be empty.
 ///
 /// # Examples
@@ -99,6 +112,10 @@ pub struct Error {
     pub kind: ErrorKind,
     /// Additional error message providing context.
     pub msg: String,
+    /// Process-local evidence is absent after any wire deserialization.
+    #[serde(skip)]
+    #[schemars(skip)]
+    local_failure: Option<LocalFailure>,
 }
 
 impl Error {
@@ -113,7 +130,11 @@ impl Error {
     /// ```
     #[must_use]
     pub fn new(kind: ErrorKind, msg: String) -> Self {
-        Self { kind, msg }
+        Self {
+            kind,
+            msg,
+            local_failure: None,
+        }
     }
 
     /// Creates a new error with the specified kind and an empty message.
@@ -131,7 +152,20 @@ impl Error {
         Self {
             kind,
             msg: String::default(),
+            local_failure: None,
         }
+    }
+
+    /// Returns locally observed transport evidence, if recorded by this process.
+    /// Remote errors always deserialize without evidence, including forged fields.
+    #[must_use]
+    pub fn local_failure(&self) -> Option<LocalFailure> {
+        self.local_failure
+    }
+
+    pub(crate) fn with_local_failure(mut self, failure: LocalFailure) -> Self {
+        self.local_failure = Some(failure);
+        self
     }
 }
 
@@ -155,6 +189,7 @@ impl From<std::num::TryFromIntError> for Error {
         Self {
             kind: ErrorKind::InvalidArgument,
             msg: value.to_string(),
+            local_failure: None,
         }
     }
 }
@@ -164,6 +199,7 @@ impl From<serde_json::Error> for Error {
         Self {
             kind: ErrorKind::SerdeJsonError,
             msg: value.to_string(),
+            local_failure: None,
         }
     }
 }
@@ -173,6 +209,7 @@ impl From<rmp_serde::encode::Error> for Error {
         Self {
             kind: ErrorKind::SerializeFailed,
             msg: value.to_string(),
+            local_failure: None,
         }
     }
 }
@@ -182,6 +219,7 @@ impl From<rmp_serde::decode::Error> for Error {
         Self {
             kind: ErrorKind::DeserializeFailed,
             msg: value.to_string(),
+            local_failure: None,
         }
     }
 }
@@ -191,6 +229,7 @@ impl From<std::io::Error> for Error {
         Self {
             kind: ErrorKind::Unknown(value.kind().to_string()),
             msg: value.to_string(),
+            local_failure: None,
         }
     }
 }
@@ -385,5 +424,34 @@ mod tests {
         // kind is Unknown(io_kind_string)
         assert!(matches!(error.kind, ErrorKind::Unknown(_)));
         assert!(!error.msg.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod local_failure_tests {
+    use super::{Error, ErrorKind, LocalFailure};
+
+    #[test]
+    fn evidence_never_crosses_json_messagepack_or_schema() {
+        let error = Error::new(ErrorKind::TcpConnectFailed, "refused".into()).with_local_failure(
+            LocalFailure::TcpConnect(std::io::ErrorKind::ConnectionRefused),
+        );
+        let plain = Error::new(ErrorKind::TcpConnectFailed, "refused".into());
+        assert_eq!(
+            serde_json::to_vec(&error).unwrap(),
+            serde_json::to_vec(&plain).unwrap()
+        );
+        assert_eq!(
+            rmp_serde::to_vec(&error).unwrap(),
+            rmp_serde::to_vec(&plain).unwrap()
+        );
+        let decoded: Error = rmp_serde::from_slice(&rmp_serde::to_vec(&error).unwrap()).unwrap();
+        assert_eq!(decoded, plain);
+        let forged: Error = serde_json::from_str(
+            r#"{"kind":"TcpConnectFailed","msg":"refused","local_failure":{"TcpConnect":"ConnectionRefused"}}"#,
+        ).unwrap();
+        assert_eq!(forged, plain);
+        let schema = serde_json::to_string(&schemars::schema_for!(Error)).unwrap();
+        assert!(!schema.contains("local_failure"));
     }
 }

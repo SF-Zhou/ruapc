@@ -115,6 +115,65 @@ mod tests {
         SocketPoolConfig::default()
     }
 
+    #[tokio::test]
+    async fn unknown_and_overloaded_requests_drop_payload_before_queued_reply() {
+        use bytes::Bytes;
+        use std::sync::{Arc, atomic::AtomicUsize};
+
+        struct TrackedPayload {
+            bytes: Vec<u8>,
+            drops: Arc<AtomicUsize>,
+        }
+
+        impl AsRef<[u8]> for TrackedPayload {
+            fn as_ref(&self) -> &[u8] {
+                &self.bytes
+            }
+        }
+
+        impl Drop for TrackedPayload {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        for overload in [false, true] {
+            let base = Context::create(&SocketPoolConfig {
+                max_inflight_requests: 1,
+                ..Default::default()
+            })
+            .unwrap();
+            let (sender, receiver) = tokio::sync::mpsc::channel(1);
+            sender.send(Bytes::new()).await.unwrap(); // Block the error reply in the send queue.
+            let socket = crate::sockets::tcp::TcpSocket::new(sender);
+            let meta = MsgMeta {
+                method: "Missing/method".into(),
+                flags: MsgFlags::IsReq,
+                timeout_ms: 5000,
+                ..Default::default()
+            };
+            let ctx = Context::server_ctx(&base.state, crate::Socket::TCP(socket), meta);
+            let drops = Arc::new(AtomicUsize::new(0));
+            let payload = Payload::Normal(Bytes::from_owner(TrackedPayload {
+                bytes: vec![0; 1024 * 1024],
+                drops: drops.clone(),
+            }));
+            if overload {
+                base.state
+                    .metrics
+                    .server_inflight
+                    .store(1, Ordering::Relaxed);
+                spawn_handler(ctx, "Missing/method", payload, |_, _| async {
+                    panic!("rejected handler ran")
+                });
+            } else {
+                base.state.router.dispatch(ctx, payload);
+            }
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            drop(receiver);
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn simultaneous_arrivals_cannot_exceed_capacity() {
         const CAP: usize = 4;

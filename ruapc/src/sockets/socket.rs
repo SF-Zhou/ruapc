@@ -32,6 +32,7 @@ pub enum Socket {
 
 #[derive(Debug)]
 pub(crate) enum SocketHealth {
+    Tcp(std::sync::Weak<crate::tcp::TcpConnection>),
     Stream(std::sync::Weak<crate::sockets::ChannelConnection>),
     #[cfg(feature = "rdma")]
     RdmaPeer(std::sync::Weak<crate::rdma::RdmaPeerHealth>),
@@ -42,6 +43,7 @@ pub(crate) enum SocketHealth {
 impl SocketHealth {
     pub(crate) fn is_connected(&self) -> bool {
         match self {
+            Self::Tcp(socket) => socket.upgrade().is_some_and(|socket| !socket.is_closed()),
             Self::Stream(socket) => socket.upgrade().is_some_and(|socket| !socket.is_closed()),
             #[cfg(feature = "rdma")]
             Self::RdmaPeer(peer) => peer.upgrade().is_some_and(|peer| peer.is_connected()),
@@ -60,12 +62,12 @@ impl SocketHealth {
 
     pub(crate) fn same_scope(&self, other: &Self) -> bool {
         match (self, other) {
+            (Self::Tcp(left), Self::Tcp(right)) => left.ptr_eq(right),
             (Self::Stream(left), Self::Stream(right)) => left.ptr_eq(right),
             #[cfg(feature = "rdma")]
             (Self::RdmaPeer(left), Self::RdmaPeer(right)) => left.ptr_eq(right),
             #[cfg(feature = "rdma")]
             (Self::RdmaSocket(left), Self::RdmaSocket(right)) => left.ptr_eq(right),
-            #[cfg(feature = "rdma")]
             _ => false,
         }
     }
@@ -147,7 +149,7 @@ pub trait SocketTrait {
 impl Socket {
     pub(crate) fn health(&self) -> Option<SocketHealth> {
         match self {
-            Socket::TCP(socket) => Some(SocketHealth::Stream(socket.health())),
+            Socket::TCP(socket) => Some(SocketHealth::Tcp(socket.health())),
             Socket::WS(socket) => Some(SocketHealth::Stream(socket.health())),
             Socket::HTTP(socket) => socket.health().map(SocketHealth::Stream),
             #[cfg(feature = "rdma")]

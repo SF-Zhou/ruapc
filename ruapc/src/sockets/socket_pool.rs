@@ -163,6 +163,12 @@ impl SocketPool {
         options: AcquireOptions<'_>,
         state: &Arc<State>,
     ) -> Result<Socket> {
+        if endpoint.transport() == Transport::TCP {
+            return self
+                .tcp
+                .acquire_until(&endpoint.addr(), state, options.deadline)
+                .await;
+        }
         #[cfg(feature = "rdma")]
         if endpoint.transport() == Transport::RDMA {
             return match self.rdma_pool() {

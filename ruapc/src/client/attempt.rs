@@ -296,7 +296,9 @@ pub(super) async fn acquire_for_attempt(
                     activity.record_failure();
                 }
                 return Err(if timed_out {
-                    AttemptFailure::acquire_deadline()
+                    let mut failure = AttemptFailure::acquire_deadline();
+                    failure.error = error;
+                    failure
                 } else {
                     AttemptFailure::acquire(error)
                 });

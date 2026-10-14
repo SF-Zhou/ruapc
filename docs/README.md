@@ -10,6 +10,7 @@ and examples. Public API details live in rustdoc; build them with
 | Build requirements and validation | [Contributing](../CONTRIBUTING.md) |
 | Registration, DMA ownership and known limitations | [Safety boundaries](safe-boundaries.md) |
 | Reflection and internal RPC services | [Built-in services](builtin-services.md) |
+| Local failure evidence, TCP teardown and server metric names | [Local failures](local-failures.md) |
 | RDMA discovery and connection setup | [Connection lifecycle](rdma-connection.md) |
 | WRIDs, completion authority and QPN reuse | [Completion identity](wrid.md) |
 | CQ budgets, READ admission and retirement | [RDMA capacity](rdma-capacity.md) |

@@ -7,7 +7,7 @@
 pub use ruapc_macro::service;
 
 mod error;
-pub use error::{Error, ErrorKind, RemoteIoError, Result};
+pub use error::{Error, ErrorKind, LocalFailure, RemoteIoError, Result};
 
 mod msg;
 pub use msg::{Message, MsgFlags, MsgMeta, Payload};

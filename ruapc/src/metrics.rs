@@ -6,7 +6,7 @@
 //! emission is a no-op.
 //!
 //! Per-method handles are interned in a [`dashmap::DashMap`] so the hot
-//! path costs one lock-free lookup instead of label allocation. Handles
+//! path costs one cached lookup instead of label allocation. Handles
 //! bind to the recorder installed at first use: install the recorder
 //! before serving traffic.
 //!
@@ -273,5 +273,138 @@ mod tests {
         m.latency.record(0.1);
         metrics.connection_opened("TCP");
         metrics.request_rejected();
+    }
+    #[tokio::test]
+    async fn unknown_tcp_methods_cannot_grow_server_metric_cache_or_labels() {
+        use crate::{
+            Client, Context, Endpoint, Error, ErrorKind, RawCall, Router, Server, SocketPoolConfig,
+        };
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let recorder = DebuggingRecorder::new();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let mut router = Router::default();
+        router.add_method::<(), ()>(
+            "Known/fail",
+            Box::new(|ctx, payload| {
+                crate::spawn_handler(ctx, "Known/fail", payload, |mut ctx, _| async move {
+                    ctx.send_err_rsp(Error::kind(ErrorKind::InvalidArgument))
+                        .await;
+                });
+                Ok(())
+            }),
+        );
+        let config = SocketPoolConfig {
+            max_inflight_requests: 1,
+            ..Default::default()
+        };
+        let server = Server::create(router, &config).unwrap();
+        let address = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let context = Context::create(&config)
+            .unwrap()
+            .with_endpoint(Endpoint::tcp(address));
+        let client = Client {
+            timeout: Duration::from_secs(2),
+            max_retries: 0,
+            ..Default::default()
+        };
+        assert_eq!(server.state().metrics.server_methods.len(), 0);
+        // Exercise actual wire dispatch before and after a known method is cached.
+        for phase in 0..2 {
+            for index in 0..256 {
+                let name = format!("Unknown{phase}/method{index}");
+                let error = client
+                    .ruapc_raw_call::<_, (), Error>(&context, &(), None, &name)
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error.kind, ErrorKind::InvalidArgument));
+                assert_eq!(server.state().metrics.server_methods.len(), phase);
+                assert!(!server.state().metrics.server_methods.contains_key(&name));
+            }
+            if phase == 0 {
+                // The first known call is rejected before a handler starts.
+                // Its canonical router name must still receive error accounting.
+                server
+                    .state()
+                    .metrics
+                    .server_inflight
+                    .store(1, Ordering::Relaxed);
+                let error = client
+                    .ruapc_raw_call::<_, (), Error>(&context, &(), None, "Known/fail")
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error.kind, ErrorKind::Overloaded));
+                server
+                    .state()
+                    .metrics
+                    .server_inflight
+                    .store(0, Ordering::Relaxed);
+                let error = client
+                    .ruapc_raw_call::<_, (), Error>(&context, &(), None, "Known/fail")
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error.kind, ErrorKind::InvalidArgument));
+                assert_eq!(server.state().metrics.server_methods.len(), 1);
+            }
+        }
+
+        // Hidden builtins are registered too: first-call errors must be
+        // counted even when overload prevents handler metrics from starting.
+        for (index, (name, inflight, expected)) in [
+            ("_ruapc.memory/read_inline", 1, ErrorKind::Overloaded),
+            (
+                "_ruapc.memory/request_is_pending",
+                0,
+                ErrorKind::DeserializeFailed,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(!server.state().router.is_public_method(name));
+            assert!(!server.state().metrics.server_methods.contains_key(name));
+            server
+                .state()
+                .metrics
+                .server_inflight
+                .store(inflight, Ordering::Relaxed);
+            let error = client
+                .ruapc_raw_call::<_, (), Error>(&context, &(), None, name)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind, expected);
+            assert_eq!(server.state().metrics.server_methods.len(), index + 2);
+        }
+
+        let snapshot = recorder.snapshotter().snapshot().into_vec();
+        let mut errors = std::collections::BTreeMap::new();
+        let mut registered = 0;
+        for (key, _, _, value) in snapshot {
+            if key.key().name().starts_with("ruapc_server_") {
+                registered += 1;
+                assert!(key.key().labels().all(|label| label.key() == "method"
+                    && matches!(
+                        label.value(),
+                        "Known/fail"
+                            | "_ruapc.memory/read_inline"
+                            | "_ruapc.memory/request_is_pending"
+                    )));
+                if key.key().name() == "ruapc_server_errors_total" {
+                    let count = match value {
+                        DebugValue::Counter(value) => value,
+                        other => panic!("unexpected error metric {other:?}"),
+                    };
+                    let name = key.key().labels().next().unwrap().value().to_owned();
+                    errors.insert(name, count);
+                }
+            }
+        }
+        assert_eq!(registered, 12);
+        assert_eq!(errors.get("Known/fail"), Some(&2));
+        assert_eq!(errors.get("_ruapc.memory/read_inline"), Some(&1));
+        assert_eq!(errors.get("_ruapc.memory/request_is_pending"), Some(&1));
+        server.stop();
+        server.join().await;
     }
 }
