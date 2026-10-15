@@ -20,6 +20,7 @@ use crate::{
     error::{ErrorKind, Result},
     msg::MsgMeta,
     rdma::poller::{PollerWaker, ReservedQueuePair},
+    sockets::{SendRequest, reserve_send},
 };
 
 pub(crate) struct RdmaSocketConfig {
@@ -76,6 +77,17 @@ impl ReadCredits {
 
     pub(crate) fn is_closed(&self) -> bool {
         self.sq.is_closed()
+    }
+
+    async fn closed(&self) {
+        let notified = self.closed.notified();
+        tokio::pin!(notified);
+        // Register before checking the persistent close state so a close
+        // cannot be lost before this future first waits for notification.
+        notified.as_mut().enable();
+        if !self.is_closed() {
+            notified.await;
+        }
     }
 
     pub(crate) fn is_idle(&self) -> bool {
@@ -233,19 +245,21 @@ impl SocketTrait for RdmaSocket {
         payload: &P,
         state: &Arc<State>,
     ) -> Result<()> {
+        let request = SendRequest::bind(meta, &state.waiter, self.conn_id);
+        if !self.state.is_ok() {
+            return Err(ErrorKind::ConnectionClosed.into());
+        }
+        let request = request?;
         let encoded = self.serialize_msg(meta, payload)?;
-
-        // Bind the pending request to this connection so it fails eagerly
-        // if the connection dies before the response arrives.
-        if meta.is_req() {
-            state.waiter.bind_connection(meta.msgid, self.conn_id);
+        if !self.state.is_ok() {
+            return Err(ErrorKind::ConnectionClosed.into());
         }
-
         if encoded.buffer.len() > self.max_msg_size {
+            request.check()?;
             // Keep the rendezvous state out of every inline send's future.
-            return Box::pin(self.send_large(meta, encoded, state)).await;
+            return Box::pin(self.send_large(meta, encoded, &request)).await;
         }
-        self.send_buffer(encoded.buffer).await
+        self.send_buffer(meta, encoded, &request).await
     }
 
     async fn remote_read(
@@ -271,7 +285,14 @@ impl SocketTrait for RdmaSocket {
 impl RdmaSocket {
     /// On error no bytes have been accepted. After success all subsequent
     /// failures belong to the connection/waiter, never the retryable send path.
-    async fn send_buffer(&self, buf: Buffer) -> Result<()> {
+    async fn send_buffer(
+        &self,
+        meta: &mut MsgMeta,
+        mut encoded: encode::Encoded,
+        request: &SendRequest<'_>,
+    ) -> Result<()> {
+        // Do not consume a send-window credit for an already expired request.
+        request.check()?;
         match self.state.try_acquire() {
             SendPermit::Granted { window_tail } => {
                 // Invariant: a fully consumed send window must contain at
@@ -283,9 +304,10 @@ impl RdmaSocket {
                 // consumed) are always signaled by the poll thread.
                 let posted = if window_tail {
                     self.queue_pair
-                        .send_signaled(buf, ibv_send_flags::IBV_SEND_SIGNALED)
+                        .send_signaled(encoded.buffer, ibv_send_flags::IBV_SEND_SIGNALED)
                 } else {
-                    self.queue_pair.send(buf, ibv_send_flags::IBV_SEND_SIGNALED)
+                    self.queue_pair
+                        .send(encoded.buffer, ibv_send_flags::IBV_SEND_SIGNALED)
                 };
                 posted.map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
                 Ok(())
@@ -294,16 +316,32 @@ impl RdmaSocket {
                 // Window exhausted: hand the framed message to the poll
                 // thread, which flushes (and opportunistically aggregates)
                 // pending sends as credits free up.
-                self.pending_sender
-                    .send(buf)
-                    .await
-                    .map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
+                let slot = reserve_send(&self.pending_sender, request.deadline(), || {
+                    self.read_credits.closed()
+                })
+                .await?;
+                if !self.state.is_ok() {
+                    return Err(ErrorKind::ConnectionClosed.into());
+                }
+                let old_timeout = meta.timeout_ms;
+                request.refresh(meta)?;
+                if meta.timeout_ms != old_timeout {
+                    encoded.refresh_timeout(meta)?;
+                }
+                request.check()?;
+                if !self.state.is_ok() {
+                    return Err(ErrorKind::ConnectionClosed.into());
+                }
+                slot.send(encoded.buffer);
                 // The poll thread may be sleeping; enqueueing a pending send
                 // produces no completion event, so wake it explicitly.
                 self.poller_waker.wake();
                 Ok(())
             }
-            SendPermit::Error => Err(ErrorKind::RdmaSendFailed.into()),
+            SendPermit::Error => Err(ErrorKind::ConnectionClosed.into()),
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

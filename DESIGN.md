@@ -59,7 +59,19 @@ inherits the deadline but starts with fresh message metadata.
    the response budget. Nested calls cap both budgets at the parent deadline.
 4. The transport binds the waiter to its process-unique connection ID before
    checking closure and enqueueing the bytes. TCP, WebSocket and HTTP/2 share
-   this ordering in `sockets/channel.rs`.
+   this ordering in `sockets/channel.rs`. Queue admission uses the request's
+   existing absolute response deadline; a full queue waits for capacity,
+   expiry or connection closure. A reserved slot is checked again before
+   synchronous submission, and request metadata reflects the remaining
+   admission budget. RDMA pending sends use the same admission helper.
+   Available capacity uses a synchronous fast path. Only a full queue creates
+   and boxes the concrete timer/close-notification future, keeping this state
+   out of ordinary send futures without dynamic dispatch. Response waiting
+   keeps the shared expiry sweep. Accepted messages are not removed from
+   send queues when their requests expire.
+   RDMA bounds both its ingress channel and poller FIFO to 1024 business
+   messages each; moving messages between them cannot bypass the combined
+   2048-message limit. Posted WRs and large sources use separate budgets.
 5. Acquire/send failures can retry only when the transport has not accepted
    the message. Once sent, the client awaits exactly one result: an ambiguous
    timeout or connection loss is never retried automatically.

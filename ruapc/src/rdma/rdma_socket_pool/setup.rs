@@ -16,6 +16,10 @@ use super::super::{
 use super::{ConnCountGuard, RdmaSocketPool};
 use crate::{Buffer, Error, ErrorKind, Result, State};
 
+// The poller stages at most this many more messages. Together the ingress
+// channel and its FIFO bound unposted business traffic to 2,048 messages.
+const PENDING_SEND_CAPACITY: usize = 1024;
+
 /// Resources owned by one local endpoint before it is handed to the poller.
 /// Both initiator and acceptor use the same negotiation and setup sequence.
 /// Kept in a Box across the peer's prepare RPC: shared transport acquisition
@@ -367,7 +371,7 @@ impl RdmaSocketPool {
         }
 
         let send_window = (config.recv_queue_len / 2).max(1);
-        let (tx, rx) = tokio::sync::mpsc::channel::<Buffer>(1024);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Buffer>(PENDING_SEND_CAPACITY);
         let read_timeout = (self.config.remote_memory.read_timeout_ms > 0)
             .then(|| Duration::from_millis(self.config.remote_memory.read_timeout_ms));
         let read_permits = self

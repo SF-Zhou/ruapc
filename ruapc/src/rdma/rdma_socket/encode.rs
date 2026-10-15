@@ -6,12 +6,40 @@ use serde::Serialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::RdmaSocket;
-use crate::{Buffer, BufferPool, MsgMeta, Result, msg::SendMsg};
+use crate::{Buffer, BufferPool, Error, ErrorKind, MsgMeta, Result, msg::SendMsg};
 
 pub(super) struct Encoded {
     pub(super) buffer: Buffer,
     pub(super) payload_offset: usize,
     pub(super) permit: Option<OwnedSemaphorePermit>,
+}
+
+impl Encoded {
+    /// Refresh the remaining budget after queue admission without invoking
+    /// user serialization again. Only timeout_ms changes, and its encoding
+    /// can only shrink as the remaining request budget decreases.
+    pub(super) fn refresh_timeout(&mut self, meta: &MsgMeta) -> Result<()> {
+        let metadata = rmp_serde::to_vec_named(meta)?;
+        let payload_offset = 8 + metadata.len();
+        if payload_offset > self.payload_offset {
+            return Err(Error::new(
+                ErrorKind::SerializeFailed,
+                "RDMA timeout refresh grew message metadata".into(),
+            ));
+        }
+        let len = self.buffer.len();
+        self.buffer
+            .copy_within(self.payload_offset..len, payload_offset);
+        self.buffer
+            .set_len(len - (self.payload_offset - payload_offset));
+        self.buffer[8..payload_offset].copy_from_slice(&metadata);
+        let meta_len = u32::try_from(metadata.len())?;
+        let frame_len = u32::try_from(self.buffer.len() - 4)?;
+        self.buffer[4..8].copy_from_slice(&meta_len.to_be_bytes());
+        self.buffer[..4].copy_from_slice(&frame_len.to_be_bytes());
+        self.payload_offset = payload_offset;
+        Ok(())
+    }
 }
 
 struct GrowingMessage<'a> {

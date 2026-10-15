@@ -93,6 +93,11 @@ impl Waiter {
     /// The deadline is `timeout` after allocation; the periodic sweep observes
     /// expiry at [`Self::SWEEP_INTERVAL`], subject to scheduler delay.
     pub(crate) fn alloc(&self, timeout: Duration) -> (u64, Receiver<'_>) {
+        self.alloc_until(Instant::now() + timeout)
+    }
+
+    /// Preserves a caller's existing absolute budget across admission work.
+    pub(crate) fn alloc_until(&self, deadline: Instant) -> (u64, Receiver<'_>) {
         let msgid = self.index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.id_map.insert(
@@ -102,7 +107,7 @@ impl Waiter {
                 sender: tx,
                 write_target: None,
                 conn_id: None,
-                deadline: Instant::now() + timeout,
+                deadline,
             },
         );
         (
@@ -138,9 +143,14 @@ impl Waiter {
     /// request. A no-op when the entry no longer exists (already completed
     /// or expired).
     pub fn bind_connection(&self, msgid: u64, conn_id: u64) {
-        if let Some(mut entry) = self.id_map.get_mut(&msgid) {
-            entry.conn_id = Some(NonZeroU64::new(conn_id).expect("connection IDs start at one"));
-        }
+        self.bind_connection_deadline(msgid, conn_id);
+    }
+
+    /// Bind and capture the admission budget under the same table lookup.
+    pub(crate) fn bind_connection_deadline(&self, msgid: u64, conn_id: u64) -> Option<Instant> {
+        let mut entry = self.id_map.get_mut(&msgid)?;
+        entry.conn_id = Some(NonZeroU64::new(conn_id).expect("connection IDs start at one"));
+        Some(entry.deadline)
     }
 
     /// Fails every pending request bound to `conn_id` with `err`.
@@ -177,7 +187,6 @@ impl Waiter {
             .is_some_and(|deadline| deadline > Instant::now())
     }
 
-    #[cfg(feature = "rdma")]
     pub(crate) fn deadline_on_connection(&self, msgid: u64, conn_id: u64) -> Option<Instant> {
         self.id_map
             .get(&msgid)

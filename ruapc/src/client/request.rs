@@ -307,9 +307,9 @@ impl Client {
             return Err(AttemptFailure::deadline());
         }
 
-        // The waiter entry expires after `timeout` (coarse, swept
-        // periodically); no per-request timer is registered.
-        let (msgid, receiver) = ctx.state.waiter.alloc(timeout);
+        // Response waiting uses the periodic sweep. A full transport queue
+        // separately bounds admission by this same absolute deadline.
+        let (msgid, receiver) = ctx.state.waiter.alloc_until(response_deadline);
         if let Some(source) = read_attachment.source {
             ctx.state.waiter.bind_read_source(msgid, source.clone());
         }
@@ -333,6 +333,11 @@ impl Client {
             timeout_ms: wire_timeout_ms(timeout),
         };
         if let Err(err) = socket.send(&mut meta, req, &ctx.state).await {
+            // Closure and expiry can race while waiting for capacity. An
+            // exhausted response budget must not start another send attempt.
+            if std::time::Instant::now() >= response_deadline {
+                return Err(AttemptFailure::deadline());
+            }
             if is_connection_failure(&err)
                 && let Some(state) = &endpoint_state
                 && let Some(conn_id) = socket.conn_id()
@@ -394,7 +399,212 @@ mod tests {
     use std::{
         future::Future,
         task::{Context as TaskContext, Poll, Waker},
+        time::Duration,
     };
+
+    fn connected_context(sender: tokio::sync::mpsc::Sender<bytes::Bytes>) -> Context {
+        let config = crate::SocketPoolConfig {
+            #[cfg(feature = "rdma")]
+            rdma: None,
+            ..Default::default()
+        };
+        let base = Context::create(&config).unwrap();
+        Context::server_ctx(
+            &base.state,
+            crate::Socket::TCP(crate::tcp::TcpSocket::new(sender)),
+            MsgMeta {
+                timeout_ms: 30_000,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn full_send_queue_observes_parent_deadline_without_retrying() {
+        let (sender, mut queue) = tokio::sync::mpsc::channel(1);
+        sender
+            .send(bytes::Bytes::from_static(b"occupied"))
+            .await
+            .unwrap();
+        let mut ctx = connected_context(sender);
+        ctx.deadline = Some(std::time::Instant::now() + Duration::from_millis(30));
+        let client = Client {
+            timeout: Duration::from_secs(30),
+            max_retries: 10,
+            ..Default::default()
+        };
+        let mut target = None;
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.ruapc_request::<(), (), Error>(
+                &ctx,
+                &(),
+                ReadAttachment::new(None, None),
+                &mut target,
+                None,
+                "Test/queue_timeout",
+            ),
+        )
+        .await
+        .expect("full queue must not hide the request deadline");
+        assert_eq!(result.unwrap_err().kind, ErrorKind::Timeout);
+        assert_eq!(ctx.state.waiter.pending_count(), 0);
+        assert_eq!(queue.recv().await.unwrap(), b"occupied"[..]);
+        assert!(
+            queue.try_recv().is_err(),
+            "expired request was never accepted"
+        );
+        let (next_id, _receiver) = ctx.state.waiter.alloc(Duration::from_secs(1));
+        assert_eq!(
+            next_id, 1,
+            "queue timeout must be terminal, despite max_retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn closure_after_response_deadline_does_not_retry_send() {
+        #[derive(JsonSchema)]
+        struct CloseAtDeadline<'a> {
+            #[schemars(skip)]
+            on_serialize: &'a dyn Fn(),
+        }
+
+        impl Serialize for CloseAtDeadline<'_> {
+            fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                (self.on_serialize)();
+                serializer.serialize_unit()
+            }
+        }
+
+        let (sender, mut queue) = tokio::sync::mpsc::channel(1);
+        let ctx = connected_context(sender);
+        let ContextEndpoint::Connected(crate::Socket::TCP(socket)) = &ctx.endpoint else {
+            unreachable!();
+        };
+        let serializations = std::cell::Cell::new(0);
+        let close_at_deadline = || {
+            serializations.set(serializations.get() + 1);
+            let deadline = ctx
+                .state
+                .waiter
+                .deadline_on_connection(0, socket.conn_id())
+                .expect("serialization runs with a bound response waiter");
+            socket.mark_closed();
+            std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+        };
+        let payload = CloseAtDeadline {
+            on_serialize: &close_at_deadline,
+        };
+        let client = Client {
+            timeout: Duration::from_millis(20),
+            max_retries: 10,
+            ..Default::default()
+        };
+        let mut target = None;
+        let error = client
+            .ruapc_request::<_, (), Error>(
+                &ctx,
+                &payload,
+                ReadAttachment::new(None, None),
+                &mut target,
+                None,
+                "Test/close_at_deadline",
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind, ErrorKind::Timeout);
+        assert_eq!(serializations.get(), 1);
+        assert_eq!(ctx.state.waiter.pending_count(), 0);
+        assert!(
+            queue.try_recv().is_err(),
+            "expired request was never accepted"
+        );
+        let (next_id, _receiver) = ctx.state.waiter.alloc(Duration::from_secs(1));
+        assert_eq!(
+            next_id, 1,
+            "closure must not restart an exhausted response budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_request_connection_failure_is_not_retried() {
+        let (sender, mut queue) = tokio::sync::mpsc::channel(1);
+        let ctx = connected_context(sender);
+        let client = Client {
+            max_retries: 10,
+            ..Default::default()
+        };
+        let mut target = None;
+        let mut request = Box::pin(client.ruapc_request::<(), (), Error>(
+            &ctx,
+            &(),
+            ReadAttachment::new(None, None),
+            &mut target,
+            None,
+            "Test/accepted",
+        ));
+        assert!(
+            request
+                .as_mut()
+                .poll(&mut TaskContext::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert!(
+            queue.try_recv().is_ok(),
+            "request reached transport acceptance"
+        );
+        let ContextEndpoint::Connected(socket) = &ctx.endpoint else {
+            unreachable!();
+        };
+        ctx.state.waiter.fail_connection(
+            socket.conn_id().unwrap(),
+            &Error::kind(ErrorKind::ConnectionClosed),
+        );
+        let error = request.await.unwrap_err();
+        assert_eq!(error.kind, ErrorKind::ConnectionClosed);
+        assert_eq!(ctx.state.waiter.pending_count(), 0);
+        assert!(queue.try_recv().is_err());
+        let (next_id, _receiver) = ctx.state.waiter.alloc(Duration::from_secs(1));
+        assert_eq!(
+            next_id, 1,
+            "accepted requests must never enter the retry path"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_queue_admission_removes_waiter_without_sending() {
+        let (sender, mut queue) = tokio::sync::mpsc::channel(1);
+        sender
+            .send(bytes::Bytes::from_static(b"occupied"))
+            .await
+            .unwrap();
+        let ctx = connected_context(sender);
+        let client = Client::default();
+        let mut target = None;
+        let mut request = Box::pin(client.ruapc_request::<(), (), Error>(
+            &ctx,
+            &(),
+            ReadAttachment::new(None, None),
+            &mut target,
+            None,
+            "Test/cancel_admission",
+        ));
+        assert!(
+            request
+                .as_mut()
+                .poll(&mut TaskContext::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert_eq!(ctx.state.waiter.pending_count(), 1);
+        drop(request);
+        assert_eq!(ctx.state.waiter.pending_count(), 0);
+        assert_eq!(queue.recv().await.unwrap(), b"occupied"[..]);
+        assert!(queue.try_recv().is_err());
+    }
 
     #[tokio::test]
     async fn cancelling_a_pending_request_settles_its_metrics() {

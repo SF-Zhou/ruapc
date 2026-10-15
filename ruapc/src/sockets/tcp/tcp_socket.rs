@@ -4,11 +4,7 @@ use bytes::Bytes;
 use serde::Serialize;
 use tokio::sync::mpsc;
 
-use crate::{
-    SocketTrait, State,
-    error::{ErrorKind, Result},
-    msg::MsgMeta,
-};
+use crate::{SocketTrait, State, error::Result, msg::MsgMeta};
 
 #[derive(Debug, Clone)]
 pub struct TcpSocket {
@@ -64,13 +60,11 @@ impl SocketTrait for TcpSocket {
         payload: &P,
         state: &Arc<State>,
     ) -> Result<()> {
-        let bytes = crate::msg::frame::encode(meta, payload)?;
-
-        let sender = self.inner.prepare_send(meta, state, "TCP")?;
-        sender
-            .send(bytes)
+        self.inner
+            .send(meta, &state.waiter, "TCP", |meta| {
+                crate::msg::frame::encode(meta, payload)
+            })
             .await
-            .map_err(|error| crate::Error::new(ErrorKind::TcpSendMsgFailed, error.to_string()))
     }
 }
 
@@ -79,7 +73,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::{Context, MsgFlags, SocketPoolConfig};
+    use crate::{Context, ErrorKind, MsgFlags, SocketPoolConfig};
 
     #[tokio::test]
     async fn closed_socket_rejects_request_after_binding_waiter() {

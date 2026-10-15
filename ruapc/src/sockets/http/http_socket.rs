@@ -137,12 +137,12 @@ impl SocketTrait for HttpSocket {
                 }
             }
             HttpSocket::Stream(stream_socket) => {
-                let bytes = crate::msg::frame::encode(meta, payload)?;
-
-                let sender = stream_socket.inner.prepare_send(meta, state, "HTTP")?;
-                sender.send(bytes).await.map_err(|error| {
-                    crate::Error::new(ErrorKind::HttpSendReqFailed, error.to_string())
-                })
+                stream_socket
+                    .inner
+                    .send(meta, &state.waiter, "HTTP", |meta| {
+                        crate::msg::frame::encode(meta, payload)
+                    })
+                    .await
             }
         }
     }

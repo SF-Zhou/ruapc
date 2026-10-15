@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+### Fixed
+- RDMA pending sends retain backpressure across the ingress channel and
+  poller FIFO, with a combined limit of 2048 reserved or queued business
+  messages per connection. FIFO refill keeps available SEND credits usable
+  without adding per-message capacity bookkeeping to the send path.
+- Send-queue admission for TCP, WebSocket, HTTP/2 and RDMA observes the
+  request deadline and wakes on connection closure. Expired requests waiting
+  for capacity are rejected before transport acceptance and are not retried.
+  Wire time budgets account for admission waits without serializing payloads
+  twice; messages already accepted retain their existing delivery semantics.
+
 ## [0.2.0-alpha.6] - 2026-10-13
 
 ### Added

@@ -160,6 +160,20 @@ impl Fixture {
             .capacity();
         (offer, capacity)
     }
+
+    fn block_inline_queue(&self) {
+        // Exhaust the software window without posting on the fixture's
+        // unconnected QP, then fill every pending queue slot.
+        assert!(matches!(
+            self.socket.state.try_acquire(),
+            crate::rdma::SendPermit::Granted { .. }
+        ));
+        for _ in 0..4 {
+            let mut queued = self.socket.rdmabuf_pool.allocate(1).unwrap();
+            queued.set_len(0);
+            self.socket.pending_sender.try_send(queued).unwrap();
+        }
+    }
 }
 
 #[tokio::test]
@@ -478,6 +492,147 @@ async fn queue_blocked_send_obeys_business_deadline_without_publishing_source() 
     assert!(fixture.socket.state.is_ok());
 
     drop(response);
+    drop(fixture);
+    state.socket_pool.join().await;
+}
+
+#[tokio::test]
+async fn inline_queue_blocked_send_times_out_without_accepting_a_message() {
+    let fixture = Fixture::new();
+    let state = fixture.state.clone();
+    fixture.block_inline_queue();
+    let (msgid, response) = state.waiter.alloc(Duration::from_millis(100));
+    let mut meta = MsgMeta {
+        msgid,
+        flags: MsgFlags::IsReq | MsgFlags::UseMessagePack,
+        timeout_ms: 100,
+        ..Default::default()
+    };
+    let mut sending = Box::pin(fixture.socket.send(&mut meta, &27, &state));
+    assert!(futures_util::poll!(sending.as_mut()).is_pending());
+    let error = tokio::time::timeout(Duration::from_secs(2), sending.as_mut())
+        .await
+        .expect("inline pending admission must honor the request deadline")
+        .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Timeout);
+    drop(sending);
+    assert_eq!(fixture.pending.len(), 4);
+    assert!(fixture.socket.state.is_ok());
+    assert_eq!(
+        fixture.socket.large.send_bytes.available_permits(),
+        BYTE_BUDGET
+    );
+
+    drop(response);
+    drop(fixture);
+    state.socket_pool.join().await;
+}
+
+#[tokio::test]
+async fn inline_queue_blocked_send_wakes_when_connection_closes() {
+    let fixture = Fixture::new();
+    let state = fixture.state.clone();
+    fixture.block_inline_queue();
+    let (msgid, response) = state.waiter.alloc(Duration::from_secs(30));
+    let mut meta = MsgMeta {
+        msgid,
+        flags: MsgFlags::IsReq | MsgFlags::UseMessagePack,
+        timeout_ms: 30_000,
+        ..Default::default()
+    };
+    let mut sending = Box::pin(fixture.socket.send(&mut meta, &27, &state));
+    assert!(futures_util::poll!(sending.as_mut()).is_pending());
+    fixture.socket.set_error();
+    let error = tokio::time::timeout(Duration::from_secs(2), sending.as_mut())
+        .await
+        .expect("connection closure must wake blocked inline admission")
+        .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::ConnectionClosed);
+    drop(sending);
+    assert_eq!(fixture.pending.len(), 4);
+
+    drop(response);
+    drop(fixture);
+    state.socket_pool.join().await;
+}
+
+#[tokio::test]
+async fn expired_inline_request_does_not_consume_a_direct_send_credit() {
+    let fixture = Fixture::new();
+    let state = fixture.state.clone();
+    let (msgid, response) = state.waiter.alloc(Duration::ZERO);
+    let mut meta = MsgMeta {
+        msgid,
+        flags: MsgFlags::IsReq | MsgFlags::UseMessagePack,
+        ..Default::default()
+    };
+    let error = fixture
+        .socket
+        .send(&mut meta, &27, &state)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Timeout);
+    assert!(fixture.pending.is_empty());
+    assert_eq!(
+        fixture.socket.state.try_acquire(),
+        crate::rdma::SendPermit::Granted { window_tail: true }
+    );
+    assert!(fixture.socket.state.is_ok());
+
+    drop(response);
+    drop(fixture);
+    state.socket_pool.join().await;
+}
+
+#[tokio::test]
+async fn inline_request_cancelled_during_serialization_keeps_direct_send_credit() {
+    struct CancelRequest<'a> {
+        response: std::cell::RefCell<Option<crate::Receiver<'a>>>,
+        serializations: std::cell::Cell<usize>,
+    }
+
+    impl serde::Serialize for CancelRequest<'_> {
+        fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            self.serializations.set(self.serializations.get() + 1);
+            drop(self.response.borrow_mut().take());
+            serializer.serialize_u32(27)
+        }
+    }
+
+    let fixture = Fixture::new();
+    let state = fixture.state.clone();
+    let (msgid, response) = state.waiter.alloc(Duration::from_secs(30));
+    let payload = CancelRequest {
+        response: std::cell::RefCell::new(Some(response)),
+        serializations: std::cell::Cell::new(0),
+    };
+    let mut meta = MsgMeta {
+        msgid,
+        flags: MsgFlags::IsReq | MsgFlags::UseMessagePack,
+        timeout_ms: 30_000,
+        ..Default::default()
+    };
+
+    let error = fixture
+        .socket
+        .send(&mut meta, &payload, &state)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind, ErrorKind::Timeout);
+    assert_eq!(payload.serializations.get(), 1);
+    assert!(!state.waiter.contains_message_id(msgid));
+    assert!(fixture.pending.is_empty());
+    assert_eq!(
+        fixture.socket.state.try_acquire(),
+        crate::rdma::SendPermit::Granted { window_tail: true }
+    );
+    assert!(fixture.socket.state.is_ok());
+
+    drop(payload);
     drop(fixture);
     state.socket_pool.join().await;
 }
