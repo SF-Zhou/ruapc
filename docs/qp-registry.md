@@ -64,6 +64,11 @@ After the configured `poll_spin_us` window, the poller arms CQ notifications,
 re-polls to close the event race and sleeps on the completion channel and
 wake pipe. Zero disables the spin window.
 
+Window-blocked business messages move from the bounded ingress channel into
+a bounded FIFO of the same capacity. The poller refills the FIFO when empty
+while flushing, preserving pending-message priority over direct senders
+without bypassing the [combined queue limit](rdma-capacity.md#pending-business-sends).
+
 ## Receive dispatch
 
 The poll thread never parses RPC frames. One receive completion consumes one

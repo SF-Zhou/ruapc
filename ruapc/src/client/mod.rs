@@ -26,7 +26,8 @@ pub(crate) use request::ReadAttachment;
 #[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone)]
 #[serde(default, deny_unknown_fields)]
 pub struct Client {
-    /// Response timeout after a connection is available. Default is 1 second.
+    /// Response timeout after a connection is available, including admission
+    /// to the transport's send queue. Default is 1 second.
     ///
     /// The effective response budget is the minimum of this value and
     /// the remaining deadline of the context (for nested RPCs issued while

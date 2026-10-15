@@ -67,7 +67,8 @@ pub(super) struct ConnState {
     /// before they can affect a replacement connection's flow control.
     pub(super) identity: CompletionIdentity,
     pub(super) flow: FlowControl,
-    /// Window-blocked framed sends in FIFO order.
+    /// Window-blocked framed sends in FIFO order. Staging is bounded by the
+    /// ingress channel's capacity, so draining cannot bypass backpressure.
     pub(super) pending_sends: VecDeque<Buffer>,
     pending_receiver: tokio::sync::mpsc::Receiver<Buffer>,
     /// Progress of the QP-owned selective SEND reclamation.
@@ -321,9 +322,15 @@ impl ConnState {
         }
     }
 
-    /// Moves window-blocked sends from the mpsc channel into the FIFO.
+    /// Moves at most the FIFO's remaining capacity out of the ingress channel.
+    /// Each stage has the same fixed capacity; reserved ingress slots count
+    /// toward the channel's bound. A batch removed for synchronous posting
+    /// still fits the staging bound because only this poller can refill it.
     pub(super) fn drain_pending(&mut self) {
-        while let Ok(buf) = self.pending_receiver.try_recv() {
+        for _ in self.pending_sends.len()..self.pending_receiver.max_capacity() {
+            let Ok(buf) = self.pending_receiver.try_recv() else {
+                break;
+            };
             self.pending_sends.push_back(buf);
         }
     }
@@ -422,7 +429,16 @@ impl ConnState {
     /// pressure.
     fn flush_pending(&mut self, finished: u64, ack: &mut Option<u32>) -> Result<()> {
         let agg_cap = self.recv_buf_size.min(MAX_AGG_BYTES);
-        while self.socket.has_large_controls() || !self.pending_sends.is_empty() {
+        loop {
+            if self.pending_sends.is_empty() {
+                // A capped drain can leave messages in the ingress channel.
+                // Refill after a batch so remaining SEND credits are usable in
+                // this pass, before publishing them to direct senders.
+                self.drain_pending();
+            }
+            if self.pending_sends.is_empty() && !self.socket.has_large_controls() {
+                break;
+            }
             match self.socket.state.try_acquire_at(finished) {
                 // Pending flushes are always posted signaled (see
                 // `post_data`), so the tail flag needs no handling here.

@@ -4,11 +4,7 @@ use bytes::{Bytes, BytesMut};
 use serde::Serialize;
 use tokio::sync::mpsc;
 
-use crate::{
-    SocketTrait, State,
-    error::{ErrorKind, Result},
-    msg::MsgMeta,
-};
+use crate::{SocketTrait, State, error::Result, msg::MsgMeta};
 
 #[derive(Debug, Clone)]
 pub struct WebSocket {
@@ -64,13 +60,12 @@ impl SocketTrait for WebSocket {
         payload: &P,
         state: &Arc<State>,
     ) -> Result<()> {
-        let mut bytes = BytesMut::with_capacity(512);
-        meta.serialize_to(payload, &mut bytes)?;
-
-        let sender = self.inner.prepare_send(meta, state, "WebSocket")?;
-        sender
-            .send(bytes.freeze())
+        self.inner
+            .send(meta, &state.waiter, "WebSocket", |meta| {
+                let mut bytes = BytesMut::with_capacity(512);
+                meta.serialize_to(payload, &mut bytes)?;
+                Ok(bytes.freeze())
+            })
             .await
-            .map_err(|error| crate::Error::new(ErrorKind::WebSocketSendFailed, error.to_string()))
     }
 }

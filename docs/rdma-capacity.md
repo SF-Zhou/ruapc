@@ -47,6 +47,32 @@ window one. DATA acknowledgments and keepalives may carry a smaller ACK
 delta. This prevents an activation ACK from starting an endless pure-ACK
 exchange on the minimum receive ring.
 
+## Pending business sends
+
+Each connection has 1024 ingress slots and a poller FIFO limited to another
+1024 messages. The combined bound is **2048 reserved or accepted, unposted
+business messages**, including large-payload offers. Reserved ingress slots
+count toward the channel limit. Moving a message into the FIFO frees an
+ingress slot only while there is space in the bounded FIFO; repeated poller
+maintenance cannot move an unlimited backlog out of the channel.
+
+The poller refills an empty FIFO during flushing so remaining SEND credits
+can serve messages still in the ingress channel in the same maintenance pass.
+FIFO order and finish-control priority are preserved. A batch being aggregated
+or synchronously posted still fits the staging bound: only the poller refills
+the FIFO, after the preceding batch's posting returns. This uses the existing
+channel backpressure without adding a shared permit or reference-count update
+to each queued message. A full queue retains deadline-aware admission and
+connection-close wakeups; accepted messages are not checked for expiry at
+dequeue time.
+
+This is a message-count limit on the send queue, not a process-memory limit.
+Caller-owned serialization buffers waiting for admission are outside it.
+Posted WRs use the separate SEND window and keep their buffers until completion
+or successful QP destruction. Large serialized sources retain their separate
+byte budget, and finish controls have their own 256-message queue described
+below; neither is released by draining a business queue slot.
+
 ## Large-payload admission and cleanup
 
 `rdma.connection.max_msg_size` continues to size each posted receive buffer;

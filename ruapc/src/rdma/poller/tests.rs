@@ -5,8 +5,9 @@ use std::sync::{atomic::AtomicUsize, mpsc};
 use ruapc_bufpool::Device as _;
 use ruapc_rdma::{QueuePair, ibv_qp_attr, ibv_qp_attr_mask, ibv_qp_state};
 
-use crate::rdma::{
-    ConnCountGuard, RdmaBandwidthLimiter, RdmaNicInfo, RdmaPathInfo, RdmaSocketConfig,
+use crate::{
+    MsgFlags, MsgMeta, SocketTrait,
+    rdma::{ConnCountGuard, RdmaBandwidthLimiter, RdmaNicInfo, RdmaPathInfo, RdmaSocketConfig},
 };
 
 /// The shared CQ length must be clamped to the device's `max_cqe`:
@@ -239,8 +240,36 @@ fn register_idle_socket_with_read_permits(
     state: &Arc<State>,
     read_permits: Arc<tokio::sync::Semaphore>,
 ) -> Arc<RdmaSocket> {
+    register_socket_with_pending_config(
+        poller,
+        device,
+        buffer_pool,
+        state,
+        read_permits,
+        PendingSendConfig {
+            capacity: 4,
+            window: 1,
+            aggregate: false,
+        },
+    )
+}
+
+struct PendingSendConfig {
+    capacity: usize,
+    window: u32,
+    aggregate: bool,
+}
+
+fn register_socket_with_pending_config(
+    poller: &DevicePoller,
+    device: &crate::rdma::RdmaDevice,
+    buffer_pool: &Arc<crate::BufferPool>,
+    state: &Arc<State>,
+    read_permits: Arc<tokio::sync::Semaphore>,
+    pending: PendingSendConfig,
+) -> Arc<RdmaSocket> {
     let connection = crate::rdma::RdmaConnectionConfig {
-        recv_queue_len: 2,
+        recv_queue_len: pending.window * 2,
         max_msg_size: 1024,
         max_large_msg_size: 0,
         traffic_class: 0,
@@ -277,7 +306,7 @@ fn register_idle_socket_with_read_permits(
         gid_index: 0,
         ip: None,
     };
-    let (pending_sender, pending_receiver) = tokio::sync::mpsc::channel(4);
+    let (pending_sender, pending_receiver) = tokio::sync::mpsc::channel(pending.capacity);
     let socket = Arc::new(RdmaSocket::new(
         reservation.bind(qp),
         buffer_pool.clone(),
@@ -287,7 +316,7 @@ fn register_idle_socket_with_read_permits(
             max_msg_size: 1024,
             max_large_msg_size: 0,
             max_inflight_large_bytes: 128 << 20,
-            send_window: 1,
+            send_window: pending.window,
             path: RdmaPathInfo {
                 local: nic.clone(),
                 remote: nic.clone(),
@@ -313,8 +342,8 @@ fn register_idle_socket_with_read_permits(
                 pending_receiver,
                 recv_submitted: 0,
                 recv_buf_size: 1024,
-                send_window: 1,
-                msg_aggregation: false,
+                send_window: pending.window,
+                msg_aggregation: pending.aggregate,
                 supervisor_guard: crate::TaskSupervisor::create().start_async_task(),
                 ring_reservation: RingReservation::add(&Arc::new(AtomicUsize::new(0)), 0).0,
                 conn_count_guard: ConnCountGuard::acquire(&Arc::new(vec![AtomicUsize::new(0)]), 0),
@@ -780,6 +809,251 @@ fn mark_dirty(poll_loop: &mut PollLoop, qp_num: u32) {
         poll_loop.conns.get_mut(&qp_num).unwrap(),
         &mut poll_loop.dirty_qps,
     );
+}
+
+/// Fill both pending stages without posting to the fixture's unconnected QP.
+/// Byte markers make FIFO order observable without involving frame decoding.
+fn fill_blocked_send_stages(
+    poll_loop: &mut PollLoop,
+    socket: &RdmaSocket,
+    pool: &Arc<crate::BufferPool>,
+) {
+    assert!(matches!(
+        socket.state.try_acquire(),
+        crate::rdma::SendPermit::Granted { .. }
+    ));
+    let capacity = socket.pending_sender.max_capacity();
+    for batch in 0..2 {
+        for index in 0..capacity {
+            let mut buffer = pool.allocate(1).unwrap();
+            buffer.set_len(1);
+            buffer[0] = (batch * capacity + index) as u8;
+            socket.pending_sender.try_send(buffer).unwrap();
+        }
+        if batch == 0 {
+            poll_loop
+                .conns
+                .get_mut(&socket.queue_pair.qp_num())
+                .unwrap()
+                .drain_pending();
+        }
+    }
+    assert_eq!(socket.pending_sender.capacity(), 0);
+    assert_eq!(
+        poll_loop.conns[&socket.queue_pair.qp_num()]
+            .pending_sends
+            .len(),
+        capacity
+    );
+}
+
+#[tokio::test]
+async fn pending_send_backlog_stays_bounded_and_cancellation_preserves_capacity() {
+    let devices = crate::rdma::test_utils::make_rdma_devices();
+    let device = &devices.devices()[0];
+    let (poller, mut poll_loop) = manual_poller(device.context());
+    let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+    let (state, _stop) = State::create(
+        crate::Router::default(),
+        &crate::SocketPoolConfig {
+            rdma: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let socket = register_idle_socket(&poller, device, &pool, &state);
+    let qp_num = socket.queue_pair.qp_num();
+    assert!(poll_loop.drain_incoming(false));
+    fill_blocked_send_stages(&mut poll_loop, &socket, &pool);
+
+    let (msgid, response) = state.waiter.alloc(Duration::from_secs(30));
+    let mut meta = MsgMeta {
+        msgid,
+        flags: MsgFlags::IsReq | MsgFlags::UseMessagePack,
+        ..Default::default()
+    };
+    let mut sending = Box::pin(socket.send(&mut meta, &27, &state));
+    assert!(futures_util::poll!(sending.as_mut()).is_pending());
+
+    // Repeated sender wakes and housekeeping must not move the ingress
+    // backlog into an ever-growing FIFO while the SEND window is exhausted.
+    for _ in 0..8 {
+        poll_loop.maintain_connections(Instant::now(), false, false);
+        assert_eq!(poll_loop.conns[&qp_num].pending_sends.len(), 4);
+        assert_eq!(socket.pending_sender.capacity(), 0);
+        assert!(futures_util::poll!(sending.as_mut()).is_pending());
+    }
+    drop(sending);
+    drop(response);
+    assert_eq!(state.waiter.pending_count(), 0);
+    assert_eq!(socket.pending_sender.capacity(), 0);
+
+    // Releasing one staging slot permits exactly one ingress dequeue. The
+    // cancelled producer must not retain the newly available channel slot.
+    let conn = poll_loop.conns.get_mut(&qp_num).unwrap();
+    assert_eq!(conn.pending_sends.pop_front().unwrap()[0], 0);
+    conn.drain_pending();
+    assert_eq!(
+        conn.pending_sends
+            .iter()
+            .map(|frame| frame[0])
+            .collect::<Vec<_>>(),
+        [1, 2, 3, 4]
+    );
+    assert_eq!(socket.pending_sender.capacity(), 1);
+    let slot = socket.pending_sender.try_reserve().unwrap();
+    assert_eq!(socket.pending_sender.capacity(), 0);
+    drop(slot);
+    assert_eq!(socket.pending_sender.capacity(), 1);
+    poll_loop.shutdown_cleanup();
+}
+
+#[tokio::test]
+async fn full_pending_send_backlog_wakes_on_close_and_poller_shutdown() {
+    for shutdown in [false, true] {
+        let devices = crate::rdma::test_utils::make_rdma_devices();
+        let device = &devices.devices()[0];
+        let (poller, mut poll_loop) = manual_poller(device.context());
+        let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+        let (state, _stop) = State::create(
+            crate::Router::default(),
+            &crate::SocketPoolConfig {
+                rdma: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let socket = register_idle_socket(&poller, device, &pool, &state);
+        let qp_num = socket.queue_pair.qp_num();
+        assert!(poll_loop.drain_incoming(false));
+        fill_blocked_send_stages(&mut poll_loop, &socket, &pool);
+        let (msgid, response) = state.waiter.alloc(Duration::from_secs(30));
+        let mut meta = MsgMeta {
+            msgid,
+            flags: MsgFlags::IsReq | MsgFlags::UseMessagePack,
+            ..Default::default()
+        };
+        let mut sending = Box::pin(socket.send(&mut meta, &27, &state));
+        assert!(futures_util::poll!(sending.as_mut()).is_pending());
+
+        if shutdown {
+            poll_loop.shutdown_cleanup();
+            assert!(socket.pending_sender.is_closed());
+        } else {
+            socket.set_error();
+            // Keep the receiver and both full stages alive: logical closure
+            // must wake admission without depending on queue destruction.
+            assert!(!socket.pending_sender.is_closed());
+            assert_eq!(socket.pending_sender.capacity(), 0);
+            assert_eq!(poll_loop.conns[&qp_num].pending_sends.len(), 4);
+        }
+        let error = tokio::time::timeout(Duration::from_secs(1), sending.as_mut())
+            .await
+            .expect("closed pending admission must wake while a socket owner remains")
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::ConnectionClosed);
+        drop(sending);
+        drop(response);
+        poll_loop.shutdown_cleanup();
+    }
+}
+
+#[tokio::test]
+async fn pending_send_refill_spends_remaining_window_in_one_maintenance_pass() {
+    for aggregate in [false, true] {
+        let devices = crate::rdma::test_utils::make_rdma_devices();
+        let device = &devices.devices()[0];
+        let (poller, mut poll_loop) = manual_poller(device.context());
+        let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+        let (state, _stop) = State::create(
+            crate::Router::default(),
+            &crate::SocketPoolConfig {
+                rdma: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let capacity = if aggregate { 2 } else { 1 };
+        let socket = register_socket_with_pending_config(
+            &poller,
+            device,
+            &pool,
+            &state,
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            PendingSendConfig {
+                capacity,
+                window: 2,
+                aggregate,
+            },
+        );
+        let peer = register_idle_socket(&poller, device, &pool, &state);
+        connect_read_pair(device, &socket.queue_pair, &peer.queue_pair);
+        assert!(poll_loop.drain_incoming(false));
+        for _ in 0..2 {
+            peer.queue_pair.recv(pool.allocate(64).unwrap()).unwrap();
+        }
+
+        let qp_num = socket.queue_pair.qp_num();
+        for batch in 0..2 {
+            for index in 0..capacity {
+                let mut buffer = pool.allocate(1).unwrap();
+                buffer.set_len(1);
+                buffer[0] = (batch * capacity + index) as u8;
+                socket.pending_sender.try_send(buffer).unwrap();
+            }
+            if batch == 0 {
+                poll_loop.conns.get_mut(&qp_num).unwrap().drain_pending();
+            }
+        }
+        assert_eq!(socket.pending_sender.capacity(), 0);
+        assert_eq!(poll_loop.conns[&qp_num].pending_sends.len(), capacity);
+
+        // No CQ polling occurs between batches. The second SEND credit must
+        // drain the ingress stage after the first FIFO batch is posted.
+        poll_loop.maintain_connections(Instant::now(), false, false);
+        assert!(poll_loop.conns[&qp_num].pending_sends.is_empty());
+        assert_eq!(socket.pending_sender.capacity(), capacity);
+        assert_eq!(socket.state.try_acquire(), crate::rdma::SendPermit::Full);
+        assert!(socket.state.is_ok());
+
+        let mut received = Vec::new();
+        let mut sends_completed = 0;
+        let mut cursor = ruapc_rdma::CompletionCursor::default();
+        let mut storage = CompletionBatch::<1>::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while received.len() < 2 || sends_completed < 2 {
+                if let Some(completion) = poller.cq().poll_batch(&mut storage).unwrap().next() {
+                    assert!(completion.info().succ());
+                    if completion.qp_num() == qp_num {
+                        assert!(!completion.info().is_recv());
+                        poll_loop.dispatch(completion, &mut Vec::new());
+                        sends_completed += 1;
+                    } else {
+                        assert_eq!(completion.qp_num(), peer.queue_pair.qp_num());
+                        assert!(completion.info().is_recv());
+                        // Consume genuine CQ-issued ownership evidence while
+                        // retaining the received bytes for the FIFO assertion.
+                        let completed = peer.queue_pair.complete(completion, &mut cursor).unwrap();
+                        let buffer = completed.buffer.unwrap().into_single().unwrap();
+                        received.push(buffer[..completed.wc.byte_len as usize].to_vec());
+                    }
+                } else {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        })
+        .await
+        .expect("both pending batches must arrive on the connected peer");
+        let expected: Vec<Vec<u8>> = (0..2)
+            .map(|batch| {
+                (0..capacity)
+                    .map(|index| (batch * capacity + index) as u8)
+                    .collect()
+            })
+            .collect();
+        assert_eq!(received, expected);
+        poll_loop.shutdown_cleanup();
+    }
 }
 
 #[tokio::test]

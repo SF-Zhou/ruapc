@@ -2,12 +2,14 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use foldhash::fast::RandomState;
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 /// Identity and close-once state shared by stream transports.
 #[derive(Debug)]
 pub(crate) struct ConnectionLifecycle {
     conn_id: u64,
     closed: std::sync::atomic::AtomicBool,
+    close_notification: CancellationToken,
 }
 
 impl ConnectionLifecycle {
@@ -15,6 +17,7 @@ impl ConnectionLifecycle {
         Self {
             conn_id: crate::task::next_conn_id(),
             closed: std::sync::atomic::AtomicBool::new(false),
+            close_notification: CancellationToken::new(),
         }
     }
 
@@ -27,7 +30,15 @@ impl ConnectionLifecycle {
     }
 
     pub(crate) fn close_once(&self) -> bool {
-        !self.closed.swap(true, std::sync::atomic::Ordering::SeqCst)
+        if self.closed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+        self.close_notification.cancel();
+        true
+    }
+
+    pub(crate) async fn closed(&self) {
+        self.close_notification.cancelled().await;
     }
 }
 

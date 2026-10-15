@@ -4,6 +4,8 @@ pub(crate) use socket::SocketHealth;
 pub use socket::{Socket, SocketTrait};
 
 mod channel;
+mod send_queue;
+pub(crate) use send_queue::{SendRequest, reserve_send};
 mod connect;
 pub(crate) use channel::ChannelConnection;
 mod lifecycle;

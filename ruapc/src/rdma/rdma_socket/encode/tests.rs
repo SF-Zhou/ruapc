@@ -183,3 +183,79 @@ fn first_large_allocation_failure_does_not_hold_partial_budget() {
     assert!(message.encoded.permit.is_none());
     assert_eq!(budget.available_permits(), INLINE);
 }
+
+#[test]
+fn refreshing_timeout_preserves_payload_across_messagepack_integer_widths() {
+    let pool = pool();
+    for use_msgpack in [true, false] {
+        let budget = Arc::new(Semaphore::new(128 * 1024));
+        let mut message = message(&pool, &budget, INLINE, 256 * 1024);
+        let calls = AtomicUsize::new(0);
+        let chunks = vec!["payload with \"quotes\", \\slashes and \nnewlines".repeat(16)];
+        let value = CountedPayload {
+            calls: &calls,
+            chunks: &chunks,
+        };
+        let mut meta = MsgMeta {
+            method: "Timeout/test".into(),
+            flags: MsgFlags::IsReq
+                | if use_msgpack {
+                    MsgFlags::UseMessagePack
+                } else {
+                    MsgFlags::empty()
+                },
+            msgid: 27,
+            timeout_ms: u32::MAX,
+            ..Default::default()
+        };
+        meta.serialize_to(&value, &mut message).unwrap();
+        let original_payload = message.encoded.buffer[message.encoded.payload_offset..].to_vec();
+
+        for timeout in [u32::MAX - 1, 65536, 65535, 256, 255, 128, 127, 1, 0] {
+            meta.timeout_ms = timeout;
+            message.encoded.refresh_timeout(&meta).unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let buffer = &message.encoded.buffer;
+            assert_eq!(
+                &buffer[message.encoded.payload_offset..],
+                original_payload.as_slice()
+            );
+            assert_eq!(
+                u32::from_be_bytes(buffer[..4].try_into().unwrap()) as usize,
+                buffer.len() - 4
+            );
+            let meta_len = u32::from_be_bytes(buffer[4..8].try_into().unwrap()) as usize;
+            assert_eq!(message.encoded.payload_offset, 8 + meta_len);
+            let decoded = Message::parse(Bytes::copy_from_slice(&buffer[4..])).unwrap();
+            assert_eq!(decoded.meta, meta);
+            assert_eq!(
+                decoded.payload.deserialize::<Vec<String>>(&meta).unwrap(),
+                chunks
+            );
+        }
+        assert!(message.encoded.permit.is_none());
+        assert_eq!(budget.available_permits(), 128 * 1024);
+    }
+}
+
+#[test]
+fn metadata_growth_during_timeout_refresh_preserves_encoded_message() {
+    let pool = pool();
+    let budget = Arc::new(Semaphore::new(128 * 1024));
+    let mut message = message(&pool, &budget, INLINE, 256 * 1024);
+    let mut meta = MsgMeta {
+        flags: MsgFlags::IsReq | MsgFlags::UseMessagePack,
+        timeout_ms: 1,
+        ..Default::default()
+    };
+    meta.serialize_to(&"payload", &mut message).unwrap();
+    let original = message.encoded.buffer.to_vec();
+    let payload_offset = message.encoded.payload_offset;
+    meta.timeout_ms = u32::MAX;
+    assert_eq!(
+        message.encoded.refresh_timeout(&meta).unwrap_err().kind,
+        ErrorKind::SerializeFailed
+    );
+    assert_eq!(&message.encoded.buffer[..], original.as_slice());
+    assert_eq!(message.encoded.payload_offset, payload_offset);
+}

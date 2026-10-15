@@ -18,6 +18,7 @@ use crate::{
     Buffer, Error, ErrorKind, Message, MsgMeta, Result, Socket, State,
     rdma::frame::{ControlFrame, LargePayloadOffer, encode_control},
     remote_memory::scatter::SpaceLayout,
+    sockets::{SendRequest, reserve_send},
 };
 
 // Cleanup is independent of the business deadline. A peer that disappears
@@ -174,21 +175,12 @@ fn protocol_error(message: &str) -> Error {
 impl RdmaSocket {
     pub(super) async fn send_large(
         &self,
-        meta: &MsgMeta,
+        meta: &mut MsgMeta,
         encoded: Encoded,
-        state: &State,
+        request: &SendRequest<'_>,
     ) -> Result<()> {
         let payload_len = encoded.buffer.len() - encoded.payload_offset;
-        let business_deadline = if meta.is_req() {
-            Some(
-                state
-                    .waiter
-                    .deadline_on_connection(meta.msgid, self.conn_id)
-                    .ok_or_else(|| Error::kind(ErrorKind::Timeout))?,
-            )
-        } else {
-            None
-        };
+        let business_deadline = request.deadline();
         self.reserve_send_bandwidth(
             payload_len as u64,
             business_deadline.map(|deadline| deadline.saturating_duration_since(Instant::now())),
@@ -197,21 +189,17 @@ impl RdmaSocket {
         // Reserve a queue slot before publishing the source. After this await,
         // ownership installation and transport acceptance are one synchronous
         // transaction; cancelling send cannot leave a half-published offer.
-        let queue_budget = business_deadline.map_or(TRANSFER_TIMEOUT, |deadline| {
-            deadline
-                .saturating_duration_since(Instant::now())
-                .min(TRANSFER_TIMEOUT)
-        });
-        let slot = tokio::time::timeout(queue_budget, self.pending_sender.reserve())
-            .await
-            .map_err(|_| Error::kind(ErrorKind::Timeout))?
-            .map_err(|_| Error::kind(ErrorKind::ConnectionClosed))?;
+        let cleanup_deadline = Instant::now() + TRANSFER_TIMEOUT;
+        let queue_deadline =
+            business_deadline.map_or(cleanup_deadline, |deadline| deadline.min(cleanup_deadline));
+        let slot = reserve_send(&self.pending_sender, Some(queue_deadline), || {
+            self.read_credits.closed()
+        })
+        .await?;
         if !self.state.is_ok() {
             return Err(ErrorKind::ConnectionClosed.into());
         }
-        if meta.is_req() && !state.waiter.pending_on_connection(meta.msgid, self.conn_id) {
-            return Err(ErrorKind::Timeout.into());
-        }
+        request.refresh(meta)?;
         let mut region = encoded
             .buffer
             .remote_buffer_info(&self.queue_pair.device_index)?;
@@ -228,20 +216,17 @@ impl RdmaSocket {
             .next
             .checked_add(1)
             .ok_or_else(|| protocol_error("transfer IDs exhausted"))?;
-        let mut offered_meta = meta.clone();
-        if let Some(deadline) = business_deadline {
-            offered_meta.timeout_ms = remaining_ms(deadline);
-            if offered_meta.timeout_ms == 0 {
-                return Err(ErrorKind::Timeout.into());
-            }
-        }
         let offer = ControlFrame::Offer(LargePayloadOffer {
             transfer_id: id,
             payload_len: payload_len as u64,
             regions: vec![region],
-            meta: offered_meta,
+            meta: meta.clone(),
         });
         let descriptor = self.control_buffer(&offer)?;
+        request.check()?;
+        if !self.state.is_ok() {
+            return Err(ErrorKind::ConnectionClosed.into());
+        }
         sources.next = id;
         sources.active.insert(
             id,
