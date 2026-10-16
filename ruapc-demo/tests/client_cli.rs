@@ -70,6 +70,31 @@ async fn client_runs_individual_calls_and_load_modes() {
 }
 
 #[tokio::test]
+async fn client_accepts_one_address_group_and_rejects_multiple_schemes() {
+    let server = TestServer::start("").await;
+    let unavailable = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead = unavailable.local_addr().unwrap();
+    drop(unavailable);
+    for transport in ["tcp", "ws", "http"] {
+        let endpoint = format!("{transport}://{dead},{},{}", server.addr, server.addr);
+        let output = client(&[&endpoint, "--rpc", "read", "--buffer-size", "4097"]).await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let endpoint = format!("tcp://{}", server.addr);
+    rejects(
+        &[&format!("{endpoint},ws://{}", server.addr)],
+        "invalid value",
+    )
+    .await;
+    rejects(&[&endpoint, &endpoint], "unexpected argument").await;
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn client_reports_argument_connection_and_preparation_errors() {
     for (flags, message) in [
         (vec!["--secs", "0"], "--secs"),

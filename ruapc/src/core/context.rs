@@ -1,5 +1,3 @@
-#[cfg(feature = "rdma")]
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -7,11 +5,10 @@ use tokio_util::sync::DropGuard;
 
 use crate::{
     Endpoint, Error, Result, Router, Socket, SocketPoolConfig, SocketTrait, State,
-    core::EndpointSet,
     msg::{MsgFlags, MsgMeta},
 };
 
-/// An established connection or equivalent destinations for an RPC.
+/// An established connection or one logical endpoint for an RPC.
 #[derive(Clone, Debug, Default)]
 pub(crate) enum ContextEndpoint {
     /// No valid endpoint (default state).
@@ -19,8 +16,8 @@ pub(crate) enum ContextEndpoint {
     Invalid,
     /// An established socket connection.
     Connected(Socket),
-    /// Several equivalent server endpoints with shared connection health.
-    Endpoints(Arc<EndpointSet>),
+    /// One server's transport and equivalent addresses.
+    Endpoint(Endpoint),
 }
 
 /// RPC context carrying request metadata and connection information.
@@ -83,12 +80,10 @@ impl Context {
 
     /// Reuses shared state for TCP bootstrap RPCs to an RDMA peer.
     #[cfg(feature = "rdma")]
-    pub(crate) fn create_with_state_and_addr(state: &Arc<State>, addr: &SocketAddr) -> Self {
+    pub(crate) fn create_with_state_and_endpoint(state: &Arc<State>, endpoint: Endpoint) -> Self {
         Self {
             state: state.clone(),
-            endpoint: ContextEndpoint::Endpoints(Arc::new(EndpointSet::new(vec![Endpoint::tcp(
-                *addr,
-            )]))),
+            endpoint: ContextEndpoint::Endpoint(endpoint),
             drop_guard: None,
             msg_meta: MsgMeta::default(),
             deadline: None,
@@ -98,29 +93,14 @@ impl Context {
     /// Shares state while selecting a destination and resetting message metadata.
     ///
     /// The deadline (if any) is inherited: nested RPCs issued while handling
-    /// a request keep the caller's remaining time budget.
+    /// a request keep the caller's remaining time budget. All addresses in
+    /// `endpoint` identify the same server; the connection pool selects an
+    /// address without changing the logical destination.
     #[must_use]
     pub fn with_endpoint(&self, endpoint: Endpoint) -> Self {
-        self.with_endpoints(vec![endpoint])
-    }
-
-    /// Creates a new context that load-balances across equivalent endpoints.
-    ///
-    /// Shares state and inherits the request deadline, with fresh message
-    /// metadata, just like [`with_endpoint`](Self::with_endpoint).
-    ///
-    /// Healthy established connections are preferred, ties are distributed
-    /// round-robin, and the remaining addresses are connected in the
-    /// background. Connect/send failures apply exponential cooldown to that
-    /// transport/address pair; connect-phase retries re-rank and use an
-    /// untried candidate first. Cooldown does not sleep a foreground request
-    /// when no alternative exists (see
-    /// [`Client::max_retries`](crate::Client::max_retries)).
-    #[must_use]
-    pub fn with_endpoints(&self, endpoints: Vec<Endpoint>) -> Self {
         Self {
             state: self.state.clone(),
-            endpoint: ContextEndpoint::Endpoints(Arc::new(EndpointSet::new(endpoints))),
+            endpoint: ContextEndpoint::Endpoint(endpoint),
             drop_guard: self.drop_guard.clone(),
             msg_meta: MsgMeta::default(),
             deadline: self.deadline,
@@ -214,5 +194,66 @@ impl Context {
     /// best-effort delivery behavior.
     pub async fn send_err_rsp(&mut self, err: Error) {
         self.send_rsp::<(), Error>(Err(err)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client_context() -> Context {
+        Context::create(&SocketPoolConfig {
+            #[cfg(feature = "rdma")]
+            rdma: None,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn selecting_endpoint_preserves_group_state_and_parent_deadline() {
+        let mut parent = client_context();
+        parent.deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+        parent.msg_meta.method = "Parent/call".into();
+        parent.msg_meta.msgid = 42;
+        let endpoint: Endpoint = "tcp://127.0.0.1:8001,127.0.0.1:8000".parse().unwrap();
+
+        let ctx = parent.with_endpoint(endpoint.clone());
+        let ContextEndpoint::Endpoint(actual) = &ctx.endpoint else {
+            panic!("with_endpoint must retain one logical endpoint");
+        };
+        assert_eq!(actual, &endpoint);
+        assert_eq!(actual.addrs().len(), 2);
+        assert!(Arc::ptr_eq(&ctx.state, &parent.state));
+        assert!(Arc::ptr_eq(
+            ctx.drop_guard.as_ref().unwrap(),
+            parent.drop_guard.as_ref().unwrap(),
+        ));
+        assert_eq!(ctx.deadline, parent.deadline);
+        assert!(ctx.msg_meta.method.is_empty());
+        assert_eq!(ctx.msg_meta.msgid, 0);
+        assert_eq!(parent.msg_meta.msgid, 42);
+        assert!(matches!(parent.endpoint, ContextEndpoint::Invalid));
+
+        let replacement: Endpoint = "tcp://127.0.0.1:9000".parse().unwrap();
+        let replaced = ctx.with_endpoint(replacement.clone());
+        assert!(matches!(
+            replaced.endpoint,
+            ContextEndpoint::Endpoint(actual) if actual == replacement
+        ));
+        assert!(matches!(ctx.endpoint, ContextEndpoint::Endpoint(actual) if actual == endpoint));
+    }
+
+    #[cfg(feature = "rdma")]
+    #[tokio::test]
+    async fn bootstrap_context_keeps_every_equivalent_address() {
+        let base = client_context();
+        let endpoint: Endpoint = "tcp://127.0.0.1:8000,127.0.0.1:8001".parse().unwrap();
+        let ctx = Context::create_with_state_and_endpoint(&base.state, endpoint.clone());
+
+        assert!(matches!(ctx.endpoint, ContextEndpoint::Endpoint(actual) if actual == endpoint));
+        assert!(Arc::ptr_eq(&ctx.state, &base.state));
+        assert!(ctx.drop_guard.is_none());
+        assert!(ctx.deadline.is_none());
     }
 }

@@ -35,7 +35,7 @@ impl RdmaSocketPool {
             ] {
                 for stripe in entries {
                     paths.push(RdmaPathEntry {
-                        peer: Some(peer.addr),
+                        peer: Some(peer.endpoint.clone()),
                         direction: RdmaConnDirection::Outbound,
                         path: stripe.socket.path.clone(),
                         qp_num: stripe.socket.queue_pair.qp_num(),

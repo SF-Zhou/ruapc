@@ -37,7 +37,7 @@ pub struct Client {
     /// a shared expiry sweep, so timeout notification may occur later.
     #[serde(with = "humantime_serde")]
     pub timeout: Duration,
-    /// Total budget for connection establishment and endpoint failover.
+    /// Total budget for connection establishment across the endpoint's addresses.
     /// Connection setup does not consume the response timeout; nested calls
     /// still cap both budgets at the parent context's remaining deadline.
     #[serde(with = "humantime_serde")]
@@ -47,10 +47,10 @@ pub struct Client {
     pub use_msgpack: bool,
     /// Retry limit for pre-wire connection or send-queue failures. Default: 2.
     ///
-    /// With [`Context::with_endpoints`](crate::Context::with_endpoints), retries
-    /// prefer untried endpoints, ranked by current health, and may cycle once
-    /// all candidates have been tried. Timeouts and connection failures while
-    /// waiting for a response are never retried: the request may have executed.
+    /// The connection pool tries equivalent addresses within each acquisition;
+    /// those address attempts do not consume this limit. Retries stay within
+    /// the same logical endpoint. Timeouts and connection failures while waiting
+    /// for a response are never retried: the request may have executed.
     pub max_retries: u32,
 }
 

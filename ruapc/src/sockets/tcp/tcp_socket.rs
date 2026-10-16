@@ -37,10 +37,6 @@ impl TcpSocket {
     pub(crate) fn is_closed(&self) -> bool {
         self.inner.is_closed()
     }
-
-    pub(crate) fn health(&self) -> std::sync::Weak<crate::sockets::ChannelConnection> {
-        Arc::downgrade(&self.inner)
-    }
 }
 
 impl crate::sockets::PoolConnection for TcpSocket {

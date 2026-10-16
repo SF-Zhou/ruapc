@@ -25,6 +25,10 @@ Use [DESIGN.md](DESIGN.md) for crate/module ownership and
   RDMA framing belongs in `rdma/frame.rs`, outside the poll loop.
 - Each connection has a process-unique `conn_id`. Closing it eagerly fails its
   waiters; eviction must check identity so it cannot remove a replacement.
+- An `Endpoint` is one transport plus a nonempty normalized group of equivalent
+  server addresses. Cache and coalesce by the complete group; never merge
+  different or overlapping groups. Callers guarantee shared server `State`
+  and RDMA lease records across all group addresses.
 - Propagate deadlines and cap nested calls at the parent's remaining budget.
   Allocate response waiters after connection acquisition. Retry only failures
   before transport acceptance; never retry ambiguous in-flight requests.
@@ -66,8 +70,10 @@ Use [DESIGN.md](DESIGN.md) for crate/module ownership and
 See [safety boundaries](docs/safe-boundaries.md), [WRIDs](docs/wrid.md),
 [capacity](docs/rdma-capacity.md) and [poller routing](docs/qp-registry.md) before
 changing ownership or completion handling. See [connection lifecycle](docs/rdma-connection.md)
-for bootstrap, path selection and peer maintenance; peer identity is the
-bootstrap address, while each connection owns its NIC pair.
+for bootstrap, path selection and peer maintenance; peer identity is the full
+user-declared address group, while each connection owns its NIC pair. See
+[endpoints](docs/endpoints.md) for URI syntax and group identity; no negotiated
+server-instance ID or automatic group merging establishes equivalence.
 
 ## Build and review
 

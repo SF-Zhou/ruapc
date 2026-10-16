@@ -1,6 +1,8 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use foldhash::fast::RandomState;
+
+use crate::Endpoint;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
@@ -42,7 +44,7 @@ impl ConnectionLifecycle {
     }
 }
 
-/// Operations required by the client-side one-connection-per-address maps.
+/// Operations required by the client-side one-connection-per-endpoint maps.
 /// This is a static generic bound; RuaPC never dispatches through `dyn`.
 pub(crate) trait PoolConnection: Clone {
     fn is_closed(&self) -> bool;
@@ -51,7 +53,7 @@ pub(crate) trait PoolConnection: Clone {
 
 #[derive(Debug)]
 pub(crate) struct ConnectionMap<S> {
-    inner: Arc<RwLock<HashMap<SocketAddr, S, RandomState>>>,
+    inner: Arc<RwLock<HashMap<Endpoint, S, RandomState>>>,
 }
 
 impl<S> Clone for ConnectionMap<S> {
@@ -71,48 +73,48 @@ impl<S> Default for ConnectionMap<S> {
 }
 
 impl<S: PoolConnection> ConnectionMap<S> {
-    pub(crate) fn try_get_live(&self, addr: &SocketAddr) -> Option<S> {
+    pub(crate) fn try_get_live(&self, endpoint: &Endpoint) -> Option<S> {
         self.inner
             .try_read()
             .ok()?
-            .get(addr)
+            .get(endpoint)
             .filter(|socket| !socket.is_closed())
             .cloned()
     }
 
-    pub(crate) async fn get_live(&self, addr: &SocketAddr) -> Option<S> {
+    pub(crate) async fn get_live(&self, endpoint: &Endpoint) -> Option<S> {
         self.inner
             .read()
             .await
-            .get(addr)
+            .get(endpoint)
             .filter(|socket| !socket.is_closed())
             .cloned()
     }
 
-    pub(crate) async fn publish(&self, addr: SocketAddr, socket: S) {
-        self.inner.write().await.insert(addr, socket);
+    pub(crate) async fn publish(&self, endpoint: Endpoint, socket: S) {
+        self.inner.write().await.insert(endpoint, socket);
     }
 
     /// Creates and publishes a socket while holding the map lock. Use this
     /// when creation starts teardown tasks that may immediately evict it.
     pub(crate) async fn try_publish_with<E>(
         &self,
-        addr: SocketAddr,
+        endpoint: Endpoint,
         create: impl FnOnce() -> Result<S, E>,
     ) -> Result<S, E> {
         let mut sockets = self.inner.write().await;
         let socket = create()?;
-        sockets.insert(addr, socket.clone());
+        sockets.insert(endpoint, socket.clone());
         Ok(socket)
     }
 
-    pub(crate) async fn evict_if_current(&self, addr: &SocketAddr, socket: &S) {
+    pub(crate) async fn evict_if_current(&self, endpoint: &Endpoint, socket: &S) {
         let mut sockets = self.inner.write().await;
         if sockets
-            .get(addr)
+            .get(endpoint)
             .is_some_and(|current| current.same_connection(socket))
         {
-            sockets.remove(addr);
+            sockets.remove(endpoint);
         }
     }
 }
@@ -160,25 +162,25 @@ mod tests {
     #[tokio::test]
     async fn stale_eviction_preserves_replacement() {
         let map = ConnectionMap::default();
-        let addr = "127.0.0.1:10001".parse().unwrap();
+        let endpoint: Endpoint = "tcp://127.0.0.1:10001".parse().unwrap();
         let old = TestConnection::new(1);
         let replacement = TestConnection::new(2);
-        map.publish(addr, old.clone()).await;
-        map.publish(addr, replacement.clone()).await;
+        map.publish(endpoint.clone(), old.clone()).await;
+        map.publish(endpoint.clone(), replacement.clone()).await;
 
-        map.evict_if_current(&addr, &old).await;
+        map.evict_if_current(&endpoint, &old).await;
 
-        assert_eq!(map.get_live(&addr).await.unwrap().id, replacement.id);
+        assert_eq!(map.get_live(&endpoint).await.unwrap().id, replacement.id);
     }
 
     #[tokio::test]
     async fn closed_connections_are_not_returned() {
         let map = ConnectionMap::default();
-        let addr = "127.0.0.1:10001".parse().unwrap();
+        let endpoint: Endpoint = "tcp://127.0.0.1:10001".parse().unwrap();
         let connection = TestConnection::new(1);
-        map.publish(addr, connection.clone()).await;
+        map.publish(endpoint.clone(), connection.clone()).await;
         connection.closed.store(true, Ordering::Release);
 
-        assert!(map.get_live(&addr).await.is_none());
+        assert!(map.get_live(&endpoint).await.is_none());
     }
 }

@@ -155,7 +155,7 @@ async fn test_metrics_emission() {
     let client = ruapc::Client::default();
     let ctx = ruapc::Context::create(&config)
         .unwrap()
-        .with_endpoint(Endpoint::tcp(addr));
+        .with_endpoint(Endpoint::tcp([addr]).unwrap());
     for _ in 0..3 {
         client.metered(&ctx, &"x".to_string()).await.unwrap();
     }
@@ -213,7 +213,7 @@ async fn test_deadline_propagation() {
     };
     let ctx = ruapc::Context::create(&config)
         .unwrap()
-        .with_endpoint(Endpoint::tcp(addr));
+        .with_endpoint(Endpoint::tcp([addr]).unwrap());
     let remaining_ms = client.budget(&ctx, &()).await.unwrap();
     assert!(
         remaining_ms > 0 && remaining_ms <= 5000,
@@ -238,7 +238,7 @@ async fn test_handler_runs_to_completion_after_client_timeout() {
     };
     let ctx = ruapc::Context::create(&config)
         .unwrap()
-        .with_endpoint(Endpoint::tcp(addr));
+        .with_endpoint(Endpoint::tcp([addr]).unwrap());
 
     // 1s of work against a 300ms budget: the client times out...
     let err = client.sleepy(&ctx, &1_000).await.unwrap_err();
@@ -275,7 +275,7 @@ async fn test_response_timeout_surfaces_and_application_retry_succeeds() {
     };
     let ctx = ruapc::Context::create(&config)
         .unwrap()
-        .with_endpoint(Endpoint::tcp(addr));
+        .with_endpoint(Endpoint::tcp([addr]).unwrap());
 
     let err = client.flaky(&ctx, &()).await.unwrap_err();
     assert_eq!(err.kind, ErrorKind::Timeout);
@@ -300,7 +300,7 @@ async fn test_connection_acquire_obeys_total_deadline() {
     let config = unified_config();
     let ctx = ruapc::Context::create(&config)
         .unwrap()
-        .with_endpoint(Endpoint::new(ruapc::Transport::WS, addr));
+        .with_endpoint(Endpoint::new(ruapc::Transport::WS, [addr]).unwrap());
     let client = ruapc::Client {
         timeout: Duration::from_millis(100),
         connect_timeout: Duration::from_millis(100),
@@ -317,24 +317,30 @@ async fn test_connection_acquire_obeys_total_deadline() {
 
 #[tokio::test]
 async fn test_connection_acquire_timeout_fails_over() {
-    let hanging = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (hanging, reserved_live) = if first.local_addr().unwrap() < second.local_addr().unwrap() {
+        (first, second)
+    } else {
+        (second, first)
+    };
     let hanging_addr = hanging.local_addr().unwrap();
+    let live_addr = reserved_live.local_addr().unwrap();
     let accept_task = tokio::spawn(async move {
         let (_stream, _) = hanging.accept().await.unwrap();
         tokio::time::sleep(Duration::from_secs(2)).await;
     });
     let config = unified_config();
-    let (_service, server, live_addr) = start(&config).await;
+    let server = make_server(Arc::new(ProdImpl::default()), &config);
+    drop(reserved_live);
+    server.listen(live_addr).await.unwrap();
     let ctx = ruapc::Context::create(&config)
         .unwrap()
-        .with_endpoints(vec![
-            Endpoint::new(ruapc::Transport::WS, hanging_addr),
-            Endpoint::tcp(live_addr),
-        ]);
+        .with_endpoint(Endpoint::new(ruapc::Transport::WS, [hanging_addr, live_addr]).unwrap());
     let client = ruapc::Client {
         timeout: Duration::from_secs(1),
         connect_timeout: Duration::from_secs(1),
-        max_retries: 1,
+        max_retries: 0,
         ..Default::default()
     };
 
@@ -354,7 +360,7 @@ async fn test_zero_connect_timeout_reuses_existing_connection() {
     let (_service, server, addr) = start(&config).await;
     let ctx = ruapc::Context::create(&config)
         .unwrap()
-        .with_endpoint(Endpoint::tcp(addr));
+        .with_endpoint(Endpoint::tcp([addr]).unwrap());
     let request = "existing".to_owned();
     assert_eq!(
         ruapc::Client::default().echo(&ctx, &request).await.unwrap(),
@@ -372,12 +378,15 @@ async fn test_zero_connect_timeout_reuses_existing_connection() {
 }
 
 #[tokio::test]
-async fn test_zero_connect_timeout_fails_over_to_existing_endpoint() {
+async fn test_zero_connect_timeout_reuses_normalized_address_group() {
     let config = unified_config();
     let (_service, server, addr) = start(&config).await;
     let base = ruapc::Context::create(&config).unwrap();
-    let request = "existing-failover".to_owned();
-    let live_ctx = base.with_endpoint(Endpoint::tcp(addr));
+    let unused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unavailable = unused.local_addr().unwrap();
+    drop(unused);
+    let request = "existing-group".to_owned();
+    let live_ctx = base.with_endpoint(Endpoint::tcp([addr, unavailable]).unwrap());
     assert_eq!(
         ruapc::Client::default()
             .echo(&live_ctx, &request)
@@ -386,10 +395,7 @@ async fn test_zero_connect_timeout_fails_over_to_existing_endpoint() {
         request
     );
 
-    let unused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let unavailable = unused.local_addr().unwrap();
-    drop(unused);
-    let ctx = base.with_endpoints(vec![Endpoint::tcp(unavailable), Endpoint::tcp(addr)]);
+    let ctx = base.with_endpoint(Endpoint::tcp([unavailable, addr, addr]).unwrap());
     let client = ruapc::Client {
         connect_timeout: Duration::ZERO,
         max_retries: 1,
@@ -416,7 +422,7 @@ async fn test_load_shedding() {
     let client_config = unified_config();
     let ctx = ruapc::Context::create(&client_config)
         .unwrap()
-        .with_endpoint(Endpoint::tcp(addr));
+        .with_endpoint(Endpoint::tcp([addr]).unwrap());
 
     // Fill the two slots, then hit the cap.
     let occupants: Vec<_> = (0..2)
@@ -455,8 +461,7 @@ async fn test_load_shedding() {
     server.join().await;
 }
 
-/// Equivalent endpoints may use different transports; a connect failure
-/// must transparently fail over to the next endpoint.
+/// Connection acquisition tries the equivalent addresses of one endpoint.
 #[tokio::test]
 async fn test_multi_address_failover() {
     let _ = tracing_subscriber::fmt().try_init();
@@ -467,16 +472,13 @@ async fn test_multi_address_failover() {
     let dead = SocketAddr::from_str("127.0.0.1:1").unwrap();
     let ctx = ruapc::Context::create(&config)
         .unwrap()
-        .with_endpoints(vec![
-            Endpoint::tcp(dead),
-            Endpoint::new(ruapc::Transport::HTTP, addr),
-        ]);
+        .with_endpoint(Endpoint::new(ruapc::Transport::HTTP, [dead, addr]).unwrap());
 
     let client = ruapc::Client {
         ..Default::default()
     };
-    // Round-robin alternates the starting address; every request must
-    // still succeed thanks to connect-phase failover.
+    // The first acquisition fails over within the group; later calls reuse
+    // its established connection.
     for i in 0..4 {
         let rsp = client.echo(&ctx, &format!("try{i}")).await.unwrap();
         assert_eq!(rsp, format!("try{i}"));
@@ -513,7 +515,7 @@ async fn test_single_endpoint_uses_full_retry_budget() {
     let config = unified_config();
     let ctx = ruapc::Context::create(&config)
         .unwrap()
-        .with_endpoint(Endpoint::new(ruapc::Transport::WS, addr));
+        .with_endpoint(Endpoint::new(ruapc::Transport::WS, [addr]).unwrap());
     let client = ruapc::Client {
         max_retries: 3,
         ..Default::default()
@@ -528,26 +530,29 @@ async fn test_single_endpoint_uses_full_retry_budget() {
     accept_task.abort();
 }
 
-/// A failed address is cooled down and a connection opened in the
-/// background becomes the preferred path even when later calls disable
-/// connect-phase retries.
+/// A group's established connection remains usable with no connection budget,
+/// even though another declared address cannot be reached.
 #[tokio::test]
-async fn test_multi_address_health_and_preconnect() {
+async fn test_multi_address_reuses_connection_without_connect_budget() {
     let config = unified_config();
     let (_service, server, addr) = start(&config).await;
     let dead = SocketAddr::from_str("127.0.0.1:1").unwrap();
     let ctx = ruapc::Context::create(&config)
         .unwrap()
-        .with_endpoints(vec![Endpoint::tcp(dead), Endpoint::tcp(addr)]);
+        .with_endpoint(Endpoint::tcp([dead, addr]).unwrap());
     let client = ruapc::Client {
         max_retries: 0,
         ..Default::default()
     };
 
-    // The first round starts on the dead address and also preconnects the
-    // live one. It may fail, but it must establish both pieces of state.
-    let _ = client.echo(&ctx, &"probe".to_string()).await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        client.echo(&ctx, &"probe".to_string()).await.unwrap(),
+        "probe"
+    );
+    let client = ruapc::Client {
+        connect_timeout: Duration::ZERO,
+        ..client
+    };
 
     for i in 0..4 {
         let value = format!("healthy-{i}");

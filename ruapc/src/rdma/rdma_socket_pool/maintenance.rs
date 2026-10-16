@@ -88,7 +88,7 @@ impl RdmaSocketPool {
                 continue;
             };
             if Arc::strong_count(&peer) == 2 {
-                self.peers.remove_if(&peer.addr, |_, current| {
+                self.peers.remove_if(&peer.endpoint, |_, current| {
                     Arc::ptr_eq(current, &peer)
                         && Arc::strong_count(current) == 2
                         && current.stripes.read().unwrap().active.is_empty()
@@ -171,7 +171,7 @@ impl RdmaSocketPool {
 
     /// Tops a desired peer up to `connections_per_peer` healthy stripes.
     async fn replenish_peer(&self, peer: &Arc<PeerState>, state: &Arc<State>) {
-        let addr = &peer.addr;
+        let endpoint = &peer.endpoint;
         const PEER_BACKOFF_KEY: &str = "";
         if !self.preconnect_ready(peer, PEER_BACKOFF_KEY) {
             return;
@@ -231,7 +231,7 @@ impl RdmaSocketPool {
                         }
                         Err(err) => {
                             self.record_preconnect_failure(peer, &remote);
-                            tracing::debug!(peer = %addr, remote_device = %remote, %err, "RDMA coverage connection failed");
+                            tracing::debug!(peer = %endpoint, remote_device = %remote, %err, "RDMA coverage connection failed");
                         }
                     }
                     }
@@ -290,7 +290,7 @@ impl RdmaSocketPool {
         .await;
         if let Err(err) = result {
             self.record_preconnect_failure(peer, PEER_BACKOFF_KEY);
-            tracing::debug!("replenishing RDMA stripes to {addr} failed: {err}");
+            tracing::debug!("replenishing RDMA stripes to {endpoint} failed: {err}");
         } else {
             self.clear_preconnect_failure(peer, PEER_BACKOFF_KEY);
         }
@@ -451,7 +451,7 @@ impl RdmaSocketPool {
             Ok(established) => {
                 self.admit_replacing(peer, &victim.socket, established);
             }
-            Err(err) => tracing::debug!(peer = %peer.addr, %err, "RDMA rebalance failed"),
+            Err(err) => tracing::debug!(peer = %peer.endpoint, %err, "RDMA rebalance failed"),
         }
         drop(guard);
     }

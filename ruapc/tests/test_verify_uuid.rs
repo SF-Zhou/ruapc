@@ -78,7 +78,7 @@ async fn test_verify_message_id() {
         let addr = server.listen(addr).await.unwrap();
         let ctx = ruapc::Context::create(&config)
             .unwrap()
-            .with_endpoint(Endpoint::new(transport, addr));
+            .with_endpoint(Endpoint::new(transport, [addr]).unwrap());
 
         let client = ruapc::Client {
             timeout: CLIENT_TIMEOUT,

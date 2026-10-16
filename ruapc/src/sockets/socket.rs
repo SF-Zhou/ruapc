@@ -30,48 +30,8 @@ pub enum Socket {
     RDMA(std::sync::Arc<crate::rdma::RdmaSocket>),
 }
 
-#[derive(Debug)]
-pub(crate) enum SocketHealth {
-    Stream(std::sync::Weak<crate::sockets::ChannelConnection>),
-    #[cfg(feature = "rdma")]
-    RdmaPeer(std::sync::Weak<crate::rdma::RdmaPeerHealth>),
-    #[cfg(feature = "rdma")]
-    RdmaSocket(std::sync::Weak<crate::rdma::RdmaSocket>),
-}
-
-impl SocketHealth {
-    pub(crate) fn is_connected(&self) -> bool {
-        match self {
-            Self::Stream(socket) => socket.upgrade().is_some_and(|socket| !socket.is_closed()),
-            #[cfg(feature = "rdma")]
-            Self::RdmaPeer(peer) => peer.upgrade().is_some_and(|peer| peer.is_connected()),
-            #[cfg(feature = "rdma")]
-            Self::RdmaSocket(socket) => socket.upgrade().is_some_and(|socket| socket.state.is_ok()),
-        }
-    }
-
-    pub(crate) fn is_aggregate(&self) -> bool {
-        match self {
-            #[cfg(feature = "rdma")]
-            Self::RdmaPeer(_) => true,
-            _ => false,
-        }
-    }
-
-    pub(crate) fn same_scope(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Stream(left), Self::Stream(right)) => left.ptr_eq(right),
-            #[cfg(feature = "rdma")]
-            (Self::RdmaPeer(left), Self::RdmaPeer(right)) => left.ptr_eq(right),
-            #[cfg(feature = "rdma")]
-            (Self::RdmaSocket(left), Self::RdmaSocket(right)) => left.ptr_eq(right),
-            #[cfg(feature = "rdma")]
-            _ => false,
-        }
-    }
-}
-
 impl Socket {
+    #[cfg(test)]
     pub(crate) fn conn_id(&self) -> Option<u64> {
         match self {
             Self::TCP(socket) => Some(socket.conn_id()),
@@ -145,19 +105,6 @@ pub trait SocketTrait {
 }
 
 impl Socket {
-    pub(crate) fn health(&self) -> Option<SocketHealth> {
-        match self {
-            Socket::TCP(socket) => Some(SocketHealth::Stream(socket.health())),
-            Socket::WS(socket) => Some(SocketHealth::Stream(socket.health())),
-            Socket::HTTP(socket) => socket.health().map(SocketHealth::Stream),
-            #[cfg(feature = "rdma")]
-            Socket::RDMA(socket) => Some(match socket.peer_health() {
-                Some(peer) => SocketHealth::RdmaPeer(peer),
-                None => SocketHealth::RdmaSocket(Arc::downgrade(socket)),
-            }),
-        }
-    }
-
     /// Returns the device index associated with this socket.
     pub fn device_index(&self, state: &State) -> DeviceIndex {
         match self {

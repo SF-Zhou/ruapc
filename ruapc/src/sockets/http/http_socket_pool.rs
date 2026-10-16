@@ -10,15 +10,16 @@ use tokio_util::sync::DropGuard;
 
 use super::http_socket::{ChannelBody, HttpSocket, StreamSocket};
 use crate::{
-    ConnectionMap, Error, ErrorKind, Message, MsgFlags, MsgMeta, RawStream, Result, Socket,
-    SocketPoolConfig, SocketPoolTrait, State, TaskSupervisor, TaskSupervisorHandle, sockets::tcp,
+    ConnectionMap, Endpoint, Error, ErrorKind, Message, MsgFlags, MsgMeta, RawStream, Result,
+    Socket, SocketPoolConfig, SocketPoolTrait, State, TaskSupervisor, TaskSupervisorHandle,
+    sockets::tcp,
 };
 
 type HttpSocketMap = ConnectionMap<HttpSocket>;
 
 pub struct HttpSocketPool {
     socket_map: HttpSocketMap,
-    connect_locks: crate::sockets::connect::ConnectLocks,
+    connect_groups: crate::sockets::connect::ConnectGroups,
     base_path: Arc<str>,
     http: Builder<TokioExecutor>,
     task_supervisor: TaskSupervisor,
@@ -34,7 +35,7 @@ impl SocketPoolTrait for HttpSocketPool {
         http.http1().keep_alive(true);
         Ok(Self {
             socket_map: ConnectionMap::default(),
-            connect_locks: Default::default(),
+            connect_groups: Default::default(),
             base_path: Arc::from(config.normalized_http_base_path()?),
             http,
             task_supervisor: TaskSupervisor::create(),
@@ -62,32 +63,49 @@ impl SocketPoolTrait for HttpSocketPool {
         self.task_supervisor.all_stopped().await;
     }
 
-    async fn acquire(&self, addr: &SocketAddr, state: &Arc<State>) -> Result<Socket> {
-        // Check if the socket is already in the socket map.
-        if let Some(socket) = self.socket_map.try_get_live(addr) {
-            return Ok(socket.into());
-        }
-
-        let _connect = self.connect_locks.lock(*addr).await;
-        if let Some(socket) = self.socket_map.get_live(addr).await {
-            return Ok(socket.into());
-        }
-
-        let supervisor = self.task_supervisor.handle();
-        let socket =
-            Self::connect_stream(addr, state, &self.socket_map, &supervisor, &self.base_path)
-                .await?;
-        Ok(socket.into())
+    async fn acquire(&self, endpoint: &Endpoint, state: &Arc<State>) -> Result<Socket> {
+        self.acquire_with_deadline(endpoint, None, state).await
     }
 }
 
 impl HttpSocketPool {
-    pub(crate) fn try_acquire(&self, addr: &SocketAddr) -> Option<Socket> {
-        self.socket_map.try_get_live(addr).map(Into::into)
+    pub(crate) async fn acquire_with_deadline(
+        &self,
+        endpoint: &Endpoint,
+        deadline: Option<std::time::Instant>,
+        state: &Arc<State>,
+    ) -> Result<Socket> {
+        if let Some(socket) = self.try_acquire(endpoint) {
+            return Ok(socket);
+        }
+        let mut group = self.connect_groups.lock(endpoint, deadline).await?;
+        if let Some(socket) = self.acquire_existing(endpoint).await {
+            return Ok(socket);
+        }
+        let supervisor = self.task_supervisor.handle();
+        let supervisor = &supervisor;
+        group
+            .connect(deadline, |addr| async move {
+                Self::connect_stream(
+                    endpoint,
+                    &addr,
+                    state,
+                    &self.socket_map,
+                    supervisor,
+                    &self.base_path,
+                )
+                .await
+                .map(Into::into)
+            })
+            .await
     }
 
-    pub(crate) async fn acquire_existing(&self, addr: &SocketAddr) -> Option<Socket> {
-        self.socket_map.get_live(addr).await.map(Into::into)
+    pub(crate) fn try_acquire(&self, endpoint: &Endpoint) -> Option<Socket> {
+        self.socket_map.try_get_live(endpoint).map(Into::into)
+    }
+
+    pub(crate) async fn acquire_existing(&self, endpoint: &Endpoint) -> Option<Socket> {
+        self.socket_map.get_live(endpoint).await.map(Into::into)
     }
 
     fn handle_new_stream(
@@ -387,6 +405,7 @@ impl HttpSocketPool {
     /// Sends a POST request with a streaming body and starts a recv loop
     /// on the response body. Returns an `HttpSocket::Stream` for sending.
     async fn connect_stream(
+        endpoint: &Endpoint,
         addr: &SocketAddr,
         state: &Arc<State>,
         socket_map: &HttpSocketMap,
@@ -445,7 +464,7 @@ impl HttpSocketPool {
             .try_start_async_task()
             .ok_or_else(|| Error::new(ErrorKind::ConnectionClosed, "HTTP pool stopped".into()))?;
         // Publish before the receive task can observe EOF and evict it.
-        socket_map.publish(*addr, socket.clone()).await;
+        socket_map.publish(endpoint.clone(), socket.clone()).await;
         // Publish may wait for the map lock and be cancelled by the connect
         // deadline. Start accounting only after that await; from here to spawn
         // there is no cancellation point that could strand an open connection.
@@ -459,6 +478,7 @@ impl HttpSocketPool {
         let state = state.clone();
         let socket_map = socket_map.clone();
         let addr = *addr;
+        let endpoint = endpoint.clone();
         tokio::spawn(async move {
             let r = tokio::select! {
                 () = recv_task.stopped() => Err(Error::new(
@@ -472,7 +492,9 @@ impl HttpSocketPool {
                 return;
             }
             state.metrics.connection_closed("HTTP");
-            socket_map.evict_if_current(&addr, &socket_for_map).await;
+            socket_map
+                .evict_if_current(&endpoint, &socket_for_map)
+                .await;
             let err = Error::new(
                 ErrorKind::ConnectionClosed,
                 format!("http connection to {addr} closed: {:?}", r.err()),

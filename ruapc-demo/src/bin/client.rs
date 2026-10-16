@@ -21,7 +21,7 @@ use std::{
     about = "Call the demo services or run a verified RPC workload"
 )]
 struct Args {
-    /// RPC endpoint.
+    /// One server endpoint: scheme://address[,address...].
     #[arg(default_value = "tcp://127.0.0.1:8000")]
     endpoint: Endpoint,
 
@@ -89,13 +89,10 @@ impl Args {
     }
 
     fn context(&self) -> Result<Context> {
-        #[cfg(feature = "rdma")]
         let enable_rdma = self.endpoint.transport() == ruapc::Transport::RDMA;
-        #[cfg(not(feature = "rdma"))]
-        let enable_rdma = false;
         let mut config = self.pool.config(enable_rdma);
         config.http_base_path.clone_from(&self.http_base_path);
-        Ok(Context::create(&config)?.with_endpoint(self.endpoint))
+        Ok(Context::create(&config)?.with_endpoint(self.endpoint.clone()))
     }
 }
 

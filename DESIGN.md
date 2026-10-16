@@ -28,7 +28,7 @@ and the separate application-source validation scheme.
 | Module | Responsibility |
 |---|---|
 | `client` | Settings, attachments, connection acquisition, retries and response decoding |
-| `core` | Contexts, endpoint health, listeners, method registration and handler admission |
+| `core` | Contexts, listeners, method registration and handler admission |
 | `core/router/schema` | Service schemas and OpenAPI projection |
 | `msg` | Metadata, payload codecs, direct serialization and stream framing |
 | `sockets` | Concrete transports, connection queues, maps and closure |
@@ -40,15 +40,19 @@ and the separate application-source validation scheme.
 `Context` combines shared `State`, a destination, incoming metadata and a
 deadline. Changing its destination preserves the deadline and clears message
 metadata. Its `remote_*` methods live in `remote_memory/context.rs`.
+An endpoint selects one transport and a complete group of equivalent server
+addresses. Transport pools own address fallback, group connection caching and
+coalesced acquisition; the client does not choose among servers or transports.
+See [endpoint identity](docs/endpoints.md) for normalization and caller obligations.
 
 ## Request lifecycle
 
 1. Generated methods enter `client/call.rs`. Plain and buffer-returning calls
    use the same executor in `client/request.rs`; the result type selects the
    response contract.
-2. The client validates attachments, ranks endpoints and acquires a connection
-   within the connection budget. Alternatives may preconnect through the task
-   supervisor.
+2. The client validates attachments and acquires a connection for its endpoint.
+   The transport pool tries the group's equivalent addresses within the
+   connection budget, independently of the request retry count.
 3. The response budget starts after connection acquisition and includes
    bandwidth and send-queue admission. Nested calls cap both budgets at the
    parent's remaining time. The client allocates its waiter after bandwidth
@@ -134,7 +138,9 @@ See the [API guide](docs/remote-memory.md) for use and recovery, and
 
 CQ poll threads route completion tokens and batch received buffers. Dispatch
 workers parse frames and invoke routing away from the poll thread. Each
-connection owns its NIC pair; peer identity is its bootstrap address.
+connection owns its NIC pair; peer identity is its complete normalized group
+of user-declared bootstrap addresses. Group addresses must share server state
+and lease records; different or overlapping groups remain independent.
 
 | Contract | Reference |
 |---|---|

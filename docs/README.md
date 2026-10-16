@@ -8,6 +8,7 @@ run `cargo doc -p ruapc --no-deps --open`.
 | Task | Guide |
 |---|---|
 | Define a service and make a typed call | [Quick start](../README.md#example) |
+| Address one server through multiple equivalent addresses | [Server endpoints](endpoints.md) |
 | Run examples, HTTP calls or verified load tests | [Demo](../ruapc-demo/README.md) |
 | Attach buffers, copy logical ranges and recover memory | [Remote memory](remote-memory.md) |
 | Allocate and register buffers | [Buffer pool](../ruapc-bufpool/README.md) |
@@ -24,6 +25,7 @@ Each guide owns a distinct part of the design. Start at
 | Contract | Reference |
 |---|---|
 | Metadata, payload formats and framing | [Wire format](../DESIGN.md#message-ownership-and-framing) |
+| Endpoint strings, complete-group identity and address fallback | [Server endpoints](endpoints.md) |
 | Registration, DMA ownership, source validation and recovery | [Safety boundaries](safe-boundaries.md) |
 | Reflection, internal RPCs and private payload control fields | [Built-in services](builtin-services.md) |
 | RDMA bootstrap, negotiation, paths and peer maintenance | [Connection lifecycle](rdma-connection.md) |

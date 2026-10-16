@@ -129,8 +129,6 @@ pub struct RdmaSocket {
     pub(crate) path: RdmaPathInfo,
     /// Process-wide unique connection id (see [`crate::task::next_conn_id`]).
     pub(crate) conn_id: u64,
-    /// Aggregate health of the outbound peer this stripe belongs to.
-    peer_health: std::sync::OnceLock<std::sync::Weak<super::RdmaPeerHealth>>,
     /// Initiator asks the poll thread to send one accounted immediate-only
     /// SEND after control-plane confirmation.
     activation_requested: AtomicBool,
@@ -164,20 +162,11 @@ impl RdmaSocket {
             max_large_msg_size: config.max_large_msg_size,
             path: config.path,
             conn_id: crate::task::next_conn_id(),
-            peer_health: std::sync::OnceLock::new(),
             activation_requested: AtomicBool::new(false),
             accept_lease_id: AtomicU64::new(0),
             bandwidth_limiter: config.bandwidth_limiter,
             read_timeout: config.read_timeout,
         }
-    }
-
-    pub(crate) fn set_peer_health(&self, health: &Arc<super::RdmaPeerHealth>) {
-        let _ = self.peer_health.set(Arc::downgrade(health));
-    }
-
-    pub(crate) fn peer_health(&self) -> Option<std::sync::Weak<super::RdmaPeerHealth>> {
-        self.peer_health.get().cloned()
     }
 
     pub(crate) fn request_activation(&self) {

@@ -13,14 +13,14 @@ use tokio_util::sync::DropGuard;
 
 use super::TcpSocket;
 use crate::{
-    ConnectionMap, Message, RawStream, Socket, SocketPoolConfig, SocketPoolTrait, State,
+    ConnectionMap, Endpoint, Message, RawStream, Socket, SocketPoolConfig, SocketPoolTrait, State,
     TaskSupervisor,
     error::{Error, ErrorKind, Result},
 };
 
 pub struct TcpSocketPool {
     socket_map: ConnectionMap<TcpSocket>,
-    connect_locks: crate::sockets::connect::ConnectLocks,
+    connect_groups: crate::sockets::connect::ConnectGroups,
     task_supervisor: TaskSupervisor,
 }
 
@@ -46,7 +46,7 @@ impl SocketPoolTrait for TcpSocketPool {
             ));
         };
 
-        let _ = self.add_socket(addr, tcp_stream, state)?;
+        let _ = self.add_socket(None, addr, tcp_stream, state)?;
         Ok(())
     }
 
@@ -62,18 +62,36 @@ impl SocketPoolTrait for TcpSocketPool {
         self.task_supervisor.all_stopped().await;
     }
 
-    async fn acquire(&self, addr: &SocketAddr, state: &Arc<State>) -> Result<Socket> {
-        // The map lock is never held over network I/O. A per-address lock
-        // coalesces concurrent misses without blocking unrelated peers.
-        if let Some(socket) = self.socket_map.try_get_live(addr) {
-            return Ok(socket.into());
-        }
+    async fn acquire(&self, endpoint: &Endpoint, state: &Arc<State>) -> Result<Socket> {
+        self.acquire_with_deadline(endpoint, None, state).await
+    }
+}
 
-        let _connect = self.connect_locks.lock(*addr).await;
-        if let Some(socket) = self.socket_map.get_live(addr).await {
-            return Ok(socket.into());
+impl TcpSocketPool {
+    pub(crate) async fn acquire_with_deadline(
+        &self,
+        endpoint: &Endpoint,
+        deadline: Option<std::time::Instant>,
+        state: &Arc<State>,
+    ) -> Result<Socket> {
+        if let Some(socket) = self.try_acquire(endpoint) {
+            return Ok(socket);
         }
+        let mut group = self.connect_groups.lock(endpoint, deadline).await?;
+        if let Some(socket) = self.acquire_existing(endpoint).await {
+            return Ok(socket);
+        }
+        group
+            .connect(deadline, |addr| self.connect_address(endpoint, addr, state))
+            .await
+    }
 
+    async fn connect_address(
+        &self,
+        endpoint: &Endpoint,
+        addr: SocketAddr,
+        state: &Arc<State>,
+    ) -> Result<Socket> {
         let stream = TcpStream::connect(addr)
             .await
             .map_err(|e| Error::new(ErrorKind::TcpConnectFailed, e.to_string()))?;
@@ -81,31 +99,32 @@ impl SocketPoolTrait for TcpSocketPool {
 
         let send_socket = self
             .socket_map
-            .try_publish_with(*addr, || self.add_socket(*addr, stream, state))
+            .try_publish_with(endpoint.clone(), || {
+                self.add_socket(Some(endpoint.clone()), addr, stream, state)
+            })
             .await?;
         Ok(send_socket.into())
     }
-}
 
-impl TcpSocketPool {
-    pub(crate) fn try_acquire(&self, addr: &SocketAddr) -> Option<Socket> {
-        self.socket_map.try_get_live(addr).map(Into::into)
+    pub(crate) fn try_acquire(&self, endpoint: &Endpoint) -> Option<Socket> {
+        self.socket_map.try_get_live(endpoint).map(Into::into)
     }
 
-    pub(crate) async fn acquire_existing(&self, addr: &SocketAddr) -> Option<Socket> {
-        self.socket_map.get_live(addr).await.map(Into::into)
+    pub(crate) async fn acquire_existing(&self, endpoint: &Endpoint) -> Option<Socket> {
+        self.socket_map.get_live(endpoint).await.map(Into::into)
     }
 
     pub fn new() -> Self {
         Self {
             socket_map: ConnectionMap::default(),
-            connect_locks: Default::default(),
+            connect_groups: Default::default(),
             task_supervisor: TaskSupervisor::create(),
         }
     }
 
     pub fn add_socket(
         &self,
+        endpoint: Option<Endpoint>,
         addr: SocketAddr,
         stream: tokio::net::TcpStream,
         state: &Arc<State>,
@@ -125,6 +144,7 @@ impl TcpSocketPool {
 
         tokio::spawn({
             let socket_map = self.socket_map.clone();
+            let endpoint = endpoint.clone();
             let tcp_socket = tcp_socket.clone();
             let state = state.clone();
             async move {
@@ -139,12 +159,21 @@ impl TcpSocketPool {
                         )),
                 };
                 tracing::debug!("send loop for {addr} ended: {error}");
-                Self::evict_socket(&socket_map, &addr, &tcp_socket, &state, &error).await;
+                Self::evict_socket(
+                    &socket_map,
+                    endpoint.as_ref(),
+                    &addr,
+                    &tcp_socket,
+                    &state,
+                    &error,
+                )
+                .await;
             }
         });
 
         tokio::spawn({
             let socket_map = self.socket_map.clone();
+            let endpoint = endpoint.clone();
             let tcp_socket = tcp_socket.clone();
             let state = state.clone();
             async move {
@@ -159,7 +188,15 @@ impl TcpSocketPool {
                         )),
                 };
                 tracing::debug!("receive loop for {addr} ended: {error}");
-                Self::evict_socket(&socket_map, &addr, &tcp_socket, &state, &error).await;
+                Self::evict_socket(
+                    &socket_map,
+                    endpoint.as_ref(),
+                    &addr,
+                    &tcp_socket,
+                    &state,
+                    &error,
+                )
+                .await;
             }
         });
         Ok(tcp_socket)
@@ -169,6 +206,7 @@ impl TcpSocketPool {
     /// and eagerly fails every request pending on the connection.
     async fn evict_socket(
         socket_map: &ConnectionMap<TcpSocket>,
+        endpoint: Option<&Endpoint>,
         addr: &SocketAddr,
         socket: &TcpSocket,
         state: &Arc<State>,
@@ -179,7 +217,9 @@ impl TcpSocketPool {
             return;
         }
         state.metrics.connection_closed("TCP");
-        socket_map.evict_if_current(addr, socket).await;
+        if let Some(endpoint) = endpoint {
+            socket_map.evict_if_current(endpoint, socket).await;
+        }
         let err = Error::new(
             ErrorKind::ConnectionClosed,
             format!("connection to {addr} closed: {err}"),

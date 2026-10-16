@@ -391,7 +391,8 @@ mod tests {
 
         // Build a context so dispatch has something to work with.
         let ctx = crate::Context::create(&SocketPoolConfig::default()).unwrap();
-        let mut ctx = ctx.with_endpoint(Endpoint::tcp("127.0.0.1:9999".parse().unwrap()));
+        let mut ctx =
+            ctx.with_endpoint(Endpoint::tcp(["127.0.0.1:9999".parse().unwrap()]).unwrap());
         ctx.msg_meta.method = "TestSvc/noop".to_string();
 
         // dispatch() calls the func synchronously when the method is found.
@@ -404,7 +405,8 @@ mod tests {
         let router = Router::default();
 
         let ctx = crate::Context::create(&SocketPoolConfig::default()).unwrap();
-        let mut ctx = ctx.with_endpoint(Endpoint::tcp("127.0.0.1:9999".parse().unwrap()));
+        let mut ctx =
+            ctx.with_endpoint(Endpoint::tcp(["127.0.0.1:9999".parse().unwrap()]).unwrap());
         ctx.msg_meta.method = "UnknownSvc/missing".to_string();
 
         // dispatch() spawns a tokio task that tries to send an error response for unknown

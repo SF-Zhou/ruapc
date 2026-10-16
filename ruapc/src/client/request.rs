@@ -6,17 +6,15 @@ use std::sync::Arc;
 
 use crate::{
     Buffer, Context, MAX_REGIONS, SocketTrait,
-    core::{ContextEndpoint, EndpointState},
+    core::ContextEndpoint,
     error::{Error, ErrorKind},
     msg::{MsgFlags, MsgMeta},
     remote_memory::{ReadSource, WriteTarget},
-    sockets::AcquireOptions,
 };
 
 use super::attempt::{
-    AcquiredSocket, AttemptCycle, AttemptEndpoint, AttemptFailure, AttemptOptions, acquire_direct,
-    acquire_for_attempt, capped_deadline, export_attached_regions, is_connection_failure,
-    wire_timeout_ms,
+    AttemptCycle, AttemptEndpoint, AttemptFailure, AttemptOptions, acquire_for_attempt,
+    capped_deadline, export_attached_regions, wire_timeout_ms,
 };
 
 use super::Client;
@@ -111,7 +109,7 @@ impl Client {
             .into());
         }
 
-        let (sent, endpoint_state) = self
+        let sent = self
             .send_with_retries(
                 ctx,
                 req,
@@ -122,23 +120,7 @@ impl Client {
             .await?;
         // Never retry after send: a missing response cannot tell us whether
         // the peer executed the request.
-        let (response, returned_target) = match sent.receiver.recv().await {
-            Ok(response) => response,
-            Err(err) => {
-                if matches!(err.kind, ErrorKind::ConnectionClosed)
-                    && let Some(state) = &endpoint_state
-                    && let Some(conn_id) = sent.conn_id
-                {
-                    state.record_connection_failure(conn_id);
-                }
-                return Err(err.into());
-            }
-        };
-        if let Some(state) = &endpoint_state
-            && let Some(conn_id) = sent.conn_id
-        {
-            state.record_request_success(conn_id);
-        }
+        let (response, returned_target) = sent.receiver.recv().await?;
         // Drop our clone before trying to recover the target. A handler still
         // holding it, or DMA still owning its buffers, prevents recovery.
         drop(write_target.take());
@@ -159,7 +141,7 @@ impl Client {
         read_attachment: ReadAttachment<'_>,
         write_target: Option<&Arc<WriteTarget>>,
         method_name: &str,
-    ) -> Result<(SentRequest<'a>, Option<Arc<EndpointState>>), Error>
+    ) -> Result<SentRequest<'a>, Error>
     where
         Req: Serialize + JsonSchema,
     {
@@ -168,25 +150,18 @@ impl Client {
             self.connect_timeout,
             ctx.deadline,
         );
-        let mut cycle = AttemptCycle::new(
-            self.initial_candidates(ctx)?,
-            u64::from(self.max_retries) + 1,
-        );
+        let endpoint = match &ctx.endpoint {
+            ContextEndpoint::Connected(socket) => AttemptEndpoint::Connected(socket.clone()),
+            ContextEndpoint::Endpoint(endpoint) => AttemptEndpoint::Endpoint(endpoint.clone()),
+            ContextEndpoint::Invalid => {
+                return Err(Error::new(
+                    ErrorKind::InvalidArgument,
+                    "client context without endpoint".into(),
+                ));
+            }
+        };
+        let mut cycle = AttemptCycle::new(u64::from(self.max_retries) + 1);
         loop {
-            let endpoint_state = cycle.next_candidate();
-            let endpoint = match (&ctx.endpoint, endpoint_state.clone()) {
-                (ContextEndpoint::Connected(socket), _) => {
-                    AttemptEndpoint::Connected(socket.clone())
-                }
-                (ContextEndpoint::Endpoints(_), Some(state)) => AttemptEndpoint::Endpoint(state),
-                (ContextEndpoint::Endpoints(_), None) => {
-                    unreachable!("an endpoint candidate was selected before try_send")
-                }
-                (ContextEndpoint::Invalid, _) => {
-                    unreachable!("request endpoint was validated before try_send")
-                }
-            };
-            let attempted_addr = endpoint_state.as_ref().map(|state| state.endpoint().addr());
             let result = self
                 .try_send(
                     ctx,
@@ -195,18 +170,18 @@ impl Client {
                     write_target,
                     method_name,
                     AttemptOptions {
-                        endpoint,
+                        endpoint: endpoint.clone(),
                         connect_deadline,
                         remaining_acquire_attempts: cycle.remaining_attempts(),
-                        avoided_remote_nics: cycle.avoided_remote_nics(attempted_addr),
+                        avoided_remote_nics: cycle.avoided_remote_nics(),
                     },
                 )
                 .await;
             match result {
-                Ok(sent) => return Ok((sent, endpoint_state)),
+                Ok(sent) => return Ok(sent),
                 Err(failure) => {
                     let attempt = cycle.attempt_index();
-                    if !cycle.note_failure(endpoint_state.as_ref(), &failure) {
+                    if !cycle.note_failure(&failure) {
                         return Err(failure.error);
                     }
                     tracing::warn!(
@@ -214,30 +189,6 @@ impl Client {
                         failure.error
                     );
                 }
-            }
-        }
-    }
-
-    /// Validates the context's destination and resolves the ranked
-    /// endpoint candidates (empty for an already-connected context);
-    /// alternatives beyond the first start connecting in the background.
-    fn initial_candidates(&self, ctx: &Context) -> Result<Vec<Arc<EndpointState>>, Error> {
-        match &ctx.endpoint {
-            ContextEndpoint::Invalid => Err(Error::new(
-                ErrorKind::InvalidArgument,
-                "client context without address".to_string(),
-            )),
-            ContextEndpoint::Connected(_) => Ok(Vec::new()),
-            ContextEndpoint::Endpoints(set) => {
-                let candidates = set.candidates(&ctx.state);
-                if candidates.is_empty() {
-                    return Err(Error::new(
-                        ErrorKind::InvalidArgument,
-                        "client context with empty endpoint set".to_string(),
-                    ));
-                }
-                self.preconnect(ctx, &candidates[1..]);
-                Ok(candidates)
             }
         }
     }
@@ -268,10 +219,7 @@ impl Client {
             remaining_acquire_attempts,
             avoided_remote_nics,
         } = attempt;
-        let AcquiredSocket {
-            socket,
-            endpoint_state,
-        } = acquire_for_attempt(
+        let socket = acquire_for_attempt(
             &ctx.state,
             endpoint,
             connect_deadline,
@@ -338,58 +286,18 @@ impl Client {
             if std::time::Instant::now() >= response_deadline {
                 return Err(AttemptFailure::deadline());
             }
-            if is_connection_failure(&err)
-                && let Some(state) = &endpoint_state
-                && let Some(conn_id) = socket.conn_id()
-            {
-                state.record_connection_failure(conn_id);
-            }
             return Err(AttemptFailure::send(
                 err,
                 socket.rdma_remote_device().map(str::to_owned),
             ));
         }
-        Ok(SentRequest {
-            receiver,
-            conn_id: socket.conn_id(),
-        })
-    }
-
-    /// Starts background connections to alternative endpoints so a later
-    /// failover finds them established.
-    fn preconnect(&self, ctx: &Context, candidates: &[Arc<EndpointState>]) {
-        let supervisor = ctx.state.socket_pool.task_supervisor_handle();
-        for endpoint_state in candidates {
-            let Some(activity) = endpoint_state.try_begin_preconnect() else {
-                continue;
-            };
-            let state = ctx.state.clone();
-            let endpoint_state = endpoint_state.clone();
-            let _ = supervisor.try_spawn(async move {
-                let result =
-                    acquire_direct(&state, endpoint_state.endpoint(), AcquireOptions::default())
-                        .await;
-                match &result {
-                    Ok(socket) => activity.record_connection(socket),
-                    Err(err) if is_connection_failure(err) => activity.record_failure(),
-                    Err(_) => {}
-                }
-                if let Err(err) = result {
-                    tracing::debug!(
-                        endpoint = %endpoint_state.endpoint(),
-                        %err,
-                        "background connection failed"
-                    );
-                }
-            });
-        }
+        Ok(SentRequest { receiver })
     }
 }
 
 /// A successfully sent request attempt, waiting for its response.
 struct SentRequest<'a> {
     receiver: crate::Receiver<'a>,
-    conn_id: Option<u64>,
 }
 
 #[cfg(test)]
@@ -417,6 +325,42 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    #[tokio::test]
+    async fn rejected_send_retries_are_bounded_and_release_read_sources() {
+        let (sender, queue) = tokio::sync::mpsc::channel(1);
+        drop(queue);
+        let ctx = connected_context(sender);
+        let mut buffer = ctx.state.buffer_pool.allocate(4).unwrap();
+        buffer.set_len(4);
+        buffer.copy_from_slice(b"read");
+        let source = Arc::new(ReadSource {
+            buffers: vec![buffer],
+        });
+        let client = Client {
+            max_retries: 2,
+            ..Default::default()
+        };
+        let mut target = None;
+        let error = client
+            .ruapc_request::<(), (), Error>(
+                &ctx,
+                &(),
+                ReadAttachment::new(Some(&source), None),
+                &mut target,
+                None,
+                "Test/rejected",
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind, ErrorKind::ConnectionClosed);
+        assert_eq!(ctx.state.waiter.pending_count(), 0);
+        let (next_id, _receiver) = ctx.state.waiter.alloc(Duration::from_secs(1));
+        assert_eq!(next_id, 3, "two retries permit exactly three send attempts");
+        let source = Arc::try_unwrap(source).expect("failed attempts must release their source");
+        assert_eq!(&source.buffers[0][..], b"read");
     }
 
     #[tokio::test]

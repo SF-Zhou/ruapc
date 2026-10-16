@@ -215,7 +215,7 @@ async fn run_test(tc: TestCase) {
     let addr = server.clone().listen(addr).await.unwrap();
     let ctx = Context::create(&config)
         .unwrap()
-        .with_endpoint(Endpoint::new(tc.transport, addr));
+        .with_endpoint(Endpoint::new(tc.transport, [addr]).unwrap());
 
     let client = Client {
         timeout: tc.client_timeout,
@@ -410,7 +410,7 @@ async fn setup(transport: Transport) -> (Arc<Server>, Context) {
     let addr = server.clone().listen(addr).await.unwrap();
     let ctx = Context::create(&config)
         .unwrap()
-        .with_endpoint(Endpoint::new(transport, addr));
+        .with_endpoint(Endpoint::new(transport, [addr]).unwrap());
     (server, ctx)
 }
 
@@ -601,7 +601,7 @@ async fn run_roundtrip_test(transport: Transport) {
     let addr = server.clone().listen(addr).await.unwrap();
     let ctx = Context::create(&config)
         .unwrap()
-        .with_endpoint(Endpoint::new(transport, addr));
+        .with_endpoint(Endpoint::new(transport, [addr]).unwrap());
     let client = Client::default();
 
     let payload = b"palindrome-me";

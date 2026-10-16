@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+### Changed
+- **BREAKING**: `Endpoint` now identifies one server through a nonempty,
+  sorted and deduplicated address group and one transport. Constructors accept
+  address iterators and return `Result`; `addrs()` replaces `addr()`, and
+  `Endpoint` is `Clone` rather than `Copy`. URI and serde strings use
+  `scheme://address,address`, including bracketed IPv6 addresses.
+- **BREAKING**: Removed `Context::with_endpoints` and client selection across
+  servers or transports. TCP, WebSocket, HTTP and RDMA acquire connections for
+  one complete address group; address fallback works even with zero request
+  retries. Different or overlapping groups keep independent caches and
+  acquisition locks. RDMA peer state uses the full declared bootstrap group;
+  callers guarantee shared server state and lease records across its addresses.
+- **BREAKING**: `RdmaPathEntry.peer` is now `Option<Endpoint>`; outbound path
+  reports serialize the complete `rdma://address,address` group.
+- `Endpoint` serialization and deserialization use the same canonical string
+  in JSON and MessagePack. `Transport::RDMA` and the `rdma://` scheme remain
+  available without the RDMA feature for storage and interchange; connection
+  acquisition requires the feature and an enabled RDMA pool.
+
 ### Fixed
 - RDMA pending sends retain backpressure across the ingress channel and
   poller FIFO, with a combined limit of 2048 reserved or queued business

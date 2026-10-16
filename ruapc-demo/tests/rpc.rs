@@ -24,7 +24,7 @@ async fn demo_services_round_trip_over_stream_transports() {
         let server = TestServer::start(base_path).await;
         let ctx = Context::create(&config(base_path))
             .unwrap()
-            .with_endpoint(Endpoint::new(transport, server.addr));
+            .with_endpoint(Endpoint::new(transport, [server.addr]).unwrap());
         let result = timeout(TEST_TIMEOUT, async {
             let clients = [
                 Client {

@@ -2,9 +2,6 @@ mod context;
 pub use context::Context;
 pub(crate) use context::ContextEndpoint;
 
-mod endpoint_state;
-pub(crate) use endpoint_state::{EndpointSet, EndpointState};
-
 mod server;
 pub use server::Server;
 
