@@ -15,17 +15,17 @@ pub fn init_tracing() {
 pub struct RuntimeOptions {
     /// Tokio worker threads per runtime (0 = number of CPUs).
     #[arg(long, default_value = "0")]
-    pub worker_threads: usize,
+    worker_threads: usize,
 }
 
 impl RuntimeOptions {
-    pub fn build(&self) -> tokio::runtime::Runtime {
+    pub fn build(&self) -> std::io::Result<tokio::runtime::Runtime> {
         let mut builder = tokio::runtime::Builder::new_multi_thread();
         builder.enable_all();
         if self.worker_threads > 0 {
             builder.worker_threads(self.worker_threads);
         }
-        builder.build().expect("failed to build Tokio runtime")
+        builder.build()
     }
 }
 

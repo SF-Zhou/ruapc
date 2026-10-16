@@ -1,35 +1,53 @@
+//! Serve the echo, greeting and verified remote-memory examples.
+
 use clap::Parser;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+
 use ruapc::{Context, Error, ErrorKind, ListenMode, Result, Router, Server, WithBuffers};
 use ruapc_demo::{
     EchoService, GreetService, MemBenchService, ReadCrcReq, Request, WriteCrcReq,
     app::{PoolOptions, RuntimeOptions, init_tracing},
     crc32c_of, fill_pattern,
 };
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
 
-#[derive(Parser, Debug, Clone)]
-#[command(version, about, long_about = None)]
-pub struct Args {
+#[derive(Parser, Debug)]
+#[command(version, about = "Serve the RuaPC example services")]
+struct Args {
     /// Listen address.
     #[arg(default_value = "0.0.0.0:8000")]
-    pub addr: std::net::SocketAddr,
+    addr: std::net::SocketAddr,
 
     /// Listener protocol mode.
     #[arg(long, default_value = "unified")]
-    pub listen_mode: ListenMode,
+    listen_mode: ListenMode,
 
     /// Base path for HTTP RPC and documentation endpoints.
     #[arg(long, default_value = "")]
-    pub http_base_path: String,
+    http_base_path: String,
+
+    /// Disable RDMA initialization and serve only stream transports.
+    #[cfg(feature = "rdma")]
+    #[arg(long)]
+    no_rdma: bool,
 
     #[command(flatten)]
-    pub runtime: RuntimeOptions,
+    runtime: RuntimeOptions,
 
     #[command(flatten)]
-    pub pool: PoolOptions,
+    pool: PoolOptions,
+}
+
+/// Register all demo services on one shared, stateful implementation.
+fn router() -> Router {
+    let demo = Arc::new(DemoImpl::default());
+    let mut router = Router::default();
+    EchoService::ruapc_export(demo.clone(), &mut router);
+    GreetService::ruapc_export(demo.clone(), &mut router);
+    MemBenchService::ruapc_export(demo, &mut router);
+    router
 }
 
 #[derive(Default)]
@@ -63,8 +81,7 @@ impl MemBenchService for DemoImpl {
         let mut buf = ctx
             .state
             .buffer_pool
-            .async_allocate(request.len)
-            .await
+            .allocate(request.len)
             .map_err(|e| Error::new(ErrorKind::InvalidArgument, e.to_string()))?;
         let seed = self.sequence.fetch_add(1, Ordering::Relaxed);
         fill_pattern(&mut buf[..request.len], seed);
@@ -75,38 +92,26 @@ impl MemBenchService for DemoImpl {
     }
 }
 
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
-fn main() {
-    init_tracing();
+fn main() -> Result<()> {
     let args = Args::parse();
-    let runtime = args.runtime.build();
-    runtime.block_on(async_main(args));
+    init_tracing();
+    args.runtime.build()?.block_on(run(args))
 }
 
-async fn async_main(args: Args) {
-    let demo = Arc::new(DemoImpl::default());
-    let mut router = Router::default();
-    EchoService::ruapc_export(demo.clone(), &mut router);
-    GreetService::ruapc_export(demo.clone(), &mut router);
-    MemBenchService::ruapc_export(demo.clone(), &mut router);
-    let mut config = args.pool.config(true);
+async fn run(args: Args) -> Result<()> {
+    #[cfg(feature = "rdma")]
+    let enable_rdma = !args.no_rdma;
+    #[cfg(not(feature = "rdma"))]
+    let enable_rdma = false;
+    let mut config = args.pool.config(enable_rdma);
     config.listen_mode = args.listen_mode;
     config.http_base_path = args.http_base_path;
-    let server = Server::create(router, &config).unwrap();
+    let server = Server::create(router(), &config)?;
+    let addr = server.listen(args.addr).await?;
+    tracing::info!("Serving EchoService, GreetService and MemBenchService on {addr}");
 
-    let server = Arc::new(server);
-    let addr = server.listen(args.addr).await.unwrap();
-    tracing::info!(
-        "Serving {:?} on {}...",
-        [
-            <DemoImpl as EchoService>::NAME,
-            <DemoImpl as GreetService>::NAME,
-            <DemoImpl as MemBenchService>::NAME
-        ],
-        addr.to_string()
-    );
-
-    server.join().await
+    let result = tokio::signal::ctrl_c().await;
+    server.stop();
+    server.join().await;
+    result.map_err(Into::into)
 }

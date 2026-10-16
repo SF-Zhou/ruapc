@@ -79,6 +79,9 @@ protocols, and select the outbound transport in the endpoint, for example
 
 ## Run the demos
 
+The [demo guide](ruapc-demo/README.md) covers the server and client binaries,
+command-line options, transport setup and verified echo/read/write workloads.
+
 From this repository, start the server and run a client in another terminal:
 
 ```bash
@@ -105,9 +108,9 @@ Open `http://127.0.0.1:8000/rapidoc` for interactive documentation.
 Ordinary HTTP POST calls do not support reverse RPC; RuaPC's typed HTTP client
 uses an HTTP/2 bidirectional stream.
 
-For a base path, pass `--http-base-path /api/v1` to the demo server. Set the same
-`SocketPoolConfig.http_base_path` on typed HTTP clients. RPC routes, the HTTP/2
-stream and documentation then live at `/api/v1/ServiceName/method`,
+For a base path, pass `--http-base-path /api/v1` to both the demo server and HTTP
+client (or set `SocketPoolConfig.http_base_path` in application code). RPC routes,
+the HTTP/2 stream and documentation then live at `/api/v1/ServiceName/method`,
 `/api/v1/_rpc` and `/api/v1/rapidoc`. See [built-in services](docs/builtin-services.md)
 for reflection and internal control methods.
 
@@ -160,14 +163,6 @@ eventually recycles its memory. Posted destinations remain held until completion
 or successful QP destruction. Read-source recovery does not prove that remote
 one-sided DMA has completed; see the [safety boundaries](docs/safe-boundaries.md).
 
-The [remote-memory demo](ruapc-demo/src/bin/remote_memory.rs) includes allocation,
-service registration and data verification:
-
-```bash
-cargo run -p ruapc-demo --bin remote_memory -- --transport tcp
-cargo run -p ruapc-demo --bin remote_memory --features rdma -- --transport rdma
-```
-
 ## RDMA
 
 Enable the `rdma` Cargo feature explicitly:
@@ -210,7 +205,7 @@ and reproducible comparisons.
 | [`ruapc-bufpool`](ruapc-bufpool/README.md) | Buddy/slab allocation and device registration |
 | `ruapc-macro` | `#[service]` code generation |
 | [`ruapc-rdma`](ruapc-rdma/README.md) | libibverbs bindings and owned work requests |
-| `ruapc-demo` | Example programs; not published |
+| [`ruapc-demo`](ruapc-demo/README.md) | Example server/client and verified workloads; not published |
 
 ## License
 
