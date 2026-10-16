@@ -33,6 +33,8 @@ pub struct Client {
     /// the remaining deadline of the context (for nested RPCs issued while
     /// handling a request). The budget travels with the request so the
     /// server can drop work the client no longer waits for.
+    /// Queue admission observes the absolute deadline; response waiting uses
+    /// a shared expiry sweep, so timeout notification may occur later.
     #[serde(with = "humantime_serde")]
     pub timeout: Duration,
     /// Total budget for connection establishment and endpoint failover.
@@ -73,17 +75,15 @@ impl Client {
     /// Creates a [`ClientWithBuffers`] wrapper attaching *read* buffers to
     /// requests.
     ///
-    /// The buffers' `RemoteBufferInfo` (one region per buffer, in order)
-    /// is included in each request's metadata as the request's *read
-    /// space*: a logically contiguous concatenation the server can read
-    /// from with [`Context::remote_read`](crate::Context::remote_read).
+    /// Each request advertises the buffers' logical lengths as one concatenated
+    /// read space for [`Context::remote_read`](crate::Context::remote_read).
+    /// Call [`Buffer::set_len`] after filling to expose exactly the valid bytes.
     ///
-    /// Each buffer contributes its logical length (`Buffer::len()`): call
-    /// `set_len` after filling so the space covers exactly the valid data
-    /// bytes. The wrapper, pending requests, and local inline readers share
-    /// the immutable source. Reuse the wrapper or recover its buffers with
-    /// [`ClientWithBuffers::take_read_buffers`]. This ownership protects local
-    /// CPU copies; it does not track completion of remote one-sided RDMA reads.
+    /// The reusable wrapper, pending requests and local inline readers share
+    /// the immutable source. [`ClientWithBuffers::take_read_buffers`] recovers
+    /// it when locally unique; this does not prove remote DMA completion.
+    /// See [`Context::remote_read`](crate::Context::remote_read) for RDMA
+    /// validation and recovery limits.
     ///
     /// # Examples
     ///

@@ -77,7 +77,7 @@ pub(crate) struct ReadIntoTargetRequest {
     pub(crate) ops: Vec<CopyOp>,
 }
 
-/// Identifies the original request for a post-READ liveness check.
+/// Identifies the original request for post-READ waiter membership validation.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub(crate) struct RequestStatusRequest {
     /// Message ID of the original request.
@@ -85,7 +85,7 @@ pub(crate) struct RequestStatusRequest {
 }
 
 /// Internal reverse RPCs for inline copies, client-side RDMA READs, and
-/// source-request liveness checks.
+/// source-request waiter probes.
 #[ruapc_macro::service(name = "_ruapc.memory", internal)]
 pub(crate) trait MemoryService {
     /// Reads the original request's owned source (TCP/WS/HTTP fallback).
@@ -102,13 +102,14 @@ pub(crate) trait MemoryService {
 
     /// Executes RDMA READs from the server's advertised regions
     /// (`read_regions` of this request's metadata) into the pinned write
-    /// target (RDMA path).
+    /// target (RDMA path). A successful response follows completed READs;
+    /// this operation does not perform a `request_is_pending` postcheck.
     async fn read_into_target(&self, ctx: &Context, req: &ReadIntoTargetRequest) -> Result<()>;
 
-    /// Reports whether the original request is still pending on this peer.
+    /// Reports whether the original request remains in this peer's waiter table.
     ///
-    /// RDMA uses this to reject stale READ results. It neither acknowledges
-    /// remote DMA completion nor delays source-buffer recovery.
+    /// This checks membership, not the deadline clock. [`Context::remote_read`]
+    /// defines how a positive post-READ reply validates the copied bytes.
     async fn request_is_pending(&self, ctx: &Context, req: &RequestStatusRequest) -> Result<bool>;
 }
 

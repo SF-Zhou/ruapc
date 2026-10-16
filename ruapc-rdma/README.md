@@ -3,6 +3,7 @@
 libibverbs bindings with RAII resources and buffer-owning work requests.
 Part of [RuaPC](../README.md), usable independently for low-level verbs operations.
 RPC bootstrap, path selection, flow control and poll threads live in `ruapc`.
+For that layer, see [RDMA connection setup](../docs/rdma-connection.md).
 
 ## Requirements and discovery
 
@@ -29,6 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 Inspect devices with the bundled `ibv_devinfo` implementation:
 
 ```bash
+cargo build -p ruapc-rdma
 cargo run -p ruapc-rdma --features bin --bin ibv_devinfo -- -v
 ```
 
@@ -58,18 +60,14 @@ is non-cloneable and checked against the originating CQ, hardware QPN and QP
 sequence floor. Raw metadata from `CompletionQueue::poll` cannot authorize
 buffer recovery. Applications sharing a CQ route completions by `qp_num()`.
 
-WRIDs encode a two-bit type and a 62-bit sequence. SQ and RQ use independent
-sequences; SEND variants and READ share SQ. CQ-owned QPN leases and a retirement
-floor prevent completions from a destroyed QP from releasing a replacement's
-buffers. Sequences never wrap. Posting uses per-QP counters; the registry lock
-is limited to registration, retirement and explicit statistics.
-
 `CompletionQueue::capacity()` reports the provider's CQE capacity, not a QP
 count limit. Applications must bound outstanding completions themselves.
 SEND/RECV buffers use a separate bounded slot array; slot exhaustion rejects
-the new submission without replacing an existing buffer. See
-[WRID and completion identity](../docs/wrid.md) and
-[QP registry and CQ capacity](../docs/qp-registry.md) for the full invariants.
+the new submission without replacing an existing buffer. Non-wrapping
+sequences and CQ-owned QPN leases prevent stale completion reuse; see
+[completion identity and posting](../docs/wrid.md) for the detailed contract and
+[RuaPC's CQ budgeting](../docs/rdma-capacity.md) for the RPC layer's admission
+and retirement policy.
 
 ## READ lifetime
 
@@ -86,18 +84,21 @@ them early; forgetting an owner can retain resources indefinitely. Destruction
 also releases remaining unsignaled SENDs. Failure to destroy a QP aborts the
 process before memory still accessible to DMA can be released.
 
-These guarantees cover local destinations. Remote addresses and keys do not
-provide a source-side completion lease. The RPC layer's post-READ pending check
-rejects stale results but cannot delay source recovery until remote DMA has
-completed. See [safety boundaries](../docs/safe-boundaries.md).
+These guarantees cover local destinations; remote addresses and keys provide
+no source-side completion lease. RuaPC validates `remote_read` results after
+READ completion under the immutable-source and original-request-ID contract.
+That validation does not make source recovery wait for DMA, and readable error
+destinations are not valid transfer results. See
+[application read validation and recovery](../docs/safe-boundaries.md#application-read-source-validation-and-recovery)
+for the proof and `remote_write`'s separate reverse-RPC completion path.
 
 ## Registration and FFI
 
 `ActiveDevice` implements `ruapc_bufpool::MemoryRegistrar` in
-`src/buffer_registration.rs`. Safe `Device` wrappers supply that audited
-registrar without receiving pool backing memory. `MemoryRegion` retains memory
-and its protection domain; registration grants no independent access to bytes
-owned by pool buffers. Queue operations enforce their own DMA lifetimes.
+[`buffer_registration.rs`](src/buffer_registration.rs). `MemoryRegion` retains
+memory and its protection domain, while queue operations enforce DMA lifetimes.
+Registration itself grants no independent byte access; see the
+[registration contract](../docs/safe-boundaries.md#registration-and-byte-access).
 
 `build.rs` compiles `src/shim.c` against the installed `<infiniband/verbs.h>` and
 generates bindings with bindgen. Every verbs entry point used by the crate goes
@@ -106,11 +107,10 @@ are applied. This avoids accidentally binding only a legacy exported symbol.
 
 | Module | Responsibility |
 | --- | --- |
-| `src/shim.{h,c}`, `build.rs` | C wrappers, build detection and binding generation |
-| `src/ffi/` | Generated bindings and extensions |
-| `src/types/` | Device snapshots, identifiers and other value types |
-| `src/verbs/` | Resource wrappers, posting and completion ownership |
-| `src/bin/ibv_devinfo.rs` | Device inspection CLI |
+| [`shim.h`](src/shim.h), [`shim.c`](src/shim.c), [`build.rs`](build.rs) | C wrappers, build detection and binding generation |
+| [`src/ffi/`](src/ffi/), [`src/types/`](src/types/) | Bindings, extensions, device snapshots and identifiers |
+| [`src/verbs/`](src/verbs/) | Resource wrappers, posting and completion ownership |
+| [`ibv_devinfo.rs`](src/bin/ibv_devinfo.rs) | Device inspection CLI |
 
 ## Tests
 

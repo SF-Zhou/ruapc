@@ -213,6 +213,11 @@ impl std::fmt::Display for Error {
 /// Posted destinations remain owned until completion or QP destruction;
 /// error recovery cannot release them early.
 ///
+/// Recovered buffers permit reuse but do not certify successful transfer
+/// contents. Their bytes remain readable and are not cleared; failed reads
+/// may contain data read after source reuse. See
+/// [`Context::remote_read`](crate::Context::remote_read) for source validation.
+///
 /// Converting into [`Error`] (e.g. via the `?` operator) drops any
 /// recovered buffers back to the pool.
 pub struct RemoteIoError {

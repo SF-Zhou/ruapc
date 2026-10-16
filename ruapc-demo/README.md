@@ -1,8 +1,9 @@
 # RuaPC examples
 
 This unpublished crate demonstrates service registration, typed calls and
-echo/read/write workloads. Run the commands below from the workspace root. TCP, WebSocket
-and HTTP builds do not need RDMA libraries.
+echo/read/write workloads. Run the commands below from the workspace root.
+TCP, WebSocket and HTTP need neither RDMA libraries nor a device in the default
+build.
 
 | Binary | Purpose |
 |---|---|
@@ -88,14 +89,15 @@ them and checks their CRC32C against the response. `--buffer-size` accepts 0 thr
 typed HTTP and RDMA.
 
 [`client.rs`](src/bin/client.rs) shows how to allocate buffers, set their logical
-lengths and reuse them across calls. Read attachments own immutable sources.
+lengths and reuse them across calls; see the [remote-memory API guide](../docs/remote-memory.md)
+for attachments and logical copy spaces. Read attachments own immutable sources.
 Successful `WithBuffers` responses return available write destinations only when
 uniquely held; failed or cancelled DMA can leave those destinations unavailable.
-Read-source recovery proves local uniqueness, not remote DMA completion: after
-source-side timeout or cancellation, an already posted one-sided READ may still
-be in flight. The post-READ pending check rejects expired results but cannot
-prove safe source reuse. See the [ownership contract](../DESIGN.md#remote-memory)
-and [safety boundaries](../docs/safe-boundaries.md).
+RDMA validates successful reads after READ completion, but source recovery does
+not wait for remote DMA. Readable destinations from a failed transfer are not
+valid results. See [read validation and recovery](../docs/safe-boundaries.md#application-read-source-validation-and-recovery)
+for the immutable-source/request-ID conditions and the separate `remote_write`
+completion path.
 
 ## Load testing
 
@@ -120,22 +122,19 @@ cargo run -p ruapc-demo --release --bin client -- tcp://127.0.0.1:8000 \
 `--secs` includes warmup: both bench commands request 2 seconds of warmup
 and 8 seconds of measurement. In bench mode it must exceed `--warmup-secs`.
 Stress mode has no warmup. Each coroutine waits for its call before issuing
-another, so this is a closed-loop test at fixed concurrency, not a fixed
-arrival-rate generator. Requests are assigned to warmup or measurement by their
-start time. In-flight calls can finish after the requested duration and still
-contribute to the result. The final `measured` duration includes this tail and
-excludes warmup; throughput divides successful measured calls by that duration.
+another. Requests enter warmup or measurement by their start time; in-flight
+calls can finish after `--secs` and still contribute to the result. The final
+`measured` duration includes this tail and excludes warmup; throughput divides
+successful measured calls by that duration.
 Warmup calls are excluded from reported counts and latency, but any failed
 call, including one during warmup, makes the final exit status nonzero.
 
 Echo uses `--value` for individual calls and stress, and a generated string of
 `--payload-size` bytes for bench. Read/write use `--buffer-size` per coroutine.
-Workers prepare payloads and buffers before timing starts. Calls verify echo
-contents or CRC32C; read/write timings include server-side CRC calculation,
-write-pattern generation, client verification and per-call allocation.
-Their MiB/s counts successful logical payload bytes, not network traffic.
-Use equivalent payloads, concurrency, encoding, runtime settings and CPU/NUMA
-placement when comparing runs. See the [benchmark guide](../docs/benchmark.md).
+Load workers verify echo contents or CRC32C on every call; the default one-shot
+echo/greet command only prints responses. Read/write MiB/s counts successful
+logical payload bytes. See the [measurement guide](../docs/benchmark.md#demo-measurements)
+for timing boundaries, fixed-concurrency interpretation and comparisons.
 
 ## Configuration and RDMA
 
@@ -150,9 +149,9 @@ Server and client share `--worker-threads` (0 selects Tokio's CPU-based
 default) and `--pool-mem-mb` (0 selects the library buffer-pool limit).
 `RUST_LOG` controls tracing, with `info` as the fallback. The examples use
 the system allocator. Size the pool for all workers' attachments plus transport
-and server transfer buffers. Allocation size classes and 64 MiB backing blocks
-determine pool use, not just logical payload lengths. Workload preparation
-returns an error if its buffers cannot be allocated.
+and server transfer buffers, accounting for the pool's
+[size classes and backing blocks](../ruapc-bufpool/README.md#allocation).
+Workload preparation fails if its buffers cannot be allocated.
 
 RDMA requires the `rdma` Cargo feature, a C compiler, `pkg-config`, libclang
 and the libibverbs development package. At runtime it needs an active RDMA
@@ -201,9 +200,7 @@ configuration details.
 | [`src/app.rs`](src/app.rs) | Tracing, Tokio runtime and shared pool/RDMA CLI configuration. |
 | [`src/bin/server.rs`](src/bin/server.rs) | Private service implementation, registration, listener setup and shutdown. |
 | [`src/bin/client.rs`](src/bin/client.rs) | CLI validation, individual calls, echo/read/write buffer reuse and verification, and load reporting. |
-| [`tests/common/mod.rs`](tests/common/mod.rs) | Shared process startup and cleanup for integration tests. |
-| [`tests/rpc.rs`](tests/rpc.rs) | RPC contract checks against the server binary. |
-| [`tests/client_cli.rs`](tests/client_cli.rs) | Client command-line behavior and workload checks. |
+| [`tests/`](tests/) | Server process lifecycle, stream RPC contracts, CLI failures and workload verification. |
 
 For local checks without enabling RDMA:
 

@@ -2,10 +2,10 @@
 
 Connection admission reserves software completion credits before creating a
 QP. It uses the CQ capacity returned by the provider, which may exceed the
-requested `rdma.polling.device_cq_len`. CQ capacity does not change the fixed
-62-bit WRID sequence or limit the number of QPN registry entries. Hardware
-resources, registered buffers and completion credits still bound usable
-connections.
+requested `rdma.polling.device_cq_len`. This page owns resource budgets,
+admission, and credit retirement. See [connection setup](rdma-connection.md)
+for negotiated limits, [poller scheduling](qp-registry.md) for progress, and
+[completion identities](wrid.md) for QPN/WRID reuse.
 
 ## Completion-credit budget
 
@@ -56,32 +56,29 @@ count toward the channel limit. Moving a message into the FIFO frees an
 ingress slot only while there is space in the bounded FIFO; repeated poller
 maintenance cannot move an unlimited backlog out of the channel.
 
-The poller refills an empty FIFO during flushing so remaining SEND credits
-can serve messages still in the ingress channel in the same maintenance pass.
-FIFO order and finish-control priority are preserved. A batch being aggregated
-or synchronously posted still fits the staging bound: only the poller refills
-the FIFO, after the preceding batch's posting returns. This uses the existing
-channel backpressure without adding a shared permit or reference-count update
-to each queued message. A full queue retains deadline-aware admission and
-connection-close wakeups; accepted messages are not checked for expiry at
-dequeue time.
+A batch being aggregated or synchronously posted still fits this bound: only
+the poller refills the FIFO, after the preceding batch's posting returns.
+Full queues wait within the request's absolute deadline and wake on connection
+closure. Accepted messages are not checked for expiry at dequeue time. See
+[poller scheduling](qp-registry.md#bounded-drains-and-maintenance) for FIFO
+refill and priority.
 
 This is a message-count limit on the send queue, not a process-memory limit.
 Caller-owned serialization buffers waiting for admission are outside it.
-Posted WRs use the separate SEND window and keep their buffers until completion
-or successful QP destruction. Large serialized sources retain their separate
-byte budget, and finish controls have their own 256-message queue described
-below; neither is released by draining a business queue slot.
+Posted WRs use the separate SEND window. Large serialized sources retain their
+byte budget, and finish controls have their own queue below; neither budget
+is released by draining a business queue slot. DMA ownership follows
+[safety boundaries](safe-boundaries.md#completion-and-destination-ownership).
 
 ## Large-payload admission and cleanup
 
-`rdma.connection.max_msg_size` continues to size each posted receive buffer;
-large payload support does not enlarge the receive ring. The negotiated
-`max_large_msg_size` bounds a complete serialized message, including metadata
-and the ordinary eight bytes of RDMA framing. It defaults to 64 MiB, the
-maximum single pool allocation. Zero disables large messages; nonzero values
-must cover the inline limit. Both peers take the smaller advertised limit,
-and a peer omitting the field negotiates zero.
+The encoder serializes each message once into registered storage, growing it
+as needed. Messages within `max_msg_size` keep the inline format; larger ones
+use a [payload offer](builtin-services.md#private-rdma-payload-controls).
+`max_msg_size` still sizes each posted receive buffer, so large messages do
+not enlarge the receive ring. The complete serialized size includes metadata
+and the ordinary eight-byte RDMA frame prefix; negotiation and compatibility
+rules are in [connection limits](rdma-connection.md#parameter-negotiation-and-validation).
 
 `rdma.connection.max_inflight_large_bytes` defaults to 128 MiB per connection
 and applies independently to outgoing source storage and incoming destination
@@ -90,29 +87,28 @@ the configured large-message limit. Accounting uses allocation capacity,
 including buffers retained after READ completion until their payload owner
 is dropped. If a READ fails or its receive task is cancelled before recovering
 the destination, its byte reservation remains quarantined until QP destruction;
-failing a waiter does not return that budget. Serialization growth reserves its
-replacement allocation while the previous large allocation is still charged, so a budget equal to the
-message-size limit can reject a growing message before that limit is reached.
-The default budget allows one maximum-size message to grow with both
-allocations present. Payload READs use the existing per-connection and NIC READ
-permits and bandwidth admission. Descriptors and confirmations consume normal
-data SEND credits, so they do not add a separate CQ-credit class.
+failing a waiter does not return that budget. Growth reserves the replacement
+allocation while the old one remains charged. A budget equal to the message
+limit can therefore reject growth before that limit; the default allows one
+maximum-size message with both allocations present. Payload READs use the
+existing READ permits and bandwidth admission.
 
 Each connection admits at most 128 active outgoing and 128 active incoming
 transfers. Finish and finish-reply controls use a separate bounded queue of
-256 messages; the poller services it before queued business messages.
-Confirmation bypasses application handler admission so a handler waiting
-for a large callback cannot block its own completion. Receiver replay
+256 messages; the poller services it before queued business messages. Offers
+and finish/reply controls consume normal data SEND credits, not a separate
+CQ-credit class. Confirmation bypasses application handler admission so a
+handler waiting for a large callback cannot block its own completion. Receiver replay
 tracking retains compressed transfer-ID intervals for the connection's
-lifetime; more than 128 disjoint intervals closes the connection.
+lifetime; more than 128 disjoint intervals closes the connection. The source
+keeps at most 256 finished-transfer results for replying to duplicate finishes.
 
 An independent 30-second transfer cleanup deadline bounds retained offers and
 READ/confirmation tasks, including when the business request has expired.
 READs also remain subject to `rdma.remote_memory.read_timeout_ms`. Exceeding a
-transfer deadline or failing a receiving transfer closes the connection;
-unconfirmed sources remain held until QP destruction. A confirmed expired
-request can release its serialized source while declining dispatch. See
-[large-payload ownership](safe-boundaries.md#large-payload-source-ownership).
+transfer deadline or failing a receiving transfer closes the connection.
+Source release and dispatch validity follow the
+[large-payload ownership protocol](safe-boundaries.md#large-payload-source-ownership).
 
 ## CQ shards and admission
 
@@ -123,18 +119,17 @@ and rechecks the budget before creating the QP. Failure to fit on one shard,
 or to create another shard, does not prevent admission on another fitting
 shard. Incoming and outgoing connections use the same path.
 
-`ReservedQueuePair` keeps the QP before its reservation in field destruction
-order, including setup errors and handoff to the socket. Removing a connection
-from the poller's map does not release its reservation while another owner
-retains the QP. Posting and ordinary completion dispatch never acquire the
-CQ budget lock.
+`ReservedQueuePair` drops the QP before its reservation, including setup errors
+and handoff to the socket. Removing a connection from the poller's map does
+not release its reservation while another owner retains the QP. Posting and
+ordinary completion dispatch never acquire the CQ budget lock.
 
 ## Retirement and credit reuse
 
 QP identity retirement and CQ capacity reclamation have different boundaries:
 
-1. Successful provider QP destruction permits its identity lease to retire.
-   A reused QPN receives a higher sequence floor, rejecting old CQEs.
+1. Successful provider QP destruction permits
+   [identity retirement](wrid.md); it does not yet return CQ capacity.
 2. The reservation guard marks its credits retired and wakes the poller.
    They remain charged because a provider may leave CQEs behind.
 3. The poller takes a retirement snapshot **before polling**. Only a later
@@ -158,16 +153,13 @@ NIC semaphore used by other connections.
 The poll thread checks READ deadlines during its 100 ms housekeeping sweep,
 skipping QPs with all READ permits available. Timeout reports
 `RdmaReadTimeout` and moves the QP to ERR. It does not release posted DMA
-holds or return their permits. Normal removal requires closed READ admission,
-all SQ permits returned and no pending READs, as well as settled flow state.
-This also covers a posting task paused between its last health check and the
-provider post.
+holds or return their permits.
 
-Fatal poller shutdown closes admission and fails waiters on every incoming
-and live socket before releasing any socket owner. A task that publishes a
-READ after the shutdown sweep rechecks socket health before awaiting its
-batch and repeats failure notification. Notification leaves the QP's records,
-permits and destination memory intact.
+The [poller](qp-registry.md#closing-a-connection) owns normal removal and fatal
+shutdown. Shutdown closes all connection admission before releasing socket
+owners. A READ published after the shutdown sweep rechecks socket health
+before awaiting its batch and repeats failure notification; that notification
+leaves posted permits and memory held.
 
 When the final socket owner drops, it captures the QP's actual outstanding
 READ count, destroys the QP, then returns those NIC permits. Unposted requests
@@ -175,8 +167,9 @@ and already processed completions are excluded. External socket owners delay
 this recovery. A stopped CQ admits no new connections and cannot reuse its
 remaining reservations without an empty-poll proof.
 
-Destination ownership and the separate application remote-source lifetime limitation are
-documented in [WRID ownership](wrid.md#read-ownership-and-source-lifetime).
+For destination ownership and the separate application source contract, see
+[safety boundaries](safe-boundaries.md#completion-and-destination-ownership)
+and [read validation and recovery](safe-boundaries.md#application-read-source-validation-and-recovery).
 
 ## Introspection and implementation
 

@@ -4,21 +4,22 @@ Each CQ poll thread owns a `HashMap<u32, ConnState>` keyed by the provider's
 local QP number. This connection map is separate from the verbs CQ's live
 identity registry: the former routes completions and maintains flow state;
 the latter prevents identity reuse while QPs or borrowed completions can
-still matter. See [WRID ownership](wrid.md) for identity and reclamation rules.
+still matter. This page owns routing and poll-loop scheduling; see
+[completion identities](wrid.md), [capacity](rdma-capacity.md), and
+[connection establishment](rdma-connection.md) for the adjacent contracts.
 
 ## Completion routing
 
 The poller looks up `completion.qp_num()` and checks the connection's immutable
 sequence floor before passing the CQ-issued token to `QueuePair::complete`.
-The QP validates the CQ, QPN and type-selected identity before releasing
-buffers. Only then does the poller update flow credits. Established routing
-requires a hash lookup and floor comparison; it does not lock the CQ identity
-registry or allocate an entry per completion.
+Only accepted completions update flow credits; the QP owns the
+[identity and completion checks](wrid.md). Established routing requires a
+hash lookup and floor comparison, without locking the CQ identity registry
+or allocating an entry per completion.
 
-CQ capacity does not bound registry entries or alter WRID width. The connection
-map and CQ identity registry retain at most their peak live allocation, with
-no history map indexed by every QPN ever seen. Full hash-map scans can still
-scale with retained capacity after a connection peak.
+The connection map retains its peak allocation rather than a history of every
+QPN. Full hash-map scans can therefore scale with retained capacity after a
+connection peak, even when few connections remain.
 
 ## Initial-receive publication
 
@@ -34,9 +35,8 @@ the shared inbox mutex as a publication barrier:
    Bypass the hint because it may still be false while receives are posted.
 
 A failed setup can leave no registered owner; its completion is discarded and
-QP ownership handles cleanup. Both normal drains and the poll-after-arming
-race check use the same routing path. Established-QPN hits avoid the inbox
-mutex. Removing a connection never retires an identity still held by a QP.
+QP ownership handles cleanup. Normal drains and the poll after notification
+arming use this same path. Established-QPN hits avoid the inbox mutex.
 
 ## Bounded drains and maintenance
 
@@ -60,25 +60,27 @@ requests another pass.
 Only receive-buffer deficits remain dirty for timed recovery: retry every
 100 microseconds while busy and use a 1 ms idle wait. Window-blocked sends
 wait for a completion, wake or housekeeping pass and do not force spinning.
-After the configured `poll_spin_us` window, the poller arms CQ notifications,
-re-polls to close the event race and sleeps on the completion channel and
-wake pipe. Zero disables the spin window.
+After `rdma.polling.poll_spin_us` (default 50 microseconds), the poller arms CQ
+notifications, re-polls to close the event race, and sleeps on the completion
+channel and wake pipe. Zero disables spinning.
 
-Window-blocked business messages move from the bounded ingress channel into
-a bounded FIFO of the same capacity. The poller refills the FIFO when empty
-while flushing, preserving pending-message priority over direct senders
-without bypassing the [combined queue limit](rdma-capacity.md#pending-business-sends).
+While flushing, the poller refills an empty business FIFO so remaining SEND
+credits can serve ingress messages in the same pass. Queued messages retain
+priority over direct senders; private finish/reply controls run first. Queue
+bounds and deadline admission are in
+[pending business sends](rdma-capacity.md#pending-business-sends).
 
 ## Receive dispatch
 
 The poll thread never parses RPC frames. One receive completion consumes one
 flow credit regardless of how many frames it contains. Received buffers are
 batched and handed to `rdma.polling.dispatch_workers` Tokio tasks (default 32)
-that walk the frames and dispatch messages.
+that walk the frames and dispatch messages. The flush threshold is 256 receive
+buffers; a CQ drain also flushes its remaining batch before returning.
 
-Each worker has a Tokio mpsc queue shared by the pollers. Each poller clone
-gets a home worker in round-robin order and returns to that home after a
-spill. A batch goes to the first worker below 16 outstanding batches, scanning
+Each worker has an unbounded Tokio mpsc queue shared by the pollers. Each
+poller clone gets a home worker in round-robin order and returns there after
+a spill. A batch goes to the first worker below 16 outstanding batches, scanning
 from home; otherwise it goes to the least loaded worker below 32. If all are
 at that threshold, a one-shot Tokio task handles the batch. These are routing
 thresholds, not hard queue limits: concurrent pollers may observe the same
@@ -99,10 +101,19 @@ on providers such as Soft-RoCE, preventing teardown.
 
 Successful receive completions queued before closure still settle their
 receive counts, but do not dispatch messages or replenish the receive ring.
-Removal requires the provider ERR request and the existing completion and
-READ-admission checks. Poller shutdown also requests ERR for incoming and
-registered connections. ERR itself never releases posted memory or permits;
-completion evidence or successful QP destruction remains necessary.
+Removal requires the provider ERR request, settled receive/ACK flow, empty
+pending sends, and closed, idle READ admission with no pending batches.
+Waiting for every SQ permit also covers a poster paused before registering
+its READ batch. See [READ admission and failure](rdma-capacity.md#read-admission-and-failure)
+for permit recovery.
+
+Fatal shutdown closes admission, requests ERR, and fails READ batches for all
+incoming and registered connections before releasing any socket owner. It
+notifies incoming ordinary waiters explicitly; registered-connection guards
+notify theirs when the connection map is cleared. External socket owners can
+delay QP destruction. ERR and failure notification do not themselves release
+DMA memory; see
+[destination ownership](safe-boundaries.md#completion-and-destination-ownership).
 
 ## Implementation and regression coverage
 
@@ -110,10 +121,6 @@ completion evidence or successful QP destruction remains necessary.
 [per-connection maintenance](../ruapc/src/rdma/poller/conn.rs),
 [flow control](../ruapc/src/rdma/poller/flow.rs) and
 [dispatch](../ruapc/src/rdma/poller/dispatch.rs) own these paths.
-Their tests cover early receive publication, stale identity rejection,
-bounded drains, dirty-list maintenance, minimum-window ACK behavior and
-shutdown. The verbs tests additionally verify same numeric WRIDs on distinct
-QPs, retained tokens after QPN reuse and partial setup rollback.
-
-For setup and activation, see [RDMA connection establishment](rdma-connection.md).
-For admission and shutdown ownership, see [RDMA capacity](rdma-capacity.md).
+Adjacent tests cover early receive publication, stale routing, bounded drains,
+dirty-list maintenance, minimum-window ACK behavior, and shutdown. Verbs
+identity tests are indexed in [WRIDs](wrid.md).

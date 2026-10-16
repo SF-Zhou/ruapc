@@ -18,10 +18,9 @@ use super::{Client, ReadAttachment};
 ///
 /// # Read buffers
 ///
-/// The attached read buffers form the request's *read space*, advertised
-/// in the request metadata; the server reads from it via
-/// [`Context::remote_read`](crate::Context::remote_read). They are
-/// owned by this wrapper and kept immutable while pending reads hold them.
+/// Read attachments are reusable immutable sources for [`Context::remote_read`].
+/// Pending requests and local readers share them with this wrapper. Recover
+/// local ownership through [`take_read_buffers`](Self::take_read_buffers).
 ///
 /// # Write buffers
 ///
@@ -34,9 +33,6 @@ use super::{Client, ReadAttachment};
 /// # Examples
 ///
 /// ```rust,ignore
-/// // Server reads from the client's buffers:
-/// let rsp = client.with_read_buffers(bufs).upload(&ctx, &req).await?;
-///
 /// // Upload and download in a single call:
 /// let (rsp, out) = client
 ///     .with_read_buffers(src_bufs)
@@ -86,8 +82,8 @@ impl<'a> ClientWithBuffers<'a> {
 
     /// Recovers the source buffers when no pending request or local reader
     /// still holds them. On `None`, the wrapper retains its source for a later
-    /// attempt. This checks local ownership only; remote one-sided RDMA
-    /// completion is not observable here.
+    /// attempt. Local uniqueness does not prove remote DMA completion; see
+    /// [`Context::remote_read`] for validation and source-recovery limits.
     pub fn take_read_buffers(&mut self) -> Option<Vec<Buffer>> {
         match Arc::try_unwrap(self.read_source.take()?) {
             Ok(source) => Some(source.buffers),
@@ -119,6 +115,8 @@ impl<'a> ClientWithBuffers<'a> {
     /// transfer can leave no recoverable set even after the QP eventually
     /// returns its buffers to the pool. Successful plain `Result<T, E>` calls
     /// also consume the set; use `WithBuffers<T>` to receive it in the result.
+    /// Recovery permits reuse; after failure it does not establish valid
+    /// transfer contents or promise that the buffers have been zeroed.
     pub fn take_write_buffers(&self) -> Option<Vec<Buffer>> {
         self.write_buffers.lock().unwrap().take()
     }

@@ -5,6 +5,9 @@ The CQ issues the completion token, the CQE supplies the QPN, and the WRID
 encodes the type and sequence. Numeric WRIDs may repeat across different QPs
 or CQs; the full identity must not repeat.
 
+See [safety boundaries](safe-boundaries.md) for registration, source validation
+and application buffer recovery, and [capacity](rdma-capacity.md) for CQ credits.
+
 ## Fixed layout
 
 ```text
@@ -66,7 +69,7 @@ and READ destinations. If provider destruction fails, the process aborts
 before releasing memory still accessible to DMA. Removing a core poller entry
 does not destroy a QP retained by another socket owner.
 
-Memory reclamation requires all of the following:
+Reclamation through completion processing requires all of the following:
 
 1. `CompletionQueue::poll_batch` lends a non-cloneable `Completion` from
    private batch storage. Neither that storage nor the originating CQ can
@@ -125,26 +128,24 @@ protocol is implemented.
 `QueuePair::prepare_reads` takes owned destination buffers and logical
 buffer-index/offset/length descriptors. It validates bounds, registration,
 scatter limits, overflow and destination overlap, then resolves local
-addresses and keys internally. A non-cloneable `ReadPosting` cursor submits
-each request at most once to the preparing QP. The QP records a private
-`Arc<ReadBatch>` before the provider post; post failure removes that record.
-Dropping the cursor accounts for unposted requests without releasing posted
-memory.
+addresses and keys internally. Invalid plans return the input buffers without
+posting. A non-cloneable `ReadPosting` cursor submits each request at most once
+to the preparing QP. The QP records a private `Arc<ReadBatch>` before the
+provider post; post failure removes that record. Dropping the cursor accounts
+for unposted requests without releasing posted memory. `ReadPosting::cancel`
+can recover buffers only before any request has posted.
 
-Destinations remain owned through success/error/flush completions or
-successful QP destruction. Dropping, cancelling or forgetting the waiting
-future never authorizes early release. Failure notification can return to
-the caller before ownership is recoverable; it does not return DMA buffers.
-READ admission, timeouts and teardown are described in
-[RDMA capacity](rdma-capacity.md#read-admission-and-failure).
+After the unposted suffix is accounted for, destinations remain owned until
+every posted READ has a success/error/flush completion or the QP is destroyed.
+The waiting receiver gets buffers only if the entire batch succeeds. Failure
+notification can precede recovery; dropping, cancelling or forgetting the
+waiting future never authorizes early release. See
+[READ admission and failure](rdma-capacity.md#read-admission-and-failure) for
+permits, deadlines and teardown.
 
-This local destination guarantee is distinct from remote source lifetime.
-`ReadSource` shares ownership with pending requests and CPU inline readers,
-but is not a lease for unobservable one-sided READ completions. The server's
-post-READ `_ruapc.memory/request_is_pending` check rejects results from expired
-requests; it does not make source recovery wait for remote DMA. The same
-limitation applies to server sources advertised by `remote_write`, which is
-implemented as a client-side READ.
+This is a local destination guarantee. Application sources follow the separate
+[read validation and recovery contract](safe-boundaries.md#application-read-source-validation-and-recovery),
+including the success checks and limits after cancellation.
 
 ## Implementation and validation
 

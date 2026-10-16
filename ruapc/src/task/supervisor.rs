@@ -8,25 +8,26 @@ use std::{
 
 use tokio_util::sync::{CancellationToken, DropGuard, WaitForCancellationFuture};
 
-/// Internal state for task supervision.
-///
-/// Tracks the number of running tasks and provides cancellation tokens
-/// for coordinating shutdown.
+/// Registration count and shutdown signals shared by owners, handles and guards.
 #[derive(Debug, Default)]
 struct TaskSupervisorState {
-    /// Number of currently running tasks.
+    /// Outstanding guards, including the internal stop observer.
     running: AtomicU64,
     /// Token cancelled when stop is requested.
     stop: CancellationToken,
-    /// Token cancelled when all tasks have stopped.
+    /// Token cancelled when the registration count reaches zero.
     stopped: CancellationToken,
 }
 
-/// Task lifecycle supervisor for graceful shutdown.
+/// Shutdown signal and guard-based accounting for registered tasks.
 ///
-/// The `TaskSupervisor` tracks spawned async tasks and provides mechanisms
-/// for graceful shutdown. It ensures all tasks complete before allowing
-/// the server to fully stop.
+/// Hold a guard for each task whose exit must be tracked. Manually registered
+/// tasks choose how to respond to [`stop`](Self::stop); tasks spawned through
+/// [`TaskSupervisorHandle::try_spawn`] drop their future when shutdown wins
+/// the select. Dropping the supervisor requests stop without waiting.
+///
+/// [`all_stopped`](Self::all_stopped) waits for these registrations to end.
+/// Application RPC handlers are not registered with the server's supervisors.
 ///
 /// # Examples
 ///
@@ -37,8 +38,8 @@ struct TaskSupervisorState {
 /// let supervisor = TaskSupervisor::create();
 /// let guard = supervisor.try_start_async_task().unwrap();
 /// tokio::spawn(async move {
-///     // Task work here
-///     drop(guard); // Automatically decrements running count
+///     guard.stopped().await;
+///     // Finish task-specific cleanup before the guard drops.
 /// });
 /// supervisor.stop();
 /// supervisor.all_stopped().await;
@@ -55,10 +56,10 @@ pub struct TaskSupervisor(Arc<TaskSupervisorState>);
 #[derive(Debug, Clone)]
 pub struct TaskSupervisorHandle(Arc<TaskSupervisorState>);
 
-/// RAII guard for tracking individual async tasks.
+/// Registration held for the lifetime of a tracked task.
 ///
-/// When dropped, automatically decrements the running task count
-/// and signals completion if this was the last task.
+/// Dropping it decrements the count and signals completion at zero. It does
+/// not cancel the task; retain it until all work being tracked has finished.
 #[derive(Debug)]
 pub struct TaskSupervisorGuard(Arc<TaskSupervisorState>);
 
@@ -72,13 +73,11 @@ impl TaskSupervisorState {
 }
 
 impl TaskSupervisor {
-    /// Creates a new task supervisor.
+    /// Creates a supervisor inside a Tokio runtime.
     ///
-    /// Automatically starts with one guard task that monitors for completion.
-    ///
-    /// # Returns
-    ///
-    /// Returns a new `TaskSupervisor` instance.
+    /// An internal task holds a guard until stop is requested, keeping
+    /// [`all_stopped`](Self::all_stopped) pending before shutdown even when no
+    /// other tasks are registered.
     #[must_use]
     pub fn create() -> Self {
         let supervisor = Self(Arc::default());
@@ -91,20 +90,17 @@ impl TaskSupervisor {
         supervisor
     }
 
-    /// Requests all tasks to stop.
+    /// Signals shutdown and rejects subsequent task registrations.
     ///
-    /// Cancels the stop token, signaling all tasks to gracefully shutdown.
+    /// Returns immediately. Manually registered tasks must observe the signal
+    /// or finish on their own; [`TaskSupervisorHandle::try_spawn`] races its
+    /// future against this signal. Await [`all_stopped`](Self::all_stopped) to
+    /// wait for outstanding guards to be released.
     pub fn stop(&self) {
         self.0.stop.cancel();
     }
 
-    /// Creates a drop guard for this supervisor.
-    ///
-    /// The returned guard will call `stop()` when dropped.
-    ///
-    /// # Returns
-    ///
-    /// Returns a `DropGuard` that calls `stop()` on drop.
+    /// Returns a guard that requests stop on drop without waiting for tasks.
     #[must_use]
     pub fn drop_guard(&self) -> DropGuard {
         self.0.stop.clone().drop_guard()
@@ -116,20 +112,15 @@ impl TaskSupervisor {
         TaskSupervisorHandle(self.0.clone())
     }
 
-    /// Returns a future that completes when stop is requested.
-    ///
-    /// # Returns
-    ///
-    /// Returns a future that resolves when `stop()` is called.
+    /// Waits for the stop signal; this does not wait for task exit.
     pub fn stopped(&self) -> WaitForCancellationFuture<'_> {
         self.0.stop.cancelled()
     }
 
-    /// Returns a future that completes when all tasks have stopped.
+    /// Waits for all registration guards, including the internal stop observer,
+    /// to be released after shutdown is requested.
     ///
-    /// # Returns
-    ///
-    /// Returns a future that resolves when the running task count reaches zero.
+    /// Only registered work is tracked. A forgotten guard keeps this pending.
     pub fn all_stopped(&self) -> WaitForCancellationFuture<'_> {
         self.0.stopped.cancelled()
     }
@@ -143,7 +134,8 @@ impl TaskSupervisor {
         TaskSupervisorGuard(self.0.clone())
     }
 
-    /// Starts tracking a task unless shutdown has already begun.
+    /// Registers a task unless shutdown has begun. Hold the returned guard until
+    /// the tracked work ends; registration alone does not cancel or spawn it.
     #[must_use]
     pub fn try_start_async_task(&self) -> Option<TaskSupervisorGuard> {
         try_start_async_task(&self.0)
@@ -157,7 +149,11 @@ impl Drop for TaskSupervisor {
 }
 
 impl TaskSupervisorHandle {
-    /// Spawns a task tracked by this supervisor, or rejects it after stop.
+    /// Registers and spawns a future, racing it against the stop signal.
+    ///
+    /// When shutdown wins, the future is dropped without completing. Returns
+    /// `None` and drops the unpolled future if registration observes shutdown.
+    /// Requires a Tokio runtime when accepted.
     pub fn try_spawn<F>(&self, future: F) -> Option<tokio::task::JoinHandle<()>>
     where
         F: Future<Output = ()> + Send + 'static,
@@ -171,13 +167,14 @@ impl TaskSupervisorHandle {
         }))
     }
 
-    /// Starts tracking a task unless shutdown has already begun.
+    /// Registers a task with the same guard contract as
+    /// [`TaskSupervisor::try_start_async_task`].
     #[must_use]
     pub fn try_start_async_task(&self) -> Option<TaskSupervisorGuard> {
         try_start_async_task(&self.0)
     }
 
-    /// Returns a future that completes when the owner requests shutdown.
+    /// Waits for the stop signal, without waiting for registered tasks to exit.
     pub fn stopped(&self) -> WaitForCancellationFuture<'_> {
         self.0.stop.cancelled()
     }
@@ -196,11 +193,7 @@ fn try_start_async_task(state: &Arc<TaskSupervisorState>) -> Option<TaskSupervis
 }
 
 impl TaskSupervisorGuard {
-    /// Returns a future that completes when stop is requested.
-    ///
-    /// # Returns
-    ///
-    /// Returns a future that resolves when the supervisor's `stop()` is called.
+    /// Waits for the stop signal while retaining this task's registration.
     pub fn stopped(&self) -> WaitForCancellationFuture<'_> {
         self.0.stop.cancelled()
     }

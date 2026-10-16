@@ -4,26 +4,28 @@ use tokio_util::sync::DropGuard;
 
 use crate::{Listener, Result, Router, SocketPoolConfig, State};
 
-/// RPC server that listens for and handles incoming requests.
+/// RPC server owning listeners, connection pools and a service [`Router`].
 ///
-/// The `Server` manages the lifecycle of an RPC server, including:
-/// - Service registration through a [`Router`]
-/// - Network listening on specified addresses
-/// - Connection management through socket pools
-/// - Request dispatching to registered service implementations
+/// Register services before [`create`](Self::create), then call
+/// [`listen`](Self::listen) for each address. Shutdown uses
+/// [`stop`](Self::stop) followed by [`join`](Self::join); it does not drain
+/// application handlers.
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// let mut router = Router::default();
-/// EchoService::ruapc_export(Arc::new(DemoImpl), &mut router);
+/// ```rust,no_run
+/// use ruapc::{Router, Server, SocketPoolConfig};
 ///
-/// let server = Server::create(router, &SocketPoolConfig::default()).unwrap();
-/// let server = Arc::new(server);
-///
-/// let addr = SocketAddr::from_str("127.0.0.1:8000").unwrap();
-/// server.listen(addr).await.unwrap();
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let server = Server::create(Router::default(), &SocketPoolConfig::default())?;
+/// let addr = server.listen("127.0.0.1:0".parse()?).await?;
+/// println!("Listening on {addr}");
+/// tokio::signal::ctrl_c().await?;
+/// server.stop();
 /// server.join().await;
+/// # Ok(())
+/// # }
 /// ```
 pub struct Server {
     state: Arc<State>,
@@ -32,26 +34,15 @@ pub struct Server {
 }
 
 impl Server {
-    /// Creates a new RPC server with the given router and configuration.
+    /// Creates shared state and connection pools without binding a listener.
     ///
-    /// # Arguments
-    ///
-    /// * `router` - The router containing registered service methods
-    /// * `config` - Socket pool configuration specifying transport protocol and options
+    /// Requires a Tokio runtime. Use [`listen`](Self::listen) to bind addresses.
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - Socket pool creation fails
-    /// - State initialization fails
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// # use ruapc::{Server, Router, SocketPoolConfig};
-    /// let router = Router::default();
-    /// let server = Server::create(router, &SocketPoolConfig::default()).unwrap();
-    /// ```
+    /// Returns configuration, schema-generation or socket-pool initialization
+    /// errors. With RDMA enabled in `config`, the listener mode must be TCP or
+    /// UNIFIED to support bootstrap.
     pub fn create(router: Router, config: &SocketPoolConfig) -> Result<Self> {
         #[cfg(feature = "rdma")]
         if config.rdma.is_some()
@@ -74,67 +65,40 @@ impl Server {
         })
     }
 
-    /// The server's shared state (router, socket pool, buffer pool);
-    /// useful for introspection such as
-    /// `State::rdma_path_report` when the `rdma` feature is enabled.
+    /// Shared state for buffer allocation, router inspection and, with the
+    /// `rdma` feature, `State::rdma_path_report`.
     pub fn state(&self) -> &Arc<State> {
         &self.state
     }
 
-    /// Stops the server, closing all listeners and connections.
+    /// Requests listener shutdown and connection cleanup.
     ///
-    /// This method initiates a graceful shutdown by:
-    /// - Stopping the listener from accepting new connections
-    /// - Stopping the socket pool to close existing connections
-    ///
-    /// Call [`join`](Self::join) after this to wait for shutdown to complete.
+    /// Returns immediately. Call [`join`](Self::join) to await infrastructure
+    /// shutdown. Running application handlers are not cancelled or drained.
     pub fn stop(&self) {
         self.listener.stop();
         self.state.socket_pool.stop();
     }
 
-    /// Waits for the server to fully shut down.
+    /// Waits for listener and connection-pool tasks to stop.
     ///
-    /// This method blocks until:
-    /// - All listeners have stopped accepting connections
-    /// - All socket pools have closed their connections
-    ///
-    /// Should be called after [`stop`](Self::stop).
+    /// Call [`stop`](Self::stop) first. This does not wait for application
+    /// handlers; applications that need a handler drain must track it themselves.
     pub async fn join(&self) {
         self.listener.join().await;
         self.state.socket_pool.join().await;
     }
 
-    /// Starts listening for incoming connections on the specified address.
-    ///
-    /// # Arguments
-    ///
-    /// * `addr` - The socket address to bind to
-    ///
-    /// # Returns
-    ///
-    /// Returns the actual address the server is listening on, which may differ
-    /// from the requested address if port 0 was specified.
+    /// Binds an address and starts accepting connections using the configured
+    /// listener mode. Returns the actual bound address, including an assigned
+    /// port when `addr` uses port zero. May be called for multiple addresses.
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The address cannot be bound
-    /// - The listener fails to start
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// # use ruapc::{Server, Router, SocketPoolConfig};
-    /// # use std::{net::SocketAddr, str::FromStr};
-    /// # #[tokio::main]
-    /// # async fn main() {
-    /// # let server = Server::create(Router::default(), &SocketPoolConfig::default()).unwrap();
-    /// let addr = SocketAddr::from_str("127.0.0.1:8000").unwrap();
-    /// let listening_addr = server.listen(addr).await.unwrap();
-    /// println!("Server listening on {}", listening_addr);
-    /// # }
-    /// ```
+    /// Returns [`ErrorKind::TcpBindFailed`](crate::ErrorKind::TcpBindFailed) if
+    /// binding or reading the bound address fails, or
+    /// [`ErrorKind::ConnectionClosed`](crate::ErrorKind::ConnectionClosed) after
+    /// the listener has stopped.
     pub async fn listen(&self, addr: SocketAddr) -> Result<SocketAddr> {
         self.listener.start_listen(addr, &self.state).await
     }
