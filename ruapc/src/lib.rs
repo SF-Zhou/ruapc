@@ -1,3 +1,32 @@
+//! Typed, bidirectional RPC over TCP, WebSocket, HTTP and optional RDMA.
+//!
+//! Define an async trait with [`service`], implement it, and register the
+//! implementation in a [`Router`]. A [`Server`] hosts that router; generated
+//! methods on [`Client`] use a [`Context`] and [`Endpoint`] to reach it.
+//!
+//! ## Configuration
+//!
+//! [`SocketPoolConfig`] controls listeners, connection resources and handler
+//! admission. TCP is the default listener; [`ListenMode::UNIFIED`] accepts
+//! multiple protocols on one port. [`Client`] controls connection/response
+//! budgets, retries and payload format. Payloads default to MessagePack;
+//! setting [`Client::use_msgpack`] to `false` selects JSON.
+//!
+//! The optional `rdma` feature requires libibverbs development files. With
+//! it enabled, the default socket configuration initializes RDMA resources;
+//! set its `rdma` field to `None` for stream-only operation.
+//!
+//! ## Remote memory
+//!
+//! [`ClientWithBuffers`] attaches owned read sources and write destinations.
+//! Handlers use [`Context::remote_read`] and [`Context::remote_write`] with
+//! logical [`CopyOp`] ranges. [`WithBuffers`] returns a response with available
+//! write buffers; [`RemoteIoError`] describes recovery after a failed transfer.
+//!
+//! See the [quick start](https://github.com/SF-Zhou/ruapc#example) for a complete
+//! service and the [documentation index](https://github.com/SF-Zhou/ruapc/blob/main/docs/README.md)
+//! for architecture, ownership contracts and runnable workloads.
+
 #![forbid(unsafe_code)]
 // Transport enums and client call glue use statically dispatched futures.
 // Their concrete implementations determine Send; user service traits instead

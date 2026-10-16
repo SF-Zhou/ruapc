@@ -124,8 +124,16 @@ impl Context {
     /// retain them beyond the call. Converting the error with `?` to [`Error`]
     /// drops any returned buffers.
     ///
-    /// RDMA checks source-request liveness after READ completion. This rejects
-    /// stale results but does not make source recovery wait for remote DMA.
+    /// For transfers that copy bytes, RDMA validates the completed READs with
+    /// an original-request waiter membership probe. With the original immutable
+    /// source still held and no request-ID reuse, a positive probe validates
+    /// the copy. It is not a precise deadline check.
+    ///
+    /// Source recovery after cancellation does not wait for remote DMA.
+    /// Failed validation can return readable destinations in [`RemoteIoError`];
+    /// those bytes are not a valid transfer result. See the
+    /// [source contract](https://github.com/SF-Zhou/ruapc/blob/main/docs/safe-boundaries.md#application-read-source-validation-and-recovery)
+    /// for the success argument and failure behavior.
     pub async fn remote_read(
         &self,
         ops: &[CopyOp],
@@ -188,11 +196,12 @@ impl Context {
     ///
     /// Nonempty transfers validate bounds, overflow, operation count, and
     /// destination overlap within the batch. Callers coordinate writes across
-    /// separate calls. RDMA sends a reverse `read_into_target` RPC: the client
-    /// RDMA-READs `local` into destinations owned by its QP until completion or
-    /// QP destruction. TCP/WS/HTTP send the bytes in a `write_inline` RPC.
-    /// Source recovery has the remote-DMA limitation described by
-    /// [`Client::with_read_buffers`](crate::Client::with_read_buffers).
+    /// separate calls. RDMA uses a reverse RPC: the client READs `local` into
+    /// owned destinations and replies after completion. The source is retained
+    /// while awaiting that response; this path does not use the pending probe
+    /// described in [`remote_read`](Self::remote_read). Failure or cancellation
+    /// can still recover the source before remote DMA finishes. TCP/WS/HTTP
+    /// instead send the bytes in an inline-copy RPC.
     ///
     /// The transfer happens *here*, inside the handler, so its latency and
     /// errors are directly observable. Pair the witness with a response

@@ -9,15 +9,11 @@ use crate::{
 
 use super::EndpointState;
 
-/// Shared state for the RPC system.
+/// Router, connection pools, request correlation and registered-memory resources.
 ///
-/// The `State` contains shared components used throughout the RPC system:
-/// - Router for method dispatch
-/// - Waiter for request/response correlation
-/// - Socket pool for connection management
-/// - Device collection and buffer pool for memory operations
-///
-/// This state is shared between the server and all active connections.
+/// Created by [`Server::create`](crate::Server::create) or [`Context::create`]
+/// and shared by their contexts and active connections. Use [`Context::state`]
+/// or [`Server::state`](crate::Server::state) to access it.
 pub struct State {
     /// Router containing registered service methods.
     pub router: Router,
@@ -25,9 +21,9 @@ pub struct State {
     pub(crate) waiter: Arc<Waiter>,
     /// Socket pool for managing connections.
     pub(crate) socket_pool: SocketPool,
-    /// Device collection for memory registration and Remote Read/Write.
+    /// Devices used to register buffer-pool memory; TCP occupies index zero.
     pub devices: Arc<Devices>,
-    /// Shared buffer pool for RDMA and memory operations.
+    /// Shared buffer pool for transports and application memory attachments.
     pub buffer_pool: Arc<BufferPool>,
     /// Metric emission helpers (see [`crate::metrics`]); the actual
     /// storage/export belongs to the user-installed [`metrics::Recorder`].
@@ -39,18 +35,14 @@ pub struct State {
 }
 
 impl State {
-    /// Creates a new state with the given router and configuration.
+    /// Validates configuration, discovers devices, builds public schemas, and
+    /// creates buffer/connection pools and response-waiter expiry tracking.
+    /// Requires a Tokio runtime. Built-in methods are registered by
+    /// [`Router::default`], before this function receives the router.
     ///
-    /// Internally discovers devices, creates a shared buffer pool, registers
-    /// the internal remote-memory service, and creates the socket pool.
-    ///
-    /// # Returns
-    ///
-    /// Returns an Arc-wrapped state and a drop guard for lifecycle management.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if OpenAPI generation or socket pool creation fails.
+    /// Returns shared state and a guard that requests connection-pool shutdown
+    /// on drop. Configuration, OpenAPI conversion and pool initialization errors
+    /// are propagated.
     pub(crate) fn create(
         mut router: Router,
         config: &SocketPoolConfig,
@@ -129,7 +121,8 @@ impl State {
         devices
     }
 
-    /// Handles a received message from a socket.
+    /// Dispatches requests with an incoming deadline, or delivers responses to
+    /// their waiter. Messages with neither flag are logged and ignored.
     pub fn handle_recv(self: &Arc<Self>, socket: &Socket, msg: Message) -> Result<()> {
         if msg.meta.is_req() {
             let ctx = Context::server_ctx(self, socket.clone(), msg.meta);
@@ -142,15 +135,14 @@ impl State {
         Ok(())
     }
 
-    /// Central handling of a dead connection: eagerly fails requests still
-    /// waiting on a response over it. Handlers already executing keep
-    /// running to completion; their responses are simply discarded when
-    /// the send fails.
+    /// Eagerly fails waiters bound to a dead connection. Running handlers are
+    /// not cancelled; a response send failure is discarded.
     pub(crate) fn connection_closed(&self, conn_id: u64, err: &crate::Error) {
         self.waiter.fail_connection(conn_id, err);
     }
 
-    /// Handles a new incoming stream connection.
+    /// Hands an accepted stream to the configured transport pool and logs
+    /// setup errors. Connection tasks are owned by that pool.
     pub async fn handle_new_stream(self: Arc<Self>, stream: RawStream, addr: SocketAddr) {
         if let Err(e) = self
             .socket_pool
@@ -161,7 +153,7 @@ impl State {
         }
     }
 
-    /// Creates a drop guard for state lifecycle management.
+    /// Requests connection-pool shutdown when the returned guard is dropped.
     pub(crate) fn drop_guard(&self) -> DropGuard {
         self.socket_pool.drop_guard()
     }

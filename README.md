@@ -79,9 +79,6 @@ protocols, and select the outbound transport in the endpoint, for example
 
 ## Run the demos
 
-The [demo guide](ruapc-demo/README.md) covers the server and client binaries,
-command-line options, transport setup and verified echo/read/write workloads.
-
 From this repository, start the server and run a client in another terminal:
 
 ```bash
@@ -89,123 +86,52 @@ cargo run -p ruapc-demo --release --bin server -- --listen-mode unified
 cargo run -p ruapc-demo --release --bin client -- tcp://127.0.0.1:8000
 ```
 
-The client also accepts `ws://` and `http://`. Add
-`--stress --coroutines 128 --secs 10` for a load test. The demo client uses JSON
-unless `--use-msgpack` is passed; the library's `Client::default()` uses MessagePack.
+The client also accepts `ws://` and `http://`. The demo defaults to JSON;
+`--use-msgpack` selects the library's default format. Open
+`http://127.0.0.1:8000/rapidoc` for interactive API documentation.
 
-HTTP methods and reflection are available without a typed client:
-
-```bash
-curl -s -H 'content-type: application/json' -d '"hello HTTP"' \
-  http://127.0.0.1:8000/EchoService/echo
-# {"Ok":"hello HTTP"}
-
-curl -s -H 'content-type: application/json' -d '{}' \
-  http://127.0.0.1:8000/_ruapc.meta/describe
-```
-
-Open `http://127.0.0.1:8000/rapidoc` for interactive documentation.
-Ordinary HTTP POST calls do not support reverse RPC; RuaPC's typed HTTP client
-uses an HTTP/2 bidirectional stream.
-
-For a base path, pass `--http-base-path /api/v1` to both the demo server and HTTP
-client (or set `SocketPoolConfig.http_base_path` in application code). RPC routes,
-the HTTP/2 stream and documentation then live at `/api/v1/ServiceName/method`,
-`/api/v1/_rpc` and `/api/v1/rapidoc`. See [built-in services](docs/builtin-services.md)
-for reflection and internal control methods.
+The [demo guide](ruapc-demo/README.md) covers HTTP calls, base paths, remote
+memory, load testing and CLI options. Ordinary HTTP POST calls are unary;
+RuaPC's typed HTTP client uses an HTTP/2 stream that supports reverse RPC.
 
 ## Remote read/write
 
-Clients attach owned buffers; servers address their concatenated logical lengths
-with `CopyOp { src_offset, dst_offset, len }`. Set each buffer's `len()` to the
-intended transfer length: pool allocations initially expose their full size class.
+Clients attach owned read sources and write destinations. Handlers address
+those buffers through logical `CopyOp` ranges, using RDMA READ or inline
+reverse RPC over the other transports. `WithBuffers<T>` pairs a response with
+recoverable client write buffers.
 
-For example, a service can read the client's source and copy it into the client's
-write space, whose total logical length must cover the transfer:
-
-```rust
-use ruapc::{Context, Result, WithBuffers};
-
-#[ruapc::service]
-trait BlobService {
-    async fn copy(&self, ctx: &Context, req: &()) -> Result<WithBuffers<u64>>;
-}
-
-struct Blob;
-
-impl BlobService for Blob {
-    async fn copy(&self, ctx: &Context, _req: &()) -> Result<WithBuffers<u64>> {
-        let data = ctx.remote_read_all().await?;
-        let total = data.iter().map(|buffer| buffer.len() as u64).sum();
-        let sent = ctx.remote_write_all(data).await?;
-        Ok(sent.reply(total))
-    }
-}
-```
-
-After registering the service, call it with allocated source and destination buffers:
-
-```rust,ignore
-let mut transfer = client.with_read_buffers(src).with_write_buffers(dst);
-let (total, buffers) = transfer.copy(&ctx, &()).await?.into_parts();
-let reusable_sources = transfer.take_read_buffers();
-```
-
-Read attachments can be reused across calls; attaching another source replaces
-them. `read_buffers()` provides shared views, and `take_read_buffers()` returns
-ownership only when no local reader or pending request holds the source. A `None`
-result preserves the source for a later attempt.
-
-Successful `WithBuffers` responses return available write destinations. After a
-failed call, `take_write_buffers()` recovers only buffers already returned to the
-wrapper. Cancelled or failed DMA can make recovery unavailable even after the QP
-eventually recycles its memory. Posted destinations remain held until completion
-or successful QP destruction. Read-source recovery does not prove that remote
-one-sided DMA has completed; see the [safety boundaries](docs/safe-boundaries.md).
+The [remote-memory guide](docs/remote-memory.md) shows a complete service and
+client call, buffer sizing and recovery. The [safety contract](docs/safe-boundaries.md)
+explains ownership, read-then-validate and behavior after cancellation or failure.
 
 ## RDMA
 
-Enable the `rdma` Cargo feature explicitly:
+Enable the optional feature:
 
 ```toml
 ruapc = { version = "0.2.0-alpha.6", features = ["rdma"] }
 ```
 
-Building requires a C compiler, `pkg-config`, libclang and the libibverbs development
-package (`libibverbs-dev` on Debian/Ubuntu). Running requires a usable RDMA device
-and sufficient locked-memory allowance. With the feature enabled,
-`SocketPoolConfig::default()` initializes RDMA; set `config.rdma = None` to disable
-it for a particular context. RDMA servers require TCP or UNIFIED listen mode for
-bootstrap.
+RDMA builds need a C compiler, `pkg-config`, libclang and libibverbs development
+files. Running needs a usable device and sufficient locked-memory allowance.
+With the feature enabled, `SocketPoolConfig::default()` initializes RDMA;
+set `config.rdma = None` to disable it for a context. Servers need TCP or
+UNIFIED listen mode for bootstrap.
 
-```bash
-sudo prlimit --pid $$ -l=unlimited
-cargo run -p ruapc-demo --release --bin server --features rdma -- --listen-mode unified
-# In another terminal with a sufficient locked-memory limit:
-cargo run -p ruapc-demo --release --bin client --features rdma -- rdma://127.0.0.1:8000
-```
+See [build prerequisites](CONTRIBUTING.md#prerequisites),
+[demo RDMA setup](ruapc-demo/README.md#configuration-and-rdma) and
+[connection configuration](docs/rdma-connection.md).
 
-See [RDMA connection establishment](docs/rdma-connection.md) for configuration,
-path selection and diagnostics.
+<a id="benchmarks-and-workspace"></a>
 
-## Benchmarks and workspace
+## Further reading
 
-```bash
-cargo bench -p ruapc --bench echo
-cargo bench -p ruapc --bench remote_memory
-```
-
-Repository tests and RPC benchmarks enable RDMA through a development dependency.
-See [benchmark instructions](docs/benchmark.md) for prerequisites, workload controls
-and reproducible comparisons.
-
-| Crate | Responsibility |
-| --- | --- |
-| `ruapc` | Clients, servers, routing, transports and remote-memory API |
-| [`ruapc-bufpool`](ruapc-bufpool/README.md) | Buddy/slab allocation and device registration |
-| `ruapc-macro` | `#[service]` code generation |
-| [`ruapc-rdma`](ruapc-rdma/README.md) | libibverbs bindings and owned work requests |
-| [`ruapc-demo`](ruapc-demo/README.md) | Example server/client and verified workloads; not published |
+- [Documentation index](docs/README.md): guides, crate APIs and design contracts.
+- [Architecture](DESIGN.md): workspace responsibilities and request lifecycle.
+- [Contributing](CONTRIBUTING.md): environment setup and validation commands.
+- [Benchmarks](docs/benchmark.md): workloads, controls and comparison method.
+- [Changelog](CHANGELOG.md): released changes and migrations.
 
 ## License
 

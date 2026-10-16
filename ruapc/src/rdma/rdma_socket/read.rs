@@ -300,8 +300,9 @@ impl RdmaSocket {
             .await
             .map_err(|(error, buffers)| RemoteIoError::new(error, buffers))?;
 
-        // Reject results from expired requests. This check is not a remote
-        // completion lease and cannot keep the peer's source alive during DMA.
+        // Validate after READ completion; see Context::remote_read for the
+        // immutable-source and request-identity assumptions. Error destinations
+        // below are recoverable memory, not validated transfer results.
         let request = RequestStatusRequest {
             request_id: ctx.msg_meta.msgid,
         };
@@ -328,9 +329,9 @@ impl RdmaSocket {
         ops: &[CopyOp],
         local: Vec<Buffer>,
     ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
-        // The client READs into its owned, pinned target. ReadSource retains
-        // our source through the reverse RPC and local inline readers, but
-        // cannot observe remote DMA still running after a failed/cancelled RPC.
+        // Retain the source until the reverse RPC replies after client READs.
+        // Failure recovery still proves only local uniqueness; Context::remote_write
+        // documents the distinction from remote completion.
         let req = ReadIntoTargetRequest {
             request_id: ctx.msg_meta.msgid,
             ops: ops.to_vec(),

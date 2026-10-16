@@ -1,25 +1,46 @@
 # Documentation
 
-Start with the [project README](../README.md) for service definitions, clients
-and examples. Public API details live in rustdoc; build them with
-`cargo doc -p ruapc --no-deps`.
+Start with the [project quick start](../README.md#example). For public API details,
+run `cargo doc -p ruapc --no-deps --open`.
 
-| Topic | Document |
+## Use and operate RuaPC
+
+| Task | Guide |
 |---|---|
-| Workspace, request lifecycle and ownership | [Architecture](../DESIGN.md) |
-| Build requirements and validation | [Contributing](../CONTRIBUTING.md) |
-| Example server/client, CLI options and echo/read/write workloads | [Demo guide](../ruapc-demo/README.md) |
-| Registration, DMA ownership and known limitations | [Safety boundaries](safe-boundaries.md) |
-| Reflection and internal RPC services | [Built-in services](builtin-services.md) |
-| RDMA discovery and connection setup | [Connection lifecycle](rdma-connection.md) |
-| WRIDs, completion authority and QPN reuse | [Completion identity](wrid.md) |
-| CQ budgets, READ admission and retirement | [RDMA capacity](rdma-capacity.md) |
-| Completion routing and poller maintenance | [QP registry](qp-registry.md) |
-| Workloads, measurement controls and comparison method | [Benchmarks](benchmark.md) |
-| Released changes and migration notes | [Changelog](../CHANGELOG.md) |
+| Define a service and make a typed call | [Quick start](../README.md#example) |
+| Run examples, HTTP calls or verified load tests | [Demo](../ruapc-demo/README.md) |
+| Attach buffers, copy logical ranges and recover memory | [Remote memory](remote-memory.md) |
+| Allocate and register buffers | [Buffer pool](../ruapc-bufpool/README.md) |
+| Use the low-level verbs crate | [RDMA crate](../ruapc-rdma/README.md) |
+| Set up a development or test environment | [Contributing](../CONTRIBUTING.md) |
+| Measure and compare performance | [Benchmarks](benchmark.md) |
+| Upgrade between releases | [Changelog](../CHANGELOG.md) |
 
-These documents describe the current implementation. Historical experiment
-reports, raw samples, build logs and rejected patches are available in Git
-history; they are not maintained alongside current documentation. Keep new
-benchmark outputs outside `docs/` and record their source revision, workload
-and environment when sharing results.
+## Implementation contracts
+
+Each guide owns a distinct part of the design. Start at
+[architecture](../DESIGN.md) for the module map and request lifecycle.
+
+| Contract | Reference |
+|---|---|
+| Metadata, payload formats and framing | [Wire format](../DESIGN.md#message-ownership-and-framing) |
+| Registration, DMA ownership, source validation and recovery | [Safety boundaries](safe-boundaries.md) |
+| Reflection, internal RPCs and private payload control fields | [Built-in services](builtin-services.md) |
+| RDMA bootstrap, negotiation, paths and peer maintenance | [Connection lifecycle](rdma-connection.md) |
+| WRIDs, completion authority and QPN reuse | [Completion identity](wrid.md) |
+| Queue/byte budgets, READ admission and CQ credit retirement | [Capacity](rdma-capacity.md) |
+| CQ routing, dispatch, bounded drains and shutdown | [Poller](qp-registry.md) |
+| Service declaration rules and generated API | [Service macro](../ruapc-macro/src/lib.rs) |
+
+## Maintaining the docs
+
+Update the guide that owns a contract; other pages should summarize it and
+link there. Keep README focused on first use, DESIGN on module responsibilities,
+crate READMEs on their APIs, and rustdoc on each caller's obligations. Avoid
+copying configuration tables, protocol proofs or validation commands between
+these layers.
+
+Document current behavior in English, matching code names and units. Keep
+historical changes in the changelog and raw benchmark samples, build logs and
+rejected experiments outside `docs/`. Preserve useful section anchors and check
+links and examples when moving content.

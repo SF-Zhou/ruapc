@@ -4,8 +4,21 @@ RuaPC reserves `_ruapc.*` for framework services by convention. Application
 services default to their Rust trait name or choose a wire name with
 `#[ruapc::service(name = "...")]`.
 
-The built-in methods below return serialized `Result<T, Error>` envelopes.
-A `()` request is JSON `null` or MessagePack `nil`.
+This page catalogs wire methods and their exposure. The methods return
+serialized `Result<T, Error>` envelopes; a `()` request is JSON `null` or
+MessagePack `nil`.
+
+## Exposure rules
+
+| Entry point | Public methods | Internal methods |
+|---|---:|---:|
+| Framed peer RPC: TCP/WS/HTTP stream/RDMA | yes | yes |
+| Unary HTTP `/Service/method` | yes | no (404) |
+| Reflection and OpenAPI | yes | no |
+
+`#[ruapc::service(internal)]` selects these visibility rules. Internal visibility
+does not authenticate peers. Registration rejects duplicate wire method names
+instead of replacing handlers.
 
 ## Public reflection: `_ruapc.meta`
 
@@ -27,7 +40,7 @@ the same visibility rules. See [reflection types and handlers](../ruapc/src/serv
 
 ## Internal remote memory: `_ruapc.memory`
 
-These reverse RPCs implement `Context::remote_read` and `remote_write`.
+These reverse RPCs implement the [remote-memory API](remote-memory.md).
 Their Rust trait and request types are crate-private.
 
 | Method | Request | Success value | Data path |
@@ -35,28 +48,18 @@ Their Rust trait and request types are crate-private.
 | `_ruapc.memory/read_inline` | Original request ID and `CopyOp` batch | Bytes in operation order | TCP/WS/HTTP read; data in response. |
 | `_ruapc.memory/write_inline` | Original request ID, `CopyOp` batch, bytes | `()` | TCP/WS/HTTP write; data in request. |
 | `_ruapc.memory/read_into_target` | Original request ID and `CopyOp` batch; source in `MsgMeta.read_regions` | `()` | Client RDMA-READs server buffers into its pinned target. |
-| `_ruapc.memory/request_is_pending` | Original request ID | `bool` | Post-READ source-request liveness check. |
+| `_ruapc.memory/request_is_pending` | Original request ID | `bool` | Post-READ source-request waiter membership check. |
 
-`read_inline` resolves the request ID to an owned source and validates logical
-offsets; peer-provided addresses cannot select local allocations. The handler
-retains the source through its CPU copy. Inline byte fields use MessagePack
-`bin` encoding.
-
-`read_into_target` moves the client destinations into a QP-owned READ plan;
-CPU copies and competing DMA cannot access that target until buffers return.
-The pending-request probe rejects stale one-sided READ results. It does not
-acknowledge remote DMA completion or make source recovery wait for it.
-See [request types and handlers](../ruapc/src/services/memory_service.rs) and
-[ownership boundaries](safe-boundaries.md).
-
-Large serialized RDMA request/response payloads use separate private transport
-controls, described below. Their source-completion contract does not change
-the lifetime limitation of these application attachment operations.
+Inline byte fields use MessagePack `bin` encoding. The request layouts and
+validation handlers are in [memory_service.rs](../ruapc/src/services/memory_service.rs).
+For the meaning of a successful READ, waiter membership, error-buffer contents,
+and source recovery, see
+[read validation and recovery](safe-boundaries.md#application-read-source-validation-and-recovery).
 
 ## Internal RDMA bootstrap: `_ruapc.rdma`
 
-With the `rdma` feature, a TCP bootstrap connection discovers devices and
-establishes queue pairs. Peers must advertise bootstrap protocol version **2**.
+With the `rdma` feature, the connection pool uses these methods over TCP.
+Peers must advertise bootstrap protocol version **2**.
 
 | Method | Request | Success value | Purpose |
 |---|---|---|---|
@@ -65,19 +68,12 @@ establishes queue pairs. Peers must advertise bootstrap protocol version **2**.
 | `_ruapc.rdma/commit_connection` | `ConnectionLease` | `()` | Idempotently confirms initiator ownership. |
 | `_ruapc.rdma/cancel_connection` | `ConnectionLease` | `()` | Best-effort rollback. |
 
-The advertisement carries device load, directional connection limits, ports,
-and GIDs. Prepare selects a device/port/GID and exchanges QP endpoints and
-resolved limits. A lease identifies the attempt and accepted connection.
-Local send limits match peer receive limits and vice versa; mismatched resolved
-limits fail setup. Scatter/gather limits stay local, and CQs are shared rather
-than negotiated per connection.
-The optional `max_large_msg_size` limit advertises support for large-payload
-READs; a missing or zero value disables that path without changing bootstrap
-protocol version 2.
-
-Commit records ownership; activation also requires a successful data-plane
-receive. See [RDMA connection establishment](rdma-connection.md) for the
-sequence and [bootstrap wire types](../ruapc/src/rdma/rdma_service.rs) for fields.
+The advertisement carries device load, directional limits, ports, and GIDs.
+A lease contains `attempt_id` and `accepted_connection_id`. See
+[connection establishment](rdma-connection.md) for negotiation, activation,
+lease expiry, and rollback; wire types live in
+[rdma_service.rs](../ruapc/src/rdma/rdma_service.rs) and
+[endpoint.rs](../ruapc/src/rdma/endpoint.rs).
 
 ## Private RDMA payload controls
 
@@ -88,26 +84,14 @@ types in addition to ordinary RPC messages:
 |---|---|---|
 | Offer | Transfer ID, serialized payload length, payload regions, original metadata | Advertise immutable transport-owned source bytes for READ. |
 | Finish | Transfer ID | Confirm that all payload READs completed, or that none was posted. |
-| Finish reply | Transfer ID, completion-validity boolean | Permit dispatch only while the source request remains valid. |
+| Finish reply | Transfer ID, completion-validity boolean | Report whether the completed payload may be dispatched. |
 
-These controls are named-field MessagePack frames parsed directly by the
-connection's RDMA dispatcher. They are not service methods: application
-routing, reflection, unary HTTP and the `_ruapc.memory` interface cannot
-invoke them. Original application read/write attachment regions stay in
-the metadata; the offer's payload regions occupy a separate field.
+These named-field MessagePack controls are parsed by the RDMA dispatcher,
+outside service routing; reflection, unary HTTP, and `_ruapc.memory` cannot
+invoke them. The offer preserves original application read/write regions in
+its metadata and carries serialized-payload regions in a separate field.
 
-Controls bypass handler admission and use a bounded queue for finish/reply
-progress. See [message framing](../DESIGN.md#message-ownership-and-framing),
-[source ownership](safe-boundaries.md#large-payload-source-ownership) and
-[capacity](rdma-capacity.md#large-payload-admission-and-cleanup).
-
-## Exposure rules
-
-| Entry point | Public methods | Internal methods |
-|---|---:|---:|
-| Framed peer RPC: TCP/WS/HTTP stream/RDMA | yes | yes |
-| Unary HTTP `/Service/method` | yes | no (404) |
-| Reflection and OpenAPI | yes | no |
-
-`#[ruapc::service(internal)]` selects these internal visibility rules.
-Registration rejects duplicate wire method names instead of replacing handlers.
+See [framing](../DESIGN.md#message-ownership-and-framing),
+[source ownership](safe-boundaries.md#large-payload-source-ownership), and
+[admission and cleanup](rdma-capacity.md#large-payload-admission-and-cleanup).
+This private completion protocol does not extend to application attachments.

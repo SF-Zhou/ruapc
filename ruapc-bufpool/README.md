@@ -16,6 +16,8 @@ The pool grows in registered 64 MiB blocks. Requests are rounded up to these cla
 `async_allocate(size)` waits for capacity to return. Both reject zero and sizes
 above 64 MiB. Growth and device registration run outside allocator locks but
 still execute on the calling thread, including in the async API.
+`BufferPool::allocation_capacity(size)` reports the size class without
+allocating or reserving capacity.
 
 `BufferPoolBuilder` controls the memory budget (256 MiB by default), lazy merging,
 empty-slab caching, thread caches and starvation protection. Choose a budget in
@@ -54,13 +56,9 @@ fn main() -> std::io::Result<()> {
 `DeviceSet<D>` combines a TCP device at index zero with additional devices.
 `EmptyDevices` disables registration. A safe `Device` wrapper supplies identity
 and an audited `MemoryRegistrar`; it never receives pool backing memory itself.
-Custom `MemoryRegistrar` and `Devices` implementations are unsafe contracts:
-registration may retain backing memory but must preserve each allocation's
-lifetime and shared/exclusive byte access. It grants no independent permission
-to read or write those bytes.
-
-Public buffers retain the pool. Internal slab backing tokens do not, avoiding
-an ownership cycle. Device registrations are destroyed before backing memory.
+Custom `MemoryRegistrar` and `Devices` implementations must uphold the
+[registration and byte-access contracts](../docs/safe-boundaries.md#registration-and-byte-access).
+Device registrations are destroyed before backing memory.
 `TcpDevice::read_memory` is unsafe: the caller must keep the requested allocation
 alive and prevent concurrent writes throughout the copy.
 
@@ -68,30 +66,37 @@ alive and prevent concurrent writes throughout the copy.
 
 | Module | Responsibility |
 | --- | --- |
-| `pool.rs`, `pool/builder.rs` | Public API, allocation transitions and configuration |
-| `pool/allocator.rs` | Budget, buddy splitting, free lists and lazy merging |
-| `pool/allocator/waiters.rs` | Direct handoff, cancellation and starvation reservations |
-| `pool/small.rs`, `slab.rs` | Slab classes, chunk ownership and reclamation |
-| `thread_cache.rs` | Thread magazines and their pool registry |
-| `buddy.rs` | Backing regions and allocation metadata |
+| [`pool.rs`](src/pool.rs), [`pool/builder.rs`](src/pool/builder.rs) | Public API, allocation transitions and configuration |
+| [`pool/allocator.rs`](src/pool/allocator.rs), [`waiters.rs`](src/pool/allocator/waiters.rs) | Budget, merging, direct handoff and starvation reservations |
+| [`pool/small.rs`](src/pool/small.rs), [`slab.rs`](src/slab.rs), [`thread_cache.rs`](src/thread_cache.rs) | Slab classes, chunk ownership, thread caches and reclamation |
+| [`buddy.rs`](src/buddy.rs), [`aligned.rs`](src/aligned.rs) | Backing regions, allocation metadata and initialized memory |
 
 Cache locks are released before acquiring slab or buddy locks. Slab locks may
-precede the buddy mutex; the reverse order is forbidden. Buddy metadata changes
-stay under that mutex, while buffers can read immutable registration keys.
-See [DESIGN.md](../DESIGN.md) for workspace ownership boundaries.
+precede the buddy mutex; the reverse order is forbidden. `BuddyState` keeps
+mutable tree metadata and intrusive nodes behind `UnsafeCell`, accessed only
+under the buddy mutex. Registrations stay immutable; the allocator never borrows
+an entire published block mutably. Self-referencing nodes are initialized after
+the block has aliasable ownership so moves cannot invalidate their links.
 
-## Tests and benchmarks
+Public buffers retain the pool; internal slab backing tokens do not, avoiding
+a pool/slab/buffer ownership cycle. Chunk ownership moves across cache
+boundaries. Growth failure restores reserved budget; cancelling a waiter hands
+reserved capacity to another waiter or releases it to the allocator.
+
+<a id="tests-and-benchmarks"></a>
+
+## Build and validation
+
+This crate needs no RDMA libraries or device, including for its tests:
 
 ```bash
 cargo test -p ruapc-bufpool
+cargo doc -p ruapc-bufpool --no-deps
 cargo bench -p ruapc-bufpool --bench lazy_merge
 cargo bench -p ruapc-bufpool --bench contention
 cargo bench -p ruapc-bufpool --bench initialization
 ```
 
-On Linux, `RUAPC_BENCH_CPU_BASE=N` pins contention worker `i` to CPU `N+i`
-and the coordinator to `N+16`. Select available physical cores and bind memory
-to their NUMA node. To compare one case in fresh processes, set
-`RUAPC_BENCH_SIZE` (65536 or 1048576 bytes) and `RUAPC_BENCH_THREADS`
-(1, 2, 4, 8 or 16). Keep placement, harness and pool lifecycle identical between
-versions. See [benchmark instructions](../docs/benchmark.md).
+See [allocator benchmark controls](../docs/benchmark.md#allocator-harnesses)
+for case selection, CPU placement and measurement boundaries, and
+[workspace validation](../CONTRIBUTING.md) for contribution checks.

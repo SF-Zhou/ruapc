@@ -1,325 +1,169 @@
 # RuaPC architecture
 
-RuaPC is a Rust workspace for bidirectional RPC over TCP, WebSocket, HTTP
-and optional RDMA. This document describes the implementation and the
-invariants that a change must preserve.
+This document maps modules and the RPC lifecycle. Detailed contracts live in
+the [topic guides](docs/README.md); public types and methods are documented in
+rustdoc.
 
 ## Workspace and dependency direction
 
-| Crate | Responsibility | Depends on |
+| Crate | Responsibility | Workspace dependencies |
 |---|---|---|
-| `ruapc-bufpool` | Registered memory, buddy allocation, slab and thread caches | Device registration contracts |
-| `ruapc-rdma` | libibverbs ownership, owned work requests and completion evidence | `ruapc-bufpool` |
-| `ruapc-macro` | Parse and validate service traits, generate calls and handlers | Rust syntax and token libraries |
-| `ruapc` | Request lifecycle, routing, transport policy and remote memory | The three crates above; RDMA is optional |
-| `ruapc-demo` | Runnable services and verified workloads | `ruapc` |
+| `ruapc-bufpool` | Allocation, caches and device registration | None |
+| `ruapc-rdma` | Verbs resources, owned work requests and completions | `ruapc-bufpool` |
+| `ruapc-macro` | Service validation and code generation | None at runtime |
+| `ruapc` | RPC lifecycle, routing, transports and remote memory | Bufpool, macro; optional RDMA |
+| `ruapc-demo` | Service host, typed caller and verified workloads | `ruapc` |
 
-Runtime transport selection uses concrete enum variants. Async transport
-calls remain statically dispatched; no boxed future is introduced to unify
-transports. The router's registered service closures are the application
-extension boundary: they capture arbitrary user service implementations and
-schedule concrete handler futures.
+Transport selection uses concrete enums (`Socket`, `SocketPool`, `HttpSocket`)
+and statically dispatched futures. Registered service closures and device
+registrars are the trait-object extension boundaries.
 
-The core crate enforces `#![forbid(unsafe_code)]`. Allocator, registration and
-verbs code belongs in its dependencies. Their safe APIs must own the memory
-used by hardware and validate the evidence for returning it; accepting raw
-addresses alongside a caller's ownership promise does not establish this boundary.
+The core crate forbids unsafe code. Allocation, registration and verbs belong
+in its dependencies, whose APIs enforce local memory ownership and completion
+evidence. See [safety boundaries](docs/safe-boundaries.md) for these contracts
+and the separate application-source validation scheme.
 
 ## Core library boundaries
 
-| Module | Owns | Does not own |
-|---|---|---|
-| `client` | Client settings, attachments, acquire/send retries, response decoding, generated-call contracts | Transport framing and server dispatch |
-| `core` | Contexts, endpoint health, server/listener state, method registry and handler admission | Memory-transfer algorithms |
-| `core/router/schema` | Public/internal schema generation and OpenAPI projection | Runtime method invocation |
-| `msg` | Metadata, payload decoding, direct serialization and shared stream framing | Connections or scheduling |
-| `sockets` | Concrete transports, connection queues, connection maps and close-once state | Registered-memory ownership |
-| `remote_memory` | Logical spaces, copy validation, inline fallback, owned read sources, pinned write targets and completion witnesses | QP work-request posting |
-| `rdma` | Path selection, bootstrap, connections, READ execution and CQ polling | Application dispatch policy |
-| `task` | Supervised background tasks and request/response correlation | Handler cancellation policy |
-| `metrics` | Cached facade handles and scoped request accounting | Rendering or exporting metrics |
+| Module | Responsibility |
+|---|---|
+| `client` | Settings, attachments, connection acquisition, retries and response decoding |
+| `core` | Contexts, endpoint health, listeners, method registration and handler admission |
+| `core/router/schema` | Service schemas and OpenAPI projection |
+| `msg` | Metadata, payload codecs, direct serialization and stream framing |
+| `sockets` | Concrete transports, connection queues, maps and closure |
+| `remote_memory` | Logical copy spaces, validation, inline copies and buffer recovery |
+| `rdma` | Path selection, bootstrap, READ execution and CQ polling |
+| `task` | Background-task supervision and response waiters |
+| `metrics` | Cached recorder handles and scoped request accounting |
 
 `Context` combines shared `State`, a destination, incoming metadata and a
-propagated deadline. Its `remote_*` methods are implemented in
-`remote_memory/context.rs`; the context module itself concerns request
-lifetime and response delivery. A context created for another endpoint
-inherits the deadline but starts with fresh message metadata.
+deadline. Changing its destination preserves the deadline and clears message
+metadata. Its `remote_*` methods live in `remote_memory/context.rs`.
 
 ## Request lifecycle
 
-1. A generated service method enters `client/call.rs`, which selects the
-   plain or buffer-returning contract by type. Both reach the same request
-   executor in `client/request.rs`.
-2. The executor validates the destination and attachments, ranks endpoints
-   and acquires a connection under a connection deadline. Alternative
-   endpoints can preconnect through the pool's task supervisor.
-3. After acquisition and bandwidth admission, the executor allocates a
-   waiter and binds the wrapper's existing read source and write target to it.
-   Connection setup does not consume
-   the response budget. Nested calls cap both budgets at the parent deadline.
-4. The transport binds the waiter to its process-unique connection ID before
-   checking closure and enqueueing the bytes. TCP, WebSocket and HTTP/2 share
-   this ordering in `sockets/channel.rs`. Queue admission uses the request's
-   existing absolute response deadline; a full queue waits for capacity,
-   expiry or connection closure. A reserved slot is checked again before
-   synchronous submission, and request metadata reflects the remaining
-   admission budget. RDMA pending sends use the same admission helper.
-   Available capacity uses a synchronous fast path. Only a full queue creates
-   and boxes the concrete timer/close-notification future, keeping this state
-   out of ordinary send futures without dynamic dispatch. Response waiting
-   keeps the shared expiry sweep. Accepted messages are not removed from
-   send queues when their requests expire.
-   RDMA bounds both its ingress channel and poller FIFO to 1024 business
-   messages each; moving messages between them cannot bypass the combined
-   2048-message limit. Posted WRs and large sources use separate budgets.
-5. Acquire/send failures can retry only when the transport has not accepted
-   the message. Once sent, the client awaits exactly one result: an ambiguous
-   timeout or connection loss is never retried automatically.
-6. The server reserves in-flight capacity atomically, rejects overload and
-   drops expired requests before invoking a handler. Deadline expiry does not
-   cancel a running handler; long-running handlers can inspect `Context::is_expired`.
-7. Response, connection failure or the periodic expiry sweep removes the
-   waiter. Unary HTTP creates its waiter only after the complete request body
-   arrives, matching framed transports. Cancelling a pending receive removes
-   its waiter through a cleanup guard.
-   Method accounting settles through a guard on completion, cancellation and
-   panic, without registering a timer for each request.
+1. Generated methods enter `client/call.rs`. Plain and buffer-returning calls
+   use the same executor in `client/request.rs`; the result type selects the
+   response contract.
+2. The client validates attachments, ranks endpoints and acquires a connection
+   within the connection budget. Alternatives may preconnect through the task
+   supervisor.
+3. The response budget starts after connection acquisition and includes
+   bandwidth and send-queue admission. Nested calls cap both budgets at the
+   parent's remaining time. The client allocates its waiter after bandwidth
+   admission and attaches the read source and write target.
+4. Before queueing, the transport binds the waiter to its connection ID and
+   checks closure. A full queue waits for capacity, deadline or closure;
+   submission rechecks state and advertises the remaining admission budget.
+   TCP/WS/HTTP share this logic in `sockets/channel.rs`; RDMA uses the same
+   admission helper. Accepted messages stay queued even if their requests expire.
+5. Only failures before transport acceptance can retry. After acceptance the
+   client waits for one result; ambiguous timeouts and connection loss do not
+   trigger automatic retries.
+6. Server dispatch reserves capacity atomically and drops expired requests
+   before execution. Generated handlers contain panics. Running handlers are
+   not cancelled by deadline expiry; they can poll `Context::is_expired()`.
+7. A response, connection failure, cancellation guard or expiry sweep removes
+   the waiter. Response expiry uses a shared 50 ms sweep, subject to scheduler
+   delay. Unary HTTP allocates its response waiter after receiving the complete
+   request body.
 
-Connection teardown is idempotent. A stale connection may evict only itself,
-never a replacement stored under the same peer address. Normal RDMA poller
-removal also waits for pending READs and flow credits to settle. Fatal shutdown
-releases the poller's socket owners; QPs retained elsewhere keep their DMA holds
-until completion or successful destruction.
+Connection closure is idempotent and eagerly fails its waiters. Eviction checks
+connection identity so an old connection cannot remove its replacement. RDMA
+shutdown additionally follows the [poller and DMA cleanup rules](docs/qp-registry.md#closing-a-connection).
+
+Metrics use the `metrics` facade; applications install a recorder before
+traffic. Per-method handles are cached per `State`, and guards settle accounting
+on completion, cancellation and panic. Only `server_inflight` has a local value,
+used for admission control.
 
 ## Message ownership and framing
 
-`msg/meta.rs` defines routing fields and payload-format flags. Metadata is
-always MessagePack with field names, so decoding never depends on a flag
-inside the yet-to-be-decoded metadata. `Client::default()` selects MessagePack
-payloads; clearing its `use_msgpack` option selects JSON.
+Metadata is always named-field MessagePack. `UseMessagePack` selects only the
+payload decoder; default clients use MessagePack, otherwise JSON. Compatible
+metadata fields use `#[serde(default)]` and omit empty/default values where
+appropriate. See [`MsgMeta`](ruapc/src/msg/meta.rs) for fields and defaults.
 
-`msg/encode.rs` writes metadata and payload directly into transport-owned
-storage. It backfills lengths after serialization. `msg/message.rs` checks
-bounds before reading metadata and advances the payload view without copying
-its bytes.
+`msg/encode.rs` serializes directly into transport storage and backfills lengths.
+`msg/message.rs` validates bounds before decoding metadata and advances the
+payload view without copying.
 
 | Carrier | Frame |
 |---|---|
-| TCP, HTTP/2 bidirectional stream | `[RUA!: 4B][body_len: 4B][meta_len: 4B][meta][payload]` |
+| TCP, HTTP/2 stream | `[RUA!: 4B][body_len: 4B][meta_len: 4B][meta][payload]` |
 | WebSocket binary message | `[meta_len: 4B][meta][payload]` |
 | RDMA inline message | `[frame_len: 4B][meta_len: 4B][meta][payload]` |
 | RDMA large-payload control | `[0: 4B][control_len: 4B][kind: 1B][named MessagePack body]` |
-| Unary HTTP | JSON request/response bodies with routing supplied by the URL |
+| Unary HTTP | JSON bodies; routing comes from the URL |
 
-Lengths are big-endian `u32`s. `body_len` and `frame_len` both count the
-`meta_len` prefix, metadata and payload, excluding their outer headers.
-`control_len` counts the kind byte and control body. Control kinds are offer
-(1), finish (2), and finish reply (3). Both RDMA frame forms can be aggregated
-in one receive buffer.
+Lengths are big-endian `u32`s. `body_len` and `frame_len` count the `meta_len`
+prefix, metadata and payload. `control_len` counts the kind byte and control
+body; kinds are offer (1), finish (2) and finish reply (3).
 
-TCP and HTTP/2 share `msg/frame.rs`, including the send/receive size limit and
-incremental parser. Incomplete frames remain buffered; complete bodies are
-split out without copying. RDMA framing lives in `rdma/frame.rs` and is
-independent of the polling machinery. Aggregated RDMA frames consume one
-receive credit for the entire SEND, irrespective of message count.
-
-RDMA peers negotiate `max_large_msg_size` separately from the inline receive
-buffer size, `max_msg_size`. A missing or zero large-message limit disables
-the extension. `rdma/rdma_socket/encode.rs` serializes each message once,
-growing registered storage as needed. Messages fitting the inline limit keep
-their existing wire format. Larger requests and responses send an offer with
-the original metadata and separate payload regions, then the receiver READs
-the serialized payload into owned registered storage. Application attachment
-regions in the original metadata remain unchanged.
-
-`rdma/rdma_socket/large.rs` retains each published source until a finish
-control on that connection proves that the receiver has completed its READs
-or posted none. The receiver waits for the source's finish reply before
-dispatching the message. Request confirmation checks its original waiter,
-connection identity and deadline; expiry rejects dispatch without releasing
-an unconfirmed source. Transfer IDs never wrap or repeat on a connection.
-Finish controls use a bounded queue ahead of queued business messages and
-bypass handler admission, while consuming normal SEND credits. See
-[source ownership](docs/safe-boundaries.md#large-payload-source-ownership) and
-[transfer budgets](docs/rdma-capacity.md#large-payload-admission-and-cleanup).
+TCP and HTTP/2 share the size limit and incremental parser in `msg/frame.rs`.
+Incomplete frames remain buffered; complete bodies are split without copying.
+RDMA framing lives in `rdma/frame.rs`, outside the poll loop. Inline and control
+frames can share a receive buffer; the whole SEND consumes one receive credit.
+Large payloads use the [private offer/finish controls](docs/builtin-services.md#private-rdma-payload-controls),
+with separate [storage and queue budgets](docs/rdma-capacity.md#large-payload-admission-and-cleanup).
 
 ## Remote memory
 
-A read or write space is an ordered list of registered regions, concatenated
-by logical length. A local buffer list forms the same kind of space.
-`CopyOp { src_offset, dst_offset, len }` addresses those logical spaces, so
-local and remote segmentation can differ.
+Client attachments and local buffer lists form logical spaces by concatenating
+buffer lengths. `CopyOp` addresses those spaces independently of segmentation.
+`remote_memory/scatter.rs` validates bounds, overflow, region/op limits and
+destination overlap, then fragments operations at buffer boundaries. The RDMA
+dependency independently validates the owned destination plan before posting.
 
-`remote_memory/scatter.rs` owns bounds, overflow, region/op limits and
-non-overlapping destination validation, then fragments ranges at segment
-boundaries. `remote_memory/context.rs` validates the logical operation while
-borrowing the caller's buffers. After ownership moves into the RDMA dependency,
-it independently validates the concrete destination plan before posting and
-returns the buffers if validation fails. `RemoteIoError` carries recoverable
-local buffers; once work has been posted, failures can return no buffers even
-if the QP has since completed and recycled them.
+| Component | Role |
+|---|---|
+| `read_source.rs` | Immutable sources shared by wrappers, pending requests and inline readers |
+| `write_target.rs` | Exclusive destination checkout for CPU copies or owned RDMA READ plans |
+| `inline.rs`, `services/memory_service.rs` | Reverse-RPC fallback over TCP/WS/HTTP |
+| `with_buffers.rs` | Completed-write witnesses and typed buffer-returning responses |
+| `rdma/rdma_socket/read.rs` | Concrete READ planning and admission |
 
-Client read attachments take ownership through `with_read_buffer(Buffer)` or
-`with_read_buffers(Vec<Buffer>)`. Calling either method on an existing wrapper
-replaces its source list. `remote_memory/read_source.rs` owns the immutable source
-and CPU-copy logic. The wrapper shares an `Arc<ReadSource>` with pending
-requests and local reverse-RPC readers, so cancelling or forgetting a request
-future cannot release memory while a CPU copy still uses it. `read_buffers()`
-provides shared views, and the wrapper can issue more requests using the same
-source. `take_read_buffers(&mut self)` recovers ownership only when its source
-is uniquely held; otherwise it returns `None` and retains the source for a
-later recovery attempt.
-
-Byte-stream transports use `remote_memory/inline.rs`: reverse RPCs gather
-source ranges into an inline body and scatter them into destinations. The
-peer independently validates requests in `services/memory_service.rs`.
-`read_inline` identifies the original request and copies from its owned source;
-it does not accept peer-supplied addresses or look them up in a registration map.
-
-RDMA transfers always use READ. For `remote_write`, the server advertises its
-source buffers and the client reads into its own pinned destination buffers.
-`Arc<WriteTarget>` is held both by the waiter and by in-flight writers. Its
-`Mutex<Option<Vec<Buffer>>>` grants either CPU access or an exclusive transfer:
-`take_for_read` removes the entire destination vector before passing it to the
-dependency's owned READ plan. While the slot is empty, `copy_in`, region export
-and another READ checkout return `BuffersInUse`. This excludes concurrent CPU
-and NIC writes, including competing reverse RPCs for the same request.
-
-`restore_after_read` puts back only buffers returned by the dependency: after
-successful completion, or an error before anything was posted. Cancellation or
-a posted-operation failure can leave the target empty; the QP then retains and
-eventually recycles its buffers. A timeout cannot recover those destinations
-through the now-empty target.
-
-A completed write returns `SentBuffers`; combining it with a response yields
-`WithBuffers<T>`. A handler with no transfer explicitly uses `sent_nothing()`.
-The generated client contract returns completed write buffers with a successful
-response when their target can be uniquely recovered. Failed calls can recover
-available destinations with `take_write_buffers()`; any remaining transfer keeps
-its buffers until it finishes. This contract is based on types, not the spelling
-of an alias.
-
-Application read-source ownership covers local CPU readers. It is not a remote DMA completion
-lease: after source-side timeout or cancellation, the source side cannot observe
-when an already posted one-sided READ finishes. The existing post-READ
-`request_is_pending` check rejects data for an expired request, but does not
-acknowledge remote completion before source recovery or reuse. Destination-side
-READ batches separately retain their memory until every posted completion arrives
-or their QP is successfully destroyed. Local destination ownership does not
-remove the source-side limitation.
-The private large-payload finish protocol applies only to transport-owned
-serialized messages; it does not extend the lifetime contract of application
-read attachments or `remote_write` sources.
+RDMA transfers use READ in both directions: `remote_write` asks the client to
+read the server's source. Application reads validate the original waiter after
+READ completion; large serialized messages use a separate finish protocol.
+See the [API guide](docs/remote-memory.md) for use and recovery, and
+[safety boundaries](docs/safe-boundaries.md) for success assumptions and failure behavior.
 
 ## RDMA execution
 
-`rdma/rdma_socket/read.rs` translates logical copy operations into remote
-ranges and local buffer-index/offset/length descriptors, applies admission
-limits and awaits results. `ruapc-rdma` validates the concrete plan and owns
-posted destination buffers. Cancellation accounts for unposted work; timeout
-fails the receiver and moves the QP to ERR without releasing posted memory.
+CQ poll threads route completion tokens and batch received buffers. Dispatch
+workers parse frames and invoke routing away from the poll thread. Each
+connection owns its NIC pair; peer identity is its bootstrap address.
 
-The CQ poll thread routes completion tokens and batches received buffers; a
-shared pool of dispatch workers parses frames and invokes routing away from
-the poll thread. Saturated workers fall back to one spawned dispatch task per
-batch. Flow control reuses a data SEND credit only after both local completion
-and the peer's receive acknowledgment.
-
-Completion identity is `(CQ, hardware QPN, WRType, sequence)`. WRIDs contain
-2 type bits and 62 sequence bits; SQ and RQ allocate independently, with SEND
-and READ sharing SQ. CQ-owned QPN leases prevent reuse from authorizing stale
-completions. Sequences never wrap, and QP destruction precedes release of
-leases or DMA memory. CQ capacity reservations retire separately, after an
-empty poll following a retirement snapshot.
-
-The detailed contracts have one reference each:
-
-- [Connection lifecycle](docs/rdma-connection.md): bootstrap, path selection
-  and publication to the poller.
-- [Completion identity](docs/wrid.md): owned posting, QPN leases, buffer
-  recovery and [sequence exhaustion](docs/wrid.md#why-the-sequence-does-not-wrap).
-- [RDMA capacity](docs/rdma-capacity.md): CQ credit budgets, READ limits,
-  timeout and shutdown.
-- [QP registry](docs/qp-registry.md): CQ routing, bounded drains and maintenance.
+| Contract | Reference |
+|---|---|
+| Bootstrap, path selection and peer maintenance | [Connection lifecycle](docs/rdma-connection.md) |
+| CQ-issued evidence, WR sequences and QPN reuse | [Completion identity](docs/wrid.md) |
+| CQ reservations, send queues and READ limits | [Capacity](docs/rdma-capacity.md) |
+| Completion routing, bounded drains and shutdown | [Poller](docs/qp-registry.md) |
 
 ## Buffer-pool ownership
 
-`pool.rs` exposes allocation and configuration. Its private modules separate
-builder defaults, lock-protected buddy state, slab coordination and async
-waiter/reservation state. The fast allocation path returns directly; only a
-miss enters the shared slow-path state machine.
+The pool combines buddy allocation, slabs and thread caches. Public buffers
+retain the pool; internal backing tokens avoid ownership cycles. See the
+[bufpool guide](ruapc-bufpool/README.md) for allocation, lock order and internals.
 
-Buddy blocks provide intrusive free lists and lazy four-way coalescing.
-Small allocations use per-class slab locks and bounded thread-local caches.
-A slab owns a backing-allocation token without an `Arc<BufferPool>`; public
-buffers hold the pool alive. This avoids a pool → slab → buffer → pool cycle.
-Chunk ownership is transferred rather than copied across cache boundaries.
-
-`BuddyBlock` keeps registrations and backing memory immutable. `BuddyState`
-contains the mutable tree and intrusive nodes behind `UnsafeCell`; accessing it
-requires the pool lock. The allocator never creates a mutable reference covering
-the entire published block. Self-referencing nodes are initialized after the
-block has aliasable ownership, so subsequent moves do not invalidate their links.
-
-Registered memory is initialized before any safe byte slice is exposed.
-64-bit Linux allocations use anonymous zero-filled mappings with the required
-alignment, so initial allocation does not eagerly touch every byte. Other
-platforms use zeroed allocation. Reusing a buffer does not clear it; callers
-must set its logical length to the bytes they intend to expose. Mutable
-access to an `AlignedMemory` slice requires an exclusive borrow.
-
-Device registrations are destroyed before their backing memory. Growth
-failure restores reserved budget; cancellation passes reserved capacity to
-another waiter or returns it to the allocator.
-
-`ruapc::Devices` is a type alias for `ruapc_bufpool::DeviceSet<RdmaDevice>`
-with RDMA enabled, or `DeviceSet` for stream transports. `DeviceSet` assigns
-stable device indices, keeps TCP at index zero and registers memory directly
-through each device's associated `MemoryRegistrar`. Safe `Device` wrappers
-provide identity, metadata and a registrar reference; they never receive the
-pool's backing memory. The core's `RdmaDevice` delegates registration to
-`ActiveDevice`, whose audited implementation lives in
-`ruapc-rdma/src/buffer_registration.rs`; TCP's implementation stays in
-`ruapc-bufpool/src/tcp_device.rs`.
-
-`MemoryRegistrar` and the custom collection trait `Devices` have unsafe
-implementation contracts. Retaining backing memory for registration grants no
-independent byte access while pool buffers exist, and registration destruction
-must end its use of that region before returning. `DeviceSet` drops completed
-registrations on partial failure. The RDMA registrar accepts only ordinary
-virtual-address mappings; failed deregistration aborts before releasing memory.
-Low-level registered TCP reads carry an
-explicit access contract; normal RPC reads use their owned request source and
-safe slices.
+`ruapc::Devices` aliases `DeviceSet<RdmaDevice>` with RDMA enabled and
+`DeviceSet` otherwise. TCP occupies index zero. RDMA registration delegates to
+`ActiveDevice` in `ruapc-rdma/src/buffer_registration.rs`; TCP registration stays
+in `ruapc-bufpool/src/tcp_device.rs`. The unsafe registrar and collection contracts
+are documented in [registration and byte access](docs/safe-boundaries.md#registration-and-byte-access).
 
 ## Generated services and examples
 
-`ruapc-macro` has three stages: attribute arguments, a validated service/method
-model, and token generation. The model guarantees the shape expected by the
-generator. Unsupported signatures produce diagnostics at the offending
-syntax rather than panicking or silently dropping items. Conditional
-compilation is propagated to generated declarations and registrations.
+`ruapc-macro` separates attribute parsing, a validated service/method model and
+token generation. Unsupported signatures produce diagnostics at their source
+spans; conditional compilation carries through generated declarations and
+registrations. Buffer-returning contracts follow types, including aliases.
 
-The [demo crate](ruapc-demo/README.md) provides a service host (`server`) and a
-typed caller and echo/read/write load generator (`client`). It shares setup in
-`app.rs`; `lib.rs` exposes service contracts, request types and CRC/pattern helpers.
-Service implementations and registration remain private to `server.rs`, alongside
-listener setup and shutdown. `client.rs` owns CLI handling, individual calls,
-echo/read/write buffer reuse, response verification and load reporting.
-Stress and latency modes use one load runner and prepare buffers before timing.
-Integration tests live under `ruapc-demo/tests/` and exercise the compiled
-binaries through their CLI and public RPC contracts. Shared process helpers
-live in `tests/common/mod.rs`; server and client implementations stay private
-to their binaries. RDMA-enabled server builds accept `--no-rdma` for stream-only
-operation, allowing these integration tests to run without an RDMA device.
+<a id="validation"></a>
 
-## Validation
-
-Run the workspace checks from [CONTRIBUTING.md](CONTRIBUTING.md). Functional
-checks and performance measurements serve different purposes: tests establish
-lifetime/protocol behavior, while release benchmarks compare equivalent
-workloads on the same machine, dependency lock and CPU/memory placement.
-
-[Benchmarks](docs/benchmark.md) cover echo, remote memory, buffer-pool
-contention, merging and initial allocation. The [documentation index](docs/README.md)
-links the current design references.
+The [demo guide](ruapc-demo/README.md) owns binary setup, CLI behavior, workload
+verification and its source map. See [CONTRIBUTING.md](CONTRIBUTING.md) for
+checks and [benchmarks](docs/benchmark.md) for performance comparisons.

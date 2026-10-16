@@ -2,17 +2,9 @@
 
 ## Project
 
-RuaPC is a Rust RPC workspace supporting TCP, WebSocket, HTTP and optional
-RDMA through a unified API. Start with [DESIGN.md](DESIGN.md) for module
-ownership and the [documentation index](docs/README.md) for detailed contracts.
-
-| Crate | Responsibility |
-|---|---|
-| `ruapc` | Client, server, routing, framing and transport policy |
-| `ruapc-bufpool` | Buddy/slab allocation, thread caches and device registration |
-| `ruapc-macro` | `#[service]` validation and code generation |
-| `ruapc-rdma` | libibverbs bindings, owned work requests and completion evidence |
-| `ruapc-demo` | Example applications and workloads; not published |
+RuaPC provides TCP, WebSocket, HTTP and optional RDMA through one Rust RPC API.
+Use [DESIGN.md](DESIGN.md) for crate/module ownership and
+[the documentation index](docs/README.md) for the authoritative contract guides.
 
 ## Implementation constraints
 
@@ -50,9 +42,11 @@ ownership and the [documentation index](docs/README.md) for detailed contracts.
 - Read attachments own immutable buffers and replace the wrapper's source list.
   Pending requests and inline readers share that ownership. Recovery requires
   uniqueness; a failed recovery attempt preserves the source.
-- Local read-source ownership is not a remote DMA completion lease. The
-  post-READ pending check rejects expired results but cannot delay source
-  reuse until unobservable remote completions. Preserve this limitation in docs.
+- Preserve [read-then-validate](docs/safe-boundaries.md#application-read-source-validation-and-recovery):
+  success depends on the original waiter's immutable source and no request ID reuse.
+  The probe checks membership, not a strict deadline or remote DMA completion.
+  Failure can permit source reuse before remote completion; recovered error
+  bytes remain readable but are not valid transfer results.
 - RDMA transfers use READ, including client-side READ for `remote_write`.
   A write target transfers its entire destination vector into the owned READ
   plan and excludes CPU copies or competing READs until buffers are restored.
@@ -77,20 +71,12 @@ bootstrap address, while each connection owns its NIC pair.
 
 ## Build and review
 
-RDMA is not a default `ruapc` feature. Workspace tests and `ruapc` benchmarks
-still require libibverbs development files: a self dev-dependency enables RDMA.
-CI uses Soft-RoCE (`rxe_0`, `RUAPC_PREFER_RXE=1`). See
-[CONTRIBUTING.md](CONTRIBUTING.md) for prerequisites and feature-specific checks.
-
-```bash
-cargo build --workspace --all-features
-cargo test --workspace --all-features
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps
-```
-
+Follow [CONTRIBUTING.md](CONTRIBUTING.md) for prerequisites, workspace checks,
+feature/rustdoc checks and Soft-RoCE setup. Core tests and RPC benchmarks enable
+RDMA through a self dev-dependency even though downstream RDMA is opt-in.
 Always run formatting and Clippy before committing. PRs target `main`; all CI
-checks must pass before merging. Release tags publish crates in dependency
-order: bufpool, macro, rdma, core. Keep docs about current behavior; historical
-benchmark outputs and rejected experiments belong outside `docs/`.
+checks must pass before merging. Release order is bufpool, macro, RDMA, core.
+
+Follow the [documentation ownership rules](docs/README.md#maintaining-the-docs):
+keep each contract in its owning guide, link to it from summaries, and keep
+historical benchmark outputs and rejected experiments outside `docs/`.

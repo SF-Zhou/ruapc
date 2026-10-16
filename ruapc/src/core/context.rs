@@ -26,7 +26,8 @@ pub(crate) enum ContextEndpoint {
 /// RPC context carrying request metadata and connection information.
 ///
 /// Handlers use it to access shared state, inspect their deadline, and issue
-/// nested or reverse RPCs. Clones share state and connection lifetime guards.
+/// nested or reverse RPCs. Clones share state and connection lifetime guards;
+/// [`with_endpoint`](Self::with_endpoint) selects a destination for a new call.
 ///
 /// # Examples
 ///
@@ -34,9 +35,13 @@ pub(crate) enum ContextEndpoint {
 ///
 /// ```rust,no_run
 /// # use ruapc::{Context, Endpoint, SocketPoolConfig};
-/// let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
-/// let endpoint: Endpoint = "tcp://127.0.0.1:8000".parse().unwrap();
+/// # #[tokio::main]
+/// # async fn main() -> ruapc::Result<()> {
+/// let ctx = Context::create(&SocketPoolConfig::default())?;
+/// let endpoint: Endpoint = "tcp://127.0.0.1:8000".parse()?;
 /// let ctx = ctx.with_endpoint(endpoint);
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Clone)]
 pub struct Context {
@@ -52,12 +57,19 @@ pub struct Context {
 }
 
 impl Context {
-    /// Creates a new context with the given socket pool configuration.
+    /// Creates client state and connection pools with the default [`Router`].
+    ///
+    /// Requires a Tokio runtime. Select a destination with
+    /// [`with_endpoint`](Self::with_endpoint) before making calls. Configuration,
+    /// schema generation and socket-pool initialization errors are returned.
     pub fn create(config: &SocketPoolConfig) -> Result<Self> {
         Self::create_with_router(Router::default(), config)
     }
 
-    /// Creates a new context with a custom router and configuration.
+    /// Creates client state with handlers for incoming reverse RPCs.
+    ///
+    /// Register services on `router` before calling this. Runtime requirements
+    /// and initialization errors are the same as [`create`](Self::create).
     pub fn create_with_router(router: Router, config: &SocketPoolConfig) -> Result<Self> {
         let (state, drop_guard) = State::create(router, config)?;
         Ok(Self {
@@ -69,9 +81,7 @@ impl Context {
         })
     }
 
-    /// Creates a context with a specific state and address.
-    ///
-    /// Internal method used by RDMA implementation.
+    /// Reuses shared state for TCP bootstrap RPCs to an RDMA peer.
     #[cfg(feature = "rdma")]
     pub(crate) fn create_with_state_and_addr(state: &Arc<State>, addr: &SocketAddr) -> Self {
         Self {
@@ -85,7 +95,7 @@ impl Context {
         }
     }
 
-    /// Creates a new context with the specified target endpoint.
+    /// Shares state while selecting a destination and resetting message metadata.
     ///
     /// The deadline (if any) is inherited: nested RPCs issued while handling
     /// a request keep the caller's remaining time budget.
@@ -95,6 +105,9 @@ impl Context {
     }
 
     /// Creates a new context that load-balances across equivalent endpoints.
+    ///
+    /// Shares state and inherits the request deadline, with fresh message
+    /// metadata, just like [`with_endpoint`](Self::with_endpoint).
     ///
     /// Healthy established connections are preferred, ties are distributed
     /// round-robin, and the remaining addresses are connected in the
@@ -156,7 +169,10 @@ impl Context {
         }
     }
 
-    /// Sends an RPC response back to the client.
+    /// Attempts to send a response on this context's connection.
+    ///
+    /// Generated service handlers normally call this. It preserves the request
+    /// ID and payload encoding; transport send errors are discarded.
     pub async fn send_rsp<Rsp, E>(&mut self, rsp: std::result::Result<Rsp, E>)
     where
         Rsp: Serialize,
@@ -194,7 +210,8 @@ impl Context {
         }
     }
 
-    /// Sends an error response back to the client.
+    /// Sends an error through [`send_rsp`](Self::send_rsp), with the same
+    /// best-effort delivery behavior.
     pub async fn send_err_rsp(&mut self, err: Error) {
         self.send_rsp::<(), Error>(Err(err)).await;
     }
