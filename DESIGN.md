@@ -300,10 +300,18 @@ generator. Unsupported signatures produce diagnostics at the offending
 syntax rather than panicking or silently dropping items. Conditional
 compilation is propagated to generated declarations and registrations.
 
-The demo crate shares setup in `app.rs` and verified echo/read/write workloads
-in `workload.rs`. Read workloads create their owning source wrapper before timing
-starts and reuse it across calls. Executables select workloads and report results;
-they do not duplicate buffer-recovery and payload-validation logic.
+The [demo crate](ruapc-demo/README.md) provides a service host (`server`) and a
+typed caller and echo/read/write load generator (`client`). It shares setup in
+`app.rs`; `lib.rs` exposes service contracts, request types and CRC/pattern helpers.
+Service implementations and registration remain private to `server.rs`, alongside
+listener setup and shutdown. `client.rs` owns CLI handling, individual calls,
+echo/read/write buffer reuse, response verification and load reporting.
+Stress and latency modes use one load runner and prepare buffers before timing.
+Integration tests live under `ruapc-demo/tests/` and exercise the compiled
+binaries through their CLI and public RPC contracts. Shared process helpers
+live in `tests/common/mod.rs`; server and client implementations stay private
+to their binaries. RDMA-enabled server builds accept `--no-rdma` for stream-only
+operation, allowing these integration tests to run without an RDMA device.
 
 ## Validation
 

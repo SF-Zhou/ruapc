@@ -8,6 +8,7 @@ and examples. Public API details live in rustdoc; build them with
 |---|---|
 | Workspace, request lifecycle and ownership | [Architecture](../DESIGN.md) |
 | Build requirements and validation | [Contributing](../CONTRIBUTING.md) |
+| Example server/client, CLI options and echo/read/write workloads | [Demo guide](../ruapc-demo/README.md) |
 | Registration, DMA ownership and known limitations | [Safety boundaries](safe-boundaries.md) |
 | Reflection and internal RPC services | [Built-in services](builtin-services.md) |
 | RDMA discovery and connection setup | [Connection lifecycle](rdma-connection.md) |

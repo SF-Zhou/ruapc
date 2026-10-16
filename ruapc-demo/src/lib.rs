@@ -1,23 +1,25 @@
-//! Shared service contracts, setup, and verified workloads for the examples.
+//! Shared service contracts, setup, and data helpers for the examples.
+
+#![forbid(unsafe_code)]
 
 pub mod app;
-pub mod workload;
 
 use ruapc::{Context, Result, WithBuffers};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// A string payload, encoded as a JSON string or a MessagePack string.
 #[derive(Serialize, Deserialize, Debug, Clone, JsonSchema)]
 pub struct Request(pub String);
 
 #[ruapc::service]
 pub trait EchoService {
-    async fn echo(&self, c: &Context, r: &Request) -> Result<String>;
+    async fn echo(&self, ctx: &Context, request: &Request) -> Result<String>;
 }
 
 #[ruapc::service]
 pub trait GreetService {
-    async fn greet(&self, c: &Context, r: &Request) -> Result<String>;
+    async fn greet(&self, ctx: &Context, request: &Request) -> Result<String>;
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, JsonSchema)]
@@ -34,11 +36,11 @@ pub struct WriteCrcReq {
 #[ruapc::service]
 pub trait MemBenchService {
     /// Reads the client's attached read buffers and returns their CRC32C.
-    async fn read_crc(&self, c: &Context, r: &ReadCrcReq) -> Result<u32>;
+    async fn read_crc(&self, ctx: &Context, request: &ReadCrcReq) -> Result<u32>;
 
-    /// Fills the client's pinned write buffers with `r.len` bytes of a
+    /// Fills the client's pinned write buffers with `request.len` bytes of a
     /// varying pattern and returns the CRC32C of the written data.
-    async fn write_crc(&self, c: &Context, r: &WriteCrcReq) -> Result<WithBuffers<u32>>;
+    async fn write_crc(&self, ctx: &Context, request: &WriteCrcReq) -> Result<WithBuffers<u32>>;
 }
 
 /// Computes the CRC32C (CRC-32/iSCSI) of a logical contiguous space made of
