@@ -1,13 +1,14 @@
-//! Per-peer connection state: stripes, metadata and health.
+//! State shared by one complete bootstrap address group: stripes and metadata.
 
 use std::{
     collections::HashMap,
-    net::SocketAddr,
     sync::{Arc, Mutex, RwLock},
     time::Instant,
 };
 
 use foldhash::fast::RandomState;
+
+use crate::{Context, Endpoint, State};
 
 use super::connect::CachedPeerAdvertisement;
 use super::maintenance::RetryBackoff;
@@ -33,16 +34,16 @@ pub(super) struct PeerMeta {
 }
 
 pub(crate) struct PeerState {
-    pub(super) addr: SocketAddr,
+    pub(super) endpoint: Endpoint,
     pub(super) connect: tokio::sync::Mutex<()>,
     pub(super) stripes: RwLock<PeerStripes>,
     pub(super) meta: Mutex<PeerMeta>,
 }
 
 impl PeerState {
-    pub(super) fn new(addr: SocketAddr) -> Self {
+    pub(super) fn new(endpoint: Endpoint) -> Self {
         Self {
-            addr,
+            endpoint,
             connect: tokio::sync::Mutex::new(()),
             stripes: RwLock::new(PeerStripes::default()),
             meta: Mutex::new(PeerMeta::default()),
@@ -53,13 +54,12 @@ impl PeerState {
         self.meta.lock().unwrap().last_used = Some(now);
     }
 
-    pub(crate) fn is_connected(&self) -> bool {
-        self.stripes
-            .read()
-            .unwrap()
-            .active
-            .iter()
-            .any(|stripe| stripe.socket.state.is_ok())
+    /// Control RPCs use the same complete address group over TCP. Entry-point
+    /// failure can select another listener without changing this peer's QPs.
+    pub(super) fn bootstrap_context(&self, state: &Arc<State>) -> Context {
+        let endpoint = Endpoint::tcp(self.endpoint.addrs().iter().copied())
+            .expect("RDMA peer endpoint is nonempty");
+        Context::create_with_state_and_endpoint(state, endpoint)
     }
 
     pub(super) fn active_snapshot(&self) -> Vec<Stripe> {
@@ -80,7 +80,7 @@ impl PeerState {
 impl std::fmt::Debug for PeerState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PeerState")
-            .field("addr", &self.addr)
+            .field("endpoint", &self.endpoint)
             .finish_non_exhaustive()
     }
 }

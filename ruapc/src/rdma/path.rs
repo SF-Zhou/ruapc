@@ -1,15 +1,16 @@
 //! RDMA path awareness: NIC identities and path reports.
 //!
-//! A *path* is the pair of NICs an RDMA connection runs on. Peers are still
-//! identified by their bootstrap TCP address; the path is a property of
-//! each individual connection (stripe), giving full NIC visibility without
-//! changing the peer identity.
+//! A *path* is the pair of NICs an RDMA connection runs on. Peers are
+//! identified by their complete bootstrap TCP address group; the path belongs
+//! to each individual connection (stripe).
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 
 use ruapc_rdma::ibv_gid;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+use crate::Endpoint;
 
 /// Best-effort IP address carried by a GID.
 ///
@@ -72,8 +73,9 @@ pub enum StripePhase {
 /// One RDMA connection and the path it runs on.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RdmaPathEntry {
-    /// Bootstrap TCP address of the peer (outbound connections only).
-    pub peer: Option<SocketAddr>,
+    /// RDMA endpoint containing the complete bootstrap address group
+    /// (outbound connections only).
+    pub peer: Option<Endpoint>,
     /// Whether this side established or accepted the connection.
     pub direction: RdmaConnDirection,
     /// The NIC pair the connection runs on.

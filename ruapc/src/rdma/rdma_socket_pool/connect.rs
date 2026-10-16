@@ -25,7 +25,7 @@ impl RdmaSocketPool {
         avoided_remote_nics: &HashSet<String>,
         deadline: Option<Instant>,
     ) -> Result<Socket> {
-        let addr = &peer.addr;
+        let endpoint = &peer.endpoint;
         self.ensure_maintenance_task(state);
         // Re-check under the connect lock: another task may have connected,
         // or every stripe may have failed and must be replaced.
@@ -42,7 +42,7 @@ impl RdmaSocketPool {
                 stripes.active.clone()
             } else {
                 if !stripes.active.is_empty() {
-                    tracing::info!("all RDMA stripes to {addr} failed, reconnecting");
+                    tracing::info!("all RDMA stripes to {endpoint} failed, reconnecting");
                     stripes.active.clear();
                 }
                 Vec::new()
@@ -55,7 +55,7 @@ impl RdmaSocketPool {
         let plan = match self.prepare_connect_plan(peer, state, deadline).await {
             Ok(plan) => plan,
             Err(err) if fallback.is_some() => {
-                tracing::debug!(peer = %addr, %err, "RDMA discovery failed; using existing stripe");
+                tracing::debug!(peer = %endpoint, %err, "RDMA discovery failed; using existing stripe");
                 return Ok(fallback.expect("checked above"));
             }
             Err(err) => return Err(err),
@@ -86,7 +86,7 @@ impl RdmaSocketPool {
                     Error::new(
                         ErrorKind::Overloaded,
                         format!(
-                            "RDMA peer {addr} reached preconnect_max_per_peer ({max_connections})"
+                            "RDMA peer {endpoint} reached preconnect_max_per_peer ({max_connections})"
                         ),
                     )
                 });
@@ -97,7 +97,7 @@ impl RdmaSocketPool {
             {
                 Ok(established) => established,
                 Err(err) if fallback.is_some() => {
-                    tracing::debug!(peer = %addr, %err, "RDMA additional connection failed; using existing stripe");
+                    tracing::debug!(peer = %endpoint, %err, "RDMA additional connection failed; using existing stripe");
                     return Ok(fallback.expect("checked above"));
                 }
                 Err(err) => return Err(err),
@@ -135,7 +135,7 @@ impl RdmaSocketPool {
             return Err(Error::new(
                 ErrorKind::ConnectionClosed,
                 format!(
-                    "RDMA initial stripe {} to {addr} closed before publication",
+                    "RDMA initial stripe {} to {endpoint} closed before publication",
                     stripe.socket.conn_id
                 ),
             ));
@@ -146,7 +146,7 @@ impl RdmaSocketPool {
             .ok_or_else(|| {
                 Error::new(
                     ErrorKind::ConnectionClosed,
-                    format!("all freshly established RDMA stripes to {addr} failed"),
+                    format!("all freshly established RDMA stripes to {endpoint} failed"),
                 )
             })?;
         self.admit_initial(peer, established_sockets);
@@ -154,7 +154,7 @@ impl RdmaSocketPool {
     }
 
     /// Fetches the peer's device list and enumerates the compatible path
-    /// candidates: everything a placement decision towards `addr` needs.
+    /// candidates: everything a placement decision towards this peer needs.
     pub(super) async fn prepare_connect_plan(
         &self,
         peer: &Arc<PeerState>,
@@ -166,21 +166,21 @@ impl RdmaSocketPool {
                 ErrorKind::Timeout,
                 format!(
                     "RDMA discovery for {}: connection deadline expired",
-                    peer.addr
+                    peer.endpoint
                 ),
             ));
         }
-        let mut bootstrap_ctx = Context::create_with_state_and_addr(state, &peer.addr);
+        let mut bootstrap_ctx = peer.bootstrap_context(state);
         bootstrap_ctx.deadline = deadline;
         let remote_info = self.fetch_peer_advertisement(peer, &bootstrap_ctx).await?;
         let candidates = match self.enumerate_path_candidates(&remote_info) {
             Ok(candidates) => candidates,
             Err(err) => {
                 self.invalidate_advertisement_cache(peer);
-                return Err(at_stage(&format!("select paths to {}", peer.addr), err));
+                return Err(at_stage(&format!("select paths to {}", peer.endpoint), err));
             }
         };
-        tracing::debug!(peer = %peer.addr, remote_devices = remote_info.devices.len(), candidates = candidates.len(), "RDMA connection paths enumerated");
+        tracing::debug!(peer = %peer.endpoint, remote_devices = remote_info.devices.len(), candidates = candidates.len(), "RDMA connection paths enumerated");
         Ok(ConnectPlan {
             bootstrap_ctx,
             remote_info,
@@ -189,7 +189,7 @@ impl RdmaSocketPool {
         })
     }
 
-    /// Establishes one stripe towards `addr`, falling over to the next
+    /// Establishes one stripe towards this peer, falling over to the next
     /// best candidate when a NIC pair turns out to be unreachable
     /// (device matching cannot verify routability). Each failed pair is
     /// blacklisted by `connect_stripe`, so later placements avoid it too.
@@ -213,7 +213,7 @@ impl RdmaSocketPool {
                     ErrorKind::Timeout,
                     format!(
                         "RDMA path failover to {}: connection deadline expired after {attempted} attempts",
-                        peer.addr
+                        peer.endpoint
                     ),
                 ));
             }
@@ -227,7 +227,7 @@ impl RdmaSocketPool {
                 Ok(candidate) => candidate,
                 Err(err) => {
                     return Err(last_failure.unwrap_or_else(|| {
-                        at_stage(&format!("select path to {}", peer.addr), err)
+                        at_stage(&format!("select path to {}", peer.endpoint), err)
                     }));
                 }
             };
@@ -242,7 +242,7 @@ impl RdmaSocketPool {
                     let err = at_stage(
                         &format!(
                             "path failover exhausted {attempted} attempts to {}",
-                            peer.addr
+                            peer.endpoint
                         ),
                         err,
                     );
@@ -250,7 +250,7 @@ impl RdmaSocketPool {
                         return Err(err);
                     }
                     tracing::debug!(
-                        peer = %peer.addr,
+                        peer = %peer.endpoint,
                         local = %candidate.path.local.device,
                         remote = %candidate.path.remote.device,
                         remaining_candidates = remaining.len(),
@@ -273,12 +273,11 @@ impl RdmaSocketPool {
         let EstablishedSocket { socket, rollback } = established;
         let stripe = Stripe { socket };
         let mut stripes = peer.stripes.write().unwrap();
-        stripe.socket.set_peer_health(peer);
         rollback.disarm();
         stripes.active.push(stripe.clone());
         drop(stripes);
         stripe.socket.request_activation();
-        tracing::debug!(peer = %peer.addr, conn_id = stripe.socket.conn_id, "RDMA stripe published; activation requested");
+        tracing::debug!(peer = %peer.endpoint, conn_id = stripe.socket.conn_id, "RDMA stripe published; activation requested");
         stripe
     }
 
@@ -290,7 +289,6 @@ impl RdmaSocketPool {
             .into_iter()
             .map(|established| {
                 let EstablishedSocket { socket, rollback } = established;
-                socket.set_peer_health(peer);
                 rollbacks.push(rollback);
                 Stripe { socket }
             })
@@ -304,7 +302,7 @@ impl RdmaSocketPool {
         for stripe in &stripes {
             stripe.socket.request_activation();
         }
-        tracing::debug!(peer = %peer.addr, stripes = stripes.len(), "RDMA initial stripes published; activation requested");
+        tracing::debug!(peer = %peer.endpoint, stripes = stripes.len(), "RDMA initial stripes published; activation requested");
     }
 
     /// Replaces `victim` only if it is still in rotation. The replacement is
@@ -324,7 +322,6 @@ impl RdmaSocketPool {
         else {
             return false;
         };
-        socket.set_peer_health(peer);
         rollback.disarm();
         stripes.active.push(Stripe {
             socket: socket.clone(),
@@ -333,7 +330,7 @@ impl RdmaSocketPool {
         stripes.draining.push(victim.clone());
         drop(stripes);
         socket.request_activation();
-        tracing::debug!(peer = %peer.addr, conn_id = socket.conn_id, previous_conn_id = victim.socket.conn_id, "RDMA replacement published; activation requested");
+        tracing::debug!(peer = %peer.endpoint, conn_id = socket.conn_id, previous_conn_id = victim.socket.conn_id, "RDMA replacement published; activation requested");
         self.drain_then_close(peer, victim.socket);
         true
     }
@@ -344,20 +341,20 @@ impl RdmaSocketPool {
         ctx: &Context,
     ) -> Result<RdmaPeerAdvertisement> {
         if let Some(info) = self.get_cached_advertisement(peer) {
-            tracing::debug!(peer = %peer.addr, devices = info.devices.len(), "using cached RDMA advertisement");
+            tracing::debug!(peer = %peer.endpoint, devices = info.devices.len(), "using cached RDMA advertisement");
             return Ok(info);
         }
 
         // Boxed to break the bootstrap RPC / socket acquire future recursion.
         let info = Box::pin(self.bootstrap_client.discover(ctx, &()))
             .await
-            .map_err(|err| at_stage(&format!("discover peer {}", peer.addr), err))?;
+            .map_err(|err| at_stage(&format!("discover peer {}", peer.endpoint), err))?;
         if info.protocol_version != RDMA_BOOTSTRAP_PROTOCOL_VERSION {
             return Err(Error::new(
                 ErrorKind::InvalidArgument,
                 format!(
                     "RDMA peer {} advertised unsupported bootstrap protocol version {} (expected {})",
-                    peer.addr, info.protocol_version, RDMA_BOOTSTRAP_PROTOCOL_VERSION
+                    peer.endpoint, info.protocol_version, RDMA_BOOTSTRAP_PROTOCOL_VERSION
                 ),
             ));
         }

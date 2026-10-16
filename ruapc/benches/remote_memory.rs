@@ -260,7 +260,7 @@ async fn run(options: BenchOptions) {
             continue;
         }
         println!("{transport:?}");
-        let ctx = base_ctx.with_endpoint(Endpoint::new(transport, addr));
+        let ctx = base_ctx.with_endpoint(Endpoint::new(transport, [addr]).unwrap());
         let probe = Client {
             timeout: Duration::from_secs(1),
             connect_timeout: Duration::from_secs(5),

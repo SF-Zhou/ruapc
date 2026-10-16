@@ -63,7 +63,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let server = Server::create(router, &config)?;
     let addr = server.listen("127.0.0.1:0".parse()?).await?;
 
-    let ctx = Context::create(&config)?.with_endpoint(Endpoint::tcp(addr));
+    let ctx = Context::create(&config)?.with_endpoint(Endpoint::tcp([addr])?);
     let response = Client::default().echo(&ctx, &Request("Rua!".into())).await?;
     assert_eq!(response, "Rua!");
 
@@ -76,6 +76,12 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 The default listener accepts TCP. Use `ListenMode::UNIFIED` to accept the other
 protocols, and select the outbound transport in the endpoint, for example
 `"ws://127.0.0.1:8000".parse::<Endpoint>()?`.
+One endpoint can name equivalent addresses of that same server, such as
+`tcp://127.0.0.1:8000,127.0.0.1:8001`. All transports support this form; see
+[endpoint identity and address fallback](docs/endpoints.md).
+Serde stores endpoints as that string in JSON and MessagePack. RDMA endpoints
+can be constructed and exchanged without the RDMA feature; connecting requires
+the feature and an enabled RDMA pool.
 
 ## Run the demos
 

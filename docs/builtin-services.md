@@ -60,6 +60,9 @@ and source recovery, see
 
 With the `rdma` feature, the connection pool uses these methods over TCP.
 Peers must advertise bootstrap protocol version **2**.
+Bootstrap RPCs use the endpoint's full equivalent-address group; every address
+must share the acceptor's `State` and lease records. See
+[group identity](endpoints.md#identity-and-caller-obligations).
 
 | Method | Request | Success value | Purpose |
 |---|---|---|---|

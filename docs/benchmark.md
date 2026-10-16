@@ -28,7 +28,8 @@ and sufficient locked-memory allowance.
 | `echo`, concurrent | 16 B payload, 64 or 1,024 tasks | 256,000 requests per case, split evenly across tasks |
 | [`remote_memory`](../ruapc/benches/remote_memory.rs) | Serial 64 KiB and 1 MiB reads/writes with full-pattern verification | 8 warmups; 512 measured requests for 64 KiB, 128 for 1 MiB |
 
-Echo also runs concurrent RDMA cases across two endpoints on the same server.
+Echo also runs concurrent RDMA cases with one endpoint containing two bootstrap
+addresses on the same server. Both addresses share one peer's stripe set.
 Its pool limit is 1 GiB per context and its Tokio worker count uses the runtime
 default. Remote memory uses 512 MiB per context and four runtime workers.
 Keep these settings fixed across compared versions.

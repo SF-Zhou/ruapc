@@ -179,7 +179,7 @@ async fn setup(config: &SocketPoolConfig) -> (Arc<LargePayloadServiceImpl>, Serv
     Arc::new(LargePayloadCallbackImpl).ruapc_export(&mut router);
     let ctx = Context::create_with_router(router, config)
         .unwrap()
-        .with_endpoint(Endpoint::new(Transport::RDMA, addr));
+        .with_endpoint(Endpoint::new(Transport::RDMA, [addr]).unwrap());
     (service, server, ctx)
 }
 
@@ -406,7 +406,7 @@ async fn disabled_peer_negotiates_legacy_inline_messages_only() {
     let addr = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let ctx = Context::create(&config())
         .unwrap()
-        .with_endpoint(Endpoint::new(Transport::RDMA, addr));
+        .with_endpoint(Endpoint::new(Transport::RDMA, [addr]).unwrap());
     let client = client(true);
     let inline = blob(100, 3);
     assert_eq!(client.echo(&ctx, &inline).await.unwrap(), inline);

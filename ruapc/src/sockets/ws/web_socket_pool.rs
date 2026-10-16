@@ -16,7 +16,7 @@ use tokio_util::sync::DropGuard;
 
 use super::WebSocket;
 use crate::{
-    ConnectionMap, Message, RawStream, Socket, SocketPoolConfig, SocketPoolTrait, State,
+    ConnectionMap, Endpoint, Message, RawStream, Socket, SocketPoolConfig, SocketPoolTrait, State,
     TaskSupervisor,
     error::{Error, ErrorKind, Result},
     sockets::tcp,
@@ -32,7 +32,7 @@ pub(crate) fn web_socket_config() -> tungstenite::protocol::WebSocketConfig {
 
 pub struct WebSocketPool {
     socket_map: ConnectionMap<WebSocket>,
-    connect_locks: crate::sockets::connect::ConnectLocks,
+    connect_groups: crate::sockets::connect::ConnectGroups,
     task_supervisor: TaskSupervisor,
 }
 
@@ -44,7 +44,7 @@ impl SocketPoolTrait for WebSocketPool {
     ) -> Result<Self> {
         Ok(Self {
             socket_map: ConnectionMap::default(),
-            connect_locks: Default::default(),
+            connect_groups: Default::default(),
             task_supervisor: TaskSupervisor::create(),
         })
     }
@@ -60,10 +60,10 @@ impl SocketPoolTrait for WebSocketPool {
                 let stream = accept_async_with_config(tcp_stream, Some(web_socket_config()))
                     .await
                     .map_err(|e| Error::new(ErrorKind::WebSocketAcceptFailed, e.to_string()))?;
-                self.add_socket(addr, stream, state)?;
+                self.add_socket(None, addr, stream, state)?;
             }
             RawStream::WS(web_socket_stream) => {
-                self.add_socket(addr, *web_socket_stream, state)?;
+                self.add_socket(None, addr, *web_socket_stream, state)?;
             }
         }
         Ok(())
@@ -81,17 +81,36 @@ impl SocketPoolTrait for WebSocketPool {
         self.task_supervisor.all_stopped().await;
     }
 
-    async fn acquire(&self, addr: &SocketAddr, state: &Arc<State>) -> Result<Socket> {
-        // Check if the socket is already in the socket map.
-        if let Some(socket) = self.socket_map.try_get_live(addr) {
-            return Ok(socket.into());
-        }
+    async fn acquire(&self, endpoint: &Endpoint, state: &Arc<State>) -> Result<Socket> {
+        self.acquire_with_deadline(endpoint, None, state).await
+    }
+}
 
-        let _connect = self.connect_locks.lock(*addr).await;
-        if let Some(socket) = self.socket_map.get_live(addr).await {
-            return Ok(socket.into());
+impl WebSocketPool {
+    pub(crate) async fn acquire_with_deadline(
+        &self,
+        endpoint: &Endpoint,
+        deadline: Option<std::time::Instant>,
+        state: &Arc<State>,
+    ) -> Result<Socket> {
+        if let Some(socket) = self.try_acquire(endpoint) {
+            return Ok(socket);
         }
+        let mut group = self.connect_groups.lock(endpoint, deadline).await?;
+        if let Some(socket) = self.acquire_existing(endpoint).await {
+            return Ok(socket);
+        }
+        group
+            .connect(deadline, |addr| self.connect_address(endpoint, addr, state))
+            .await
+    }
 
+    async fn connect_address(
+        &self,
+        endpoint: &Endpoint,
+        addr: SocketAddr,
+        state: &Arc<State>,
+    ) -> Result<Socket> {
         // Connect the TCP stream ourselves so socket options (nodelay,
         // keepalive) can be applied before the WebSocket handshake.
         let tcp_stream = tokio::net::TcpStream::connect(addr)
@@ -108,23 +127,24 @@ impl SocketPoolTrait for WebSocketPool {
 
         let send_socket = self
             .socket_map
-            .try_publish_with(*addr, || self.add_socket(*addr, stream, state))
+            .try_publish_with(endpoint.clone(), || {
+                self.add_socket(Some(endpoint.clone()), addr, stream, state)
+            })
             .await?;
         Ok(send_socket.into())
     }
-}
 
-impl WebSocketPool {
-    pub(crate) fn try_acquire(&self, addr: &SocketAddr) -> Option<Socket> {
-        self.socket_map.try_get_live(addr).map(Into::into)
+    pub(crate) fn try_acquire(&self, endpoint: &Endpoint) -> Option<Socket> {
+        self.socket_map.try_get_live(endpoint).map(Into::into)
     }
 
-    pub(crate) async fn acquire_existing(&self, addr: &SocketAddr) -> Option<Socket> {
-        self.socket_map.get_live(addr).await.map(Into::into)
+    pub(crate) async fn acquire_existing(&self, endpoint: &Endpoint) -> Option<Socket> {
+        self.socket_map.get_live(endpoint).await.map(Into::into)
     }
 
     pub fn add_socket<S>(
         &self,
+        endpoint: Option<Endpoint>,
         addr: SocketAddr,
         stream: WebSocketStream<S>,
         state: &Arc<State>,
@@ -145,6 +165,7 @@ impl WebSocketPool {
 
         tokio::spawn({
             let socket_map = self.socket_map.clone();
+            let endpoint = endpoint.clone();
             let web_socket = web_socket.clone();
             let state = state.clone();
             async move {
@@ -159,12 +180,21 @@ impl WebSocketPool {
                         )),
                 };
                 tracing::debug!("send loop for {addr} ended: {error}");
-                Self::evict_socket(&socket_map, &addr, &web_socket, &state, &error).await;
+                Self::evict_socket(
+                    &socket_map,
+                    endpoint.as_ref(),
+                    &addr,
+                    &web_socket,
+                    &state,
+                    &error,
+                )
+                .await;
             }
         });
 
         tokio::spawn({
             let socket_map = self.socket_map.clone();
+            let endpoint = endpoint.clone();
             let web_socket = web_socket.clone();
             let state = state.clone();
             async move {
@@ -179,7 +209,15 @@ impl WebSocketPool {
                         )),
                 };
                 tracing::debug!("receive loop for {addr} ended: {error}");
-                Self::evict_socket(&socket_map, &addr, &web_socket, &state, &error).await;
+                Self::evict_socket(
+                    &socket_map,
+                    endpoint.as_ref(),
+                    &addr,
+                    &web_socket,
+                    &state,
+                    &error,
+                )
+                .await;
             }
         });
         Ok(web_socket)
@@ -189,6 +227,7 @@ impl WebSocketPool {
     /// and eagerly fails every request pending on the connection.
     async fn evict_socket(
         socket_map: &ConnectionMap<WebSocket>,
+        endpoint: Option<&Endpoint>,
         addr: &SocketAddr,
         socket: &WebSocket,
         state: &Arc<State>,
@@ -199,7 +238,9 @@ impl WebSocketPool {
             return;
         }
         state.metrics.connection_closed("WS");
-        socket_map.evict_if_current(addr, socket).await;
+        if let Some(endpoint) = endpoint {
+            socket_map.evict_if_current(endpoint, socket).await;
+        }
         let err = Error::new(
             ErrorKind::ConnectionClosed,
             format!("connection to {addr} closed: {err}"),

@@ -85,7 +85,7 @@ async fn test_upload_with_read_buffer_tcp() {
     let addr = server.clone().listen(addr).await.unwrap();
 
     let ctx = Context::create(&config).unwrap();
-    let ctx = ctx.with_endpoint(ruapc::Endpoint::tcp(addr));
+    let ctx = ctx.with_endpoint(ruapc::Endpoint::tcp([addr]).unwrap());
 
     // 1. Test a normal request without memory attachments.
     let client = Client::default();
@@ -143,7 +143,7 @@ async fn test_upload_with_read_buffer_websocket() {
     let addr = server.clone().listen(addr).await.unwrap();
 
     let ctx = Context::create(&config).unwrap();
-    let ctx = ctx.with_endpoint(ruapc::Endpoint::new(ruapc::Transport::WS, addr));
+    let ctx = ctx.with_endpoint(ruapc::Endpoint::new(ruapc::Transport::WS, [addr]).unwrap());
 
     let test_data = b"WebSocket buffer test!";
     let mut buf = ctx.state.buffer_pool.allocate(1024 * 1024).unwrap();
@@ -180,7 +180,7 @@ async fn test_upload_with_read_buffer_http() {
     let addr = server.clone().listen(addr).await.unwrap();
 
     let ctx = Context::create(&config).unwrap();
-    let ctx = ctx.with_endpoint(ruapc::Endpoint::new(ruapc::Transport::HTTP, addr));
+    let ctx = ctx.with_endpoint(ruapc::Endpoint::new(ruapc::Transport::HTTP, [addr]).unwrap());
 
     let test_data = b"HTTP buffer test!";
     let mut buf = ctx.state.buffer_pool.allocate(1024 * 1024).unwrap();

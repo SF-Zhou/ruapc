@@ -46,7 +46,7 @@ async fn test_hello() {
         let client = ruapc::Client::default();
         let ctx = ruapc::Context::create(&config)
             .unwrap()
-            .with_endpoint(Endpoint::new(transport, addr));
+            .with_endpoint(Endpoint::new(transport, [addr]).unwrap());
         let rsp = client.hello(&ctx, &"ruapc".to_string()).await.unwrap();
         assert_eq!(rsp, "hello ruapc!");
 
@@ -122,7 +122,7 @@ async fn test_typed_http_with_base_path() {
     let client = ruapc::Client::default();
     let ctx = ruapc::Context::create(&config)
         .unwrap()
-        .with_endpoint(Endpoint::new(Transport::HTTP, addr));
+        .with_endpoint(Endpoint::new(Transport::HTTP, [addr]).unwrap());
     let rsp = client.hello(&ctx, &"ruapc".to_string()).await.unwrap();
     assert_eq!(rsp, "hello ruapc!");
 
@@ -150,7 +150,7 @@ async fn test_rdma_concurrent() {
 
     let ctx = ruapc::Context::create(&config)
         .unwrap()
-        .with_endpoint(Endpoint::new(Transport::RDMA, addr));
+        .with_endpoint(Endpoint::new(Transport::RDMA, [addr]).unwrap());
     let mut tasks = Vec::new();
     for task_id in 0..128 {
         let ctx = ctx.clone();
@@ -196,7 +196,7 @@ async fn test_rdma() {
     client.hello(&ctx, &"ruapc".to_string()).await.unwrap_err();
     ctx.send_rsp(Result::Ok(())).await;
 
-    let ctx = ctx.with_endpoint(Endpoint::new(Transport::RDMA, addr));
+    let ctx = ctx.with_endpoint(Endpoint::new(Transport::RDMA, [addr]).unwrap());
     for _ in 0..256 {
         let rsp = client.hello(&ctx, &"ruapc".to_string()).await.unwrap();
         assert_eq!(rsp, "hello ruapc!");

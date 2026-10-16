@@ -1,20 +1,13 @@
 //! Machinery for one pre-wire request attempt: socket acquisition,
-//! failure classification, endpoint failover accounting, and time-budget
-//! arithmetic. Everything here happens *before* a request reaches the
-//! wire, so failures are safe to retry.
+//! failure classification, retry accounting, and time-budget arithmetic.
+//! Only transient failures before transport acceptance may be retried.
 
-use std::{
-    collections::{HashMap, HashSet},
-    net::SocketAddr,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use ruapc_bufpool::RemoteBufferInfo;
 
 use crate::{
     Buffer, Endpoint, Socket, State,
-    core::EndpointState,
     error::{Error, ErrorKind},
     remote_memory::WriteTarget,
     sockets::AcquireOptions,
@@ -22,9 +15,10 @@ use crate::{
 
 /// Destination of one attempt: an already-connected socket (server-side
 /// reverse RPC) or an endpoint to acquire a connection for.
+#[derive(Clone)]
 pub(super) enum AttemptEndpoint {
     Connected(Socket),
-    Endpoint(Arc<EndpointState>),
+    Endpoint(Endpoint),
 }
 
 pub(super) struct AttemptOptions<'a> {
@@ -34,19 +28,11 @@ pub(super) struct AttemptOptions<'a> {
     pub(super) avoided_remote_nics: Option<&'a HashSet<String>>,
 }
 
-pub(super) struct AcquiredSocket {
-    pub(super) socket: Socket,
-    pub(super) endpoint_state: Option<Arc<EndpointState>>,
-}
-
 /// How a failed attempt may be answered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum AttemptDisposition {
-    /// Transient connection trouble: retry, on any endpoint.
+    /// Transient connection trouble before transport acceptance.
     Retryable,
-    /// The endpoint (not the request) is unusable: only moving to an
-    /// untried endpoint can help.
-    FailoverOnly,
     /// Retrying cannot help (e.g. the request deadline expired).
     Terminal,
 }
@@ -84,16 +70,8 @@ impl AttemptFailure {
             disposition: if is_connection_failure(&error) {
                 AttemptDisposition::Retryable
             } else {
-                AttemptDisposition::FailoverOnly
+                AttemptDisposition::Terminal
             },
-            error,
-            failed_remote_nic: None,
-        }
-    }
-
-    pub(super) fn failover(error: Error) -> Self {
-        Self {
-            disposition: AttemptDisposition::FailoverOnly,
             error,
             failed_remote_nic: None,
         }
@@ -125,55 +103,21 @@ impl From<Error> for AttemptFailure {
     }
 }
 
-/// Endpoint-failover accounting for one request's pre-wire retry cycle.
+/// Retry accounting for one logical endpoint's pre-acceptance failures.
 pub(super) struct AttemptCycle {
-    /// Ranked endpoint candidates; empty when the context carries an
-    /// already-connected socket.
-    candidates: Vec<Arc<EndpointState>>,
-    /// Endpoints attempted in the current pass; cleared once every
-    /// candidate was tried, so retries cycle back to the first.
-    tried: HashSet<Endpoint>,
-    /// Remote RDMA NICs to steer away from, learned from send failures;
-    /// empty (and never fed) on other transports.
-    avoided_remote_nics: HashMap<SocketAddr, HashSet<String>>,
-    /// Failed attempts so far.
+    /// Remote RDMA NICs to steer away from, learned from send failures.
+    avoided_remote_nics: HashSet<String>,
     attempt: u64,
     max_attempts: u64,
 }
 
 impl AttemptCycle {
-    pub(super) fn new(candidates: Vec<Arc<EndpointState>>, max_attempts: u64) -> Self {
+    pub(super) fn new(max_attempts: u64) -> Self {
         Self {
-            candidates,
-            tried: HashSet::new(),
-            avoided_remote_nics: HashMap::new(),
+            avoided_remote_nics: HashSet::new(),
             attempt: 0,
             max_attempts,
         }
-    }
-
-    /// Picks the endpoint for the next attempt: re-ranks by current health
-    /// (except on the first attempt, which keeps the caller's round-robin
-    /// order) and prefers candidates not yet tried in this pass. `None`
-    /// with an already-connected context (no candidates).
-    pub(super) fn next_candidate(&mut self) -> Option<Arc<EndpointState>> {
-        if self.candidates.is_empty() {
-            return None;
-        }
-        if self.attempt != 0 {
-            self.candidates
-                .sort_by_key(|candidate| candidate.selection_rank());
-        }
-        if self.tried.len() == self.candidates.len() {
-            self.tried.clear();
-        }
-        let candidate = self
-            .candidates
-            .iter()
-            .find(|candidate| !self.tried.contains(&candidate.endpoint()))
-            .expect("a non-empty candidate cycle has an untried endpoint")
-            .clone();
-        Some(candidate)
     }
 
     /// Index of the attempt currently running (0-based).
@@ -185,145 +129,76 @@ impl AttemptCycle {
         self.max_attempts - self.attempt
     }
 
-    pub(super) fn avoided_remote_nics(&self, addr: Option<SocketAddr>) -> Option<&HashSet<String>> {
-        addr.and_then(|addr| self.avoided_remote_nics.get(&addr))
+    pub(super) fn avoided_remote_nics(&self) -> Option<&HashSet<String>> {
+        (!self.avoided_remote_nics.is_empty()).then_some(&self.avoided_remote_nics)
     }
 
-    /// Records a failed attempt and decides whether another attempt should
-    /// run; advances the attempt counter when it should.
-    pub(super) fn note_failure(
-        &mut self,
-        attempted: Option<&Arc<EndpointState>>,
-        failure: &AttemptFailure,
-    ) -> bool {
-        if let (Some(state), Some(remote)) = (attempted, &failure.failed_remote_nic) {
-            self.avoided_remote_nics
-                .entry(state.endpoint().addr())
-                .or_default()
-                .insert(remote.clone());
+    /// Records a failed attempt and advances only when a retry is allowed.
+    pub(super) fn note_failure(&mut self, failure: &AttemptFailure) -> bool {
+        if let Some(remote) = &failure.failed_remote_nic {
+            self.avoided_remote_nics.insert(remote.clone());
         }
-        if let Some(state) = attempted {
-            self.tried.insert(state.endpoint());
+        if failure.disposition != AttemptDisposition::Retryable
+            || self.attempt + 1 >= self.max_attempts
+        {
+            return false;
         }
-        let has_untried_endpoint = self.tried.len() < self.candidates.len();
-        let retry = should_retry_attempt(
-            failure.disposition,
-            self.attempt,
-            self.max_attempts,
-            has_untried_endpoint,
-        );
-        if retry {
-            self.attempt += 1;
-        }
-        retry
+        self.attempt += 1;
+        true
     }
 }
 
-fn should_retry_attempt(
-    disposition: AttemptDisposition,
-    attempt: u64,
-    max_attempts: u64,
-    has_untried_endpoint: bool,
-) -> bool {
-    if attempt + 1 >= max_attempts {
-        return false;
-    }
-    match disposition {
-        AttemptDisposition::Retryable => true,
-        AttemptDisposition::FailoverOnly => has_untried_endpoint,
-        AttemptDisposition::Terminal => false,
-    }
-}
-
-/// Resolves the socket for one attempt: reuses the connected socket, or
-/// acquires (possibly establishing) a connection for the endpoint while
-/// keeping its health state up to date.
+/// Reuses a connected socket, or asks the pool to acquire a connection for
+/// the complete endpoint. Address selection belongs to the connection pool.
 pub(super) async fn acquire_for_attempt(
     state: &Arc<State>,
     attempt_endpoint: AttemptEndpoint,
     connect_deadline: std::time::Instant,
     remaining_acquire_attempts: u64,
     avoided_remote_nics: Option<&HashSet<String>>,
-) -> std::result::Result<AcquiredSocket, AttemptFailure> {
-    let endpoint_state = match attempt_endpoint {
-        AttemptEndpoint::Connected(socket) => {
-            return Ok(AcquiredSocket {
-                socket,
-                endpoint_state: None,
-            });
-        }
-        AttemptEndpoint::Endpoint(endpoint_state) => endpoint_state,
+) -> std::result::Result<Socket, AttemptFailure> {
+    let endpoint = match attempt_endpoint {
+        AttemptEndpoint::Connected(socket) => return Ok(socket),
+        AttemptEndpoint::Endpoint(endpoint) => endpoint,
     };
-    let endpoint = endpoint_state.endpoint();
-    let socket = if let Some(result) = try_acquire_direct(state, endpoint, avoided_remote_nics) {
-        let socket = result.map_err(AttemptFailure::acquire)?;
-        if !endpoint_state.is_current(&socket) {
-            endpoint_state.record_observed_connection(&socket);
-        }
-        socket
-    } else if let Some(acquire_deadline) = split_connection_deadline(
+    if let Some(result) = try_acquire_direct(state, &endpoint, avoided_remote_nics) {
+        return result.map_err(AttemptFailure::acquire);
+    }
+    if let Some(acquire_deadline) = split_connection_deadline(
         std::time::Instant::now(),
         connect_deadline,
         remaining_acquire_attempts,
     ) {
-        // A fresh connection may be needed: span the whole attempt with a
-        // ConnectActivity so concurrent preconnects are suppressed and a
-        // delayed failure cannot penalize a newer connection.
         let options = AcquireOptions {
             avoided_remote_nics,
             deadline: Some(acquire_deadline),
         };
-        let activity = endpoint_state.begin_connect();
-        let result = tokio::time::timeout_at(
+        match tokio::time::timeout_at(
             tokio::time::Instant::from_std(acquire_deadline),
-            acquire_direct(state, endpoint, options),
+            acquire_direct(state, &endpoint, options),
         )
-        .await;
-        match result {
-            Err(_elapsed) => {
-                activity.record_failure();
-                return Err(AttemptFailure::acquire_deadline());
+        .await
+        {
+            Err(_elapsed) => Err(AttemptFailure::acquire_deadline()),
+            Ok(Ok(socket)) => Ok(socket),
+            Ok(Err(error)) if matches!(error.kind, ErrorKind::Timeout) => {
+                Err(AttemptFailure::acquire_deadline())
             }
-            Ok(Ok(socket)) => {
-                if !endpoint_state.is_current(&socket) {
-                    activity.record_connection(&socket);
-                }
-                socket
-            }
-            Ok(Err(error)) => {
-                let timed_out = matches!(error.kind, ErrorKind::Timeout);
-                if timed_out || is_connection_failure(&error) {
-                    activity.record_failure();
-                }
-                return Err(if timed_out {
-                    AttemptFailure::acquire_deadline()
-                } else {
-                    AttemptFailure::acquire(error)
-                });
-            }
+            Ok(Err(error)) => Err(AttemptFailure::acquire(error)),
         }
     } else {
-        // No time left to connect: only an existing connection can serve
-        // this attempt.
-        let socket = acquire_existing_direct(state, endpoint, avoided_remote_nics)
+        // No time left to connect: an existing connection can still serve
+        // this attempt without consuming a fresh connection budget.
+        acquire_existing_direct(state, &endpoint, avoided_remote_nics)
             .await
             .ok_or_else(AttemptFailure::acquire_deadline)?
-            .map_err(AttemptFailure::acquire)?;
-        if !endpoint_state.is_current(&socket) {
-            endpoint_state.record_observed_connection(&socket);
-        }
-        socket
-    };
-    Ok(AcquiredSocket {
-        socket,
-        endpoint_state: Some(endpoint_state),
-    })
+            .map_err(AttemptFailure::acquire)
+    }
 }
 
 /// Exports the attached buffers as regions for the device the connection
 /// actually runs on (TCP device, or the specific RDMA NIC of this
-/// connection). Region export failures are endpoint problems (a buffer
-/// not registered for this NIC), so they fail over instead of retrying.
+/// connection). Invalid registrations are terminal for this call.
 pub(super) fn export_attached_regions(
     socket: &Socket,
     state: &State,
@@ -340,13 +215,13 @@ pub(super) fn export_attached_regions(
         read_regions.push(
             buf.remote_buffer_info(&device_index)
                 .map_err(|e| Error::new(ErrorKind::InvalidArgument, e.to_string()))
-                .map_err(AttemptFailure::failover)?,
+                .map_err(AttemptFailure::from)?,
         );
     }
     if let Some(target) = write_target {
         write_regions = target
             .export_regions(&device_index)
-            .map_err(AttemptFailure::failover)?;
+            .map_err(AttemptFailure::from)?;
     }
     Ok((read_regions, write_regions))
 }
@@ -363,7 +238,7 @@ pub(super) fn capped_deadline(
 }
 
 /// Splits the remaining connect budget evenly across the remaining
-/// attempts, so one slow endpoint cannot starve the others. `None` when
+/// attempts, so one slow acquisition cannot consume every retry. `None` when
 /// no usable slice is left.
 fn split_connection_deadline(
     now: std::time::Instant,
@@ -386,9 +261,9 @@ pub(super) fn wire_timeout_ms(timeout: Duration) -> u32 {
     u32::try_from(millis).unwrap_or(u32::MAX)
 }
 
-pub(super) async fn acquire_direct(
+async fn acquire_direct(
     state: &Arc<State>,
-    endpoint: Endpoint,
+    endpoint: &Endpoint,
     options: AcquireOptions<'_>,
 ) -> std::result::Result<Socket, Error> {
     state
@@ -399,7 +274,7 @@ pub(super) async fn acquire_direct(
 
 fn try_acquire_direct(
     state: &Arc<State>,
-    endpoint: Endpoint,
+    endpoint: &Endpoint,
     avoided_remote_nics: Option<&HashSet<String>>,
 ) -> Option<std::result::Result<Socket, Error>> {
     state.socket_pool.try_acquire(
@@ -413,7 +288,7 @@ fn try_acquire_direct(
 
 async fn acquire_existing_direct(
     state: &Arc<State>,
-    endpoint: Endpoint,
+    endpoint: &Endpoint,
     avoided_remote_nics: Option<&HashSet<String>>,
 ) -> Option<std::result::Result<Socket, Error>> {
     state
@@ -428,7 +303,7 @@ async fn acquire_existing_direct(
         .await
 }
 
-/// Connection-level errors used for endpoint health and pre-wire retries.
+/// Connection-level errors eligible for pre-acceptance retries.
 /// Classification alone does not make a failure after send safe to retry.
 pub(super) fn is_connection_failure(err: &Error) -> bool {
     let common = matches!(
@@ -491,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_errors_do_not_penalize_endpoints() {
+    fn unknown_errors_are_not_connection_failures() {
         assert!(!is_connection_failure(&Error::new(
             ErrorKind::Unknown("other".into()),
             "unclassified".into(),
@@ -502,88 +377,41 @@ mod tests {
     }
 
     #[test]
-    fn retry_disposition_respects_failure_scope() {
-        assert!(should_retry_attempt(
-            AttemptDisposition::Retryable,
-            0,
-            3,
-            false,
-        ));
-        assert!(should_retry_attempt(
-            AttemptDisposition::FailoverOnly,
-            0,
-            3,
-            true,
-        ));
-        assert!(!should_retry_attempt(
-            AttemptDisposition::FailoverOnly,
-            0,
-            3,
-            false,
-        ));
-        assert!(!should_retry_attempt(
-            AttemptDisposition::Terminal,
-            0,
-            3,
-            true,
-        ));
-    }
-
-    #[test]
-    fn invalid_acquire_error_only_fails_over() {
+    fn invalid_acquire_and_send_errors_are_terminal() {
         let failure = AttemptFailure::acquire(Error::kind(ErrorKind::InvalidArgument));
-        assert_eq!(failure.disposition, AttemptDisposition::FailoverOnly);
-        let failure = AttemptFailure::failover(Error::kind(ErrorKind::InvalidArgument));
-        assert_eq!(failure.disposition, AttemptDisposition::FailoverOnly);
-    }
-
-    fn endpoint_state(port: u16) -> Arc<EndpointState> {
-        Arc::new(EndpointState::new(Endpoint::tcp(
-            format!("127.0.0.1:{port}").parse().unwrap(),
-        )))
-    }
-
-    #[test]
-    fn attempt_cycle_prefers_untried_endpoints_before_recycling() {
-        let mut cycle = AttemptCycle::new(vec![endpoint_state(10001), endpoint_state(10002)], 5);
-        let failure = AttemptFailure::acquire(Error::kind(ErrorKind::TcpConnectFailed));
-
-        let first = cycle.next_candidate().unwrap();
-        assert!(cycle.note_failure(Some(&first), &failure));
-        let second = cycle.next_candidate().unwrap();
-        assert_ne!(first.endpoint(), second.endpoint());
-        assert!(cycle.note_failure(Some(&second), &failure));
-        // Every endpoint was tried: the cycle restarts instead of starving.
-        assert!(cycle.next_candidate().is_some());
-        assert_eq!(cycle.attempt_index(), 2);
-        assert_eq!(cycle.remaining_attempts(), 3);
+        assert_eq!(failure.disposition, AttemptDisposition::Terminal);
+        let failure = AttemptFailure::send(Error::kind(ErrorKind::InvalidArgument), None);
+        assert_eq!(failure.disposition, AttemptDisposition::Terminal);
+        let mut cycle = AttemptCycle::new(3);
+        assert!(!cycle.note_failure(&failure));
     }
 
     #[test]
     fn attempt_cycle_stops_at_the_attempt_budget() {
-        let mut cycle = AttemptCycle::new(vec![endpoint_state(10001)], 2);
         let failure = AttemptFailure::acquire(Error::kind(ErrorKind::TcpConnectFailed));
+        let mut cycle = AttemptCycle::new(2);
+        assert_eq!(cycle.remaining_attempts(), 2);
+        assert!(cycle.note_failure(&failure));
+        assert_eq!(cycle.attempt_index(), 1);
+        assert_eq!(cycle.remaining_attempts(), 1);
+        assert!(!cycle.note_failure(&failure));
 
-        let first = cycle.next_candidate().unwrap();
-        assert!(cycle.note_failure(Some(&first), &failure));
-        let second = cycle.next_candidate().unwrap();
-        assert!(!cycle.note_failure(Some(&second), &failure));
+        let mut no_retries = AttemptCycle::new(1);
+        assert!(!no_retries.note_failure(&failure));
     }
 
     #[test]
-    fn attempt_cycle_records_failed_remote_nics_per_peer() {
-        let state = endpoint_state(10001);
-        let addr = state.endpoint().addr();
-        let mut cycle = AttemptCycle::new(vec![state.clone()], 3);
-        let failure = AttemptFailure::send(
-            Error::kind(ErrorKind::RdmaSendFailed),
-            Some("mlx5_1".into()),
-        );
-
-        assert!(cycle.avoided_remote_nics(Some(addr)).is_none());
-        assert!(cycle.note_failure(Some(&state), &failure));
-        let avoided = cycle.avoided_remote_nics(Some(addr)).unwrap();
+    fn attempt_cycle_preserves_failed_remote_nics_across_retries() {
+        let mut cycle = AttemptCycle::new(4);
+        assert!(cycle.avoided_remote_nics().is_none());
+        for nic in ["mlx5_1", "mlx5_2", "mlx5_1"] {
+            let failure =
+                AttemptFailure::send(Error::kind(ErrorKind::RdmaSendFailed), Some(nic.into()));
+            assert!(cycle.note_failure(&failure));
+        }
+        let avoided = cycle.avoided_remote_nics().unwrap();
+        assert_eq!(avoided.len(), 2);
         assert!(avoided.contains("mlx5_1"));
-        assert!(cycle.avoided_remote_nics(None).is_none());
+        assert!(avoided.contains("mlx5_2"));
     }
 }

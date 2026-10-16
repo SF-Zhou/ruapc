@@ -37,7 +37,7 @@ impl BootstrapRollback {
             lease: Some(lease),
             supervisor: pool.task_supervisor.handle(),
             client: pool.bootstrap_client.clone(),
-            context: Context::create_with_state_and_addr(state, &peer.addr),
+            context: peer.bootstrap_context(state),
         }
     }
 
@@ -101,7 +101,7 @@ impl RdmaSocketPool {
         let started = Instant::now();
         let span = tracing::info_span!(
             "rdma_connect",
-            peer = %peer.addr,
+            peer = %peer.endpoint,
             attempt_id,
             local_device = %candidate.path.local.device,
             local_port = candidate.path.local.port_num,
@@ -125,7 +125,7 @@ impl RdmaSocketPool {
                     tracing::warn!(%err, error_kind = ?err.kind, elapsed_ms = started.elapsed().as_millis() as u64, "RDMA connection attempt failed");
                     Err(Error::new(err.kind, format!(
                         "RDMA connection to {} (attempt {attempt_id}, {}:{}/gid{} -> {}:{}/gid{}): {}",
-                        peer.addr, candidate.path.local.device, candidate.path.local.port_num,
+                        peer.endpoint, candidate.path.local.device, candidate.path.local.port_num,
                         candidate.path.local.gid_index, candidate.path.remote.device,
                         candidate.path.remote.port_num, candidate.path.remote.gid_index, err.msg,
                     )))

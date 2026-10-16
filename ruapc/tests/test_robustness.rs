@@ -69,7 +69,7 @@ async fn test_inflight_request_fails_fast_on_disconnect() {
         };
         let ctx = ruapc::Context::create(&config)
             .unwrap()
-            .with_endpoint(Endpoint::new(transport, addr));
+            .with_endpoint(Endpoint::new(transport, [addr]).unwrap());
 
         let request = {
             let client = client.clone();
@@ -113,7 +113,7 @@ async fn test_pool_reconnects_after_server_restart() {
         let client = ruapc::Client::default();
         let ctx = ruapc::Context::create(&config)
             .unwrap()
-            .with_endpoint(Endpoint::new(transport, addr));
+            .with_endpoint(Endpoint::new(transport, [addr]).unwrap());
         let rsp = client.echo(&ctx, &"one".to_string()).await.unwrap();
         assert_eq!(rsp, "one");
 
@@ -125,7 +125,7 @@ async fn test_pool_reconnects_after_server_restart() {
         // need a moment to rebind.
         let server = make_server(&config);
         let addr = server.listen(addr).await.unwrap();
-        let ctx = ctx.with_endpoint(Endpoint::new(transport, addr));
+        let ctx = ctx.with_endpoint(Endpoint::new(transport, [addr]).unwrap());
 
         let mut recovered = false;
         for _ in 0..50 {
@@ -163,7 +163,7 @@ async fn test_handler_panic_returns_error() {
         };
         let ctx = ruapc::Context::create(&config)
             .unwrap()
-            .with_endpoint(Endpoint::new(transport, addr));
+            .with_endpoint(Endpoint::new(transport, [addr]).unwrap());
 
         let started = std::time::Instant::now();
         let err = client.panicky(&ctx, &"boom".to_string()).await.unwrap_err();

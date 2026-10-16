@@ -12,7 +12,7 @@ use tokio_util::sync::DropGuard;
 use super::path::RdmaPathInfo;
 use super::{DevicePollers, PollerConfig, RdmaDeviceRefresher, RdmaSocket, RdmaSocketPoolConfig};
 use crate::{
-    BufferPool, Client, Devices, Error, ErrorKind, Result, Socket, SocketPoolConfig,
+    BufferPool, Client, Devices, Endpoint, Error, ErrorKind, Result, Socket, SocketPoolConfig,
     SocketPoolTrait, State, TaskSupervisor,
 };
 
@@ -24,12 +24,14 @@ mod connect;
 mod handshake;
 mod placement;
 use placement::PathCandidate;
+#[cfg(test)]
+mod group_tests;
 mod maintenance;
 mod report;
 mod setup;
 
 type PathKey = (String, u8, u8, String, u8, u8);
-type PeerMap = dashmap::DashMap<SocketAddr, Arc<PeerState>, RandomState>;
+type PeerMap = dashmap::DashMap<Endpoint, Arc<PeerState>, RandomState>;
 
 /// One RDMA connection towards a peer, tagged with bookkeeping metadata.
 ///
@@ -39,8 +41,6 @@ type PeerMap = dashmap::DashMap<SocketAddr, Arc<PeerState>, RandomState>;
 pub(crate) struct Stripe {
     pub(crate) socket: Arc<RdmaSocket>,
 }
-
-pub(crate) type RdmaPeerHealth = PeerState;
 
 /// RAII increment of one device's live-connection counter; decremented
 /// when the poll thread tears the connection down (the guard travels
@@ -168,9 +168,9 @@ impl SocketPoolTrait for RdmaSocketPool {
         self.task_supervisor.all_stopped().await;
     }
 
-    /// Acquires or creates an RDMA socket for the specified address.
-    async fn acquire(&self, addr: &SocketAddr, state: &Arc<State>) -> Result<Socket> {
-        self.acquire_with_deadline(addr, &HashSet::new(), None, state)
+    /// Acquires or creates an RDMA socket for the complete bootstrap address group.
+    async fn acquire(&self, endpoint: &Endpoint, state: &Arc<State>) -> Result<Socket> {
+        self.acquire_with_options(endpoint, &HashSet::new(), None, state)
             .await
     }
 
@@ -241,18 +241,18 @@ impl RdmaSocketPool {
         })
     }
 
-    pub(crate) async fn acquire_with_deadline(
+    pub(crate) async fn acquire_with_options(
         &self,
-        addr: &SocketAddr,
+        endpoint: &Endpoint,
         avoided_remote_nics: &HashSet<String>,
         deadline: Option<Instant>,
         state: &Arc<State>,
     ) -> Result<Socket> {
-        if let Some(socket) = self.try_acquire(addr, avoided_remote_nics) {
+        if let Some(socket) = self.try_acquire(endpoint, avoided_remote_nics) {
             return Ok(socket);
         }
 
-        let peer = self.peer(*addr);
+        let peer = self.peer(endpoint);
         let guard = match deadline {
             Some(deadline) => tokio::time::timeout_at(
                 tokio::time::Instant::from_std(deadline),
@@ -263,7 +263,7 @@ impl RdmaSocketPool {
                 Error::new(
                     ErrorKind::Timeout,
                     format!(
-                        "RDMA connection to {addr}: deadline expired waiting for peer connect lock"
+                        "RDMA connection to {endpoint}: deadline expired waiting for peer connect lock"
                     ),
                 )
             }),
@@ -282,10 +282,10 @@ impl RdmaSocketPool {
 
     pub(crate) fn try_acquire(
         &self,
-        addr: &SocketAddr,
+        endpoint: &Endpoint,
         avoided_remote_nics: &HashSet<String>,
     ) -> Option<Socket> {
-        let peer = self.existing_peer(addr)?;
+        let peer = self.existing_peer(endpoint)?;
         // The fast path must never block: a writer in the way means
         // connection churn, which the slow path handles anyway. A
         // poisoned lock likewise falls through to the slow path.
@@ -298,10 +298,10 @@ impl RdmaSocketPool {
 
     pub(crate) async fn acquire_existing(
         &self,
-        addr: &SocketAddr,
+        endpoint: &Endpoint,
         avoided_remote_nics: &HashSet<String>,
     ) -> Option<Socket> {
-        let peer = self.existing_peer(addr)?;
+        let peer = self.existing_peer(endpoint)?;
         let stripes = peer.stripes.read().unwrap();
         let socket = self.pick_stripe(&stripes.active, avoided_remote_nics)?;
         drop(stripes);
@@ -309,15 +309,15 @@ impl RdmaSocketPool {
         Some(socket)
     }
 
-    fn peer(&self, addr: SocketAddr) -> Arc<PeerState> {
+    fn peer(&self, endpoint: &Endpoint) -> Arc<PeerState> {
         self.peers
-            .entry(addr)
-            .or_insert_with(|| Arc::new(PeerState::new(addr)))
+            .entry(endpoint.clone())
+            .or_insert_with(|| Arc::new(PeerState::new(endpoint.clone())))
             .clone()
     }
 
-    fn existing_peer(&self, addr: &SocketAddr) -> Option<Arc<PeerState>> {
-        self.peers.get(addr).map(|peer| peer.clone())
+    fn existing_peer(&self, endpoint: &Endpoint) -> Option<Arc<PeerState>> {
+        self.peers.get(endpoint).map(|peer| peer.clone())
     }
 
     /// Picks one healthy connection stripe round-robin.
@@ -346,7 +346,7 @@ impl RdmaSocketPool {
         pseudo_random(self.rng_seq.fetch_add(1, Ordering::Relaxed))
     }
 
-    /// Penalizes a NIC pair towards `addr` after its QP setup failed.
+    /// Penalizes a NIC pair towards this peer after its QP setup failed.
     fn blacklist_path(&self, peer: &PeerState, path: &RdmaPathInfo) {
         peer.meta.lock().unwrap().blacklist.insert(
             Self::path_key(path),
@@ -365,7 +365,7 @@ impl RdmaSocketPool {
         )
     }
 
-    /// Whether the candidate's NIC pair towards `addr` is currently
+    /// Whether the candidate's NIC pair towards this peer is currently
     /// penalized; expired entries are pruned on the way.
     fn is_blacklisted(&self, peer: &PeerState, candidate: &PathCandidate) -> bool {
         let mut meta = peer.meta.lock().unwrap();

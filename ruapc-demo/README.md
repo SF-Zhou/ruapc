@@ -30,7 +30,20 @@ cargo run -p ruapc-demo --release --bin client -- ws://127.0.0.1:8000
 cargo run -p ruapc-demo --release --bin client -- http://127.0.0.1:8000
 ```
 
-Endpoints use an IP address and port, for example `tcp://[::1]:8000` for IPv6.
+The client takes one endpoint: one scheme and one or more equivalent server
+addresses, for example `tcp://127.0.0.1:8000` or
+`tcp://[::1]:8000,[::1]:8001`. TCP, WS, HTTP and RDMA all support groups:
+
+```bash
+# Replace both addresses with addresses served by the same server State.
+cargo run -p ruapc-demo --release --bin client -- 'tcp://192.0.2.10:8000,192.0.2.11:8000'
+```
+
+Addresses are sorted and deduplicated. A group has one transport; separate
+endpoint arguments or mixed schemes inside a group are rejected. See
+[endpoint identity and address fallback](../docs/endpoints.md) for the same-server
+contract, independent overlapping groups and canonical string format.
+
 Use `--listen-mode tcp`, `ws` or `http` on the server to select one protocol.
 The server stops and joins its background tasks on Ctrl-C. RPC, setup and
 workload failures make the client exit with a nonzero status.
@@ -67,7 +80,9 @@ cargo run -p ruapc-demo --release --bin client -- http://127.0.0.1:8000 --http-b
 
 The routes then include `/api/v1/EchoService/echo`,
 `/api/v1/_ruapc.meta/describe`, `/api/v1/openapi.json` and `/api/v1/rapidoc`.
-Keep the endpoint itself in `http://IP:port` form; pass the prefix separately.
+Pass the prefix separately from the `http://address[,address...]` endpoint.
+This group form is a RuaPC endpoint string; ordinary HTTP callers still use
+a single-address URL.
 RuaPC's typed HTTP client connects to the HTTP/2 bidirectional stream at
 `/api/v1/_rpc`, which supports reverse RPC and remote memory. Ordinary HTTP
 POST calls do not support reverse RPC. See [built-in services](../docs/builtin-services.md)
@@ -153,8 +168,8 @@ and server transfer buffers, accounting for the pool's
 [size classes and backing blocks](../ruapc-bufpool/README.md#allocation).
 Workload preparation fails if its buffers cannot be allocated.
 
-RDMA requires the `rdma` Cargo feature, a C compiler, `pkg-config`, libclang
-and the libibverbs development package. At runtime it needs an active RDMA
+RDMA connections require the `rdma` Cargo feature, a C compiler, `pkg-config`,
+libclang and the libibverbs development package. At runtime it needs an active RDMA
 device and sufficient locked-memory allowance. See
 [CONTRIBUTING.md](../CONTRIBUTING.md#rdma-tests) for Soft-RoCE setup.
 
@@ -182,7 +197,8 @@ cargo run -p ruapc-demo --features rdma --bin server -- --no-rdma --listen-mode 
 
 `--no-rdma` is available only in RDMA-enabled server builds. A build without
 the feature needs neither this flag nor RDMA libraries. The client enables
-RDMA automatically only for an `rdma://` endpoint.
+RDMA automatically only for an `rdma://` endpoint. Builds without the feature
+still parse that endpoint format, but report an error when making a call.
 
 Feature-enabled server/client builds also expose `--rdma-devices` (a
 comma-separated local allowlist), `--poll-threads`, `--conns-per-peer`,

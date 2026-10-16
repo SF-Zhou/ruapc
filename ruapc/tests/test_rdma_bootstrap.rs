@@ -5,7 +5,7 @@ use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use ruapc::rdma::{RdmaConnDirection, RdmaPathReport};
 use ruapc::{
-    Client, Context, Endpoint, ErrorKind, ListenMode, Server, SocketPoolConfig, Transport,
+    Client, Context, Endpoint, ErrorKind, ListenMode, Listener, Server, SocketPoolConfig, Transport,
 };
 
 #[ruapc::service]
@@ -80,6 +80,73 @@ fn healthy_qps(report: &RdmaPathReport, direction: RdmaConnDirection) -> BTreeSe
         .collect()
 }
 
+/// Equivalent group spellings reuse one stripe set. Losing every bootstrap
+/// listener does not close connections already serving RDMA requests.
+#[tokio::test]
+async fn bootstrap_group_reuses_stripes_after_listeners_stop() {
+    let config = config();
+    let mut router = ruapc::Router::default();
+    Arc::new(BootstrapProbeImpl).ruapc_export(&mut router);
+    let server = Server::create(router, &config).unwrap();
+    let first = Listener::new();
+    let second = Listener::new();
+    let first_addr = first
+        .start_listen("127.0.0.1:0".parse().unwrap(), server.state())
+        .await
+        .unwrap();
+    let second_addr = second
+        .start_listen("127.0.0.1:0".parse().unwrap(), server.state())
+        .await
+        .unwrap();
+    let unavailable = "127.0.0.1:0".parse().unwrap();
+    let endpoint = Endpoint::new(Transport::RDMA, [first_addr, unavailable, second_addr]).unwrap();
+    let context = Context::create(&config)
+        .unwrap()
+        .with_endpoint(endpoint.clone());
+    let reordered = context.with_endpoint(
+        Endpoint::new(
+            Transport::RDMA,
+            [second_addr, first_addr, second_addr, unavailable],
+        )
+        .unwrap(),
+    );
+    let client = Client {
+        max_retries: 0,
+        ..Default::default()
+    };
+    let (first_reply, second_reply) =
+        tokio::join!(client.ping(&context, &1), client.ping(&reordered, &2),);
+    assert_eq!(first_reply.unwrap(), 1);
+    assert_eq!(second_reply.unwrap(), 2);
+    let report = context.state.rdma_path_report().await.unwrap();
+    let qps = healthy_qps(&report, RdmaConnDirection::Outbound);
+    assert_eq!(qps.len(), 2);
+    assert_eq!(report.paths.len(), 2);
+    assert!(
+        report
+            .paths
+            .iter()
+            .all(|path| path.peer.as_ref() == Some(&endpoint))
+    );
+
+    first.stop();
+    second.stop();
+    first.join().await;
+    second.join().await;
+    for value in 3..7 {
+        assert_eq!(client.ping(&reordered, &value).await.unwrap(), value);
+    }
+    assert_eq!(
+        healthy_qps(
+            &context.state.rdma_path_report().await.unwrap(),
+            RdmaConnDirection::Outbound,
+        ),
+        qps,
+    );
+    drop((context, reordered));
+    stop_server(&server).await;
+}
+
 /// The first stripe is already confirmed when the second stripe fails local
 /// registration. Both the first committed lease and the second prepared lease
 /// must be rolled back, without waiting for either accept lease to expire.
@@ -94,7 +161,7 @@ async fn initial_stripe_failure_rolls_back_all_unpublished_connections() {
     rdma.polling.device_cq_len = 16;
     let context = Context::create(&client_config)
         .unwrap()
-        .with_endpoint(Endpoint::new(Transport::RDMA, address));
+        .with_endpoint(Endpoint::new(Transport::RDMA, [address]).unwrap());
     let client = Client {
         max_retries: 0,
         ..Default::default()
@@ -147,7 +214,7 @@ async fn all_initial_stripes_survive_accept_lease_expiration() {
     let (server, address) = start_server(&config).await;
     let context = Context::create(&config)
         .unwrap()
-        .with_endpoint(Endpoint::new(Transport::RDMA, address));
+        .with_endpoint(Endpoint::new(Transport::RDMA, [address]).unwrap());
     let client = Client {
         max_retries: 0,
         ..Default::default()

@@ -70,13 +70,6 @@ impl HttpSocket {
             Self::Stream(socket) => socket.is_closed(),
         }
     }
-
-    pub(crate) fn health(&self) -> Option<std::sync::Weak<crate::sockets::ChannelConnection>> {
-        match self {
-            Self::ForResponse(_) => None,
-            Self::Stream(socket) => Some(Arc::downgrade(&socket.inner)),
-        }
-    }
 }
 
 /// A streaming body backed by an mpsc channel.

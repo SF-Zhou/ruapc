@@ -41,7 +41,7 @@ mod rdma_socket;
 pub(crate) use rdma_socket::{RdmaSocket, RdmaSocketConfig};
 
 mod rdma_socket_pool;
-pub(crate) use rdma_socket_pool::{ConnCountGuard, RdmaPeerHealth, RdmaSocketPool};
+pub(crate) use rdma_socket_pool::{ConnCountGuard, RdmaSocketPool};
 
 #[cfg(test)]
 pub(crate) mod test_utils;

@@ -3,11 +3,9 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio_util::sync::DropGuard;
 
 use crate::{
-    BufferPool, Context, Devices, Endpoint, Message, Metrics, RawStream, Result, Router, Socket,
-    SocketPool, SocketPoolConfig, Waiter,
+    BufferPool, Context, Devices, Message, Metrics, RawStream, Result, Router, Socket, SocketPool,
+    SocketPoolConfig, Waiter,
 };
-
-use super::EndpointState;
 
 /// Router, connection pools, request correlation and registered-memory resources.
 ///
@@ -31,7 +29,6 @@ pub struct State {
     /// Server-side in-flight request cap (0 = unlimited); excess requests
     /// are rejected with [`ErrorKind::Overloaded`](crate::ErrorKind).
     pub(crate) max_inflight_requests: usize,
-    pub(crate) endpoint_states: dashmap::DashMap<Endpoint, Arc<EndpointState>>,
 }
 
 impl State {
@@ -78,18 +75,10 @@ impl State {
             buffer_pool,
             metrics: Arc::default(),
             max_inflight_requests: config.max_inflight_requests,
-            endpoint_states: dashmap::DashMap::new(),
         };
         let state = Arc::new(state);
         let drop_guard = state.drop_guard();
         Ok((state, drop_guard))
-    }
-
-    pub(crate) fn endpoint_state(&self, endpoint: Endpoint) -> Arc<EndpointState> {
-        self.endpoint_states
-            .entry(endpoint)
-            .or_insert_with(|| Arc::new(EndpointState::new(endpoint)))
-            .clone()
     }
 
     /// Discovers and creates devices based on the socket pool configuration.

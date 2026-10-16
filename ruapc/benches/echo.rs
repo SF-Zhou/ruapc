@@ -192,7 +192,7 @@ async fn run(options: BenchOptions) {
             continue;
         }
         println!("{transport:?}");
-        let ctx = base_ctx.with_endpoint(Endpoint::new(transport, addr));
+        let ctx = base_ctx.with_endpoint(Endpoint::new(transport, [addr]).unwrap());
 
         // Probe the transport once: environments without e.g. a usable RDMA
         // device should skip instead of failing the whole benchmark.
@@ -220,11 +220,9 @@ async fn run(options: BenchOptions) {
 
     #[cfg(feature = "rdma")]
     if let Some(second_addr) = second_addr {
-        println!("RDMA (2 endpoints)");
-        let ctx = base_ctx.with_endpoints(vec![
-            Endpoint::new(Transport::RDMA, addr),
-            Endpoint::new(Transport::RDMA, second_addr),
-        ]);
+        println!("RDMA (1 endpoint, 2 bootstrap addresses)");
+        let ctx =
+            base_ctx.with_endpoint(Endpoint::new(Transport::RDMA, [addr, second_addr]).unwrap());
         let probe_client = Client::default();
         if let Err(err) = probe_client.echo(&ctx, &"probe".to_string()).await {
             println!("  skipped: {err}");

@@ -1,6 +1,5 @@
 /// Socket abstraction layer.
 mod socket;
-pub(crate) use socket::SocketHealth;
 pub use socket::{Socket, SocketTrait};
 
 mod channel;

@@ -48,6 +48,11 @@ jobs:
     - name: Install dependencies
       run: sudo apt-get update && sudo apt-get install -y pkg-config libibverbs-dev ibverbs-utils
 
+    # Run separately: the core crate's self dev-dependency enables RDMA in
+    # workspace tests, even when --no-default-features is specified.
+    - name: Test without RDMA
+      run: cargo test -p ruapc-demo --no-default-features
+
     - name: Run tests
       run: |
         sudo prlimit --pid $$ -l=unlimited && ulimit -a

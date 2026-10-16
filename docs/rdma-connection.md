@@ -4,8 +4,16 @@
 
 RuaPC discovers devices and exchanges QP parameters through `_ruapc.rdma`
 RPCs over TCP, then activates the connection through the RDMA data plane.
-A peer is identified by its bootstrap TCP address. Each connection stripe
-chooses its own local and remote device, port, and GID.
+A peer is identified by its complete normalized group of bootstrap TCP
+addresses. Each connection stripe chooses its own local and remote device,
+port, and GID. Discovery caches, acquisition locks, path failures and stripes
+belong to that full group, independently of which address answered a bootstrap
+RPC. Different or overlapping groups are not automatically merged.
+
+Callers declare all group addresses equivalent: they must reach one server
+`State`, including shared prepare/commit/cancel lease records. Bootstrap does
+not negotiate an instance ID to verify this. A later RPC or rollback can use
+another group address. See [endpoint identity and strings](endpoints.md).
 
 This page owns bootstrap, path selection, negotiation, and peer maintenance.
 See the [built-in method catalog](builtin-services.md#internal-rdma-bootstrap-_ruapcrdma),

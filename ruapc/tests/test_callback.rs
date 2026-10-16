@@ -57,7 +57,7 @@ async fn test_callback() {
     let mut router = Router::default();
     bar.clone().ruapc_export(&mut router);
     let ctx = Context::create_with_router(router, &SocketPoolConfig::default()).unwrap();
-    let ctx = ctx.with_endpoint(ruapc::Endpoint::tcp(addr));
+    let ctx = ctx.with_endpoint(ruapc::Endpoint::tcp([addr]).unwrap());
 
     let client = Client::default();
     assert_eq!(client.foo(&ctx, &FooReq(0)).await, Ok(FooRsp(1)));
@@ -87,7 +87,7 @@ async fn test_callback_http() {
     let mut router = Router::default();
     bar.clone().ruapc_export(&mut router);
     let ctx = Context::create_with_router(router, &config).unwrap();
-    let ctx = ctx.with_endpoint(ruapc::Endpoint::new(ruapc::Transport::HTTP, addr));
+    let ctx = ctx.with_endpoint(ruapc::Endpoint::new(ruapc::Transport::HTTP, [addr]).unwrap());
 
     let client = Client::default();
     assert_eq!(client.foo(&ctx, &FooReq(0)).await, Ok(FooRsp(1)));

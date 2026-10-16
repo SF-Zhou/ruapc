@@ -68,7 +68,7 @@ pub enum RawStream {
 /// Trait defining the interface for individual socket pool implementations.
 ///
 /// Used by `TcpSocketPool`, `WebSocketPool`, `HttpSocketPool`, etc.
-/// `SocketPool` (the enum) dispatches to these via its own methods.
+/// The composite `SocketPool` dispatches to these through the transport enum.
 pub trait SocketPoolTrait: Sized {
     fn create(
         config: &SocketPoolConfig,
@@ -76,7 +76,7 @@ pub trait SocketPoolTrait: Sized {
         buffer_pool: &Arc<crate::BufferPool>,
     ) -> Result<Self>;
 
-    async fn acquire(&self, addr: &SocketAddr, state: &Arc<State>) -> Result<Socket>;
+    async fn acquire(&self, endpoint: &RpcEndpoint, state: &Arc<State>) -> Result<Socket>;
 
     async fn handle_new_stream(
         &self,
@@ -138,37 +138,40 @@ impl SocketPool {
     }
 
     /// Acquires a socket using the transport carried by `endpoint`.
-    pub async fn acquire(&self, endpoint: RpcEndpoint, state: &Arc<State>) -> Result<Socket> {
-        match endpoint.transport() {
-            Transport::TCP => self.tcp.acquire(&endpoint.addr(), state).await,
-            Transport::WS => self.ws.acquire(&endpoint.addr(), state).await,
-            Transport::HTTP => self.http.acquire(&endpoint.addr(), state).await,
-            #[cfg(feature = "rdma")]
-            Transport::RDMA => match &self.rdma {
-                Some(pool) => pool.acquire(&endpoint.addr(), state).await,
-                None => Err(Error::new(
-                    ErrorKind::InvalidArgument,
-                    "RDMA endpoint requires SocketPoolConfig.rdma = Some(...)".into(),
-                )),
-            },
-        }
+    pub async fn acquire(&self, endpoint: &RpcEndpoint, state: &Arc<State>) -> Result<Socket> {
+        self.acquire_with_options(endpoint, AcquireOptions::default(), state)
+            .await
     }
 
-    /// Like [`SocketPool::acquire`], applying the constraints and budget in
-    /// `options`. This is the single point where [`AcquireOptions`] meets
-    /// transport-specific behavior.
+    /// Acquires within the caller's budget, including address fallback and
+    /// transport handshakes. RDMA consumes the whole group as its peer key.
     pub(crate) async fn acquire_with_options(
         &self,
-        endpoint: RpcEndpoint,
+        endpoint: &RpcEndpoint,
         options: AcquireOptions<'_>,
         state: &Arc<State>,
     ) -> Result<Socket> {
-        #[cfg(feature = "rdma")]
-        if endpoint.transport() == Transport::RDMA {
-            return match self.rdma_pool() {
+        match endpoint.transport() {
+            Transport::TCP => {
+                self.tcp
+                    .acquire_with_deadline(endpoint, options.deadline, state)
+                    .await
+            }
+            Transport::WS => {
+                self.ws
+                    .acquire_with_deadline(endpoint, options.deadline, state)
+                    .await
+            }
+            Transport::HTTP => {
+                self.http
+                    .acquire_with_deadline(endpoint, options.deadline, state)
+                    .await
+            }
+            #[cfg(feature = "rdma")]
+            Transport::RDMA => match &self.rdma {
                 Some(pool) => {
-                    pool.acquire_with_deadline(
-                        &endpoint.addr(),
+                    pool.acquire_with_options(
+                        endpoint,
                         options.avoided_nics(),
                         options.deadline,
                         state,
@@ -179,17 +182,9 @@ impl SocketPool {
                     ErrorKind::InvalidArgument,
                     "RDMA endpoint requires SocketPoolConfig.rdma = Some(...)".into(),
                 )),
-            };
-        }
-        match options.deadline {
-            Some(deadline) => {
-                tokio::time::timeout_at(deadline.into(), self.acquire(endpoint, state))
-                    .await
-                    .map_err(|_| {
-                        Error::new(ErrorKind::Timeout, "connection deadline expired".into())
-                    })?
-            }
-            None => self.acquire(endpoint, state).await,
+            },
+            #[cfg(not(feature = "rdma"))]
+            Transport::RDMA => Err(Self::rdma_feature_required()),
         }
     }
 
@@ -198,23 +193,23 @@ impl SocketPool {
     #[cfg_attr(not(feature = "rdma"), expect(unused_variables))]
     pub(crate) fn try_acquire(
         &self,
-        endpoint: RpcEndpoint,
+        endpoint: &RpcEndpoint,
         options: AcquireOptions<'_>,
     ) -> Option<Result<Socket>> {
         match endpoint.transport() {
-            Transport::TCP => self.tcp.try_acquire(&endpoint.addr()).map(Ok),
-            Transport::WS => self.ws.try_acquire(&endpoint.addr()).map(Ok),
-            Transport::HTTP => self.http.try_acquire(&endpoint.addr()).map(Ok),
+            Transport::TCP => self.tcp.try_acquire(endpoint).map(Ok),
+            Transport::WS => self.ws.try_acquire(endpoint).map(Ok),
+            Transport::HTTP => self.http.try_acquire(endpoint).map(Ok),
             #[cfg(feature = "rdma")]
             Transport::RDMA => match &self.rdma {
-                Some(pool) => pool
-                    .try_acquire(&endpoint.addr(), options.avoided_nics())
-                    .map(Ok),
+                Some(pool) => pool.try_acquire(endpoint, options.avoided_nics()).map(Ok),
                 None => Some(Err(Error::new(
                     ErrorKind::InvalidArgument,
                     "RDMA endpoint requires SocketPoolConfig.rdma = Some(...)".into(),
                 ))),
             },
+            #[cfg(not(feature = "rdma"))]
+            Transport::RDMA => Some(Err(Self::rdma_feature_required())),
         }
     }
 
@@ -223,17 +218,17 @@ impl SocketPool {
     #[cfg_attr(not(feature = "rdma"), expect(unused_variables))]
     pub(crate) async fn acquire_existing(
         &self,
-        endpoint: RpcEndpoint,
+        endpoint: &RpcEndpoint,
         options: AcquireOptions<'_>,
     ) -> Option<Result<Socket>> {
         match endpoint.transport() {
-            Transport::TCP => self.tcp.acquire_existing(&endpoint.addr()).await.map(Ok),
-            Transport::WS => self.ws.acquire_existing(&endpoint.addr()).await.map(Ok),
-            Transport::HTTP => self.http.acquire_existing(&endpoint.addr()).await.map(Ok),
+            Transport::TCP => self.tcp.acquire_existing(endpoint).await.map(Ok),
+            Transport::WS => self.ws.acquire_existing(endpoint).await.map(Ok),
+            Transport::HTTP => self.http.acquire_existing(endpoint).await.map(Ok),
             #[cfg(feature = "rdma")]
             Transport::RDMA => match &self.rdma {
                 Some(pool) => pool
-                    .acquire_existing(&endpoint.addr(), options.avoided_nics())
+                    .acquire_existing(endpoint, options.avoided_nics())
                     .await
                     .map(Ok),
                 None => Some(Err(Error::new(
@@ -241,11 +236,22 @@ impl SocketPool {
                     "RDMA endpoint requires SocketPoolConfig.rdma = Some(...)".into(),
                 ))),
             },
+            #[cfg(not(feature = "rdma"))]
+            Transport::RDMA => Some(Err(Self::rdma_feature_required())),
         }
     }
 
+    #[cfg(feature = "rdma")]
     pub(crate) fn task_supervisor_handle(&self) -> crate::TaskSupervisorHandle {
         self.task_supervisor.handle()
+    }
+
+    #[cfg(not(feature = "rdma"))]
+    fn rdma_feature_required() -> Error {
+        Error::new(
+            ErrorKind::InvalidArgument,
+            "RDMA endpoint requires the `rdma` Cargo feature".into(),
+        )
     }
 
     /// Handles a new incoming connection stream.
