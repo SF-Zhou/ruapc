@@ -1,5 +1,5 @@
-//! Background upkeep: the maintenance task, dead-path pruning, peer
-//! replenishment, preconnect backoff and rebalancing.
+//! Periodic upkeep: dead-path pruning, idle-peer eviction and rebalancing.
+//! Connection replenishment is shared with first use and recovery in `reconcile`.
 
 use std::{
     collections::HashSet,
@@ -10,20 +10,9 @@ use std::{
 
 use super::super::RdmaSocket;
 use super::super::path::RdmaNicInfo;
-use super::placement::{self, PathPreference, ReconcileAction};
+use super::placement;
 use super::{PeerState, RdmaSocketPool, Stripe, pseudo_random};
-use crate::{Result, State};
-
-#[derive(Clone, Copy)]
-pub(super) struct RetryBackoff {
-    pub(super) failures: u32,
-    pub(super) retry_at: Instant,
-}
-
-pub(super) fn preconnect_backoff_delay(failures: u32) -> Duration {
-    let exponent = failures.saturating_sub(1).min(8);
-    Duration::from_millis((100u64 << exponent).min(30_000))
-}
+use crate::State;
 
 impl RdmaSocketPool {
     const DESIRED_PEER_IDLE_TTL: Duration = Duration::from_secs(60);
@@ -37,8 +26,7 @@ impl RdmaSocketPool {
             return;
         }
         let weak_state = Arc::downgrade(state);
-        let guard = self.task_supervisor.start_async_task();
-        tokio::spawn(async move {
+        let _ = self.task_supervisor.handle().try_spawn(async move {
             let mut seq = 0usize;
             loop {
                 // 0.5x..1.5x jitter decorrelates clients that would
@@ -46,10 +34,7 @@ impl RdmaSocketPool {
                 // load snapshot.
                 seq = seq.wrapping_add(1);
                 let sleep_ms = interval_ms / 2 + pseudo_random(seq) % interval_ms.max(1);
-                tokio::select! {
-                    () = guard.stopped() => break,
-                    () = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {}
-                }
+                tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
                 let Some(state) = weak_state.upgrade() else {
                     break;
                 };
@@ -64,23 +49,14 @@ impl RdmaSocketPool {
     /// One maintenance tick: fail connections on dead local ports, prune
     /// dead stripes, and replenish peers below `connections_per_peer`.
     pub(crate) async fn run_maintenance(&self, state: &Arc<State>) {
-        self.fail_paths_on_dead_ports().await;
-        self.prune_dead().await;
+        self.fail_paths_on_dead_ports();
+        self.prune_dead();
         let now = Instant::now();
         let snapshot: Vec<Arc<PeerState>> =
             self.peers.iter().map(|peer| peer.value().clone()).collect();
         let mut peers = Vec::new();
         for peer in snapshot {
-            let has_stripes = !peer.stripes.read().unwrap().active.is_empty();
-            let recently_used = peer
-                .meta
-                .lock()
-                .unwrap()
-                .last_used
-                .is_some_and(|last_used| {
-                    now.saturating_duration_since(last_used) < Self::DESIRED_PEER_IDLE_TTL
-                });
-            if has_stripes || recently_used {
+            if peer.is_desired(now, Self::DESIRED_PEER_IDLE_TTL) {
                 peers.push(peer);
                 continue;
             }
@@ -91,7 +67,7 @@ impl RdmaSocketPool {
                 self.peers.remove_if(&peer.endpoint, |_, current| {
                     Arc::ptr_eq(current, &peer)
                         && Arc::strong_count(current) == 2
-                        && current.stripes.read().unwrap().active.is_empty()
+                        && !current.is_desired(now, Self::DESIRED_PEER_IDLE_TTL)
                 });
             }
         }
@@ -127,7 +103,7 @@ impl RdmaSocketPool {
     /// Proactively fails connections whose local port went down; the port
     /// state comes from the periodic device refresher, so failures are
     /// detected even on idle connections that see no completion errors.
-    async fn fail_paths_on_dead_ports(&self) {
+    fn fail_paths_on_dead_ports(&self) {
         let fail_if_dead = |socket: &Arc<RdmaSocket>| {
             if socket.state.is_ok() && self.local_nic_dead(&socket.path.local) {
                 tracing::warn!(
@@ -155,13 +131,11 @@ impl RdmaSocketPool {
         }
     }
 
-    /// Removes dead stripes (and fully dead peers) from the socket map and
-    /// prunes released inbound connections.
-    async fn prune_dead(&self) {
+    /// Prunes dead stripes while preserving recovery intent, and removes
+    /// released inbound connections.
+    fn prune_dead(&self) {
         for peer in self.peers.iter() {
-            let mut stripes = peer.value().stripes.write().unwrap();
-            stripes.active.retain(|s| s.socket.state.is_ok());
-            stripes.draining.retain(|s| s.socket.state.is_ok());
+            peer.value().prune_dead(self.config.probe.interval_ms != 0);
         }
         self.inbound
             .lock()
@@ -169,166 +143,12 @@ impl RdmaSocketPool {
             .retain(|conn| conn.strong_count() > 0);
     }
 
-    /// Tops a desired peer up to `connections_per_peer` healthy stripes.
-    async fn replenish_peer(&self, peer: &Arc<PeerState>, state: &Arc<State>) {
-        let endpoint = &peer.endpoint;
-        const PEER_BACKOFF_KEY: &str = "";
-        if !self.preconnect_ready(peer, PEER_BACKOFF_KEY) {
-            return;
-        }
-        let Ok(guard) = peer.connect.try_lock() else {
-            // An acquire is already connecting to this peer; retry next tick.
+    async fn rebalance_peer(&self, peer: &Arc<PeerState>, state: &Arc<State>) {
+        // Coverage replacement must not change per-NIC counts between this
+        // snapshot and publication, or rebalancing could remove sole coverage.
+        let Ok(_connect) = peer.connect.try_lock() else {
             return;
         };
-        let result: Result<()> = async {
-            let plan = self.prepare_connect_plan(peer, state, None).await?;
-            let mut existing = peer.active_snapshot();
-            let max_connections = self.config.peers.preconnect_max_per_peer as usize;
-            let min_per_remote = self.config.peers.min_connections_per_remote_nic as usize;
-            let avoided_remote_nics = HashSet::new();
-            let mut remote_names = Vec::new();
-            for candidate in &plan.candidates {
-                if !remote_names.contains(&candidate.path.remote.device) {
-                    remote_names.push(candidate.path.remote.device.clone());
-                }
-            }
-            let healthy_remotes: Vec<String> = existing
-                .iter()
-                .filter(|stripe| stripe.socket.state.is_ok())
-                .map(|stripe| stripe.socket.path.remote.device.clone())
-                .collect();
-            let coverage_blocked: HashSet<String> = remote_names
-                .iter()
-                .filter(|remote| !self.preconnect_ready(peer, remote))
-                .cloned()
-                .collect();
-            let actions = placement::plan_connections(
-                &remote_names,
-                &healthy_remotes,
-                &coverage_blocked,
-                min_per_remote,
-                self.config.peers.connections_per_peer as usize,
-                max_connections,
-            );
-            for action in actions {
-                match action {
-                    ReconcileAction::ConnectCoverage(remote) => {
-                    if !self.preconnect_ready(peer, &remote) {
-                            continue;
-                    }
-                    let preference = PathPreference {
-                        remote_device: Some(&remote),
-                        avoided_remote_nics: &avoided_remote_nics,
-                    };
-                    match self
-                        .connect_with_failover(peer, state, &plan, preference, &existing)
-                        .await
-                    {
-                        Ok(established) => {
-                            self.clear_preconnect_failure(peer, &remote);
-                            let stripe = self.admit_established(peer, established);
-                            existing.push(stripe);
-                        }
-                        Err(err) => {
-                            self.record_preconnect_failure(peer, &remote);
-                            tracing::debug!(peer = %endpoint, remote_device = %remote, %err, "RDMA coverage connection failed");
-                        }
-                    }
-                    }
-                    ReconcileAction::ConnectTarget => {
-                        let established = self
-                            .connect_with_failover(
-                                peer,
-                                state,
-                                &plan,
-                                PathPreference {
-                                    remote_device: None,
-                                    avoided_remote_nics: &avoided_remote_nics,
-                                },
-                                &existing,
-                            )
-                            .await?;
-                        let stripe = self.admit_established(peer, established);
-                        existing.push(stripe);
-                    }
-                }
-            }
-            // Coverage actions may fail after the pure plan is built. Fill
-            // the normal target from the resulting actual state rather than
-            // assuming every planned action succeeded. The iteration bound
-            // is computed upfront so connections that die right after
-            // admission cannot keep this loop alive; the next maintenance
-            // tick retries them (under backoff).
-            let healthy_count = |stripes: &[Stripe]| {
-                stripes
-                    .iter()
-                    .filter(|stripe| stripe.socket.state.is_ok())
-                    .count()
-            };
-            let target = self.config.peers.connections_per_peer as usize;
-            for _ in 0..target.saturating_sub(healthy_count(&existing)) {
-                if healthy_count(&existing) >= max_connections {
-                    break;
-                }
-                let established = self
-                    .connect_with_failover(
-                        peer,
-                        state,
-                        &plan,
-                        PathPreference {
-                            remote_device: None,
-                            avoided_remote_nics: &avoided_remote_nics,
-                        },
-                        &existing,
-                    )
-                    .await?;
-                let stripe = self.admit_established(peer, established);
-                existing.push(stripe);
-            }
-            Ok(())
-        }
-        .await;
-        if let Err(err) = result {
-            self.record_preconnect_failure(peer, PEER_BACKOFF_KEY);
-            tracing::debug!("replenishing RDMA stripes to {endpoint} failed: {err}");
-        } else {
-            self.clear_preconnect_failure(peer, PEER_BACKOFF_KEY);
-        }
-        drop(guard);
-    }
-
-    fn preconnect_ready(&self, peer: &PeerState, remote: &str) -> bool {
-        peer.meta
-            .lock()
-            .unwrap()
-            .backoff
-            .get(remote)
-            .is_none_or(|state| Instant::now() >= state.retry_at)
-    }
-
-    fn record_preconnect_failure(&self, peer: &PeerState, remote: &str) {
-        let mut meta = peer.meta.lock().unwrap();
-        let failures = meta
-            .backoff
-            .get(remote)
-            .map_or(1, |state| state.failures.saturating_add(1));
-        let base = preconnect_backoff_delay(failures);
-        let jitter =
-            Duration::from_millis(self.pseudo_random() % (base.as_millis() as u64 / 2 + 1));
-        meta.backoff.insert(
-            remote.to_owned(),
-            RetryBackoff {
-                failures,
-                retry_at: Instant::now() + base + jitter,
-            },
-        );
-    }
-
-    fn clear_preconnect_failure(&self, peer: &PeerState, remote: &str) {
-        peer.meta.lock().unwrap().backoff.remove(remote);
-    }
-
-    async fn rebalance_peer(&self, peer: &Arc<PeerState>, state: &Arc<State>) {
         let Ok(plan) = self.prepare_connect_plan(peer, state, None).await else {
             return;
         };
@@ -441,9 +261,6 @@ impl RdmaSocketPool {
         let victim = &stripes[victim_index];
         let best = &plan.candidates[best_index];
 
-        let Ok(guard) = peer.connect.try_lock() else {
-            return;
-        };
         match self
             .connect_stripe(peer, state, &plan.bootstrap_ctx, best)
             .await
@@ -453,7 +270,6 @@ impl RdmaSocketPool {
             }
             Err(err) => tracing::debug!(peer = %peer.endpoint, %err, "RDMA rebalance failed"),
         }
-        drop(guard);
     }
 
     pub(super) fn drain_then_close(&self, peer: &Arc<PeerState>, socket: Arc<RdmaSocket>) {

@@ -73,6 +73,11 @@ impl AcceptLease {
         {
             self.expires_at = now + lease_duration;
         }
+        if self.state == AcceptLeaseState::Active
+            && let Some(socket) = self.socket.upgrade()
+        {
+            socket.enable_probes();
+        }
     }
 
     fn expiry(&self, now: Instant) -> Option<LeaseExpiry> {
@@ -248,6 +253,7 @@ impl RdmaSocketPool {
         }
         self.ensure_accept_lease_sweeper(state);
         self.ensure_maintenance_task(state);
+        self.ensure_probe_task(state);
         tracing::debug!(
             conn_id = socket.conn_id,
             local_qp = socket.queue_pair.qp_num(),

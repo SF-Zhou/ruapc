@@ -78,6 +78,23 @@ lease expiry, and rollback; wire types live in
 [rdma_service.rs](../ruapc/src/rdma/rdma_service.rs) and
 [endpoint.rs](../ruapc/src/rdma/endpoint.rs).
 
+## Internal RDMA health probe
+
+With the `rdma` feature, both sides of an established RDMA connection use this
+method to check that specific connection. It rejects other transports.
+
+| Method | Request | Success value | Purpose |
+|---|---|---|---|
+| `_ruapc.rdma/probe` | RPC nonce (`u64`); eight bytes of read space in `MsgMeta.read_regions` | `ProbeReply { rpc_nonce, read_nonce }` | Validate an ordinary RPC round trip and a remote READ on the same connection. |
+
+The read-space nonce is a little-endian `u64` and differs from the RPC nonce.
+The caller requires both
+returned values to match; the receiver uses `Context::remote_read`, including
+its post-READ waiter membership check. The Rust trait and reply type are
+crate-private, defined in [probe.rs](../ruapc/src/rdma/probe.rs). See
+[periodic connection probes](rdma-connection.md#periodic-connection-probes)
+for scheduling, timeout thresholds and reconnection ownership.
+
 ## Private RDMA payload controls
 
 An RDMA connection with large-payload support carries three transport frame

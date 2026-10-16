@@ -47,7 +47,7 @@ async fn test_rdma_path_report() {
     let rsp = client.hello(&ctx, &"ruapc".to_string()).await.unwrap();
     assert_eq!(rsp, "hello ruapc!");
 
-    // Client side: one healthy outbound path towards the server.
+    // Client side: at least one healthy outbound path towards the server.
     let report = ctx.state.rdma_path_report().await.unwrap();
     let outbound: Vec<_> = report
         .paths

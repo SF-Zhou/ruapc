@@ -27,27 +27,15 @@ impl RdmaSocketPool {
     ) -> Result<Socket> {
         let endpoint = &peer.endpoint;
         self.ensure_maintenance_task(state);
-        // Re-check under the connect lock: another task may have connected,
-        // or every stripe may have failed and must be replaced.
-        let existing = {
-            let mut stripes = peer.stripes.write().unwrap();
-            if let Some(socket) = self.pick_stripe(&stripes.active, avoided_remote_nics) {
-                return Ok(socket);
-            }
-            if stripes
-                .active
-                .iter()
-                .any(|stripe| stripe.socket.state.is_ok())
-            {
-                stripes.active.clone()
-            } else {
-                if !stripes.active.is_empty() {
-                    tracing::info!("all RDMA stripes to {endpoint} failed, reconnecting");
-                    stripes.active.clear();
-                }
-                Vec::new()
-            }
-        };
+        self.ensure_probe_task(state);
+        // Preserve recovery intent before removing failed stripes, including
+        // when this foreground reconnect fails and no new requests arrive.
+        peer.prune_dead(self.config.probe.interval_ms != 0);
+        // Re-check under the connect lock: another task may have connected.
+        let existing = peer.active_snapshot();
+        if let Some(socket) = self.pick_stripe(&existing, avoided_remote_nics) {
+            return Ok(socket);
+        }
 
         let fallback = (!avoided_remote_nics.is_empty())
             .then(|| self.pick_stripe(&existing, &HashSet::new()))
@@ -276,7 +264,7 @@ impl RdmaSocketPool {
         rollback.disarm();
         stripes.active.push(stripe.clone());
         drop(stripes);
-        stripe.socket.request_activation();
+        stripe.socket.activate_published();
         tracing::debug!(peer = %peer.endpoint, conn_id = stripe.socket.conn_id, "RDMA stripe published; activation requested");
         stripe
     }
@@ -300,7 +288,7 @@ impl RdmaSocketPool {
         published.active = stripes.clone();
         drop(published);
         for stripe in &stripes {
-            stripe.socket.request_activation();
+            stripe.socket.activate_published();
         }
         tracing::debug!(peer = %peer.endpoint, stripes = stripes.len(), "RDMA initial stripes published; activation requested");
     }
@@ -320,6 +308,13 @@ impl RdmaSocketPool {
             .iter()
             .position(|stripe| Arc::ptr_eq(&stripe.socket, victim))
         else {
+            drop(stripes);
+            tracing::debug!(
+                peer = %peer.endpoint,
+                conn_id = socket.conn_id,
+                previous_conn_id = victim.conn_id,
+                "RDMA replacement discarded; previous stripe is no longer active"
+            );
             return false;
         };
         rollback.disarm();
@@ -329,7 +324,7 @@ impl RdmaSocketPool {
         let victim = stripes.active.remove(position);
         stripes.draining.push(victim.clone());
         drop(stripes);
-        socket.request_activation();
+        socket.activate_published();
         tracing::debug!(peer = %peer.endpoint, conn_id = socket.conn_id, previous_conn_id = victim.socket.conn_id, "RDMA replacement published; activation requested");
         self.drain_then_close(peer, victim.socket);
         true

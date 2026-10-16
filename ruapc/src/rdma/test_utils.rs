@@ -12,6 +12,41 @@ pub(crate) fn open_rdma_device() -> ruapc_rdma::ActiveDevice {
         .expect("no RDMA device matching filter found")
 }
 
+/// Small same-host fixture on one usable device. Background work starts only
+/// when a test explicitly enables it; callers choose their own stripe count.
+pub(crate) fn small_rdma_config() -> crate::SocketPoolConfig {
+    let prefer_rxe = std::env::var("RUAPC_PREFER_RXE").is_ok();
+    let device = ruapc_rdma::ActiveDevice::available()
+        .expect("RDMA devices must be available")
+        .into_iter()
+        .find(|device| {
+            (!prefer_rxe || device.info().name.starts_with("rxe"))
+                && device.info().ports.iter().any(|port| {
+                    port.is_usable()
+                        && (!port.port_attr.link_layer.is_ethernet() || !port.gids.is_empty())
+                })
+        })
+        .expect("RDMA tests require one connectable device");
+    let mut config = crate::SocketPoolConfig {
+        listen_mode: crate::ListenMode::UNIFIED,
+        buffer_pool_memory: 128 << 20,
+        ..Default::default()
+    };
+    let rdma = config.rdma.as_mut().unwrap();
+    rdma.path.device_filter = vec![device.info().name.clone()];
+    rdma.connection.qp.max_send_wr = 16;
+    rdma.connection.qp.max_recv_wr = 16;
+    rdma.connection.qp.max_send_sge = 1;
+    rdma.connection.recv_queue_len = 4;
+    rdma.connection.max_msg_size = 16 * 1024;
+    rdma.polling.poll_threads_per_device = 1;
+    rdma.polling.dispatch_workers = 1;
+    rdma.peers.min_connections_per_remote_nic = 0;
+    rdma.maintenance.interval_ms = 0;
+    rdma.probe.interval_ms = 0;
+    config
+}
+
 /// Builds a [`crate::Devices`] populated with all available RDMA devices,
 /// honoring the `RUAPC_PREFER_RXE` env var.
 pub(crate) fn make_rdma_devices() -> Arc<crate::Devices> {

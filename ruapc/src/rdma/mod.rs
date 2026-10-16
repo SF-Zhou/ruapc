@@ -1,8 +1,8 @@
 mod config;
 pub use config::{
     RdmaConnectionTuningConfig, RdmaMaintenanceConfig, RdmaPathPolicyConfig, RdmaPeerPoolConfig,
-    RdmaPollingConfig, RdmaQueuePairConfig, RdmaRemoteMemoryConfig, RdmaSocketPoolConfig,
-    RdmaSubnetDomains, RdmaSubnetPolicy,
+    RdmaPollingConfig, RdmaProbeConfig, RdmaQueuePairConfig, RdmaRemoteMemoryConfig,
+    RdmaSocketPoolConfig, RdmaSubnetDomains, RdmaSubnetPolicy,
 };
 
 mod frame;
@@ -30,6 +30,9 @@ pub(crate) use rdma_device_refresher::RdmaDeviceRefresher;
 
 mod rdma_service;
 pub(crate) use rdma_service::{RdmaBootstrapService, RdmaPeerAdvertisement};
+
+mod probe;
+pub(crate) use probe::{RdmaProbeService, probe_connection};
 
 mod rdma_state;
 pub(crate) use rdma_state::{RdmaState, SendPermit};

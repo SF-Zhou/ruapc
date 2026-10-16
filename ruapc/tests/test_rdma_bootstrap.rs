@@ -50,8 +50,9 @@ fn config() -> SocketPoolConfig {
     rdma.peers.connections_per_peer = 2;
     rdma.polling.poll_threads_per_device = 1;
     rdma.polling.dispatch_workers = 1;
-    // Only handshake cleanup may change the tested connections. Maintenance
-    // must not hide a lost stripe by replenishing it in the background.
+    // Disable periodic replenishment so it cannot hide a lost stripe. The
+    // single NIC is already covered by the two initial stripes, so first-use
+    // preconnect has no additional coverage to create.
     rdma.maintenance.interval_ms = 0;
     config
 }

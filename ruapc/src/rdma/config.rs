@@ -12,6 +12,7 @@ pub struct RdmaSocketPoolConfig {
     pub path: RdmaPathPolicyConfig,
     pub peers: RdmaPeerPoolConfig,
     pub maintenance: RdmaMaintenanceConfig,
+    pub probe: RdmaProbeConfig,
     pub remote_memory: RdmaRemoteMemoryConfig,
 }
 
@@ -21,6 +22,7 @@ impl RdmaSocketPoolConfig {
         self.polling.validate()?;
         self.peers.validate()?;
         self.maintenance.validate()?;
+        self.probe.validate()?;
         self.remote_memory.validate()
     }
 }
@@ -189,8 +191,13 @@ pub struct RdmaPathPolicyConfig {
 #[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone)]
 #[serde(default, deny_unknown_fields)]
 pub struct RdmaPeerPoolConfig {
+    /// Initial foreground stripe count and total healthy-connection target.
     pub connections_per_peer: u32,
+    /// Background coverage target for each remote NIC with a compatible
+    /// local path. Zero disables per-NIC coverage preconnection.
     pub min_connections_per_remote_nic: u32,
+    /// Maximum active connections per peer. Coverage takes priority over
+    /// extra stripes on an already covered NIC; replacements drain separately.
     pub preconnect_max_per_peer: u32,
     /// Budget for preparation and, after the first commit, data-plane
     /// activation. Once active, retain the lease for this long solely for
@@ -235,7 +242,9 @@ impl RdmaPeerPoolConfig {
 #[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone)]
 #[serde(default, deny_unknown_fields)]
 pub struct RdmaMaintenanceConfig {
-    /// Maintenance interval in milliseconds. Zero disables maintenance.
+    /// Periodic maintenance interval in milliseconds. Zero disables periodic
+    /// retries and rebalancing. First-use preconnection and independently
+    /// configured health probes and recovery still run.
     pub interval_ms: u64,
     /// Minimum load improvement required before migrating a connection.
     pub rebalance_threshold: u32,
@@ -258,6 +267,51 @@ impl RdmaMaintenanceConfig {
         if self.rebalance_threshold == 0 {
             return Err(invalid_config(
                 "rdma.maintenance.rebalance_threshold must be nonzero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Periodic connection health checks for both outbound and inbound RDMA connections.
+#[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone)]
+#[serde(default, deny_unknown_fields)]
+pub struct RdmaProbeConfig {
+    /// Base delay in milliseconds before the first health-check round and
+    /// after each completed round, randomized to 0.5–1.5 times this value.
+    /// Zero disables probing.
+    pub interval_ms: u64,
+    /// Total budget in milliseconds for one probe's RPC and remote READ checks.
+    /// Must be nonzero when probing is enabled.
+    pub timeout_ms: u64,
+    /// Consecutive timed-out probes before closing and replacing a connection.
+    /// Success or a non-timeout error resets the count. Must be nonzero when enabled.
+    pub max_consecutive_timeouts: u32,
+}
+
+impl Default for RdmaProbeConfig {
+    fn default() -> Self {
+        Self {
+            interval_ms: 60_000,
+            timeout_ms: 1_000,
+            max_consecutive_timeouts: 3,
+        }
+    }
+}
+
+impl RdmaProbeConfig {
+    fn validate(&self) -> crate::Result<()> {
+        if self.interval_ms == 0 {
+            return Ok(());
+        }
+        if self.timeout_ms == 0 {
+            return Err(invalid_config(
+                "rdma.probe.timeout_ms must be nonzero when probing is enabled",
+            ));
+        }
+        if self.max_consecutive_timeouts == 0 {
+            return Err(invalid_config(
+                "rdma.probe.max_consecutive_timeouts must be nonzero when probing is enabled",
             ));
         }
         Ok(())
@@ -449,6 +503,7 @@ mod tests {
         assert_eq!(rdma.path.subnet_policy, RdmaSubnetPolicy::Require);
         assert_eq!(rdma.peers, RdmaPeerPoolConfig::default());
         assert_eq!(rdma.maintenance, RdmaMaintenanceConfig::default());
+        assert_eq!(rdma.probe, RdmaProbeConfig::default());
         assert_eq!(rdma.remote_memory, RdmaRemoteMemoryConfig::default());
     }
 
@@ -528,6 +583,83 @@ mod tests {
         config.polling = RdmaPollingConfig::default();
         config.remote_memory.max_inflight_read_wrs = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn probe_defaults_and_nested_roundtrip() {
+        let defaults = RdmaProbeConfig::default();
+        assert_eq!(defaults.interval_ms, 60_000);
+        assert_eq!(defaults.timeout_ms, 1_000);
+        assert_eq!(defaults.max_consecutive_timeouts, 3);
+        defaults.validate().unwrap();
+        assert_eq!(
+            serde_json::from_str::<RdmaProbeConfig>("{}").unwrap(),
+            defaults
+        );
+
+        let config: SocketPoolConfig = serde_json::from_value(serde_json::json!({
+            "rdma": { "probe": { "interval_ms": 250, "timeout_ms": 50 } }
+        }))
+        .unwrap();
+        assert_eq!(
+            config.rdma.as_ref().unwrap().probe,
+            RdmaProbeConfig {
+                interval_ms: 250,
+                timeout_ms: 50,
+                ..defaults
+            }
+        );
+        let encoded = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            encoded["rdma"]["probe"],
+            serde_json::json!({
+                "interval_ms": 250,
+                "timeout_ms": 50,
+                "max_consecutive_timeouts": 3
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<SocketPoolConfig>(encoded).unwrap(),
+            config
+        );
+        assert!(
+            serde_json::from_value::<SocketPoolConfig>(serde_json::json!({
+                "rdma": { "probe": { "timeout": 50 } }
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn probe_validation_requires_nonzero_budget_and_threshold_when_enabled() {
+        for probe in [
+            RdmaProbeConfig {
+                timeout_ms: 0,
+                ..Default::default()
+            },
+            RdmaProbeConfig {
+                max_consecutive_timeouts: 0,
+                ..Default::default()
+            },
+        ] {
+            let config = RdmaSocketPoolConfig {
+                probe,
+                ..Default::default()
+            };
+            let error = config.validate().unwrap_err();
+            assert_eq!(error.kind, crate::ErrorKind::InvalidArgument);
+        }
+
+        RdmaSocketPoolConfig {
+            probe: RdmaProbeConfig {
+                interval_ms: 0,
+                timeout_ms: 0,
+                max_consecutive_timeouts: 0,
+            },
+            ..Default::default()
+        }
+        .validate()
+        .unwrap();
     }
 
     #[test]
