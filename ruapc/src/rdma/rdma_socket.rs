@@ -132,6 +132,8 @@ pub struct RdmaSocket {
     /// Initiator asks the poll thread to send one accounted immediate-only
     /// SEND after control-plane confirmation.
     activation_requested: AtomicBool,
+    /// Published by the initiator, or confirmed and activated by the acceptor.
+    probe_ready: AtomicBool,
     /// Server-side accept lease notified by the first successful receive.
     accept_lease_id: AtomicU64,
     /// Shared bandwidth shaper for the local RDMA port.
@@ -163,15 +165,30 @@ impl RdmaSocket {
             path: config.path,
             conn_id: crate::task::next_conn_id(),
             activation_requested: AtomicBool::new(false),
+            probe_ready: AtomicBool::new(false),
             accept_lease_id: AtomicU64::new(0),
             bandwidth_limiter: config.bandwidth_limiter,
             read_timeout: config.read_timeout,
         }
     }
 
+    /// Start an outbound connection after publication has disarmed rollback.
+    pub(crate) fn activate_published(&self) {
+        self.request_activation();
+        self.enable_probes();
+    }
+
     pub(crate) fn request_activation(&self) {
         self.activation_requested.store(true, Ordering::Release);
         self.poller_waker.wake();
+    }
+
+    pub(crate) fn enable_probes(&self) {
+        self.probe_ready.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_probe_ready(&self) -> bool {
+        self.probe_ready.load(Ordering::Acquire)
     }
 
     pub(crate) fn take_activation_request(&self) -> bool {

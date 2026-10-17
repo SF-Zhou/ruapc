@@ -8,7 +8,7 @@ mod schema;
 pub use schema::MethodSchema;
 
 #[cfg(feature = "rdma")]
-use crate::rdma::RdmaBootstrapService;
+use crate::rdma::{RdmaBootstrapService, RdmaProbeService};
 use crate::{
     Context, Payload,
     error::{Error, ErrorKind, Result},
@@ -45,8 +45,8 @@ struct Method {
 /// Define services with [`#[service]`](crate::service) and call their generated
 /// `ruapc_export` before passing the router to [`Server::create`](crate::Server::create)
 /// or [`Context::create_with_router`]. The default router includes public
-/// reflection and internal remote-memory services, plus RDMA bootstrap when
-/// that feature is enabled.
+/// reflection and internal remote-memory services, plus RDMA bootstrap and
+/// connection probes when that feature is enabled.
 ///
 /// Internal methods remain dispatchable but are excluded from
 /// [`method_names`](Self::method_names), [`method_schemas`](Self::method_schemas)
@@ -72,11 +72,21 @@ impl Default for Router {
         MemoryService::ruapc_export(dummy.clone(), &mut this);
         #[cfg(feature = "rdma")]
         RdmaBootstrapService::ruapc_export(dummy.clone(), &mut this);
+        #[cfg(feature = "rdma")]
+        RdmaProbeService::ruapc_export(dummy.clone(), &mut this);
         this
     }
 }
 
 impl Router {
+    /// Interposes on an existing handler without changing its schemas or visibility.
+    #[cfg(all(test, feature = "rdma"))]
+    pub(crate) fn wrap_method(&mut self, name: &str, wrap: impl FnOnce(Func) -> Func) {
+        let method = self.methods.get_mut(name).expect("test method must exist");
+        let original = std::mem::replace(&mut method.func, Box::new(|_, _| Ok(())));
+        method.func = wrap(original);
+    }
+
     /// Registers a public method and its request/response schemas.
     ///
     /// Normally called by [`#[service]`](crate::service). `name` is the wire name
@@ -287,9 +297,49 @@ mod tests {
             "_ruapc.rdma/commit_connection",
             "_ruapc.rdma/discover",
             "_ruapc.rdma/prepare_connection",
+            "_ruapc.rdma/probe",
         ]);
         expected.sort_unstable();
         assert_eq!(all_names, expected);
+        #[cfg(feature = "rdma")]
+        {
+            assert!(!router.is_public_method("_ruapc.rdma/probe"));
+            assert!(
+                router
+                    .method_schemas()
+                    .all(|(name, _)| name != "_ruapc.rdma/probe")
+            );
+        }
+    }
+
+    #[cfg(feature = "rdma")]
+    #[tokio::test]
+    async fn test_builtin_rdma_probe_is_not_a_unary_http_endpoint() {
+        let config = crate::SocketPoolConfig {
+            listen_mode: crate::ListenMode::UNIFIED,
+            rdma: None,
+            ..Default::default()
+        };
+        let server = crate::Server::create(Router::default(), &config).unwrap();
+        let address = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        assert!(
+            !server
+                .state()
+                .router
+                .openapi
+                .paths
+                .paths
+                .contains_key("/_ruapc.rdma/probe")
+        );
+        let response = reqwest::Client::new()
+            .post(format!("http://{address}/_ruapc.rdma/probe"))
+            .json(&7u64)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404);
+        server.stop();
+        server.join().await;
     }
 
     #[test]

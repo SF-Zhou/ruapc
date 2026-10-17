@@ -72,6 +72,8 @@ acquisition and remains available with `Client::max_retries = 0`. Concurrent
 acquisitions of the same normalized group share connection setup. TCP, WS and
 HTTP each cache one outbound stream per group; RDMA maintains its configured
 connection stripes for the whole group.
+After first use, RDMA also preconnects compatible remote NICs in the background;
+see [coverage targets and limits](rdma-connection.md#path-policy-and-maintenance).
 
 A failed alternate address does not invalidate a healthy established
 connection. Request retries remain limited to failures before transport

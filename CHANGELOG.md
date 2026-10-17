@@ -6,7 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+### Added
+- Both ends of RDMA connections run background probes that verify an ordinary
+  RPC round trip and `remote_read` on each connection. `rdma.probe` configures
+  the interval, total timeout and consecutive-timeout threshold, defaulting to
+  60 seconds, 1 second and 3 timeouts. Failed connections close and the original
+  initiator rebuilds them, independently of periodic maintenance.
+- RDMA starts background remote-NIC preconnection immediately after initial
+  acquisition, independently of the periodic maintenance interval. Coverage
+  skips NICs without a compatible local path, isolates failed attempts, and
+  can replace redundant stripes when the active-connection limit is reached.
+
 ### Changed
+- **BREAKING**: RDMA over Ethernet requires matching GID types on both ends.
+  The best-effort fallback across different GID types has been removed;
+  NIC pairs without a common GID type are no longer connection candidates.
 - **BREAKING**: `Endpoint` now identifies one server through a nonempty,
   sorted and deduplicated address group and one transport. Constructors accept
   address iterators and return `Result`; `addrs()` replaces `addr()`, and

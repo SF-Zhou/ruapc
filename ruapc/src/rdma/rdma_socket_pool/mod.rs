@@ -27,6 +27,8 @@ use placement::PathCandidate;
 #[cfg(test)]
 mod group_tests;
 mod maintenance;
+mod probe;
+mod reconcile;
 mod report;
 mod setup;
 
@@ -130,6 +132,8 @@ pub struct RdmaSocketPool {
     rng_seq: AtomicUsize,
     /// Whether the background maintenance task has been started.
     maintenance_started: AtomicBool,
+    /// Whether the independent connection health probe task has started.
+    probe_started: AtomicBool,
     /// Round-robin cursor selecting the next peer to rebalance.
     rebalance_cursor: AtomicUsize,
     /// Buffer pool bytes pinned by the receive rings of live connections.
@@ -235,6 +239,7 @@ impl RdmaSocketPool {
             next_stripe: AtomicUsize::new(0),
             rng_seq: AtomicUsize::new(0),
             maintenance_started: AtomicBool::new(false),
+            probe_started: AtomicBool::new(false),
             rebalance_cursor: AtomicUsize::new(0),
             ring_bytes: Arc::new(AtomicUsize::new(0)),
             pool_capacity_warned: std::sync::atomic::AtomicBool::new(false),
@@ -276,6 +281,7 @@ impl RdmaSocketPool {
         drop(guard);
         if result.is_ok() {
             peer.touch(Instant::now());
+            self.schedule_reconcile(&peer, state);
         }
         result
     }

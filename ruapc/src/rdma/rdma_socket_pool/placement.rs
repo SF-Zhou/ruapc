@@ -120,6 +120,27 @@ pub(super) fn eligible_paths(
         .collect()
 }
 
+/// Remote NICs with at least one candidate satisfying the hard path constraints.
+///
+/// Enumeration has already checked local ports, connection limits and the
+/// existing link/GID matching rules.
+/// Subnet preference, link class and temporary blacklisting affect path
+/// selection, not which remote NICs background connections should cover.
+pub(super) fn eligible_remote_nics(
+    candidates: &[PathCandidate],
+    subnet_policy: RdmaSubnetPolicy,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    candidates
+        .iter()
+        .filter(|candidate| {
+            subnet_policy != RdmaSubnetPolicy::Require || candidate.path.same_connectivity_domain
+        })
+        .filter(|candidate| seen.insert(candidate.path.remote.device.as_str()))
+        .map(|candidate| candidate.path.remote.device.clone())
+        .collect()
+}
+
 fn addresses_share_connectivity_domain(
     local: Option<IpAddr>,
     remote: Option<IpAddr>,
@@ -142,49 +163,63 @@ fn retain_if_any<T>(items: &mut Vec<T>, predicate: impl Fn(&T) -> bool) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ReconcileAction {
     ConnectCoverage(String),
+    ReplaceCoverage { remote: String, victim: String },
     ConnectTarget,
 }
 
-pub(super) fn plan_connections(
+/// Choose one action from the current healthy snapshot. The caller must
+/// re-evaluate after each attempt so failed connections never reserve capacity.
+pub(super) fn next_connection_action(
     remote_names: &[String],
     healthy_remotes: &[String],
     coverage_blocked: &HashSet<String>,
     min_per_remote: usize,
     target: usize,
     max: usize,
-) -> Vec<ReconcileAction> {
-    let mut actions = Vec::new();
+) -> Option<ReconcileAction> {
     let mut counts: HashMap<&str, usize> = HashMap::new();
     for remote in healthy_remotes {
         *counts.entry(remote).or_default() += 1;
     }
-    let mut total = healthy_remotes.len();
-    while total < max {
-        let mut progressed = false;
-        for remote in remote_names {
-            if total == max {
-                break;
-            }
-            if coverage_blocked.contains(remote) {
-                continue;
-            }
-            let count = counts.entry(remote).or_default();
-            if *count < min_per_remote {
-                *count += 1;
-                total += 1;
-                actions.push(ReconcileAction::ConnectCoverage(remote.clone()));
-                progressed = true;
-            }
+    // Cover missing NICs before filling others to their minimum.
+    if let Some((remote, count)) = remote_names
+        .iter()
+        .filter(|remote| !coverage_blocked.contains(*remote))
+        .map(|remote| (remote, counts.get(remote.as_str()).copied().unwrap_or(0)))
+        .filter(|(_, count)| *count < min_per_remote)
+        .min_by_key(|(_, count)| *count)
+    {
+        if healthy_remotes.len() < max {
+            return Some(ReconcileAction::ConnectCoverage(remote.clone()));
         }
-        if !progressed {
-            break;
-        }
+
+        // Recover slots from NICs that are no longer eligible first. If
+        // the cap cannot cover every minimum, move only from a NIC with
+        // at least two more connections. That improves coverage without
+        // moving a sole connection or oscillating between equal counts.
+        let eligible: HashSet<&str> = remote_names.iter().map(String::as_str).collect();
+        let victim = healthy_remotes
+            .iter()
+            .map(String::as_str)
+            .filter(|candidate| !eligible.contains(candidate))
+            .max_by_key(|candidate| counts.get(candidate).copied().unwrap_or(0))
+            .or_else(|| {
+                remote_names
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|candidate| {
+                        counts.get(candidate).copied().unwrap_or(0) >= count.saturating_add(2)
+                    })
+                    .max_by_key(|candidate| counts.get(candidate).copied().unwrap_or(0))
+            });
+        // No donor can improve the least-covered NIC, so none can
+        // improve any of the more-covered remaining NICs either.
+        return victim.map(|victim| ReconcileAction::ReplaceCoverage {
+            remote: remote.clone(),
+            victim: victim.to_owned(),
+        });
     }
-    while total < target.min(max) {
-        actions.push(ReconcileAction::ConnectTarget);
-        total += 1;
-    }
-    actions
+    (healthy_remotes.len() < target.min(max)).then_some(ReconcileAction::ConnectTarget)
 }
 
 pub(super) struct ExistingStripe<'a> {
@@ -310,27 +345,83 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_coverage_before_target() {
+    fn coverage_keeps_remote_nics_with_less_preferred_paths() {
+        let mut preferred = path_candidate(0, "preferred", true);
+        preferred.class = PathClass::InfiniBand;
+        let mut fallback = path_candidate(1, "fallback", false);
+        fallback.class = PathClass::RoceOther;
+
         assert_eq!(
-            plan_connections(
+            eligible_remote_nics(&[preferred, fallback], RdmaSubnetPolicy::Prefer),
+            ["preferred", "fallback"],
+        );
+    }
+
+    #[test]
+    fn coverage_requires_one_matching_local_path_and_preserves_order() {
+        let candidates = [
+            path_candidate(0, "a", false),
+            path_candidate(0, "b", true),
+            path_candidate(1, "a", true),
+            path_candidate(2, "b", true),
+            path_candidate(1, "c", false),
+        ];
+        assert_eq!(
+            eligible_remote_nics(&candidates, RdmaSubnetPolicy::Require),
+            ["b", "a"],
+        );
+        assert_eq!(
+            eligible_remote_nics(&candidates, RdmaSubnetPolicy::Prefer),
+            ["a", "b", "c"],
+        );
+    }
+
+    #[test]
+    fn coverage_skips_remote_nics_without_matching_paths() {
+        let candidates = [
+            path_candidate(0, "outside_domain", false),
+            path_candidate(0, "a", true),
+            path_candidate(1, "a", true),
+            path_candidate(0, "b", true),
+        ];
+        let remotes = eligible_remote_nics(&candidates, RdmaSubnetPolicy::Require);
+        assert_eq!(
+            next_connection_action(&remotes, &[], &HashSet::new(), 1, 1, 2),
+            Some(ReconcileAction::ConnectCoverage("a".into())),
+        );
+        assert_eq!(
+            next_connection_action(&remotes, &["a".into()], &HashSet::new(), 1, 1, 2),
+            Some(ReconcileAction::ConnectCoverage("b".into())),
+        );
+        assert!(eligible_remote_nics(&candidates[..1], RdmaSubnetPolicy::Require).is_empty());
+        assert!(eligible_remote_nics(&[], RdmaSubnetPolicy::Prefer).is_empty());
+        assert!(eligible_remote_nics(&[], RdmaSubnetPolicy::Require).is_empty());
+    }
+
+    #[test]
+    fn reconcile_coverage_before_target() {
+        let remotes = ["a".into(), "b".into()];
+        assert_eq!(
+            next_connection_action(&remotes, &["a".into()], &HashSet::new(), 1, 3, 4,),
+            Some(ReconcileAction::ConnectCoverage("b".into())),
+        );
+        assert_eq!(
+            next_connection_action(
+                &remotes,
                 &["a".into(), "b".into()],
-                &["a".into()],
                 &HashSet::new(),
                 1,
                 3,
                 4,
             ),
-            [
-                ReconcileAction::ConnectCoverage("b".into()),
-                ReconcileAction::ConnectTarget,
-            ]
+            Some(ReconcileAction::ConnectTarget),
         );
     }
 
     #[test]
     fn blocked_coverage_falls_back_to_target() {
         assert_eq!(
-            plan_connections(
+            next_connection_action(
                 &["a".into(), "b".into()],
                 &["a".into()],
                 &HashSet::from(["b".into()]),
@@ -338,8 +429,191 @@ mod tests {
                 2,
                 4,
             ),
-            [ReconcileAction::ConnectTarget]
+            Some(ReconcileAction::ConnectTarget)
         );
+    }
+
+    #[test]
+    fn coverage_replaces_redundant_connections_at_the_cap() {
+        assert_eq!(
+            next_connection_action(
+                &["a".into(), "b".into()],
+                &["a".into(), "a".into()],
+                &HashSet::new(),
+                1,
+                2,
+                2,
+            ),
+            Some(ReconcileAction::ReplaceCoverage {
+                remote: "b".into(),
+                victim: "a".into(),
+            }),
+        );
+    }
+
+    #[test]
+    fn coverage_replaces_ineligible_nics_before_eligible_redundancy() {
+        assert_eq!(
+            next_connection_action(
+                &["a".into(), "b".into()],
+                &["a".into(), "a".into(), "retired".into()],
+                &HashSet::new(),
+                1,
+                3,
+                3,
+            ),
+            Some(ReconcileAction::ReplaceCoverage {
+                remote: "b".into(),
+                victim: "retired".into(),
+            }),
+        );
+    }
+
+    #[test]
+    fn insufficient_cap_preserves_sole_coverage_without_oscillation() {
+        assert!(
+            next_connection_action(
+                &["a".into(), "b".into(), "c".into()],
+                &["a".into(), "b".into()],
+                &HashSet::new(),
+                2,
+                2,
+                2,
+            )
+            .is_none(),
+        );
+    }
+
+    #[test]
+    fn replanning_failed_coverage_leaves_capacity_for_later_nics() {
+        let remotes = ["a".into(), "b".into(), "c".into()];
+        assert_eq!(
+            next_connection_action(&remotes, &[], &HashSet::new(), 1, 1, 2),
+            Some(ReconcileAction::ConnectCoverage("a".into())),
+        );
+        // A failed connection is blocked, but never enters the healthy snapshot.
+        let blocked = HashSet::from(["a".into()]);
+        assert_eq!(
+            next_connection_action(&remotes, &[], &blocked, 1, 1, 2),
+            Some(ReconcileAction::ConnectCoverage("b".into())),
+        );
+        assert_eq!(
+            next_connection_action(&remotes, &["b".into()], &blocked, 1, 1, 2),
+            Some(ReconcileAction::ConnectCoverage("c".into())),
+        );
+    }
+
+    #[test]
+    fn bounded_replanning_prioritizes_missing_nics() {
+        let remotes: Vec<String> = (0..8).map(|index| format!("nic{index}")).collect();
+        for (min, max, initial_count, initial_nic, expected_counts) in [
+            (8, 16, 1, 0, vec![2; 8]),
+            (8, 16, 16, 0, vec![2; 8]),
+            (8, 16, 16, 7, vec![2; 8]),
+            (16, 16, 16, 7, vec![2; 8]),
+            (1, 16, 1, 0, vec![1; 8]),
+            (1, 4, 1, 0, vec![1, 1, 1, 1, 0, 0, 0, 0]),
+            (1, 4, 4, 0, vec![1, 1, 1, 1, 0, 0, 0, 0]),
+            (8, 4, 1, 0, vec![1, 1, 1, 1, 0, 0, 0, 0]),
+        ] {
+            let mut healthy = vec![remotes[initial_nic].clone(); initial_count];
+            // Match reconcile_peer: replan after every attempt,
+            // with this bound shared by additions and replacements.
+            for _ in 0..max + remotes.len() {
+                let Some(action) =
+                    next_connection_action(&remotes, &healthy, &HashSet::new(), min, 1, max)
+                else {
+                    break;
+                };
+                match action {
+                    ReconcileAction::ConnectCoverage(remote) => healthy.push(remote),
+                    ReconcileAction::ReplaceCoverage { remote, victim } => {
+                        let index = healthy.iter().position(|nic| *nic == victim).unwrap();
+                        healthy[index] = remote;
+                    }
+                    ReconcileAction::ConnectTarget => panic!("coverage already meets target"),
+                }
+                assert!(healthy.len() <= max);
+            }
+            let counts: Vec<usize> = remotes
+                .iter()
+                .map(|remote| healthy.iter().filter(|nic| *nic == remote).count())
+                .collect();
+            assert_eq!(
+                counts, expected_counts,
+                "min={min}, max={max}, initial={initial_count} on nic{initial_nic}"
+            );
+            assert!(
+                next_connection_action(&remotes, &healthy, &HashSet::new(), min, 1, max).is_none(),
+                "bounded pass did not finish: min={min}, max={max}, initial={initial_count} on nic{initial_nic}",
+            );
+        }
+    }
+
+    #[test]
+    fn coverage_actions_are_bounded_and_converge_with_insufficient_capacity() {
+        let remotes = ["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        for distribution in 0..256usize {
+            let mut initial = Vec::new();
+            for (index, name) in ["a", "b", "c", "retired"].into_iter().enumerate() {
+                initial.extend(std::iter::repeat_n(
+                    name.to_owned(),
+                    (distribution >> (2 * index)) & 3,
+                ));
+            }
+            for min in 1..=3 {
+                for extra_capacity in 0..=2 {
+                    for blocked in [HashSet::new(), HashSet::from(["b".to_owned()])] {
+                        let max = initial.len() + extra_capacity;
+                        let mut healthy = initial.clone();
+                        for _ in 0..max + remotes.len() {
+                            let Some(action) =
+                                next_connection_action(&remotes, &healthy, &blocked, min, max, max)
+                            else {
+                                break;
+                            };
+                            match action {
+                                ReconcileAction::ConnectCoverage(remote) => {
+                                    assert!(!blocked.contains(&remote));
+                                    healthy.push(remote);
+                                }
+                                ReconcileAction::ReplaceCoverage { remote, victim } => {
+                                    assert!(!blocked.contains(&remote));
+                                    if remotes.contains(&victim) {
+                                        let count = |name: &str| {
+                                            healthy.iter().filter(|nic| *nic == name).count()
+                                        };
+                                        assert!(count(&victim) >= count(&remote) + 2);
+                                    }
+                                    let index =
+                                        healthy.iter().position(|nic| *nic == victim).unwrap();
+                                    healthy[index] = remote;
+                                }
+                                ReconcileAction::ConnectTarget => healthy.push("a".into()),
+                            }
+                            assert!(healthy.len() <= max);
+                        }
+                        assert!(
+                            next_connection_action(&remotes, &healthy, &blocked, min, max, max)
+                                .is_none()
+                        );
+                        for remote in &remotes {
+                            let count = healthy.iter().filter(|nic| *nic == remote).count();
+                            if count < min && !blocked.contains(remote) {
+                                assert_eq!(healthy.len(), max);
+                                assert!(healthy.iter().all(|nic| remotes.contains(nic)));
+                                for other in &remotes {
+                                    assert!(
+                                        healthy.iter().filter(|nic| *nic == other).count()
+                                            <= count + 1
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -380,15 +654,53 @@ mod tests {
             remote_load: index as u64,
         }
     }
+
+    fn path_candidate(
+        local_device_index: usize,
+        remote: &str,
+        same_connectivity_domain: bool,
+    ) -> PathCandidate {
+        PathCandidate {
+            local_device_index,
+            remote: DeviceSelection {
+                device_name: remote.into(),
+                port_num: 1,
+                gid_index: 0,
+            },
+            remote_limits: RdmaConnectionLimits {
+                max_send_wr: 64,
+                max_recv_wr: 64,
+                recv_queue_len: 8,
+                max_msg_size: 64 * 1024,
+                max_large_msg_size: 64 * 1024 * 1024,
+            },
+            class: PathClass::RoceV2,
+            path: RdmaPathInfo {
+                local: RdmaNicInfo {
+                    device: format!("local{local_device_index}"),
+                    port_num: 1,
+                    gid_index: 0,
+                    ip: None,
+                },
+                remote: RdmaNicInfo {
+                    device: remote.into(),
+                    port_num: 1,
+                    gid_index: 0,
+                    ip: None,
+                },
+                same_connectivity_domain,
+            },
+        }
+    }
 }
 
 impl RdmaSocketPool {
-    /// Enumerates every compatible (local NIC, remote NIC) pair.
+    /// Enumerates locally usable NIC pairs with negotiable connection limits.
     ///
-    /// One candidate is produced per compatible port pair (the GID within
-    /// a port pair is chosen by the existing preference logic). Link class
-    /// preference is applied after request constraints and reachability
-    /// filters, keeping lower classes available as fallbacks.
+    /// Configured subnet domains retain every matching GID pair for later
+    /// selection; otherwise each port pair keeps its preferred GID pair.
+    /// Link class preference is applied after request constraints and
+    /// reachability filters, keeping lower classes available as fallbacks.
     pub(super) fn enumerate_path_candidates(
         &self,
         remote_info: &RdmaPeerAdvertisement,
@@ -408,10 +720,30 @@ impl RdmaSocketPool {
 
         // Remote ports are pre-filtered: peers only advertise usable ports.
         for remote_device in &remote_info.devices {
+            let compatible_local_devices: Vec<_> = local_devices
+                .iter()
+                .enumerate()
+                .filter(|(_, local_device)| {
+                    if let Err(err) = self.resolve_connection_config(
+                        local_device,
+                        remote_device.limits,
+                        self.config.connection.traffic_class,
+                    ) {
+                        tracing::debug!(
+                            local = %local_device.info().name,
+                            remote = %remote_device.name,
+                            %err,
+                            "skipping RDMA NIC pair with incompatible connection limits"
+                        );
+                        return false;
+                    }
+                    true
+                })
+                .collect();
             for remote_port in &remote_device.ports {
                 remote_ports += 1;
 
-                for (local_device_index, local_device) in local_devices.iter().enumerate() {
+                for &(local_device_index, local_device) in &compatible_local_devices {
                     let local_info = local_device.info();
                     for local_port in &local_info.ports {
                         if !local_port.is_usable() {
@@ -620,16 +952,6 @@ impl RdmaSocketPool {
             }
         }
 
-        // Preserve the previous best-effort fallback for unusual providers
-        // whose two sides report different GID type names.
-        if pairs.is_empty()
-            && let (Some(local), Some(remote)) = (
-                Self::first_gid(local_gids, |_| true),
-                Self::first_gid(remote_gids, |_| true),
-            )
-        {
-            pairs.push((local, remote));
-        }
         pairs
     }
 
@@ -666,9 +988,7 @@ mod path_selection_tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
-    use std::time::Duration;
 
-    use super::super::maintenance::preconnect_backoff_delay;
     use super::super::{ConnCountGuard, RdmaSocketPool, next_attempt_id};
     use super::*;
     use crate::rdma::RdmaSocketPoolConfig;
@@ -870,13 +1190,6 @@ mod path_selection_tests {
             )
             .unwrap();
         assert_eq!(selected.path.remote.device, "remoteA");
-    }
-
-    #[test]
-    fn test_preconnect_backoff_is_bounded() {
-        assert_eq!(preconnect_backoff_delay(1), Duration::from_millis(100));
-        assert_eq!(preconnect_backoff_delay(4), Duration::from_millis(800));
-        assert!(preconnect_backoff_delay(100) <= Duration::from_secs(30));
     }
 
     #[test]
@@ -1090,6 +1403,22 @@ mod gid_match_tests {
                 .copied(),
             Some((0, 2))
         );
+    }
+
+    #[test]
+    fn test_rocev1_only_and_rocev2_only_do_not_match() {
+        let v1 = [gid(0, "fe80::1", GidType::RoCEv1)];
+        let v2 = [gid(3, "::ffff:10.0.0.2", GidType::RoCEv2)];
+        assert!(RdmaSocketPool::match_roce_gid_pairs(&v1, &v2).is_empty());
+        assert!(RdmaSocketPool::match_roce_gid_pairs(&v2, &v1).is_empty());
+    }
+
+    #[test]
+    fn test_other_gid_types_with_different_names_do_not_match() {
+        let local = [gid(0, "fe80::1", GidType::Other("custom_a".into()))];
+        let remote = [gid(2, "fe80::2", GidType::Other("custom_b".into()))];
+        assert!(RdmaSocketPool::match_roce_gid_pairs(&local, &remote).is_empty());
+        assert!(RdmaSocketPool::match_roce_gid_pairs(&remote, &local).is_empty());
     }
 
     #[test]

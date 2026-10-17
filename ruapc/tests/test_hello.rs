@@ -130,8 +130,8 @@ async fn test_typed_http_with_base_path() {
     server.join().await;
 }
 
-/// Drives many concurrent requests over one RDMA connection so the send
-/// window (32) overflows: exercises the pending-send path and opportunistic
+/// Drives many concurrent requests over one RDMA connection so the small send
+/// window overflows: exercises the pending-send path and opportunistic
 /// aggregation, and validates every response.
 #[cfg(feature = "rdma")]
 #[tokio::test]
@@ -140,10 +140,13 @@ async fn test_rdma_concurrent() {
     let mut router = ruapc::Router::default();
     foo.ruapc_export(&mut router);
 
-    let config = SocketPoolConfig {
+    let mut config = SocketPoolConfig {
         listen_mode: ListenMode::UNIFIED,
         ..Default::default()
     };
+    let rdma = config.rdma.as_mut().unwrap();
+    rdma.peers.min_connections_per_remote_nic = 0;
+    rdma.peers.preconnect_max_per_peer = 1;
     let server = ruapc::Server::create(router, &config).unwrap();
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
     let addr = server.listen(addr).await.unwrap();

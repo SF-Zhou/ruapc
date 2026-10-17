@@ -15,7 +15,8 @@ Callers declare all group addresses equivalent: they must reach one server
 not negotiate an instance ID to verify this. A later RPC or rollback can use
 another group address. See [endpoint identity and strings](endpoints.md).
 
-This page owns bootstrap, path selection, negotiation, and peer maintenance.
+This page owns bootstrap, path selection, negotiation, peer maintenance, and
+connection health probes.
 See the [built-in method catalog](builtin-services.md#internal-rdma-bootstrap-_ruapcrdma),
 [capacity budgets](rdma-capacity.md), and [poller routing](qp-registry.md) for
 the adjacent contracts.
@@ -35,6 +36,11 @@ Paths are relative to the repository root.
 | `ruapc/src/rdma/rdma_socket_pool/handshake.rs` | One outbound handshake and rollback until publication. |
 | `ruapc/src/rdma/rdma_socket_pool/setup.rs` | Shared negotiation, poller/QP creation, endpoint generation, connection and registration. |
 | `ruapc/src/rdma/rdma_socket_pool/accept.rs` | Acceptor prepare/commit/cancel, leases, expiry. |
+| `ruapc/src/rdma/probe.rs` | Internal health RPC, remote READ validation, per-probe deadline. |
+| `ruapc/src/rdma/rdma_socket_pool/probe.rs` | Periodic checks of individual connections, timeout counts, reconnect scheduling. |
+| `ruapc/src/rdma/rdma_socket_pool/reconcile.rs` | Shared first-use, periodic and recovery replenishment, single-flight scheduling and backoff. |
+| `ruapc/src/rdma/rdma_socket_pool/peer.rs` | Group state, connection identity checks and recovery intent synchronized with publication. |
+| `ruapc/src/rdma/rdma_socket_pool/maintenance.rs` | Periodic dead-path pruning, idle-peer eviction, rebalancing and draining. |
 | `ruapc-rdma/src/verbs/qp_connection.rs`, `ruapc-rdma/src/verbs/queue_pair.rs` | Verbs parameter validation and RESET → INIT → RTR → RTS transitions. |
 | `ruapc/src/rdma/poller/conn.rs` | Activation SEND, first successful receive, completion failures. |
 
@@ -113,20 +119,55 @@ NICs able to reach that candidate, it chooses the lowest connection count,
 including both inbound and outbound connections. These policies rank paths;
 they do not establish reachability.
 
-Pool maintenance starts on use and runs every `maintenance.interval_ms`
-(default 5000), with 0.5–1.5× jitter; zero disables it. An independent task
-refreshes device properties every 15 seconds. Maintenance fails connections
+Ethernet paths require a matching GID type on both ends. RoCE v1 and RoCE v2
+do not match each other; a NIC with no compatible local GID pair is skipped.
+
+After the initial foreground stripes are published, the pool immediately
+schedules background preconnection for that address group. The first request
+does not wait for this work. Each remote NIC is a coverage target only if at
+least one local device/port/GID pair passes the connection constraints,
+including limit negotiation and a required connectivity domain. A remote NIC
+without such a pair is skipped. Subnet `prefer`, link-class preferences and
+load ranking choose paths within each target NIC; they do not exclude other
+compatible NICs from coverage.
+
+First-use preconnection, periodic replenishment and health-triggered recovery
+share one queued or running reconciliation pass per group. It shares the peer's
+connection lock with foreground acquisition and periodic maintenance. Discovery and each
+connection action release the lock before rejoining its FIFO queue, so an
+already waiting foreground acquisition can proceed before the next action.
+Each action recomputes placement from published healthy connections after
+reacquiring the lock, and holds it through handshake and publication. A
+foreground acquisition can still wait for the current discovery or connection
+action, including path failover; a handshake already in progress is not
+preempted. The background pass continues toward its coverage targets even
+when periodic maintenance is
+disabled. Failed NICs enter backoff without reserving connection slots or
+preventing other eligible NICs from being attempted. Shutdown cancels the task
+and rolls back unpublished connections through the normal handshake cleanup.
+
+Periodic maintenance starts on use and runs every `maintenance.interval_ms`
+(default 5000), with 0.5–1.5× jitter. Zero disables maintenance retries and
+rebalancing; first-use background preconnection and the independent
+[health probes](#periodic-connection-probes) still run. An independent
+task refreshes device properties every 15 seconds. Maintenance fails connections
 on unusable local ports and prunes dead stripes. For peers with active stripes
-or use within the last 60 seconds, it replenishes remote-NIC coverage first,
-then total connections:
+or use within the last 60 seconds, and peers awaiting probe-triggered recovery,
+it replenishes remote-NIC coverage first, then total connections:
 
 | Setting | Default | Purpose |
 |---|---:|---|
-| `peers.min_connections_per_remote_nic` | 1 | Coverage target per reachable remote NIC. |
-| `peers.connections_per_peer` | 1 | Total healthy-stripe target. |
-| `peers.preconnect_max_per_peer` | 16 | Upper bound for replenishment/additional connections. |
+| `peers.min_connections_per_remote_nic` | 1 | Coverage target per compatible remote NIC; zero disables per-NIC preconnection. |
+| `peers.connections_per_peer` | 1 | Initial foreground stripe count and total healthy-stripe target. |
+| `peers.preconnect_max_per_peer` | 16 | Upper bound on active connections for replenishment/additional connections. |
 | `maintenance.rebalance_threshold` | 2 | Required load improvement before migration. |
 | `maintenance.drain_timeout_ms` | 10000 | Grace period before closing a replaced stripe. |
+
+Coverage takes priority over extra connections to an already covered NIC.
+At the active-connection cap, a missing NIC can replace a redundant connection;
+the replacement is published before the old stripe drains. If the cap cannot
+hold the configured per-NIC targets, coverage is distributed across eligible
+NICs within that cap. Set the cap high enough to cover every desired NIC.
 
 Failed replenishment backs off. Each maintenance pass considers one peer for
 rebalancing. A migration establishes and publishes a replacement before moving
@@ -134,7 +175,67 @@ the old connection to draining. `State::rdma_path_report()` reports each NIC pai
 direction, QP, health, active/draining phase, and device connection counts;
 servers access it through `Server::state()`. CQ fields are described in
 [capacity introspection](rdma-capacity.md#introspection-and-implementation).
-Implementations are `rdma_socket_pool/placement.rs`, `maintenance.rs`, and `report.rs`.
+Implementations are `rdma_socket_pool/placement.rs`, `reconcile.rs`,
+`maintenance.rs`, and `report.rs`.
+
+## Periodic connection probes
+
+Both clients and servers periodically probe each published outbound connection
+and each activated inbound connection. A probe uses that exact RDMA socket;
+it does not acquire another stripe or retry the request. The internal
+`_ruapc.rdma/probe` RPC carries a nonce and eight bytes of immutable read space.
+The receiver performs `Context::remote_read` on the same connection and returns
+both the RPC nonce and the value read. Success requires both values to match,
+including the normal post-READ source-request validation. Probes from both ends
+therefore exercise RPC and RDMA READ in both directions.
+
+These settings are under `SocketPoolConfig.rdma.probe` and apply locally;
+the peers may configure different schedules and thresholds.
+
+| Setting | Default | Purpose |
+|---|---:|---|
+| `interval_ms` | 60000 | Base delay before the first round and after each completed round, with 0.5–1.5× jitter; zero disables this side's probes. |
+| `timeout_ms` | 1000 | Total budget for one probe's RPC and remote READ checks; must be nonzero when enabled. |
+| `max_consecutive_timeouts` | 3 | Consecutive timed-out probes before closing the connection; must be nonzero when enabled. |
+
+Each pool draws a new randomized delay for the first round and every later
+round, spreading clients that start together. Rounds do not overlap or catch
+up after a slow check. Connections are probed concurrently within a round,
+so one unresponsive connection does not serialize checks of the others. A
+connection has at most one probe in flight. Timeout counts belong to its process-unique `conn_id` and
+never carry over to a replacement. `Timeout` and `RdmaReadTimeout` count toward
+the threshold. Success clears the count; a non-timeout error also interrupts
+the consecutive-timeout sequence, without establishing a successful health
+check. In particular, `Overloaded` and local allocation failures do not count
+as connection timeouts. Internal RPCs use ordinary handler admission, so load
+can reject a probe or its reverse source-validation RPC.
+
+Reaching the threshold marks that socket failed and immediately fails its
+bound RPC waiters. The poller performs normal QP teardown. The initiator queues
+background replenishment for the original address group under its connection
+lock, preserving compatible-NIC coverage and the total connection target.
+`peers.min_connections_per_remote_nic = 0` disables coverage, but does not
+disable replacement of the configured `peers.connections_per_peer` target.
+A failed reconnect remains pending and is retried under backoff by later
+maintenance or probe rounds, including when `maintenance.interval_ms = 0`.
+
+The acceptor does not have the initiator's bootstrap address group. When it
+closes an inbound connection, the original initiator detects that closure
+through its probes or transport errors and rebuilds the connection. It does
+not establish a new peer identity from the inbound NIC address. If the
+initiator disables probes, recovery follows ordinary maintenance and subsequent
+acquisition instead; an idle peer may need another application call.
+
+Timeouts accumulate across scheduled rounds, not three immediate attempts.
+With defaults, persistent probe timeouts normally close a connection after
+roughly three minutes. Existing verbs failures and the independent
+`remote_memory.read_timeout_ms` can close it sooner. Probe failure never
+replays an application RPC already accepted by the transport.
+
+The probe timer retains only a weak `State` reference while sleeping. Pool
+shutdown cancels in-flight probes and reconnect tasks. Probe timeout or
+cancellation does not release posted READ memory or permits early; the usual
+[completion and source-lifetime rules](safe-boundaries.md) still apply.
 
 <a id="参数协商与验证"></a>
 
@@ -224,9 +325,9 @@ the incomplete connection.
 
 Initial `connections_per_peer` stripes retain their guards until all handshakes
 and publication health checks pass. Any failure rolls back the unpublished
-set. Under the publication lock, each stripe gains peer health tracking,
-disarms rollback, and enters the selectable active set. After unlocking, the
-pool requests activation. Thus automatic activation cannot precede publication.
+set. Under the publication lock, each stripe disarms rollback and enters the
+selectable active set. After unlocking, the pool requests activation and enables
+health probes. Thus automatic activation cannot precede publication.
 Migration likewise publishes a replacement before draining the old connection.
 
 <a id="日志定位"></a>
@@ -247,8 +348,11 @@ and `local_qp`. Connection IDs differ between peers; prepare's
 | `ibv_modify_qp failed` | RESET→INIT / INIT→RTR / RTR→RTS stage, target state, attribute mask, provider errno, connection parameters. |
 | `RDMA connection confirmed; awaiting publication` | Control-plane confirmation only. |
 | `RDMA ... published; activation requested` | Selectable connection; activation remains asynchronous. |
+| `RDMA replacement discarded; previous stripe is no longer active` | Peer and old/new connection IDs; a concurrent failure removed the victim, so the unpublished replacement rolls back. |
 | `RDMA accept lease expired before activation` | Attempt, connection, state, QP, path; distinguishes missing commit from missing receive. |
 | `RDMA work completion failed; closing connection` | Connection, QP, path, WR ID, status, `vendor_err`; activation may expose reachability failure. |
+| `RDMA connection probe failed` | Connection, NIC pair, error and consecutive-timeout count. Non-timeout errors interrupt the count. |
+| `RDMA connection probe timeout threshold reached; closing connection` | Connection, NIC pair and timeout count that triggered closure. |
 | `rdma_bootstrap_cancel` | Unpublished-connection rollback; failed peer cleanup falls back to lease expiry. |
 
 Stage wrappers preserve `ErrorKind`; verbs errors retain their `RdmaError`
