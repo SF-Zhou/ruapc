@@ -117,18 +117,18 @@ impl RdmaBandwidthLimiter {
     pub(crate) async fn reserve_send(
         &self,
         bytes: u64,
-        request_remaining: Option<Duration>,
+        request_deadline: Option<Instant>,
     ) -> Result<()> {
-        self.reserve(&self.send, "SEND", bytes, request_remaining)
+        self.reserve(&self.send, "SEND", bytes, request_deadline)
             .await
     }
 
     pub(crate) async fn reserve_recv(
         &self,
         bytes: u64,
-        request_remaining: Option<Duration>,
+        request_deadline: Option<Instant>,
     ) -> Result<()> {
-        self.reserve(&self.recv, "RECV", bytes, request_remaining)
+        self.reserve(&self.recv, "RECV", bytes, request_deadline)
             .await
     }
 
@@ -137,15 +137,16 @@ impl RdmaBandwidthLimiter {
         limiter: &GcraRateLimiter,
         direction: &'static str,
         bytes: u64,
-        request_remaining: Option<Duration>,
+        request_deadline: Option<Instant>,
     ) -> Result<()> {
+        let request_remaining =
+            request_deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
         if request_remaining == Some(Duration::ZERO) {
             return Err(Error::new(
                 ErrorKind::Timeout,
                 format!("request deadline expired before RDMA {direction} bandwidth admission"),
             ));
         }
-        let request_deadline = request_remaining.map(|remaining| Instant::now() + remaining);
         let wait_limit = request_remaining
             .map(|remaining| remaining.min(self.max_wait))
             .unwrap_or(self.max_wait);
@@ -282,5 +283,57 @@ mod tests {
         );
         assert_eq!(limiters.send.reserve_within_at(100, 100, 0, 0, 1_000), None);
         assert_eq!(limiters.recv.reserve_within_at(100, 100, 0, 0, 1_000), None);
+    }
+
+    #[tokio::test]
+    async fn expired_deadline_rejects_without_charging_bandwidth() {
+        let limiter = RdmaBandwidthLimiter::new(
+            "mlx5_0".into(),
+            1,
+            100,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        );
+        let deadline = Some(Instant::now());
+        assert_eq!(
+            limiter.reserve_send(100, deadline).await.unwrap_err().kind,
+            ErrorKind::Timeout
+        );
+        assert_eq!(
+            limiter.reserve_recv(100, deadline).await.unwrap_err().kind,
+            ErrorKind::Timeout
+        );
+        assert_eq!(limiter.send.tat_nanos.load(Ordering::Relaxed), 0);
+        assert_eq!(limiter.recv.tat_nanos.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn rejected_wait_uses_the_tighter_limit() {
+        let limiter = RdmaBandwidthLimiter::new(
+            "mlx5_0".into(),
+            1,
+            100,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        );
+        // The first transfer fits the idle burst, then leaves three seconds
+        // of bandwidth debt for the next transfer.
+        limiter.reserve_send(300, None).await.unwrap();
+        for (deadline, expected) in [
+            (
+                Some(Instant::now() + Duration::from_millis(100)),
+                ErrorKind::Timeout,
+            ),
+            (
+                Some(Instant::now() + Duration::from_secs(10)),
+                ErrorKind::RdmaRateLimited,
+            ),
+            (None, ErrorKind::RdmaRateLimited),
+        ] {
+            assert_eq!(
+                limiter.reserve_send(100, deadline).await.unwrap_err().kind,
+                expected
+            );
+        }
     }
 }

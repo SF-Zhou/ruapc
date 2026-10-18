@@ -93,7 +93,8 @@ This reduces receive-pool pressure without moving parsing onto the poller.
 
 ## Closing a connection
 
-Closing a socket marks it failed, closes READ admission and wakes the poller.
+Closing a socket marks it failed, closes READ admission, fails posted READ
+waiters without releasing their DMA holds, and wakes the poller.
 The poll thread performs the provider QP transition to ERR, serialized with
 receive reposting. A repost already in progress therefore precedes the ERR
 flush. Posting a receive after that flush can leave it without a completion

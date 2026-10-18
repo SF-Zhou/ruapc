@@ -149,11 +149,33 @@ congested connection does not reserve NIC capacity while waiting for its own
 queue. Connection closure wakes blocked admission tasks without closing the
 NIC semaphore used by other connections.
 
-`rdma.remote_memory.read_timeout_ms` defaults to 10000; zero disables it.
-The poll thread checks READ deadlines during its 100 ms housekeeping sweep,
-skipping QPs with all READ permits available. Timeout reports
-`RdmaReadTimeout` and moves the QP to ERR. It does not release posted DMA
-holds or return their permits.
+`rdma.remote_memory.read_timeout_ms` defaults to 10000. Its budget starts
+before bandwidth admission and covers bandwidth, SQ/NIC permit waits and
+completion. The request's remaining budget independently limits the same
+stages; zero disables only the configured READ budget, not request deadlines.
+Normal server RPC contexts always carry a request deadline. An internal or
+low-level READ with neither deadline has no automatic expiry and must rely on
+completion or connection closure.
+Permit waits use the earlier absolute deadline, including before the first WR
+is posted and between later WRs. Uncontended permit acquisition creates no
+timer; the posting path checks expiry before handing a WR to the provider.
+
+The poll thread checks posted READ deadlines during its 100 ms housekeeping
+sweep, skipping QPs with all READ permits available; completion waits do not
+create per-operation timers. Request expiry in application remote-memory
+operations reports `Timeout` without itself closing the connection.
+Large-payload cancellation still closes its connection under the separate
+[source-ownership protocol](safe-boundaries.md#large-payload-source-ownership).
+The independent READ watchdog remains armed after request expiry or receiver
+cancellation: when posted work exceeds that budget, the sweep moves the QP
+to ERR. A waiting caller receives `RdmaReadTimeout` unless an earlier request
+deadline applies. Admission expiry alone does not prove a connection failure.
+
+Connection closure immediately fails READ waiters even with the watchdog
+disabled or missing flush completions. Expiry and closure never release
+posted DMA holds or return their permits. If no WR was posted, admission
+failure can restore the complete destination vector; after partial posting,
+the unposted suffix is cancelled and the QP retains the posted destinations.
 
 The [poller](qp-registry.md#closing-a-connection) owns normal removal and fatal
 shutdown. Shutdown closes all connection admission before releasing socket
@@ -182,8 +204,9 @@ not match established paths.
 
 The implementation and adjacent tests are in
 [poller/budget.rs](../ruapc/src/rdma/poller/budget.rs),
-[poller routing and shard selection](../ruapc/src/rdma/poller/mod.rs) and
-[READ admission](../ruapc/src/rdma/rdma_socket/read.rs).
+[poller routing and shard selection](../ruapc/src/rdma/poller/mod.rs),
+[READ execution](../ruapc/src/rdma/rdma_socket/read.rs) and
+[READ admission and credits](../ruapc/src/rdma/rdma_socket/read/credits.rs).
 Tests cover concurrent admission, retirement races, short/full drain bounds,
 shard fallback and cancelled permit waits. Routing and maintenance are
 covered in [QP registry](qp-registry.md).

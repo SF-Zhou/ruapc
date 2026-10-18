@@ -181,11 +181,8 @@ impl RdmaSocket {
     ) -> Result<()> {
         let payload_len = encoded.buffer.len() - encoded.payload_offset;
         let business_deadline = request.deadline();
-        self.reserve_send_bandwidth(
-            payload_len as u64,
-            business_deadline.map(|deadline| deadline.saturating_duration_since(Instant::now())),
-        )
-        .await?;
+        self.reserve_send_bandwidth(payload_len as u64, business_deadline)
+            .await?;
         // Reserve a queue slot before publishing the source. After this await,
         // ownership installation and transport acceptance are one synchronous
         // transaction; cancelling send cannot leave a half-published offer.
@@ -427,13 +424,7 @@ impl RdmaSocket {
             socket: self.clone(),
             permit: Some(permit),
         };
-        let buffer = self
-            .read_payload(
-                &offer.regions,
-                buffer,
-                deadline.map(|deadline| deadline.saturating_duration_since(Instant::now())),
-            )
-            .await?;
+        let buffer = self.read_payload(&offer.regions, buffer, deadline).await?;
         // Successful owned READ completion has returned the buffer. Its budget
         // can now follow the received payload instead of the QP's failure holds.
         let received = ReceivedPayload {

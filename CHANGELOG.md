@@ -18,6 +18,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   can replace redundant stripes when the active-connection limit is reached.
 
 ### Changed
+- **BREAKING**: `ruapc-rdma::ReadFailure` adds `RequestTimeout` to distinguish
+  request expiry from the connection-level READ watchdog. Exhaustive matches
+  must handle the new variant.
 - **BREAKING**: RDMA over Ethernet requires matching GID types on both ends.
   The best-effort fallback across different GID types has been removed;
   NIC pairs without a common GID type are no longer connection candidates.
@@ -40,6 +43,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   acquisition requires the feature and an enabled RDMA pool.
 
 ### Fixed
+- RDMA READ deadlines cover bandwidth and SQ/NIC permit admission, including
+  waits before the first posted WR. Request deadlines also bound completion
+  without closing healthy connections or disabling the independent READ
+  watchdog. Connection closure wakes posted READ waiters even when the
+  watchdog is disabled; posted DMA memory and permits remain held until
+  completion or successful QP destruction.
 - RDMA pending sends retain backpressure across the ingress channel and
   poller FIFO, with a combined limit of 2048 reserved or queued business
   messages per connection. FIFO refill keeps available SEND credits usable

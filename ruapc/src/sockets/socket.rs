@@ -58,15 +58,11 @@ impl Socket {
     pub(crate) async fn reserve_rdma_send_bandwidth(
         &self,
         bytes: u64,
-        request_remaining: Option<std::time::Duration>,
+        request_deadline: Option<std::time::Instant>,
     ) -> Result<()> {
         match self {
             #[cfg(feature = "rdma")]
-            Self::RDMA(socket) => {
-                socket
-                    .reserve_send_bandwidth(bytes, request_remaining)
-                    .await
-            }
+            Self::RDMA(socket) => socket.reserve_send_bandwidth(bytes, request_deadline).await,
             _ => Ok(()),
         }
     }
@@ -126,13 +122,13 @@ impl Socket {
         src_layout: &SpaceLayout,
         ops: &[CopyOp],
         target: std::sync::Arc<crate::remote_memory::WriteTarget>,
-        request_remaining: Option<std::time::Duration>,
+        request_deadline: Option<std::time::Instant>,
     ) -> Result<()> {
         match self {
             #[cfg(feature = "rdma")]
             Socket::RDMA(rdma_socket) => {
                 rdma_socket
-                    .read_into_target(regions, src_layout, ops, target, request_remaining)
+                    .read_into_target(regions, src_layout, ops, target, request_deadline)
                     .await
             }
             _ => Err(crate::Error::new(

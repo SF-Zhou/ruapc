@@ -1,4 +1,5 @@
 use super::*;
+use tokio::sync::Semaphore;
 
 #[tokio::test]
 async fn queue_reservation_wakes_on_connection_close_without_closing_shared_nic() {

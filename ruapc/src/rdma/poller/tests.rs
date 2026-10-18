@@ -240,33 +240,41 @@ fn register_idle_socket_with_read_permits(
     state: &Arc<State>,
     read_permits: Arc<tokio::sync::Semaphore>,
 ) -> Arc<RdmaSocket> {
-    register_socket_with_pending_config(
+    register_socket_with_config(
         poller,
         device,
         buffer_pool,
         state,
         read_permits,
-        PendingSendConfig {
-            capacity: 4,
-            window: 1,
-            aggregate: false,
-        },
+        SocketTestConfig::default(),
     )
 }
 
-struct PendingSendConfig {
+struct SocketTestConfig {
     capacity: usize,
     window: u32,
     aggregate: bool,
+    read_timeout: Option<Duration>,
 }
 
-fn register_socket_with_pending_config(
+impl Default for SocketTestConfig {
+    fn default() -> Self {
+        Self {
+            capacity: 4,
+            window: 1,
+            aggregate: false,
+            read_timeout: None,
+        }
+    }
+}
+
+fn register_socket_with_config(
     poller: &DevicePoller,
     device: &crate::rdma::RdmaDevice,
     buffer_pool: &Arc<crate::BufferPool>,
     state: &Arc<State>,
     read_permits: Arc<tokio::sync::Semaphore>,
-    pending: PendingSendConfig,
+    pending: SocketTestConfig,
 ) -> Arc<RdmaSocket> {
     let connection = crate::rdma::RdmaConnectionConfig {
         recv_queue_len: pending.window * 2,
@@ -322,7 +330,7 @@ fn register_socket_with_pending_config(
                 remote: nic.clone(),
                 same_connectivity_domain: true,
             },
-            read_timeout: None,
+            read_timeout: pending.read_timeout,
             read_permits,
             bandwidth_limiter: Arc::new(RdmaBandwidthLimiter::new(
                 nic.device,
@@ -552,6 +560,367 @@ async fn close_between_receive_health_check_and_post_is_flushed_by_poller() {
     poll_loop.maintain_connections(Instant::now(), false, false);
     assert!(!poll_loop.conns.contains_key(&socket.queue_pair.qp_num()));
     poll_loop.shutdown_cleanup();
+}
+
+#[tokio::test]
+async fn read_deadlines_bound_first_nic_admission_and_restore_unposted_targets() {
+    use crate::remote_memory::{CopyOp, WriteTarget, scatter::SpaceLayout};
+
+    let devices = crate::rdma::test_utils::make_rdma_devices();
+    let device = &devices.devices()[0];
+    let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+    let (state, _stop) = State::create(
+        crate::Router::default(),
+        &crate::SocketPoolConfig {
+            rdma: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let short = Duration::from_millis(50);
+    for (read_timeout, parent_remaining, expected) in [
+        (Some(short), None, ErrorKind::RdmaReadTimeout),
+        (
+            Some(Duration::from_secs(5)),
+            Some(short),
+            ErrorKind::Timeout,
+        ),
+        (None, Some(short), ErrorKind::Timeout),
+    ] {
+        let (poller, mut poll_loop) = manual_poller(device.context());
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let socket = register_socket_with_config(
+            &poller,
+            device,
+            &pool,
+            &state,
+            permits.clone(),
+            SocketTestConfig {
+                read_timeout,
+                ..Default::default()
+            },
+        );
+        let peer =
+            register_idle_socket_with_read_permits(&poller, device, &pool, &state, permits.clone());
+        connect_read_pair(device, &socket.queue_pair, &peer.queue_pair);
+        assert!(poll_loop.drain_incoming(false));
+        let mut source = pool.allocate(64).unwrap();
+        source.set_len(64);
+        source.fill(0x5a);
+        let regions = [source.remote_buffer_info(&device.index()).unwrap()];
+        let layout = SpaceLayout::from_lens([64]).unwrap();
+        let ops = [CopyOp::new(0, 0, 64)];
+        let mut other_destination = pool.allocate(64).unwrap();
+        other_destination.set_len(64);
+        let other_target = WriteTarget::new(vec![other_destination]).unwrap();
+        let mut other_read =
+            Box::pin(peer.read_into_target(&regions, &layout, &ops, other_target, None));
+        assert!(futures_util::poll!(&mut other_read).is_pending());
+        assert_eq!(peer.queue_pair.pending_read_count(), 1);
+
+        let mut destination = pool.allocate(64).unwrap();
+        destination.set_len(64);
+        destination.fill(0xa5);
+        let target = WriteTarget::new(vec![destination]).unwrap();
+        let mut read = Box::pin(socket.read_into_target(
+            &regions,
+            &layout,
+            &ops,
+            target.clone(),
+            parent_remaining.map(|remaining| Instant::now() + remaining),
+        ));
+        assert!(futures_util::poll!(&mut read).is_pending());
+        assert_eq!(socket.queue_pair.pending_read_count(), 0);
+        assert_eq!(permits.available_permits(), 0);
+
+        // No completion or housekeeping pass runs: a batch waiting for its
+        // first NIC permit has not entered the QP's READ map yet.
+        let error = tokio::time::timeout(Duration::from_secs(2), read)
+            .await
+            .expect("READ admission must honor its own and the parent's deadline")
+            .unwrap_err();
+        assert_eq!(error.kind, expected);
+        assert!(
+            socket.state.is_ok(),
+            "unposted expiry must not close the QP"
+        );
+        assert_eq!(socket.queue_pair.pending_read_count(), 0);
+        let returned = WriteTarget::try_into_buffers(target).unwrap();
+        assert_eq!(returned[0].as_slice(), &[0xa5; 64]);
+        assert_eq!(permits.available_permits(), 0);
+        assert_eq!(peer.queue_pair.pending_read_count(), 1);
+
+        drop(other_read);
+        poll_loop.shutdown_cleanup();
+        drop(socket);
+        assert_eq!(permits.available_permits(), 0);
+        drop(peer);
+        assert_eq!(permits.available_permits(), 1);
+        drop(source);
+    }
+}
+
+#[tokio::test]
+async fn read_deadlines_bound_partial_posting_without_releasing_dma() {
+    use crate::remote_memory::{CopyOp, WriteTarget, scatter::SpaceLayout};
+
+    let devices = crate::rdma::test_utils::make_rdma_devices();
+    let device = &devices.devices()[0];
+    let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+    let (state, _stop) = State::create(
+        crate::Router::default(),
+        &crate::SocketPoolConfig {
+            rdma: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let short = Duration::from_millis(500);
+    for (read_timeout, parent_remaining, expected) in [
+        (Some(short), None, ErrorKind::RdmaReadTimeout),
+        (
+            Some(Duration::from_secs(5)),
+            Some(short),
+            ErrorKind::Timeout,
+        ),
+    ] {
+        let (poller, mut poll_loop) = manual_poller(device.context());
+        let permits = Arc::new(tokio::sync::Semaphore::new(2));
+        let socket = register_socket_with_config(
+            &poller,
+            device,
+            &pool,
+            &state,
+            permits.clone(),
+            SocketTestConfig {
+                read_timeout,
+                ..Default::default()
+            },
+        );
+        let peer =
+            register_idle_socket_with_read_permits(&poller, device, &pool, &state, permits.clone());
+        connect_read_pair(device, &socket.queue_pair, &peer.queue_pair);
+        assert!(poll_loop.drain_incoming(false));
+        let mut source = pool.allocate(192).unwrap();
+        source.set_len(192);
+        source.fill(0x5a);
+        let regions = [source.remote_buffer_info(&device.index()).unwrap()];
+        let layout = SpaceLayout::from_lens([192]).unwrap();
+        let ops = [
+            CopyOp::new(0, 0, 64),
+            CopyOp::new(64, 64, 64),
+            CopyOp::new(128, 128, 64),
+        ];
+        // A separate destination pool lets the test observe DMA ownership
+        // independently of the socket's pool and the remote source.
+        let destination_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+        let destination_lifetime = Arc::downgrade(&destination_pool);
+        let mut destination = destination_pool.allocate(192).unwrap();
+        destination.set_len(192);
+        let target = WriteTarget::new(vec![destination]).unwrap();
+        drop(destination_pool);
+        let mut read = Box::pin(socket.read_into_target(
+            &regions,
+            &layout,
+            &ops,
+            target.clone(),
+            parent_remaining.map(|remaining| Instant::now() + remaining),
+        ));
+        assert!(futures_util::poll!(&mut read).is_pending());
+        assert_eq!(socket.queue_pair.pending_read_count(), 2);
+
+        let mut other_destination = pool.allocate(64).unwrap();
+        other_destination.set_len(64);
+        let other_target = WriteTarget::new(vec![other_destination]).unwrap();
+        let other_ops = [CopyOp::new(0, 0, 64)];
+        let mut other_read =
+            Box::pin(peer.read_into_target(&regions, &layout, &other_ops, other_target, None));
+        assert!(futures_util::poll!(&mut other_read).is_pending());
+        assert_eq!(peer.queue_pair.pending_read_count(), 0);
+
+        // The first completion gives SQ capacity back to this batch, but
+        // its NIC permit goes to the other QP already waiting in the FIFO.
+        complete_one_read(&poller, &mut poll_loop).await;
+        assert!(futures_util::poll!(&mut other_read).is_pending());
+        assert_eq!(peer.queue_pair.pending_read_count(), 1);
+        assert!(futures_util::poll!(&mut read).is_pending());
+        assert_eq!(socket.queue_pair.pending_read_count(), 1);
+        assert_eq!(permits.available_permits(), 0);
+
+        let error = tokio::time::timeout(Duration::from_secs(2), read)
+            .await
+            .expect("partial posting must stop waiting for NIC capacity at its deadline")
+            .unwrap_err();
+        assert_eq!(error.kind, expected);
+        assert!(socket.state.is_ok());
+        assert_eq!(socket.queue_pair.pending_read_count(), 1);
+        assert_eq!(permits.available_permits(), 0);
+        assert!(WriteTarget::try_into_buffers(target).is_none());
+        assert!(destination_lifetime.upgrade().is_some());
+
+        // Admission expiry alone does not prove this QP is faulty. Its
+        // outstanding prefix is still subject to the poller's hard watchdog.
+        poll_loop.maintain_connections(Instant::now() + Duration::from_secs(10), true, false);
+        assert!(!socket.state.is_ok());
+        assert_eq!(socket.queue_pair.pending_read_count(), 1);
+        assert_eq!(permits.available_permits(), 0);
+
+        drop(other_read);
+        poll_loop.shutdown_cleanup();
+        assert!(destination_lifetime.upgrade().is_some());
+        assert_eq!(permits.available_permits(), 0);
+        drop(socket);
+        assert!(destination_lifetime.upgrade().is_none());
+        assert_eq!(permits.available_permits(), 1);
+        drop(peer);
+        assert_eq!(permits.available_permits(), 2);
+        drop(source);
+    }
+}
+
+#[tokio::test]
+async fn parent_read_completion_deadline_preserves_the_hard_watchdog() {
+    use crate::remote_memory::{CopyOp, WriteTarget, scatter::SpaceLayout};
+
+    let devices = crate::rdma::test_utils::make_rdma_devices();
+    let device = &devices.devices()[0];
+    let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+    let (poller, mut poll_loop) = manual_poller(device.context());
+    let (state, _stop) = State::create(
+        crate::Router::default(),
+        &crate::SocketPoolConfig {
+            rdma: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let permits = Arc::new(tokio::sync::Semaphore::new(1));
+    let socket = register_socket_with_config(
+        &poller,
+        device,
+        &pool,
+        &state,
+        permits.clone(),
+        SocketTestConfig {
+            read_timeout: Some(Duration::from_secs(1)),
+            ..Default::default()
+        },
+    );
+    let peer =
+        register_idle_socket_with_read_permits(&poller, device, &pool, &state, permits.clone());
+    connect_read_pair(device, &socket.queue_pair, &peer.queue_pair);
+    assert!(poll_loop.drain_incoming(false));
+    let mut source = pool.allocate(64).unwrap();
+    source.set_len(64);
+    let regions = [source.remote_buffer_info(&device.index()).unwrap()];
+    let layout = SpaceLayout::from_lens([64]).unwrap();
+    let mut destination = pool.allocate(64).unwrap();
+    destination.set_len(64);
+    let target = WriteTarget::new(vec![destination]).unwrap();
+    let ops = [CopyOp::new(0, 0, 64)];
+    // An expired absolute request deadline cannot post even when both
+    // resources are immediately available, and leaves the target reusable.
+    let error = socket
+        .read_into_target(
+            &regions,
+            &layout,
+            &ops,
+            target.clone(),
+            Some(Instant::now()),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Timeout);
+    assert_eq!(socket.queue_pair.pending_read_count(), 0);
+    assert_eq!(permits.available_permits(), 1);
+    let mut read = Box::pin(socket.read_into_target(
+        &regions,
+        &layout,
+        &ops,
+        target.clone(),
+        Some(Instant::now() + Duration::from_millis(50)),
+    ));
+    assert!(futures_util::poll!(&mut read).is_pending());
+    assert_eq!(socket.queue_pair.pending_read_count(), 1);
+    let now = Instant::now();
+    poll_loop.maintain_connections(now + Duration::from_millis(100), true, false);
+    let error = tokio::time::timeout(Duration::from_secs(1), read)
+        .await
+        .expect("the parent deadline must settle an already-posted batch")
+        .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Timeout);
+    assert!(socket.state.is_ok());
+    assert_eq!(socket.queue_pair.pending_read_count(), 1);
+    assert_eq!(permits.available_permits(), 0);
+    assert!(WriteTarget::try_into_buffers(target).is_none());
+
+    // Taking the receiver at the parent deadline must not disable the
+    // independent watchdog for READs still owned by this QP.
+    poll_loop.maintain_connections(now + Duration::from_secs(2), true, false);
+    assert!(!socket.state.is_ok());
+    assert_eq!(socket.queue_pair.pending_read_count(), 1);
+    assert_eq!(permits.available_permits(), 0);
+    poll_loop.shutdown_cleanup();
+    drop(socket);
+    assert_eq!(permits.available_permits(), 1);
+    drop(peer);
+    drop(source);
+}
+
+#[tokio::test]
+async fn closing_a_posted_read_without_a_watchdog_wakes_before_any_completion() {
+    use crate::remote_memory::{CopyOp, WriteTarget, scatter::SpaceLayout};
+
+    let devices = crate::rdma::test_utils::make_rdma_devices();
+    let device = &devices.devices()[0];
+    let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+    let (poller, mut poll_loop) = manual_poller(device.context());
+    let (state, _stop) = State::create(
+        crate::Router::default(),
+        &crate::SocketPoolConfig {
+            rdma: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let permits = Arc::new(tokio::sync::Semaphore::new(1));
+    let socket =
+        register_idle_socket_with_read_permits(&poller, device, &pool, &state, permits.clone());
+    let peer =
+        register_idle_socket_with_read_permits(&poller, device, &pool, &state, permits.clone());
+    connect_read_pair(device, &socket.queue_pair, &peer.queue_pair);
+    assert!(poll_loop.drain_incoming(false));
+    let mut source = pool.allocate(64).unwrap();
+    source.set_len(64);
+    let regions = [source.remote_buffer_info(&device.index()).unwrap()];
+    let layout = SpaceLayout::from_lens([64]).unwrap();
+    let destination_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+    let destination_lifetime = Arc::downgrade(&destination_pool);
+    let mut destination = destination_pool.allocate(64).unwrap();
+    destination.set_len(64);
+    let target = WriteTarget::new(vec![destination]).unwrap();
+    drop(destination_pool);
+    let ops = [CopyOp::new(0, 0, 64)];
+    let mut read = Box::pin(socket.read_into_target(&regions, &layout, &ops, target.clone(), None));
+    assert!(futures_util::poll!(&mut read).is_pending());
+    assert_eq!(socket.queue_pair.pending_read_count(), 1);
+    socket.set_error();
+    let error = tokio::time::timeout(Duration::from_secs(1), read)
+        .await
+        .expect("closing a QP must wake its READ even with read_timeout_ms = 0")
+        .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::ConnectionClosed);
+    assert_eq!(socket.queue_pair.pending_read_count(), 1);
+    assert_eq!(permits.available_permits(), 0);
+    assert!(WriteTarget::try_into_buffers(target).is_none());
+    assert!(destination_lifetime.upgrade().is_some());
+    poll_loop.shutdown_cleanup();
+    assert!(destination_lifetime.upgrade().is_some());
+    drop(socket);
+    assert!(destination_lifetime.upgrade().is_none());
+    assert_eq!(permits.available_permits(), 1);
+    drop(peer);
+    drop(source);
 }
 
 #[tokio::test]
@@ -974,16 +1343,17 @@ async fn pending_send_refill_spends_remaining_window_in_one_maintenance_pass() {
         )
         .unwrap();
         let capacity = if aggregate { 2 } else { 1 };
-        let socket = register_socket_with_pending_config(
+        let socket = register_socket_with_config(
             &poller,
             device,
             &pool,
             &state,
             Arc::new(tokio::sync::Semaphore::new(1)),
-            PendingSendConfig {
+            SocketTestConfig {
                 capacity,
                 window: 2,
                 aggregate,
+                ..Default::default()
             },
         );
         let peer = register_idle_socket(&poller, device, &pool, &state);
