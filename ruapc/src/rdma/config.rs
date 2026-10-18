@@ -322,7 +322,8 @@ impl RdmaProbeConfig {
 #[derive(Deserialize, Serialize, Debug, PartialEq, Clone)]
 #[serde(default, deny_unknown_fields)]
 pub struct RdmaRemoteMemoryConfig {
-    /// Read timeout in milliseconds. Zero disables the timeout.
+    /// READ admission and completion budget in milliseconds. Zero disables
+    /// this budget; the request deadline still applies.
     pub read_timeout_ms: u64,
     /// Shared in-flight RDMA READ work-request limit per local NIC.
     pub max_inflight_read_wrs: u32,

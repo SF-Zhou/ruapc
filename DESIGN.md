@@ -126,7 +126,8 @@ dependency independently validates the owned destination plan before posting.
 | `write_target.rs` | Exclusive destination checkout for CPU copies or owned RDMA READ plans |
 | `inline.rs`, `services/memory_service.rs` | Reverse-RPC fallback over TCP/WS/HTTP |
 | `with_buffers.rs` | Completed-write witnesses and typed buffer-returning responses |
-| `rdma/rdma_socket/read.rs` | Concrete READ planning and admission |
+| `rdma/rdma_socket/read.rs` | Concrete READ planning and execution |
+| `rdma/rdma_socket/read/credits.rs` | SQ/NIC admission, closure and completion credits |
 
 RDMA transfers use READ in both directions: `remote_write` asks the client to
 read the server's source. Application reads validate the original waiter after

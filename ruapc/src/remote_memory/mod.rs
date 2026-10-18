@@ -21,3 +21,6 @@ pub(crate) use read_source::ReadSource;
 
 mod with_buffers;
 pub use with_buffers::{ResultWithBuffers, SentBuffers, WithBuffers};
+
+#[cfg(all(test, feature = "rdma"))]
+mod timeout_tests;

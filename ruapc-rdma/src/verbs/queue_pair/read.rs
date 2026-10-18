@@ -66,7 +66,10 @@ struct PreparedRead {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadFailure {
     Completion,
+    /// The READ watchdog expired; the connection must be closed.
     Timeout,
+    /// The caller's request deadline expired without proving a connection fault.
+    RequestTimeout,
     ConnectionClosed,
     Cancelled,
 }
@@ -116,7 +119,9 @@ impl Drop for ReadPosting {
 pub(super) struct ReadBatch {
     remaining: AtomicUsize,
     failed: AtomicBool,
-    deadline: Option<Instant>,
+    read_deadline: Option<Instant>,
+    request_deadline: Option<Instant>,
+    read_timeout_reported: AtomicBool,
     inner: Mutex<ReadBatchInner>,
 }
 
@@ -130,13 +135,16 @@ impl ReadBatch {
     fn new(
         count: usize,
         buffers: Vec<Buffer>,
-        deadline: Option<Instant>,
+        read_deadline: Option<Instant>,
+        request_deadline: Option<Instant>,
     ) -> (Arc<Self>, ReadReceiver) {
         let (tx, rx) = oneshot::channel();
         let batch = Arc::new(Self {
             remaining: AtomicUsize::new(count),
             failed: AtomicBool::new(false),
-            deadline,
+            read_deadline,
+            request_deadline,
+            read_timeout_reported: AtomicBool::new(false),
             inner: Mutex::new(ReadBatchInner {
                 buffers: Some(buffers),
                 tx: Some(tx),
@@ -188,6 +196,21 @@ impl ReadBatch {
         } else {
             false
         }
+    }
+
+    /// Reports the earlier expired deadline without releasing DMA ownership.
+    /// The independent READ watchdog remains armed after request expiry or
+    /// receiver cancellation, and requests connection closure at most once.
+    fn expire(&self, now: Instant) -> bool {
+        let read_expired = self.read_deadline.is_some_and(|deadline| deadline <= now);
+        if self.request_deadline.is_some_and(|request| {
+            request <= now && self.read_deadline.is_none_or(|read| request <= read)
+        }) {
+            self.fail(ReadFailure::RequestTimeout);
+        } else if read_expired {
+            self.fail(ReadFailure::Timeout);
+        }
+        read_expired && !self.read_timeout_reported.swap(true, Ordering::Relaxed)
     }
 
     fn cancel_unposted(&self) -> Option<Vec<Buffer>> {
@@ -286,13 +309,31 @@ impl QueuePair {
         requests: Vec<ReadRequest>,
         deadline: Option<Instant>,
     ) -> std::result::Result<(ReadPosting, ReadReceiver), (Error, Vec<Buffer>)> {
+        self.prepare_reads_with_deadlines(buffers, requests, deadline, None)
+    }
+
+    /// Prepares owned READs with independent connection and request deadlines.
+    ///
+    /// Request expiry only notifies the receiver; READ-watchdog expiry also
+    /// requires closing the connection, even if the receiver has already timed
+    /// out or been dropped. Neither deadline permits early buffer recovery.
+    /// Callers must separately bound admission before posting: only posted WRs
+    /// are visible to [`Self::expire_reads`].
+    pub fn prepare_reads_with_deadlines(
+        &self,
+        buffers: Vec<Buffer>,
+        requests: Vec<ReadRequest>,
+        read_deadline: Option<Instant>,
+        request_deadline: Option<Instant>,
+    ) -> std::result::Result<(ReadPosting, ReadReceiver), (Error, Vec<Buffer>)> {
         let reads = match prepare(&buffers, requests, self.gather_limit(), |buffer| {
             self.lkey(buffer)
         }) {
             Ok(reads) => reads,
             Err(error) => return Err((error, buffers)),
         };
-        let (batch, receiver) = ReadBatch::new(reads.len(), buffers, deadline);
+        let (batch, receiver) =
+            ReadBatch::new(reads.len(), buffers, read_deadline, request_deadline);
         Ok((
             ReadPosting {
                 owner: self.read_state.owner,
@@ -341,15 +382,14 @@ impl QueuePair {
         }
     }
 
-    /// Fails expired waiters while preserving their buffers. A caller should
-    /// move the QP to ERR when this reports a newly expired batch.
+    /// Fails expired waiters while preserving their buffers. Returns true only
+    /// for a newly expired READ watchdog, requiring the caller to move the QP
+    /// to ERR. Request expiry alone does not prove a connection fault, and
+    /// does not disarm the READ watchdog after notifying the receiver.
     pub fn expire_reads(&self, now: Instant) -> bool {
         let mut expired = false;
         for entry in &self.read_state.batches {
-            let batch = entry.value();
-            if batch.deadline.is_some_and(|deadline| deadline <= now) {
-                expired |= batch.fail(ReadFailure::Timeout);
-            }
+            expired |= entry.value().expire(now);
         }
         expired
     }
@@ -450,7 +490,7 @@ mod tests {
     #[test]
     fn only_last_completion_returns_owned_memory() {
         let (buffers, lifetime) = buffers();
-        let (batch, mut rx) = ReadBatch::new(2, buffers, None);
+        let (batch, mut rx) = ReadBatch::new(2, buffers, None, None);
         batch.complete_one(true);
         assert!(rx.try_recv().is_err());
         assert!(lifetime.upgrade().is_some());
@@ -464,9 +504,11 @@ mod tests {
     #[test]
     fn timeout_notifies_once_and_holds_memory_through_flush() {
         let (buffers, lifetime) = buffers();
+        let now = Instant::now();
         let (batch, mut rx) =
-            ReadBatch::new(2, buffers, Some(Instant::now() - Duration::from_millis(1)));
-        assert!(batch.fail(ReadFailure::Timeout));
+            ReadBatch::new(2, buffers, Some(now - Duration::from_millis(1)), None);
+        assert!(batch.expire(now));
+        assert!(!batch.expire(now));
         assert!(!batch.fail(ReadFailure::ConnectionClosed));
         assert_eq!(rx.try_recv().unwrap().unwrap_err(), ReadFailure::Timeout);
         batch.complete_one(false);
@@ -476,9 +518,86 @@ mod tests {
     }
 
     #[test]
+    fn request_timeout_keeps_dma_owned_and_leaves_read_watchdog_armed() {
+        let (buffers, lifetime) = buffers();
+        let request_deadline = Instant::now();
+        let read_deadline = request_deadline + Duration::from_secs(1);
+        let (batch, mut rx) =
+            ReadBatch::new(2, buffers, Some(read_deadline), Some(request_deadline));
+
+        assert!(!batch.expire(request_deadline));
+        assert_eq!(
+            rx.try_recv().unwrap().unwrap_err(),
+            ReadFailure::RequestTimeout
+        );
+        assert!(lifetime.upgrade().is_some());
+        batch.complete_one(true);
+        assert!(lifetime.upgrade().is_some());
+        assert!(batch.expire(read_deadline));
+        assert!(!batch.expire(read_deadline));
+        assert!(lifetime.upgrade().is_some());
+        batch.complete_one(false);
+        assert!(lifetime.upgrade().is_none());
+    }
+
+    #[test]
+    fn request_timeout_without_read_watchdog_never_requests_connection_closure() {
+        let (buffers, lifetime) = buffers();
+        let deadline = Instant::now();
+        let (batch, mut rx) = ReadBatch::new(1, buffers, None, Some(deadline));
+        assert!(!batch.expire(deadline));
+        assert_eq!(
+            rx.try_recv().unwrap().unwrap_err(),
+            ReadFailure::RequestTimeout
+        );
+        assert!(!batch.expire(deadline + Duration::from_secs(60)));
+        assert!(lifetime.upgrade().is_some());
+        batch.complete_one(true);
+        assert!(lifetime.upgrade().is_none());
+    }
+
+    #[test]
+    fn delayed_sweep_reports_earlier_deadline_and_still_requests_read_timeout_closure() {
+        let now = Instant::now();
+        for (read_deadline, request_deadline, expected) in [
+            (
+                now + Duration::from_secs(1),
+                now,
+                ReadFailure::RequestTimeout,
+            ),
+            (now, now + Duration::from_secs(1), ReadFailure::Timeout),
+            (now, now, ReadFailure::RequestTimeout),
+        ] {
+            let (buffers, lifetime) = buffers();
+            let (batch, mut rx) =
+                ReadBatch::new(1, buffers, Some(read_deadline), Some(request_deadline));
+            let sweep_at = now + Duration::from_secs(2);
+            assert!(batch.expire(sweep_at));
+            assert_eq!(rx.try_recv().unwrap().unwrap_err(), expected);
+            assert!(!batch.expire(sweep_at));
+            assert!(lifetime.upgrade().is_some());
+            batch.complete_one(false);
+            assert!(lifetime.upgrade().is_none());
+        }
+    }
+
+    #[test]
+    fn cancelled_receiver_does_not_disarm_read_watchdog() {
+        let (buffers, lifetime) = buffers();
+        let deadline = Instant::now();
+        let (batch, rx) = ReadBatch::new(1, buffers, Some(deadline), None);
+        drop(rx);
+        assert!(batch.expire(deadline));
+        assert!(!batch.expire(deadline));
+        assert!(lifetime.upgrade().is_some());
+        batch.complete_one(true);
+        assert!(lifetime.upgrade().is_none());
+    }
+
+    #[test]
     fn cancelled_poster_accounts_the_unposted_suffix() {
         let (buffers, lifetime) = buffers();
-        let (batch, mut rx) = ReadBatch::new(3, buffers, None);
+        let (batch, mut rx) = ReadBatch::new(3, buffers, None, None);
         let reads = (0..3)
             .map(|_| PreparedRead {
                 remote_addr: 0,
@@ -503,7 +622,7 @@ mod tests {
     #[test]
     fn partial_failure_after_early_completions_settles_once() {
         let (buffers, lifetime) = buffers();
-        let (batch, mut rx) = ReadBatch::new(3, buffers, None);
+        let (batch, mut rx) = ReadBatch::new(3, buffers, None, None);
         batch.complete_one(true);
         batch.complete_one(true);
         assert!(rx.try_recv().is_err());
@@ -515,7 +634,7 @@ mod tests {
     #[test]
     fn dropped_receiver_cannot_release_inflight_memory() {
         let (buffers, lifetime) = buffers();
-        let (batch, rx) = ReadBatch::new(1, buffers, None);
+        let (batch, rx) = ReadBatch::new(1, buffers, None, None);
         drop(rx);
         assert!(lifetime.upgrade().is_some());
         batch.complete_one(true);
@@ -525,7 +644,7 @@ mod tests {
     #[test]
     fn unposted_cancel_recovers_memory_and_closes_receiver() {
         let (buffers, lifetime) = buffers();
-        let (batch, mut rx) = ReadBatch::new(1, buffers, None);
+        let (batch, mut rx) = ReadBatch::new(1, buffers, None, None);
         let posting = ReadPosting {
             owner: 1,
             reads: vec![PreparedRead {

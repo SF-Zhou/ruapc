@@ -24,8 +24,9 @@ pub enum ErrorKind {
     /// overflow, overlapping destination ranges, or too many ops/regions.
     InvalidCopyOp,
     /// An RDMA READ exceeded `rdma.remote_memory.read_timeout_ms`.
-    /// The QP moves to ERR; posted memory remains held until all completions
-    /// arrive or QP destruction succeeds.
+    /// Expired posted READs move the QP to ERR; admission expiry alone does
+    /// not. Posted memory remains held until all completions arrive or QP
+    /// destruction succeeds.
     RdmaReadTimeout,
     /// The local NIC bandwidth limiter could not admit an RDMA transfer
     /// within `rdma.remote_memory.bandwidth_limit_max_wait_ms`.

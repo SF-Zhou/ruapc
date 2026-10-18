@@ -73,6 +73,31 @@ write. `SentBuffers::merge` combines completed writes. Generated clients select
 the buffer-returning contract by type, including aliases such as
 `ResultWithBuffers<T>`.
 
+## Timeouts
+
+Incoming RPCs give the handler an absolute request deadline. Nonempty
+`remote_read` and `remote_write` calls use that deadline throughout their
+asynchronous waits; transferring control between admission, posting and
+completion does not restart the budget.
+
+RDMA READs also have an independent configured budget. Disabling that budget
+does not disable the handler's request deadline. Admission can time out before
+the first WR or between WRs; posted READs can time out without receiving a CQE.
+See [READ admission and failure](rdma-capacity.md#read-admission-and-failure)
+for configuration, error kinds and the periodic completion checks.
+
+Reverse RPCs use the default client's response budget, capped by the handler's
+remaining deadline. This covers TCP/WebSocket/HTTP/2 inline copies, RDMA
+`remote_write`, and the source validation after an RDMA `remote_read` completes.
+Send-queue admission and response waiting both honor this effective budget.
+The response and READ expiry sweeps can delay notification beyond the nominal
+deadline; they do not require a response or completion to arrive first.
+
+An expired remote-memory call returns an error to the handler; it does not
+cancel the handler itself or authorize early recovery of DMA buffers. The
+handler decides how to handle the error. Recovery follows the ownership rules
+below.
+
 ## Ownership and recovery
 
 | Resource | Lifetime and recovery |

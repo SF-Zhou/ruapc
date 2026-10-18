@@ -8,11 +8,11 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ruapc_rdma::ibv_send_flags;
 use serde::Serialize;
-use tokio::sync::{Notify, Semaphore, mpsc::Sender};
+use tokio::sync::mpsc::Sender;
 
 use super::{RdmaBandwidthLimiter, RdmaPathInfo, RdmaState, SendPermit};
 use crate::{
@@ -35,75 +35,7 @@ pub(crate) struct RdmaSocketConfig {
     pub(crate) sq_read_cap: u32,
 }
 
-/// Owns this QP's READ admission and its share of the NIC-wide limit.
-///
-/// The socket must declare this owner after its QP. Normal completions return
-/// both permits immediately; final destruction returns only the NIC permits
-/// for WRs whose completions were never processed, after destroying the QP.
-#[derive(Debug)]
-pub(crate) struct ReadCredits {
-    device: Arc<Semaphore>,
-    sq: Semaphore,
-    cap: usize,
-    closed: Notify,
-    /// Captured from the QP during exclusive socket destruction. SQ occupancy
-    /// is insufficient: an unposted task may hold SQ capacity while awaiting
-    /// the NIC, and forgetting that future need not keep the socket alive.
-    unpolled_on_drop: usize,
-}
-
-impl ReadCredits {
-    fn new(device: Arc<Semaphore>, cap: u32) -> Self {
-        let cap = cap.max(1) as usize;
-        Self {
-            device,
-            sq: Semaphore::new(cap),
-            cap,
-            closed: Notify::new(),
-            unpolled_on_drop: 0,
-        }
-    }
-
-    /// Called once for each authentic READ completion, including errors.
-    pub(crate) fn complete(&self) {
-        self.device.add_permits(1);
-        self.sq.add_permits(1);
-    }
-
-    pub(crate) fn close(&self) {
-        self.sq.close();
-        self.closed.notify_waiters();
-    }
-
-    pub(crate) fn is_closed(&self) -> bool {
-        self.sq.is_closed()
-    }
-
-    async fn closed(&self) {
-        let notified = self.closed.notified();
-        tokio::pin!(notified);
-        // Register before checking the persistent close state so a close
-        // cannot be lost before this future first waits for notification.
-        notified.as_mut().enable();
-        if !self.is_closed() {
-            notified.await;
-        }
-    }
-
-    pub(crate) fn is_idle(&self) -> bool {
-        self.sq.available_permits() == self.cap
-    }
-}
-
-impl Drop for ReadCredits {
-    fn drop(&mut self) {
-        // The QP's successful destruction has ended DMA. Forgotten unposted
-        // futures may leak their own permits, but must never invent NIC credit.
-        if self.unpolled_on_drop != 0 {
-            self.device.add_permits(self.unpolled_on_drop);
-        }
-    }
-}
+pub(crate) use read::ReadCredits;
 
 #[derive(Debug)]
 pub struct RdmaSocket {
@@ -138,9 +70,9 @@ pub struct RdmaSocket {
     accept_lease_id: AtomicU64,
     /// Shared bandwidth shaper for the local RDMA port.
     bandwidth_limiter: Arc<RdmaBandwidthLimiter>,
-    /// Software deadline for RDMA READ completions; `None` disables the
-    /// timeout. Enforced by the poll thread's periodic sweep, not by
-    /// per-operation timers.
+    /// Software budget for READ admission and completion. `None` disables
+    /// this budget, but not request deadlines. Completion expiry uses the
+    /// poll thread's sweep; only contended admission creates a timer.
     read_timeout: Option<Duration>,
 }
 
@@ -215,6 +147,9 @@ impl RdmaSocket {
             return;
         }
         self.read_credits.close();
+        // Notify callers even if the provider never produces flush CQEs.
+        // Failure notification preserves posted buffers and READ permits.
+        self.fail_read_batches();
         self.large.close();
         // The poll thread moves the QP to ERR, serialized with receive
         // reposting. A receive posted after the provider's ERR flush can
@@ -227,10 +162,10 @@ impl RdmaSocket {
     pub(crate) async fn reserve_send_bandwidth(
         &self,
         bytes: u64,
-        request_remaining: Option<Duration>,
+        request_deadline: Option<Instant>,
     ) -> Result<()> {
         self.bandwidth_limiter
-            .reserve_send(bytes, request_remaining)
+            .reserve_send(bytes, request_deadline)
             .await
     }
 }
@@ -240,7 +175,8 @@ impl Drop for RdmaSocket {
         // No posting or completion can still execute through this socket.
         // Snapshot only: refunding here would release admission before the QP
         // is destroyed. Fields then drop in order: QP, large transfers, credits.
-        self.read_credits.unpolled_on_drop = self.queue_pair.pending_read_count();
+        self.read_credits
+            .record_unpolled(self.queue_pair.pending_read_count());
     }
 }
 

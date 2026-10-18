@@ -231,8 +231,7 @@ impl Client {
         // capped by the parent context's remaining deadline (nested RPCs).
         let now = std::time::Instant::now();
         let response_deadline = capped_deadline(now, self.timeout, ctx.deadline);
-        let timeout = response_deadline.saturating_duration_since(now);
-        if timeout.is_zero() {
+        if response_deadline <= now {
             return Err(AttemptFailure::deadline());
         }
 
@@ -242,7 +241,7 @@ impl Client {
             .charge_bytes
             .unwrap_or_else(|| read_regions.iter().map(|region| region.len).sum::<u64>());
         if let Err(err) = socket
-            .reserve_rdma_send_bandwidth(read_bytes, Some(timeout))
+            .reserve_rdma_send_bandwidth(read_bytes, Some(response_deadline))
             .await
         {
             return Err(AttemptFailure::send(
