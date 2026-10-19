@@ -1,0 +1,767 @@
+<!DOCTYPE html>
+<html lang="en" class="no-js">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RuaPC — One service API. Every wire.</title>
+  <meta name="description" content="RuaPC is a Rust RPC library with one typed service API for TCP, WebSocket, HTTP/2 and optional RDMA. Generated clients, reverse RPC and remote memory.">
+  <meta name="author" content="SF-Zhou">
+  <meta name="generator" content="DeepSeek V4.1 Flash">
+  <meta name="theme-color" content="#f7f1e4">
+  <meta name="color-scheme" content="light">
+
+  <link rel="canonical" href="https://sf-zhou.github.io/ruapc/">
+  <link rel="sitemap" type="application/xml" href="./sitemap.xml">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="RuaPC">
+  <meta property="og:title" content="RuaPC — One service API. Every wire.">
+  <meta property="og:description" content="Typed Rust RPC over TCP, WebSocket, HTTP/2 and optional RDMA. Define the service once; change the wire, not the application.">
+  <meta property="og:url" content="https://sf-zhou.github.io/ruapc/">
+  <meta property="og:image" content="https://sf-zhou.github.io/ruapc/assets/img/og.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:type" content="image/png">
+  <meta property="og:image:alt" content="RuaPC — one service API for TCP, WebSocket, HTTP/2 and RDMA.">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="RuaPC — One service API. Every wire.">
+  <meta name="twitter:description" content="Typed Rust RPC over TCP, WebSocket, HTTP/2 and optional RDMA.">
+  <meta name="twitter:image" content="https://sf-zhou.github.io/ruapc/assets/img/og.png">
+  <meta name="twitter:image:alt" content="RuaPC — one service API. Every wire.">
+
+  <link rel="icon" href="./favicon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="./assets/img/apple-touch-icon.png">
+  <link rel="preload" href="./assets/fonts/bricolage-grotesque-latin.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="./assets/fonts/instrument-serif-italic-latin.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="./assets/fonts/ibm-plex-mono-400-latin.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="./assets/styles.css">
+  <noscript>
+    <style>
+      @media (max-width: 1000px) {
+        .menu-btn,
+        .header-actions { display: none !important; }
+        .header-inner {
+          grid-template-columns: 1fr;
+          gap: 2px;
+        }
+        .site-nav {
+          grid-column: 1 / -1;
+          display: flex !important;
+          flex-wrap: wrap;
+          justify-content: flex-start;
+          gap: 4px 16px;
+          padding-bottom: 10px;
+        }
+      }
+    </style>
+  </noscript>
+
+  <script>document.documentElement.classList.replace('no-js', 'js');</script>
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareSourceCode",
+    "name": "RuaPC",
+    "description": "A Rust RPC library with a shared typed service API for TCP, WebSocket, HTTP/2 and optional RDMA.",
+    "codeRepository": "https://github.com/SF-Zhou/ruapc",
+    "programmingLanguage": "Rust",
+    "license": [
+      "https://github.com/SF-Zhou/ruapc/blob/main/LICENSE-MIT",
+      "https://github.com/SF-Zhou/ruapc/blob/main/LICENSE-APACHE"
+    ],
+    "version": "0.2.0-alpha.6",
+    "sameAs": "https://crates.io/crates/ruapc",
+    "url": "https://sf-zhou.github.io/ruapc/"
+  }
+  </script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <div class="grain" aria-hidden="true"></div>
+
+  <svg class="sprite" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg">
+    <symbol id="i-arrow-up-right" viewBox="0 0 24 24"><path d="M7 17 17 7M8 7h9v9"/></symbol>
+    <symbol id="i-arrow-right" viewBox="0 0 24 24"><path d="M4 12h15M13 6l6 6-6 6"/></symbol>
+    <symbol id="i-arrow-down" viewBox="0 0 24 24"><path d="M12 4v15M6 13l6 6 6-6"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+    <symbol id="i-code" viewBox="0 0 24 24"><path d="m8 7-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></symbol>
+    <symbol id="i-reverse" viewBox="0 0 24 24"><path d="M4 8h15M15 4l4 4-4 4M20 16H5M9 12l-4 4 4 4"/></symbol>
+    <symbol id="i-network" viewBox="0 0 24 24"><circle cx="6" cy="6" r="2.4"/><circle cx="18" cy="6" r="2.4"/><circle cx="12" cy="18" r="2.4"/><path d="M8.4 6h7.2M7.3 8.3l3.5 7.4M16.7 8.3l-3.5 7.4"/></symbol>
+    <symbol id="i-server" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01M11 7.5h5M11 16.5h5"/></symbol>
+    <symbol id="i-cable" viewBox="0 0 24 24"><path d="M8 3v5M16 3v5M6 8h12v3a6 6 0 0 1-12 0zM12 17v4"/></symbol>
+    <symbol id="i-wave" viewBox="0 0 24 24"><path d="M4 12a8 8 0 0 1 16 0M7 12a5 5 0 0 1 10 0M10 12a2 2 0 0 1 4 0"/><circle cx="12" cy="17.5" r="1.4"/></symbol>
+    <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3.2 3.3 3.2 14.7 0 18M12 3c-3.2 3.3-3.2 14.7 0 18"/></symbol>
+    <symbol id="i-chip" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="2"/><path d="M10 2v3M14 2v3M10 19v3M14 19v3M2 10h3M2 14h3M19 10h3M19 14h3"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M7 3h7l4 4v14H7z"/><path d="M14 3v5h5M10 12h6M10 16h6"/></symbol>
+    <symbol id="i-braces" viewBox="0 0 24 24"><path d="M9 4H7a2 2 0 0 0-2 2v3a2 2 0 0 1-2 2 2 2 0 0 1 2 2v3a2 2 0 0 0 2 2h2M15 4h2a2 2 0 0 1 2 2v3a2 2 0 0 0 2 2 2 2 0 0 0-2 2v3a2 2 0 0 1-2 2h-2"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/></symbol>
+    <symbol id="i-chart" viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3 4 6v5c0 5 3.5 8 8 10 4.5-2 8-5 8-10V6z"/><path d="m8.5 12 2.5 2.5 4.5-5"/></symbol>
+    <symbol id="i-layers" viewBox="0 0 24 24"><path d="m12 3 9 5-9 5-9-5z"/><path d="m3 13 9 5 9-5M3 17l9 5 9-5"/></symbol>
+    <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+    <symbol id="i-spark" viewBox="0 0 24 24"><path d="M12 2c.7 5.7 4.3 9.3 10 10-5.7.7-9.3 4.3-10 10-.7-5.7-4.3-9.3-10-10 5.7-.7 9.3-4.3 10-10Z"/></symbol>
+    <symbol id="i-github" viewBox="0 0 24 24"><path d="M12 .6C5.7.6.6 5.7.6 12c0 5.1 3.3 9.4 7.8 10.9.6.1.8-.2.8-.5v-2.1c-3.2.7-3.9-1.4-3.9-1.4-.5-1.3-1.3-1.7-1.3-1.7-1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.8-1.6-2.6-.3-5.4-1.3-5.4-5.9 0-1.3.5-2.4 1.2-3.2-.1-.3-.5-1.5.1-3.2 0 0 1-.3 3.3 1.2a11 11 0 0 1 6 0C18.1 4.6 19.1 5 19.1 5c.6 1.7.2 2.9.1 3.2.8.8 1.2 1.9 1.2 3.2 0 4.6-2.8 5.6-5.4 5.9.4.4.8 1 .8 2v3c0 .3.2.6.8.5 4.5-1.5 7.8-5.8 7.8-10.9C23.4 5.7 18.3.6 12 .6Z"/></symbol>
+  </svg>
+
+  <header class="site-header" data-header>
+    <div class="wrap header-inner">
+      <a class="brand" href="#top" aria-label="RuaPC home">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 48 48" focusable="false">
+            <path d="M10 18.5 7.5 6.5l11 5.2a20.5 20.5 0 0 1 11 0l11-5.2L38 18.5a16.5 16.5 0 1 1-28 0Z" fill="currentColor"/>
+            <path d="M17 26c1.7 1.9 3.1 1.9 4.7 0M26.3 26c1.7 1.9 3.1 1.9 4.7 0" fill="none" stroke="#ffd43b" stroke-width="2.2" stroke-linecap="round"/>
+            <path d="M22 31.2h4L24 34z" fill="#ff5b35"/>
+            <path d="M7.8 30.5l6 1M7.8 35.5l6-1M40.2 30.5l-6 1M40.2 35.5l-6-1" fill="none" stroke="#ffd43b" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+        </span>
+        <span class="brand-word">RuaPC</span>
+        <span class="brand-chip">alpha</span>
+      </a>
+
+      <nav class="site-nav" aria-label="Primary">
+        <a href="#why">Why RuaPC</a>
+        <a href="#code">The API</a>
+        <a href="#transports">Transports</a>
+        <a href="#kit">Toolkit</a>
+        <a href="https://github.com/SF-Zhou/ruapc/blob/main/docs/README.md" target="_blank" rel="noopener">Docs <svg class="icon icon--tiny" aria-hidden="true"><use href="#i-arrow-up-right"/></svg></a>
+      </nav>
+
+      <div class="header-actions">
+        <a class="ghost-btn" href="https://github.com/SF-Zhou/ruapc" target="_blank" rel="noopener" aria-label="RuaPC on GitHub">
+          <svg class="icon icon--fill" aria-hidden="true"><use href="#i-github"/></svg>
+          <span>GitHub</span>
+        </a>
+        <button class="menu-btn" type="button" aria-label="Open menu" aria-expanded="false" aria-controls="mobile-nav" data-menu-btn>
+          <svg class="icon menu-open" aria-hidden="true"><use href="#i-menu"/></svg>
+          <svg class="icon menu-close" aria-hidden="true"><use href="#i-close"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <nav class="mobile-nav" id="mobile-nav" aria-label="Mobile" hidden data-mobile-nav>
+      <a href="#why">Why RuaPC <span>01</span></a>
+      <a href="#code">The API <span>02</span></a>
+      <a href="#transports">Transports <span>03</span></a>
+      <a href="#memory">Remote memory <span>04</span></a>
+      <a href="#kit">Toolkit <span>05</span></a>
+      <a href="#quickstart">Get started <span>06</span></a>
+      <a href="https://github.com/SF-Zhou/ruapc/blob/main/docs/README.md" target="_blank" rel="noopener">Documentation <svg class="icon icon--tiny" aria-hidden="true"><use href="#i-arrow-up-right"/></svg></a>
+      <a class="mobile-gh" href="https://github.com/SF-Zhou/ruapc" target="_blank" rel="noopener">
+        <svg class="icon icon--fill" aria-hidden="true"><use href="#i-github"/></svg> GitHub
+      </a>
+    </nav>
+  </header>
+
+  <main id="main">
+    <section class="hero" id="top">
+      <div class="hero-sun" aria-hidden="true"></div>
+      <div class="hero-orbit" aria-hidden="true"></div>
+      <div class="wrap hero-grid">
+        <div class="hero-copy">
+          <p class="eyebrow" data-rise style="--d: 40ms">
+            <span class="status-dot" aria-hidden="true"></span>
+            Rust RPC <span class="eyebrow-divider">/</span> v0.2.0-alpha.6
+          </p>
+          <h1 class="hero-title">
+            <span class="hero-line" data-rise style="--d: 100ms">One service API.</span>
+            <span class="hero-line" data-rise style="--d: 180ms"><span class="serif-accent">Every wire.</span></span>
+          </h1>
+          <p class="lede" data-rise style="--d: 260ms">
+            RuaPC gives TCP, WebSocket, HTTP/2 and optional RDMA one typed Rust
+            interface. Define the service once. Change the wire, not the application.
+          </p>
+          <div class="hero-actions" data-rise style="--d: 330ms">
+            <a class="btn btn--primary" href="#quickstart">Start building <svg class="icon" aria-hidden="true"><use href="#i-arrow-down"/></svg></a>
+            <a class="btn btn--secondary" href="https://github.com/SF-Zhou/ruapc#example" target="_blank" rel="noopener">Read the docs <svg class="icon icon--tiny" aria-hidden="true"><use href="#i-arrow-up-right"/></svg></a>
+          </div>
+          <div class="install-bar" data-rise style="--d: 400ms">
+            <span class="install-prompt" aria-hidden="true">$</span>
+            <code>cargo add ruapc@0.2.0-alpha.6</code>
+            <button class="copy-btn" type="button" data-copy-text="cargo add ruapc@0.2.0-alpha.6" aria-label="Copy cargo add ruapc@0.2.0-alpha.6">
+              <svg class="icon icon--tiny" aria-hidden="true"><use href="#i-copy"/></svg>
+              <span class="copy-label">Copy</span>
+            </button>
+            <span class="sr-only" role="status" aria-live="polite" data-copy-status></span>
+          </div>
+          <ul class="hero-facts" data-rise style="--d: 470ms" aria-label="At a glance">
+            <li><strong>04</strong><span>transports</span></li>
+            <li><strong>01</strong><span>typed API</span></li>
+            <li><strong>00</strong><span>unsafe in core</span></li>
+          </ul>
+        </div>
+
+        <div class="hero-visual" data-rise style="--d: 220ms">
+          <figure class="board" data-board>
+            <div class="board-head">
+              <span class="board-title"><span class="live-dot" aria-hidden="true"></span> Wire room</span>
+              <span class="board-tag">connected</span>
+            </div>
+
+            <div class="service-node">
+              <div class="service-copy">
+                <span class="micro-label">Service</span>
+                <strong>EchoService</strong>
+                <code>#[ruapc::service]</code>
+              </div>
+              <span class="node-badge">typed</span>
+            </div>
+
+            <div class="board-wires" role="group" aria-label="Preview a transport endpoint">
+              <button class="wire" type="button" data-transport="tcp" aria-pressed="true">
+                <span class="wire-index">01</span>
+                <span class="wire-main"><strong>TCP</strong><em>persistent stream</em></span>
+                <span class="wire-state">default</span>
+              </button>
+              <button class="wire" type="button" data-transport="ws" aria-pressed="false">
+                <span class="wire-index">02</span>
+                <span class="wire-main"><strong>WebSocket</strong><em>HTTP upgrade</em></span>
+                <span class="wire-state">same port</span>
+              </button>
+              <button class="wire" type="button" data-transport="http" aria-pressed="false">
+                <span class="wire-index">03</span>
+                <span class="wire-main"><strong>HTTP/2</strong><em>streams + JSON</em></span>
+                <span class="wire-state">same port</span>
+              </button>
+              <button class="wire" type="button" data-transport="rdma" aria-pressed="false">
+                <span class="wire-index">04</span>
+                <span class="wire-main"><strong>RDMA</strong><em>kernel bypass</em></span>
+                <span class="wire-state">feature</span>
+              </button>
+            </div>
+
+            <div class="client-node">
+              <div class="client-head">
+                <span class="micro-label">Client</span>
+                <span class="client-ready"><span class="live-dot live-dot--small" aria-hidden="true"></span> ready</span>
+              </div>
+              <code class="board-endpoint"><span data-scheme>tcp</span><span class="endpoint-rest">://127.0.0.1:8000</span><span class="caret" aria-hidden="true"></span></code>
+              <span class="client-sub">Client::default().echo(&amp;ctx, …)</span>
+            </div>
+
+            <div class="board-foot">
+              <span>Same handler. Same call.</span>
+              <span class="rua-stamp">RUA!</span>
+            </div>
+            <span class="sr-only" role="status" aria-live="polite" data-board-status></span>
+          </figure>
+          <span class="sticker sticker--note" aria-hidden="true">the transport is a detail</span>
+          <span class="sticker sticker--star" aria-hidden="true"><svg class="icon icon--fill"><use href="#i-spark"/></svg></span>
+        </div>
+      </div>
+    </section>
+
+    <div class="marquee" aria-hidden="true">
+      <div class="marquee-track">
+        <div class="marquee-group">
+          <span>TCP</span><span class="spark">✦</span><span>WebSocket</span><span class="spark">✦</span><span>HTTP/2</span><span class="spark">✦</span><span>RDMA</span><span class="spark">✦</span><span>Remote memory</span><span class="spark">✦</span><span>Reverse RPC</span><span class="spark">✦</span><span>OpenAPI</span><span class="spark">✦</span><span>MessagePack</span><span class="spark">✦</span>
+        </div>
+        <div class="marquee-group">
+          <span>TCP</span><span class="spark">✦</span><span>WebSocket</span><span class="spark">✦</span><span>HTTP/2</span><span class="spark">✦</span><span>RDMA</span><span class="spark">✦</span><span>Remote memory</span><span class="spark">✦</span><span>Reverse RPC</span><span class="spark">✦</span><span>OpenAPI</span><span class="spark">✦</span><span>MessagePack</span><span class="spark">✦</span>
+        </div>
+      </div>
+    </div>
+
+    <section class="section why" id="why">
+      <div class="wrap">
+        <div class="section-head">
+          <p class="kicker reveal"><span class="kicker-num">01</span> Why RuaPC</p>
+          <div class="section-head-main">
+            <h2 class="reveal">The transport is a detail.<br><span class="serif-accent">Your service isn't.</span></h2>
+            <p class="section-lede reveal">Start on TCP. Add WebSocket, HTTP, or RDMA when the deployment asks for it. The service definition, typed calls, deadlines and failure model stay put.</p>
+          </div>
+        </div>
+
+        <div class="principles">
+          <article class="principle reveal">
+            <div class="icon-box" aria-hidden="true"><svg class="icon"><use href="#i-code"/></svg></div>
+            <span class="micro-label">A / Codegen</span>
+            <h3>Typed end to end.</h3>
+            <p><code>#[ruapc::service]</code> generates typed client methods, server dispatch and OpenAPI schemas. Invalid signatures fail at the source span, not at runtime.</p>
+          </article>
+          <article class="principle reveal">
+            <div class="icon-box" aria-hidden="true"><svg class="icon"><use href="#i-reverse"/></svg></div>
+            <span class="micro-label">B / Reverse RPC</span>
+            <h3>Calls can go back.</h3>
+            <p>Persistent transports let a handler call into the client. No side channel, no second control API, no special case in the service definition.</p>
+          </article>
+          <article class="principle reveal">
+            <div class="icon-box" aria-hidden="true"><svg class="icon"><use href="#i-network"/></svg></div>
+            <span class="micro-label">C / Endpoints</span>
+            <h3>One endpoint contract.</h3>
+            <p>A scheme plus one or more equivalent addresses. Transport pools own connection caching, coalescing and address fallback.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section code-section" id="code">
+      <div class="wrap">
+        <div class="section-head">
+          <p class="kicker reveal"><span class="kicker-num">02</span> The API</p>
+          <div class="section-head-main">
+            <h2 class="reveal">From trait to traffic<br><span class="serif-accent">in three moves.</span></h2>
+            <p class="section-lede reveal">The macro does the glue. You keep ordinary async Rust: a trait, an implementation, and a call.</p>
+          </div>
+        </div>
+
+        <div class="code-layout reveal">
+          <div class="code-card">
+            <div class="code-tabs" role="tablist" aria-label="Code examples">
+              <button class="code-tab" type="button" role="tab" id="tab-define" aria-controls="panel-define" aria-selected="true" tabindex="0">01 Define</button>
+              <button class="code-tab" type="button" role="tab" id="tab-serve" aria-controls="panel-serve" aria-selected="false" tabindex="-1">02 Serve</button>
+              <button class="code-tab" type="button" role="tab" id="tab-call" aria-controls="panel-call" aria-selected="false" tabindex="-1">03 Call</button>
+            </div>
+
+            <div class="code-window">
+              <div class="code-bar">
+                <span class="code-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+                <span class="code-file" data-code-file>src/service.rs</span>
+                <button class="code-copy" type="button" data-copy-panel="panel-define" aria-label="Copy the visible code">
+                  <svg class="icon icon--tiny" aria-hidden="true"><use href="#i-copy"/></svg>
+                  <span class="copy-label">Copy</span>
+                </button>
+                <span class="sr-only" role="status" aria-live="polite" data-copy-status></span>
+              </div>
+
+              <div class="code-panels">
+                <div class="code-panel" role="tabpanel" id="panel-define" aria-labelledby="tab-define" tabindex="0">
+<pre><code><span class="tok-k">use</span> ruapc::{Context, Result};
+<span class="tok-k">use</span> schemars::JsonSchema;
+<span class="tok-k">use</span> serde::{Deserialize, Serialize};
+
+<span class="tok-a">#[derive(Serialize, Deserialize, JsonSchema)]</span>
+<span class="tok-k">pub struct</span> <span class="tok-t">Request</span>(<span class="tok-k">pub</span> String);
+
+<span class="tok-a">#[ruapc::service]</span>
+<span class="tok-k">pub trait</span> <span class="tok-t">EchoService</span> {
+    <span class="tok-k">async fn</span> echo(<span class="tok-k">&amp;self</span>, ctx: <span class="tok-k">&amp;</span><span class="tok-t">Context</span>, req: <span class="tok-k">&amp;</span><span class="tok-t">Request</span>) -&gt; <span class="tok-t">Result</span>&lt;String&gt;;
+}
+
+<span class="tok-k">struct</span> <span class="tok-t">Echo</span>;
+
+<span class="tok-k">impl</span> <span class="tok-t">EchoService</span> <span class="tok-k">for</span> <span class="tok-t">Echo</span> {
+    <span class="tok-k">async fn</span> echo(<span class="tok-k">&amp;self</span>, _ctx: <span class="tok-k">&amp;</span><span class="tok-t">Context</span>, req: <span class="tok-k">&amp;</span><span class="tok-t">Request</span>) -&gt; <span class="tok-t">Result</span>&lt;String&gt; {
+        <span class="tok-t">Ok</span>(req.<span class="tok-n">0</span>.clone())
+    }
+}</code></pre>
+                </div>
+
+                <div class="code-panel" role="tabpanel" id="panel-serve" aria-labelledby="tab-serve" tabindex="0" hidden>
+<pre><code><span class="tok-k">use</span> std::sync::Arc;
+<span class="tok-k">use</span> ruapc::{ListenMode, Router, Server, SocketPoolConfig};
+
+<span class="tok-a">#[tokio::main]</span>
+<span class="tok-k">async fn</span> main() -&gt; std::result::<span class="tok-t">Result</span>&lt;(), <span class="tok-t">Box</span>&lt;<span class="tok-k">dyn</span> std::error::<span class="tok-t">Error</span>&gt;&gt; {
+    <span class="tok-k">let</span> config = SocketPoolConfig {
+        listen_mode: ListenMode::UNIFIED,
+        ..Default::default()
+    };
+
+    <span class="tok-k">let mut</span> router = Router::default();
+    EchoService::ruapc_export(Arc::new(Echo), <span class="tok-k">&amp;mut</span> router);
+
+    <span class="tok-k">let</span> server = Server::create(router, <span class="tok-k">&amp;</span>config)?;
+    server.listen(<span class="tok-s">"0.0.0.0:8000"</span>.parse()?).<span class="tok-k">await</span>?;
+
+    tokio::signal::ctrl_c().<span class="tok-k">await</span>?;
+    server.stop();
+    server.join().<span class="tok-k">await</span>;
+    <span class="tok-t">Ok</span>(())
+}</code></pre>
+                </div>
+
+                <div class="code-panel" role="tabpanel" id="panel-call" aria-labelledby="tab-call" tabindex="0" hidden>
+<pre><code><span class="tok-k">use</span> ruapc::{Client, Context, SocketPoolConfig};
+
+<span class="tok-a">#[tokio::main]</span>
+<span class="tok-k">async fn</span> main() -&gt; std::result::<span class="tok-t">Result</span>&lt;(), <span class="tok-t">Box</span>&lt;<span class="tok-k">dyn</span> std::error::<span class="tok-t">Error</span>&gt;&gt; {
+    <span class="tok-k">let</span> config = SocketPoolConfig::default();
+    <span class="tok-k">let</span> ctx = Context::create(<span class="tok-k">&amp;</span>config)?
+        <span class="tok-c">// tcp:// → ws:// → http:// → rdma://</span>
+        .with_endpoint(<span class="tok-s">"ws://127.0.0.1:8000"</span>.parse()?);
+
+    <span class="tok-k">let</span> response = Client::default()
+        .echo(<span class="tok-k">&amp;</span>ctx, <span class="tok-k">&amp;</span>Request(<span class="tok-s">"Rua!"</span>.into()))
+        .<span class="tok-k">await</span>?;
+
+    assert_eq!(response, <span class="tok-s">"Rua!"</span>);
+    <span class="tok-t">Ok</span>(())
+}</code></pre>
+                </div>
+              </div>
+
+              <div class="code-status">
+                <span>Rust 2024</span>
+                <span data-code-status>typed client + dispatch + schema</span>
+              </div>
+            </div>
+          </div>
+
+          <aside class="code-notes" aria-live="polite">
+            <div class="note-panel" data-note="define">
+              <span class="micro-label">What you get</span>
+              <h3>One trait, three artifacts.</h3>
+              <ul>
+                <li>A typed client with the trait's methods.</li>
+                <li>Server dispatch and an OpenAPI schema.</li>
+                <li>Compile-time validation at the source span.</li>
+              </ul>
+              <a class="text-link" href="https://github.com/SF-Zhou/ruapc/blob/main/ruapc-macro/src/lib.rs" target="_blank" rel="noopener">Service macro reference <svg class="icon icon--tiny" aria-hidden="true"><use href="#i-arrow-up-right"/></svg></a>
+            </div>
+            <div class="note-panel" data-note="serve" hidden>
+              <span class="micro-label">What you get</span>
+              <h3>Bind once. Speak four protocols.</h3>
+              <ul>
+                <li>Register services before creating the server.</li>
+                <li><code>UNIFIED</code> serves TCP, WebSocket and HTTP on one port.</li>
+                <li>RDMA bootstraps over a TCP or <code>UNIFIED</code> listener.</li>
+              </ul>
+              <a class="text-link" href="https://github.com/SF-Zhou/ruapc/blob/main/docs/rdma-connection.md" target="_blank" rel="noopener">Connection lifecycle <svg class="icon icon--tiny" aria-hidden="true"><use href="#i-arrow-up-right"/></svg></a>
+            </div>
+            <div class="note-panel" data-note="call" hidden>
+              <span class="micro-label">What you get</span>
+              <h3>Swap the scheme. Keep the call.</h3>
+              <ul>
+                <li>The endpoint selects the transport, not the code.</li>
+                <li>The same generated method works on every wire.</li>
+                <li>Deadlines and remote memory travel with the context.</li>
+              </ul>
+              <a class="text-link" href="https://github.com/SF-Zhou/ruapc/blob/main/docs/endpoints.md" target="_blank" rel="noopener">Endpoint guide <svg class="icon icon--tiny" aria-hidden="true"><use href="#i-arrow-up-right"/></svg></a>
+            </div>
+          </aside>
+        </div>
+      </div>
+    </section>
+
+    <section class="section transports" id="transports">
+      <div class="wrap">
+        <div class="section-head">
+          <p class="kicker reveal"><span class="kicker-num">03</span> The wires</p>
+          <div class="section-head-main">
+            <h2 class="reveal">Pick a wire.<br><span class="serif-accent">Keep the code.</span></h2>
+            <p class="section-lede reveal">Every transport is a typed endpoint. Persistent transports add reverse RPC; RDMA adds kernel bypass and READ-based transfers. A unified listener can speak TCP, WebSocket and HTTP on the same port.</p>
+          </div>
+        </div>
+
+        <div class="transport-grid reveal">
+          <article class="transport">
+            <div class="transport-top">
+              <span class="t-num">01</span>
+              <svg class="icon" aria-hidden="true"><use href="#i-cable"/></svg>
+            </div>
+            <h3>TCP</h3>
+            <p class="t-desc">Persistent streams with reverse RPC and inline remote memory. The zero-ceremony default.</p>
+            <code class="t-endpoint">tcp://host:8000</code>
+            <ul class="t-tags">
+              <li>persistent</li><li>reverse RPC</li><li>inline memory</li>
+            </ul>
+            <p class="t-foot">no RDMA toolchain</p>
+          </article>
+
+          <article class="transport">
+            <div class="transport-top">
+              <span class="t-num">02</span>
+              <svg class="icon" aria-hidden="true"><use href="#i-wave"/></svg>
+            </div>
+            <h3>WebSocket</h3>
+            <p class="t-desc">The same persistent contract over an HTTP upgrade, using WebSocket framing.</p>
+            <code class="t-endpoint">ws://host:8000</code>
+            <ul class="t-tags">
+              <li>persistent</li><li>HTTP upgrade</li><li>reverse RPC</li>
+            </ul>
+            <p class="t-foot">shares the unified port</p>
+          </article>
+
+          <article class="transport">
+            <div class="transport-top">
+              <span class="t-num">03</span>
+              <svg class="icon" aria-hidden="true"><use href="#i-globe"/></svg>
+            </div>
+            <h3>HTTP/2</h3>
+            <p class="t-desc">Typed streams for reverse RPC and remote memory, plus plain JSON POST for ordinary callers.</p>
+            <code class="t-endpoint">http://host:8000</code>
+            <ul class="t-tags">
+              <li>h2 streams</li><li>JSON POST</li><li>RapiDoc</li>
+            </ul>
+            <p class="t-foot">docs ship at /rapidoc</p>
+          </article>
+
+          <article class="transport transport--rdma">
+            <div class="transport-top">
+              <span class="t-num">04</span>
+              <svg class="icon" aria-hidden="true"><use href="#i-chip"/></svg>
+            </div>
+            <h3>RDMA</h3>
+            <p class="t-desc">Optional kernel-bypass transport with READ-based transfers. Bootstraps over TCP or a unified listener.</p>
+            <code class="t-endpoint">rdma://host:8000</code>
+            <ul class="t-tags">
+              <li>optional</li><li>kernel bypass</li><li>RDMA READ</li>
+            </ul>
+            <p class="t-foot">feature = "rdma"</p>
+          </article>
+        </div>
+
+        <div class="unified-strip reveal">
+          <svg class="icon icon--large" aria-hidden="true"><use href="#i-server"/></svg>
+          <div>
+            <strong>Unified listener</strong>
+            <p>One port accepts TCP, WebSocket and HTTP. With RDMA enabled, the same listener carries bootstrap.</p>
+          </div>
+          <code>ListenMode::UNIFIED</code>
+        </div>
+
+        <p class="section-note reveal">Typed HTTP/2 streams support reverse RPC and remote memory. Ordinary unary HTTP POST calls are JSON and unary. <a href="https://github.com/SF-Zhou/ruapc/blob/main/docs/endpoints.md" target="_blank" rel="noopener">Read the transport contracts <svg class="icon icon--tiny" aria-hidden="true"><use href="#i-arrow-up-right"/></svg></a></p>
+      </div>
+    </section>
+
+    <section class="section memory" id="memory">
+      <div class="wrap memory-grid">
+        <div class="memory-copy">
+          <p class="kicker reveal"><span class="kicker-num">04</span> Remote memory</p>
+          <h2 class="reveal">Move bytes.<br><span class="serif-accent">Keep ownership.</span></h2>
+          <p class="section-lede reveal">Attach owned buffers to a call and address them as one flat <code>CopyOp</code> space. RuaPC fragments the ranges, validates bounds and overlap, and picks the path: RDMA READ or inline reverse RPC.</p>
+          <ul class="checklist reveal">
+            <li><svg class="icon" aria-hidden="true"><use href="#i-check"/></svg> Owned read sources and exclusive write destinations.</li>
+            <li><svg class="icon" aria-hidden="true"><use href="#i-check"/></svg> Read-then-validate results; recoverable failures return buffers when the contract allows.</li>
+            <li><svg class="icon" aria-hidden="true"><use href="#i-check"/></svg> Works over TCP, WebSocket, typed HTTP/2 and RDMA.</li>
+          </ul>
+          <div class="link-row reveal">
+            <a class="text-link" href="https://github.com/SF-Zhou/ruapc/blob/main/docs/remote-memory.md" target="_blank" rel="noopener">Remote memory guide <svg class="icon icon--tiny" aria-hidden="true"><use href="#i-arrow-up-right"/></svg></a>
+            <a class="text-link" href="https://github.com/SF-Zhou/ruapc/blob/main/docs/safe-boundaries.md" target="_blank" rel="noopener">Safety boundaries <svg class="icon icon--tiny" aria-hidden="true"><use href="#i-arrow-up-right"/></svg></a>
+          </div>
+        </div>
+
+        <div class="memory-visual reveal">
+          <div class="mem-card" role="img" aria-label="Client read buffers form one logical copy space. A handler reads them into local buffers and writes results back to client destination buffers.">
+            <div class="mem-card-head">
+              <span>Logical copy space</span>
+              <span class="mem-owned"><svg class="icon icon--tiny" aria-hidden="true"><use href="#i-shield"/></svg> owned</span>
+            </div>
+            <div class="mem-space">
+              <div class="mem-column">
+                <span class="mem-label">Client</span>
+                <div class="mem-chip">src[0] <span>4 KiB</span></div>
+                <div class="mem-chip">src[1] <span>12 KiB</span></div>
+                <div class="mem-brace"><span></span><em>one CopyOp space</em><span></span></div>
+              </div>
+              <div class="mem-arrows">
+                <div class="mem-arrow">
+                  <span>READ</span>
+                  <svg class="mem-arrow-svg" aria-hidden="true"><path d="M2 6h34M29 1l7 5-7 5"/></svg>
+                </div>
+                <div class="mem-arrow mem-arrow--back">
+                  <svg class="mem-arrow-svg" aria-hidden="true"><path d="M44 6H10M17 1l-7 5 7 5"/></svg>
+                  <span>WRITE</span>
+                </div>
+              </div>
+              <div class="mem-column mem-column--right">
+                <span class="mem-label">Handler</span>
+                <div class="mem-chip mem-chip--primary">local buffer</div>
+                <div class="mem-chip mem-chip--ghost">WithBuffers&lt;T&gt;</div>
+              </div>
+            </div>
+            <div class="mem-card-foot">
+              <code>CopyOp { src_offset, dst_offset, len }</code>
+              <span><svg class="icon icon--tiny" aria-hidden="true"><use href="#i-check"/></svg> bounds · overlap</span>
+            </div>
+          </div>
+
+          <div class="mem-snippet">
+            <div class="mem-snippet-bar"><span>handler.rs</span><span>owned →</span></div>
+<pre><code><span class="tok-k">let</span> data = ctx.remote_read_all().<span class="tok-k">await</span>?;
+<span class="tok-k">let</span> total = data.iter()
+    .map(|b| b.len() <span class="tok-k">as</span> <span class="tok-t">u64</span>).sum();
+<span class="tok-k">let</span> sent = ctx.remote_write_all(data).<span class="tok-k">await</span>?;
+<span class="tok-t">Ok</span>(sent.reply(total))</code></pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section kit" id="kit">
+      <div class="wrap">
+        <div class="section-head">
+          <p class="kicker reveal"><span class="kicker-num">05</span> The toolkit</p>
+          <div class="section-head-main">
+            <h2 class="reveal">Batteries,<br><span class="serif-accent">not boilerplate.</span></h2>
+            <p class="section-lede reveal">The pieces you would otherwise wire together ship with the library: schemas, docs, codecs, deadlines and metrics.</p>
+          </div>
+        </div>
+
+        <div class="kit-grid">
+          <article class="kit-card kit-card--yellow reveal">
+            <div class="kit-top">
+              <div class="icon-box" aria-hidden="true"><svg class="icon"><use href="#i-code"/></svg></div>
+              <span class="kit-num">01</span>
+            </div>
+            <h3>Codegen, not boilerplate.</h3>
+            <p>Define one trait. Get a typed client, server dispatch and an OpenAPI schema. Reserved names and bad signatures fail at compile time.</p>
+            <span class="kit-tag">#[ruapc::service]</span>
+          </article>
+
+          <article class="kit-card kit-card--blue reveal">
+            <div class="kit-top">
+              <div class="icon-box" aria-hidden="true"><svg class="icon"><use href="#i-file"/></svg></div>
+              <span class="kit-num">02</span>
+            </div>
+            <h3>Docs at the endpoint.</h3>
+            <p>RapiDoc at <code>/rapidoc</code>; the schema at <code>/openapi.json</code>. Documentation moves with the service, not a separate deployment.</p>
+            <span class="kit-tag">/openapi.json</span>
+          </article>
+
+          <article class="kit-card reveal">
+            <div class="kit-top">
+              <div class="icon-box" aria-hidden="true"><svg class="icon"><use href="#i-braces"/></svg></div>
+              <span class="kit-num">03</span>
+            </div>
+            <h3>MessagePack or JSON.</h3>
+            <p>MessagePack payloads by default; JSON when a caller asks. Unary HTTP endpoints accept JSON directly.</p>
+            <span class="kit-tag">rmp-serde · serde_json</span>
+          </article>
+
+          <article class="kit-card reveal">
+            <div class="kit-top">
+              <div class="icon-box" aria-hidden="true"><svg class="icon"><use href="#i-clock"/></svg></div>
+              <span class="kit-num">04</span>
+            </div>
+            <h3>Deadlines that travel.</h3>
+            <p>Context deadlines propagate to transports. Nested calls are capped by the parent's remaining budget.</p>
+            <span class="kit-tag">ctx.deadline()</span>
+          </article>
+
+          <article class="kit-card reveal">
+            <div class="kit-top">
+              <div class="icon-box" aria-hidden="true"><svg class="icon"><use href="#i-chart"/></svg></div>
+              <span class="kit-num">05</span>
+            </div>
+            <h3>Bring your own metrics.</h3>
+            <p>Emit through the metrics facade. Per-method handles are cached per state; accounting settles on completion, cancellation or panic.</p>
+            <span class="kit-tag">metrics facade</span>
+          </article>
+
+          <article class="kit-card kit-card--ink reveal">
+            <div class="kit-top">
+              <div class="icon-box" aria-hidden="true"><svg class="icon"><use href="#i-shield"/></svg></div>
+              <span class="kit-num">06</span>
+            </div>
+            <h3>Safe at the core.</h3>
+            <p><code>ruapc</code> forbids unsafe. Allocation, registration and verbs sit behind owned-safe APIs in <code>ruapc-bufpool</code> and <code>ruapc-rdma</code>.</p>
+            <span class="kit-tag">#![forbid(unsafe_code)]</span>
+          </article>
+
+          <article class="kit-card kit-card--wide reveal">
+            <div class="kit-top">
+              <div class="icon-box" aria-hidden="true"><svg class="icon"><use href="#i-layers"/></svg></div>
+              <span class="kit-num">07</span>
+            </div>
+            <h3>Endpoint groups.</h3>
+            <p>One endpoint can name a sorted, deduplicated group of equivalent addresses. Pools cache by the complete group and handle fallback without merging overlapping sets.</p>
+            <span class="kit-tag">tcp://a:8000,b:8000</span>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="quickstart" id="quickstart">
+      <div class="wrap">
+        <div class="cta reveal">
+          <div class="cta-copy">
+            <p class="kicker kicker--light"><span class="kicker-num">06</span> Get started</p>
+            <h2>Ready to <span class="serif-accent">Rua?</span></h2>
+            <p class="cta-lede">Add the crate and start on TCP, WebSocket or HTTP. No RDMA toolchain required. Turn on the optional <code>rdma</code> feature when the hardware shows up.</p>
+            <div class="install-bar install-bar--light">
+              <span class="install-prompt" aria-hidden="true">$</span>
+              <code>cargo add ruapc@0.2.0-alpha.6</code>
+              <button class="copy-btn" type="button" data-copy-text="cargo add ruapc@0.2.0-alpha.6" aria-label="Copy cargo add ruapc@0.2.0-alpha.6">
+                <svg class="icon icon--tiny" aria-hidden="true"><use href="#i-copy"/></svg>
+                <span class="copy-label">Copy</span>
+              </button>
+              <span class="sr-only" role="status" aria-live="polite" data-copy-status></span>
+            </div>
+            <div class="cta-actions">
+              <a class="btn btn--primary" href="https://github.com/SF-Zhou/ruapc#example" target="_blank" rel="noopener">Quick start <svg class="icon icon--tiny" aria-hidden="true"><use href="#i-arrow-up-right"/></svg></a>
+              <a class="btn btn--ghost-light" href="https://github.com/SF-Zhou/ruapc/blob/main/ruapc-demo/README.md" target="_blank" rel="noopener">Run the demos <svg class="icon icon--tiny" aria-hidden="true"><use href="#i-arrow-up-right"/></svg></a>
+              <a class="btn btn--ghost-light" href="https://docs.rs/ruapc" target="_blank" rel="noopener">API reference <svg class="icon icon--tiny" aria-hidden="true"><use href="#i-arrow-up-right"/></svg></a>
+            </div>
+            <p class="cta-note">Stable Rust <span>·</span> MIT OR Apache-2.0 <span>·</span> currently in alpha</p>
+          </div>
+
+          <div class="cta-art" aria-hidden="true">
+            <span class="speech">RUA!</span>
+            <figure class="mascot-frame">
+              <img src="./assets/img/ruapc-mascot.webp" srcset="./assets/img/ruapc-mascot.webp 640w, ./assets/img/ruapc-mascot@2x.webp 1280w" sizes="260px" width="640" height="640" alt="" decoding="async">
+              <figcaption>certified rua delivery</figcaption>
+            </figure>
+            <svg class="doodle doodle--arrow" viewBox="0 0 80 60" fill="none" aria-hidden="true"><path d="M4 8c24 2 45 14 58 38M50 44l13 4 5-13" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <div class="footer-top">
+        <div class="footer-brand">
+          <a class="brand brand--footer" href="#top" aria-label="RuaPC home">
+            <span class="brand-mark" aria-hidden="true">
+              <svg viewBox="0 0 48 48" focusable="false">
+                <path d="M10 18.5 7.5 6.5l11 5.2a20.5 20.5 0 0 1 11 0l11-5.2L38 18.5a16.5 16.5 0 1 1-28 0Z" fill="currentColor"/>
+                <path d="M17 26c1.7 1.9 3.1 1.9 4.7 0M26.3 26c1.7 1.9 3.1 1.9 4.7 0" fill="none" stroke="#ffd43b" stroke-width="2.2" stroke-linecap="round"/>
+                <path d="M22 31.2h4L24 34z" fill="#ff5b35"/>
+                <path d="M7.8 30.5l6 1M7.8 35.5l6-1M40.2 30.5l-6 1M40.2 35.5l-6-1" fill="none" stroke="#ffd43b" stroke-width="1.5" stroke-linecap="round"/>
+              </svg>
+            </span>
+            <span class="brand-word">RuaPC</span>
+          </a>
+          <p>One service API. Every wire.<br>Rust RPC, currently in alpha.</p>
+          <a class="footer-gh" href="https://github.com/SF-Zhou/ruapc" target="_blank" rel="noopener">
+            <svg class="icon icon--fill" aria-hidden="true"><use href="#i-github"/></svg>
+            Star on GitHub
+          </a>
+        </div>
+
+        <nav class="footer-cols" aria-label="Footer">
+          <div>
+            <h3>Explore</h3>
+            <a href="#why">Why RuaPC</a>
+            <a href="#code">The API</a>
+            <a href="#transports">Transports</a>
+            <a href="#memory">Remote memory</a>
+            <a href="#kit">Toolkit</a>
+          </div>
+          <div>
+            <h3>Documentation</h3>
+            <a href="https://github.com/SF-Zhou/ruapc/blob/main/docs/README.md" target="_blank" rel="noopener">Documentation index</a>
+            <a href="https://github.com/SF-Zhou/ruapc/blob/main/docs/endpoints.md" target="_blank" rel="noopener">Server endpoints</a>
+            <a href="https://github.com/SF-Zhou/ruapc/blob/main/docs/remote-memory.md" target="_blank" rel="noopener">Remote memory</a>
+            <a href="https://github.com/SF-Zhou/ruapc/blob/main/docs/safe-boundaries.md" target="_blank" rel="noopener">Safety boundaries</a>
+            <a href="https://github.com/SF-Zhou/ruapc/blob/main/CHANGELOG.md" target="_blank" rel="noopener">Changelog</a>
+          </div>
+          <div>
+            <h3>Project</h3>
+            <a href="https://github.com/SF-Zhou/ruapc" target="_blank" rel="noopener">GitHub</a>
+            <a href="https://crates.io/crates/ruapc" target="_blank" rel="noopener">crates.io</a>
+            <a href="https://docs.rs/ruapc" target="_blank" rel="noopener">docs.rs</a>
+            <a href="https://github.com/SF-Zhou/ruapc/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">Contributing</a>
+            <a href="https://github.com/SF-Zhou/ruapc/blob/main/LICENSE-MIT" target="_blank" rel="noopener">MIT / Apache-2.0</a>
+          </div>
+        </nav>
+      </div>
+
+      <div class="footer-bottom">
+        <span>© 2026 SF-Zhou</span>
+        <span>Built with Rust. Rua!</span>
+        <span class="footer-credit">Website generated by <span class="credit-model">DeepSeek V4.1 Flash</span></span>
+        <a href="#top">Back to top <span aria-hidden="true">↑</span></a>
+      </div>
+
+      <div class="footer-rua" aria-hidden="true">RUA!</div>
+    </div>
+  </footer>
+
+  <script src="./assets/main.js" defer onerror="document.documentElement.classList.add('reveal-fallback')"></script>
+</body>
+</html>

@@ -16,7 +16,7 @@ A Rust RPC library with a shared service API for TCP, WebSocket, HTTP and option
 - Payloads use MessagePack by default; clients can select JSON. HTTP POST endpoints accept JSON.
 - RapiDoc serves interactive documentation; metrics use the `metrics` facade with an application-provided recorder.
 
-See the [documentation index](docs/README.md), [architecture](DESIGN.md) and [contribution guide](CONTRIBUTING.md).
+See the [website](https://sf-zhou.github.io/ruapc/), [documentation index](docs/README.md), [architecture](DESIGN.md) and [contribution guide](CONTRIBUTING.md).
 
 ## Example
 
