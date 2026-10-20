@@ -1,12 +1,10 @@
 //! [`Context`]: RAII wrapper for `ibv_context`.
 
-use std::{path::Path, sync::Arc};
+use std::sync::Arc;
 
-use crate::{Error, ErrorKind, GidType, LinkLayer, Result};
+use crate::{ErrorKind, Result};
 
-/// GID type string values from sysfs.
-const GID_TYPE_IB_ROCE_V1: &str = "IB/RoCE v1\n";
-const GID_TYPE_ROCE_V2: &str = "RoCE v2\n";
+mod gid;
 
 /// An opened RDMA device context.
 ///
@@ -17,6 +15,7 @@ const GID_TYPE_ROCE_V2: &str = "RoCE v2\n";
 /// device list can be safely freed after opening a device.
 pub struct Context {
     ptr: *mut crate::ibv_context,
+    gid_query: gid::GidQuery,
 }
 
 impl Context {
@@ -31,7 +30,10 @@ impl Context {
         if ptr.is_null() {
             return Err(ErrorKind::IBOpenDeviceFail.with_errno());
         }
-        Ok(Arc::new(Self { ptr }))
+        Ok(Arc::new(Self {
+            ptr,
+            gid_query: gid::GidQuery::default(),
+        }))
     }
 
     /// Returns the raw context pointer.
@@ -59,46 +61,6 @@ impl Context {
             return Err(ErrorKind::IBQueryPortFail.with_errno());
         }
         Ok(unsafe { attr.assume_init() })
-    }
-
-    /// Queries a GID for the specified port and index.
-    pub fn query_gid(&self, port_num: u8, gid_index: u8) -> Result<crate::ibv_gid> {
-        let mut gid = crate::ibv_gid::default();
-        let ret = unsafe {
-            crate::ruapc_ibv_query_gid(self.ptr, port_num as _, gid_index as _, &mut gid)
-        };
-        if ret == 0 && !gid.is_null() {
-            Ok(gid)
-        } else {
-            Err(ErrorKind::IBQueryGidFail.with_errno())
-        }
-    }
-
-    /// Queries the GID type from sysfs.
-    pub fn query_gid_type(
-        &self,
-        port_num: u8,
-        gid_index: u8,
-        ibdev_path: &Path,
-        port_attr: &crate::ibv_port_attr,
-    ) -> Result<GidType> {
-        let path = ibdev_path.join(format!("ports/{port_num}/gid_attrs/types/{gid_index}"));
-        match std::fs::read_to_string(path) {
-            Ok(content) => {
-                if content == GID_TYPE_IB_ROCE_V1 {
-                    match port_attr.link_layer {
-                        LinkLayer::InfiniBand => Ok(GidType::IB),
-                        LinkLayer::Ethernet => Ok(GidType::RoCEv1),
-                        _ => Ok(GidType::Other(content.trim().to_string())),
-                    }
-                } else if content == GID_TYPE_ROCE_V2 {
-                    Ok(GidType::RoCEv2)
-                } else {
-                    Ok(GidType::Other(content.trim().to_string()))
-                }
-            }
-            Err(err) => Err(Error::new(ErrorKind::IBQueryGidTypeFail, err.to_string())),
-        }
     }
 }
 

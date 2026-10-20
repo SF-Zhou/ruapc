@@ -46,7 +46,12 @@ jobs:
         tool: cargo-llvm-cov
 
     - name: Install dependencies
-      run: sudo apt-get update && sudo apt-get install -y pkg-config libibverbs-dev ibverbs-utils
+      run: sudo apt-get update && sudo apt-get install -y clang pkg-config libibverbs-dev ibverbs-utils
+
+    - name: Test RDMA query compatibility
+      run: |
+        bash ruapc-rdma/tests/test_queries.sh
+        CC=clang CFLAGS='-fsanitize=address,undefined' bash ruapc-rdma/tests/test_queries.sh
 
     # Run separately: the core crate's self dev-dependency enables RDMA in
     # workspace tests, even when --no-default-features is specified.

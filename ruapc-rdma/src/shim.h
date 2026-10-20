@@ -51,6 +51,15 @@ int ruapc_ibv_query_port(struct ibv_context *context, uint8_t port_num,
 int ruapc_ibv_query_gid(struct ibv_context *context, uint8_t port_num,
                         int index, union ibv_gid *gid);
 
+/* Direct kernel queries, independent of ibv_query_gid_ex availability.
+ * Both return zero on success or a positive errno on failure. */
+int ruapc_ibv_query_gid_driver_id(struct ibv_context *context,
+                                uint32_t *driver_id);
+
+int ruapc_ibv_query_gid_entry(struct ibv_context *context, uint32_t driver_id,
+                            uint8_t port_num, uint32_t index,
+                            union ibv_gid *gid, uint32_t *gid_type);
+
 /* Protection domain */
 
 struct ibv_pd *ruapc_ibv_alloc_pd(struct ibv_context *context);

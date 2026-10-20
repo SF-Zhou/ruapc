@@ -185,8 +185,11 @@ fn main() {
     // version, including any macro / static inline compat layers.
     println!("cargo:rerun-if-changed=src/shim.c");
     println!("cargo:rerun-if-changed=src/shim.h");
+    println!("cargo:rerun-if-changed=src/gid_query.c");
+    println!("cargo:rerun-if-changed=src/gid_query.h");
+    println!("cargo:rerun-if-changed=src/uverbs_driver.c");
     let mut shim = cc::Build::new();
-    shim.file("src/shim.c");
+    shim.files(["src/shim.c", "src/gid_query.c", "src/uverbs_driver.c"]);
     for path in &include_paths {
         shim.include(path);
     }

@@ -37,6 +37,24 @@ cargo run -p ruapc-rdma --features bin --bin ibv_devinfo -- -v
 Device snapshots support serde and JSON Schema. Capability masks use typed
 `enumflags2::BitFlags`; GIDs are classified as IB, RoCE v1 or RoCE v2.
 
+`Context::query_gid_entry` queries the GID and its type together with the
+kernel's `QUERY_GID_ENTRY` ioctl. Device snapshots use this combined query;
+`query_gid` and `query_gid_type` also try the ioctl first. The implementation
+does not require `ibv_query_gid_ex`, so it can use a newer kernel with older
+libibverbs releases, including rdma-core v28 from Ubuntu 20.04. The kernel
+method was introduced in Linux 5.10; older kernels need a backport or the
+legacy fallback.
+
+The ioctl requires a driver ID. Discovery uses RDMA netlink and checks the
+returned character-device identity against the opened uverbs FD. If discovery
+is unavailable, or the ioctl returns `ENOTTY` / `EPROTONOSUPPORT`, queries fall
+back to `ibv_query_gid` and sysfs GID types. Driver IDs and unsupported-method
+results are cached per context; transient discovery failures can be retried
+after a one-second cooldown. Other ioctl errors, including empty GID
+entries, do not fall back. Native InfiniBand ports need no sysfs type file;
+Ethernet ports still require one on the legacy path. The inspection CLI's
+optional `board_id` remains a sysfs query.
+
 ## Resources and completions
 
 ```text
@@ -100,14 +118,18 @@ memory and its protection domain, while queue operations enforce DMA lifetimes.
 Registration itself grants no independent byte access; see the
 [registration contract](../docs/safe-boundaries.md#registration-and-byte-access).
 
-`build.rs` compiles `src/shim.c` against the installed `<infiniband/verbs.h>` and
-generates bindings with bindgen. Every verbs entry point used by the crate goes
-through a `ruapc_ibv_*` C wrapper so header macros and static inline functions
-are applied. This avoids accidentally binding only a legacy exported symbol.
+`build.rs` compiles the C shim against the installed `<infiniband/verbs.h>` and
+generates bindings with bindgen. Every libibverbs entry point used by the crate
+goes through a `ruapc_ibv_*` C wrapper so header macros and static inline
+functions are applied. This avoids accidentally binding only a legacy exported
+symbol. The direct GID query keeps its newer UAPI method IDs and response
+layout private, allowing builds with old kernel headers. Its translation unit
+is separate from `verbs.h` to avoid vendor/distro header conflicts.
 
 | Module | Responsibility |
 | --- | --- |
 | [`shim.h`](src/shim.h), [`shim.c`](src/shim.c), [`build.rs`](build.rs) | C wrappers, build detection and binding generation |
+| [`gid_query.c`](src/gid_query.c), [`uverbs_driver.c`](src/uverbs_driver.c) | GID ioctl and RDMA netlink driver discovery |
 | [`src/ffi/`](src/ffi/), [`src/types/`](src/types/) | Bindings, extensions, device snapshots and identifiers |
 | [`src/verbs/`](src/verbs/) | Resource wrappers, posting and completion ownership |
 | [`ibv_devinfo.rs`](src/bin/ibv_devinfo.rs) | Device inspection CLI |
@@ -116,7 +138,12 @@ are applied. This avoids accidentally binding only a legacy exported symbol.
 
 ```bash
 cargo test -p ruapc-rdma
+bash ruapc-rdma/tests/test_queries.sh
 ```
+
+The C query tests check ioctl encoding and netlink parsing without hardware.
+Set `CC=clang CFLAGS='-fsanitize=address,undefined'` to also run them with
+sanitizers.
 
 Device tests open real devices. Setting `RUAPC_PREFER_RXE=1` restricts their
 selection to Soft-RoCE devices named `rxe*`, as in CI. See
