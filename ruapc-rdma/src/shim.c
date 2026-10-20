@@ -1,5 +1,6 @@
 /* See shim.h for why these wrappers exist. */
 #include "shim.h"
+#include "gid_query.h"
 
 /* Device management */
 
@@ -46,6 +47,14 @@ int ruapc_ibv_query_gid(struct ibv_context *context, uint8_t port_num,
                         int index, union ibv_gid *gid)
 {
 	return ibv_query_gid(context, port_num, index, gid);
+}
+
+int ruapc_ibv_query_gid_entry(struct ibv_context *context, uint32_t driver_id,
+			    uint8_t port_num, uint32_t index,
+			    union ibv_gid *gid, uint32_t *gid_type)
+{
+	return ruapc_query_gid_entry(context->cmd_fd, driver_id, port_num, index,
+				    gid->raw, gid_type);
 }
 
 /* Protection domain */

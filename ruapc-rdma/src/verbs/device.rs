@@ -201,14 +201,13 @@ impl ActiveDevice {
         let mut gids = Vec::with_capacity(gid_tbl_len as usize);
         for gid_index in 0..gid_tbl_len {
             let gid_index = gid_index as u8;
-            let Ok(gid) = self.context.query_gid(port_num, gid_index) else {
+            let Ok(entry) =
+                self.context
+                    .query_gid_entry(port_num, gid_index, &self.info.ibdev_path, port_attr)
+            else {
                 continue;
             };
-            if let Ok(gid_type) =
-                self.context
-                    .query_gid_type(port_num, gid_index, &self.info.ibdev_path, port_attr)
-                && let Some(gid) = Gid::usable(gid_index, gid, gid_type)
-            {
+            if let Some(gid) = Gid::usable(gid_index, entry.gid, entry.gid_type) {
                 gids.push(gid);
             }
         }
