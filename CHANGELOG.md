@@ -16,6 +16,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   acquisition, independently of the periodic maintenance interval. Coverage
   skips NICs without a compatible local path, isolates failed attempts, and
   can replace redundant stripes when the active-connection limit is reached.
+- `ruapc-rdma::Context::query_gid_entry` returns a GID and its type from one
+  kernel query on Linux 5.10+, falling back to `ibv_query_gid` and the sysfs
+  GID type elsewhere.
 
 ### Changed
 - **BREAKING**: `ruapc-rdma::ReadFailure` adds `RequestTimeout` to distinguish
@@ -41,6 +44,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   in JSON and MessagePack. `Transport::RDMA` and the `rdma://` scheme remain
   available without the RDMA feature for storage and interchange; connection
   acquisition requires the feature and an enabled RDMA pool.
+- RDMA GID queries use the kernel `QUERY_GID_ENTRY` and `QUERY_GID_TABLE`
+  ioctls when available, so a device snapshot collects all GIDs with one ioctl
+  instead of one query per index. Driver IDs come from RDMA netlink and are
+  bound to the opened uverbs device; kernels or drivers without the methods
+  keep using `ibv_query_gid` and the sysfs GID type. Native InfiniBand ports
+  no longer need the sysfs `gid_attrs/types` file on the legacy path.
 
 ### Fixed
 - RDMA READ deadlines cover bandwidth and SQ/NIC permit admission, including

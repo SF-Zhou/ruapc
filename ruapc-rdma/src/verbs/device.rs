@@ -169,11 +169,32 @@ impl ActiveDevice {
     pub fn query_device_info(&self) -> Result<DeviceInfo> {
         let device_attr = self.context.query_device()?;
 
-        let mut ports = Vec::with_capacity(device_attr.phys_port_cnt as usize);
+        let mut port_attrs = Vec::with_capacity(device_attr.phys_port_cnt as usize);
+        let mut table_capacity = 0usize;
         for port_num in 1..=device_attr.phys_port_cnt {
             let port_attr = self.context.query_port(port_num)?;
+            table_capacity = table_capacity.saturating_add(gid_table_len(&port_attr));
+            port_attrs.push((port_num, port_attr));
+        }
 
-            let gids = self.collect_port_gids(port_num, &port_attr);
+        // One device-wide ioctl replaces one query per GID index. A failed or
+        // unsupported table query falls back to the per-index queries, which
+        // also covers kernels without the direct methods.
+        let gid_table = self
+            .context
+            .query_gid_table(table_capacity)
+            .unwrap_or_default();
+
+        let mut ports = Vec::with_capacity(port_attrs.len());
+        for (port_num, port_attr) in port_attrs {
+            let gids = match &gid_table {
+                Some(entries) => entries
+                    .iter()
+                    .filter(|(port, _)| *port == port_num)
+                    .filter_map(|(_, gid)| Gid::usable(gid.index, gid.gid, gid.gid_type.clone()))
+                    .collect(),
+                None => self.collect_port_gids(port_num, &port_attr),
+            };
             ports.push(Port {
                 port_num,
                 port_attr,
@@ -195,10 +216,10 @@ impl ActiveDevice {
     }
 
     fn collect_port_gids(&self, port_num: u8, port_attr: &crate::ibv_port_attr) -> Vec<Gid> {
-        // GID indices are exchanged as `u8` during connection negotiation,
-        // so entries beyond index 255 are unusable and not collected.
-        let gid_tbl_len = port_attr.gid_tbl_len.clamp(0, 1 + u8::MAX as i32);
-        let mut gids = Vec::with_capacity(gid_tbl_len as usize);
+        // GID indices are exchanged as `u8` during connection negotiation, so
+        // entries beyond index 255 are unusable and not collected.
+        let gid_tbl_len = gid_table_len(port_attr).min(1 + u8::MAX as usize);
+        let mut gids = Vec::with_capacity(gid_tbl_len);
         for gid_index in 0..gid_tbl_len {
             let gid_index = gid_index as u8;
             let Ok(entry) =
@@ -213,6 +234,12 @@ impl ActiveDevice {
         }
         gids
     }
+}
+
+/// Buffer capacity for the device-wide table query. It must cover every slot
+/// the kernel may report, including indices the snapshot cannot expose.
+fn gid_table_len(port_attr: &crate::ibv_port_attr) -> usize {
+    port_attr.gid_tbl_len.max(0) as usize
 }
 
 impl std::fmt::Debug for ActiveDevice {
