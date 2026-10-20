@@ -57,6 +57,14 @@ int ruapc_ibv_query_gid_entry(struct ibv_context *context, uint32_t driver_id,
 				    gid->raw, gid_type);
 }
 
+int ruapc_ibv_query_gid_table(struct ibv_context *context, uint32_t driver_id,
+			    void *entries, uint32_t max_entries,
+			    uint32_t *num_entries)
+{
+	return ruapc_query_gid_table(context->cmd_fd, driver_id, entries,
+				     max_entries, num_entries);
+}
+
 /* Protection domain */
 
 struct ibv_pd *ruapc_ibv_alloc_pd(struct ibv_context *context)

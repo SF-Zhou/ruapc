@@ -37,23 +37,27 @@ cargo run -p ruapc-rdma --features bin --bin ibv_devinfo -- -v
 Device snapshots support serde and JSON Schema. Capability masks use typed
 `enumflags2::BitFlags`; GIDs are classified as IB, RoCE v1 or RoCE v2.
 
-`Context::query_gid_entry` queries the GID and its type together with the
-kernel's `QUERY_GID_ENTRY` ioctl. Device snapshots use this combined query;
-`query_gid` and `query_gid_type` also try the ioctl first. The implementation
-does not require `ibv_query_gid_ex`, so it can use a newer kernel with older
-libibverbs releases, including rdma-core v28 from Ubuntu 20.04. The kernel
-method was introduced in Linux 5.10; older kernels need a backport or the
-legacy fallback.
+`Context::query_gid_entry` queries a GID and its type together with the
+kernel's `QUERY_GID_ENTRY` ioctl. Device snapshots use the device-wide
+`QUERY_GID_TABLE` ioctl, so collecting every port's GIDs needs one ioctl
+instead of one per index; `query_gid` and `query_gid_type` also try the
+per-index ioctl first. The implementation does not require
+`ibv_query_gid_ex`, so it can use a newer kernel with older libibverbs
+releases, including rdma-core v28 from Ubuntu 20.04. Both methods were
+introduced in Linux 5.10; older kernels need a backport or the legacy
+fallback.
 
 The ioctl requires a driver ID. Discovery uses RDMA netlink and checks the
 returned character-device identity against the opened uverbs FD. If discovery
 is unavailable, or the ioctl returns `ENOTTY` / `EPROTONOSUPPORT`, queries fall
-back to `ibv_query_gid` and sysfs GID types. Driver IDs and unsupported-method
-results are cached per context; transient discovery failures can be retried
-after a one-second cooldown. Other ioctl errors, including empty GID
-entries, do not fall back. Native InfiniBand ports need no sysfs type file;
-Ethernet ports still require one on the legacy path. The inspection CLI's
-optional `board_id` remains a sysfs query.
+back to `ibv_query_gid` and sysfs GID types; snapshots then query each GID
+index separately, and a `QUERY_GID_TABLE` response that does not fit falls
+back the same way. Driver IDs and unsupported-method results are cached per
+context; transient discovery failures can be retried after a one-second
+cooldown. Other ioctl errors, including empty GID entries, do not fall back.
+Native InfiniBand ports need no sysfs type file; Ethernet ports still require
+one on the legacy path. The inspection CLI's optional `board_id` remains a
+sysfs query.
 
 ## Resources and completions
 
@@ -141,8 +145,9 @@ cargo test -p ruapc-rdma
 bash ruapc-rdma/tests/test_queries.sh
 ```
 
-The C query tests check ioctl encoding and netlink parsing without hardware.
-Set `CC=clang CFLAGS='-fsanitize=address,undefined'` to also run them with
+The C query tests check ioctl encoding and netlink parsing without RDMA
+hardware; they still compile against the installed libibverbs headers. Set
+`CC=clang CFLAGS='-fsanitize=address,undefined'` to also run them with
 sanitizers.
 
 Device tests open real devices. Setting `RUAPC_PREFER_RXE=1` restricts their

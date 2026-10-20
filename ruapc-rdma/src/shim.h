@@ -52,13 +52,19 @@ int ruapc_ibv_query_gid(struct ibv_context *context, uint8_t port_num,
                         int index, union ibv_gid *gid);
 
 /* Direct kernel queries, independent of ibv_query_gid_ex availability.
- * Both return zero on success or a positive errno on failure. */
+ * All return zero on success or a positive errno on failure.
+ * `ruapc_ibv_query_gid_driver_id` is defined in src/uverbs_driver.c. */
 int ruapc_ibv_query_gid_driver_id(struct ibv_context *context,
                                 uint32_t *driver_id);
 
 int ruapc_ibv_query_gid_entry(struct ibv_context *context, uint32_t driver_id,
                             uint8_t port_num, uint32_t index,
                             union ibv_gid *gid, uint32_t *gid_type);
+
+/* `entries` points to `max_entries` writable entries of 32 bytes each. */
+int ruapc_ibv_query_gid_table(struct ibv_context *context, uint32_t driver_id,
+                            void *entries, uint32_t max_entries,
+                            uint32_t *num_entries);
 
 /* Protection domain */
 
