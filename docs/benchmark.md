@@ -63,12 +63,83 @@ excludes setup, initial registration and warmup, and reuses sources and write
 destinations. It includes full-pattern verification and per-call
 `remote_read_all` destination allocation.
 
+## RDMA ownership harnesses
+
+```bash
+cargo bench -p ruapc-rdma --features bench-internals --bench buffer_stash
+cargo bench -p ruapc-rdma --features bench-internals --bench read_bookkeeping
+```
+
+These standalone harnesses require the libibverbs build prerequisites but no
+RDMA device. The `bench-internals` feature exposes internal measurement
+components through a hidden `bench_support` module. They own only buffers
+created for the measurement; they cannot access a real QP's retained buffers
+or construct CQ completion proofs. Treat these interfaces as benchmark support,
+not as an application API.
+
+| Harness | Workload | Timed operations |
+|---|---|---|
+| [`buffer_stash`](../ruapc-rdma/benches/buffer_stash.rs) | Actual `WrSlots`, depth 64; single buffer and prebuilt gather lists of 1/4/16 buffers | Insert/take roundtrip, empty/mismatched take, occupied-slot collision |
+| `buffer_stash`, churn | Sequence strides 1/8/32; retire the oldest WR every two attempts, with at most 64 live entries | Attempt cost, observed collision rate, peak live entries and their buffer capacity bytes |
+| `buffer_stash`, sweep | Actual `CompletionCursor`; dense widths 1/8/32, sparse width 32 and a 4096-sequence gap | Staging inserts, cursor traversal, takes and recycling; denominator is SQ sequences visited, including empty IDs |
+| `buffer_stash`, producer/consumer | Two threads, two batches of 32 buffers; slot transfer and a handoff-only control | Ownership roundtrip including two channel messages per batch and scheduling |
+| [`read_bookkeeping`](../ruapc-rdma/benches/read_bookkeeping.rs) | WR group sizes 1/8/32; prepare also varies 1/4/32 scatter segments | Separately measures plan validation, batch creation, ledger insert/remove and final completion notification |
+
+The slot cases preallocate and reuse buffers and gather containers; they do not
+measure buffer allocation/free. The collision case deliberately maps a new
+sequence onto an occupied slot and checks that ownership is returned. Churn
+measures collisions under a synthetic posting/retirement schedule; its peak
+capacity counts only buffers actually in slots, excluding unused fixture buffers
+and pool caches. Neither case estimates collision frequency in a live QP.
+Sweep timings include staging
+and recycling, so dense/sparse results are not pure traversal costs.
+
+READ preparation supplies a constant lkey and excludes input-plan construction
+and output destruction. Batch creation includes the actual Arc/oneshot
+allocations. Ledger cases measure the real DashMap, Arc traffic and nonfinal
+completion accounting using one long-lived batch; the two-thread version
+allows 64 WRs in flight and includes atomic publication/backpressure. They
+exclude the SQ posting mutex, provider calls and CQ polling. Final-completion
+cases prebuild batches and measure the final accounting plus oneshot extraction,
+with either an unpolled receiver or a counting waker; no executor runs.
+The shared ledger batch concentrates reference-count and countdown contention;
+its throughput is not the throughput or latency of independent READ batches.
+Prebuilt chunks also affect cache residency, and loop/container/clock overhead
+remains in the measurements. Do not add component timings to predict RPC cost.
+
+Thread startup, affinity, warmup and final destruction stay outside timing.
+Output reports total wall time divided by operations, **not latency samples**.
+READ case names specify per-batch or per-WR accounting. Handoff controls show
+harness overhead but must not be mechanically subtracted from other cases.
+
+| Environment variable | Effect |
+|---|---|
+| `RUAPC_RDMA_BENCH_ITERS` | Positive measured operation/batch count, default 100000; sweep rounds up to its width. |
+| `RUAPC_RDMA_BENCH_WARMUP` | Positive warmup count, default 1000. |
+| `RUAPC_RDMA_BENCH_REPEATS` | Positive sample count per case, default 3. |
+| `RUAPC_RDMA_BENCH_FILTER` | Case-name substring; unset runs all cases. |
+| `RUAPC_RDMA_BENCH_CPU_BASE=N` | On Linux, pin the main thread to CPU N and the completion thread to N+1. |
+
+For example, bind memory to the chosen cores' NUMA node and measure just the
+READ ledger:
+
+```bash
+RUAPC_RDMA_BENCH_CPU_BASE=96 RUAPC_RDMA_BENCH_FILTER=read/ledger \
+  numactl --membind=1 cargo bench -p ruapc-rdma --features bench-internals \
+  --bench read_bookkeeping
+```
+
+Use the RPC harnesses above to validate effects on real hardware. In particular,
+direct multi-threaded slot access does not measure contention on the real SQ
+posting mutex, and device-free bookkeeping does not establish end-to-end gains.
+
 ## Allocator harnesses
 
 ```bash
 cargo bench -p ruapc-bufpool --bench lazy_merge
 cargo bench -p ruapc-bufpool --bench contention
 cargo bench -p ruapc-bufpool --bench initialization
+cargo bench -p ruapc-bufpool --bench handoff
 ```
 
 These harnesses need no RDMA libraries or device:
@@ -83,6 +154,16 @@ These harnesses need no RDMA libraries or device:
 - [`initialization`](../ruapc-bufpool/benches/initialization.rs) compares 64 MiB
   backing allocation and first full write. It separates demand-paged creation
   from touching all bytes; it does not measure hot pool reuse or registration.
+- [`handoff`](../ruapc-bufpool/benches/handoff.rs) compares same-thread
+  allocation/free, producer allocation with consumer-thread free, and a
+  preallocated-buffer handoff control. Cases use 16 KiB/64 KiB/1 MiB buffers,
+  groups of 1/4/16 buffers, and thread caches enabled/disabled. Each case uses a
+  fresh 512 MiB pool, 128 warmup batches and 2000 measured batches. Two reusable
+  batches bound in-flight memory; each bounded-channel message carries eight
+  groups. Container capacity is reused. Timing waits for all measured batches
+  to return and excludes thread startup, affinity, initial allocation, warmup
+  and final destruction. There is no payload copying or device registration.
+  `ns/buffer` is an amortized wall-time cost, not a latency distribution.
 
 Contention accepts `RUAPC_BENCH_SIZE` (65536 or 1048576 bytes) and
 `RUAPC_BENCH_THREADS` (1, 2, 4, 8 or 16) to select a case in a fresh process.
@@ -91,6 +172,22 @@ to `N+16`; for example, base 96 uses coordinator CPU 112. Choose available
 physical cores and bind memory to their NUMA node. A process-wide CPU mask still
 permits workers to migrate between cores. Keep pool lifecycle and allocation
 history equivalent across runs.
+
+Handoff accepts `RUAPC_BENCH_ITERS` (positive batch count), `RUAPC_BENCH_SIZE`
+(16384, 65536 or 1048576), `RUAPC_BENCH_GATHER` (1, 4 or 16),
+`RUAPC_BENCH_THREAD_CACHE` (0 or 1), and `RUAPC_BENCH_MODE` (`same_thread`,
+`cross_thread` or `reuse`). Unset selectors run all combinations. Its
+`RUAPC_BENCH_CPU_BASE=N` pins the producer to N and consumer to N+1, unlike
+contention's coordinator convention. The `reuse` mode moves preallocated
+buffers through the same channels without allocating/freeing them; it is a
+synchronization control, not a quantity to subtract mechanically.
+
+```bash
+RUAPC_BENCH_ITERS=20000 RUAPC_BENCH_SIZE=65536 \
+  RUAPC_BENCH_GATHER=16 RUAPC_BENCH_THREAD_CACHE=1 \
+  RUAPC_BENCH_CPU_BASE=96 numactl --membind=1 \
+  cargo bench -p ruapc-bufpool --bench handoff
+```
 
 ## Demo measurements
 
