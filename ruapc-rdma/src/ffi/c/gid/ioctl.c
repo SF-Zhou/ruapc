@@ -7,7 +7,7 @@
  * Reference: rdma-core b63b7bfe5d5b0adb97b973c71723adf2323afa2c,
  * libibverbs/cmd_device.c and kernel-headers/rdma/ib_user_ioctl_{cmds,verbs}.h.
  */
-#include "gid_query.h"
+#include "ioctl.h"
 
 #include <errno.h>
 #include <stddef.h>

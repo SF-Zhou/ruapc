@@ -48,10 +48,10 @@ jobs:
     - name: Install dependencies
       run: sudo apt-get update && sudo apt-get install -y clang pkg-config libibverbs-dev ibverbs-utils
 
-    - name: Test RDMA query compatibility
+    - name: Test RDMA query wrappers
       run: |
-        bash ruapc-rdma/tests/test_queries.sh
-        CC=clang CFLAGS='-fsanitize=address,undefined' bash ruapc-rdma/tests/test_queries.sh
+        bash ruapc-rdma/tests/test_queries.sh --native
+        CC=clang CFLAGS='-fsanitize=address,undefined' bash ruapc-rdma/tests/test_queries.sh --native
 
     # Run separately: the core crate's self dev-dependency enables RDMA in
     # workspace tests, even when --no-default-features is specified.
@@ -63,6 +63,10 @@ jobs:
         sudo prlimit --pid $$ -l=unlimited && ulimit -a
         ibv_devinfo -d rxe_0 -v
         cargo fmt -- --check
+        # --all-features selects the libibverbs GID backend; check the
+        # default ioctl/sysfs backend separately.
+        cargo clippy --release -p ruapc-rdma --all-targets --no-default-features -- -D warnings
+        cargo test --release -p ruapc-rdma --no-default-features
         cargo clippy --release --all-features -- -D warnings
         cargo llvm-cov --all-features --ignore-filename-regex "ruapc-demo/*|ruapc-macro/*|ruapc/src/bin/*|ruapc-rdma/src/bin/*" --cobertura --output-path cobertura.xml
 

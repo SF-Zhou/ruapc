@@ -4,7 +4,7 @@
  * not a wildcard. GET_CHARDEV supplies the ID without depending on sysfs.
  * See Linux drivers/infiniband/core/{nldev,uverbs_main}.c.
  */
-#include "shim.h"
+#include "compat.h"
 
 #include <errno.h>
 #include <limits.h>

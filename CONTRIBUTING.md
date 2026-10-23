@@ -11,6 +11,10 @@ Read [DESIGN.md](DESIGN.md) for module boundaries and use the
 | Workspace builds, tests and RPC benchmarks | Stable Rust, C compiler, `pkg-config`, libclang and libibverbs development files (`libibverbs-dev` on Debian/Ubuntu) |
 | Tests that open RDMA devices | Usable RDMA NIC or Soft-RoCE and sufficient locked-memory allowance |
 
+`--all-features` enables the RDMA crate's optional
+[`ibv-query-gid-ex` backend](ruapc-rdma/README.md#gid-query-backends), which
+requires libibverbs headers and a runtime library from rdma-core v32 or later.
+
 The core crate's self dev-dependency enables RDMA for its tests and benchmarks.
 Selecting a TCP test does not remove that build dependency. Stream-only demo
 tests and allocator/macro tests can run without an RDMA device:
@@ -28,8 +32,13 @@ Branch from `main`, add tests for changed behavior, and run:
 cargo build --workspace --all-features
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy -p ruapc-rdma --all-targets --no-default-features -- -D warnings
+cargo test -p ruapc-rdma --no-default-features
 cargo test --workspace --all-features
 ```
+
+The separate `ruapc-rdma` checks exercise its default ioctl/sysfs GID backend;
+the all-feature workspace checks exercise the libibverbs backend.
 
 Run formatting and Clippy before committing. PRs target `main`, and all CI
 checks must pass before merging. [CI](.github/workflows/rust.yml) runs formatting,

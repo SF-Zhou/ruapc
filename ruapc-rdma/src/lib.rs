@@ -16,7 +16,7 @@
 //! - **Type-safe bindings**: Generated FFI types have custom Rust wrappers
 //!   (`FwVer`, `Guid`, `WRID`, `LinkLayer`) substituted at build time.
 //!   Every verbs entry point is routed through a C shim compiled against the
-//!   installed header (see `src/shim.h`), never bound directly.
+//!   installed header (see `src/ffi/c/verbs.h`), never bound directly.
 //!
 //! ## Module Organization
 //!

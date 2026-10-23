@@ -1,8 +1,9 @@
 //! # Generated libibverbs FFI bindings and extensions
 //!
 //! The `bindings` submodule includes the bindgen output produced by
-//! `build.rs` (see the crate README for the C shim rationale). The sibling
-//! modules extend the generated types with safe, idiomatic helpers:
+//! `build.rs` from the C wrappers in `src/ffi/c/` (see the crate README for
+//! the shim rationale). The sibling modules extend the generated types with
+//! safe, idiomatic helpers:
 //!
 //! - [`flags`]: typed accessors and static names for `enumflags2` capability
 //!   enums generated from the installed header

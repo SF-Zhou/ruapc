@@ -177,9 +177,9 @@ impl ActiveDevice {
             port_attrs.push((port_num, port_attr));
         }
 
-        // One device-wide ioctl replaces one query per GID index. A failed or
-        // unsupported table query falls back to the per-index queries, which
-        // also covers kernels without the direct methods.
+        // One device-wide query replaces one query per GID index. A failed or
+        // unsupported table query falls back to the selected backend's
+        // per-index queries.
         let gid_table = self
             .context
             .query_gid_table(table_capacity)

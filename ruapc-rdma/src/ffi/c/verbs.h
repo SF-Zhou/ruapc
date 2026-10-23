@@ -12,7 +12,7 @@
  * the legacy ibv_query_port only fills the compat-sized prefix of
  * ibv_port_attr, leaving newer fields uninitialized).
  *
- * Routing every call through this C translation unit guarantees "freshly
+ * Routing every call through a C translation unit guarantees "freshly
  * compiled against the installed header" semantics for each entry point,
  * on any platform and any rdma-core version, present or future. The C
  * compiler also type-checks each wrapper body against the real header
@@ -21,10 +21,10 @@
  * 9.79 ns/op both with and without the shim).
  *
  * Rust code must never bind an ibv_* symbol directly; add a wrapper here
- * instead.
+ * or in the selected gid/compat or gid/native backend instead.
  */
-#ifndef RUAPC_RDMA_SHIM_H
-#define RUAPC_RDMA_SHIM_H
+#ifndef RUAPC_VERBS_SHIM_H
+#define RUAPC_VERBS_SHIM_H
 
 #include <infiniband/verbs.h>
 
@@ -47,24 +47,6 @@ int ruapc_ibv_query_device(struct ibv_context *context,
 
 int ruapc_ibv_query_port(struct ibv_context *context, uint8_t port_num,
                          struct ibv_port_attr *port_attr);
-
-int ruapc_ibv_query_gid(struct ibv_context *context, uint8_t port_num,
-                        int index, union ibv_gid *gid);
-
-/* Direct kernel queries, independent of ibv_query_gid_ex availability.
- * All return zero on success or a positive errno on failure.
- * `ruapc_ibv_query_gid_driver_id` is defined in src/uverbs_driver.c. */
-int ruapc_ibv_query_gid_driver_id(struct ibv_context *context,
-                                uint32_t *driver_id);
-
-int ruapc_ibv_query_gid_entry(struct ibv_context *context, uint32_t driver_id,
-                            uint8_t port_num, uint32_t index,
-                            union ibv_gid *gid, uint32_t *gid_type);
-
-/* `entries` points to `max_entries` writable entries of 32 bytes each. */
-int ruapc_ibv_query_gid_table(struct ibv_context *context, uint32_t driver_id,
-                            void *entries, uint32_t max_entries,
-                            uint32_t *num_entries);
 
 /* Protection domain */
 
@@ -120,4 +102,4 @@ int ruapc_ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
 int ruapc_ibv_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr,
                         struct ibv_recv_wr **bad_wr);
 
-#endif /* RUAPC_RDMA_SHIM_H */
+#endif /* RUAPC_VERBS_SHIM_H */
