@@ -13,6 +13,8 @@ categories = ["network-programming", "external-ffi-bindings"]
 
 [features]
 bin = ["dep:clap"]
+# Use the installed libibverbs extended GID APIs instead of compatibility queries.
+ibv-query-gid-ex = []
 
 [dependencies]
 clap = { workspace = true, optional = true }

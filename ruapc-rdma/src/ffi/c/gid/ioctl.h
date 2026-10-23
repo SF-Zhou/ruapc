@@ -1,5 +1,5 @@
-#ifndef RUAPC_GID_QUERY_H
-#define RUAPC_GID_QUERY_H
+#ifndef RUAPC_GID_IOCTL_H
+#define RUAPC_GID_IOCTL_H
 
 #include <stdint.h>
 

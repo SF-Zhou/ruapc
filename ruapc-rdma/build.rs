@@ -2,7 +2,7 @@
 //!
 //! This script:
 //! 1. Probes for libibverbs using pkg-config
-//! 2. Compiles the C shim (src/shim.c) wrapping all verbs entry points, so
+//! 2. Compiles the C shim and selected GID backend wrapping verbs entry points, so
 //!    static inline functions and function-like macros in verbs.h (which
 //!    bindgen cannot handle) are always honored
 //! 3. Generates FFI bindings using bindgen
@@ -179,17 +179,29 @@ fn main() {
     let mut include_paths = lib.include_paths.into_iter().collect::<HashSet<_>>();
     include_paths.insert(PathBuf::from("/usr/include"));
 
-    // Compile the C shim wrapping all verbs entry points (see src/shim.h for
+    // Compile the C shim wrapping all verbs entry points (see src/ffi/c/verbs.h for
     // details). Compiling it against the locally installed header guarantees
     // the wrappers match the exact semantics of this platform's rdma-core
     // version, including any macro / static inline compat layers.
-    println!("cargo:rerun-if-changed=src/shim.c");
-    println!("cargo:rerun-if-changed=src/shim.h");
-    println!("cargo:rerun-if-changed=src/gid_query.c");
-    println!("cargo:rerun-if-changed=src/gid_query.h");
-    println!("cargo:rerun-if-changed=src/uverbs_driver.c");
+    // Select the GID backend once for both compilation and binding generation.
+    // The default backend must remain buildable with older verbs.h headers.
+    let (gid_header, gid_sources): (&str, &[&str]) =
+        if env::var_os("CARGO_FEATURE_IBV_QUERY_GID_EX").is_some() {
+            ("src/ffi/c/gid/native.h", &["src/ffi/c/gid/native.c"])
+        } else {
+            (
+                "src/ffi/c/gid/compat.h",
+                &[
+                    "src/ffi/c/gid/compat.c",
+                    "src/ffi/c/gid/ioctl.c",
+                    "src/ffi/c/gid/driver.c",
+                ],
+            )
+        };
+    // Include private C-only headers as well as those read by bindgen.
+    println!("cargo:rerun-if-changed=src/ffi/c");
     let mut shim = cc::Build::new();
-    shim.files(["src/shim.c", "src/gid_query.c", "src/uverbs_driver.c"]);
+    shim.file("src/ffi/c/verbs.c").files(gid_sources);
     for path in &include_paths {
         shim.include(path);
     }
@@ -204,7 +216,8 @@ fn main() {
     // Configure bindgen to generate RDMA verb bindings
     let builder = bindgen::Builder::default()
         .clang_args(include_paths.iter().map(|p| format!("-I{p:?}")))
-        .header("src/shim.h") // includes <infiniband/verbs.h>
+        .header("src/ffi/c/verbs.h") // includes <infiniband/verbs.h>
+        .header(gid_header)
         // Enable common derives for generated types
         .derive_copy(true)
         .derive_debug(true)
@@ -243,7 +256,7 @@ fn main() {
         .allowlist_type("ibv_device_cap_flags")
         .allowlist_type("ibv_port_cap_flags")
         .allowlist_type("ibv_port_cap_flags2")
-        // All verbs entry points go through the C shim (src/shim.h); Rust
+        // All verbs entry points go through the C shim headers; Rust
         // never binds ibv_* symbols directly. This guarantees macro/inline
         // layers in verbs.h are honored, on any rdma-core version.
         .allowlist_function("ruapc_ibv_.*")

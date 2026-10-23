@@ -6,7 +6,7 @@
 static int mock_ioctl(int fd, unsigned long request, ...);
 
 #define ioctl mock_ioctl
-#include "../src/gid_query.c"
+#include "../../src/ffi/c/gid/ioctl.c"
 #undef ioctl
 
 static int response_error;

@@ -1,5 +1,5 @@
 /* Exercise the netlink parser without requiring a device or kernel support. */
-#include "../src/uverbs_driver.c"
+#include "../../src/ffi/c/gid/driver.c"
 
 #include <assert.h>
 

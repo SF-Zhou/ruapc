@@ -37,7 +37,9 @@ cargo run -p ruapc-rdma --features bin --bin ibv_devinfo -- -v
 Device snapshots support serde and JSON Schema. Capability masks use typed
 `enumflags2::BitFlags`; GIDs are classified as IB, RoCE v1 or RoCE v2.
 
-`Context::query_gid_entry` queries a GID and its type together with the
+### GID query backends
+
+By default, `Context::query_gid_entry` queries a GID and its type together with the
 kernel's `QUERY_GID_ENTRY` ioctl. Device snapshots use the device-wide
 `QUERY_GID_TABLE` ioctl, so collecting every port's GIDs needs one ioctl
 instead of one per index; `query_gid` and `query_gid_type` also try the
@@ -58,6 +60,22 @@ cooldown. Other ioctl errors, including empty GID entries, do not fall back.
 Native InfiniBand ports need no sysfs type file; Ethernet ports still require
 one on the legacy path. The inspection CLI's optional `board_id` remains a
 sysfs query.
+
+Enable the optional `ibv-query-gid-ex` feature to use libibverbs' public
+`ibv_query_gid_ex` and `ibv_query_gid_table` APIs directly:
+
+```bash
+cargo build -p ruapc-rdma --features ibv-query-gid-ex
+```
+
+This feature is disabled by default and requires libibverbs headers and a
+runtime library from rdma-core v32 or later. Both APIs were introduced in
+[rdma-core v32](https://github.com/linux-rdma/rdma-core/blob/v32.0/libibverbs/verbs.h#L2225-L2250).
+Per-index queries use `ibv_query_gid_ex`; snapshots use `ibv_query_gid_table`
+and fall back to per-index queries if the table query fails. This backend
+does not compile in the crate's ioctl, driver discovery or sysfs fallback;
+any fallback inside libibverbs is controlled by the installed library.
+The public `Context` query methods remain the same in both modes.
 
 ## Resources and completions
 
@@ -126,14 +144,18 @@ Registration itself grants no independent byte access; see the
 generates bindings with bindgen. Every libibverbs entry point used by the crate
 goes through a `ruapc_ibv_*` C wrapper so header macros and static inline
 functions are applied. This avoids accidentally binding only a legacy exported
-symbol. The direct GID query keeps its newer UAPI method IDs and response
-layout private, allowing builds with old kernel headers. Its translation unit
-is separate from `verbs.h` to avoid vendor/distro header conflicts.
+symbol. GID backend selection happens at the Rust module and C build boundaries,
+so callers share one query interface. The default direct GID query keeps its
+newer UAPI method IDs and response layout private, allowing builds with old
+kernel headers. Its translation unit is separate from `verbs.h` to avoid
+vendor/distro header conflicts.
 
 | Module | Responsibility |
 | --- | --- |
-| [`shim.h`](src/shim.h), [`shim.c`](src/shim.c), [`build.rs`](build.rs) | C wrappers, build detection and binding generation |
-| [`gid_query.c`](src/gid_query.c), [`uverbs_driver.c`](src/uverbs_driver.c) | GID ioctl and RDMA netlink driver discovery |
+| [`ffi/c/verbs.h`](src/ffi/c/verbs.h), [`ffi/c/verbs.c`](src/ffi/c/verbs.c), [`build.rs`](build.rs) | C wrappers, build detection and binding generation |
+| [`context/gid.rs`](src/verbs/context/gid.rs), [`context/gid/`](src/verbs/context/gid/) | Shared GID query API and compile-time backend selection |
+| [`ffi/c/gid/compat.c`](src/ffi/c/gid/compat.c), [`ioctl.c`](src/ffi/c/gid/ioctl.c), [`driver.c`](src/ffi/c/gid/driver.c) | Default GID ioctl and RDMA netlink driver discovery |
+| [`ffi/c/gid/native.c`](src/ffi/c/gid/native.c) | Optional libibverbs GID query wrappers |
 | [`src/ffi/`](src/ffi/), [`src/types/`](src/types/) | Bindings, extensions, device snapshots and identifiers |
 | [`src/verbs/`](src/verbs/) | Resource wrappers, posting and completion ownership |
 | [`ibv_devinfo.rs`](src/bin/ibv_devinfo.rs) | Device inspection CLI |
@@ -142,14 +164,20 @@ is separate from `verbs.h` to avoid vendor/distro header conflicts.
 
 ```bash
 cargo test -p ruapc-rdma
+cargo test -p ruapc-rdma --features ibv-query-gid-ex
 bash ruapc-rdma/tests/test_queries.sh
+bash ruapc-rdma/tests/test_queries.sh --native
 ```
 
-The C query tests check ioctl encoding and netlink parsing without RDMA
-hardware; they still compile against the installed libibverbs headers. Set
-`CC=clang CFLAGS='-fsanitize=address,undefined'` to also run them with
-sanitizers.
+The C query tests in [`tests/gid/`](tests/gid/) check ioctl encoding and
+netlink parsing without RDMA hardware; they still compile against the
+installed libibverbs headers.
+`--native` additionally checks the libibverbs GID wrappers, including flags,
+entry sizes and error returns, and needs the newer headers. Set
+`CC=clang CFLAGS='-fsanitize=address,undefined'` to also run them with sanitizers.
 
-Device tests open real devices. Setting `RUAPC_PREFER_RXE=1` restricts their
-selection to Soft-RoCE devices named `rxe*`, as in CI. See
+Run both Rust commands to exercise the default and libibverbs GID backends;
+`--all-features` selects only the latter. Device tests open real devices.
+Setting `RUAPC_PREFER_RXE=1` restricts their selection to Soft-RoCE devices
+named `rxe*`, as in CI. See
 [CONTRIBUTING.md](../CONTRIBUTING.md) for setup and workspace checks.
