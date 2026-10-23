@@ -87,12 +87,18 @@ this QP is still live.
 
 ## SEND/RECV slots and selective signaling
 
-`WrSlots` stores owned SEND/RECV buffers in power-of-two arrays indexed by
-sequence modulo capacity. Each occupied slot retains the full sequence.
-Insertion makes one claim attempt; an occupied or changing slot returns the
-untouched buffer with `WorkRequestSlotsExhausted`. It never overwrites a live
-buffer or waits for a completion that the posting thread may itself need to
-process. Removal requires an exact sequence match.
+`WrSlots` is a `SlotTable<WrBuffers>`: owned SEND/RECV buffers in
+power-of-two arrays indexed by sequence modulo capacity. Each occupied slot
+retains the full sequence. Insertion makes one claim attempt; an occupied or
+changing slot returns the untouched buffer with
+`WorkRequestSlotsExhausted`. It never overwrites a live buffer or waits for a
+completion that the posting thread may itself need to process. Removal
+requires an exact sequence match. The READ ledger reuses the same table for
+`Arc<ReadBatch>` values, but a READ must not be rejected for bookkeeping
+contention: a colliding sequence spills into a small locked fallback map keyed
+by the full sequence. READ removal tries the slot's exact tag first and
+consults the fallback only on a miss. `SlotTable::len` is a diagnostic
+snapshot that walks every slot; it is never completion evidence.
 
 Selective SEND signaling relies on RC SQ ordering. The SQ posting mutex
 keeps allocation and provider posting in the same order, so a later completion
@@ -129,11 +135,16 @@ protocol is implemented.
 buffer-index/offset/length descriptors. It validates bounds, registration,
 scatter limits, overflow and destination overlap, then resolves local
 addresses and keys internally. Invalid plans return the input buffers without
-posting. A non-cloneable `ReadPosting` cursor submits each request at most once
-to the preparing QP. The QP records a private `Arc<ReadBatch>` before the
-provider post; post failure removes that record. Dropping the cursor accounts
-for unposted requests without releasing posted memory. `ReadPosting::cancel`
-can recover buffers only before any request has posted.
+posting. Descriptors of all requests in a plan share one allocation. A
+non-cloneable `ReadPosting` cursor submits each request at most once to the
+preparing QP. Before the provider post, the QP records a private
+`Arc<ReadBatch>` in a sequence-indexed slot table; post failure rolls that
+record back. A completion matches the full sequence, so it cannot settle a
+newer request that reused the same slot index, and a READ whose slot is still
+held by an older in-flight READ is recorded in the fallback map instead of
+being rejected. Dropping the cursor accounts for unposted requests without
+releasing posted memory. `ReadPosting::cancel` can recover buffers only before
+any request has posted.
 
 After the unposted suffix is accounted for, destinations remain owned until
 every posted READ has a success/error/flush completion or the QP is destroyed.
@@ -142,6 +153,15 @@ notification can precede recovery; dropping, cancelling or forgetting the
 waiting future never authorizes early release. See
 [READ admission and failure](rdma-capacity.md#read-admission-and-failure) for
 permits, deadlines and teardown.
+
+A batch joins the deadline and failure pending list only after the provider
+accepts its first WR. That list holds weak references, is pruned on a bounded
+registration cadence, and is scanned without its lock, so a completed batch is
+not retained when idle sweeps do not run and a waker runs outside the lock.
+Deadline sweeps consider only provider-accepted, unsettled WRs: a suffix still
+waiting for admission neither arms the READ watchdog nor requests closure.
+`QueuePair::read_slot_spills` counts fallback-map use per QP for diagnosis; the
+fallback changes cost only, never ownership or ordering.
 
 This is a local destination guarantee. Application sources follow the separate
 [read validation and recovery contract](safe-boundaries.md#application-read-source-validation-and-recovery),

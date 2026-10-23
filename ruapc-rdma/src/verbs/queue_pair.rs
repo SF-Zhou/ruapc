@@ -6,6 +6,9 @@ pub use read::{ReadFailure, ReadPosting, ReadReceiver, ReadRequest, ReadSegment}
 #[cfg(feature = "bench-internals")]
 pub use read::bench_support as read_bench_support;
 
+#[cfg(test)]
+mod completion_tests;
+
 use ruapc_bufpool::{Buffer, DeviceIndex};
 
 use super::{
@@ -219,7 +222,7 @@ impl QueuePair {
         // larger) queue depths; size the slot arrays from those.
         let send_wrs = WrSlots::new(init_attr.cap.max_send_wr);
         let recv_wrs = WrSlots::new(init_attr.cap.max_recv_wr);
-        let read_state = read::ReadState::new();
+        let read_state = read::ReadState::new(init_attr.cap.max_send_wr);
         let qp = Self {
             ptr,
             _pd: Arc::clone(pd),

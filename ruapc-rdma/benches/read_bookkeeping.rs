@@ -4,10 +4,14 @@
 //! `prepare` excludes input-plan construction and output destruction and supplies
 //! a constant lkey instead of consulting a registered device. `batch/create`
 //! measures the real Arc/oneshot allocation, excluding destination allocation.
-//! `ledger` measures real map insertion/removal, Arc traffic and nonfinal batch
-//! accounting. Its posting groups share one long-lived batch, so batch creation
-//! and final notification are excluded. The two-thread case includes bounded
-//! atomic publication/backpressure, but no per-WR channel or thread startup.
+//! `ledger` measures real slot-table insertion/removal, Arc traffic, the per-WR
+//! acceptance store and nonfinal batch accounting. Its posting groups share one
+//! long-lived batch, so batch creation and final notification are excluded. The
+//! two-thread case includes bounded atomic publication/backpressure and the
+//! shared batch's acceptance/completion contention, but no per-WR channel or
+//! thread startup. `ledger/lifecycle` includes one short batch's creation,
+//! pending registration/pruning and final notification; `ledger/spill` forces
+//! the collision fallback with a two-slot table.
 //! `finish` measures the last completion plus receiver extraction; its optional
 //! counting waker measures invocation, not executor scheduling or task resumption.
 //! No case posts work, creates a QP, or fabricates a CQ completion token.
@@ -109,6 +113,9 @@ fn create_run(iterations: u64, pool: &Arc<BufferPool>, wrs: usize) -> Duration {
 fn insert_group(state: &Ledger, batch: &Batch, sequence: u64, wrs: u64) {
     for sequence in sequence..sequence + wrs {
         assert!(state.insert(sequence, batch));
+        // Production stores the accepted count after the provider post. Include
+        // it so the batch's atomic line sees the same producer traffic.
+        batch.mark_accepted(usize::try_from(sequence + 1).expect("sequence fits usize"));
     }
 }
 
@@ -148,14 +155,34 @@ fn finish_ledger(state: &Ledger, batch: Batch, mut receiver: ReadReceiver) {
 }
 
 fn ledger_serial(config: &Config, name: &str, pool: &Arc<BufferPool>, wrs: u64) {
-    let state = Ledger::new();
+    ledger_serial_with(config, name, pool, wrs, &Ledger::new());
+}
+
+/// Forces sequence collisions into the slot table's fallback map and asserts
+/// that the measured case actually took that path.
+fn ledger_spill(config: &Config, name: &str, pool: &Arc<BufferPool>, wrs: u64) {
+    let state = Ledger::with_depth(1);
+    ledger_serial_with(config, name, pool, wrs, &state);
+    assert!(
+        state.spills() != 0,
+        "spill case never reached the fallback map"
+    );
+}
+
+fn ledger_serial_with(
+    config: &Config,
+    name: &str,
+    pool: &Arc<BufferPool>,
+    wrs: u64,
+    state: &Ledger,
+) {
     let (batch, receiver) = ledger_batch(config, pool, wrs);
     let mut sequence = 0;
     for (phase, iterations) in phases(config).enumerate() {
         let start = Instant::now();
         for _ in 0..iterations {
-            insert_group(&state, &batch, sequence, wrs);
-            complete_group(&state, sequence, wrs);
+            insert_group(state, &batch, sequence, wrs);
+            complete_group(state, sequence, wrs);
             sequence += wrs;
         }
         let elapsed = start.elapsed();
@@ -163,7 +190,47 @@ fn ledger_serial(config: &Config, name: &str, pool: &Arc<BufferPool>, wrs: u64) 
             config.report(name, elapsed, iterations * wrs);
         }
     }
-    finish_ledger(&state, batch, receiver);
+    finish_ledger(state, batch, receiver);
+}
+
+/// One complete short-batch lifetime: batch creation, pending registration,
+/// one insert/complete per WR and final notification. Buffers are recycled
+/// through the receiver, so no pool allocation is measured between batches.
+fn lifecycle_run(iterations: u64, pool: &Arc<BufferPool>, wrs: u64) -> Duration {
+    let state = Ledger::new();
+    let mut buffers = vec![destination(pool, SEGMENT_LEN)];
+    let mut sequence = 0u64;
+    let mut elapsed = Duration::ZERO;
+    let mut remaining = iterations;
+    while remaining != 0 {
+        let count = remaining.min(CHUNK);
+        let start = Instant::now();
+        for _ in 0..count {
+            let (batch, mut receiver) = Batch::new(wrs as usize, std::mem::take(&mut buffers));
+            state.register(&batch);
+            let first = sequence;
+            for accepted in 1..=wrs as usize {
+                assert!(state.insert(sequence, &batch));
+                batch.mark_accepted(accepted);
+                sequence += 1;
+            }
+            for sequence in first..first + wrs {
+                assert!(state.complete(sequence));
+            }
+            buffers = receiver.try_recv().unwrap().unwrap();
+        }
+        elapsed += start.elapsed();
+        remaining -= count;
+    }
+    assert!(state.is_empty());
+    elapsed
+}
+
+fn ledger_lifecycle(config: &Config, name: &str, pool: &Arc<BufferPool>, wrs: u64) {
+    lifecycle_run(config.warmup, pool, wrs);
+    for _ in 0..config.repeats {
+        config.report(name, lifecycle_run(config.iters, pool, wrs), config.iters);
+    }
 }
 
 // Keep publication and completion counters on distinct cache lines. Their
@@ -290,7 +357,8 @@ fn main() {
     let pool = pool();
     println!(
         "READ benchmarks: no QP/provider/CQ polling; prepare uses a constant lkey; \
-         ledger includes nonfinal accounting; finish excludes executor scheduling"
+         ledger includes per-WR acceptance and nonfinal accounting; \
+         finish excludes executor scheduling"
     );
     for wrs in [1, 8, 32] {
         for scatter in [1, 4, 32] {
@@ -321,6 +389,16 @@ fn main() {
         let name = format!("read/ledger/threads/wrs={wrs}/window={LEDGER_WINDOW}/per-wr");
         if config.selected(&name) {
             ledger_threads(&config, &name, &pool, wrs as u64);
+        }
+        if wrs == 32 {
+            let name = format!("read/ledger/spill/wrs={wrs}/per-wr");
+            if config.selected(&name) {
+                ledger_spill(&config, &name, &pool, wrs as u64);
+            }
+        }
+        let name = format!("read/ledger/lifecycle/wrs={wrs}/per-batch");
+        if config.selected(&name) {
+            ledger_lifecycle(&config, &name, &pool, wrs as u64);
         }
         for armed in [false, true] {
             let mode = if armed { "counting-waker" } else { "unpolled" };

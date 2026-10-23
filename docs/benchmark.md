@@ -96,12 +96,20 @@ and recycling, so dense/sparse results are not pure traversal costs.
 
 READ preparation supplies a constant lkey and excludes input-plan construction
 and output destruction. Batch creation includes the actual Arc/oneshot
-allocations. Ledger cases measure the real DashMap, Arc traffic and nonfinal
-completion accounting using one long-lived batch; the two-thread version
-allows 64 WRs in flight and includes atomic publication/backpressure. They
-exclude the SQ posting mutex, provider calls and CQ polling. Final-completion
-cases prebuild batches and measure the final accounting plus oneshot extraction,
-with either an unpolled receiver or a counting waker; no executor runs.
+allocations. Ledger cases measure the real sequence-indexed slot table,
+Arc traffic, the per-WR acceptance store and nonfinal completion accounting
+using one long-lived batch; the two-thread version allows 64 WRs in flight and
+includes atomic publication/backpressure plus the acceptance/completion
+contention on that shared batch. `ledger/lifecycle` includes one short batch's
+creation, pending registration/pruning and final notification while recycling
+its buffers; `ledger/spill` forces the collision fallback with a two-slot table,
+asserts that the fallback actually ran, and is not a normal-path cost. These
+cases exclude the SQ posting mutex, provider calls and CQ polling. A sequence
+reaches the fallback only when an older READ stays in flight across a full
+table of later SQ sequences, so production frequency depends on the workload;
+`QueuePair::read_slot_spills` reports it per QP. Final-completion cases prebuild
+batches and measure the final accounting plus oneshot extraction, with either
+an unpolled receiver or a counting waker; no executor runs.
 The shared ledger batch concentrates reference-count and countdown contention;
 its throughput is not the throughput or latency of independent READ batches.
 Prebuilt chunks also affect cache residency, and loop/container/clock overhead

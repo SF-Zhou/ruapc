@@ -634,7 +634,7 @@ async fn read_deadlines_bound_first_nic_admission_and_restore_unposted_targets()
         assert_eq!(permits.available_permits(), 0);
 
         // No completion or housekeeping pass runs: a batch waiting for its
-        // first NIC permit has not entered the QP's READ map yet.
+        // first NIC permit has not entered the QP's READ ledger yet.
         let error = tokio::time::timeout(Duration::from_secs(2), read)
             .await
             .expect("READ admission must honor its own and the parent's deadline")
