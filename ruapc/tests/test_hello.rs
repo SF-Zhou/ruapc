@@ -73,7 +73,8 @@ async fn test_http() {
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
     let addr = server.listen(addr).await.unwrap();
 
-    let client = reqwest::Client::new();
+    // The test server is local; ignore ambient proxy configuration.
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let req = client
         .post(format!("http://{}/_ruapc.meta/describe", addr))
         .json(&ruapc::services::DescribeRequest::default())

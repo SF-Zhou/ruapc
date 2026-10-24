@@ -6,9 +6,9 @@
 //! request, and response types remain the Rust type checker's responsibility.
 
 use syn::{
-    Attribute, FnArg, Generics, Ident, ItemTrait, LitStr, Meta, ReturnType, Signature, Token,
-    TraitItem, TraitItemFn, Type, TypeParamBound, Visibility, ext::IdentExt, parse_quote,
-    punctuated::Punctuated, spanned::Spanned,
+    Attribute, FnArg, Generics, Ident, ItemTrait, LitStr, Meta, ReceiverKind, ReturnType, Safety,
+    Signature, Token, TraitItem, TraitItemFn, Type, TypeParamBound, Visibility, ext::IdentExt,
+    parse_quote, punctuated::Punctuated, spanned::Spanned,
 };
 
 use crate::args::ServiceArgs;
@@ -36,7 +36,7 @@ pub(crate) struct Method {
 impl Service {
     pub(crate) fn parse(args: ServiceArgs, declaration: ItemTrait) -> syn::Result<Self> {
         reject_generics(&declaration.generics, "service traits")?;
-        if declaration.unsafety.is_some() || declaration.auto_token.is_some() {
+        if declaration.unsafety.is_some() || declaration.modifiers.auto_token.is_some() {
             return Err(syn::Error::new_spanned(
                 &declaration.ident,
                 "service traits cannot be unsafe or auto traits",
@@ -99,7 +99,7 @@ impl Method {
         }
         reject_generics(&signature.generics, "RPC methods")?;
         if signature.constness.is_some()
-            || signature.unsafety.is_some()
+            || matches!(signature.safety, Safety::Unsafe(_))
             || signature.abi.is_some()
             || signature.variadic.is_some()
         {
@@ -121,9 +121,8 @@ impl Method {
             ));
         }
         let valid_receiver = signature.receiver().is_some_and(|receiver| {
-            receiver.reference.is_some()
+            matches!(&receiver.kind, ReceiverKind::Reference(_, _, None))
                 && receiver.mutability.is_none()
-                && receiver.colon_token.is_none()
         });
         if !valid_receiver {
             return Err(syn::Error::new_spanned(

@@ -30,12 +30,12 @@ required-features = ["bench-internals"]
 
 [dependencies]
 clap = { workspace = true, optional = true }
-enumflags2 = { version = "0.7", features = ["serde"] }
+enumflags2.workspace = true
 libc.workspace = true
-ruapc-bufpool = { version = "0.2.0-alpha.6", path = "../ruapc-bufpool" }
+ruapc-bufpool.workspace = true
 schemars.workspace = true
 serde.workspace = true
-strum = { version = "0.28", features = ["derive"] }
+strum.workspace = true
 
 [[bin]]
 name = "ibv_devinfo"
@@ -46,8 +46,8 @@ required-features = ["bin"]
 serde_json.workspace = true
 
 [build-dependencies]
-bindgen = "0.72"
-cc = "1"
-pkg-config = "0.3"
-syn = { version = "2.0", features = ["full", "parsing"] }
-prettyplease = "0.2"
+bindgen.workspace = true
+cc.workspace = true
+pkg-config.workspace = true
+syn.workspace = true
+prettyplease.workspace = true

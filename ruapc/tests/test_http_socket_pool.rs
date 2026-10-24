@@ -20,6 +20,14 @@ impl TestService for TestServiceImpl {
     }
 }
 
+/// Local test servers must not be routed through an ambient HTTP proxy.
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build test HTTP client")
+}
+
 #[tokio::test]
 async fn test_http_openapi_json_endpoint() {
     let test_service = Arc::new(TestServiceImpl);
@@ -35,7 +43,7 @@ async fn test_http_openapi_json_endpoint() {
     let addr = server.listen(addr).await.unwrap();
 
     // Test /openapi.json endpoint
-    let client = reqwest::Client::new();
+    let client = http_client();
     let response = client
         .get(format!("http://{}/openapi.json", addr))
         .send()
@@ -89,7 +97,7 @@ async fn test_http_rapidoc_js_endpoint() {
     let addr = server.listen(addr).await.unwrap();
 
     // Test /rapidoc/rapidoc-min.js endpoint
-    let client = reqwest::Client::new();
+    let client = http_client();
     let response = client
         .get(format!("http://{}/rapidoc/rapidoc-min.js", addr))
         .send()
@@ -124,7 +132,7 @@ async fn test_http_rapidoc_html_endpoints() {
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
     let addr = server.listen(addr).await.unwrap();
 
-    let client = reqwest::Client::new();
+    let client = http_client();
     let paths = vec!["/rapidoc", "/rapidoc/", "/rapidoc/index.html"];
 
     for path in paths {
@@ -164,7 +172,7 @@ async fn test_http_not_found_endpoint() {
     let addr = server.listen(addr).await.unwrap();
 
     // Test non-existent GET endpoint
-    let client = reqwest::Client::new();
+    let client = http_client();
     let response = client
         .get(format!("http://{}/nonexistent", addr))
         .send()
@@ -238,7 +246,7 @@ async fn test_http_post_request_processing() {
     let addr = server.listen(addr).await.unwrap();
 
     // Test POST request to service method
-    let client = reqwest::Client::new();
+    let client = http_client();
     let response = client
         .post(format!("http://{}/TestService/test_method", addr))
         .json(&"test input")
@@ -269,7 +277,7 @@ async fn test_http_base_path_routes() {
     };
     let server = ruapc::Server::create(router, &config).unwrap();
     let addr = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
-    let client = reqwest::Client::new();
+    let client = http_client();
 
     let response = client
         .post(format!(
@@ -340,7 +348,7 @@ async fn test_http_websocket_upgrade() {
     let addr = server.listen(addr).await.unwrap();
 
     // Test WebSocket upgrade request
-    let client = reqwest::Client::new();
+    let client = http_client();
     let response = client
         .get(format!("http://{}/ws", addr))
         .header("Connection", "Upgrade")
@@ -373,7 +381,7 @@ async fn test_http_concurrent_requests() {
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
     let addr = server.listen(addr).await.unwrap();
 
-    let client = reqwest::Client::new();
+    let client = http_client();
 
     // Send multiple concurrent requests
     let tasks = (0..10)
@@ -430,7 +438,7 @@ async fn test_http_malformed_request_body() {
     let addr = server.listen(addr).await.unwrap();
 
     // Test POST request with malformed JSON body
-    let client = reqwest::Client::new();
+    let client = http_client();
     let response = client
         .post(format!("http://{}/TestService/test_method", addr))
         .header("content-type", "application/json")
@@ -463,7 +471,7 @@ async fn test_http_large_request_body() {
 
     // Test POST request with large body
     let large_input = "x".repeat(1024 * 10); // 10KB string
-    let client = reqwest::Client::new();
+    let client = http_client();
     let response = client
         .post(format!("http://{}/TestService/test_method", addr))
         .json(&large_input)
@@ -495,7 +503,7 @@ async fn test_http_method_variants() {
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
     let addr = server.listen(addr).await.unwrap();
 
-    let client = reqwest::Client::new();
+    let client = http_client();
 
     // Test different HTTP methods for static resources (should all be 404 except GET)
     let methods = vec![
@@ -539,7 +547,7 @@ async fn test_http_edge_case_paths() {
     let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
     let addr = server.listen(addr).await.unwrap();
 
-    let client = reqwest::Client::new();
+    let client = http_client();
 
     // Test edge case paths that should definitely return 404
     let edge_cases = vec![

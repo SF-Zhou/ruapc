@@ -19,7 +19,7 @@ schemars.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["sync", "rt", "rt-multi-thread", "macros", "time"] }
+tokio.workspace = true
 
 [[bench]]
 name = "lazy_merge"

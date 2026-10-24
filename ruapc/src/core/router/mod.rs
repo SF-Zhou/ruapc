@@ -331,7 +331,10 @@ mod tests {
                 .paths
                 .contains_key("/_ruapc.rdma/probe")
         );
-        let response = reqwest::Client::new()
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
             .post(format!("http://{address}/_ruapc.rdma/probe"))
             .json(&7u64)
             .send()

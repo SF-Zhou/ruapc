@@ -15,9 +15,9 @@ default = []
 [dependencies]
 # The macro generates code against ruapc's internal glue API, so the two
 # crates must be paired exactly (same reason serde pins serde_derive).
-ruapc-macro = { version = "=0.2.0-alpha.6", path = "../ruapc-macro" }
-ruapc-bufpool = { version = "0.2.0-alpha.6", path = "../ruapc-bufpool" }
-ruapc-rdma = { version = "0.2.0-alpha.6", path = "../ruapc-rdma", optional = true }
+ruapc-macro.workspace = true
+ruapc-bufpool.workspace = true
+ruapc-rdma = { workspace = true, optional = true }
 
 arc-swap.workspace = true
 bitflags.workspace = true
@@ -55,10 +55,10 @@ unsafe_code = "forbid"
 [dev-dependencies]
 # Self dev-dependency: enables the `rdma` feature for this crate's own unit,
 # integration tests, and benches without forcing it on downstream users.
-ruapc = { path = ".", features = ["rdma"] }
+ruapc = { workspace = true, features = ["rdma"] }
 
-metrics-util = "0.20"
-reqwest = { version = "0.12", features = ["json"] }
+metrics-util.workspace = true
+reqwest.workspace = true
 
 [[bench]]
 name = "echo"
