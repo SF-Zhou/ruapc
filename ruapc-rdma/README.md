@@ -102,8 +102,11 @@ buffer recovery. Applications sharing a CQ route completions by `qp_num()`.
 
 `CompletionQueue::capacity()` reports the provider's CQE capacity, not a QP
 count limit. Applications must bound outstanding completions themselves.
-SEND/RECV buffers use a separate bounded slot array; slot exhaustion rejects
-the new submission without replacing an existing buffer. Non-wrapping
+SEND/RECV buffers use a bounded slot array; slot exhaustion rejects the new
+submission without replacing an existing buffer. READ batches use a separate
+sequence-indexed slot table; a sequence colliding with an older in-flight READ
+spills into a tiny fallback map instead of rejecting the READ, and
+`QueuePair::read_slot_spills` reports how often that happened. Non-wrapping
 sequences and CQ-owned QPN leases prevent stale completion reuse; see
 [completion identity and posting](../docs/wrid.md) for the detailed contract and
 [RuaPC's CQ budgeting](../docs/rdma-capacity.md) for the RPC layer's admission

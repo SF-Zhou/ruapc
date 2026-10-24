@@ -1,12 +1,12 @@
-//! Lock-free slot array for in-flight work request buffers
+//! Lock-free slot arrays for in-flight work-request ownership
 //!
-//! Buffers of posted work requests occupy a power-of-two slot array indexed by
-//! `id % capacity`.
+//! Owned values (send/receive buffers or READ batches) occupy a power-of-two
+//! slot array indexed by `id % capacity`.
 //!
 //! ## Why this is safe without a lock
 //!
 //! - The owning work queue supplies non-repeating IDs. This table stores
-//!   buffers independently of ID allocation and hardware posting order.
+//!   owned values independently of ID allocation and hardware posting order.
 //! - Each slot is guarded by an atomic tag acting as a tiny state machine:
 //!   `EMPTY -> WRITING -> id + TAG_BASE -> WRITING -> EMPTY`.
 //! - Reusing an array index requires an empty slot; completing a work request
@@ -15,8 +15,10 @@
 //!
 //! Queue depth alone does not prevent collisions: failed posts and bufferless
 //! work requests leave gaps in the ID sequence. Insertion returns the untouched
-//! buffer on contention instead of waiting for a completion that might need to
-//! run on the posting thread itself.
+//! value on contention instead of waiting for a completion that might need to
+//! run on the posting thread itself. Callers that cannot reject their
+//! operation on collision keep a fallback; the READ ledger does so, while
+//! SEND/RECV posting reports an exhausted table.
 
 use std::{
     cell::UnsafeCell,
@@ -33,25 +35,28 @@ const WRITING: u64 = 1;
 /// overflow this addition or collide with `EMPTY`/`WRITING`.
 const TAG_BASE: u64 = 2;
 
-struct Slot {
+struct Slot<T> {
     tag: AtomicU64,
-    buffer: UnsafeCell<Option<WrBuffers>>,
+    value: UnsafeCell<Option<T>>,
 }
 
-/// SAFETY: access to `buffer` is serialized by the `tag` state machine:
+/// SAFETY: access to `value` is serialized by the `tag` state machine:
 /// only the thread that moved the tag into `WRITING` may touch the cell,
 /// and tag transitions use acquire/release ordering.
-unsafe impl Sync for Slot {}
+unsafe impl<T: Send> Sync for Slot<T> {}
 
-/// Fixed-capacity lock-free storage for in-flight work request buffers.
-pub(crate) struct WrSlots {
-    slots: Box<[Slot]>,
+/// Fixed-capacity lock-free storage for in-flight work-request ownership.
+pub(crate) struct SlotTable<T> {
+    slots: Box<[Slot<T>]>,
     mask: u64,
 }
 
-impl WrSlots {
+/// In-flight send/receive work-request buffers.
+pub(crate) type WrSlots = SlotTable<WrBuffers>;
+
+impl<T> SlotTable<T> {
     /// Number of slots allocated for this ownership table.
-    #[cfg(feature = "bench-internals")]
+    #[cfg(any(feature = "bench-internals", test))]
     pub fn capacity(&self) -> usize {
         self.slots.len()
     }
@@ -59,7 +64,7 @@ impl WrSlots {
     /// Metadata bytes occupied by one slot, excluding buffer backing storage.
     #[cfg(feature = "bench-internals")]
     pub fn slot_bytes() -> usize {
-        std::mem::size_of::<Slot>()
+        std::mem::size_of::<Slot<T>>()
     }
 
     /// Creates a slot array for a work queue of the given depth.
@@ -75,7 +80,7 @@ impl WrSlots {
         let slots = (0..cap)
             .map(|_| Slot {
                 tag: AtomicU64::new(EMPTY),
-                buffer: UnsafeCell::new(None),
+                value: UnsafeCell::new(None),
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -85,30 +90,32 @@ impl WrSlots {
         }
     }
 
-    /// Stores the buffer of an about-to-be-posted work request.
+    /// Stores the value of an about-to-be-posted work request.
     ///
     /// Returns ownership immediately if another request or completion still
     /// occupies the selected slot. No allocation or waiting occurs here.
-    pub fn insert(&self, id: u64, buffer: WrBuffers) -> Result<(), WrBuffers> {
+    #[inline]
+    pub fn insert(&self, id: u64, value: T) -> Result<(), T> {
         let slot = &self.slots[(id & self.mask) as usize];
         if slot
             .tag
             .compare_exchange(EMPTY, WRITING, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            return Err(buffer);
+            return Err(value);
         }
         // SAFETY: we own the slot while its tag is `WRITING`.
-        unsafe { *slot.buffer.get() = Some(buffer) };
+        unsafe { *slot.value.get() = Some(value) };
         slot.tag.store(id.wrapping_add(TAG_BASE), Ordering::Release);
         Ok(())
     }
 
-    /// Takes the buffer of a completed (or failed-to-post) work request.
+    /// Takes the value of a completed (or failed-to-post) work request.
     ///
-    /// Returns `None` if no buffer was stored for this ID (e.g. buffer-less
+    /// Returns `None` if no value was stored for this ID (e.g. buffer-less
     /// immediate-only sends).
-    pub fn take(&self, id: u64) -> Option<WrBuffers> {
+    #[inline]
+    pub fn take(&self, id: u64) -> Option<T> {
         let slot = &self.slots[(id & self.mask) as usize];
         let tag = id.wrapping_add(TAG_BASE);
         if slot
@@ -117,18 +124,31 @@ impl WrSlots {
             .is_ok()
         {
             // SAFETY: we own the slot while its tag is `WRITING`.
-            let buffer = unsafe { (*slot.buffer.get()).take() };
+            let value = unsafe { (*slot.value.get()).take() };
             slot.tag.store(EMPTY, Ordering::Release);
-            buffer
+            value
         } else {
             None
         }
     }
+
+    /// Number of occupied slots in a diagnostic snapshot.
+    ///
+    /// Concurrent insertion or completion can make the result stale; it is
+    /// never completion evidence. Slots being claimed for insertion or
+    /// removal are excluded. This walks every slot, so callers keep it off
+    /// completion paths.
+    pub fn len(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| slot.tag.load(Ordering::Acquire) >= TAG_BASE)
+            .count()
+    }
 }
 
-impl std::fmt::Debug for WrSlots {
+impl<T> std::fmt::Debug for SlotTable<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WrSlots")
+        f.debug_struct("SlotTable")
             .field("capacity", &self.slots.len())
             .finish()
     }

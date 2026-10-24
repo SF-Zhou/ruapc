@@ -607,9 +607,11 @@ impl ConnState {
     /// permits stay held until completion processing or successful QP destruction.
     pub(super) fn sweep_read_timeouts(&self, now: Instant) {
         self.socket.sweep_large_transfers(now);
-        // Avoid walking every shard of an empty READ map for every idle QP.
-        // A READ starting after this check is covered by the next sweep; a
-        // posted READ retains its SQ permit until completion processing.
+        // Skip the scan while every READ permit is available: no accepted WR
+        // can carry a deadline. A READ starting after this check is covered by
+        // the next sweep; an accepted WR retains its SQ permit until completion
+        // processing. Idle QPs likewise skip pending-list pruning, which a
+        // bounded registration cadence handles instead of a sweep.
         if self.socket.read_credits.is_idle() {
             return;
         }

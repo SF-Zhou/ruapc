@@ -210,12 +210,14 @@ impl RdmaSocket {
 
     /// Waits after posting finishes or its unposted suffix has been cancelled.
     pub(crate) async fn await_read_batch(&self, receiver: ReadReceiver) -> Result<Vec<Buffer>> {
-        // A task may pass its final health check, then publish the WR only
-        // after shutdown has scanned the READ map. Recheck only once per
-        // batch, after publication, so that late work receives a failure even
-        // when no poller remains. If shutdown scans after publication instead,
-        // it finds the entry itself; the map's shard locks order both cases.
-        // Failure notification leaves the DMA holds in the QP.
+        // A task may pass its final health check, then record its READ only
+        // after shutdown has scanned the pending list. Recheck only once per
+        // batch, after posting, so that late work receives a failure even when
+        // no poller remains. If shutdown scans after publication instead, the
+        // registered batch fails there. Registration follows the first
+        // provider-accepted post and precedes this recheck, so one of the two
+        // observers always sees the batch. Failure notification leaves the DMA
+        // holds in the QP.
         if !self.state.is_ok() {
             self.fail_read_batches();
         }

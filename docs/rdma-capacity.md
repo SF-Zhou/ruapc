@@ -162,12 +162,16 @@ timer; the posting path checks expiry before handing a WR to the provider.
 
 The poll thread checks posted READ deadlines during its 100 ms housekeeping
 sweep, skipping QPs with all READ permits available; completion waits do not
-create per-operation timers. Request expiry in application remote-memory
-operations reports `Timeout` without itself closing the connection.
-Large-payload cancellation still closes its connection under the separate
+create per-operation timers. Only provider-accepted, unsettled WRs count: a
+batch is registered for the sweep after its first accepted post, so a suffix
+still waiting for admission neither arms the READ watchdog nor requests
+closure, while the caller's own deadline still bounds that wait. Request
+expiry in application remote-memory operations reports `Timeout` without
+itself closing the connection. Large-payload cancellation still closes its
+connection under the separate
 [source-ownership protocol](safe-boundaries.md#large-payload-source-ownership).
 The independent READ watchdog remains armed after request expiry or receiver
-cancellation: when posted work exceeds that budget, the sweep moves the QP
+cancellation: when accepted work exceeds that budget, the sweep moves the QP
 to ERR. A waiting caller receives `RdmaReadTimeout` unless an earlier request
 deadline applies. Admission expiry alone does not prove a connection failure.
 

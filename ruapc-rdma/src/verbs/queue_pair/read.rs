@@ -5,15 +5,19 @@
 #[doc(hidden)]
 pub mod bench_support;
 
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    },
+    time::Instant,
 };
-use std::time::Instant;
 
 use ruapc_bufpool::Buffer;
 use tokio::sync::oneshot;
 
+use super::super::wr_slots::SlotTable;
 use super::{QueuePair, ReadSge};
 use crate::{Error, ErrorKind, Result, WRID};
 
@@ -27,19 +31,215 @@ pub(super) fn next_owner() -> u64 {
 
 /// Connection-local READ bookkeeping stays inline in the QP so posting and
 /// completion do not follow another allocation to reach their ownership table.
+///
+/// The common path is a power-of-two slot table indexed by SQ sequence: one
+/// compare-exchange per posted READ and one per completion, with no hashing,
+/// locking or per-shard state. A sequence whose slot is still occupied by an
+/// older in-flight READ spills into a small locked map instead of failing the
+/// READ. That needs an older READ to stay in flight across at least one full
+/// table of later SQ sequences (sends included), so the fallback is off the
+/// common path; [`ReadState::spills`] counts every use for diagnosis.
+///
+/// `ReadBatch::remaining` covers every WR in the plan, including a suffix still
+/// waiting for admission. `ReadBatch::accepted` counts WRs the provider took,
+/// and `ReadBatch::aborted` counts the suffix the cursor settled without
+/// posting, so a deadline sweep derives in-flight work as
+/// `accepted + aborted - (total - remaining)` without another atomic on the
+/// completion path. It never closes a healthy connection for work that has not
+/// reached the NIC.
+///
+/// Only batches that have posted at least one WR are tracked for deadline and
+/// failure notification. That list holds `Weak` references and is pruned on a
+/// bounded registration cadence, so a normally completed batch is not retained
+/// indefinitely when the poll thread skips idle sweeps.
 pub(super) struct ReadState {
-    batches: dashmap::DashMap<WRID, Arc<ReadBatch>>,
+    batches: SlotTable<Arc<ReadBatch>>,
+    pending: Mutex<PendingBatches>,
+    overflow: Mutex<HashMap<u64, Arc<ReadBatch>>>,
+    overflow_len: AtomicUsize,
+    /// READs that used `overflow` because an older in-flight READ still
+    /// occupied their slot. Per-QP and monotonic; a diagnostic only.
+    spills: AtomicUsize,
     owner: u64,
 }
 
+/// Registrations between bounded cleanups of the pending weak list.
+///
+/// A dead entry retains only its `Arc` allocation, but an unbounded list would
+/// leak one such allocation per completed batch when no deadline sweep runs.
+const PENDING_PRUNE_INTERVAL: usize = 64;
+
+#[derive(Default)]
+struct PendingBatches {
+    entries: Vec<Weak<ReadBatch>>,
+    /// Scratch list reused across deadline scans so the poll path does not
+    /// allocate for every sweep. It is cached empty: a retained batch would
+    /// outlive the scan and defer its destruction to the poll thread.
+    scan: Vec<Arc<ReadBatch>>,
+    /// Registrations since the last bounded cleanup.
+    registrations: usize,
+}
+
 impl ReadState {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(depth: u32) -> Self {
         Self {
-            // A fixed shard count bounds idle per-QP storage independently
-            // of host CPU count; SQ posting is already serialized.
-            batches: dashmap::DashMap::with_shard_amount(4),
+            batches: SlotTable::new(depth),
+            pending: Mutex::new(PendingBatches::default()),
+            overflow: Mutex::new(HashMap::new()),
+            overflow_len: AtomicUsize::new(0),
+            spills: AtomicUsize::new(0),
             owner: next_owner(),
         }
+    }
+
+    fn lock_pending(&self) -> std::sync::MutexGuard<'_, PendingBatches> {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lock_overflow(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Arc<ReadBatch>>> {
+        self.overflow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Records a posted READ and reports whether its sequence was vacant.
+    ///
+    /// A slot still occupied by an older in-flight READ spills into the
+    /// fallback map instead of rejecting the READ; [`Self::spills`] counts it.
+    #[inline]
+    fn insert(&self, sequence: u64, batch: Arc<ReadBatch>) -> bool {
+        if let Err(batch) = self.batches.insert(sequence, batch) {
+            self.spills.fetch_add(1, Ordering::Relaxed);
+            let mut overflow = self.lock_overflow();
+            debug_assert!(
+                !overflow.contains_key(&sequence),
+                "READ sequence {sequence} recorded twice"
+            );
+            let vacant = overflow.insert(sequence, batch).is_none();
+            if vacant {
+                self.overflow_len.fetch_add(1, Ordering::Release);
+            }
+            return vacant;
+        }
+        true
+    }
+
+    /// Settles one recorded READ, or rolls back a failed post.
+    #[inline]
+    fn remove(&self, sequence: u64) -> Option<Arc<ReadBatch>> {
+        if let Some(batch) = self.batches.take(sequence) {
+            return Some(batch);
+        }
+        if self.overflow_len.load(Ordering::Acquire) != 0 {
+            let mut overflow = self.lock_overflow();
+            if let Some(batch) = overflow.remove(&sequence) {
+                self.overflow_len.fetch_sub(1, Ordering::Release);
+                return Some(batch);
+            }
+        }
+        None
+    }
+
+    fn len(&self) -> usize {
+        self.batches.len() + self.overflow_len.load(Ordering::Acquire)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Number of READs that used the fallback map instead of a vacant slot.
+    fn spills(&self) -> usize {
+        self.spills.load(Ordering::Relaxed)
+    }
+
+    /// Makes a batch visible to deadline and failure scans after its first
+    /// successful post. Registration happens after the provider call, so an
+    /// unposted plan can never be mistaken for an outstanding READ.
+    fn register_pending(&self, batch: &Arc<ReadBatch>) {
+        let mut pending = self.lock_pending();
+        pending.registrations += 1;
+        if pending.registrations >= PENDING_PRUNE_INTERVAL {
+            pending.registrations = 0;
+            pending.entries.retain(Self::retain_pending);
+        }
+        pending.entries.push(Arc::downgrade(batch));
+    }
+
+    /// Keeps only batches that can still post or settle work.
+    fn retain_pending(weak: &Weak<ReadBatch>) -> bool {
+        weak.upgrade()
+            .is_some_and(|batch| batch.remaining.load(Ordering::Acquire) != 0)
+    }
+
+    /// Collects live batches while pruning dead and settled entries. The
+    /// returned list is scanned without holding the pending lock, so a waker
+    /// (or a panicking waker) runs outside it.
+    fn pending_batches(&self) -> Vec<Arc<ReadBatch>> {
+        let mut pending = self.lock_pending();
+        let mut scan = std::mem::take(&mut pending.scan);
+        debug_assert!(scan.is_empty(), "cached scan list retained batches");
+        pending.entries.retain(|weak| {
+            let Some(batch) = weak.upgrade() else {
+                return false;
+            };
+            if batch.remaining.load(Ordering::Acquire) == 0 {
+                return false;
+            }
+            scan.push(batch);
+            true
+        });
+        scan
+    }
+
+    /// Returns the scratch list after a scan, keeping only its capacity.
+    ///
+    /// Clearing before taking the lock drops the scanned references on the
+    /// scanning thread, so a cached batch cannot outlive the sweep or move its
+    /// destruction to the poll thread.
+    fn restore_scan(&self, mut scan: Vec<Arc<ReadBatch>>) {
+        scan.clear();
+        if scan.capacity() == 0 {
+            return;
+        }
+        let mut pending = self.lock_pending();
+        if scan.capacity() > pending.scan.capacity() {
+            pending.scan = scan;
+        }
+    }
+
+    fn fail_pending(&self) {
+        let batches = self.pending_batches();
+        for batch in &batches {
+            batch.fail(ReadFailure::ConnectionClosed);
+        }
+        self.restore_scan(batches);
+    }
+
+    fn expire_pending(&self, now: Instant) -> bool {
+        let batches = self.pending_batches();
+        let mut expired = false;
+        for batch in &batches {
+            // `remaining` also counts an unposted suffix waiting for admission.
+            // Only work the NIC can still access may expire the watchdog.
+            if batch.has_in_flight() {
+                expired |= batch.expire(now);
+            }
+        }
+        self.restore_scan(batches);
+        expired
+    }
+
+    #[cfg(test)]
+    fn pending_len(&self) -> usize {
+        self.lock_pending().entries.len()
+    }
+
+    #[cfg(test)]
+    fn scan_capacity(&self) -> usize {
+        self.lock_pending().scan.capacity()
     }
 }
 
@@ -63,7 +263,10 @@ pub struct ReadRequest {
 struct PreparedRead {
     remote_addr: u64,
     rkey: u32,
-    sges: Vec<ReadSge>,
+    /// Half-open range of this request's descriptors in the plan's shared
+    /// scatter-list allocation.
+    sge_start: usize,
+    sge_end: usize,
 }
 
 /// Reason a posted READ batch did not produce usable destination buffers.
@@ -85,10 +288,17 @@ pub type ReadReceiver = oneshot::Receiver<std::result::Result<Vec<Buffer>, ReadF
 /// A validated batch's exclusive posting cursor. Each request can be posted
 /// once, to its preparing QP. Dropping the cursor accounts its unposted suffix;
 /// buffers already visible to the NIC remain owned by that QP.
+///
+/// Leaking the cursor skips that accounting: the batch and its buffers are
+/// never settled, and a batch that had already posted stays in the QP's
+/// deadline scan for the QP's lifetime. Do not `mem::forget` it.
 #[derive(Debug)]
 pub struct ReadPosting {
     owner: u64,
     reads: Vec<PreparedRead>,
+    /// All requests' descriptors in one allocation; each [`PreparedRead`]
+    /// selects a contiguous range.
+    sges: Vec<ReadSge>,
     next: usize,
     batch: Arc<ReadBatch>,
 }
@@ -119,13 +329,31 @@ impl Drop for ReadPosting {
     }
 }
 
+/// READ batch state.
+///
+/// Field order is part of the design: `repr(C)` puts `accepted` exactly one
+/// cache line after `remaining`, so the cursor's per-WR acceptance store cannot
+/// invalidate the line a completion updates. `total`, the deadlines and the
+/// rarely written flags fill that line instead. See
+/// `posting_accounting_stays_off_the_completion_line`.
 #[derive(Debug)]
+#[repr(C)]
 pub(super) struct ReadBatch {
+    /// WRs not yet settled by completion or unposted cancellation. Written by
+    /// the poll thread for every completion.
     remaining: AtomicUsize,
+    /// Total WRs in the plan; immutable after construction.
+    total: usize,
     failed: AtomicBool,
+    read_timeout_reported: AtomicBool,
     read_deadline: Option<Instant>,
     request_deadline: Option<Instant>,
-    read_timeout_reported: AtomicBool,
+    /// WRs that cursor settled without posting after an earlier WR had already
+    /// been accepted. Written only by that cursor's cancellation path.
+    aborted: AtomicUsize,
+    /// WRs the provider accepted. Written only by the plan's exclusive posting
+    /// cursor, so it never races [`Self::aborted`].
+    accepted: AtomicUsize,
     inner: Mutex<ReadBatchInner>,
 }
 
@@ -144,7 +372,10 @@ impl ReadBatch {
     ) -> (Arc<Self>, ReadReceiver) {
         let (tx, rx) = oneshot::channel();
         let batch = Arc::new(Self {
+            total: count,
             remaining: AtomicUsize::new(count),
+            accepted: AtomicUsize::new(0),
+            aborted: AtomicUsize::new(0),
             failed: AtomicBool::new(false),
             read_deadline,
             request_deadline,
@@ -160,6 +391,7 @@ impl ReadBatch {
         (batch, rx)
     }
 
+    #[inline]
     fn complete_one(&self, success: bool) {
         if !success {
             self.failed.store(true, Ordering::Release);
@@ -174,6 +406,39 @@ impl ReadBatch {
         if self.remaining.fetch_sub(count, Ordering::AcqRel) == count {
             self.finish();
         }
+        // Settle the suffix for the in-flight derivation. `remaining` is
+        // decremented first, so a concurrent scan undercounts instead of
+        // reporting never-posted work as DMA.
+        self.aborted.fetch_add(count, Ordering::AcqRel);
+    }
+
+    /// Records that the provider accepted `accepted` WRs of this plan.
+    ///
+    /// The field sits one cache line after `remaining`, so this store does not
+    /// invalidate the line a completion updates.
+    #[inline]
+    fn mark_accepted(&self, accepted: usize) {
+        self.accepted.store(accepted, Ordering::Release);
+    }
+
+    /// Whether a provider-accepted WR has not settled yet.
+    ///
+    /// In-flight work is `accepted + aborted - (total - remaining)`: accepted
+    /// WRs plus the unposted suffix the cursor already settled, minus every
+    /// settled WR. Both accounting fields are loaded before `remaining`, so a
+    /// concurrent abort or completion can only make the derived count lower
+    /// (a sweep that misses this round) rather than report an unposted suffix
+    /// as DMA still in flight; the next sweep observes the final value.
+    #[inline]
+    fn has_in_flight(&self) -> bool {
+        let accounted = self
+            .accepted
+            .load(Ordering::Acquire)
+            .saturating_add(self.aborted.load(Ordering::Acquire));
+        let settled = self
+            .total
+            .saturating_sub(self.remaining.load(Ordering::Acquire));
+        accounted > settled
     }
 
     fn finish(&self) {
@@ -236,7 +501,10 @@ fn prepare(
     requests: Vec<ReadRequest>,
     gather_limit: usize,
     mut lkey: impl FnMut(&Buffer) -> Result<u32>,
-) -> Result<Vec<PreparedRead>> {
+) -> Result<(Vec<PreparedRead>, Vec<ReadSge>)> {
+    if buffers.len() > u32::MAX as usize {
+        return Err(invalid("READ destination buffer count overflows"));
+    }
     let keys = buffers.iter().map(&mut lkey).collect::<Result<Vec<_>>>()?;
     // A single destination cannot overlap another one. Keep its bounds/key
     // checks but avoid allocating an interval list for this common case.
@@ -244,64 +512,81 @@ fn prepare(
         || requests
             .first()
             .is_some_and(|request| request.segments.len() > 1);
-    let mut destinations = Vec::new();
-    // Consume the plan so Vec's collecting iterator can reuse its allocation
-    // for the prepared descriptors, including each request's scatter list.
-    let reads = requests
-        .into_iter()
-        .map(|request| {
-            if request.segments.is_empty() || request.segments.len() > gather_limit {
-                return Err(invalid("invalid READ scatter count"));
+    // Pack (buffer index, offset) into one sort key. Buffer capacities keep
+    // destinations below u32; this makes the overlap sort compare u64 keys
+    // instead of 24-byte interval tuples.
+    let mut destinations: Vec<(u64, u32)> = Vec::new();
+    // Descriptors of every request share one allocation; a per-request Vec
+    // would add an allocation and copy for each RDMA READ of a batch.
+    let segments = requests
+        .iter()
+        .map(|request| request.segments.len())
+        .sum::<usize>();
+    let mut sges = Vec::with_capacity(segments);
+    let mut reads = Vec::with_capacity(requests.len());
+    for request in requests {
+        if request.segments.is_empty() || request.segments.len() > gather_limit {
+            return Err(invalid("invalid READ scatter count"));
+        }
+        let sge_start = sges.len();
+        let mut total = 0u64;
+        for segment in request.segments {
+            let buffer = buffers
+                .get(segment.buffer)
+                .ok_or_else(|| invalid("READ buffer index out of bounds"))?;
+            let end = segment
+                .offset
+                .checked_add(segment.len)
+                .ok_or_else(|| invalid("READ destination overflows"))?;
+            if segment.len == 0 || end > buffer.len() {
+                return Err(invalid("READ destination exceeds buffer length"));
             }
-            let mut total = 0u64;
-            let sges = request
-                .segments
-                .into_iter()
-                .map(|segment| {
-                    let buffer = buffers
-                        .get(segment.buffer)
-                        .ok_or_else(|| invalid("READ buffer index out of bounds"))?;
-                    let end = segment
-                        .offset
-                        .checked_add(segment.len)
-                        .ok_or_else(|| invalid("READ destination overflows"))?;
-                    if segment.len == 0 || end > buffer.len() {
-                        return Err(invalid("READ destination exceeds buffer length"));
-                    }
-                    let len = u32::try_from(segment.len)
-                        .map_err(|_| invalid("READ segment exceeds u32::MAX"))?;
-                    total = total
-                        .checked_add(u64::from(len))
-                        .ok_or_else(|| invalid("READ length overflows"))?;
-                    if check_overlap {
-                        destinations.push((segment.buffer, segment.offset, end));
-                    }
-                    Ok(ReadSge {
-                        addr: buffer.as_ptr() as u64 + segment.offset as u64,
-                        len,
-                        lkey: keys[segment.buffer],
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            request
-                .remote_addr
-                .checked_add(total)
-                .ok_or_else(|| invalid("READ remote address overflows"))?;
-            Ok(PreparedRead {
-                remote_addr: request.remote_addr,
-                rkey: request.rkey,
-                sges,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    destinations.sort_unstable();
-    if destinations
-        .windows(2)
-        .any(|pair| pair[0].0 == pair[1].0 && pair[0].2 > pair[1].1)
-    {
+            let len =
+                u32::try_from(segment.len).map_err(|_| invalid("READ segment exceeds u32::MAX"))?;
+            total = total
+                .checked_add(u64::from(len))
+                .ok_or_else(|| invalid("READ length overflows"))?;
+            if check_overlap {
+                let offset = u32::try_from(segment.offset)
+                    .map_err(|_| invalid("READ destination exceeds u32::MAX"))?;
+                destinations.push((
+                    (u64::try_from(segment.buffer)
+                        .map_err(|_| invalid("READ destination buffer index overflows"))?
+                        << 32)
+                        | u64::from(offset),
+                    len,
+                ));
+            }
+            sges.push(ReadSge {
+                addr: buffer.as_ptr() as u64 + segment.offset as u64,
+                len,
+                lkey: keys[segment.buffer],
+            });
+        }
+        request
+            .remote_addr
+            .checked_add(total)
+            .ok_or_else(|| invalid("READ remote address overflows"))?;
+        reads.push(PreparedRead {
+            remote_addr: request.remote_addr,
+            rkey: request.rkey,
+            sge_start,
+            sge_end: sges.len(),
+        });
+    }
+    destinations.sort_unstable_by_key(|destination| destination.0);
+    if destinations.windows(2).any(|pair| {
+        let [previous, next] = pair else {
+            unreachable!("windows yields two elements");
+        };
+        let previous_start = (previous.0 & 0xffff_ffff) as u32;
+        previous.0 >> 32 == next.0 >> 32
+            && u64::from(previous_start) + u64::from(previous.1)
+                > u64::from((next.0 & 0xffff_ffff) as u32)
+    }) {
         return Err(invalid("READ destinations overlap"));
     }
-    Ok(reads)
+    Ok((reads, sges))
 }
 
 impl QueuePair {
@@ -321,8 +606,8 @@ impl QueuePair {
     /// Request expiry only notifies the receiver; READ-watchdog expiry also
     /// requires closing the connection, even if the receiver has already timed
     /// out or been dropped. Neither deadline permits early buffer recovery.
-    /// Callers must separately bound admission before posting: only posted WRs
-    /// are visible to [`Self::expire_reads`].
+    /// Callers must separately bound admission before posting: only WRs the
+    /// provider accepted are visible to [`Self::expire_reads`].
     pub fn prepare_reads_with_deadlines(
         &self,
         buffers: Vec<Buffer>,
@@ -330,10 +615,10 @@ impl QueuePair {
         read_deadline: Option<Instant>,
         request_deadline: Option<Instant>,
     ) -> std::result::Result<(ReadPosting, ReadReceiver), (Error, Vec<Buffer>)> {
-        let reads = match prepare(&buffers, requests, self.gather_limit(), |buffer| {
+        let (reads, sges) = match prepare(&buffers, requests, self.gather_limit(), |buffer| {
             self.lkey(buffer)
         }) {
-            Ok(reads) => reads,
+            Ok(prepared) => prepared,
             Err(error) => return Err((error, buffers)),
         };
         let (batch, receiver) =
@@ -342,6 +627,7 @@ impl QueuePair {
             ReadPosting {
                 owner: self.read_state.owner,
                 reads,
+                sges,
                 next: 0,
                 batch,
             },
@@ -362,28 +648,35 @@ impl QueuePair {
         // SAFETY: prepare validated every range against the owned buffers and
         // resolved keys on this QP. The exclusive cursor posts each range once.
         // This QP keeps the batch through an authentic completion or destruction.
+        let sges = &posting.sges[read.sge_start..read.sge_end];
         unsafe {
             self.read_sges(
-                &read.sges,
+                sges,
                 read.remote_addr,
                 read.rkey,
                 |wr_id| {
-                    self.read_state.batches.insert(wr_id, posting.batch.clone());
+                    self.read_state
+                        .insert(wr_id.sequence(), posting.batch.clone());
                 },
                 |wr_id| {
-                    self.read_state.batches.remove(&wr_id);
+                    self.read_state.remove(wr_id.sequence());
                 },
             )
         }?;
-        posting.next += 1;
+        // The provider has accepted this WR. Account it before any operation
+        // that can unwind, or Drop would treat posted DMA as unposted.
+        let accepted = posting.next + 1;
+        posting.batch.mark_accepted(accepted);
+        posting.next = accepted;
+        if posting.next == 1 {
+            self.read_state.register_pending(&posting.batch);
+        }
         Ok(())
     }
 
     /// Fails waiters without returning buffers still referenced by the NIC.
     pub fn fail_pending_reads(&self) {
-        for entry in &self.read_state.batches {
-            entry.value().fail(ReadFailure::ConnectionClosed);
-        }
+        self.read_state.fail_pending();
     }
 
     /// Fails expired waiters while preserving their buffers. Returns true only
@@ -391,15 +684,16 @@ impl QueuePair {
     /// to ERR. Request expiry alone does not prove a connection fault, and
     /// does not disarm the READ watchdog after notifying the receiver.
     pub fn expire_reads(&self, now: Instant) -> bool {
-        let mut expired = false;
-        for entry in &self.read_state.batches {
-            expired |= entry.value().expire(now);
-        }
-        expired
+        self.read_state.expire_pending(now)
     }
 
+    /// Whether a recorded READ still awaits completion or rollback.
+    ///
+    /// An unposted suffix is not recorded here: closing READ admission fails
+    /// its waiter, which then settles the batch, and teardown waits for that
+    /// admission to become closed and idle.
     pub fn has_pending_reads(&self) -> bool {
-        !self.read_state.batches.is_empty()
+        !self.read_state.is_empty()
     }
 
     /// Number of posted READ WRs whose completions have not been processed.
@@ -408,13 +702,26 @@ impl QueuePair {
     /// Accounting must exclude both operations before using the count, and
     /// destroy the QP before returning credits for its unpolled WRs. The count
     /// itself is not completion evidence and does not release DMA ownership.
+    /// It does not observe an unposted suffix, which owns no ledger entry.
     pub fn pending_read_count(&self) -> usize {
-        self.read_state.batches.len()
+        self.read_state.len()
+    }
+
+    /// Number of READs this QP recorded in the fallback map because an older
+    /// in-flight READ still occupied their sequence-indexed slot.
+    ///
+    /// A sequence collides only when an older READ stays in flight across a
+    /// full table of later SQ sequences (sends included). The fallback changes
+    /// bookkeeping cost only: it never rejects, reorders or corrupts a READ.
+    /// The value is monotonic per QP and is a diagnostic snapshot, not
+    /// completion evidence.
+    pub fn read_slot_spills(&self) -> usize {
+        self.read_state.spills()
     }
 
     /// Called only after the completion path verifies CQ/QP ownership.
     pub(super) fn complete_read(&self, wr_id: WRID, success: bool) {
-        if let Some((_, batch)) = self.read_state.batches.remove(&wr_id) {
+        if let Some(batch) = self.read_state.remove(wr_id.sequence()) {
             batch.complete_one(success);
         }
     }
@@ -479,15 +786,15 @@ mod tests {
                 ErrorKind::InvalidReadPlan
             );
         }
-        let plan = prepare(
+        let (plan, sges) = prepare(
             &buffers,
             vec![request(0, 0, 8), request(0, 8, 8)],
             32,
             |_| Ok(42),
         )
         .unwrap();
-        assert_eq!(plan[1].sges[0].addr, buffers[0].as_ptr() as u64 + 8);
-        assert_eq!(plan[1].sges[0].lkey, 42);
+        assert_eq!(sges[plan[1].sge_start].addr, buffers[0].as_ptr() as u64 + 8);
+        assert_eq!(sges[plan[1].sge_start].lkey, 42);
         assert!(prepare(&buffers, vec![request(0, 0, 8)], 0, |_| Ok(0)).is_err());
     }
 
@@ -606,12 +913,14 @@ mod tests {
             .map(|_| PreparedRead {
                 remote_addr: 0,
                 rkey: 0,
-                sges: Vec::new(),
+                sge_start: 0,
+                sge_end: 0,
             })
             .collect();
         let posting = ReadPosting {
             owner: 1,
             reads,
+            sges: Vec::new(),
             next: 1,
             batch: batch.clone(),
         };
@@ -646,6 +955,199 @@ mod tests {
     }
 
     #[test]
+    fn ledger_spills_colliding_sequences_without_losing_ownership() {
+        let (buffers_a, lifetime_a) = buffers();
+        let (buffers_b, lifetime_b) = buffers();
+        let (batch_a, _rx_a) = ReadBatch::new(1, buffers_a, None, None);
+        let (batch_b, _rx_b) = ReadBatch::new(1, buffers_b, None, None);
+        let state = ReadState::new(64);
+        let capacity = SlotTable::<Arc<ReadBatch>>::new(64).capacity() as u64;
+        assert!(state.insert(0, batch_a.clone()));
+        assert_eq!(state.spills(), 0);
+        assert!(state.insert(capacity, batch_b.clone()));
+        // The second sequence reuses the first slot index while its READ is
+        // still recorded, so it must be counted as a fallback use.
+        assert_eq!(state.spills(), 1);
+        assert_eq!(state.len(), 2);
+        assert!(Arc::ptr_eq(&state.remove(0).unwrap(), &batch_a));
+        assert!(Arc::ptr_eq(&state.remove(capacity).unwrap(), &batch_b));
+        assert!(state.is_empty());
+        assert_eq!(state.spills(), 1);
+        drop(batch_a);
+        drop(batch_b);
+        assert!(lifetime_a.upgrade().is_none());
+        assert!(lifetime_b.upgrade().is_none());
+    }
+
+    #[test]
+    fn ledger_scans_only_posted_batches_and_prunes_settled_entries() {
+        let (buffers, lifetime) = buffers();
+        let deadline = Instant::now() - Duration::from_millis(1);
+        let (batch, mut rx) = ReadBatch::new(1, buffers, Some(deadline), None);
+        let state = ReadState::new(64);
+        // A prepared but unposted batch is not an outstanding READ.
+        assert!(!state.expire_pending(Instant::now()));
+        assert!(rx.try_recv().is_err());
+        state.register_pending(&batch);
+        // Registration alone is not enough: the WR must be installed before
+        // the watchdog can observe it.
+        assert!(!state.expire_pending(Instant::now()));
+        assert!(state.insert(0, batch.clone()));
+        batch.mark_accepted(1);
+        assert!(state.expire_pending(Instant::now()));
+        assert_eq!(rx.try_recv().unwrap().unwrap_err(), ReadFailure::Timeout);
+        // Settlement drops the batch from the scan without returning its
+        // buffers, and cannot request connection closure again.
+        assert!(lifetime.upgrade().is_some());
+        assert!(state.remove(0).is_some());
+        batch.complete_one(false);
+        assert!(!state.expire_pending(Instant::now()));
+        assert!(lifetime.upgrade().is_none());
+        drop(batch);
+        assert!(lifetime.upgrade().is_none());
+    }
+
+    #[test]
+    fn ledger_fails_every_posted_batch_without_releasing_dma_holders() {
+        let (buffers, lifetime) = buffers();
+        let (batch, mut rx) = ReadBatch::new(1, buffers, None, None);
+        let state = ReadState::new(64);
+        state.register_pending(&batch);
+        state.fail_pending();
+        assert_eq!(
+            rx.try_recv().unwrap().unwrap_err(),
+            ReadFailure::ConnectionClosed
+        );
+        assert!(lifetime.upgrade().is_some());
+        batch.complete_one(false);
+        assert!(lifetime.upgrade().is_none());
+    }
+
+    #[test]
+    fn unposted_read_suffix_does_not_trigger_watchdog_closure() {
+        let (buffers, lifetime) = buffers();
+        let deadline = Instant::now() - Duration::from_millis(1);
+        let (batch, mut rx) = ReadBatch::new(2, buffers, Some(deadline), None);
+        let state = ReadState::new(64);
+        state.register_pending(&batch);
+
+        // Only the first WR reached the NIC and completed; the second is
+        // still waiting for admission and owns no DMA.
+        assert!(state.insert(0, batch.clone()));
+        batch.mark_accepted(1);
+        assert!(state.remove(0).is_some());
+        batch.complete_one(true);
+        assert!(!state.expire_pending(Instant::now()));
+        assert!(rx.try_recv().is_err());
+        assert!(lifetime.upgrade().is_some());
+
+        // Posting the suffix arms the expired watchdog for real DMA.
+        assert!(state.insert(1, batch.clone()));
+        batch.mark_accepted(2);
+        assert!(state.expire_pending(Instant::now()));
+        assert_eq!(rx.try_recv().unwrap().unwrap_err(), ReadFailure::Timeout);
+        assert!(state.remove(1).is_some());
+        assert!(lifetime.upgrade().is_some());
+        batch.complete_one(false);
+        assert!(lifetime.upgrade().is_none());
+    }
+
+    #[test]
+    fn completed_batches_are_pruned_without_deadline_scans() {
+        let state = ReadState::new(64);
+        for sequence in 0..10_000u64 {
+            let (buffers, lifetime) = buffers();
+            let (batch, rx) = ReadBatch::new(1, buffers, None, None);
+            assert!(state.insert(sequence, batch.clone()));
+            state.register_pending(&batch);
+            assert!(state.remove(sequence).is_some());
+            drop(rx);
+            batch.complete_one(true);
+            assert!(lifetime.upgrade().is_none());
+        }
+        assert!(
+            state.pending_len() <= PENDING_PRUNE_INTERVAL,
+            "completed batches accumulated: {}",
+            state.pending_len()
+        );
+        assert!(state.is_empty());
+    }
+
+    #[test]
+    fn scan_cache_keeps_capacity_without_retaining_batches() {
+        let state = ReadState::new(64);
+        let mut batches = Vec::new();
+        let mut lifetimes = Vec::new();
+        for sequence in 0..4u64 {
+            let (buffers, lifetime) = buffers();
+            let (batch, _rx) = ReadBatch::new(1, buffers, None, None);
+            state.register_pending(&batch);
+            assert!(state.insert(sequence, batch.clone()));
+            batches.push(batch);
+            lifetimes.push(lifetime);
+        }
+        let scan = state.pending_batches();
+        assert_eq!(scan.len(), 4);
+        state.restore_scan(scan);
+        // Settlement and completion drop the only strong references. A scan
+        // cache that retained its batches would keep them alive past the sweep.
+        drop(batches);
+        for sequence in 0..4u64 {
+            assert!(state.remove(sequence).is_some());
+        }
+        for lifetime in lifetimes {
+            assert!(
+                lifetime.upgrade().is_none(),
+                "cached scan list retained a batch"
+            );
+        }
+        // The next scan reuses the cached capacity and prunes dead entries.
+        let scan = state.pending_batches();
+        assert!(scan.capacity() >= 4);
+        assert!(scan.is_empty());
+        state.restore_scan(scan);
+        assert!(state.is_empty());
+        assert!(state.scan_capacity() >= 4);
+    }
+
+    /// The posting cursor's per-WR store must never land on the line a
+    /// completion updates. Any nonzero multiple of the line size guarantees
+    /// that for every allocation address; the field order is chosen so the
+    /// gap costs no extra allocation space.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn posting_accounting_stays_off_the_completion_line() {
+        let gap =
+            std::mem::offset_of!(ReadBatch, accepted) - std::mem::offset_of!(ReadBatch, remaining);
+        assert_eq!(
+            gap, 64,
+            "`accepted` must be one cache line after `remaining`; keep the repr(C) field order"
+        );
+    }
+
+    #[test]
+    fn poisoned_pending_lock_does_not_block_registration_or_failure() {
+        let state = Arc::new(ReadState::new(64));
+        let (buffers, _) = buffers();
+        let (batch, mut rx) = ReadBatch::new(1, buffers, None, None);
+        let poisoned = Arc::clone(&state);
+        std::thread::spawn(move || {
+            let _guard = poisoned.pending.lock().unwrap();
+            panic!("poison the pending list");
+        })
+        .join()
+        .unwrap_err();
+        // A provider post must never turn lock poisoning into an unwind that
+        // Drop would mistake for an unposted WR.
+        state.register_pending(&batch);
+        state.fail_pending();
+        assert_eq!(
+            rx.try_recv().unwrap().unwrap_err(),
+            ReadFailure::ConnectionClosed
+        );
+    }
+
+    #[test]
     fn unposted_cancel_recovers_memory_and_closes_receiver() {
         let (buffers, lifetime) = buffers();
         let (batch, mut rx) = ReadBatch::new(1, buffers, None, None);
@@ -654,8 +1156,10 @@ mod tests {
             reads: vec![PreparedRead {
                 remote_addr: 0,
                 rkey: 0,
-                sges: Vec::new(),
+                sge_start: 0,
+                sge_end: 0,
             }],
+            sges: Vec::new(),
             next: 0,
             batch,
         };

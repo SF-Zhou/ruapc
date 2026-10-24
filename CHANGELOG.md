@@ -19,6 +19,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - `ruapc-rdma::Context::query_gid_entry` returns a GID and its type from one
   kernel query on Linux 5.10+, falling back to `ibv_query_gid` and the sysfs
   GID type elsewhere.
+- `ruapc-rdma::QueuePair::read_slot_spills` reports how often a READ had to use
+  the fallback map because an older in-flight READ still occupied its
+  sequence-indexed slot. The per-QP counter is a diagnostic snapshot, not
+  completion evidence.
 
 ### Changed
 - **BREAKING**: `ruapc-rdma::ReadFailure` adds `RequestTimeout` to distinguish
@@ -50,8 +54,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   bound to the opened uverbs device; kernels or drivers without the methods
   keep using `ibv_query_gid` and the sysfs GID type. Native InfiniBand ports
   no longer need the sysfs `gid_attrs/types` file on the legacy path.
+- RDMA READ completion bookkeeping uses a per-QP sequence-indexed slot table
+  instead of a sharded hash map, and destination validation uses one shared
+  scatter-list allocation with packed overlap keys. A sequence collides only
+  when an older READ stays in flight across a full table of later SQ
+  sequences; it then spills into a fallback map, so a READ is never rejected
+  for bookkeeping contention.
 
 ### Fixed
+- RDMA READ posting accounts provider acceptance before pending registration,
+  so an unwind in that window cannot release buffers the NIC already owns.
+  Deadline sweeps only consider WRs the provider accepted; an unposted suffix
+  waiting for admission no longer closes a healthy connection. The pending
+  weak list is pruned on a bounded registration cadence even while idle.
 - RDMA READ deadlines cover bandwidth and SQ/NIC permit admission, including
   waits before the first posted WR. Request deadlines also bound completion
   without closing healthy connections or disabling the independent READ
