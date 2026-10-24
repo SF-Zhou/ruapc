@@ -181,3 +181,8 @@ Run both Rust commands to exercise the default and libibverbs GID backends;
 Setting `RUAPC_PREFER_RXE=1` restricts their selection to Soft-RoCE devices
 named `rxe*`, as in CI. See
 [CONTRIBUTING.md](../CONTRIBUTING.md) for setup and workspace checks.
+
+Standalone ownership benchmarks live in `benches/` and use the optional
+`bench-internals` feature. See the [benchmark guide](../docs/benchmark.md#rdma-ownership-harnesses)
+for commands, measurement boundaries and the allocator's cross-thread handoff
+benchmark. These measurements require build dependencies but no RDMA device.

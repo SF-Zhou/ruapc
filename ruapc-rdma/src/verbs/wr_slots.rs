@@ -50,6 +50,18 @@ pub(crate) struct WrSlots {
 }
 
 impl WrSlots {
+    /// Number of slots allocated for this ownership table.
+    #[cfg(feature = "bench-internals")]
+    pub fn capacity(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Metadata bytes occupied by one slot, excluding buffer backing storage.
+    #[cfg(feature = "bench-internals")]
+    pub fn slot_bytes() -> usize {
+        std::mem::size_of::<Slot>()
+    }
+
     /// Creates a slot array for a work queue of the given depth.
     ///
     /// Capacity is `2 * depth` rounded up to a power of two: the extra

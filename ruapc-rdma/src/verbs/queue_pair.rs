@@ -3,6 +3,9 @@ use std::{os::raw::c_int, ptr, sync::Arc};
 mod read;
 pub use read::{ReadFailure, ReadPosting, ReadReceiver, ReadRequest, ReadSegment};
 
+#[cfg(feature = "bench-internals")]
+pub use read::bench_support as read_bench_support;
+
 use ruapc_bufpool::{Buffer, DeviceIndex};
 
 use super::{
@@ -53,7 +56,7 @@ pub struct CompletionCursor {
 
 impl CompletionCursor {
     #[inline]
-    fn sweep_to(&mut self, first_sequence: u64, completed: u64) -> std::ops::Range<u64> {
+    pub(crate) fn sweep_to(&mut self, first_sequence: u64, completed: u64) -> std::ops::Range<u64> {
         let start = self.sq_swept.max(first_sequence);
         self.sq_swept = self.sq_swept.max(completed + 1);
         start..completed

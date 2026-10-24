@@ -15,6 +15,18 @@ categories = ["network-programming", "external-ffi-bindings"]
 bin = ["dep:clap"]
 # Use the installed libibverbs extended GID APIs instead of compatibility queries.
 ibv-query-gid-ex = []
+# Internal ownership components for standalone, device-free benchmarks.
+bench-internals = []
+
+[[bench]]
+name = "buffer_stash"
+harness = false
+required-features = ["bench-internals"]
+
+[[bench]]
+name = "read_bookkeeping"
+harness = false
+required-features = ["bench-internals"]
 
 [dependencies]
 clap = { workspace = true, optional = true }

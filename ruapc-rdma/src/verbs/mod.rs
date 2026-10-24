@@ -48,3 +48,8 @@ pub use queue_pair::{
 };
 
 mod wr_slots;
+
+#[cfg(feature = "bench-internals")]
+pub use queue_pair::read_bench_support;
+#[cfg(feature = "bench-internals")]
+pub(crate) use wr_slots::WrSlots;

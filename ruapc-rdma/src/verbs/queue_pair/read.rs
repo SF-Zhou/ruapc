@@ -1,6 +1,10 @@
 //! Owned RDMA READ plans. Posted destinations stay held through completion
 //! or successful QP destruction; failure notification does not release them.
 
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub mod bench_support;
+
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},

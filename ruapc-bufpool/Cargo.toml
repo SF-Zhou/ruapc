@@ -34,5 +34,9 @@ harness = false
 name = "initialization"
 harness = false
 
+[[bench]]
+name = "handoff"
+harness = false
+
 [lints]
 workspace = true
