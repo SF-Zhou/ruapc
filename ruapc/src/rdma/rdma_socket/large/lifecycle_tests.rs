@@ -72,14 +72,7 @@ impl Fixture {
             },
             ..Default::default()
         };
-        let qp = QueuePair::create(
-            device.pd(),
-            poller.cq(),
-            poller.cq(),
-            &mut attrs,
-            device.index(),
-        )
-        .unwrap();
+        let qp = QueuePair::create(device.pd(), poller.cq(), &mut attrs, device.index()).unwrap();
         let nic = RdmaNicInfo {
             device: device.info().name.clone(),
             port_num: device.info().ports[0].port_num,

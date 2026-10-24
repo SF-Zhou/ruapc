@@ -83,16 +83,17 @@ The public `Context` query methods remain the same in both modes.
 Context
   ├─ ProtectionDomain
   │    ├─ MemoryRegion → retains backing memory
-  │    └─ QueuePair    → retains send/receive CQs and work requests
+  │    └─ QueuePair    → retains its completion queue and work requests
   ├─ CompChannel
   └─ CompletionQueue  → retains an optional completion channel
 ```
 
 Ownership through `Arc` keeps parent resources alive until their children are
-dropped. `QueuePair::send` and `recv` take ownership of pool buffers, and
-`prepare_reads` takes ownership of READ destinations. The crate also supports
-gather-list sends and selective signaling; a signaled completion can reclaim
-preceding unsignaled SENDs.
+dropped. A `QueuePair` posts SEND, RECV and READ work to one completion queue
+and accepts completions only from that CQ and QPN. `QueuePair::send` and
+`recv` take ownership of pool buffers, and `prepare_reads` takes ownership of
+READ destinations. The crate also supports gather-list sends and selective
+signaling; a signaled completion can reclaim preceding unsignaled SENDs.
 
 Use `CompletionQueue::poll_batch` with reusable `CompletionBatch` storage and
 pass each CQ-issued `Completion` to `QueuePair::complete`. The borrowed proof

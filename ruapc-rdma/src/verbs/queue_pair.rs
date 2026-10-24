@@ -115,10 +115,9 @@ impl SendSignaling {
 pub struct QueuePair {
     ptr: *mut crate::ibv_qp,
     _pd: Arc<ProtectionDomain>,
-    /// CQ-owned QPN identity and sequence space. A shared CQ uses one lease for
-    /// both directions; separate CQs each register their own identity.
-    send_identity: IdentityLease,
-    recv_identity: Option<IdentityLease>,
+    /// CQ-owned QPN identity and both sequence streams. One lease covers SEND,
+    /// RECV and READ because this QP posts to a single completion queue.
+    identity: IdentityLease,
     /// In-flight SEND buffers; READs share the identity's SQ sequence counter.
     send_wrs: WrSlots,
     /// In-flight buffers of receive-queue work requests.
@@ -142,25 +141,17 @@ pub struct QueuePair {
     pub device_index: DeviceIndex,
 }
 
-/// Setup can register one CQ before another rejects a reused QPN. Drop must
-/// destroy the provider QP before Rust releases either registered identity.
+/// Setup leases the QPN after the provider assigns it. Drop must destroy the
+/// provider QP before Rust releases that lease.
 struct CreatingQueuePair {
     ptr: *mut crate::ibv_qp,
-    send_identity: Option<IdentityLease>,
-    recv_identity: Option<IdentityLease>,
+    identity: Option<IdentityLease>,
 }
 
 impl CreatingQueuePair {
-    fn register_identities(
-        &mut self,
-        send_cq: &Arc<CompletionQueue>,
-        recv_cq: &Arc<CompletionQueue>,
-    ) -> Result<()> {
+    fn register_identity(&mut self, cq: &Arc<CompletionQueue>) -> Result<()> {
         let qp_num = unsafe { (*self.ptr).qp_num };
-        self.send_identity = Some(send_cq.register_qp(qp_num)?);
-        if !Arc::ptr_eq(send_cq, recv_cq) {
-            self.recv_identity = Some(recv_cq.register_qp(qp_num)?);
-        }
+        self.identity = Some(cq.register_qp(qp_num)?);
         Ok(())
     }
 }
@@ -180,10 +171,11 @@ fn destroy_provider_qp(ptr: *mut crate::ibv_qp) {
 }
 
 impl QueuePair {
+    /// Creates a queue pair that posts SEND, RECV and READ work to `cq` and
+    /// receives every completion from it.
     pub fn create(
         pd: &Arc<ProtectionDomain>,
-        send_cq: &Arc<CompletionQueue>,
-        recv_cq: &Arc<CompletionQueue>,
+        cq: &Arc<CompletionQueue>,
         init_attr: &mut crate::ibv_qp_init_attr,
         device_index: DeviceIndex,
     ) -> Result<Self> {
@@ -192,13 +184,12 @@ impl QueuePair {
         if init_attr.qp_type != crate::ibv_qp_type::IBV_QPT_RC
             || !init_attr.srq.is_null()
             || !init_attr.qp_context.is_null()
-            || !Arc::ptr_eq(pd.context(), send_cq.context())
-            || !Arc::ptr_eq(pd.context(), recv_cq.context())
+            || !Arc::ptr_eq(pd.context(), cq.context())
         {
             return Err(ErrorKind::InvalidQueuePairConfig.into());
         }
-        init_attr.send_cq = send_cq.as_ptr();
-        init_attr.recv_cq = recv_cq.as_ptr();
+        init_attr.send_cq = cq.as_ptr();
+        init_attr.recv_cq = cq.as_ptr();
         let ptr = unsafe { crate::ruapc_ibv_create_qp(pd.as_ptr(), init_attr) };
         if ptr.is_null() {
             let source = std::io::Error::last_os_error();
@@ -211,13 +202,12 @@ impl QueuePair {
             ));
         }
         // QPN identity can only be claimed after the provider assigns it.
-        // The guard destroys this QP before releasing any partial registration.
+        // The guard destroys this QP if the lease is rejected.
         let mut creating = CreatingQueuePair {
             ptr,
-            send_identity: None,
-            recv_identity: None,
+            identity: None,
         };
-        creating.register_identities(send_cq, recv_cq)?;
+        creating.register_identity(cq)?;
         // `ibv_create_qp` updates `init_attr.cap` with the actual (possibly
         // larger) queue depths; size the slot arrays from those.
         let send_wrs = WrSlots::new(init_attr.cap.max_send_wr);
@@ -226,8 +216,7 @@ impl QueuePair {
         let qp = Self {
             ptr,
             _pd: Arc::clone(pd),
-            send_identity: creating.send_identity.take().unwrap(),
-            recv_identity: creating.recv_identity.take(),
+            identity: creating.identity.take().unwrap(),
             send_wrs,
             recv_wrs,
             read_state,
@@ -239,30 +228,15 @@ impl QueuePair {
         Ok(qp)
     }
 
-    /// This QP's send completion identity, registered after provider creation.
+    /// This QP's completion identity, registered after provider creation.
     #[inline]
-    pub fn send_identity(&self) -> CompletionIdentity {
-        self.send_identity.identity()
+    pub fn identity(&self) -> CompletionIdentity {
+        self.identity.identity()
     }
 
-    /// This QP's receive completion identity. With a shared CQ it equals
-    /// [`send_identity`](Self::send_identity).
-    #[inline]
-    pub fn recv_identity(&self) -> CompletionIdentity {
-        self.receive_identity().identity()
-    }
-
-    pub fn send_cq(&self) -> &Arc<CompletionQueue> {
-        self.send_identity.cq()
-    }
-
-    pub fn recv_cq(&self) -> &Arc<CompletionQueue> {
-        self.receive_identity().cq()
-    }
-
-    #[inline]
-    fn receive_identity(&self) -> &IdentityLease {
-        self.recv_identity.as_ref().unwrap_or(&self.send_identity)
+    /// The completion queue this QP posts to and completes on.
+    pub fn cq(&self) -> &Arc<CompletionQueue> {
+        self.identity.cq()
     }
 
     /// Sets the selective signaling interval for data sends.
@@ -401,9 +375,9 @@ impl QueuePair {
         // The sequence guard serializes allocation, ownership registration
         // and provider posting. SQ IDs must follow hardware post order for
         // the selective completion sweep to be safe.
-        let posting = self.send_identity.lock_send()?;
+        let posting = self.identity.lock_send()?;
         let id = posting.sequence();
-        let route = self.send_identity();
+        let route = self.identity();
         let (wr_id, opcode, imm_data) = match imm {
             Some(imm) => (
                 route.encode(WRType::SendImm, id),
@@ -434,7 +408,7 @@ impl QueuePair {
             // QPN's previous incarnations and their receive-queue traffic.
             send_flags: signaling
                 .flags(
-                    id - self.send_identity().first_sequence(),
+                    id - self.identity().first_sequence(),
                     self.send_signal_interval,
                     flags,
                 )
@@ -495,9 +469,9 @@ impl QueuePair {
         }
         let num_sge = sges.len() as c_int;
 
-        let posting = self.send_identity.lock_send()?;
+        let posting = self.identity.lock_send()?;
         let id = posting.sequence();
-        let wr_id = self.send_identity().encode(WRType::Read, id);
+        let wr_id = self.identity().encode(WRType::Read, id);
         register(wr_id);
         let mut wr = crate::ibv_send_wr {
             wr_id,
@@ -521,8 +495,8 @@ impl QueuePair {
         let addr = buffer.as_ptr() as u64;
         let len = buffer.capacity() as u32;
         let lkey = self.lkey(&buffer)?;
-        let id = self.receive_identity().alloc_recv()?;
-        let wr_id = self.recv_identity().encode(WRType::Recv, id);
+        let id = self.identity.alloc_recv()?;
+        let wr_id = self.identity().encode(WRType::Recv, id);
         self.recv_wrs
             .insert(id, buffer.into())
             .map_err(|_| ErrorKind::WorkRequestSlotsExhausted)?;
@@ -556,12 +530,8 @@ impl QueuePair {
         cursor: &mut CompletionCursor,
     ) -> Result<CompletedWork<'a>> {
         let wc = completion.info();
-        let route = if wc.is_recv() {
-            self.receive_identity()
-        } else {
-            &self.send_identity
-        };
-        if !completion.belongs_to(route.cq(), self.qp_num(), route.identity()) {
+        let identity = self.identity();
+        if !completion.belongs_to(self.cq(), self.qp_num(), identity) {
             return Err(ErrorKind::InvalidCompletion.into());
         }
         let id = completion.sequence();
@@ -571,7 +541,7 @@ impl QueuePair {
         } else {
             // A replacement QP can start far above zero. Never scan the
             // sequence space preceding this QPN incarnation.
-            for swept in cursor.sweep_to(route.identity().first_sequence(), id) {
+            for swept in cursor.sweep_to(identity.first_sequence(), id) {
                 if self.send_wrs.take(swept).is_some() {
                     swept_sends += 1;
                 }
@@ -732,44 +702,27 @@ mod tests {
     }
 
     #[test]
-    fn qp_identities_are_registered_after_creation_and_retire_after_destruction() {
+    fn qp_identity_is_registered_after_creation_and_retires_after_destruction() {
         let device = crate::test_utils::open_device();
         let cq = CompletionQueue::create(device.context(), 16, None).unwrap();
-        let qp = QueuePair::create(
-            device.pd(),
-            &cq,
-            &cq,
-            &mut init_attr(),
-            DeviceIndex::default(),
-        )
-        .unwrap();
-        let identity = qp.send_identity();
-        assert_eq!(identity, qp.recv_identity());
+        let qp =
+            QueuePair::create(device.pd(), &cq, &mut init_attr(), DeviceIndex::default()).unwrap();
+        let identity = qp.identity();
         assert_eq!(identity.qp_num(), qp.qp_num());
-        assert!(Arc::ptr_eq(qp.send_cq(), &cq));
-        assert!(Arc::ptr_eq(qp.recv_cq(), &cq));
+        assert!(Arc::ptr_eq(qp.cq(), &cq));
         assert_eq!(cq.qp_registry_stats().active, 1);
         for _ in 0..300 {
-            qp.send_identity.lock_send().unwrap().sequence();
+            qp.identity.lock_send().unwrap().sequence();
         }
-        qp.receive_identity().alloc_recv().unwrap();
+        qp.identity.alloc_recv().unwrap();
         drop(qp);
         assert_eq!(cq.qp_registry_stats().active, 0);
         assert_eq!(cq.qp_registry_stats().next_sequence_floor, 300);
-        let replacement = QueuePair::create(
-            device.pd(),
-            &cq,
-            &cq,
-            &mut init_attr(),
-            DeviceIndex::default(),
-        )
-        .unwrap();
-        assert_eq!(replacement.send_identity().first_sequence(), 300);
-        assert_eq!(
-            replacement.send_identity.lock_send().unwrap().sequence(),
-            300
-        );
-        assert_eq!(replacement.receive_identity().alloc_recv().unwrap(), 300);
+        let replacement =
+            QueuePair::create(device.pd(), &cq, &mut init_attr(), DeviceIndex::default()).unwrap();
+        assert_eq!(replacement.identity().first_sequence(), 300);
+        assert_eq!(replacement.identity.lock_send().unwrap().sequence(), 300);
+        assert_eq!(replacement.identity.alloc_recv().unwrap(), 300);
     }
 
     #[test]
@@ -778,98 +731,45 @@ mod tests {
         let cq = CompletionQueue::create(device.context(), 1, None).unwrap();
         let qps: Vec<_> = (0..cq.capacity() + 2)
             .map(|_| {
-                QueuePair::create(
-                    device.pd(),
-                    &cq,
-                    &cq,
-                    &mut init_attr(),
-                    DeviceIndex::default(),
-                )
-                .unwrap()
+                QueuePair::create(device.pd(), &cq, &mut init_attr(), DeviceIndex::default())
+                    .unwrap()
             })
             .collect();
         assert!(qps.len() > cq.capacity() as usize);
         assert_eq!(cq.qp_registry_stats().active, qps.len());
-        assert!(
-            qps.iter()
-                .all(|qp| qp.send_identity().first_sequence() == 0)
-        );
+        assert!(qps.iter().all(|qp| qp.identity().first_sequence() == 0));
         drop(qps);
         assert_eq!(cq.qp_registry_stats().active, 0);
         assert_eq!(cq.qp_registry_stats().next_sequence_floor, 1);
     }
 
     #[test]
-    fn separate_cqs_preserve_independent_retired_floors() {
+    fn failed_identity_registration_destroys_the_provider_qp() {
         let device = crate::test_utils::open_device();
-        let send_cq = CompletionQueue::create(device.context(), 16, None).unwrap();
-        let recv_cq = CompletionQueue::create(device.context(), 1024, None).unwrap();
-        let qp = QueuePair::create(
-            device.pd(),
-            &send_cq,
-            &recv_cq,
-            &mut init_attr(),
-            DeviceIndex::default(),
-        )
-        .unwrap();
-        assert!(qp.recv_identity.is_some());
-        assert!(Arc::ptr_eq(qp.send_cq(), &send_cq));
-        assert!(Arc::ptr_eq(qp.recv_cq(), &recv_cq));
-        for _ in 0..7 {
-            qp.send_identity.lock_send().unwrap().sequence();
-        }
-        for _ in 0..11 {
-            qp.receive_identity().alloc_recv().unwrap();
-        }
-        drop(qp);
-        assert_eq!(send_cq.qp_registry_stats().next_sequence_floor, 7);
-        assert_eq!(recv_cq.qp_registry_stats().next_sequence_floor, 11);
-        let next = QueuePair::create(
-            device.pd(),
-            &send_cq,
-            &recv_cq,
-            &mut init_attr(),
-            DeviceIndex::default(),
-        )
-        .unwrap();
-        assert_eq!(next.send_identity().first_sequence(), 7);
-        assert_eq!(next.recv_identity().first_sequence(), 11);
-    }
-
-    #[test]
-    fn failed_second_cq_registration_releases_only_its_own_partial_lease() {
-        let device = crate::test_utils::open_device();
-        let send_cq = CompletionQueue::create(device.context(), 16, None).unwrap();
-        let recv_cq = CompletionQueue::create(device.context(), 16, None).unwrap();
+        let cq = CompletionQueue::create(device.context(), 16, None).unwrap();
         let mut attrs = init_attr();
-        attrs.send_cq = send_cq.as_ptr();
-        attrs.recv_cq = recv_cq.as_ptr();
+        attrs.send_cq = cq.as_ptr();
+        attrs.recv_cq = cq.as_ptr();
         let ptr = unsafe { crate::ruapc_ibv_create_qp(device.pd().as_ptr(), &mut attrs) };
         assert!(!ptr.is_null());
         let qp_num = unsafe { (*ptr).qp_num };
         let mut creating = CreatingQueuePair {
             ptr,
-            send_identity: None,
-            recv_identity: None,
+            identity: None,
         };
         // Model provider QPN reuse before the previous Rust lease was released.
-        let old = recv_cq.register_qp(qp_num).unwrap();
+        let old = cq.register_qp(qp_num).unwrap();
         assert_eq!(
-            creating
-                .register_identities(&send_cq, &recv_cq)
-                .unwrap_err()
-                .kind,
+            creating.register_identity(&cq).unwrap_err().kind,
             ErrorKind::CompletionIdentityInUse
         );
-        assert_eq!(send_cq.qp_registry_stats().active, 1);
-        assert_eq!(recv_cq.qp_registry_stats().active, 1);
-        drop(creating); // Its Drop destroys the provider QP before its fields.
-        assert_eq!(send_cq.qp_registry_stats().active, 0);
-        assert_eq!(send_cq.qp_registry_stats().next_sequence_floor, 1);
-        assert_eq!(recv_cq.qp_registry_stats().active, 1);
+        assert_eq!(cq.qp_registry_stats().active, 1);
+        drop(creating); // Its Drop destroys the provider QP before its lease.
+        assert_eq!(cq.qp_registry_stats().active, 1);
+        assert_eq!(cq.qp_registry_stats().next_sequence_floor, 0);
         assert_eq!(old.lock_send().unwrap().sequence(), 0);
         drop(old);
-        assert_eq!(recv_cq.qp_registry_stats().next_sequence_floor, 1);
+        assert_eq!(cq.qp_registry_stats().next_sequence_floor, 1);
     }
 
     #[test]
@@ -879,22 +779,19 @@ mod tests {
         let mut attrs = init_attr();
         attrs.srq = ptr::dangling_mut();
         assert_eq!(
-            QueuePair::create(device.pd(), &cq, &cq, &mut attrs, DeviceIndex::default())
+            QueuePair::create(device.pd(), &cq, &mut attrs, DeviceIndex::default())
                 .unwrap_err()
                 .kind,
             ErrorKind::InvalidQueuePairConfig
         );
         attrs.srq = ptr::null_mut();
         attrs.qp_context = ptr::dangling_mut();
-        assert!(
-            QueuePair::create(device.pd(), &cq, &cq, &mut attrs, DeviceIndex::default()).is_err()
-        );
+        assert!(QueuePair::create(device.pd(), &cq, &mut attrs, DeviceIndex::default()).is_err());
         let foreign = crate::test_utils::open_device();
         let foreign_cq = CompletionQueue::create(foreign.context(), 16, None).unwrap();
         assert_eq!(
             QueuePair::create(
                 device.pd(),
-                &cq,
                 &foreign_cq,
                 &mut init_attr(),
                 DeviceIndex::default()

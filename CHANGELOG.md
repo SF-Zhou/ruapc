@@ -25,6 +25,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   completion evidence.
 
 ### Changed
+- **BREAKING**: `ruapc-rdma::QueuePair::create` takes one completion queue.
+  SEND, RECV and READ work all post to it and every completion returns through
+  it. `QueuePair::send_cq`, `recv_cq`, `send_identity` and `recv_identity` are
+  replaced by `cq` and `identity`.
 - **BREAKING**: `ruapc-rdma::ReadFailure` adds `RequestTimeout` to distinguish
   request expiry from the connection-level READ watchdog. Exhaustive matches
   must handle the new variant.

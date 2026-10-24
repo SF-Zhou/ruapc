@@ -27,9 +27,9 @@ appear in the RPC wire format.
 
 Each CQ owns a registry of live QPNs and their immutable `first_sequence`,
 plus one `retired_floor`, initially zero. `QueuePair::create` first creates
-the provider QP to obtain its QPN, then leases that QPN before exposing the
-QP or posting work. A duplicate live QPN is rejected. Shared send/receive
-CQs use one lease; separate CQs lease the QPN independently.
+the provider QP to obtain its QPN, then leases that QPN from the one CQ the QP
+posts both directions to, before exposing the QP or posting work. A duplicate
+live QPN is rejected.
 
 The non-cloneable `IdentityLease` retains its CQ and owns independent
 `send_next` and `recv_next` counters, starting at the leased floor. SQ
@@ -177,8 +177,9 @@ including the success checks and limits after cancellation.
 - [READ plans](../ruapc-rdma/src/verbs/queue_pair/read.rs) and
   [buffer slots](../ruapc-rdma/src/verbs/wr_slots.rs) enforce buffer ownership.
 
-Tests alongside these modules cover QPN reuse, retained tokens, separate CQs,
-partial setup rollback, failed-post floors, exhaustion, overlap rejection and
-slot collisions. The completion API includes a compile-fail test against token
-fabrication. See [QP registry](qp-registry.md) for core routing and publication,
-and [RDMA capacity](rdma-capacity.md) for the separate CQ credit lifetime.
+Tests alongside these modules cover QPN reuse, retained tokens, cross-CQ token
+rejection, partial setup rollback, failed-post floors, exhaustion, overlap
+rejection and slot collisions. The completion API includes a compile-fail test
+against token fabrication. See [QP registry](qp-registry.md) for core routing
+and publication, and [RDMA capacity](rdma-capacity.md) for the separate CQ
+credit lifetime.

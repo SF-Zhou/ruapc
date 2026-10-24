@@ -75,7 +75,6 @@ fn read_completion_sweeps_unsignaled_send_and_settles_read_batch() {
             QueuePair::create(
                 device.active.pd(),
                 &cq,
-                &cq,
                 &mut ibv_qp_init_attr {
                     qp_type: ibv_qp_type::IBV_QPT_RC,
                     cap: ibv_qp_cap {
@@ -126,7 +125,7 @@ fn read_completion_sweeps_unsignaled_send_and_settles_read_batch() {
         sender.set_send_signal_interval(8, 8);
         // Model a failed post's consumed sequence: the following data SEND
         // is offset 1 and therefore unsignaled, leaving the READ to sweep it.
-        drop(sender.send_identity.lock_send().unwrap());
+        drop(sender.identity.lock_send().unwrap());
         let make_buffer = || {
             let mut buffer = pool.allocate(64).unwrap();
             buffer.set_len(64);

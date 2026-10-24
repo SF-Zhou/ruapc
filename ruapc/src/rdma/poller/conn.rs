@@ -98,7 +98,7 @@ impl ConnState {
         Self {
             dirty: false,
             qp_error_requested: false,
-            identity: reg.socket.queue_pair.send_identity(),
+            identity: reg.socket.queue_pair.identity(),
             flow: FlowControl::new(reg.send_window, reg.recv_submitted, Instant::now()),
             pending_sends: VecDeque::new(),
             pending_receiver: reg.pending_receiver,
