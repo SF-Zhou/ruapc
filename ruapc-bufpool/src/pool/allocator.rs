@@ -3,22 +3,22 @@
 //! together under that lock; no buffer may be dropped while it is held.
 
 use std::collections::VecDeque;
-use std::io::{Error, ErrorKind, Result};
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use aliasable::boxed::AliasableBox;
-use tokio::sync::oneshot;
 
 use crate::buddy::{BuddyBlock, BuddyState, FreeNode, NUM_LEVELS, NodeState, SIZE_64MIB};
 use crate::buffer::Buffer;
+use crate::completion as oneshot;
 use crate::intrusive_list::IntrusiveList;
 
 use super::BufferPool;
 
 mod waiters;
+pub(super) use waiters::Handoffs;
 use waiters::{Reservation, Waiter};
 
 /// Internal pool state protected by the mutex.
@@ -117,15 +117,14 @@ impl BuddyAllocator {
 
     /// Reserves a 64 MiB slot of the memory budget for a new block.
     ///
-    /// # Errors
-    ///
-    /// Returns `OutOfMemory` if the reservation would exceed the limit.
-    pub(super) fn try_reserve_block(&mut self, max_memory: usize) -> Result<()> {
+    /// Returns false if the reservation would exceed the limit. The async
+    /// caller can then register a waiter without constructing an unused error.
+    pub(super) fn try_reserve_block(&mut self, max_memory: usize) -> bool {
         if max_memory.saturating_sub(self.allocated_memory) < SIZE_64MIB {
-            return Err(Error::new(ErrorKind::OutOfMemory, "memory limit reached"));
+            return false;
         }
         self.allocated_memory += SIZE_64MIB;
-        Ok(())
+        true
     }
 
     /// Attempts to allocate from local state: free lists first, then
@@ -134,24 +133,38 @@ impl BuddyAllocator {
         &mut self,
         level: usize,
         pool: &Arc<BufferPool>,
+        handoffs: &mut Handoffs,
     ) -> Option<Buffer> {
-        if let Some(buffer) = self.try_allocate_from_free_lists(level, pool) {
+        if let Some(buffer) = self.try_allocate_available(level, pool) {
             return Some(buffer);
-        }
-
-        // Demand-driven coalescing: merging is deferred on free (lazy buddy),
-        // so free quads at lower levels may satisfy this allocation once merged.
-        if self.coalesce_pending(level) {
-            return self.try_allocate_from_free_lists(level, pool);
         }
 
         // A cancelled reserved waiter may be sitting on absorbed capacity
         // with no future free to notice the cancellation; reclaim it here so
         // allocation misses cannot strand memory indefinitely.
-        if self.reclaim_cancelled_reservation() {
+        if self.reclaim_cancelled_reservation(handoffs) {
             return self.try_allocate_from_free_lists(level, pool);
         }
 
+        None
+    }
+
+    /// Allocates only public capacity, without reclaiming a reservation.
+    /// A priority claim must keep its reservation until it owns a buffer even
+    /// when the receiver cancels concurrently with this allocation.
+    pub(super) fn try_allocate_available(
+        &mut self,
+        level: usize,
+        pool: &Arc<BufferPool>,
+    ) -> Option<Buffer> {
+        if let Some(buffer) = self.try_allocate_from_free_lists(level, pool) {
+            return Some(buffer);
+        }
+        // Demand-driven coalescing: merging is deferred on free (lazy buddy),
+        // so free quads at lower levels may satisfy this allocation once merged.
+        if self.coalesce_pending(level) {
+            return self.try_allocate_from_free_lists(level, pool);
+        }
         None
     }
 
@@ -269,31 +282,58 @@ impl BuddyAllocator {
         self.blocks.push(block);
     }
 
+    /// Returns ordinary frees without constructing a handoff queue. The demand
+    /// check and the free share the allocator lock, so a waiter cannot appear
+    /// between them. This path never drops a sender or invokes a user waker.
+    #[inline]
+    pub(super) fn try_deallocate_without_waiters(
+        &mut self,
+        pool: &BufferPool,
+        level: usize,
+        index: usize,
+        block: NonNull<BuddyBlock>,
+    ) -> bool {
+        if self.min_waiting_level.is_some() || self.reservation.is_some() {
+            return false;
+        }
+        self.try_merge(unsafe { BuddyBlock::allocator_state(block) }, level, index);
+        if pool.has_demand.load(Ordering::Relaxed) {
+            pool.has_demand.store(false, Ordering::SeqCst);
+        }
+        true
+    }
+
     pub(crate) fn deallocate_buffer(
         &mut self,
         pool: &Arc<BufferPool>,
         level: usize,
         index: usize,
         block: NonNull<BuddyBlock>,
+        handoffs: &mut Handoffs,
     ) {
-        if self.min_waiting_level.is_none() && self.reservation.is_none() {
-            // Ordinary frees need only the buddy state. Avoid walking waiter
-            // policy and touching its cache lines when no request is queued.
-            self.try_merge(unsafe { BuddyBlock::allocator_state(block) }, level, index);
-            if pool.has_demand.load(Ordering::Relaxed) {
-                pool.has_demand.store(false, Ordering::SeqCst);
-            }
+        if self.try_deallocate_without_waiters(pool, level, index, block) {
             return;
         }
-        if !self.try_absorb_into_reservation(pool, level, index, block) {
+        self.deallocate_buffer_with_waiters(pool, level, index, block, handoffs);
+    }
+
+    pub(super) fn deallocate_buffer_with_waiters(
+        &mut self,
+        pool: &Arc<BufferPool>,
+        level: usize,
+        index: usize,
+        block: NonNull<BuddyBlock>,
+        handoffs: &mut Handoffs,
+    ) {
+        if !self.try_absorb_into_reservation(pool, level, index, block, handoffs) {
             let state = unsafe { BuddyBlock::allocator_state(block) };
             self.try_merge(state, level, index);
             // Starvation check runs before serving so that a freshly
             // activated reservation can claim this free ahead of smaller
             // waiters.
-            self.check_starvation(pool);
+            self.check_starvation(pool, handoffs);
         }
-        self.serve_waiters(pool);
+        self.serve_waiters(pool, handoffs);
     }
 
     /// Returns `true` if a node freed at `level` should be merged upward.

@@ -25,6 +25,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   completion evidence.
 
 ### Changed
+- **BREAKING**: `ruapc-rdma::QueuePair::prepare_reads` no longer takes a
+  deadline and returns the runtime-independent `ReadCompletion` instead of a
+  Tokio `ReadReceiver`. Its future yields a single `Result`; `try_recv` returns
+  `None` while pending. `prepare_reads_with_deadlines`, `expire_reads` and
+  `fail_pending_reads` are removed. Applications can use `ReadPosting::handle`
+  to observe progress and notify failure; RuaPC owns its deadline and
+  connection-failure registry in the core. DMA ownership remains in the verbs
+  crate and failure notification never authorizes buffer recovery.
+- `ruapc-bufpool` and `ruapc-rdma` no longer depend on Tokio in production.
+  Allocation waiters use runtime-independent futures, with channel delivery
+  and cancellation cleanup outside the allocator mutex.
+- Allocation and READ completion notifications share a safe implementation
+  without a channel dependency. Waiting allocations avoid constructing unused
+  errors; pools that have never used slabs skip their reclaim scans.
 - **BREAKING**: `ruapc-rdma::QueuePair::create` takes one completion queue.
   SEND, RECV and READ work all post to it and every completion returns through
   it. `QueuePair::send_cq`, `recv_cq`, `send_identity` and `recv_identity` are

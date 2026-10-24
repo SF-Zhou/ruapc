@@ -149,7 +149,6 @@ fn read_completion_sweeps_unsignaled_send_and_settles_read_batch() {
                         len: 64,
                     }],
                 }],
-                None,
             )
             .unwrap();
         sender.post_read(&mut posting).unwrap();

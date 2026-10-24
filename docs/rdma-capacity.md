@@ -162,7 +162,13 @@ timer; the posting path checks expiry before handing a WR to the provider.
 
 The poll thread checks posted READ deadlines during its 100 ms housekeeping
 sweep, skipping QPs with all READ permits available; completion waits do not
-create per-operation timers. Only provider-accepted, unsettled WRs count: a
+create per-operation timers. The core socket owns the pending registry and
+both deadlines; the verbs crate provides weak observation/failure handles
+and retains exclusive completion authority. The registry prunes on a bounded
+registration cadence, including when idle sweeps are skipped. Temporary strong
+observations are dropped and failures notified outside the registry lock, so
+closing a result producer cannot invoke a waker under that lock.
+Only provider-accepted, unsettled WRs count: a
 batch is registered for the sweep after its first accepted post, so a suffix
 still waiting for admission neither arms the READ watchdog nor requests
 closure, while the caller's own deadline still bounds that wait. Request
@@ -210,7 +216,8 @@ The implementation and adjacent tests are in
 [poller/budget.rs](../ruapc/src/rdma/poller/budget.rs),
 [poller routing and shard selection](../ruapc/src/rdma/poller/mod.rs),
 [READ execution](../ruapc/src/rdma/rdma_socket/read.rs) and
-[READ admission and credits](../ruapc/src/rdma/rdma_socket/read/credits.rs).
+[READ admission and credits](../ruapc/src/rdma/rdma_socket/read/credits.rs), with
+[deadline tracking](../ruapc/src/rdma/rdma_socket/read/pending.rs) in the core.
 Tests cover concurrent admission, retirement races, short/full drain bounds,
 shard fallback and cancelled permit waits. Routing and maintenance are
 covered in [QP registry](qp-registry.md).

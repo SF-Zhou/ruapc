@@ -10,8 +10,8 @@
 //! two-thread case includes bounded atomic publication/backpressure and the
 //! shared batch's acceptance/completion contention, but no per-WR channel or
 //! thread startup. `ledger/lifecycle` includes one short batch's creation,
-//! pending registration/pruning and final notification; `ledger/spill` forces
-//! the collision fallback with a two-slot table.
+//! ownership accounting and final notification, excluding the core deadline
+//! registry; `ledger/spill` forces the collision fallback with a two-slot table.
 //! `finish` measures the last completion plus receiver extraction; its optional
 //! counting waker measures invocation, not executor scheduling or task resumption.
 //! No case posts work, creates a QP, or fabricates a CQ completion token.
@@ -31,7 +31,7 @@ use std::{
 use ruapc_bufpool::{Buffer, BufferPool, BufferPoolBuilder, EmptyDevices};
 
 use ruapc_rdma::{
-    ReadFailure, ReadReceiver, ReadRequest, ReadSegment, WRID,
+    ReadCompletion, ReadFailure, ReadRequest, ReadSegment, WRID,
     bench_support::read::{Batch, Ledger, prepare},
 };
 
@@ -129,7 +129,7 @@ fn phases(config: &Config) -> impl Iterator<Item = u64> + '_ {
     std::iter::once(config.warmup).chain(std::iter::repeat_n(config.iters, config.repeats))
 }
 
-fn ledger_batch(config: &Config, pool: &Arc<BufferPool>, wrs: u64) -> (Batch, ReadReceiver) {
+fn ledger_batch(config: &Config, pool: &Arc<BufferPool>, wrs: u64) -> (Batch, ReadCompletion) {
     let count = config
         .iters
         .checked_mul(config.repeats as u64)
@@ -144,7 +144,7 @@ fn ledger_batch(config: &Config, pool: &Arc<BufferPool>, wrs: u64) -> (Batch, Re
     Batch::new(count, vec![destination(pool, SEGMENT_LEN)])
 }
 
-fn finish_ledger(state: &Ledger, batch: Batch, mut receiver: ReadReceiver) {
+fn finish_ledger(state: &Ledger, batch: Batch, mut receiver: ReadCompletion) {
     assert!(state.is_empty());
     assert_eq!(batch.remaining(), 1);
     batch.abort_unposted(1);
@@ -193,9 +193,9 @@ fn ledger_serial_with(
     finish_ledger(state, batch, receiver);
 }
 
-/// One complete short-batch lifetime: batch creation, pending registration,
-/// one insert/complete per WR and final notification. Buffers are recycled
-/// through the receiver, so no pool allocation is measured between batches.
+/// One complete low-level batch lifetime: creation, one insert/complete per WR
+/// and final notification. Core deadline-registry work is excluded. Buffers are
+/// recycled through the receiver, so no pool allocation is measured between batches.
 fn lifecycle_run(iterations: u64, pool: &Arc<BufferPool>, wrs: u64) -> Duration {
     let state = Ledger::new();
     let mut buffers = vec![destination(pool, SEGMENT_LEN)];
@@ -207,7 +207,6 @@ fn lifecycle_run(iterations: u64, pool: &Arc<BufferPool>, wrs: u64) -> Duration 
         let start = Instant::now();
         for _ in 0..count {
             let (batch, mut receiver) = Batch::new(wrs as usize, std::mem::take(&mut buffers));
-            state.register(&batch);
             let first = sequence;
             for accepted in 1..=wrs as usize {
                 assert!(state.insert(sequence, &batch));

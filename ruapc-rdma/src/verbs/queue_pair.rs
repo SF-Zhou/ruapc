@@ -1,7 +1,9 @@
 use std::{os::raw::c_int, ptr, sync::Arc};
 
 mod read;
-pub use read::{ReadFailure, ReadPosting, ReadReceiver, ReadRequest, ReadSegment};
+pub use read::{
+    ReadCompletion, ReadFailure, ReadHandle, ReadObservation, ReadPosting, ReadRequest, ReadSegment,
+};
 
 #[cfg(feature = "bench-internals")]
 pub use read::bench_support as read_bench_support;

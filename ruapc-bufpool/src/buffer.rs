@@ -264,12 +264,9 @@ impl Buffer {
 
     /// Decomposes the buffer into its raw parts without running `Drop`.
     ///
-    /// Used by the pool to reclaim a buffer while already holding the pool
-    /// mutex (e.g. when a waiter cancelled before receiving a handed-off
-    /// buffer): running `Drop` would re-enter the non-reentrant mutex.
-    ///
-    /// Also used to transfer a buddy leaf to the pool's internal slab layer
-    /// without retaining an Arc back to the pool.
+    /// Transfers a buddy leaf to the pool's internal slab layer without
+    /// retaining an Arc back to the pool. Failed waiter handoffs also use this
+    /// to recycle capacity iteratively instead of recursively running `Drop`.
     ///
     /// The internal `Arc<BufferPool>` reference is released here. This is
     /// safe to call while holding the pool mutex as long as the caller owns

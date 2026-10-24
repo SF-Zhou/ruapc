@@ -43,8 +43,8 @@ pub use qp_connection::QpConnectionConfig;
 
 mod queue_pair;
 pub use queue_pair::{
-    CompletedWork, CompletionCursor, MAX_GATHER_SGE, QueuePair, ReadFailure, ReadPosting,
-    ReadReceiver, ReadRequest, ReadSegment, ReadSge, WrBuffers,
+    CompletedWork, CompletionCursor, MAX_GATHER_SGE, QueuePair, ReadCompletion, ReadFailure,
+    ReadHandle, ReadObservation, ReadPosting, ReadRequest, ReadSegment, ReadSge, WrBuffers,
 };
 
 mod wr_slots;

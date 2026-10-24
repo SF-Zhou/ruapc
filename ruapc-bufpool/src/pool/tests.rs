@@ -480,6 +480,280 @@ async fn test_handoff_serves_multiple_waiters_from_one_free() {
     }
 }
 
+/// Both wake and waker destruction are extension points: either can call back
+/// into the pool synchronously, even when the allocation future is not polled.
+struct ReentrantPoolWaker {
+    pool: std::sync::Weak<BufferPool>,
+    wakes: Arc<std::sync::atomic::AtomicUsize>,
+    drops: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ReentrantPoolWaker {
+    fn check_unlocked(&self) {
+        if let Some(pool) = self.pool.upgrade() {
+            assert!(
+                pool.inner.try_lock().is_ok(),
+                "waker ran under allocator lock"
+            );
+            assert!(
+                pool.slab_classes
+                    .iter()
+                    .all(|class| class.try_lock().is_ok()),
+                "waker ran under slab lock"
+            );
+            assert!(pool.thread_shards.try_lock().is_ok());
+            // Exercise actual synchronous re-entry after checking, so failures
+            // report an assertion instead of leaving the test deadlocked.
+            assert_eq!(pool.allocated_memory(), SIZE_64MIB);
+        }
+    }
+}
+
+impl std::task::Wake for ReentrantPoolWaker {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.check_unlocked();
+        self.wakes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Drop for ReentrantPoolWaker {
+    fn drop(&mut self) {
+        self.check_unlocked();
+        self.drops
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn test_handoff_waker_can_reenter_pool_without_runtime() {
+    use std::future::Future;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Waker};
+
+    let pool = test_pool_with_max(SIZE_64MIB);
+    let held = pool.allocate(SIZE_64MIB).unwrap();
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let waker = Waker::from(Arc::new(ReentrantPoolWaker {
+        pool: Arc::downgrade(&pool),
+        wakes: Arc::clone(&wakes),
+        drops: Arc::clone(&drops),
+    }));
+    let mut waiting = Box::pin(pool.async_allocate(SIZE_64MIB));
+    assert!(
+        waiting
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    drop(waker);
+
+    drop(held);
+    assert_eq!(wakes.load(Ordering::Relaxed), 1);
+    assert_eq!(drops.load(Ordering::Relaxed), 1);
+    // Capacity was assigned under the lock before the callback ran.
+    assert!(pool.allocate(SIZE_64MIB).is_err());
+    let std::task::Poll::Ready(Ok(buffer)) = waiting
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+    else {
+        panic!("assigned buffer was not delivered");
+    };
+    drop(buffer);
+    assert!(pool.allocate(SIZE_64MIB).is_ok());
+}
+
+#[test]
+fn closed_reservation_is_reclaimed_without_repeating_wake() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Waker};
+
+    let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
+        .max_memory(SIZE_64MIB)
+        .starvation_timeout(Duration::ZERO)
+        .build();
+    let mut held: Vec<_> = (0..64).map(|_| pool.allocate(SIZE_1MIB).unwrap()).collect();
+    let mut receiver = pool.with_allocator(|inner, _| inner.wait_for(3, &pool));
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let waker = Waker::from(Arc::new(ReentrantPoolWaker {
+        pool: Arc::downgrade(&pool),
+        wakes: Arc::clone(&wakes),
+        drops: Arc::clone(&drops),
+    }));
+    assert!(
+        Pin::new(&mut receiver)
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    drop(waker);
+    // The first free activates a reservation and absorbs its sole free leaf.
+    drop(held.pop());
+    assert_eq!(pool.free_counts(), [0; NUM_LEVELS]);
+    receiver.close();
+    // Closing takes and wakes the registered waker outside the channel lock.
+    // Its callback and destruction may re-enter the pool immediately.
+    assert_eq!(wakes.load(Ordering::Relaxed), 1);
+    assert_eq!(drops.load(Ordering::Relaxed), 1);
+    // Reclaiming the cancelled reservation releases its sender without
+    // repeating the notification already delivered by close.
+    let recovered = pool.allocate(SIZE_1MIB).unwrap();
+    assert_eq!(wakes.load(Ordering::Relaxed), 1);
+    assert_eq!(drops.load(Ordering::Relaxed), 1);
+    drop(recovered);
+    drop(held);
+    assert!(pool.allocate(SIZE_64MIB).is_ok());
+}
+
+#[test]
+fn test_handoff_cancellation_after_assignment_serves_next_waiter() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    let pool = test_pool_with_max(SIZE_64MIB);
+    let held = pool.allocate(SIZE_64MIB).unwrap();
+    let mut first = Box::pin(pool.async_allocate(SIZE_64MIB));
+    let mut second = Box::pin(pool.async_allocate(SIZE_64MIB));
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(first.as_mut().poll(&mut context).is_pending());
+    assert!(second.as_mut().poll(&mut context).is_pending());
+
+    // Pause exactly between assigning capacity under the mutex and sending it.
+    let (level, index, block) = held.into_raw_parts();
+    let mut handoffs = Handoffs::default();
+    {
+        let mut inner = pool.inner.lock().unwrap();
+        inner.deallocate_buffer(&pool, level, index, block, &mut handoffs);
+    }
+    assert!(pool.allocate(SIZE_64MIB).is_err());
+    drop(first);
+    handoffs.finish(&pool);
+    let Poll::Ready(Ok(buffer)) = second.as_mut().poll(&mut context) else {
+        panic!("cancelled handoff stranded capacity ahead of the next waiter");
+    };
+    drop(buffer);
+    assert!(pool.allocate(SIZE_64MIB).is_ok());
+}
+
+#[test]
+fn cancelled_overflow_handoff_recycles_capacity_to_next_waiter() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    let pool = test_pool_with_max(SIZE_64MIB);
+    let held = pool.allocate(SIZE_64MIB).unwrap();
+    let mut waiting: Vec<_> = (0..5)
+        .map(|_| Box::pin(pool.async_allocate(LEVEL_SIZES[2])))
+        .collect();
+    let mut context = Context::from_waker(Waker::noop());
+    for waiter in &mut waiting {
+        assert!(waiter.as_mut().poll(&mut context).is_pending());
+    }
+
+    // One return assigns four chunks before any notification is delivered.
+    // Cancel the first recipient while its peers still await that delivery.
+    let (level, index, block) = held.into_raw_parts();
+    let mut handoffs = Handoffs::default();
+    {
+        let mut inner = pool.inner.lock().unwrap();
+        inner.deallocate_buffer(&pool, level, index, block, &mut handoffs);
+    }
+    assert!(pool.allocate(LEVEL_SIZES[2]).is_err());
+    drop(waiting.remove(0));
+    handoffs.finish(&pool);
+
+    // The three already assigned recipients and the fifth queued waiter must
+    // all receive distinct buffers, including the cancelled recipient's space.
+    let mut received = Vec::new();
+    for waiter in &mut waiting {
+        let Poll::Ready(Ok(buffer)) = waiter.as_mut().poll(&mut context) else {
+            panic!("cancelled overflow handoff stranded a live waiter");
+        };
+        assert_eq!(buffer.len(), LEVEL_SIZES[2]);
+        received.push(buffer);
+    }
+    let mut regions: Vec<_> = received
+        .iter()
+        .map(|buffer| {
+            let start = buffer.as_ptr() as usize;
+            (start, start.checked_add(buffer.len()).unwrap())
+        })
+        .collect();
+    regions.sort_unstable();
+    for pair in regions.windows(2) {
+        assert!(pair[0].1 <= pair[1].0, "handoff buffers overlap");
+    }
+    drop(received);
+    assert!(pool.allocate(SIZE_64MIB).is_ok());
+}
+
+#[test]
+fn test_handoff_skips_long_cancelled_queue() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    let pool = test_pool_with_max(SIZE_64MIB);
+    let held = pool.allocate(SIZE_64MIB).unwrap();
+    let mut context = Context::from_waker(Waker::noop());
+    for _ in 0..8192 {
+        let mut cancelled = Box::pin(pool.async_allocate(SIZE_64MIB));
+        assert!(cancelled.as_mut().poll(&mut context).is_pending());
+    }
+    let mut waiting = Box::pin(pool.async_allocate(SIZE_64MIB));
+    assert!(waiting.as_mut().poll(&mut context).is_pending());
+    drop(held);
+    let Poll::Ready(Ok(buffer)) = waiting.as_mut().poll(&mut context) else {
+        panic!("cancelled queue blocked the live waiter");
+    };
+    drop(buffer);
+    assert!(pool.allocate(SIZE_64MIB).is_ok());
+}
+
+#[test]
+fn test_handoff_send_races_receiver_cancellation() {
+    use std::future::Future;
+    use std::task::{Context, Waker};
+
+    let pool = test_pool_with_max(SIZE_64MIB);
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        let (sender, incoming) = std::sync::mpsc::sync_channel(0);
+        let barrier = &barrier;
+        scope.spawn(move || {
+            for buffer in incoming {
+                barrier.wait();
+                drop(buffer);
+                barrier.wait();
+            }
+        });
+        for _ in 0..512 {
+            let held = pool.allocate(SIZE_64MIB).unwrap();
+            let mut waiting = Box::pin(pool.async_allocate(SIZE_64MIB));
+            assert!(
+                waiting
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            sender.send(held).unwrap();
+            barrier.wait();
+            drop(waiting);
+            barrier.wait();
+            assert!(
+                pool.allocate(SIZE_64MIB).is_ok(),
+                "cancel/send race leaked capacity"
+            );
+        }
+    });
+}
+
 #[tokio::test]
 async fn test_handoff_cancelled_waiter_returns_buffer() {
     use std::time::Duration;
@@ -496,8 +770,7 @@ async fn test_handoff_cancelled_waiter_returns_buffer() {
     waiter.abort();
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    // The free hands a buffer to the cancelled waiter; the failed send
-    // must reclaim it into the pool instead of leaking it.
+    // The free must skip the cancelled waiter without stranding capacity.
     drop(held);
 
     // The full 64MiB must be recoverable again.
@@ -1173,4 +1446,101 @@ fn registration_keys_remain_readable_during_allocator_mutation() {
             assert_eq!((key.lkey, key.rkey), (7, 11));
         }
     });
+}
+
+#[test]
+fn buddy_only_reclaim_skips_unused_slab_and_cache_locks() {
+    use std::sync::mpsc;
+
+    let pool = test_pool_with_max(SIZE_64MIB);
+    let held = pool.allocate(SIZE_64MIB).unwrap();
+    let class_guards: Vec<_> = pool
+        .slab_classes
+        .iter()
+        .map(|class| class.lock().unwrap())
+        .collect();
+    let shard_guard = pool.thread_shards.lock().unwrap();
+    let (finished, completion) = mpsc::sync_channel(1);
+    let worker_pool = Arc::clone(&pool);
+    let worker = std::thread::spawn(move || {
+        worker_pool.reclaim_cached_capacity();
+        finished.send(()).unwrap();
+    });
+    let result = completion.recv_timeout(Duration::from_secs(5));
+    // Release the locks before joining or asserting, so a regression fails
+    // this test instead of leaving the worker permanently blocked.
+    drop(class_guards);
+    drop(shard_guard);
+    worker.join().unwrap();
+    assert!(
+        result.is_ok(),
+        "buddy-only reclaim waited on unused slab locks"
+    );
+    drop(held);
+}
+
+#[test]
+fn first_slab_installed_after_waiter_registration_releases_to_waiter() {
+    use std::future::Future;
+    use std::pin::pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Wake, Waker};
+
+    #[derive(Default)]
+    struct Notifications(AtomicUsize);
+    impl Wake for Notifications {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    for thread_cache in [false, true] {
+        let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
+            .max_memory(SIZE_64MIB)
+            .slab_empty_watermark(8)
+            .thread_cache(thread_cache)
+            .build();
+        let mut held: Vec<_> = (0..64).map(|_| pool.allocate(SIZE_1MIB).unwrap()).collect();
+        // Pause a first small allocation after acquiring its buddy backing,
+        // before installing a slab or publishing any reclaimable chunks.
+        let backing = held.pop().unwrap();
+        let notifications = Arc::new(Notifications::default());
+        let waker = Waker::from(Arc::clone(&notifications));
+        let mut context = Context::from_waker(&waker);
+        let mut allocation = pin!(pool.async_allocate(SIZE_64MIB));
+        assert!(allocation.as_mut().poll(&mut context).is_pending());
+        // Both reclaim sweeps skipped unused slabs before registration
+        // completed. Demand must cover the subsequent first installation.
+        drop(held);
+        let chunk = pool.install_backing_and_take(1, backing);
+        assert_eq!(notifications.0.load(Ordering::Relaxed), 0);
+        drop(chunk);
+        assert_eq!(notifications.0.load(Ordering::Relaxed), 1);
+        let Poll::Ready(Ok(buffer)) = allocation.as_mut().poll(&mut context) else {
+            panic!("first slab installation stranded the waiting allocation");
+        };
+        assert_eq!(buffer.len(), SIZE_64MIB);
+    }
+}
+
+#[test]
+fn slab_reclaim_remains_enabled_after_whole_pool_reuse() {
+    for thread_cache in [false, true] {
+        let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
+            .max_memory(SIZE_64MIB)
+            .slab_empty_watermark(8)
+            .thread_cache(thread_cache)
+            .build();
+        for _ in 0..2 {
+            for size in SLAB_CLASS_SIZES {
+                drop(pool.allocate(size).unwrap());
+                // Empty slabs or cached chunks must still be swept after
+                // prior rounds drained every slab back to the buddy layer.
+                let whole = pool.allocate(SIZE_64MIB).unwrap();
+                assert_eq!(whole.len(), SIZE_64MIB);
+                assert_eq!(pool.slab_free_counts(), [0; NUM_SLAB_CLASSES]);
+                drop(whole);
+            }
+        }
+    }
 }

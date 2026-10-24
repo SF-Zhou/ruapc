@@ -154,12 +154,13 @@ waiting future never authorizes early release. See
 [READ admission and failure](rdma-capacity.md#read-admission-and-failure) for
 permits, deadlines and teardown.
 
-A batch joins the deadline and failure pending list only after the provider
-accepts its first WR. That list holds weak references, is pruned on a bounded
-registration cadence, and is scanned without its lock, so a completed batch is
-not retained when idle sweeps do not run and a waker runs outside the lock.
-Deadline sweeps consider only provider-accepted, unsettled WRs: a suffix still
-waiting for admission neither arms the READ watchdog nor requests closure.
+`ReadCompletion` publishes the result through a runtime-independent future.
+Its lifetime is separate from the buffer-owning batch, so retaining the future
+cannot keep its own producer alive after QP destruction. Weak `ReadHandle`s
+allow observation and early failure notification; neither a handle nor its
+temporary strong `ReadObservation` can settle work or recover buffers.
+Deadline registration and failure policy belong to the core's
+[READ admission layer](rdma-capacity.md#read-admission-and-failure).
 `QueuePair::read_slot_spills` counts fallback-map use per QP for diagnosis; the
 fallback changes cost only, never ownership or ordering.
 

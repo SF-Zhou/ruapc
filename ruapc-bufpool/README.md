@@ -16,6 +16,7 @@ The pool grows in registered 64 MiB blocks. Requests are rounded up to these cla
 `async_allocate(size)` waits for capacity to return. Both reject zero and sizes
 above 64 MiB. Growth and device registration run outside allocator locks but
 still execute on the calling thread, including in the async API.
+Allocation futures are runtime independent; Tokio is used only by tests.
 `BufferPool::allocation_capacity(size)` reports the size class without
 allocating or reserving capacity.
 
@@ -68,6 +69,7 @@ alive and prevent concurrent writes throughout the copy.
 | --- | --- |
 | [`pool.rs`](src/pool.rs), [`pool/builder.rs`](src/pool/builder.rs) | Public API, allocation transitions and configuration |
 | [`pool/allocator.rs`](src/pool/allocator.rs), [`waiters.rs`](src/pool/allocator/waiters.rs) | Budget, merging, direct handoff and starvation reservations |
+| [`completion.rs`](src/completion.rs) | Safe runtime-independent single-value notification shared with RDMA |
 | [`pool/small.rs`](src/pool/small.rs), [`slab.rs`](src/slab.rs), [`thread_cache.rs`](src/thread_cache.rs) | Slab classes, chunk ownership, thread caches and reclamation |
 | [`buddy.rs`](src/buddy.rs), [`aligned.rs`](src/aligned.rs) | Backing regions, allocation metadata and initialized memory |
 
@@ -82,6 +84,18 @@ Public buffers retain the pool; internal slab backing tokens do not, avoiding
 a pool/slab/buffer ownership cycle. Chunk ownership moves across cache
 boundaries. Growth failure restores reserved budget; cancelling a waiter hands
 reserved capacity to another waiter or releases it to the allocator.
+Capacity assignment and waiter registration share the allocator mutex.
+Channel delivery, cancelled sender destruction and wakers run after unlocking;
+a cancelled delivery can therefore return its buffer without recursively
+locking the allocator. Assigned buffers remain reserved for their waiters
+while delivery runs outside the lock.
+
+Pools that have never installed a slab skip slab and thread-cache reclaim
+sweeps. A monotonic hint is published before the first installation; once a
+slab has been used, the normal sweeps remain enabled. Its sequentially
+consistent ordering with waiter demand prevents a first installation racing
+with waiter registration from stranding capacity. The budget check constructs
+an out-of-memory error only when returning failure to a synchronous caller.
 
 <a id="tests-and-benchmarks"></a>
 
@@ -95,6 +109,7 @@ cargo doc -p ruapc-bufpool --no-deps
 cargo bench -p ruapc-bufpool --bench lazy_merge
 cargo bench -p ruapc-bufpool --bench contention
 cargo bench -p ruapc-bufpool --bench initialization
+cargo bench -p ruapc-bufpool --bench async_handoff
 ```
 
 See [allocator benchmark controls](../docs/benchmark.md#allocator-harnesses)

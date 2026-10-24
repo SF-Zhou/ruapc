@@ -15,6 +15,14 @@ use super::BufferPool;
 impl BufferPool {
     /// Reclaim magazines first: cached chunks otherwise keep their slabs busy.
     pub(super) fn reclaim_cached_capacity(self: &Arc<Self>) {
+        // The post-registration sweep follows has_demand's SeqCst store. If
+        // this load still sees false, every later slab installation and chunk
+        // return follows it in that order, so the return observes demand and
+        // releases empty backing instead of stranding it in a cache. Existing
+        // slabs always take the normal sweep: this hint never returns to false.
+        if !self.may_have_slabs.load(Ordering::SeqCst) {
+            return;
+        }
         self.flush_thread_cache();
         self.reclaim_empty_slabs();
     }
@@ -72,6 +80,9 @@ impl BufferPool {
         class: usize,
         backing: Buffer,
     ) -> Buffer {
+        // Publish before any chunk can enter a slab or thread cache. This
+        // pairs with reclaim_cached_capacity and the demand checks on return.
+        self.may_have_slabs.store(true, Ordering::SeqCst);
         let chunk = {
             let mut slab_class = self.slab_classes[class]
                 .lock()
