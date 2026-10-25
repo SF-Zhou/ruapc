@@ -161,6 +161,7 @@ impl BufferPoolBuilder {
             slab_empty_watermark: self.slab_empty_watermark,
             thread_cache: self.thread_cache,
             has_demand: AtomicBool::new(false),
+            may_have_slabs: AtomicBool::new(false),
             slab_classes: std::array::from_fn(|class| Mutex::new(SlabClass::new(class))),
             thread_shards: Mutex::new(Vec::new()),
             inner: Mutex::new(inner),

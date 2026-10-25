@@ -1,18 +1,106 @@
 //! Direct waiter handoff and bounded subtree reservations for starvation
-//! protection. Called only with the parent allocator's mutex held.
+//! protection. Allocation decisions require the parent allocator mutex; channel
+//! operations and their user-provided wakers run only after releasing that lock.
 
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use tokio::sync::oneshot;
-
 use crate::BufferPool;
 use crate::buddy::{BuddyBlock, LEVEL_SIZES, NODES_PER_LEVEL, NUM_LEVELS, NodeState};
 use crate::buffer::Buffer;
+use crate::completion as oneshot;
 
 use super::BuddyAllocator;
+
+/// Channel operations deferred until the allocator mutex has been released.
+///
+/// Even dropping a cancelled sender may run a receiver waker while receiver
+/// cancellation is still in progress. Keeping both sender and buffer here also
+/// makes a failed send's buffer destruction safe to re-enter the pool.
+#[derive(Default)]
+pub(in crate::pool) struct Handoffs {
+    // Single-buffer handoffs are common; keep that path allocation-free.
+    first: Option<Handoff>,
+    overflow: Vec<Handoff>,
+}
+
+enum Handoff {
+    Deliver(oneshot::Sender<Buffer>, Buffer),
+    Cancel(oneshot::Sender<Buffer>),
+}
+
+impl Handoffs {
+    fn deliver(&mut self, sender: oneshot::Sender<Buffer>, buffer: Buffer) {
+        self.push(Handoff::Deliver(sender, buffer));
+    }
+
+    fn cancel(&mut self, sender: oneshot::Sender<Buffer>) {
+        self.push(Handoff::Cancel(sender));
+    }
+
+    fn push(&mut self, handoff: Handoff) {
+        if self.first.is_none() {
+            self.first = Some(handoff);
+        } else {
+            self.overflow.push(handoff);
+        }
+    }
+
+    /// Runs with no pool lock held. Capacity has already been assigned, so
+    /// competing allocations cannot steal a waiter's buffer before it wakes.
+    #[inline]
+    pub(in crate::pool) fn finish(&mut self, pool: &Arc<BufferPool>) {
+        if self.first.is_some() {
+            self.finish_pending(pool);
+        }
+    }
+
+    fn finish_pending(&mut self, pool: &Arc<BufferPool>) {
+        while let Some(first) = self.first.take() {
+            if self.overflow.is_empty() {
+                self.finish_one(first, pool);
+            } else {
+                self.finish_overflow(first, pool);
+            }
+        }
+    }
+
+    // Most frees produce just one handoff. Keep the Vec iterator and its unwind
+    // cleanup out of that path while preserving assignment order for batches.
+    #[inline(never)]
+    fn finish_overflow(&mut self, first: Handoff, pool: &Arc<BufferPool>) {
+        let overflow = std::mem::take(&mut self.overflow);
+        self.finish_one(first, pool);
+        for handoff in overflow {
+            self.finish_one(handoff, pool);
+        }
+    }
+
+    #[inline(always)]
+    fn finish_one(&mut self, handoff: Handoff, pool: &Arc<BufferPool>) {
+        match handoff {
+            Handoff::Deliver(sender, buffer) => {
+                if let Err(buffer) = sender.send(buffer) {
+                    self.recycle_failed(buffer, pool);
+                }
+            }
+            Handoff::Cancel(sender) => drop(sender),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn recycle_failed(&mut self, buffer: Buffer, pool: &Arc<BufferPool>) {
+        // Recycle into this worklist instead of recursively dropping buffers
+        // through return_buffer for every cancellation. The next loop iteration
+        // handles any handoffs produced while returning the rejected buffer.
+        let (level, index, block) = buffer.into_raw_parts();
+        let mut inner = pool.inner.lock().expect("BufferPool mutex poisoned");
+        inner.deallocate_buffer(pool, level, index, block, self);
+    }
+}
 
 /// A queued asynchronous allocation waiting for capacity.
 pub(super) struct Waiter {
@@ -66,17 +154,18 @@ unsafe impl Send for ReservedSubtree {}
 impl BuddyAllocator {
     /// Releases the reservation if its waiter has been cancelled.
     /// Returns `true` if a reservation was reclaimed.
-    pub(super) fn reclaim_cancelled_reservation(&mut self) -> bool {
+    pub(super) fn reclaim_cancelled_reservation(&mut self, handoffs: &mut Handoffs) -> bool {
         let Some(res) = &self.reservation else {
             return false;
         };
-        if !res.sender.is_closed() {
+        if !res.sender.is_canceled() {
             return false;
         }
         let res = self.reservation.take().unwrap();
         if let Some(sub) = &res.subtree {
             self.release_reservation_subtree(res.level, sub);
         }
+        handoffs.cancel(res.sender);
         true
     }
 
@@ -93,11 +182,26 @@ impl BuddyAllocator {
     /// Smallest-first is a deliberate policy: it maximizes the number of
     /// satisfied waiters. Large waiters are protected from starvation by the
     /// reservation mechanism (see [`Reservation`]).
-    pub(in crate::pool) fn serve_waiters(&mut self, pool: &Arc<BufferPool>) {
-        self.try_complete_reservation_from_lists(pool);
+    pub(in crate::pool) fn serve_waiters(
+        &mut self,
+        pool: &Arc<BufferPool>,
+        handoffs: &mut Handoffs,
+    ) {
+        self.try_complete_reservation_from_lists(pool, handoffs);
 
         while let Some(wait_level) = self.min_waiting_level {
-            let Some(buffer) = self.try_allocate_local(wait_level, pool) else {
+            if self.waiting_lists[wait_level]
+                .front()
+                .expect("waiting list at min_waiting_level must be non-empty")
+                .sender
+                .is_canceled()
+            {
+                let waiter = self.waiting_lists[wait_level].pop_front().unwrap();
+                self.update_min_waiting_level_on_remove(wait_level);
+                handoffs.cancel(waiter.sender);
+                continue;
+            }
+            let Some(buffer) = self.try_allocate_local(wait_level, pool, handoffs) else {
                 break;
             };
 
@@ -106,7 +210,7 @@ impl BuddyAllocator {
                 .expect("waiting list at min_waiting_level must be non-empty");
             self.update_min_waiting_level_on_remove(wait_level);
 
-            self.deliver(waiter.sender, buffer);
+            handoffs.deliver(waiter.sender, buffer);
         }
 
         // Every writer of this hint holds the allocator mutex. Skip unchanged
@@ -142,6 +246,7 @@ impl BuddyAllocator {
         level: usize,
         index: usize,
         block: NonNull<BuddyBlock>,
+        handoffs: &mut Handoffs,
     ) -> bool {
         let Some(res) = &mut self.reservation else {
             return false;
@@ -153,7 +258,7 @@ impl BuddyAllocator {
             return false;
         }
 
-        if res.sender.is_closed() {
+        if res.sender.is_canceled() {
             // The reserved waiter was cancelled: mark this node absorbed as
             // well, then release the whole subtree in one pass. (Freeing the
             // node separately first would double-process it during release.)
@@ -161,6 +266,7 @@ impl BuddyAllocator {
             let state = unsafe { BuddyBlock::allocator_state(block) };
             state.set_state(level, index, NodeState::Free);
             self.release_reservation_subtree(res.level, &res.subtree.unwrap());
+            handoffs.cancel(res.sender);
             return true;
         }
 
@@ -168,7 +274,7 @@ impl BuddyAllocator {
         debug_assert_eq!(state.get_state(level, index), NodeState::Allocated);
         state.set_state(level, index, NodeState::Free); // absorbed marker
         sub.collected += LEVEL_SIZES[level];
-        self.try_finalize_reservation(pool);
+        self.try_finalize_reservation(pool, handoffs);
         true
     }
 
@@ -179,7 +285,7 @@ impl BuddyAllocator {
     /// at least 1 (largest level first) has been queued longer than the
     /// starvation timeout, removes it from the waiting lists and activates a
     /// reservation for it.
-    pub(super) fn check_starvation(&mut self, pool: &Arc<BufferPool>) {
+    pub(super) fn check_starvation(&mut self, pool: &Arc<BufferPool>, handoffs: &mut Handoffs) {
         if let Some(res) = &self.reservation {
             if res.subtree.is_some() {
                 return;
@@ -188,7 +294,7 @@ impl BuddyAllocator {
             let level = res.level;
             if let Some(subtree) = self.reserve_subtree(level) {
                 self.reservation.as_mut().unwrap().subtree = Some(subtree);
-                self.try_finalize_reservation(pool);
+                self.try_finalize_reservation(pool, handoffs);
             }
             return;
         }
@@ -214,7 +320,7 @@ impl BuddyAllocator {
                 level,
                 subtree,
             });
-            self.try_finalize_reservation(pool);
+            self.try_finalize_reservation(pool, handoffs);
             return;
         }
     }
@@ -296,7 +402,11 @@ impl BuddyAllocator {
 
     /// Completes the reservation if its subtree has been fully collected:
     /// the whole subtree is handed to the waiter as a single buffer.
-    pub(super) fn try_finalize_reservation(&mut self, pool: &Arc<BufferPool>) {
+    pub(super) fn try_finalize_reservation(
+        &mut self,
+        pool: &Arc<BufferPool>,
+        handoffs: &mut Handoffs,
+    ) {
         let Some(res) = &self.reservation else {
             return;
         };
@@ -338,7 +448,7 @@ impl BuddyAllocator {
                 Arc::clone(pool),
             )
         };
-        self.deliver(res.sender, buffer);
+        handoffs.deliver(res.sender, buffer);
     }
 
     /// Priority claim for the reserved waiter: if public capacity at its
@@ -346,8 +456,12 @@ impl BuddyAllocator {
     /// and release any partially drained subtree back to the pool.
     ///
     /// Also detects a cancelled reserved waiter and releases its subtree.
-    pub(super) fn try_complete_reservation_from_lists(&mut self, pool: &Arc<BufferPool>) {
-        if self.reclaim_cancelled_reservation() {
+    pub(super) fn try_complete_reservation_from_lists(
+        &mut self,
+        pool: &Arc<BufferPool>,
+        handoffs: &mut Handoffs,
+    ) {
+        if self.reclaim_cancelled_reservation(handoffs) {
             return;
         }
         let Some(res) = &self.reservation else {
@@ -355,7 +469,7 @@ impl BuddyAllocator {
         };
 
         let level = res.level;
-        let Some(buffer) = self.try_allocate_local(level, pool) else {
+        let Some(buffer) = self.try_allocate_available(level, pool) else {
             return;
         };
 
@@ -363,7 +477,7 @@ impl BuddyAllocator {
         if let Some(sub) = &res.subtree {
             self.release_reservation_subtree(res.level, sub);
         }
-        self.deliver(res.sender, buffer);
+        handoffs.deliver(res.sender, buffer);
     }
 
     /// Returns all absorbed capacity of a released reservation to the pool.
@@ -410,16 +524,6 @@ impl BuddyAllocator {
         {
             self.min_waiting_level =
                 (removed_level..NUM_LEVELS).find(|&level| !self.waiting_lists[level].is_empty());
-        }
-    }
-    /// Handoff can race with cancellation. Reclaim under the existing lock:
-    /// dropping Buffer here would recursively lock the allocator and deadlock.
-    fn deliver(&mut self, sender: oneshot::Sender<Buffer>, buffer: Buffer) {
-        if let Err(buffer) = sender.send(buffer) {
-            let (level, index, block) = buffer.into_raw_parts();
-            // SAFETY: the live buffer retained the block; the pool lock gives
-            // exclusive access to its allocation state.
-            self.try_merge(unsafe { BuddyBlock::allocator_state(block) }, level, index);
         }
     }
 }

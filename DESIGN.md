@@ -22,6 +22,11 @@ The core crate forbids unsafe code. Allocation, registration and verbs belong
 in its dependencies, whose APIs enforce local memory ownership and completion
 evidence. See [safety boundaries](docs/safe-boundaries.md) for these contracts
 and the separate application-source validation scheme.
+Bufpool allocation and RDMA completion futures are runtime independent.
+They share a safe single-value notification implementation in bufpool's hidden
+`completion` module; it supplies notification, not completion authority.
+The core owns Tokio integration and READ deadline/connection-failure policy;
+the dependencies retain buffer ownership and completion authority.
 
 ## Core library boundaries
 
@@ -128,6 +133,7 @@ dependency independently validates the owned destination plan before posting.
 | `with_buffers.rs` | Completed-write witnesses and typed buffer-returning responses |
 | `rdma/rdma_socket/read.rs` | Concrete READ planning and execution |
 | `rdma/rdma_socket/read/credits.rs` | SQ/NIC admission, closure and completion credits |
+| `rdma/rdma_socket/read/pending.rs` | Weak READ tracking, deadline policy and failure notification |
 
 RDMA transfers use READ in both directions: `remote_write` asks the client to
 read the server's source. Application reads validate the original waiter after

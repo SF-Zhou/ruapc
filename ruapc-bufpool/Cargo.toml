@@ -17,7 +17,6 @@ foldhash.workspace = true
 libc.workspace = true
 schemars.workspace = true
 serde.workspace = true
-tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync", "rt", "rt-multi-thread", "macros", "time"] }
@@ -36,6 +35,10 @@ harness = false
 
 [[bench]]
 name = "handoff"
+harness = false
+
+[[bench]]
+name = "async_handoff"
 harness = false
 
 [lints]

@@ -121,6 +121,14 @@ resolves local addresses and registration keys internally. Its non-cloneable
 the cursor accounts for its unposted suffix while the QP retains posted work.
 Explicit cancellation before any post can recover the destination vector.
 
+Preparation also returns a concrete, runtime-independent `ReadCompletion`
+future. It yields `Result<Vec<Buffer>, ReadFailure>`; `try_recv` checks for a
+ready result without waiting. This crate and its production dependencies do
+not require Tokio. `ReadPosting::handle` provides a weak `ReadHandle` for
+observing progress or notifying failure without granting completion authority.
+The application owns deadline and connection-failure policy; RuaPC implements
+it in its [READ admission and failure layer](../docs/rdma-capacity.md#read-admission-and-failure).
+
 Timeout or connection failure can notify a receiver before DMA has stopped.
 Posted destinations remain owned until all posted READs complete or the provider
 successfully destroys the QP. Dropping or forgetting a future cannot release

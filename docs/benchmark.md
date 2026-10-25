@@ -101,10 +101,11 @@ Arc traffic, the per-WR acceptance store and nonfinal completion accounting
 using one long-lived batch; the two-thread version allows 64 WRs in flight and
 includes atomic publication/backpressure plus the acceptance/completion
 contention on that shared batch. `ledger/lifecycle` includes one short batch's
-creation, pending registration/pruning and final notification while recycling
+creation and final notification while recycling
 its buffers; `ledger/spill` forces the collision fallback with a two-slot table,
 asserts that the fallback actually ran, and is not a normal-path cost. These
-cases exclude the SQ posting mutex, provider calls and CQ polling. A sequence
+cases exclude the core's deadline registry, SQ posting mutex, provider calls
+and CQ polling. A sequence
 reaches the fallback only when an older READ stays in flight across a full
 table of later SQ sequences, so production frequency depends on the workload;
 `QueuePair::read_slot_spills` reports it per QP. Final-completion cases prebuild
@@ -148,10 +149,24 @@ cargo bench -p ruapc-bufpool --bench lazy_merge
 cargo bench -p ruapc-bufpool --bench contention
 cargo bench -p ruapc-bufpool --bench initialization
 cargo bench -p ruapc-bufpool --bench handoff
+cargo bench -p ruapc-bufpool --bench async_handoff
 ```
 
 These harnesses need no RDMA libraries or device:
 
+- [`async_handoff`](../ruapc-bufpool/benches/async_handoff.rs) fills a 64 MiB pool
+  with one buffer, polls an asynchronous allocation to Pending, then either
+  hands the released buffer to that waiter or cancels the waiter before freeing
+  and synchronously reacquiring it. The armed waker counts notifications; no
+  executor runs and no payload bytes are touched. Pool creation, initial
+  allocation, warmup and final destruction are untimed. `RUAPC_BENCH_ITERS`
+  (100000), `RUAPC_BENCH_WARMUP` (1000) and `RUAPC_BENCH_REPEATS` (5) accept
+  positive counts. `RUAPC_BENCH_SLAB_HISTORY=1` allocates and frees a 64 KiB chunk
+  before the initial whole-pool allocation, which reclaims its cached slab.
+  This preparation is untimed; it measures the same waiter cycle in a pool
+  that has previously used slabs. The default is 0 and output records the mode.
+  Pin the process and memory externally. `ns/op` is amortized wall time for
+  the entire registration/delivery or cancellation cycle.
 - [`lazy_merge`](../ruapc-bufpool/benches/lazy_merge.rs) compares eager and default
   lazy merging under churn, bursts, mixed sizes and demand for larger blocks.
 - [`contention`](../ruapc-bufpool/benches/contention.rs) churns 64 KiB slab buffers

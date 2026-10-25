@@ -773,6 +773,15 @@ async fn read_deadlines_bound_partial_posting_without_releasing_dma() {
 
 #[tokio::test]
 async fn parent_read_completion_deadline_preserves_the_hard_watchdog() {
+    completion_watchdog_survives_waiter(false).await;
+}
+
+#[tokio::test]
+async fn cancelled_read_completion_preserves_the_hard_watchdog() {
+    completion_watchdog_survives_waiter(true).await;
+}
+
+async fn completion_watchdog_survives_waiter(cancel_receiver: bool) {
     use crate::remote_memory::{CopyOp, WriteTarget, scatter::SpaceLayout};
 
     let devices = crate::rdma::test_utils::make_rdma_devices();
@@ -836,12 +845,16 @@ async fn parent_read_completion_deadline_preserves_the_hard_watchdog() {
     assert!(futures_util::poll!(&mut read).is_pending());
     assert_eq!(socket.queue_pair.pending_read_count(), 1);
     let now = Instant::now();
-    poll_loop.maintain_connections(now + Duration::from_millis(100), true, false);
-    let error = tokio::time::timeout(Duration::from_secs(1), read)
-        .await
-        .expect("the parent deadline must settle an already-posted batch")
-        .unwrap_err();
-    assert_eq!(error.kind, ErrorKind::Timeout);
+    if cancel_receiver {
+        drop(read);
+    } else {
+        poll_loop.maintain_connections(now + Duration::from_millis(100), true, false);
+        let error = tokio::time::timeout(Duration::from_secs(1), read)
+            .await
+            .expect("the parent deadline must settle an already-posted batch")
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Timeout);
+    }
     assert!(socket.state.is_ok());
     assert_eq!(socket.queue_pair.pending_read_count(), 1);
     assert_eq!(permits.available_permits(), 0);
@@ -1125,7 +1138,6 @@ async fn a_read_posted_after_the_shutdown_scan_does_not_wait_for_a_stopped_polle
                     len: 64,
                 }],
             }],
-            None,
         )
         .unwrap();
     let device_permit = permits.acquire().await.unwrap();
@@ -1140,6 +1152,7 @@ async fn a_read_posted_after_the_shutdown_scan_does_not_wait_for_a_stopped_polle
         Ok(()) => {
             device_permit.forget();
             assert_eq!(socket.queue_pair.pending_read_count(), 1);
+            socket.register_read_batch(&posting, None, None);
             let error =
                 tokio::time::timeout(Duration::from_secs(1), socket.await_read_batch(receiver))
                     .await

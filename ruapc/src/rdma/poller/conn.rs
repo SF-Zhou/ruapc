@@ -615,7 +615,7 @@ impl ConnState {
         if self.socket.read_credits.is_idle() {
             return;
         }
-        if self.socket.queue_pair.expire_reads(now) {
+        if self.socket.expire_read_batches(now) {
             tracing::error!(
                 "RDMA READ timeout on qp={}, moving connection to error state",
                 self.socket.queue_pair.qp_num()

@@ -4,10 +4,12 @@
 use std::{sync::Arc, time::Instant};
 
 use ruapc_bufpool::RemoteBufferInfo;
-use ruapc_rdma::{ReadFailure, ReadPosting, ReadReceiver, ReadRequest, ReadSegment};
+use ruapc_rdma::{ReadCompletion, ReadFailure, ReadPosting, ReadRequest, ReadSegment};
 
 mod credits;
+mod pending;
 pub(crate) use credits::ReadCredits;
+pub(super) use pending::PendingReads;
 
 use super::RdmaSocket;
 use crate::{
@@ -139,7 +141,21 @@ impl RdmaSocket {
     }
 
     pub(crate) fn fail_read_batches(&self) {
-        self.queue_pair.fail_pending_reads();
+        self.pending_reads.fail();
+    }
+
+    pub(crate) fn expire_read_batches(&self, now: Instant) -> bool {
+        self.pending_reads.expire(now)
+    }
+
+    pub(crate) fn register_read_batch(
+        &self,
+        posting: &ReadPosting,
+        read_deadline: Option<Instant>,
+        request_deadline: Option<Instant>,
+    ) {
+        self.pending_reads
+            .register(posting.handle(), read_deadline, request_deadline);
     }
 
     /// Preparation takes real buffer ownership; local addresses and keys never
@@ -183,8 +199,9 @@ impl RdmaSocket {
         }
         let (mut posting, receiver) = self
             .queue_pair
-            .prepare_reads_with_deadlines(local, reads, read_deadline, request_deadline)
+            .prepare_reads(local, reads)
             .map_err(|(error, buffers)| RemoteIoError::new(plan_error(error), Some(buffers)))?;
+        let mut registered = false;
         while posting.remaining() != 0 {
             if let Err(error) = self.post_read(&mut posting, deadline).await {
                 // The cursor returns buffers only before the first post;
@@ -200,6 +217,13 @@ impl RdmaSocket {
                 }
                 return Err(RemoteIoError::new(error, buffers));
             }
+            if !registered {
+                // Publish after the first provider-accepted WR and before the
+                // next await, including admission for a later WR. Cancellation
+                // cannot skip registration while leaving posted DMA behind.
+                self.register_read_batch(&posting, read_deadline, request_deadline);
+                registered = true;
+            }
         }
         let result = self.await_read_batch(receiver).await;
         // Retain the posting owner's Arc until notification so the runtime
@@ -209,7 +233,7 @@ impl RdmaSocket {
     }
 
     /// Waits after posting finishes or its unposted suffix has been cancelled.
-    pub(crate) async fn await_read_batch(&self, receiver: ReadReceiver) -> Result<Vec<Buffer>> {
+    pub(crate) async fn await_read_batch(&self, receiver: ReadCompletion) -> Result<Vec<Buffer>> {
         // A task may pass its final health check, then record its READ only
         // after shutdown has scanned the pending list. Recheck only once per
         // batch, after posting, so that late work receives a failure even when
@@ -221,11 +245,7 @@ impl RdmaSocket {
         if !self.state.is_ok() {
             self.fail_read_batches();
         }
-        match receiver.await {
-            Ok(Ok(buffers)) => Ok(buffers),
-            Ok(Err(reason)) => Err(read_failure_error(reason)),
-            Err(_) => Err(read_failure_error(ReadFailure::Cancelled)),
-        }
+        receiver.await.map_err(read_failure_error)
     }
 
     async fn post_read(

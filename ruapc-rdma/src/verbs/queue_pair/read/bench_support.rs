@@ -36,8 +36,8 @@ pub struct Batch(Arc<ReadBatch>);
 
 impl Batch {
     #[inline]
-    pub fn new(count: usize, buffers: Vec<Buffer>) -> (Self, ReadReceiver) {
-        let (batch, receiver) = ReadBatch::new(count, buffers, None, None);
+    pub fn new(count: usize, buffers: Vec<Buffer>) -> (Self, ReadCompletion) {
+        let (batch, receiver) = ReadBatch::new(count, buffers);
         (Self(batch), receiver)
     }
 
@@ -83,13 +83,6 @@ impl Ledger {
     /// power of two). A depth of one forces collisions into the fallback map.
     pub fn with_depth(depth: u32) -> Self {
         Self(ReadState::new(depth))
-    }
-
-    /// Marks a batch as having an accepted WR, enabling the pending-list path
-    /// exercised by real READ deadlines and failure scans.
-    #[inline]
-    pub fn register(&self, batch: &Batch) {
-        self.0.register_pending(&batch.0);
     }
 
     /// Number of inserts that had to use the collision fallback map.

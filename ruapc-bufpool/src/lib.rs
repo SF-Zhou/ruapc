@@ -34,6 +34,8 @@
 mod aligned;
 mod buddy;
 mod buffer;
+#[doc(hidden)]
+pub mod completion;
 mod intrusive_list;
 mod pool;
 mod slab;

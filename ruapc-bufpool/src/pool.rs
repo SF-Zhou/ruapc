@@ -10,11 +10,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aliasable::boxed::AliasableBox;
-use tokio::sync::oneshot;
 
 use crate::AlignedMemory;
 use crate::buddy::{BuddyBlock, LEVEL_SIZES, NUM_LEVELS, SIZE_64MIB, size_to_level};
 use crate::buffer::Buffer;
+use crate::completion as oneshot;
 use crate::devices::Devices;
 use crate::slab::{NUM_SLAB_CLASSES, SLAB_CLASS_SIZES, SlabClass, size_to_class};
 use crate::thread_cache::CacheShard;
@@ -25,7 +25,7 @@ mod small;
 #[cfg(test)]
 mod tests;
 
-use allocator::BuddyAllocator;
+use allocator::{BuddyAllocator, Handoffs};
 pub use builder::{BufferPoolBuilder, DEFAULT_BUFFER_POOL_MEMORY};
 
 enum AllocationStep {
@@ -52,6 +52,10 @@ pub struct BufferPool {
     /// empty-slab watermark, so that cached slabs cannot stall waiters or
     /// the anti-starvation drain. Conservatively-true is harmless.
     has_demand: AtomicBool,
+    /// Monotonic hint published before installing any slab. Pools that only
+    /// use buddy buffers can skip reclaiming unused slab classes and caches.
+    /// Once true, retain the normal reclaim sweeps even after all slabs drain.
+    may_have_slabs: AtomicBool,
     /// Slab size classes for small allocations, each behind its own mutex
     /// so small-buffer traffic does not contend on the buddy pool's mutex.
     /// Lock ordering: a slab class lock may be taken before `inner`, never
@@ -112,7 +116,17 @@ impl BufferPool {
         block: NonNull<BuddyBlock>,
     ) {
         let mut inner = self.inner.lock().expect("BufferPool mutex poisoned");
-        inner.deallocate_buffer(self, level, index, block);
+        if inner.try_deallocate_without_waiters(self, level, index, block) {
+            return;
+        }
+        // Create a handoff queue only when demand exists. Move the held guard
+        // into the inner scope so it is released before handoffs on unwinding.
+        let mut handoffs = Handoffs::default();
+        {
+            let mut inner = inner;
+            inner.deallocate_buffer_with_waiters(self, level, index, block, &mut handoffs);
+        }
+        handoffs.finish(self);
     }
 
     /// Allocates a buffer of at least the specified size.
@@ -148,7 +162,7 @@ impl BufferPool {
     fn allocate_buddy(self: &Arc<Self>, level: usize) -> Result<Buffer> {
         {
             let mut inner = self.inner.lock().expect("BufferPool mutex poisoned");
-            if let Some(buffer) = inner.try_allocate_local(level, self) {
+            if let Some(buffer) = inner.try_allocate_available(level, self) {
                 return Ok(buffer);
             }
         }
@@ -170,7 +184,8 @@ impl BufferPool {
     /// Like [`Self::allocate`], pool growth (block creation and device
     /// registration) happens outside the pool mutex. Note that it still runs
     /// on the current thread and may block it for the duration of the device
-    /// registration; this only happens when the pool actually grows.
+    /// registration; this only happens when the pool actually grows. Waiting
+    /// uses a runtime-independent future; no Tokio runtime is required.
     ///
     /// # Errors
     ///
@@ -194,7 +209,7 @@ impl BufferPool {
         loop {
             {
                 let mut inner = self.inner.lock().expect("BufferPool mutex poisoned");
-                if let Some(buffer) = inner.try_allocate_local(level, self) {
+                if let Some(buffer) = inner.try_allocate_available(level, self) {
                     return Ok(buffer);
                 }
             }
@@ -216,22 +231,25 @@ impl BufferPool {
     fn prepare_allocation(self: &Arc<Self>, level: usize, wait: bool) -> Result<AllocationStep> {
         self.reclaim_cached_capacity();
 
-        let receiver = {
-            let mut inner = self.inner.lock().expect("BufferPool mutex poisoned");
-            if let Some(buffer) = inner.try_allocate_local(level, self) {
+        let step = self.with_allocator(|inner, handoffs| {
+            if let Some(buffer) = inner.try_allocate_local(level, self, handoffs) {
                 return Ok(AllocationStep::Ready(buffer));
             }
-            match inner.try_reserve_block(self.max_memory) {
-                Ok(()) => return Ok(AllocationStep::Grow),
-                Err(error) if !wait => return Err(error),
-                Err(_) => inner.wait_for(level, self),
+            if inner.try_reserve_block(self.max_memory) {
+                Ok(AllocationStep::Grow)
+            } else if wait {
+                Ok(AllocationStep::Wait(inner.wait_for(level, self)))
+            } else {
+                Err(Error::new(ErrorKind::OutOfMemory, "memory limit reached"))
             }
-        };
+        })?;
 
-        // A concurrent free either observes registered demand or is captured by
-        // this sweep. Idle threads cannot strand cached chunks while we wait.
-        self.reclaim_cached_capacity();
-        Ok(AllocationStep::Wait(receiver))
+        if matches!(step, AllocationStep::Wait(_)) {
+            // A concurrent free either observes registered demand or is captured
+            // by this sweep. Idle threads cannot strand cached chunks while we wait.
+            self.reclaim_cached_capacity();
+        }
+        Ok(step)
     }
 
     /// Completes an already reserved growth without holding the pool lock during
@@ -239,11 +257,27 @@ impl BufferPool {
     /// handing remaining capacity to waiters queued during registration.
     fn grow_and_allocate(self: &Arc<Self>, level: usize) -> Result<Buffer> {
         let block = self.create_block_or_release()?;
-        let mut inner = self.inner.lock().expect("BufferPool mutex poisoned");
-        inner.install_block(block);
-        let buffer = inner.try_allocate_local(level, self);
-        inner.serve_waiters(self);
-        buffer.ok_or_else(|| Error::other("fresh block did not satisfy reserved allocation"))
+        self.with_allocator(|inner, handoffs| {
+            inner.install_block(block);
+            let buffer = inner.try_allocate_local(level, self, handoffs);
+            inner.serve_waiters(self, handoffs);
+            buffer.ok_or_else(|| Error::other("fresh block did not satisfy reserved allocation"))
+        })
+    }
+
+    /// Keeps channel sends, sender destruction and user wakers outside the
+    /// allocator lock. The handoff queue outlives the guard even during unwinding.
+    fn with_allocator<T>(
+        self: &Arc<Self>,
+        operation: impl FnOnce(&mut BuddyAllocator, &mut Handoffs) -> T,
+    ) -> T {
+        let mut handoffs = Handoffs::default();
+        let result = {
+            let mut inner = self.inner.lock().expect("BufferPool mutex poisoned");
+            operation(&mut inner, &mut handoffs)
+        };
+        handoffs.finish(self);
+        result
     }
 
     /// Creates and registers a new 64 MiB block. Requires a prior successful

@@ -46,6 +46,7 @@ pub struct RdmaSocket {
     large: large::LargeTransfers,
     /// Field order ensures unpolled READ permits return only after QP destruction.
     pub(crate) read_credits: ReadCredits,
+    pending_reads: read::PendingReads,
     pub(crate) rdmabuf_pool: Arc<BufferPool>,
     pub(crate) state: RdmaState,
     /// Window-blocked framed sends, flushed by the poll thread once
@@ -88,6 +89,7 @@ impl RdmaSocket {
             queue_pair,
             large: large::LargeTransfers::new(config.max_inflight_large_bytes),
             read_credits: ReadCredits::new(config.read_permits, config.sq_read_cap),
+            pending_reads: read::PendingReads::default(),
             rdmabuf_pool,
             state: RdmaState::new(config.send_window.max(1)),
             pending_sender,

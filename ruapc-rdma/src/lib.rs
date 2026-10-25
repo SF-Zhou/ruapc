@@ -63,8 +63,9 @@ mod verbs;
 pub use verbs::{
     ActiveDevice, CompChannel, CompletedWork, Completion, CompletionBatch, CompletionCursor,
     CompletionIdentity, CompletionQueue, Completions, Context, Device, DeviceList, MAX_GATHER_SGE,
-    MemoryRegion, ProtectionDomain, QpConnectionConfig, QpRegistryStats, QueuePair, ReadFailure,
-    ReadPosting, ReadReceiver, ReadRequest, ReadSegment, ReadSge, WrBuffers,
+    MemoryRegion, ProtectionDomain, QpConnectionConfig, QpRegistryStats, QueuePair, ReadCompletion,
+    ReadFailure, ReadHandle, ReadObservation, ReadPosting, ReadRequest, ReadSegment, ReadSge,
+    WrBuffers,
 };
 
 #[cfg(test)]
