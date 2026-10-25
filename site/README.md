@@ -50,9 +50,10 @@ README and the checker, then uploads it as the Pages artifact.
 
 ## Updating
 
-- The release version appears in the hero eyebrow, both install commands,
-  social metadata, structured data and the OG artwork. Update them together
-  when the crate version changes.
+- The release version appears in the hero eyebrow, both install commands
+  (including their copy text and accessible labels), and structured data.
+  Update them together when the crate version changes. Keep the OG artwork
+  free of release version numbers.
 - The canonical URL, Open Graph metadata, sitemap and `robots.txt` use
   `https://sf-zhou.github.io/ruapc/`. Update all of them (and the root README
   link) together if the site moves to a custom domain.
