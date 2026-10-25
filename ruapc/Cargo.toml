@@ -55,7 +55,9 @@ unsafe_code = "forbid"
 [dev-dependencies]
 # Self dev-dependency: enables the `rdma` feature for this crate's own unit,
 # integration tests, and benches without forcing it on downstream users.
-ruapc = { workspace = true, features = ["rdma"] }
+# Keep this path-only: a registry version requirement would make packaging
+# resolve `ruapc` from the registry before this release is uploaded.
+ruapc = { path = ".", features = ["rdma"] }
 
 metrics-util.workspace = true
 reqwest.workspace = true
