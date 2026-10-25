@@ -78,7 +78,7 @@ impl Context {
         })
     }
 
-    /// Reuses shared state for TCP bootstrap RPCs to an RDMA peer.
+    /// Reuses shared state for bootstrap RPCs to an RDMA peer.
     #[cfg(feature = "rdma")]
     pub(crate) fn create_with_state_and_endpoint(state: &Arc<State>, endpoint: Endpoint) -> Self {
         Self {

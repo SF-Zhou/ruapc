@@ -119,7 +119,7 @@ async fn start(
     let addr = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let context = Context::create(client_config)
         .unwrap()
-        .with_endpoint(Endpoint::new(Transport::RDMA, [addr]).unwrap());
+        .with_endpoint(Endpoint::rdma(Transport::TCP, [addr]).unwrap());
     (server, context)
 }
 

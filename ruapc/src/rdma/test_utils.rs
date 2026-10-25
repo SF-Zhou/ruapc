@@ -63,3 +63,15 @@ pub(crate) fn make_rdma_devices() -> Arc<crate::Devices> {
     assert!(!devices.devices().is_empty(), "no RDMA device found");
     Arc::new(devices)
 }
+
+/// Builds an endpoint for a transport loop, using TCP as the RDMA bootstrap.
+pub(crate) fn transport_endpoint(
+    transport: crate::Transport,
+    address: std::net::SocketAddr,
+) -> crate::Endpoint {
+    if transport == crate::Transport::RDMA {
+        crate::Endpoint::rdma(crate::Transport::TCP, [address]).unwrap()
+    } else {
+        crate::Endpoint::new(transport, [address]).unwrap()
+    }
+}

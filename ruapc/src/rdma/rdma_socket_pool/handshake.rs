@@ -164,7 +164,8 @@ impl RdmaSocketPool {
             traffic_class: local.config.traffic_class,
         };
         // Bootstrap RPCs recurse through SocketPool::acquire. Boxing keeps the
-        // generated future finite; the bootstrap context uses TCP transport.
+        // generated future finite; the bootstrap context uses the endpoint's
+        // declared stream transport.
         let response = Box::pin(self.bootstrap_client.prepare_connection(ctx, &request))
             .await
             .map_err(|err| {

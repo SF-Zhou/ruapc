@@ -152,7 +152,7 @@ impl Fixture {
         let address = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let context = Context::create_with_router(client_router, &config)
             .unwrap()
-            .with_endpoint(Endpoint::new(Transport::RDMA, [address]).unwrap());
+            .with_endpoint(Endpoint::rdma(Transport::TCP, [address]).unwrap());
         // Bootstrap and activation do not consume the short transfer budget.
         let server_conn_id = Client::default().ping(&context, &()).await.unwrap();
         Self {

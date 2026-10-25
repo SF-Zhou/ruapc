@@ -1,8 +1,8 @@
 //! RDMA path awareness: NIC identities and path reports.
 //!
 //! A *path* is the pair of NICs an RDMA connection runs on. Peers are
-//! identified by their complete bootstrap TCP address group; the path belongs
-//! to each individual connection (stripe).
+//! identified by their bootstrap transport and complete address group; the
+//! path belongs to each individual connection (stripe).
 
 use std::net::IpAddr;
 

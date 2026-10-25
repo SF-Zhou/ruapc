@@ -43,7 +43,7 @@ async fn test_rdma_path_report() {
     let client = ruapc::Client::default();
     let ctx = ruapc::Context::create(&config)
         .unwrap()
-        .with_endpoint(Endpoint::new(Transport::RDMA, [addr]).unwrap());
+        .with_endpoint(Endpoint::rdma(Transport::TCP, [addr]).unwrap());
     let rsp = client.hello(&ctx, &"ruapc".to_string()).await.unwrap();
     assert_eq!(rsp, "hello ruapc!");
 
@@ -58,7 +58,7 @@ async fn test_rdma_path_report() {
     let path = &outbound[0].path;
     assert_eq!(
         outbound[0].peer,
-        Some(Endpoint::new(Transport::RDMA, [addr]).unwrap()),
+        Some(Endpoint::rdma(Transport::TCP, [addr]).unwrap()),
     );
     assert!(outbound[0].healthy);
     assert!(!path.local.device.is_empty());

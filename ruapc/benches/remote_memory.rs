@@ -20,11 +20,15 @@ use std::{
 };
 
 use ruapc::{
-    Buffer, BufferPool, Client, Context, Endpoint, ListenMode, Result, ResultWithBuffers, Router,
-    Server, SocketPoolConfig, Transport,
+    Buffer, BufferPool, Client, Context, ListenMode, Result, ResultWithBuffers, Router, Server,
+    SocketPoolConfig, Transport,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+mod common;
+
+use common::endpoint;
 
 const WARMUP_ITERS: usize = 8;
 /// Size in bytes and measured iterations; the larger case moves more bytes.
@@ -260,7 +264,7 @@ async fn run(options: BenchOptions) {
             continue;
         }
         println!("{transport:?}");
-        let ctx = base_ctx.with_endpoint(Endpoint::new(transport, [addr]).unwrap());
+        let ctx = base_ctx.with_endpoint(endpoint(transport, addr));
         let probe = Client {
             timeout: Duration::from_secs(1),
             connect_timeout: Duration::from_secs(5),

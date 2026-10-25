@@ -68,7 +68,7 @@ async fn assert_reconcile_yields_to_foreground(periodic: bool) {
     let (router, mut requests) = gated_router();
     let server = Server::create(router, &config).unwrap();
     let address = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
-    let endpoint = Endpoint::new(Transport::RDMA, [address]).unwrap();
+    let endpoint = Endpoint::rdma(Transport::TCP, [address]).unwrap();
     let context = Context::create(&config).unwrap();
     let pool = context.state.socket_pool.rdma_pool().unwrap();
     let peer = pool.peer(&endpoint);

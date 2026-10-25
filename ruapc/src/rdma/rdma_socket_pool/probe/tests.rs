@@ -290,7 +290,7 @@ impl Fixture {
             &config(client_interval, timeout_ms),
         )
         .unwrap()
-        .with_endpoint(Endpoint::new(Transport::RDMA, [address]).unwrap());
+        .with_endpoint(Endpoint::rdma(Transport::TCP, [address]).unwrap());
         let client = Client {
             max_retries: 0,
             ..Default::default()

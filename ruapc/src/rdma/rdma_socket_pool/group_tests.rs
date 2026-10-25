@@ -13,8 +13,8 @@ fn pool_without_rdma_devices() -> RdmaSocketPool {
 }
 
 fn endpoint(ports: &[u16]) -> Endpoint {
-    Endpoint::new(
-        Transport::RDMA,
+    Endpoint::rdma(
+        Transport::TCP,
         ports
             .iter()
             .map(|port| SocketAddr::from(([127, 0, 0, 1], *port))),
@@ -100,81 +100,101 @@ async fn overlapping_groups_keep_independent_peer_state() {
     assert!(subset.meta.lock().unwrap().last_used.is_none());
 }
 
-#[tokio::test]
-async fn bootstrap_group_reconnects_through_another_listener_without_rdma_hardware() {
+fn mark_closed(socket: &Socket) -> bool {
+    match socket {
+        Socket::TCP(socket) => socket.mark_closed(),
+        Socket::WS(socket) => socket.mark_closed(),
+        Socket::HTTP(crate::http::HttpSocket::Stream(socket)) => socket.mark_closed(),
+        Socket::HTTP(crate::http::HttpSocket::ForResponse(_)) => false,
+        #[cfg(feature = "rdma")]
+        Socket::RDMA(_) => false,
+    }
+}
+
+fn bootstrap_config() -> SocketPoolConfig {
     // Keep the real bootstrap service and RDMA pool, but register no RDMA
-    // devices. Discovery and TCP entry-point failover require no verbs work.
-    let mut config = SocketPoolConfig::default();
+    // devices. Discovery and bootstrap entry-point failover require no verbs
+    // work, and a UNIFIED listener can serve every bootstrap transport.
+    let mut config = SocketPoolConfig {
+        listen_mode: crate::ListenMode::UNIFIED,
+        ..Default::default()
+    };
     config.rdma.as_mut().unwrap().path.device_filter =
         vec!["ruapc-test-no-matching-rdma-device".into()];
-    let server = Server::create(Router::default(), &config).unwrap();
-    assert!(server.state().devices.devices().is_empty());
-    let first = Listener::new();
-    let second = Listener::new();
-    let first_addr = first
-        .start_listen("127.0.0.1:0".parse().unwrap(), server.state())
-        .await
-        .unwrap();
-    let second_addr = second
-        .start_listen("127.0.0.1:0".parse().unwrap(), server.state())
-        .await
-        .unwrap();
-    let unavailable = "127.0.0.1:0".parse().unwrap();
-    let group = Endpoint::new(Transport::RDMA, [second_addr, unavailable, first_addr]).unwrap();
-    let peer = PeerState::new(group.clone());
-    let context = Context::create(&SocketPoolConfig {
-        rdma: None,
-        ..Default::default()
-    })
-    .unwrap();
-    let bootstrap = peer.bootstrap_context(&context.state);
-    let crate::core::ContextEndpoint::Endpoint(tcp_endpoint) = &bootstrap.endpoint else {
-        panic!("bootstrap must retain an address group");
-    };
-    assert_eq!(tcp_endpoint.transport(), Transport::TCP);
-    assert_eq!(tcp_endpoint.addrs(), group.addrs());
-    let client = Client {
-        max_retries: 0,
-        ..Default::default()
-    };
-    let info = client.discover(&bootstrap, &()).await.unwrap();
-    assert_eq!(info.protocol_version, RDMA_BOOTSTRAP_PROTOCOL_VERSION);
-    assert!(info.devices.is_empty());
-    let Socket::TCP(original) = context
-        .state
-        .socket_pool
-        .acquire(tcp_endpoint, &context.state)
-        .await
-        .unwrap()
-    else {
-        panic!("bootstrap must use TCP");
-    };
+    config
+}
 
-    // The normalized TCP group tries port zero, then the lower live port.
-    // Stop that accept loop and invalidate its cached connection. The same
-    // bootstrap context must still discover through the other listener.
-    let (closed, remaining) = if first_addr < second_addr {
-        (&first, &second)
-    } else {
-        (&second, &first)
-    };
-    closed.stop();
-    closed.join().await;
-    assert!(original.mark_closed());
-    let info = client.discover(&bootstrap, &()).await.unwrap();
-    assert_eq!(info.protocol_version, RDMA_BOOTSTRAP_PROTOCOL_VERSION);
-    let replacement = context
-        .state
-        .socket_pool
-        .acquire(tcp_endpoint, &context.state)
-        .await
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bootstrap_group_reconnects_through_another_listener_for_every_transport() {
+    for bootstrap_transport in [Transport::TCP, Transport::WS, Transport::HTTP] {
+        let config = bootstrap_config();
+        let server = Server::create(Router::default(), &config).unwrap();
+        assert!(server.state().devices.devices().is_empty());
+        let first = Listener::new();
+        let second = Listener::new();
+        let first_addr = first
+            .start_listen("127.0.0.1:0".parse().unwrap(), server.state())
+            .await
+            .unwrap();
+        let second_addr = second
+            .start_listen("127.0.0.1:0".parse().unwrap(), server.state())
+            .await
+            .unwrap();
+        let unavailable = "127.0.0.1:0".parse().unwrap();
+        let group =
+            Endpoint::rdma(bootstrap_transport, [second_addr, unavailable, first_addr]).unwrap();
+        let peer = PeerState::new(group.clone());
+        let context = Context::create(&SocketPoolConfig {
+            rdma: None,
+            ..Default::default()
+        })
         .unwrap();
-    assert_ne!(replacement.conn_id(), Some(original.conn_id()));
+        let bootstrap = peer.bootstrap_context(&context.state);
+        let crate::core::ContextEndpoint::Endpoint(bootstrap_endpoint) = &bootstrap.endpoint else {
+            panic!("bootstrap must retain an address group");
+        };
+        assert_eq!(bootstrap_endpoint.transport(), bootstrap_transport);
+        assert_eq!(bootstrap_endpoint.addrs(), group.addrs());
+        let client = Client {
+            max_retries: 0,
+            ..Default::default()
+        };
+        let info = client.discover(&bootstrap, &()).await.unwrap();
+        assert_eq!(info.protocol_version, RDMA_BOOTSTRAP_PROTOCOL_VERSION);
+        assert!(info.devices.is_empty());
+        let original = context
+            .state
+            .socket_pool
+            .acquire(bootstrap_endpoint, &context.state)
+            .await
+            .unwrap();
 
-    remaining.stop();
-    remaining.join().await;
-    server.stop();
-    tokio::time::timeout(Duration::from_secs(5), server.join())
-        .await
-        .unwrap();
+        // The normalized group tries port zero, then the lower live port.
+        // Stop that accept loop and invalidate its cached connection. The same
+        // bootstrap context must still discover through the other listener.
+        let (closed, remaining) = if first_addr < second_addr {
+            (&first, &second)
+        } else {
+            (&second, &first)
+        };
+        closed.stop();
+        closed.join().await;
+        assert!(mark_closed(&original));
+        let info = client.discover(&bootstrap, &()).await.unwrap();
+        assert_eq!(info.protocol_version, RDMA_BOOTSTRAP_PROTOCOL_VERSION);
+        let replacement = context
+            .state
+            .socket_pool
+            .acquire(bootstrap_endpoint, &context.state)
+            .await
+            .unwrap();
+        assert_ne!(replacement.conn_id(), original.conn_id());
+
+        remaining.stop();
+        remaining.join().await;
+        server.stop();
+        tokio::time::timeout(Duration::from_secs(5), server.join())
+            .await
+            .unwrap();
+    }
 }

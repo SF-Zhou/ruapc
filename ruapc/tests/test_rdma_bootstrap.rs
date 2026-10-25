@@ -100,13 +100,13 @@ async fn bootstrap_group_reuses_stripes_after_listeners_stop() {
         .await
         .unwrap();
     let unavailable = "127.0.0.1:0".parse().unwrap();
-    let endpoint = Endpoint::new(Transport::RDMA, [first_addr, unavailable, second_addr]).unwrap();
+    let endpoint = Endpoint::rdma(Transport::TCP, [first_addr, unavailable, second_addr]).unwrap();
     let context = Context::create(&config)
         .unwrap()
         .with_endpoint(endpoint.clone());
     let reordered = context.with_endpoint(
-        Endpoint::new(
-            Transport::RDMA,
+        Endpoint::rdma(
+            Transport::TCP,
             [second_addr, first_addr, second_addr, unavailable],
         )
         .unwrap(),
@@ -162,7 +162,7 @@ async fn initial_stripe_failure_rolls_back_all_unpublished_connections() {
     rdma.polling.device_cq_len = 16;
     let context = Context::create(&client_config)
         .unwrap()
-        .with_endpoint(Endpoint::new(Transport::RDMA, [address]).unwrap());
+        .with_endpoint(Endpoint::rdma(Transport::TCP, [address]).unwrap());
     let client = Client {
         max_retries: 0,
         ..Default::default()
@@ -215,7 +215,7 @@ async fn all_initial_stripes_survive_accept_lease_expiration() {
     let (server, address) = start_server(&config).await;
     let context = Context::create(&config)
         .unwrap()
-        .with_endpoint(Endpoint::new(Transport::RDMA, [address]).unwrap());
+        .with_endpoint(Endpoint::rdma(Transport::TCP, [address]).unwrap());
     let client = Client {
         max_retries: 0,
         ..Default::default()
@@ -262,4 +262,38 @@ async fn all_initial_stripes_survive_accept_lease_expiration() {
     }
     drop(context);
     stop_server(&server).await;
+}
+
+/// Bootstrap RPCs use the stream transport named by the RDMA endpoint scheme;
+/// the data plane remains RDMA.
+#[tokio::test]
+async fn stream_bootstrap_transports_establish_rdma_connections() {
+    for (bootstrap, listen_mode) in [
+        (Transport::WS, ListenMode::WS),
+        (Transport::HTTP, ListenMode::HTTP),
+    ] {
+        let mut config = config();
+        config.listen_mode = listen_mode;
+        let (server, address) = start_server(&config).await;
+        let endpoint = Endpoint::rdma(bootstrap, [address]).unwrap();
+        let context = Context::create(&config)
+            .unwrap()
+            .with_endpoint(endpoint.clone());
+        let client = Client {
+            max_retries: 0,
+            ..Default::default()
+        };
+        assert_eq!(client.ping(&context, &7).await.unwrap(), 7);
+        let report = context.state.rdma_path_report().await.unwrap();
+        assert!(!report.paths.is_empty(), "{bootstrap:?}");
+        assert!(
+            report
+                .paths
+                .iter()
+                .all(|path| path.peer.as_ref() == Some(&endpoint)),
+            "{bootstrap:?}: {report:?}"
+        );
+        drop(context);
+        stop_server(&server).await;
+    }
 }

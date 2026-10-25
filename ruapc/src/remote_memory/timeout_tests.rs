@@ -8,9 +8,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+use crate::rdma::test_utils::transport_endpoint as endpoint;
 use crate::{
-    Buffer, Client, Context, Endpoint, Error, ErrorKind, ListenMode, Result, Router, Server,
-    Socket, SocketPoolConfig, State, Transport, core::ContextEndpoint,
+    Buffer, Client, Context, Error, ErrorKind, ListenMode, Result, Router, Server, Socket,
+    SocketPoolConfig, State, Transport, core::ContextEndpoint,
 };
 
 const BYTES: usize = 64;
@@ -142,7 +143,7 @@ impl Fixture {
         }
         let client = Context::create_with_router(router, &config)
             .unwrap()
-            .with_endpoint(Endpoint::new(transport, [address]).unwrap());
+            .with_endpoint(endpoint(transport, address));
         Client {
             timeout: GUARD,
             ..Default::default()

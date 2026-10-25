@@ -32,15 +32,17 @@ cargo run -p ruapc-demo --release --bin client -- http://127.0.0.1:8000
 
 The client takes one endpoint: one scheme and one or more equivalent server
 addresses, for example `tcp://127.0.0.1:8000` or
-`tcp://[::1]:8000,[::1]:8001`. TCP, WS, HTTP and RDMA all support groups:
+`tcp://[::1]:8000,[::1]:8001`. TCP, WS, HTTP and RDMA all support groups;
+RDMA uses `tcp+rdma://`, `ws+rdma://` or `http+rdma://`:
 
 ```bash
 # Replace both addresses with addresses served by the same server State.
 cargo run -p ruapc-demo --release --bin client -- 'tcp://192.0.2.10:8000,192.0.2.11:8000'
 ```
 
-Addresses are sorted and deduplicated. A group has one transport; separate
-endpoint arguments or mixed schemes inside a group are rejected. See
+Addresses are sorted and deduplicated. A group has one endpoint scheme,
+including the RDMA bootstrap transport; separate endpoint arguments or mixed
+schemes inside a group are rejected. See
 [endpoint identity and address fallback](../docs/endpoints.md) for the same-server
 contract, independent overlapping groups and canonical string format.
 
@@ -183,13 +185,13 @@ cargo run -p ruapc-demo --release --features rdma --bin server -- \
 
 # Client terminal; use the server's bootstrap IP and a local device name:
 cargo run -p ruapc-demo --release --features rdma --bin client -- \
-  rdma://127.0.0.1:8000 --rdma-devices mlx5_0
+  tcp+rdma://127.0.0.1:8000 --rdma-devices mlx5_0
 ```
 
-With the feature enabled, `server` initializes RDMA by default and requires
-`tcp` or `unified` listen mode for bootstrap. Add `--no-rdma` to run that build
-without opening RDMA devices, including with a dedicated HTTP or WebSocket
-listener:
+With the feature enabled, `server` initializes RDMA by default. It must serve
+the bootstrap transport named by the client endpoint: `tcp`, `ws`, `http` or
+`unified`. Add `--no-rdma` to run that build without opening RDMA devices,
+including with a dedicated HTTP or WebSocket listener:
 
 ```bash
 cargo run -p ruapc-demo --features rdma --bin server -- --no-rdma --listen-mode http
@@ -197,8 +199,9 @@ cargo run -p ruapc-demo --features rdma --bin server -- --no-rdma --listen-mode 
 
 `--no-rdma` is available only in RDMA-enabled server builds. A build without
 the feature needs neither this flag nor RDMA libraries. The client enables
-RDMA automatically only for an `rdma://` endpoint. Builds without the feature
-still parse that endpoint format, but report an error when making a call.
+RDMA automatically only for a `<bootstrap>+rdma://` endpoint. Builds without
+the feature still parse that endpoint format, but report an error when making
+a call.
 
 Feature-enabled server/client builds also expose `--rdma-devices` (a
 comma-separated local allowlist), `--poll-threads`, `--conns-per-peer`,

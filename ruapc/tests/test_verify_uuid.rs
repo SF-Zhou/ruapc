@@ -5,7 +5,11 @@ use std::{str::FromStr, sync::Arc, time::Duration};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use ruapc::{Client, Endpoint, ListenMode, SocketPoolConfig, Transport};
+use ruapc::{Client, ListenMode, SocketPoolConfig, Transport};
+
+mod common;
+
+use common::endpoint;
 
 const CLIENT_TIMEOUT: Duration = Duration::from_millis(200);
 
@@ -78,7 +82,7 @@ async fn test_verify_message_id() {
         let addr = server.listen(addr).await.unwrap();
         let ctx = ruapc::Context::create(&config)
             .unwrap()
-            .with_endpoint(Endpoint::new(transport, [addr]).unwrap());
+            .with_endpoint(endpoint(transport, addr));
 
         let client = ruapc::Client {
             timeout: CLIENT_TIMEOUT,

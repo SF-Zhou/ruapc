@@ -38,15 +38,16 @@ fn stream_config() -> SocketPoolConfig {
 
 #[test]
 fn application_endpoint_caches_use_normalized_strings_for_every_transport() {
-    for transport in [
-        Transport::TCP,
-        Transport::WS,
-        Transport::HTTP,
-        Transport::RDMA,
+    for (scheme, transport) in [
+        ("tcp", Transport::TCP),
+        ("ws", Transport::WS),
+        ("http", Transport::HTTP),
+        ("tcp+rdma", Transport::RDMA),
+        ("ws+rdma", Transport::RDMA),
+        ("http+rdma", Transport::RDMA),
     ] {
-        let input =
-            format!("{transport}://[::1]:8000,127.0.0.1:8001,127.0.0.1:8000,127.0.0.1:8001");
-        let canonical = format!("{transport}://127.0.0.1:8000,127.0.0.1:8001,[::1]:8000");
+        let input = format!("{scheme}://[::1]:8000,127.0.0.1:8001,127.0.0.1:8000,127.0.0.1:8001");
+        let canonical = format!("{scheme}://127.0.0.1:8000,127.0.0.1:8001,[::1]:8000");
         let app: ApplicationConfig =
             serde_json::from_str(&format!(r#"{{"endpoint":"{input}"}}"#)).unwrap();
 
@@ -102,7 +103,7 @@ async fn cached_rdma_endpoint_reports_backend_unavailable_when_used() {
     let base = Context::create(&config).unwrap();
     let pool = SocketPool::create(&config, &base.state.devices, &base.state.buffer_pool).unwrap();
     let app = ApplicationConfig {
-        endpoint: "rdma://127.0.0.1:0,[::1]:0".parse().unwrap(),
+        endpoint: "http+rdma://127.0.0.1:0,[::1]:0".parse().unwrap(),
     };
 
     let result = timeout(TEST_TIMEOUT, async {
