@@ -191,7 +191,11 @@ async fn test_http_unary_body_size_limit() {
     let addr = SocketAddr::from_str("127.0.0.1:0").unwrap();
     let addr = server.listen(addr).await.unwrap();
 
-    let client = reqwest::Client::new();
+    // The test server is local; ignore ambient proxy configuration.
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build test HTTP client");
 
     // 64 MiB + 1: just above MAX_MSG_SIZE.
     let body = vec![b'x'; (64 << 20) + 1];

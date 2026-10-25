@@ -13,7 +13,7 @@ license.workspace = true
 rdma = ["ruapc/rdma"]
 
 [dependencies]
-ruapc = { path = "../ruapc" }
+ruapc.workspace = true
 
 clap.workspace = true
 crc-fast.workspace = true
