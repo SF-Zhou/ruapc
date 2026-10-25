@@ -68,6 +68,14 @@ Enable the optional `ibv-query-gid-ex` feature to use libibverbs' public
 cargo build -p ruapc-rdma --features ibv-query-gid-ex
 ```
 
+When using the core crate, enable `rdma-ibv-query-gid-ex` there; `ruapc`
+forwards it to this crate's `ibv-query-gid-ex` feature and also enables its
+`rdma` feature:
+
+```bash
+cargo build -p ruapc --features rdma-ibv-query-gid-ex
+```
+
 This feature is disabled by default and requires libibverbs headers and a
 runtime library from rdma-core v32 or later. Both APIs were introduced in
 [rdma-core v32](https://github.com/linux-rdma/rdma-core/blob/v32.0/libibverbs/verbs.h#L2225-L2250).

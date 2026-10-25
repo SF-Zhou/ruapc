@@ -10,6 +10,9 @@ license.workspace = true
 
 [features]
 rdma = ["ruapc-rdma"]
+# Forward ruapc-rdma's optional libibverbs GID query backend through the core
+# crate. Enabling it also enables RDMA.
+rdma-ibv-query-gid-ex = ["rdma", "ruapc-rdma/ibv-query-gid-ex"]
 default = []
 
 [dependencies]

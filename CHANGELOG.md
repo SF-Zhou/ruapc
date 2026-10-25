@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+### Added
+- `ruapc` adds `rdma-ibv-query-gid-ex`, which enables RDMA and forwards to
+  `ruapc-rdma`'s `ibv-query-gid-ex` backend for libibverbs' extended GID query
+  APIs.
+
 ## [0.2.0-alpha.7] - 2026-10-25
 
 ### Added

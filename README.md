@@ -126,6 +126,14 @@ set `config.rdma = None` to disable it for a context. RDMA endpoints name their
 bootstrap transport (`tcp+rdma://`, `ws+rdma://` or `http+rdma://`); servers
 must serve that transport, and `UNIFIED` serves all three.
 
+To use libibverbs' extended GID query APIs, enable
+`rdma-ibv-query-gid-ex`; it also enables RDMA and forwards the backend
+selection to `ruapc-rdma`:
+
+```toml
+ruapc = { version = "0.2.0-alpha.7", features = ["rdma-ibv-query-gid-ex"] }
+```
+
 See [build prerequisites](CONTRIBUTING.md#prerequisites),
 [demo RDMA setup](ruapc-demo/README.md#configuration-and-rdma) and
 [connection configuration](docs/rdma-connection.md).
