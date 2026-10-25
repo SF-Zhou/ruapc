@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.2.0-alpha.7] - 2026-10-25
+
 ### Added
 - Both ends of RDMA connections run background probes that verify an ordinary
   RPC round trip and `remote_read` on each connection. `rdma.probe` configures
@@ -16,9 +18,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   acquisition, independently of the periodic maintenance interval. Coverage
   skips NICs without a compatible local path, isolates failed attempts, and
   can replace redundant stripes when the active-connection limit is reached.
-- `ruapc-rdma::Context::query_gid_entry` returns a GID and its type from one
-  kernel query on Linux 5.10+, falling back to `ibv_query_gid` and the sysfs
-  GID type elsewhere.
+- By default, `ruapc-rdma::Context::query_gid_entry` returns a GID and its
+  type from one kernel query on Linux 5.10+, falling back to `ibv_query_gid`
+  and the sysfs GID type when driver discovery or the ioctl is unavailable.
+- `ruapc-rdma` adds the optional `ibv-query-gid-ex` feature to query GIDs
+  through libibverbs' public APIs. Disabled by default, it requires headers
+  and a runtime library from rdma-core v32 or later. See
+  [GID query backends](ruapc-rdma/README.md#gid-query-backends).
 - `ruapc-rdma::QueuePair::read_slot_spills` reports how often a READ had to use
   the fallback map because an older in-flight READ still occupied its
   sequence-indexed slot. The per-QP counter is a diagnostic snapshot, not
@@ -70,17 +76,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   acquisition locks. RDMA peer state uses the full declared bootstrap group;
   callers guarantee shared server state and lease records across its addresses.
 - **BREAKING**: `RdmaPathEntry.peer` is now `Option<Endpoint>`; outbound path
-  reports serialize the complete `rdma://address,address` group.
+  reports serialize the complete `<bootstrap>+rdma://address,address` group,
+  such as `tcp+rdma://192.0.2.10:8000,192.0.2.11:8000`.
 - `Endpoint` serialization and deserialization use the same canonical string
-  in JSON and MessagePack. `Transport::RDMA` and the `rdma://` scheme remain
-  available without the RDMA feature for storage and interchange; connection
-  acquisition requires the feature and an enabled RDMA pool.
-- RDMA GID queries use the kernel `QUERY_GID_ENTRY` and `QUERY_GID_TABLE`
-  ioctls when available, so a device snapshot collects all GIDs with one ioctl
-  instead of one query per index. Driver IDs come from RDMA netlink and are
-  bound to the opened uverbs device; kernels or drivers without the methods
-  keep using `ibv_query_gid` and the sysfs GID type. Native InfiniBand ports
-  no longer need the sysfs `gid_attrs/types` file on the legacy path.
+  in JSON and MessagePack. `Transport::RDMA` and the `<bootstrap>+rdma`
+  schemes remain available without the RDMA feature for storage and
+  interchange; connection acquisition requires the feature and an enabled
+  RDMA pool.
+- By default, RDMA GID queries use the kernel `QUERY_GID_ENTRY` and
+  `QUERY_GID_TABLE` ioctls when available, so a device snapshot collects all
+  GIDs with one ioctl instead of one query per index. Driver IDs come from
+  RDMA netlink and are bound to the opened uverbs device; kernels or drivers
+  without the methods keep using `ibv_query_gid` and the sysfs GID type.
+  Native InfiniBand ports no longer need the sysfs `gid_attrs/types` file on
+  the legacy path.
 - RDMA READ completion bookkeeping uses a per-QP sequence-indexed slot table
   instead of a sharded hash map, and destination validation uses one shared
   scatter-list allocation with packed overlap keys. A sequence collides only

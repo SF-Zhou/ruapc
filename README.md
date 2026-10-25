@@ -24,7 +24,7 @@ Add the dependencies below. TCP, WebSocket and HTTP require no RDMA libraries.
 
 ```toml
 [dependencies]
-ruapc = "0.2.0-alpha.6"
+ruapc = "0.2.0-alpha.7"
 schemars = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
@@ -116,7 +116,7 @@ explains ownership, read-then-validate and behavior after cancellation or failur
 Enable the optional feature:
 
 ```toml
-ruapc = { version = "0.2.0-alpha.6", features = ["rdma"] }
+ruapc = { version = "0.2.0-alpha.7", features = ["rdma"] }
 ```
 
 RDMA builds need a C compiler, `pkg-config`, libclang and libibverbs development
