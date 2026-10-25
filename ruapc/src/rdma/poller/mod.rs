@@ -375,8 +375,7 @@ impl DevicePoller {
     ) -> Result<()> {
         let qp = &conn.socket.queue_pair;
         if !Arc::ptr_eq(&conn.socket.queue_pair.reservation.shared, &self.shared)
-            || !Arc::ptr_eq(qp.send_cq(), &self.cq)
-            || !Arc::ptr_eq(qp.recv_cq(), &self.cq)
+            || !Arc::ptr_eq(qp.cq(), &self.cq)
         {
             return Err(Error::new(
                 ErrorKind::InvalidArgument,

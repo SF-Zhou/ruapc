@@ -219,7 +219,7 @@ impl RdmaSocketPool {
             },
             ..Default::default()
         };
-        let mut queue_pair = QueuePair::create(device.pd(), cq, cq, &mut init_attr, device.index())
+        let mut queue_pair = QueuePair::create(device.pd(), cq, &mut init_attr, device.index())
             .map_err(Error::from)?;
         queue_pair.set_send_signal_interval(
             self.config.connection.send_signal_interval,

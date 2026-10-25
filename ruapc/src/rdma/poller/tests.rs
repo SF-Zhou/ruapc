@@ -300,14 +300,7 @@ fn register_socket_with_config(
         },
         ..Default::default()
     };
-    let qp = QueuePair::create(
-        device.pd(),
-        poller.cq(),
-        poller.cq(),
-        &mut attrs,
-        device.index(),
-    )
-    .unwrap();
+    let qp = QueuePair::create(device.pd(), poller.cq(), &mut attrs, device.index()).unwrap();
     let nic = RdmaNicInfo {
         device: device.info().name.clone(),
         port_num: device.info().ports[0].port_num,
@@ -1524,8 +1517,8 @@ async fn identical_wrids_are_routed_by_their_provider_qp_numbers() {
         sockets[1].queue_pair.qp_num()
     );
     assert_eq!(
-        sockets[0].queue_pair.recv_identity().first_sequence(),
-        sockets[1].queue_pair.recv_identity().first_sequence()
+        sockets[0].queue_pair.identity().first_sequence(),
+        sockets[1].queue_pair.identity().first_sequence()
     );
 
     for socket in &sockets {
@@ -1607,14 +1600,7 @@ async fn early_flush_completion_waits_for_registration_and_settles_receive() {
         },
         ..Default::default()
     };
-    let qp = QueuePair::create(
-        device.pd(),
-        poller.cq(),
-        poller.cq(),
-        &mut attrs,
-        device.index(),
-    )
-    .unwrap();
+    let qp = QueuePair::create(device.pd(), poller.cq(), &mut attrs, device.index()).unwrap();
     let port = device.info().ports[0].port_num;
     let mut init = ibv_qp_attr {
         qp_state: ibv_qp_state::IBV_QPS_INIT,
