@@ -7,6 +7,10 @@ use std::{str::FromStr, sync::Arc};
 
 use ruapc::{Endpoint, ListenMode, SocketPoolConfig, Transport};
 
+mod common;
+
+use common::endpoint;
+
 #[ruapc::service]
 trait Foo {
     async fn hello(&self, _: &ruapc::Context, req: &String) -> ruapc::Result<String>;
@@ -46,7 +50,7 @@ async fn test_hello() {
         let client = ruapc::Client::default();
         let ctx = ruapc::Context::create(&config)
             .unwrap()
-            .with_endpoint(Endpoint::new(transport, [addr]).unwrap());
+            .with_endpoint(endpoint(transport, addr));
         let rsp = client.hello(&ctx, &"ruapc".to_string()).await.unwrap();
         assert_eq!(rsp, "hello ruapc!");
 
@@ -154,7 +158,7 @@ async fn test_rdma_concurrent() {
 
     let ctx = ruapc::Context::create(&config)
         .unwrap()
-        .with_endpoint(Endpoint::new(Transport::RDMA, [addr]).unwrap());
+        .with_endpoint(Endpoint::rdma(Transport::TCP, [addr]).unwrap());
     let mut tasks = Vec::new();
     for task_id in 0..128 {
         let ctx = ctx.clone();
@@ -200,7 +204,7 @@ async fn test_rdma() {
     client.hello(&ctx, &"ruapc".to_string()).await.unwrap_err();
     ctx.send_rsp(Result::Ok(())).await;
 
-    let ctx = ctx.with_endpoint(Endpoint::new(Transport::RDMA, [addr]).unwrap());
+    let ctx = ctx.with_endpoint(Endpoint::rdma(Transport::TCP, [addr]).unwrap());
     for _ in 0..256 {
         let rsp = client.hello(&ctx, &"ruapc".to_string()).await.unwrap();
         assert_eq!(rsp, "hello ruapc!");

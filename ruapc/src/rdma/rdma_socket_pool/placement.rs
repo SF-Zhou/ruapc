@@ -1059,7 +1059,7 @@ mod path_selection_tests {
     }
 
     fn peer() -> PeerState {
-        PeerState::new(crate::Endpoint::new(crate::Transport::RDMA, [addr()]).unwrap())
+        PeerState::new(crate::Endpoint::rdma(crate::Transport::TCP, [addr()]).unwrap())
     }
 
     fn preference<'a>(
@@ -1271,7 +1271,7 @@ mod path_selection_tests {
         }
         // The blacklist is per peer: another address is unaffected.
         let other = PeerState::new(
-            crate::Endpoint::new(crate::Transport::RDMA, ["127.0.0.1:9998".parse().unwrap()])
+            crate::Endpoint::rdma(crate::Transport::TCP, ["127.0.0.1:9998".parse().unwrap()])
                 .unwrap(),
         );
         assert!(!pool.is_blacklisted(&other, &candidates[0]));

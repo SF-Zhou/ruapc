@@ -10,7 +10,7 @@ A Rust RPC library with a shared service API for TCP, WebSocket, HTTP and option
 <img src="docs/logo.png" alt="RuaPC" width="256" height="256">
 
 - `#[service]` generates typed clients, server dispatch and OpenAPI schemas.
-- A unified listener accepts TCP, WebSocket and HTTP on one port, including RDMA bootstrap when enabled.
+- A unified listener accepts TCP, WebSocket and HTTP on one port; RDMA bootstrap can use any of them when enabled.
 - Persistent TCP, WebSocket, HTTP/2 and RDMA connections support reverse RPC.
 - Remote read/write transfers use RDMA READs or inline reverse RPC over the other transports.
 - Payloads use MessagePack by default; clients can select JSON. HTTP POST endpoints accept JSON.
@@ -122,8 +122,9 @@ ruapc = { version = "0.2.0-alpha.6", features = ["rdma"] }
 RDMA builds need a C compiler, `pkg-config`, libclang and libibverbs development
 files. Running needs a usable device and sufficient locked-memory allowance.
 With the feature enabled, `SocketPoolConfig::default()` initializes RDMA;
-set `config.rdma = None` to disable it for a context. Servers need TCP or
-UNIFIED listen mode for bootstrap.
+set `config.rdma = None` to disable it for a context. RDMA endpoints name their
+bootstrap transport (`tcp+rdma://`, `ws+rdma://` or `http+rdma://`); servers
+must serve that transport, and `UNIFIED` serves all three.
 
 See [build prerequisites](CONTRIBUTING.md#prerequisites),
 [demo RDMA setup](ruapc-demo/README.md#configuration-and-rdma) and

@@ -46,8 +46,10 @@ the dependencies retain buffer ownership and completion authority.
 deadline. Changing its destination preserves the deadline and clears message
 metadata. Its `remote_*` methods live in `remote_memory/context.rs`.
 An endpoint selects one transport and a complete group of equivalent server
-addresses. Transport pools own address fallback, group connection caching and
-coalesced acquisition; the client does not choose among servers or transports.
+addresses. An RDMA endpoint also names the stream transport that carries
+bootstrap RPCs. Transport pools own address fallback, group connection caching
+and coalesced acquisition; the client does not choose among servers or
+transports.
 See [endpoint identity](docs/endpoints.md) for normalization and caller obligations.
 
 ## Request lifecycle
@@ -145,9 +147,10 @@ See the [API guide](docs/remote-memory.md) for use and recovery, and
 
 CQ poll threads route completion tokens and batch received buffers. Dispatch
 workers parse frames and invoke routing away from the poll thread. Each
-connection owns its NIC pair; peer identity is its complete normalized group
-of user-declared bootstrap addresses. Group addresses must share server state
-and lease records; different or overlapping groups remain independent.
+connection owns its NIC pair; peer identity is its bootstrap transport and
+complete normalized group of user-declared bootstrap addresses. Group addresses
+must share server state and lease records; different or overlapping groups
+remain independent.
 
 | Contract | Reference |
 |---|---|

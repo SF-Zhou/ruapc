@@ -8,6 +8,8 @@ use crate::{Error, ErrorKind};
 ///
 /// All variants exist regardless of enabled Cargo features. Support for a
 /// transport is checked when acquiring a connection, not when describing it.
+/// RDMA endpoints additionally name a bootstrap transport in their scheme,
+/// such as `http+rdma://`; see [`Endpoint::rdma`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, clap::ValueEnum)]
 pub enum Transport {
     TCP,
@@ -17,6 +19,11 @@ pub enum Transport {
 }
 
 impl Transport {
+    /// Canonical name of this transport.
+    ///
+    /// This is the raw transport, not always an endpoint scheme: an RDMA
+    /// endpoint encodes its bootstrap transport as `<bootstrap>+rdma`; see
+    /// [`Endpoint::scheme`].
     #[must_use]
     pub const fn scheme(self) -> &'static str {
         match self {
@@ -66,43 +73,149 @@ impl fmt::Display for ListenMode {
     }
 }
 
-/// One server reached through a nonempty set of equivalent addresses.
+/// Stream transport that can carry RDMA bootstrap RPCs.
+///
+/// The private type makes an RDMA endpoint with an RDMA bootstrap
+/// unrepresentable after parsing or construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RdmaBootstrap {
+    Tcp,
+    Ws,
+    Http,
+}
+
+impl RdmaBootstrap {
+    const fn transport(self) -> Transport {
+        match self {
+            Self::Tcp => Transport::TCP,
+            Self::Ws => Transport::WS,
+            Self::Http => Transport::HTTP,
+        }
+    }
+
+    const fn scheme(self) -> &'static str {
+        self.transport().scheme()
+    }
+}
+
+impl TryFrom<Transport> for RdmaBootstrap {
+    type Error = Error;
+
+    fn try_from(transport: Transport) -> Result<Self, Self::Error> {
+        match transport {
+            Transport::TCP => Ok(Self::Tcp),
+            Transport::WS => Ok(Self::Ws),
+            Transport::HTTP => Ok(Self::Http),
+            Transport::RDMA => Err(Error::new(
+                ErrorKind::InvalidArgument,
+                format!("RDMA bootstrap transport must be tcp, ws or http; got {transport}"),
+            )),
+        }
+    }
+}
+
+/// One transport and, for RDMA, the stream transport carrying bootstrap RPCs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum EndpointScheme {
+    Stream(Transport),
+    Rdma(RdmaBootstrap),
+}
+
+impl EndpointScheme {
+    fn parse(value: &str) -> crate::Result<Self> {
+        match value.split_once('+') {
+            Some((bootstrap, transport)) => {
+                let transport = transport.parse::<Transport>()?;
+                if transport != Transport::RDMA {
+                    return Err(Error::new(
+                        ErrorKind::InvalidArgument,
+                        format!(
+                            "endpoint scheme {value} must combine a bootstrap transport with rdma"
+                        ),
+                    ));
+                }
+                let bootstrap = RdmaBootstrap::try_from(bootstrap.parse::<Transport>()?)?;
+                Ok(Self::Rdma(bootstrap))
+            }
+            None => match value.parse::<Transport>()? {
+                Transport::RDMA => Err(Error::new(
+                    ErrorKind::InvalidArgument,
+                    "RDMA endpoints must name their bootstrap transport, e.g. tcp+rdma://, ws+rdma:// or http+rdma://"
+                        .into(),
+                )),
+                transport => Ok(Self::Stream(transport)),
+            },
+        }
+    }
+
+    const fn transport(self) -> Transport {
+        match self {
+            Self::Stream(transport) => transport,
+            Self::Rdma(_) => Transport::RDMA,
+        }
+    }
+
+    const fn bootstrap(self) -> Option<Transport> {
+        match self {
+            Self::Stream(_) => None,
+            Self::Rdma(bootstrap) => Some(bootstrap.transport()),
+        }
+    }
+}
+
+impl fmt::Display for EndpointScheme {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Stream(transport) => f.write_str(transport.scheme()),
+            Self::Rdma(bootstrap) => {
+                write!(f, "{}+{}", bootstrap.scheme(), Transport::RDMA.scheme())
+            }
+        }
+    }
+}
+
+/// One server reached through one transport and a nonempty set of equivalent
+/// addresses.
 ///
 /// Addresses are sorted and deduplicated. Their order carries no preference;
-/// the transport and complete set identify the endpoint within a client pool.
-/// Overlapping but different sets do not share connections. Callers guarantee
-/// that every address reaches the same server state, including its RDMA leases.
+/// the transport, bootstrap transport and complete set identify the endpoint
+/// within a client pool. Overlapping but different sets do not share
+/// connections. Callers guarantee that every address reaches the same server
+/// state, including its RDMA leases.
 ///
-/// The string representation is `transport://address,address`, with brackets
-/// around IPv6 addresses, for example `tcp://127.0.0.1:8000,[::1]:8000`.
+/// RDMA first exchanges discovery and connection metadata over another
+/// transport. An RDMA endpoint therefore also names the bootstrap transport:
+/// [`Endpoint::rdma`] accepts TCP, WebSocket or HTTP. The string representation
+/// always makes it explicit, for example `http+rdma://127.0.0.1:8000`. Other
+/// transports use `transport://address,address`, with brackets around IPv6
+/// addresses, for example `tcp://127.0.0.1:8000,[::1]:8000`.
+///
 /// Serde uses this normalized string in JSON and MessagePack. An endpoint can
 /// be stored or exchanged without enabling its transport backend, including
 /// RDMA; backend availability is checked when acquiring a connection.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Endpoint {
-    transport: Transport,
+    scheme: EndpointScheme,
     addrs: Arc<[SocketAddr]>,
 }
 
 impl Endpoint {
-    /// Creates an endpoint, rejecting an empty address set.
+    /// Creates a non-RDMA endpoint, rejecting an empty address set.
+    ///
+    /// RDMA endpoints must name the transport that carries bootstrap RPCs;
+    /// use [`Endpoint::rdma`] instead.
     pub fn new(
         transport: Transport,
         addrs: impl IntoIterator<Item = SocketAddr>,
     ) -> crate::Result<Self> {
-        let mut addrs: Vec<_> = addrs.into_iter().collect();
-        addrs.sort_unstable();
-        addrs.dedup();
-        if addrs.is_empty() {
+        if transport == Transport::RDMA {
             return Err(Error::new(
                 ErrorKind::InvalidArgument,
-                "an endpoint requires at least one address".into(),
+                "RDMA endpoints require a bootstrap transport; use Endpoint::rdma with tcp, ws or http"
+                    .into(),
             ));
         }
-        Ok(Self {
-            transport,
-            addrs: addrs.into(),
-        })
+        Self::from_parts(EndpointScheme::Stream(transport), addrs)
     }
 
     /// Creates a TCP endpoint from equivalent server addresses.
@@ -110,9 +223,65 @@ impl Endpoint {
         Self::new(Transport::TCP, addrs)
     }
 
+    /// Creates an RDMA endpoint whose bootstrap RPCs use `bootstrap`.
+    ///
+    /// `bootstrap` must be [`Transport::TCP`], [`Transport::WS`] or
+    /// [`Transport::HTTP`]. The address group carries bootstrap RPCs and
+    /// identifies the peer; the RDMA data plane uses the negotiated device
+    /// endpoints. Every address must reach the same server state.
+    pub fn rdma(
+        bootstrap: Transport,
+        addrs: impl IntoIterator<Item = SocketAddr>,
+    ) -> crate::Result<Self> {
+        let bootstrap = RdmaBootstrap::try_from(bootstrap)?;
+        Self::from_parts(EndpointScheme::Rdma(bootstrap), addrs)
+    }
+
+    fn from_parts(
+        scheme: EndpointScheme,
+        addrs: impl IntoIterator<Item = SocketAddr>,
+    ) -> crate::Result<Self> {
+        Ok(Self {
+            scheme,
+            addrs: normalized_addrs(addrs)?,
+        })
+    }
+
     #[must_use]
     pub const fn transport(&self) -> Transport {
-        self.transport
+        self.scheme.transport()
+    }
+
+    /// The transport carrying RDMA bootstrap RPCs.
+    ///
+    /// Returns `None` for every non-RDMA endpoint.
+    #[must_use]
+    pub const fn bootstrap_transport(&self) -> Option<Transport> {
+        self.scheme.bootstrap()
+    }
+
+    /// Canonical endpoint scheme, including the RDMA bootstrap prefix.
+    ///
+    /// Returns `tcp`, `ws`, `http`, `tcp+rdma`, `ws+rdma` or `http+rdma`.
+    /// [`Transport::scheme`] returns only the raw transport name.
+    #[must_use]
+    pub fn scheme(&self) -> String {
+        self.scheme.to_string()
+    }
+
+    /// The stream endpoint used for RDMA bootstrap RPCs.
+    ///
+    /// Returns `None` for every non-RDMA endpoint. The result uses the same
+    /// normalized address group and the bootstrap transport of this endpoint.
+    #[must_use]
+    pub fn bootstrap_endpoint(&self) -> Option<Self> {
+        match self.scheme {
+            EndpointScheme::Rdma(bootstrap) => Some(Self {
+                scheme: EndpointScheme::Stream(bootstrap.transport()),
+                addrs: self.addrs.clone(),
+            }),
+            EndpointScheme::Stream(_) => None,
+        }
     }
 
     #[must_use]
@@ -121,9 +290,24 @@ impl Endpoint {
     }
 }
 
+fn normalized_addrs(
+    addrs: impl IntoIterator<Item = SocketAddr>,
+) -> crate::Result<Arc<[SocketAddr]>> {
+    let mut addrs: Vec<_> = addrs.into_iter().collect();
+    addrs.sort_unstable();
+    addrs.dedup();
+    if addrs.is_empty() {
+        return Err(Error::new(
+            ErrorKind::InvalidArgument,
+            "an endpoint requires at least one address".into(),
+        ));
+    }
+    Ok(addrs.into())
+}
+
 impl fmt::Display for Endpoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}://", self.transport)?;
+        write!(f, "{}://", self.scheme)?;
         for (index, addr) in self.addrs.iter().enumerate() {
             if index != 0 {
                 f.write_str(",")?;
@@ -144,7 +328,7 @@ impl FromStr for Endpoint {
                 format!("endpoint must use transport://address,address: {value}"),
             )
         })?;
-        let transport = scheme.parse()?;
+        let scheme = EndpointScheme::parse(scheme)?;
         let addrs = addresses
             .split(',')
             .map(|addr| {
@@ -156,7 +340,7 @@ impl FromStr for Endpoint {
                 })
             })
             .collect::<crate::Result<Vec<_>>>()?;
-        Self::new(transport, addrs)
+        Self::from_parts(scheme, addrs)
     }
 }
 
@@ -203,10 +387,13 @@ mod tests {
             "tcp://127.0.0.1:8000,127.0.0.2:8000",
             "ws://127.0.0.1:8000,[::1]:8000",
             "http://[::1]:8000,[::2]:8000",
-            "rdma://127.0.0.1:8000,[::1]:8000",
+            "tcp+rdma://127.0.0.1:8000,[::1]:8000",
+            "ws+rdma://127.0.0.1:8000,[::1]:8000",
+            "http+rdma://127.0.0.1:8000,[::1]:8000",
         ] {
             let endpoint: Endpoint = value.parse().unwrap();
             assert_eq!(endpoint.to_string(), value);
+            assert_eq!(endpoint.scheme(), value.split_once("://").unwrap().0);
             let json = serde_json::to_string(&endpoint).unwrap();
             assert_eq!(json, format!("\"{value}\""));
             assert_eq!(serde_json::from_str::<Endpoint>(&json).unwrap(), endpoint);
@@ -224,11 +411,11 @@ mod tests {
 
     #[test]
     fn deserialization_normalizes_endpoint_strings_and_rejects_invalid_groups() {
-        let value = "rdma://127.0.0.1:8001,127.0.0.1:8000,127.0.0.1:8001";
+        let value = "http+rdma://127.0.0.1:8001,127.0.0.1:8000,127.0.0.1:8001";
         let json = serde_json::to_string(value).unwrap();
         let messagepack = rmp_serde::to_vec(value).unwrap();
-        let expected = Endpoint::new(
-            Transport::RDMA,
+        let expected = Endpoint::rdma(
+            Transport::HTTP,
             [
                 "127.0.0.1:8000".parse().unwrap(),
                 "127.0.0.1:8001".parse().unwrap(),
@@ -242,7 +429,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(expected).unwrap(),
-            "rdma://127.0.0.1:8000,127.0.0.1:8001"
+            "http+rdma://127.0.0.1:8000,127.0.0.1:8001"
         );
 
         for value in [
@@ -258,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_rejects_missing_or_unknown_scheme() {
+    fn endpoint_rejects_missing_unknown_or_ambiguous_scheme() {
         assert!("127.0.0.1:8000".parse::<Endpoint>().is_err());
         assert!("unified://127.0.0.1:8000".parse::<Endpoint>().is_err());
         for invalid in [
@@ -268,10 +455,62 @@ mod tests {
             "tcp://127.0.0.1:8000,ws://127.0.0.1:8001",
             "http://127.0.0.1:8000/path",
             "tcp://::1:8000",
+            // RDMA must name a bootstrap transport.
+            "rdma://127.0.0.1:8000",
+            // Only a bootstrap transport plus final `rdma` is accepted.
+            "tcp+ws://127.0.0.1:8000",
+            "ws+tcp://127.0.0.1:8000",
+            "rdma+tcp://127.0.0.1:8000",
+            "rdma+rdma://127.0.0.1:8000",
+            "tcp+tcp://127.0.0.1:8000",
+            "http+rdma+ws://127.0.0.1:8000",
+            "tcp+://127.0.0.1:8000",
         ] {
             assert!(invalid.parse::<Endpoint>().is_err(), "{invalid}");
         }
         assert!(Endpoint::tcp([]).is_err());
+        assert!(Endpoint::rdma(Transport::TCP, []).is_err());
+        assert!(Endpoint::new(Transport::RDMA, ["127.0.0.1:8000".parse().unwrap()]).is_err());
+        assert!(Endpoint::rdma(Transport::RDMA, ["127.0.0.1:8000".parse().unwrap()]).is_err());
+    }
+
+    #[test]
+    fn rdma_bootstrap_transport_is_part_of_endpoint_identity() {
+        let a = "127.0.0.1:8000".parse().unwrap();
+        let b = "127.0.0.1:8001".parse().unwrap();
+        let tcp = Endpoint::rdma(Transport::TCP, [a, b]).unwrap();
+        let ws = Endpoint::rdma(Transport::WS, [a]).unwrap();
+        let http = Endpoint::rdma(Transport::HTTP, [a, b]).unwrap();
+        assert_eq!(tcp.transport(), Transport::RDMA);
+        assert_eq!(tcp.bootstrap_transport(), Some(Transport::TCP));
+        assert_eq!(ws.bootstrap_transport(), Some(Transport::WS));
+        assert_eq!(http.bootstrap_transport(), Some(Transport::HTTP));
+        assert_eq!(
+            ws.bootstrap_endpoint(),
+            Some(Endpoint::new(Transport::WS, [a]).unwrap())
+        );
+        assert_ne!(tcp, http);
+        assert_eq!(tcp.scheme(), "tcp+rdma");
+        assert_eq!(http.scheme(), "http+rdma");
+        assert_eq!(tcp.to_string(), "tcp+rdma://127.0.0.1:8000,127.0.0.1:8001");
+        assert_eq!(
+            http.to_string(),
+            "http+rdma://127.0.0.1:8000,127.0.0.1:8001"
+        );
+        assert_eq!(
+            tcp.bootstrap_endpoint(),
+            Some(Endpoint::tcp([a, b]).unwrap())
+        );
+        let plain = Endpoint::tcp([a]).unwrap();
+        assert_eq!(plain.bootstrap_transport(), None);
+        assert_eq!(plain.bootstrap_endpoint(), None);
+        assert_eq!(plain.scheme(), "tcp");
+
+        let mut groups = std::collections::HashSet::new();
+        groups.insert(tcp);
+        groups.insert(http);
+        groups.insert(plain);
+        assert_eq!(groups.len(), 3);
     }
 
     #[test]

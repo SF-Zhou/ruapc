@@ -87,7 +87,8 @@ impl Drop for ConnCountGuard {
 /// Rust drops struct fields in **declaration order**, so the fields below
 /// are intentionally ordered to satisfy the ibverbs requirement.
 pub struct RdmaSocketPool {
-    /// Client for bootstrap control RPCs over TCP (no RDMA resources).
+    /// Client for bootstrap control RPCs over the endpoint's declared
+    /// bootstrap transport (no RDMA resources).
     pub bootstrap_client: Client,
     /// Supervisor for managing asynchronous tasks — dropped first so that
     /// watcher tasks finish and connections are marked for teardown.

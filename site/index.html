@@ -379,7 +379,7 @@
 <span class="tok-k">async fn</span> main() -&gt; std::result::<span class="tok-t">Result</span>&lt;(), <span class="tok-t">Box</span>&lt;<span class="tok-k">dyn</span> std::error::<span class="tok-t">Error</span>&gt;&gt; {
     <span class="tok-k">let</span> config = SocketPoolConfig::default();
     <span class="tok-k">let</span> ctx = Context::create(<span class="tok-k">&amp;</span>config)?
-        <span class="tok-c">// tcp:// → ws:// → http:// → rdma://</span>
+        <span class="tok-c">// tcp:// → ws:// → http:// → http+rdma://</span>
         .with_endpoint(<span class="tok-s">"ws://127.0.0.1:8000"</span>.parse()?);
 
     <span class="tok-k">let</span> response = Client::default()
@@ -416,7 +416,7 @@
               <ul>
                 <li>Register services before creating the server.</li>
                 <li><code>UNIFIED</code> serves TCP, WebSocket and HTTP on one port.</li>
-                <li>RDMA bootstraps over a TCP or <code>UNIFIED</code> listener.</li>
+                <li>RDMA bootstraps over TCP, WebSocket, HTTP or a <code>UNIFIED</code> listener.</li>
               </ul>
               <a class="text-link" href="https://github.com/SF-Zhou/ruapc/blob/main/docs/rdma-connection.md" target="_blank" rel="noopener">Connection lifecycle <svg class="icon icon--tiny" aria-hidden="true"><use href="#i-arrow-up-right"/></svg></a>
             </div>
@@ -494,8 +494,8 @@
               <svg class="icon" aria-hidden="true"><use href="#i-chip"/></svg>
             </div>
             <h3>RDMA</h3>
-            <p class="t-desc">Optional kernel-bypass transport with READ-based transfers. Bootstraps over TCP or a unified listener.</p>
-            <code class="t-endpoint">rdma://host:8000</code>
+            <p class="t-desc">Optional kernel-bypass transport with READ-based transfers. Bootstraps over TCP, WebSocket, HTTP or a unified listener.</p>
+            <code class="t-endpoint">tcp+rdma://host:8000</code>
             <ul class="t-tags">
               <li>optional</li><li>kernel bypass</li><li>RDMA READ</li>
             </ul>

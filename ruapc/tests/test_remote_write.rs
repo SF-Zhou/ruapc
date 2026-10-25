@@ -6,6 +6,10 @@ use ruapc::*;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+mod common;
+
+use common::endpoint;
+
 // ==========================================================================
 // Service definition
 // ==========================================================================
@@ -215,7 +219,7 @@ async fn run_test(tc: TestCase) {
     let addr = server.clone().listen(addr).await.unwrap();
     let ctx = Context::create(&config)
         .unwrap()
-        .with_endpoint(Endpoint::new(tc.transport, [addr]).unwrap());
+        .with_endpoint(endpoint(tc.transport, addr));
 
     let client = Client {
         timeout: tc.client_timeout,
@@ -410,7 +414,7 @@ async fn setup(transport: Transport) -> (Arc<Server>, Context) {
     let addr = server.clone().listen(addr).await.unwrap();
     let ctx = Context::create(&config)
         .unwrap()
-        .with_endpoint(Endpoint::new(transport, [addr]).unwrap());
+        .with_endpoint(endpoint(transport, addr));
     (server, ctx)
 }
 
@@ -601,7 +605,7 @@ async fn run_roundtrip_test(transport: Transport) {
     let addr = server.clone().listen(addr).await.unwrap();
     let ctx = Context::create(&config)
         .unwrap()
-        .with_endpoint(Endpoint::new(transport, [addr]).unwrap());
+        .with_endpoint(endpoint(transport, addr));
     let client = Client::default();
 
     let payload = b"palindrome-me";

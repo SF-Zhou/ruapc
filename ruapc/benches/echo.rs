@@ -23,6 +23,10 @@ use std::{str::FromStr, sync::Arc, time::Instant};
 
 use ruapc::{Client, Context, Endpoint, ListenMode, Router, Server, SocketPoolConfig, Transport};
 
+mod common;
+
+use common::endpoint;
+
 const WARMUP_ITERS: usize = 1_000;
 const SERIAL_ITERS: usize = 5_000;
 /// Concurrency levels for the closed-loop throughput benchmark.
@@ -192,7 +196,7 @@ async fn run(options: BenchOptions) {
             continue;
         }
         println!("{transport:?}");
-        let ctx = base_ctx.with_endpoint(Endpoint::new(transport, [addr]).unwrap());
+        let ctx = base_ctx.with_endpoint(endpoint(transport, addr));
 
         // Probe the transport once: environments without e.g. a usable RDMA
         // device should skip instead of failing the whole benchmark.
@@ -222,7 +226,7 @@ async fn run(options: BenchOptions) {
     if let Some(second_addr) = second_addr {
         println!("RDMA (1 endpoint, 2 bootstrap addresses)");
         let ctx =
-            base_ctx.with_endpoint(Endpoint::new(Transport::RDMA, [addr, second_addr]).unwrap());
+            base_ctx.with_endpoint(Endpoint::rdma(Transport::TCP, [addr, second_addr]).unwrap());
         let probe_client = Client::default();
         if let Err(err) = probe_client.echo(&ctx, &"probe".to_string()).await {
             println!("  skipped: {err}");

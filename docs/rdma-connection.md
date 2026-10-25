@@ -3,12 +3,14 @@
 <a id="rdma-连接建立"></a>
 
 RuaPC discovers devices and exchanges QP parameters through `_ruapc.rdma`
-RPCs over TCP, then activates the connection through the RDMA data plane.
-A peer is identified by its complete normalized group of bootstrap TCP
-addresses. Each connection stripe chooses its own local and remote device,
-port, and GID. Discovery caches, acquisition locks, path failures and stripes
-belong to that full group, independently of which address answered a bootstrap
-RPC. Different or overlapping groups are not automatically merged.
+RPCs over the endpoint's declared bootstrap transport (`tcp+rdma`, `ws+rdma`,
+or `http+rdma`), then activates the connection through the RDMA data plane.
+A peer is identified by that bootstrap transport and its complete normalized
+group of bootstrap addresses. Each connection stripe chooses its own local and
+remote device, port, and GID. Discovery caches, acquisition locks, path
+failures and stripes belong to that full group, independently of which address
+answered a bootstrap RPC. Different or overlapping groups are not
+automatically merged.
 
 Callers declare all group addresses equivalent: they must reach one server
 `State`, including shared prepare/commit/cancel lease records. Bootstrap does
@@ -58,12 +60,12 @@ sequenceDiagram
     participant IP as Initiator poller
     participant A as Acceptor bootstrap
     participant AP as Acceptor poller
-    I->>A: TCP discover()
+    I->>A: bootstrap discover()
     A-->>I: version, devices/ports/GIDs, load, limits
     I->>I: Validate version and select paths
     loop Each initial stripe
         I->>I: Negotiate limits; create local QP and endpoint
-        I->>A: TCP prepare_connection(attempt_id, endpoint, target, limits)
+        I->>A: bootstrap prepare_connection(attempt_id, endpoint, target, limits)
         A->>A: Validate; create QP and connect to RTS
         A->>AP: Post receives and register socket
         A->>A: Create Pending lease
@@ -71,7 +73,7 @@ sequenceDiagram
         I->>I: Hold rollback guard; validate response
         I->>I: Connect local QP to RTS
         I->>IP: Post receives and register socket
-        I->>A: TCP commit_connection(lease)
+        I->>A: bootstrap commit_connection(lease)
         A->>A: Confirmed; start activation deadline
         A-->>I: Success
         I->>I: Retain EstablishedSocket and rollback guard
@@ -85,8 +87,8 @@ sequenceDiagram
 ```
 
 RTS means the NIC accepted local configuration, not that the remote path is
-reachable. TCP commit confirms initiator QP ownership; routing failures may
-first appear in the activation SEND's completion. Publication and acquire do
+reachable. Bootstrap commit confirms initiator QP ownership; routing failures
+may first appear in the activation SEND's completion. Publication and acquire do
 not wait for activation. Either the activation packet or ordinary traffic can
 provide the acceptor's first successful receive.
 
@@ -317,7 +319,7 @@ the overall budget remains; this relies on commit's method-specific idempotency.
 Once prepare returns a valid lease for the attempt, `BootstrapRollback` owns
 remote cleanup and, after local registration, failure closure of that socket.
 Handshake failure, cancellation, or an unpublished completed stripe drops the
-guard: it marks the local socket failed and schedules TCP cancel through a
+guard: it marks the local socket failed and schedules cancel through a
 fresh cleanup context. The [poller](qp-registry.md#closing-a-connection) performs
 the QP transition to ERR. If cancel fails, the supervisor has stopped, or a
 lost prepare response prevents learning the lease, acceptor expiry reclaims

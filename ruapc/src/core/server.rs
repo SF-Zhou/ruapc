@@ -41,21 +41,11 @@ impl Server {
     /// # Errors
     ///
     /// Returns configuration, schema-generation or socket-pool initialization
-    /// errors. With RDMA enabled in `config`, the listener mode must be TCP or
-    /// UNIFIED to support bootstrap.
+    /// errors.
+    ///
+    /// With RDMA enabled, bind a listener mode that serves the client's
+    /// bootstrap transport: TCP, WS, HTTP or [`crate::ListenMode::UNIFIED`].
     pub fn create(router: Router, config: &SocketPoolConfig) -> Result<Self> {
-        #[cfg(feature = "rdma")]
-        if config.rdma.is_some()
-            && !matches!(
-                config.listen_mode,
-                crate::ListenMode::TCP | crate::ListenMode::UNIFIED
-            )
-        {
-            return Err(crate::Error::new(
-                crate::ErrorKind::InvalidArgument,
-                "an RDMA-capable server requires TCP or UNIFIED listen mode for bootstrap".into(),
-            ));
-        }
         let (state, drop_guard) = State::create(router, config)?;
 
         Ok(Self {
@@ -101,5 +91,30 @@ impl Server {
     /// the listener has stopped.
     pub async fn listen(&self, addr: SocketAddr) -> Result<SocketAddr> {
         self.listener.start_listen(addr, &self.state).await
+    }
+}
+
+#[cfg(all(test, feature = "rdma"))]
+mod tests {
+    use super::*;
+    use crate::ListenMode;
+
+    #[tokio::test]
+    async fn rdma_enabled_server_accepts_every_listener_mode() {
+        for listen_mode in [
+            ListenMode::TCP,
+            ListenMode::WS,
+            ListenMode::HTTP,
+            ListenMode::UNIFIED,
+        ] {
+            let config = SocketPoolConfig {
+                listen_mode,
+                ..Default::default()
+            };
+            let server = Server::create(Router::default(), &config)
+                .unwrap_or_else(|err| panic!("{listen_mode} rejected: {err}"));
+            server.stop();
+            server.join().await;
+        }
     }
 }

@@ -25,6 +25,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   completion evidence.
 
 ### Changed
+- **BREAKING**: RDMA endpoints now name their bootstrap transport in the
+  scheme: `tcp+rdma://`, `ws+rdma://` or `http+rdma://`. Bare `rdma://` is
+  rejected. `Endpoint::rdma(bootstrap, addrs)` replaces
+  `Endpoint::new(Transport::RDMA, ...)`; `bootstrap_transport()`, `scheme()`
+  and `bootstrap_endpoint()` expose the selected transport and canonical
+  scheme, while `Transport::scheme()` remains the raw transport name.
+  Discovery and prepare/commit/cancel RPCs use the bootstrap transport; the
+  data plane remains RDMA. Servers may use any listener mode that serves the
+  selected bootstrap transport, including WS and HTTP.
 - **BREAKING**: `ruapc-rdma::QueuePair::prepare_reads` no longer takes a
   deadline and returns the runtime-independent `ReadCompletion` instead of a
   Tokio `ReadReceiver`. Its future yields a single `Result`; `try_recv` returns

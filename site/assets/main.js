@@ -163,7 +163,7 @@
     tcp: "tcp",
     ws: "ws",
     http: "http",
-    rdma: "rdma",
+    rdma: "tcp+rdma",
   };
 
   for (const button of boardButtons) {

@@ -43,6 +43,8 @@ pub(super) struct PeerMeta {
 
 pub(crate) struct PeerState {
     pub(super) endpoint: Endpoint,
+    /// Bootstrap endpoint over the stream transport selected by `endpoint`.
+    pub(super) bootstrap_endpoint: Endpoint,
     pub(super) connect: tokio::sync::Mutex<()>,
     pub(super) stripes: RwLock<PeerStripes>,
     pub(super) meta: Mutex<PeerMeta>,
@@ -66,8 +68,12 @@ impl Drop for ReconcileGuard {
 
 impl PeerState {
     pub(super) fn new(endpoint: Endpoint) -> Self {
+        let bootstrap_endpoint = endpoint
+            .bootstrap_endpoint()
+            .expect("RDMA peer endpoint declares a bootstrap transport");
         Self {
             endpoint,
+            bootstrap_endpoint,
             connect: tokio::sync::Mutex::new(()),
             stripes: RwLock::new(PeerStripes::default()),
             meta: Mutex::new(PeerMeta::default()),
@@ -176,12 +182,11 @@ impl PeerState {
         }
     }
 
-    /// Control RPCs use the same complete address group over TCP. Entry-point
-    /// failure can select another listener without changing this peer's QPs.
+    /// Control RPCs use the same complete address group over the bootstrap
+    /// transport selected when this peer was created. Entry-point failure can
+    /// select another listener without changing this peer's QPs.
     pub(super) fn bootstrap_context(&self, state: &Arc<State>) -> Context {
-        let endpoint = Endpoint::tcp(self.endpoint.addrs().iter().copied())
-            .expect("RDMA peer endpoint is nonempty");
-        Context::create_with_state_and_endpoint(state, endpoint)
+        Context::create_with_state_and_endpoint(state, self.bootstrap_endpoint.clone())
     }
 
     pub(super) fn active_snapshot(&self) -> Vec<Stripe> {
@@ -214,8 +219,8 @@ mod tests {
 
     fn peer() -> Arc<PeerState> {
         Arc::new(PeerState::new(
-            Endpoint::new(
-                Transport::RDMA,
+            Endpoint::rdma(
+                Transport::TCP,
                 [
                     "127.0.0.1:41001".parse().unwrap(),
                     "127.0.0.1:41002".parse().unwrap(),

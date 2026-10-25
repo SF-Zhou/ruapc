@@ -58,7 +58,8 @@ and source recovery, see
 
 ## Internal RDMA bootstrap: `_ruapc.rdma`
 
-With the `rdma` feature, the connection pool uses these methods over TCP.
+With the `rdma` feature, the connection pool uses these methods over the RDMA
+endpoint's declared bootstrap transport (`tcp`, `ws` or `http`).
 Peers must advertise bootstrap protocol version **2**.
 Bootstrap RPCs use the endpoint's full equivalent-address group; every address
 must share the acceptor's `State` and lease records. See

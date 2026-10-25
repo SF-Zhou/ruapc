@@ -6,6 +6,10 @@ use ruapc::*;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+mod common;
+
+use common::endpoint;
+
 // ==========================================================================
 // Service definition
 // ==========================================================================
@@ -186,7 +190,7 @@ async fn run_test(tc: TestCase) {
     let addr = server.clone().listen(addr).await.unwrap();
     let ctx = Context::create(&config)
         .unwrap()
-        .with_endpoint(Endpoint::new(tc.transport, [addr]).unwrap());
+        .with_endpoint(endpoint(tc.transport, addr));
 
     // Fill the client buffers and set their logical lengths; together
     // they form the read space the server operates on.

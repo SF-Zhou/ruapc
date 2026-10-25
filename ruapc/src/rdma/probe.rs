@@ -182,7 +182,7 @@ mod tests {
         });
         let server = Server::create(router, &config).unwrap();
         let address = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
-        let endpoint = Endpoint::new(Transport::RDMA, [address]).unwrap();
+        let endpoint = Endpoint::rdma(Transport::TCP, [address]).unwrap();
         let mut context = Context::create(&config).unwrap();
         let Socket::RDMA(socket) = context
             .state
