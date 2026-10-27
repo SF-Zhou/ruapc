@@ -1,6 +1,6 @@
 //! Immutable, owned source buffers shared by a client and its pending reads.
 
-use crate::{Buffer, CopyOp, Result};
+use crate::{Buffer, CopyOp, Error, Result};
 
 use super::scatter::{self, SpaceLayout};
 
@@ -17,16 +17,12 @@ impl ReadSource {
         let total = scatter::validate_ops(ops, layout.total(), u64::MAX)?;
         let mut bytes = Vec::with_capacity(usize::try_from(total)?);
         for op in ops {
-            layout.for_each_slice::<crate::Error>(
-                op.src_offset,
-                op.len,
-                |segment, offset, len| {
-                    let offset = usize::try_from(offset)?;
-                    let len = usize::try_from(len)?;
-                    bytes.extend_from_slice(&self.buffers[segment][offset..offset + len]);
-                    Ok(())
-                },
-            )?;
+            layout.for_each_slice::<Error>(op.src_offset, op.len, |segment, offset, len| {
+                let offset = usize::try_from(offset)?;
+                let len = usize::try_from(len)?;
+                bytes.extend_from_slice(&self.buffers[segment][offset..offset + len]);
+                Ok(())
+            })?;
         }
         Ok(bytes)
     }
@@ -35,6 +31,7 @@ impl ReadSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ErrorKind;
     use std::sync::Arc;
 
     #[test]
@@ -61,7 +58,7 @@ mod tests {
                 .read_inline(&[CopyOp::new(7, 0, 2)])
                 .unwrap_err()
                 .kind,
-            crate::ErrorKind::InvalidCopyOp
+            ErrorKind::InvalidCopyOp
         );
     }
 }

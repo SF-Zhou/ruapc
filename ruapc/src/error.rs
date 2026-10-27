@@ -1,6 +1,8 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::Buffer;
+
 /// Request, serialization, and transport failure categories.
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
 pub enum ErrorKind {
@@ -242,31 +244,31 @@ impl std::fmt::Display for Error {
 pub struct RemoteIoError {
     /// The underlying error.
     pub error: Error,
-    buffers: Option<Vec<crate::Buffer>>,
+    buffers: Option<Vec<Buffer>>,
 }
 
 impl RemoteIoError {
     /// Creates a new remote I/O error, optionally carrying the local
     /// buffers.
     #[must_use]
-    pub(crate) fn new(error: Error, buffers: Option<Vec<crate::Buffer>>) -> Self {
+    pub(crate) fn new(error: Error, buffers: Option<Vec<Buffer>>) -> Self {
         Self { error, buffers }
     }
 
     /// Returns the recovered local buffers, if any.
     #[must_use]
-    pub fn buffers(&self) -> Option<&[crate::Buffer]> {
+    pub fn buffers(&self) -> Option<&[Buffer]> {
         self.buffers.as_deref()
     }
 
     /// Takes the recovered local buffers, if any.
-    pub fn take_buffers(&mut self) -> Option<Vec<crate::Buffer>> {
+    pub fn take_buffers(&mut self) -> Option<Vec<Buffer>> {
         self.buffers.take()
     }
 
     /// Decomposes into the underlying error and the recovered buffers.
     #[must_use]
-    pub fn into_parts(self) -> (Error, Option<Vec<crate::Buffer>>) {
+    pub fn into_parts(self) -> (Error, Option<Vec<Buffer>>) {
         (self.error, self.buffers)
     }
 }

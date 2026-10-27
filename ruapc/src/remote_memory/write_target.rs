@@ -125,9 +125,9 @@ impl WriteTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Devices;
+    use crate::{BufferPool, Devices};
 
-    fn pool() -> Arc<crate::BufferPool> {
+    fn pool() -> Arc<BufferPool> {
         let devices = Arc::new(Devices::default());
         ruapc_bufpool::BufferPoolBuilder::new(devices).build()
     }

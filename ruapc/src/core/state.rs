@@ -3,9 +3,14 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio_util::sync::DropGuard;
 
 use crate::{
-    BufferPool, Context, Devices, Message, Metrics, RawStream, Result, Router, Socket, SocketPool,
-    SocketPoolConfig, Waiter,
+    BufferPool, Context, Devices, Error, Message, Metrics, RawStream, Result, Router, Socket,
+    SocketPool, SocketPoolConfig, Waiter,
 };
+
+#[cfg(feature = "rdma")]
+use crate::ErrorKind;
+#[cfg(feature = "rdma")]
+use crate::rdma::{RdmaDevice, RdmaPathPolicyConfig, RdmaPathReport};
 
 /// Router, connection pools, request correlation and registered-memory resources.
 ///
@@ -102,7 +107,7 @@ impl State {
                     if !rdma_device_allowed(dev.info(), prefer_rxe, &rdma.path) {
                         continue;
                     }
-                    devices.push(crate::rdma::RdmaDevice::new(dev));
+                    devices.push(RdmaDevice::new(dev));
                 }
             }
             devices
@@ -126,7 +131,7 @@ impl State {
 
     /// Eagerly fails waiters bound to a dead connection. Running handlers are
     /// not cancelled; a response send failure is discarded.
-    pub(crate) fn connection_closed(&self, conn_id: u64, err: &crate::Error) {
+    pub(crate) fn connection_closed(&self, conn_id: u64, err: &Error) {
         self.waiter.fail_connection(conn_id, err);
     }
 
@@ -155,11 +160,11 @@ impl State {
     /// Returns [`ErrorKind::InvalidArgument`](crate::ErrorKind::InvalidArgument)
     /// when RDMA resources were not enabled in `SocketPoolConfig`.
     #[cfg(feature = "rdma")]
-    pub async fn rdma_path_report(&self) -> Result<crate::rdma::RdmaPathReport> {
+    pub async fn rdma_path_report(&self) -> Result<RdmaPathReport> {
         match self.socket_pool.rdma_pool() {
             Some(pool) => Ok(pool.path_report().await),
-            None => Err(crate::Error::new(
-                crate::ErrorKind::InvalidArgument,
+            None => Err(Error::new(
+                ErrorKind::InvalidArgument,
                 "RDMA is not supported: invalid socket type".into(),
             )),
         }
@@ -175,7 +180,7 @@ fn sort_rdma_devices(devices: &mut [ruapc_rdma::ActiveDevice]) {
 fn rdma_device_allowed(
     info: &ruapc_rdma::DeviceInfo,
     prefer_rxe: bool,
-    path: &crate::rdma::RdmaPathPolicyConfig,
+    path: &RdmaPathPolicyConfig,
 ) -> bool {
     let has_allowed_port = info.ports.iter().any(|port| {
         port.is_usable()
@@ -242,7 +247,7 @@ mod tests {
             name: "mlx5_0".to_owned(),
             ..Default::default()
         };
-        let mut path = crate::rdma::RdmaPathPolicyConfig::default();
+        let mut path = RdmaPathPolicyConfig::default();
 
         assert!(rdma_device_allowed(&active, false, &path));
         assert!(rdma_device_allowed(&active_defer, false, &path));
@@ -267,7 +272,7 @@ mod tests {
 
         let mlx5_0 = rdma_device_info("mlx5_0", IBV_PORT_DOWN);
         let mlx5_1 = rdma_device_info("mlx5_1", IBV_PORT_DOWN);
-        let path = crate::rdma::RdmaPathPolicyConfig {
+        let path = RdmaPathPolicyConfig {
             device_filter: vec!["mlx5_0".to_owned(), "mlx5_1".to_owned()],
             device_exclude: vec!["mlx5_1".to_owned()],
             allow_down_ports: true,
@@ -287,13 +292,13 @@ mod tests {
     #[tokio::test]
     async fn test_handle_recv_invalid_msg_type_warns_and_ok() {
         let config = SocketPoolConfig::default();
-        let router = crate::Router::default();
+        let router = Router::default();
         let (state, _guard) = State::create(router, &config).unwrap();
 
         // Create a socket just so we have a value to pass (not actually used for this path).
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let tcp_socket = TcpSocket::new(tx);
-        let socket = crate::Socket::TCP(tcp_socket);
+        let socket = Socket::TCP(tcp_socket);
 
         // A message with flags = 0 is neither IsReq nor IsRsp → triggers the warn! branch.
         let msg = Message {

@@ -9,7 +9,11 @@ use hyper::body::Frame;
 use serde::Serialize;
 use tokio::sync::mpsc;
 
-use crate::{Error, ErrorKind, Message, MsgMeta, Result, SocketTrait, State, msg::SendMsg};
+use crate::{
+    Error, ErrorKind, Message, MsgMeta, Result, SocketTrait, State,
+    msg::{SendMsg, frame::encode},
+    sockets::{ChannelConnection, PoolConnection},
+};
 
 #[derive(Clone, Debug)]
 pub enum HttpSocket {
@@ -20,13 +24,13 @@ pub enum HttpSocket {
 /// Sender half of an HTTP/2 `/_rpc` bidirectional stream.
 #[derive(Clone, Debug)]
 pub struct StreamSocket {
-    inner: Arc<crate::sockets::ChannelConnection>,
+    inner: Arc<ChannelConnection>,
 }
 
 impl StreamSocket {
     pub(crate) fn new(sender: mpsc::Sender<Bytes>) -> Self {
         Self {
-            inner: Arc::new(crate::sockets::ChannelConnection::new(sender)),
+            inner: Arc::new(ChannelConnection::new(sender)),
         }
     }
 
@@ -50,7 +54,7 @@ impl StreamSocket {
     }
 }
 
-impl crate::sockets::PoolConnection for HttpSocket {
+impl PoolConnection for HttpSocket {
     fn is_closed(&self) -> bool {
         self.is_closed()
     }
@@ -133,7 +137,7 @@ impl SocketTrait for HttpSocket {
                 stream_socket
                     .inner
                     .send(meta, &state.waiter, "HTTP", |meta| {
-                        crate::msg::frame::encode(meta, payload).map_err(Into::into)
+                        encode(meta, payload).map_err(Into::into)
                     })
                     .await
             }

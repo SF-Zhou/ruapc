@@ -4,6 +4,8 @@
 //! access a QP's ownership tables or issue completion proofs, so measurements
 //! never grant authority to reclaim buffers posted to a real device.
 
+use crate::{CompletionCursor, WRID, WrBuffers};
+
 pub use crate::verbs::read_bench_support as read;
 
 /// An independently owned instance of the production buffer table.
@@ -16,14 +18,14 @@ impl WrSlots {
     }
 
     #[inline]
-    pub fn insert(&self, id: u64, buffer: crate::WrBuffers) -> Result<(), crate::WrBuffers> {
-        assert!(id <= crate::WRID::MAX_SEQUENCE, "sequence out of range");
+    pub fn insert(&self, id: u64, buffer: WrBuffers) -> Result<(), WrBuffers> {
+        assert!(id <= WRID::MAX_SEQUENCE, "sequence out of range");
         self.0.insert(id, buffer)
     }
 
     #[inline]
-    pub fn take(&self, id: u64) -> Option<crate::WrBuffers> {
-        assert!(id <= crate::WRID::MAX_SEQUENCE, "sequence out of range");
+    pub fn take(&self, id: u64) -> Option<WrBuffers> {
+        assert!(id <= WRID::MAX_SEQUENCE, "sequence out of range");
         self.0.take(id)
     }
 
@@ -39,14 +41,11 @@ impl WrSlots {
 /// Advances the production sweep cursor without accessing a QP or buffers.
 #[inline]
 pub fn sweep(
-    cursor: &mut crate::CompletionCursor,
+    cursor: &mut CompletionCursor,
     first_sequence: u64,
     completed: u64,
 ) -> std::ops::Range<u64> {
-    assert!(
-        completed <= crate::WRID::MAX_SEQUENCE,
-        "sequence out of range"
-    );
+    assert!(completed <= WRID::MAX_SEQUENCE, "sequence out of range");
     cursor.sweep_to(first_sequence, completed)
 }
 

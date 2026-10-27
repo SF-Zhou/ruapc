@@ -166,14 +166,14 @@ mod tests {
     #[tokio::test]
     async fn test_ruapc_request_invalid_endpoint_returns_err() {
         use crate::{
-            SocketPoolConfig,
+            Context, ErrorKind, SocketPoolConfig,
             services::{DescribeRequest, ReflectionService as _},
         };
-        let ctx = crate::Context::create(&SocketPoolConfig::default()).unwrap();
+        let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
         let client = Client::default();
         let result = client.describe(&ctx, &DescribeRequest::default()).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err.kind, crate::ErrorKind::InvalidArgument);
+        assert_eq!(err.kind, ErrorKind::InvalidArgument);
     }
 }

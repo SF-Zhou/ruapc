@@ -7,13 +7,16 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_util::sync::DropGuard;
 
 #[cfg(feature = "rdma")]
+use crate::TaskSupervisorHandle;
+#[cfg(feature = "rdma")]
 use crate::rdma::{
     ConnectionLease, PrepareConnectionRequest, PrepareConnectionResponse, RdmaPeerAdvertisement,
-    RdmaSocketPool,
+    RdmaSocket, RdmaSocketPool,
 };
 use crate::{
-    Endpoint as RpcEndpoint, Error, ErrorKind, ListenMode, Result, Socket, SocketPoolConfig, State,
-    TaskSupervisor, Transport, http::HttpSocketPool, tcp::TcpSocketPool, ws::WebSocketPool,
+    BufferPool, Devices, Endpoint as RpcEndpoint, Error, ErrorKind, ListenMode, Result, Socket,
+    SocketPoolConfig, State, TaskSupervisor, Transport, http::HttpSocketPool,
+    msg::frame::MAGIC_NUM, tcp::TcpSocketPool, ws::WebSocketPool,
 };
 
 /// Constraints and budget applied when acquiring a connection.
@@ -72,8 +75,8 @@ pub enum RawStream {
 pub trait SocketPoolTrait: Sized {
     fn create(
         config: &SocketPoolConfig,
-        devices: &Arc<crate::Devices>,
-        buffer_pool: &Arc<crate::BufferPool>,
+        devices: &Arc<Devices>,
+        buffer_pool: &Arc<BufferPool>,
     ) -> Result<Self>;
 
     async fn acquire(&self, endpoint: &RpcEndpoint, state: &Arc<State>) -> Result<Socket>;
@@ -97,8 +100,8 @@ impl SocketPool {
     /// the RDMA pool.
     pub fn create(
         config: &SocketPoolConfig,
-        devices: &Arc<crate::Devices>,
-        buffer_pool: &Arc<crate::BufferPool>,
+        devices: &Arc<Devices>,
+        buffer_pool: &Arc<BufferPool>,
     ) -> Result<Self> {
         let task_supervisor = TaskSupervisor::create();
         let tcp = TcpSocketPool::create(config, devices, buffer_pool)?;
@@ -242,7 +245,7 @@ impl SocketPool {
     }
 
     #[cfg(feature = "rdma")]
-    pub(crate) fn task_supervisor_handle(&self) -> crate::TaskSupervisorHandle {
+    pub(crate) fn task_supervisor_handle(&self) -> TaskSupervisorHandle {
         self.task_supervisor.handle()
     }
 
@@ -305,7 +308,7 @@ impl SocketPool {
     /// peer that stalls mid-prefix (then only a genuine — if broken — RuaPC
     /// client is plausible, so fall back to TCP).
     async fn peek_is_tcp_magic(stream: &tokio::net::TcpStream) -> Result<bool> {
-        let magic = crate::msg::frame::MAGIC_NUM.to_be_bytes();
+        let magic = MAGIC_NUM.to_be_bytes();
         let mut buf = [0u8; std::mem::size_of::<u32>()];
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
         loop {
@@ -388,7 +391,7 @@ impl SocketPool {
     pub(crate) fn rdma_receive_observed(
         &self,
         connection_id: u64,
-        socket: &std::sync::Arc<crate::rdma::RdmaSocket>,
+        socket: &std::sync::Arc<RdmaSocket>,
     ) -> Result<()> {
         match &self.rdma {
             Some(pool) => {
@@ -436,11 +439,13 @@ impl std::fmt::Debug for SocketPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "rdma")]
+    use crate::rdma::test_utils::make_rdma_devices;
 
     #[tokio::test]
     async fn composite_pool_lifecycle() {
         let config = SocketPoolConfig::default();
-        let devices = std::sync::Arc::new(crate::Devices::default());
+        let devices = std::sync::Arc::new(Devices::default());
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
         pool.stop();
@@ -451,7 +456,7 @@ mod tests {
     #[cfg(feature = "rdma")]
     #[tokio::test]
     async fn rdma_is_enabled_by_default_and_can_be_disabled() {
-        let devices = crate::rdma::test_utils::make_rdma_devices();
+        let devices = make_rdma_devices();
         let config = SocketPoolConfig::default();
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
@@ -461,7 +466,7 @@ mod tests {
             rdma: None,
             ..Default::default()
         };
-        let disabled_devices = std::sync::Arc::new(crate::Devices::default());
+        let disabled_devices = std::sync::Arc::new(Devices::default());
         let disabled_buffers =
             ruapc_bufpool::BufferPoolBuilder::new(disabled_devices.clone()).build();
         let disabled_pool =

@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use foldhash::fast::RandomState;
 
-use crate::Endpoint;
+use crate::{Endpoint, task::next_conn_id};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
@@ -17,7 +17,7 @@ pub(crate) struct ConnectionLifecycle {
 impl ConnectionLifecycle {
     pub(crate) fn new() -> Self {
         Self {
-            conn_id: crate::task::next_conn_id(),
+            conn_id: next_conn_id(),
             closed: std::sync::atomic::AtomicBool::new(false),
             close_notification: CancellationToken::new(),
         }

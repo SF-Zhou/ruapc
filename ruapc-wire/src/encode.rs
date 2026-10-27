@@ -1,7 +1,7 @@
 //! Serialization directly into transport-owned storage.
 
 use super::{MsgFlags, MsgMeta};
-use crate::{CodecError, CodecErrorKind, CodecResult};
+use crate::{Buffer, CodecError, CodecErrorKind, CodecResult};
 use bytes::BytesMut;
 use serde::Serialize;
 use std::io::Write;
@@ -97,7 +97,7 @@ fn finish_metadata(bytes: &mut [u8], meta_offset: usize, payload_offset: usize) 
     Ok(())
 }
 
-impl SendMsg for crate::Buffer {
+impl SendMsg for Buffer {
     type Error = CodecError;
 
     #[inline]
@@ -119,7 +119,7 @@ impl SendMsg for crate::Buffer {
     #[inline]
     fn writer(&mut self) -> impl std::io::Write {
         #[repr(transparent)]
-        struct Writer<'a>(&'a mut crate::Buffer);
+        struct Writer<'a>(&'a mut Buffer);
 
         impl std::io::Write for Writer<'_> {
             #[inline]

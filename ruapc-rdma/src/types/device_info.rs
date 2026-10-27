@@ -16,7 +16,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::{Guid, LinkLayer, ibv_device_attr, ibv_gid, ibv_port_attr, ibv_transport_type};
+use crate::{
+    Guid, LinkLayer, ibv_device_attr, ibv_gid, ibv_port_attr, ibv_port_state, ibv_transport_type,
+};
 
 /// Information about an RDMA device.
 ///
@@ -129,7 +131,7 @@ impl Port {
     pub fn is_usable(&self) -> bool {
         matches!(
             self.port_attr.state,
-            crate::ibv_port_state::IBV_PORT_ACTIVE | crate::ibv_port_state::IBV_PORT_ACTIVE_DEFER
+            ibv_port_state::IBV_PORT_ACTIVE | ibv_port_state::IBV_PORT_ACTIVE_DEFER
         ) && matches!(
             self.port_attr.link_layer,
             LinkLayer::InfiniBand | LinkLayer::Ethernet
@@ -201,14 +203,14 @@ mod tests {
         // Zeroed attrs: NOP state, unspecified link layer.
         assert!(!port.is_usable());
 
-        port.port_attr.state = crate::ibv_port_state::IBV_PORT_ACTIVE;
+        port.port_attr.state = ibv_port_state::IBV_PORT_ACTIVE;
         port.port_attr.link_layer = LinkLayer::Ethernet;
         assert!(port.is_usable());
 
-        port.port_attr.state = crate::ibv_port_state::IBV_PORT_DOWN;
+        port.port_attr.state = ibv_port_state::IBV_PORT_DOWN;
         assert!(!port.is_usable());
 
-        port.port_attr.state = crate::ibv_port_state::IBV_PORT_ACTIVE;
+        port.port_attr.state = ibv_port_state::IBV_PORT_ACTIVE;
         port.port_attr.link_layer = LinkLayer::Unspecified;
         assert!(!port.is_usable());
     }

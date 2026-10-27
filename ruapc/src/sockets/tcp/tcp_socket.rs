@@ -4,17 +4,22 @@ use bytes::Bytes;
 use serde::Serialize;
 use tokio::sync::mpsc;
 
-use crate::{SocketTrait, State, error::Result, msg::MsgMeta};
+use crate::{
+    SocketTrait, State,
+    error::Result,
+    msg::{MsgMeta, frame::encode},
+    sockets::{ChannelConnection, PoolConnection},
+};
 
 #[derive(Debug, Clone)]
 pub struct TcpSocket {
-    inner: Arc<crate::sockets::ChannelConnection>,
+    inner: Arc<ChannelConnection>,
 }
 
 impl TcpSocket {
     pub fn new(stream: mpsc::Sender<Bytes>) -> Self {
         Self {
-            inner: Arc::new(crate::sockets::ChannelConnection::new(stream)),
+            inner: Arc::new(ChannelConnection::new(stream)),
         }
     }
 
@@ -39,7 +44,7 @@ impl TcpSocket {
     }
 }
 
-impl crate::sockets::PoolConnection for TcpSocket {
+impl PoolConnection for TcpSocket {
     fn is_closed(&self) -> bool {
         self.is_closed()
     }
@@ -58,7 +63,7 @@ impl SocketTrait for TcpSocket {
     ) -> Result<()> {
         self.inner
             .send(meta, &state.waiter, "TCP", |meta| {
-                crate::msg::frame::encode(meta, payload).map_err(Into::into)
+                encode(meta, payload).map_err(Into::into)
             })
             .await
     }

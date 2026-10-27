@@ -7,11 +7,12 @@
 
 use super::*;
 use crate::{
-    MsgFlags, Router, SocketPoolConfig, SocketTrait,
+    MsgFlags, Receiver, Router, SocketPoolConfig, SocketTrait,
     rdma::{
         DevicePollers, PollerConfig, RdmaBandwidthLimiter, RdmaConnectionConfig, RdmaNicInfo,
-        RdmaPathInfo, RdmaQueuePairConfig, RdmaSocketConfig,
+        RdmaPathInfo, RdmaQueuePairConfig, RdmaSocketConfig, SendPermit,
         frame::{Frame, decode_frames},
+        test_utils::make_rdma_devices,
     },
 };
 use ruapc_bufpool::Device as _;
@@ -32,7 +33,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let devices = crate::rdma::test_utils::make_rdma_devices();
+        let devices = make_rdma_devices();
         let device = &devices.devices()[0];
         let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let connection = RdmaConnectionConfig {
@@ -159,7 +160,7 @@ impl Fixture {
         // unconnected QP, then fill every pending queue slot.
         assert!(matches!(
             self.socket.state.try_acquire(),
-            crate::rdma::SendPermit::Granted { .. }
+            SendPermit::Granted { .. }
         ));
         for _ in 0..4 {
             let mut queued = self.socket.rdmabuf_pool.allocate(1).unwrap();
@@ -568,7 +569,7 @@ async fn expired_inline_request_does_not_consume_a_direct_send_credit() {
     assert!(fixture.pending.is_empty());
     assert_eq!(
         fixture.socket.state.try_acquire(),
-        crate::rdma::SendPermit::Granted { window_tail: true }
+        SendPermit::Granted { window_tail: true }
     );
     assert!(fixture.socket.state.is_ok());
 
@@ -580,7 +581,7 @@ async fn expired_inline_request_does_not_consume_a_direct_send_credit() {
 #[tokio::test]
 async fn inline_request_cancelled_during_serialization_keeps_direct_send_credit() {
     struct CancelRequest<'a> {
-        response: std::cell::RefCell<Option<crate::Receiver<'a>>>,
+        response: std::cell::RefCell<Option<Receiver<'a>>>,
         serializations: std::cell::Cell<usize>,
     }
 
@@ -621,7 +622,7 @@ async fn inline_request_cancelled_during_serialization_keeps_direct_send_credit(
     assert!(fixture.pending.is_empty());
     assert_eq!(
         fixture.socket.state.try_acquire(),
-        crate::rdma::SendPermit::Granted { window_tail: true }
+        SendPermit::Granted { window_tail: true }
     );
     assert!(fixture.socket.state.is_ok());
 

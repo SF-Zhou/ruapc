@@ -6,8 +6,12 @@ use ruapc_bufpool::Device as _;
 use ruapc_rdma::{QueuePair, ibv_qp_attr, ibv_qp_attr_mask, ibv_qp_state};
 
 use crate::{
-    MsgFlags, MsgMeta, SocketTrait,
-    rdma::{ConnCountGuard, RdmaBandwidthLimiter, RdmaNicInfo, RdmaPathInfo, RdmaSocketConfig},
+    BufferPool, MsgFlags, MsgMeta, Router, SocketPoolConfig, SocketTrait, TaskSupervisor,
+    rdma::{
+        ConnCountGuard, RdmaBandwidthLimiter, RdmaConnectionConfig, RdmaDevice, RdmaNicInfo,
+        RdmaPathInfo, RdmaQueuePairConfig, RdmaSocketConfig, SendPermit,
+        test_utils::{make_rdma_devices, open_rdma_device},
+    },
 };
 
 /// The shared CQ length must be clamped to the device's `max_cqe`:
@@ -15,7 +19,7 @@ use crate::{
 /// driver caps `max_cqe` at 32767, below the default `device_cq_len`).
 #[tokio::test]
 async fn test_cq_len_clamped_to_device_max() {
-    let device = crate::rdma::test_utils::open_rdma_device();
+    let device = open_rdma_device();
     let config = PollerConfig {
         cq_len: u32::MAX,
         read_limit: 1,
@@ -67,7 +71,7 @@ fn wake_during_maintenance_survives_draining_the_pipe() {
 
 #[tokio::test]
 async fn shard_admission_tries_other_queues_and_reclaims_failed_setup() {
-    let device = crate::rdma::test_utils::open_rdma_device();
+    let device = open_rdma_device();
     let config = PollerConfig {
         cq_len: 63,
         read_limit: 32,
@@ -90,12 +94,12 @@ async fn shard_admission_tries_other_queues_and_reclaims_failed_setup() {
     // Give the less loaded shard an unsaturated READ reserve. The larger
     // READ demand below can fit only on the other shard, whose shared READ
     // reserve is already paid. Lowest current usage alone is insufficient.
-    let connection = |recv_queue_len, max_send_wr| crate::rdma::RdmaConnectionConfig {
+    let connection = |recv_queue_len, max_send_wr| RdmaConnectionConfig {
         recv_queue_len,
         max_msg_size: 1024,
         max_large_msg_size: 0,
         traffic_class: 0,
-        qp: crate::rdma::RdmaQueuePairConfig {
+        qp: RdmaQueuePairConfig {
             max_send_wr,
             ..Default::default()
         },
@@ -142,7 +146,7 @@ async fn shard_admission_tries_other_queues_and_reclaims_failed_setup() {
 
 #[tokio::test]
 async fn failed_new_shard_does_not_hide_existing_capacity() {
-    let devices = crate::rdma::test_utils::make_rdma_devices();
+    let devices = make_rdma_devices();
     let device = &devices.devices()[0];
     let pollers = DevicePollers::default();
     let config = PollerConfig {
@@ -151,12 +155,12 @@ async fn failed_new_shard_does_not_hide_existing_capacity() {
         spin_us: 0,
         dispatch_workers: 1,
     };
-    let connection = crate::rdma::RdmaConnectionConfig {
+    let connection = RdmaConnectionConfig {
         recv_queue_len: 2,
         max_msg_size: 1024,
         max_large_msg_size: 0,
         traffic_class: 0,
-        qp: crate::rdma::RdmaQueuePairConfig::default(),
+        qp: RdmaQueuePairConfig::default(),
     };
     let (first, a) = pollers.reserve(device, config, 2, &connection).unwrap();
     // Bypass public config validation to deterministically fail only the new
@@ -220,8 +224,8 @@ fn manual_poller(context: &Arc<ruapc_rdma::Context>) -> (DevicePoller, PollLoop)
 /// credits without inventing CQEs or requiring a connected peer.
 fn register_idle_socket(
     poller: &DevicePoller,
-    device: &crate::rdma::RdmaDevice,
-    buffer_pool: &Arc<crate::BufferPool>,
+    device: &RdmaDevice,
+    buffer_pool: &Arc<BufferPool>,
     state: &Arc<State>,
 ) -> Arc<RdmaSocket> {
     register_idle_socket_with_read_permits(
@@ -235,8 +239,8 @@ fn register_idle_socket(
 
 fn register_idle_socket_with_read_permits(
     poller: &DevicePoller,
-    device: &crate::rdma::RdmaDevice,
-    buffer_pool: &Arc<crate::BufferPool>,
+    device: &RdmaDevice,
+    buffer_pool: &Arc<BufferPool>,
     state: &Arc<State>,
     read_permits: Arc<tokio::sync::Semaphore>,
 ) -> Arc<RdmaSocket> {
@@ -270,18 +274,18 @@ impl Default for SocketTestConfig {
 
 fn register_socket_with_config(
     poller: &DevicePoller,
-    device: &crate::rdma::RdmaDevice,
-    buffer_pool: &Arc<crate::BufferPool>,
+    device: &RdmaDevice,
+    buffer_pool: &Arc<BufferPool>,
     state: &Arc<State>,
     read_permits: Arc<tokio::sync::Semaphore>,
     pending: SocketTestConfig,
 ) -> Arc<RdmaSocket> {
-    let connection = crate::rdma::RdmaConnectionConfig {
+    let connection = RdmaConnectionConfig {
         recv_queue_len: pending.window * 2,
         max_msg_size: 1024,
         max_large_msg_size: 0,
         traffic_class: 0,
-        qp: crate::rdma::RdmaQueuePairConfig {
+        qp: RdmaQueuePairConfig {
             max_send_wr: 4,
             max_recv_wr: 4,
             max_send_sge: 1,
@@ -345,7 +349,7 @@ fn register_socket_with_config(
                 recv_buf_size: 1024,
                 send_window: pending.window,
                 msg_aggregation: pending.aggregate,
-                supervisor_guard: crate::TaskSupervisor::create().start_async_task(),
+                supervisor_guard: TaskSupervisor::create().start_async_task(),
                 ring_reservation: RingReservation::add(&Arc::new(AtomicUsize::new(0)), 0).0,
                 conn_count_guard: ConnCountGuard::acquire(&Arc::new(vec![AtomicUsize::new(0)]), 0),
             },
@@ -355,7 +359,7 @@ fn register_socket_with_config(
     socket
 }
 
-fn connect_read_pair(device: &crate::rdma::RdmaDevice, first: &QueuePair, second: &QueuePair) {
+fn connect_read_pair(device: &RdmaDevice, first: &QueuePair, second: &QueuePair) {
     let info = device.info();
     let port = info.ports.iter().find(|p| p.is_usable()).unwrap();
     let gid = port
@@ -403,13 +407,13 @@ async fn complete_one_read(poller: &DevicePoller, poll_loop: &mut PollLoop) {
 
 #[tokio::test]
 async fn successful_receive_queued_before_close_is_not_reposted() {
-    let devices = crate::rdma::test_utils::make_rdma_devices();
+    let devices = make_rdma_devices();
     let device = &devices.devices()[0];
     let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
     let (poller, mut poll_loop) = manual_poller(device.context());
     let (state, _stop) = State::create(
-        crate::Router::default(),
-        &crate::SocketPoolConfig {
+        Router::default(),
+        &SocketPoolConfig {
             rdma: None,
             ..Default::default()
         },
@@ -479,13 +483,13 @@ async fn successful_receive_queued_before_close_is_not_reposted() {
 
 #[tokio::test]
 async fn close_between_receive_health_check_and_post_is_flushed_by_poller() {
-    let devices = crate::rdma::test_utils::make_rdma_devices();
+    let devices = make_rdma_devices();
     let device = &devices.devices()[0];
     let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
     let (poller, mut poll_loop) = manual_poller(device.context());
     let (state, _stop) = State::create(
-        crate::Router::default(),
-        &crate::SocketPoolConfig {
+        Router::default(),
+        &SocketPoolConfig {
             rdma: None,
             ..Default::default()
         },
@@ -559,12 +563,12 @@ async fn close_between_receive_health_check_and_post_is_flushed_by_poller() {
 async fn read_deadlines_bound_first_nic_admission_and_restore_unposted_targets() {
     use crate::remote_memory::{CopyOp, WriteTarget, scatter::SpaceLayout};
 
-    let devices = crate::rdma::test_utils::make_rdma_devices();
+    let devices = make_rdma_devices();
     let device = &devices.devices()[0];
     let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
     let (state, _stop) = State::create(
-        crate::Router::default(),
-        &crate::SocketPoolConfig {
+        Router::default(),
+        &SocketPoolConfig {
             rdma: None,
             ..Default::default()
         },
@@ -657,12 +661,12 @@ async fn read_deadlines_bound_first_nic_admission_and_restore_unposted_targets()
 async fn read_deadlines_bound_partial_posting_without_releasing_dma() {
     use crate::remote_memory::{CopyOp, WriteTarget, scatter::SpaceLayout};
 
-    let devices = crate::rdma::test_utils::make_rdma_devices();
+    let devices = make_rdma_devices();
     let device = &devices.devices()[0];
     let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
     let (state, _stop) = State::create(
-        crate::Router::default(),
-        &crate::SocketPoolConfig {
+        Router::default(),
+        &SocketPoolConfig {
             rdma: None,
             ..Default::default()
         },
@@ -784,13 +788,13 @@ async fn cancelled_read_completion_preserves_the_hard_watchdog() {
 async fn completion_watchdog_survives_waiter(cancel_receiver: bool) {
     use crate::remote_memory::{CopyOp, WriteTarget, scatter::SpaceLayout};
 
-    let devices = crate::rdma::test_utils::make_rdma_devices();
+    let devices = make_rdma_devices();
     let device = &devices.devices()[0];
     let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
     let (poller, mut poll_loop) = manual_poller(device.context());
     let (state, _stop) = State::create(
-        crate::Router::default(),
-        &crate::SocketPoolConfig {
+        Router::default(),
+        &SocketPoolConfig {
             rdma: None,
             ..Default::default()
         },
@@ -877,13 +881,13 @@ async fn completion_watchdog_survives_waiter(cancel_receiver: bool) {
 async fn closing_a_posted_read_without_a_watchdog_wakes_before_any_completion() {
     use crate::remote_memory::{CopyOp, WriteTarget, scatter::SpaceLayout};
 
-    let devices = crate::rdma::test_utils::make_rdma_devices();
+    let devices = make_rdma_devices();
     let device = &devices.devices()[0];
     let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
     let (poller, mut poll_loop) = manual_poller(device.context());
     let (state, _stop) = State::create(
-        crate::Router::default(),
-        &crate::SocketPoolConfig {
+        Router::default(),
+        &SocketPoolConfig {
             rdma: None,
             ..Default::default()
         },
@@ -933,12 +937,12 @@ async fn closing_a_posted_read_without_a_watchdog_wakes_before_any_completion() 
 async fn shutdown_returns_unpolled_read_credits_only_after_qp_destruction() {
     use crate::remote_memory::{CopyOp, WriteTarget, scatter::SpaceLayout};
 
-    let devices = crate::rdma::test_utils::make_rdma_devices();
+    let devices = make_rdma_devices();
     let device = &devices.devices()[0];
     let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
     let (state, _stop) = State::create(
-        crate::Router::default(),
-        &crate::SocketPoolConfig {
+        Router::default(),
+        &SocketPoolConfig {
             rdma: None,
             ..Default::default()
         },
@@ -1047,13 +1051,13 @@ async fn shutdown_closes_live_connections_before_refunding_incoming_reads() {
         }
     }
 
-    let devices = crate::rdma::test_utils::make_rdma_devices();
+    let devices = make_rdma_devices();
     let device = &devices.devices()[0];
     let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
     let (poller, mut poll_loop) = manual_poller(device.context());
     let (state, _stop) = State::create(
-        crate::Router::default(),
-        &crate::SocketPoolConfig {
+        Router::default(),
+        &SocketPoolConfig {
             rdma: None,
             ..Default::default()
         },
@@ -1102,13 +1106,13 @@ async fn shutdown_closes_live_connections_before_refunding_incoming_reads() {
 
 #[tokio::test]
 async fn a_read_posted_after_the_shutdown_scan_does_not_wait_for_a_stopped_poller() {
-    let devices = crate::rdma::test_utils::make_rdma_devices();
+    let devices = make_rdma_devices();
     let device = &devices.devices()[0];
     let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
     let (poller, mut poll_loop) = manual_poller(device.context());
     let (state, _stop) = State::create(
-        crate::Router::default(),
-        &crate::SocketPoolConfig {
+        Router::default(),
+        &SocketPoolConfig {
             rdma: None,
             ..Default::default()
         },
@@ -1188,14 +1192,10 @@ fn mark_dirty(poll_loop: &mut PollLoop, qp_num: u32) {
 
 /// Fill both pending stages without posting to the fixture's unconnected QP.
 /// Byte markers make FIFO order observable without involving frame decoding.
-fn fill_blocked_send_stages(
-    poll_loop: &mut PollLoop,
-    socket: &RdmaSocket,
-    pool: &Arc<crate::BufferPool>,
-) {
+fn fill_blocked_send_stages(poll_loop: &mut PollLoop, socket: &RdmaSocket, pool: &Arc<BufferPool>) {
     assert!(matches!(
         socket.state.try_acquire(),
-        crate::rdma::SendPermit::Granted { .. }
+        SendPermit::Granted { .. }
     ));
     let capacity = socket.pending_sender.max_capacity();
     for batch in 0..2 {
@@ -1224,13 +1224,13 @@ fn fill_blocked_send_stages(
 
 #[tokio::test]
 async fn pending_send_backlog_stays_bounded_and_cancellation_preserves_capacity() {
-    let devices = crate::rdma::test_utils::make_rdma_devices();
+    let devices = make_rdma_devices();
     let device = &devices.devices()[0];
     let (poller, mut poll_loop) = manual_poller(device.context());
     let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
     let (state, _stop) = State::create(
-        crate::Router::default(),
-        &crate::SocketPoolConfig {
+        Router::default(),
+        &SocketPoolConfig {
             rdma: None,
             ..Default::default()
         },
@@ -1286,13 +1286,13 @@ async fn pending_send_backlog_stays_bounded_and_cancellation_preserves_capacity(
 #[tokio::test]
 async fn full_pending_send_backlog_wakes_on_close_and_poller_shutdown() {
     for shutdown in [false, true] {
-        let devices = crate::rdma::test_utils::make_rdma_devices();
+        let devices = make_rdma_devices();
         let device = &devices.devices()[0];
         let (poller, mut poll_loop) = manual_poller(device.context());
         let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let (state, _stop) = State::create(
-            crate::Router::default(),
-            &crate::SocketPoolConfig {
+            Router::default(),
+            &SocketPoolConfig {
                 rdma: None,
                 ..Default::default()
             },
@@ -1336,13 +1336,13 @@ async fn full_pending_send_backlog_wakes_on_close_and_poller_shutdown() {
 #[tokio::test]
 async fn pending_send_refill_spends_remaining_window_in_one_maintenance_pass() {
     for aggregate in [false, true] {
-        let devices = crate::rdma::test_utils::make_rdma_devices();
+        let devices = make_rdma_devices();
         let device = &devices.devices()[0];
         let (poller, mut poll_loop) = manual_poller(device.context());
         let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let (state, _stop) = State::create(
-            crate::Router::default(),
-            &crate::SocketPoolConfig {
+            Router::default(),
+            &SocketPoolConfig {
                 rdma: None,
                 ..Default::default()
             },
@@ -1389,7 +1389,7 @@ async fn pending_send_refill_spends_remaining_window_in_one_maintenance_pass() {
         poll_loop.maintain_connections(Instant::now(), false, false);
         assert!(poll_loop.conns[&qp_num].pending_sends.is_empty());
         assert_eq!(socket.pending_sender.capacity(), capacity);
-        assert_eq!(socket.state.try_acquire(), crate::rdma::SendPermit::Full);
+        assert_eq!(socket.state.try_acquire(), SendPermit::Full);
         assert!(socket.state.is_ok());
 
         let mut received = Vec::new();
@@ -1434,13 +1434,13 @@ async fn pending_send_refill_spends_remaining_window_in_one_maintenance_pass() {
 
 #[tokio::test]
 async fn dirty_maintenance_is_bounded_and_survives_replacement() {
-    let devices = crate::rdma::test_utils::make_rdma_devices();
+    let devices = make_rdma_devices();
     let device = &devices.devices()[0];
     let (poller, mut poll_loop) = manual_poller(device.context());
     let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
     let (state, _stop) = State::create(
-        crate::Router::default(),
-        &crate::SocketPoolConfig {
+        Router::default(),
+        &SocketPoolConfig {
             rdma: None,
             ..Default::default()
         },
@@ -1460,7 +1460,7 @@ async fn dirty_maintenance_is_bounded_and_survives_replacement() {
     // first so a later full scan can drain the message without posting it.
     assert!(matches!(
         second.state.try_acquire(),
-        crate::rdma::SendPermit::Granted { .. }
+        SendPermit::Granted { .. }
     ));
     second
         .pending_sender
@@ -1509,13 +1509,13 @@ async fn dirty_maintenance_is_bounded_and_survives_replacement() {
 
 #[tokio::test]
 async fn identical_wrids_are_routed_by_their_provider_qp_numbers() {
-    let devices = crate::rdma::test_utils::make_rdma_devices();
+    let devices = make_rdma_devices();
     let device = &devices.devices()[0];
     let (poller, mut poll_loop) = manual_poller(device.context());
     let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
     let (state, _stop) = State::create(
-        crate::Router::default(),
-        &crate::SocketPoolConfig {
+        Router::default(),
+        &SocketPoolConfig {
             rdma: None,
             ..Default::default()
         },
@@ -1598,7 +1598,7 @@ async fn identical_wrids_are_routed_by_their_provider_qp_numbers() {
 
 #[tokio::test]
 async fn early_flush_completion_waits_for_registration_and_settles_receive() {
-    let devices = crate::rdma::test_utils::make_rdma_devices();
+    let devices = make_rdma_devices();
     let device = &devices.devices()[0];
     let (poller, mut poll_loop) = manual_poller(device.context());
     let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
@@ -1635,8 +1635,8 @@ async fn early_flush_completion_waits_for_registration_and_settles_receive() {
     let (pending_sender, pending_receiver) = tokio::sync::mpsc::channel(1);
     let socket = Arc::new(RdmaSocket::new(
         poller
-            .reserve(Demand::connection(&crate::rdma::RdmaConnectionConfig {
-                qp: crate::rdma::RdmaQueuePairConfig::default(),
+            .reserve(Demand::connection(&RdmaConnectionConfig {
+                qp: RdmaQueuePairConfig::default(),
                 recv_queue_len: 1,
                 max_msg_size: 1024,
                 max_large_msg_size: 0,
@@ -1670,14 +1670,14 @@ async fn early_flush_completion_waits_for_registration_and_settles_receive() {
         },
     ));
     let (state, _stop) = State::create(
-        crate::Router::default(),
-        &crate::SocketPoolConfig {
+        Router::default(),
+        &SocketPoolConfig {
             rdma: None,
             ..Default::default()
         },
     )
     .unwrap();
-    let supervisor = crate::TaskSupervisor::create();
+    let supervisor = TaskSupervisor::create();
     let counts = Arc::new(vec![AtomicUsize::new(0)]);
     let ring_total = Arc::new(AtomicUsize::new(0));
     let registration = RegisterConn {

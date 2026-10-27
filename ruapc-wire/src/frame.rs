@@ -160,13 +160,11 @@ impl FrameDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{MsgFlags, deserialize_payload, parse_body};
 
     #[test]
     fn reused_stream_frame_replaces_header_body_and_old_tail() {
-        for flags in [
-            crate::MsgFlags::IsReq,
-            crate::MsgFlags::IsReq | crate::MsgFlags::UseMessagePack,
-        ] {
+        for flags in [MsgFlags::IsReq, MsgFlags::IsReq | MsgFlags::UseMessagePack] {
             let mut frame = StreamFrame(BytesMut::with_capacity(8192));
             let pointer = frame.0.as_ptr();
             let capacity = frame.0.capacity();
@@ -195,10 +193,7 @@ mod tests {
 
     #[test]
     fn encoded_frames_survive_every_split_and_concatenation() {
-        for flags in [
-            crate::MsgFlags::IsReq,
-            crate::MsgFlags::IsReq | crate::MsgFlags::UseMessagePack,
-        ] {
+        for flags in [MsgFlags::IsReq, MsgFlags::IsReq | MsgFlags::UseMessagePack] {
             let meta = MsgMeta {
                 flags,
                 method: "Echo/echo".into(),
@@ -212,11 +207,10 @@ mod tests {
                 received.extend_from_slice(&encoded);
                 for _ in 0..2 {
                     let body = parse_message(&mut received).unwrap().unwrap();
-                    let (decoded, offset) = crate::parse_body(&body).unwrap();
+                    let (decoded, offset) = parse_body(&body).unwrap();
                     assert_eq!(decoded, meta);
                     assert_eq!(
-                        crate::deserialize_payload::<String>(&body[offset..], decoded.flags)
-                            .unwrap(),
+                        deserialize_payload::<String>(&body[offset..], decoded.flags).unwrap(),
                         "hello"
                     );
                 }
@@ -244,10 +238,7 @@ mod tests {
 
     #[test]
     fn chunk_decoder_survives_every_split_before_another_frame() {
-        for flags in [
-            crate::MsgFlags::IsReq,
-            crate::MsgFlags::IsReq | crate::MsgFlags::UseMessagePack,
-        ] {
+        for flags in [MsgFlags::IsReq, MsgFlags::IsReq | MsgFlags::UseMessagePack] {
             let meta = MsgMeta {
                 flags,
                 method: "Echo/echo".into(),
@@ -271,11 +262,10 @@ mod tests {
                         // complete frame available without copying its bytes.
                         assert_eq!(body.as_ptr(), next_body.as_ptr());
                     }
-                    let (decoded, offset) = crate::parse_body(&body).unwrap();
+                    let (decoded, offset) = parse_body(&body).unwrap();
                     assert_eq!(decoded, meta);
                     assert_eq!(
-                        crate::deserialize_payload::<String>(&body[offset..], decoded.flags)
-                            .unwrap(),
+                        deserialize_payload::<String>(&body[offset..], decoded.flags).unwrap(),
                         "hello"
                     );
                 }
@@ -289,7 +279,7 @@ mod tests {
     #[test]
     fn chunk_decoder_survives_repeated_fragmentation() {
         let meta = MsgMeta {
-            flags: crate::MsgFlags::IsReq | crate::MsgFlags::UseMessagePack,
+            flags: MsgFlags::IsReq | MsgFlags::UseMessagePack,
             method: "Echo/echo".into(),
             ..Default::default()
         };
@@ -426,7 +416,7 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err().kind,
-            crate::error::CodecErrorKind::InvalidFrame
+            CodecErrorKind::InvalidFrame
         ));
     }
 

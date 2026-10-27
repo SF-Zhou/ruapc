@@ -3,7 +3,10 @@
 use std::{io, path::Path};
 
 use super::{Context, gid_table_entry, gid_type_from_raw, nonempty_gid, query_error};
-use crate::{ErrorKind, Gid, GidType, Result, ibv_gid, ibv_gid_entry, ibv_port_attr};
+use crate::{
+    ErrorKind, Gid, GidType, Result, ibv_gid, ibv_gid_entry, ibv_port_attr, ruapc_ibv_query_gid_ex,
+    ruapc_ibv_query_gid_table_native,
+};
 
 /// libibverbs owns discovery and compatibility handling for this backend.
 #[derive(Default)]
@@ -15,7 +18,7 @@ impl GidQuery {
         // SAFETY: the context stays open and the output remains writable for
         // this synchronous call. The C shim honors the installed header's ABI.
         let ret = unsafe {
-            crate::ruapc_ibv_query_gid_ex(
+            ruapc_ibv_query_gid_ex(
                 ctx.as_ptr(),
                 u32::from(port_num),
                 u32::from(gid_index),
@@ -80,9 +83,8 @@ impl GidQuery {
         // SAFETY: the context stays open, and `raw` contains `capacity`
         // writable entries with the layout generated from the same header
         // used to compile the C shim. No outputs are read on failure.
-        let count = unsafe {
-            crate::ruapc_ibv_query_gid_table_native(ctx.as_ptr(), raw.as_mut_ptr(), capacity)
-        };
+        let count =
+            unsafe { ruapc_ibv_query_gid_table_native(ctx.as_ptr(), raw.as_mut_ptr(), capacity) };
         if count < 0 {
             return Err(query_error(
                 ErrorKind::IBQueryGidFail,
@@ -115,9 +117,11 @@ impl GidQuery {
 mod tests {
     use super::*;
 
+    use crate::test_utils::open_device;
+
     #[test]
     fn native_queries_ignore_sysfs_arguments() {
-        let dev = crate::test_utils::open_device();
+        let dev = open_device();
         let ctx = dev.context();
         let mut checked = false;
         for port in &dev.info().ports {

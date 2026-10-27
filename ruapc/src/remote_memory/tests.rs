@@ -1,5 +1,5 @@
 use super::*;
-use crate::{Error, ErrorKind, SocketPoolConfig};
+use crate::{Error, ErrorKind, SocketPoolConfig, WithBuffers};
 
 #[tokio::test]
 async fn test_send_rsp_invalid_endpoint_logs_and_does_not_panic() {
@@ -101,9 +101,9 @@ async fn test_remote_write_zero_total_short_circuits() {
     // No write regions attached, but nothing to transfer either.
     let sent = ctx.remote_write_all(vec![]).await.unwrap();
     assert!(sent.buffers().is_empty());
-    let _rsp: crate::WithBuffers<u32> = sent.reply(7);
+    let _rsp: WithBuffers<u32> = sent.reply(7);
     // The explicit no-op witness works the same way.
-    let _rsp: crate::WithBuffers<u32> = ctx.sent_nothing().reply(7);
+    let _rsp: WithBuffers<u32> = ctx.sent_nothing().reply(7);
 }
 
 #[tokio::test]

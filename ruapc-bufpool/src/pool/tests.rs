@@ -1313,7 +1313,7 @@ fn cached_slabs_and_magazines_do_not_keep_pool_alive() {
             .thread_cache(thread_cache)
             .build();
         let weak = Arc::downgrade(&pool);
-        for size in crate::slab::SLAB_CLASS_SIZES {
+        for size in SLAB_CLASS_SIZES {
             drop(pool.allocate(size).unwrap());
         }
         assert_eq!(pool.allocated_memory(), SIZE_64MIB);
@@ -1385,6 +1385,8 @@ fn registrations_drop_before_their_backing_memory() {
 
 #[test]
 fn failed_registration_returns_reserved_budget() {
+    use crate::Registration;
+
     #[derive(Debug)]
     struct FailingDevices;
     // SAFETY: registration always fails without retaining or accessing memory.
@@ -1392,7 +1394,7 @@ fn failed_registration_returns_reserved_budget() {
         fn len(&self) -> usize {
             1
         }
-        fn register(&self, _: &Arc<AlignedMemory>) -> Result<Vec<Box<dyn crate::Registration>>> {
+        fn register(&self, _: &Arc<AlignedMemory>) -> Result<Vec<Box<dyn Registration>>> {
             Err(Error::other("registration failed"))
         }
     }

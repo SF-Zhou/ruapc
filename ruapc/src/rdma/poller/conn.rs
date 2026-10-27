@@ -654,16 +654,17 @@ impl ConnState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Context, SocketPoolConfig};
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use std::time::Duration;
 
     #[tokio::test]
     async fn registered_connection_drop_fails_its_waiters_and_settles_metrics() {
-        let config = crate::SocketPoolConfig {
+        let config = SocketPoolConfig {
             rdma: None,
             ..Default::default()
         };
-        let ctx = crate::Context::create(&config).unwrap();
+        let ctx = Context::create(&config).unwrap();
         let state = &ctx.state;
         let (id, receiver) = state.waiter.alloc(Duration::from_secs(30));
         state.waiter.bind_connection(id, 42);

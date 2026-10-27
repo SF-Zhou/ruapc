@@ -2,7 +2,10 @@
 
 use super::scatter::{self, SpaceLayout};
 use crate::core::ContextEndpoint;
-use crate::{Buffer, Context, CopyOp, Error, RemoteIoError, Result, Socket, SocketTrait};
+use crate::{
+    Buffer, Context, CopyOp, Error, ErrorKind, RemoteIoError, Result, SentBuffers, Socket,
+    SocketTrait,
+};
 use ruapc_bufpool::RemoteBufferInfo;
 
 /// A read or write view of the remote peer's registered memory, built from
@@ -23,7 +26,7 @@ impl<'a> RemoteSpace<'a> {
         for region in regions {
             if region.addr.checked_add(region.len).is_none() {
                 return Err(Error::new(
-                    crate::ErrorKind::InvalidCopyOp,
+                    ErrorKind::InvalidCopyOp,
                     "remote region addr + len overflows u64".into(),
                 ));
             }
@@ -76,7 +79,7 @@ impl Context {
     pub fn remote_read_space(&self) -> Result<RemoteSpace<'_>> {
         if self.msg_meta.read_regions.is_empty() {
             return Err(Error::new(
-                crate::ErrorKind::MissingBufferInfo,
+                ErrorKind::MissingBufferInfo,
                 "request carries no read regions; client must attach buffers \
                  via with_read_buffers()"
                     .into(),
@@ -97,7 +100,7 @@ impl Context {
     pub fn remote_write_space(&self) -> Result<RemoteSpace<'_>> {
         if self.msg_meta.write_regions.is_empty() {
             return Err(Error::new(
-                crate::ErrorKind::MissingBufferInfo,
+                ErrorKind::MissingBufferInfo,
                 "request carries no write regions; client must attach buffers \
                  via with_write_buffers()"
                     .into(),
@@ -169,9 +172,9 @@ impl Context {
                 .state
                 .buffer_pool
                 .allocate(usize::try_from(region.len).map_err(|_| {
-                    Error::new(crate::ErrorKind::InvalidArgument, "region too large".into())
+                    Error::new(ErrorKind::InvalidArgument, "region too large".into())
                 })?)
-                .map_err(|e| Error::new(crate::ErrorKind::InvalidArgument, e.to_string()))?;
+                .map_err(|e| Error::new(ErrorKind::InvalidArgument, e.to_string()))?;
             buf.set_len(region.len as usize);
             local.push(buf);
         }
@@ -221,16 +224,16 @@ impl Context {
         &self,
         ops: &[CopyOp],
         local: Vec<Buffer>,
-    ) -> std::result::Result<crate::SentBuffers, RemoteIoError> {
+    ) -> std::result::Result<SentBuffers, RemoteIoError> {
         if ops.iter().all(|op| op.len == 0) {
-            return Ok(crate::SentBuffers::new(local));
+            return Ok(SentBuffers::new(local));
         }
         let (socket, _) = match self.prepare_transfer(ops, &local, Direction::Write) {
             Ok(transfer) => transfer,
             Err(error) => return Err(RemoteIoError::new(error, Some(local))),
         };
         let buffers = socket.remote_write(self, ops, local).await?;
-        Ok(crate::SentBuffers::new(buffers))
+        Ok(SentBuffers::new(buffers))
     }
 
     /// Writes the entire logical content of `local` to the beginning of
@@ -241,13 +244,13 @@ impl Context {
     pub async fn remote_write_all(
         &self,
         local: Vec<Buffer>,
-    ) -> std::result::Result<crate::SentBuffers, RemoteIoError> {
+    ) -> std::result::Result<SentBuffers, RemoteIoError> {
         let total = match local_layout(&local) {
             Ok(layout) => layout.total(),
             Err(e) => return Err(RemoteIoError::new(e, Some(local))),
         };
         if total == 0 {
-            return Ok(crate::SentBuffers::new(local));
+            return Ok(SentBuffers::new(local));
         }
         self.remote_write(&[CopyOp::new(0, 0, total)], local).await
     }
@@ -272,7 +275,7 @@ impl Context {
         scatter::validate_ops(ops, src_len, dst_len)?;
         let ContextEndpoint::Connected(socket) = &self.endpoint else {
             return Err(Error::new(
-                crate::ErrorKind::NotConnected,
+                ErrorKind::NotConnected,
                 "remote memory transfers require a connected handler context".into(),
             ));
         };
@@ -283,8 +286,8 @@ impl Context {
     /// handler paths that have nothing to transfer, fulfilling a
     /// `Result<WithBuffers<T>, E>` contract without touching the network.
     #[must_use]
-    pub fn sent_nothing(&self) -> crate::SentBuffers {
-        crate::SentBuffers::new(Vec::new())
+    pub fn sent_nothing(&self) -> SentBuffers {
+        SentBuffers::new(Vec::new())
     }
 }
 

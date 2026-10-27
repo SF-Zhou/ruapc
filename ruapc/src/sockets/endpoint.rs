@@ -2,7 +2,7 @@ use std::{fmt, net::SocketAddr, str::FromStr, sync::Arc};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{Error, ErrorKind};
+use crate::{Error, ErrorKind, Result};
 
 /// Wire transport used to reach an RPC endpoint.
 ///
@@ -44,7 +44,7 @@ impl fmt::Display for Transport {
 impl FromStr for Transport {
     type Err = Error;
 
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
         match value.to_ascii_lowercase().as_str() {
             "tcp" => Ok(Self::TCP),
             "ws" => Ok(Self::WS),
@@ -101,7 +101,7 @@ impl RdmaBootstrap {
 impl TryFrom<Transport> for RdmaBootstrap {
     type Error = Error;
 
-    fn try_from(transport: Transport) -> Result<Self, Self::Error> {
+    fn try_from(transport: Transport) -> std::result::Result<Self, Self::Error> {
         match transport {
             Transport::TCP => Ok(Self::Tcp),
             Transport::WS => Ok(Self::Ws),
@@ -122,7 +122,7 @@ enum EndpointScheme {
 }
 
 impl EndpointScheme {
-    fn parse(value: &str) -> crate::Result<Self> {
+    fn parse(value: &str) -> Result<Self> {
         match value.split_once('+') {
             Some((bootstrap, transport)) => {
                 let transport = transport.parse::<Transport>()?;
@@ -204,10 +204,7 @@ impl Endpoint {
     ///
     /// RDMA endpoints must name the transport that carries bootstrap RPCs;
     /// use [`Endpoint::rdma`] instead.
-    pub fn new(
-        transport: Transport,
-        addrs: impl IntoIterator<Item = SocketAddr>,
-    ) -> crate::Result<Self> {
+    pub fn new(transport: Transport, addrs: impl IntoIterator<Item = SocketAddr>) -> Result<Self> {
         if transport == Transport::RDMA {
             return Err(Error::new(
                 ErrorKind::InvalidArgument,
@@ -219,7 +216,7 @@ impl Endpoint {
     }
 
     /// Creates a TCP endpoint from equivalent server addresses.
-    pub fn tcp(addrs: impl IntoIterator<Item = SocketAddr>) -> crate::Result<Self> {
+    pub fn tcp(addrs: impl IntoIterator<Item = SocketAddr>) -> Result<Self> {
         Self::new(Transport::TCP, addrs)
     }
 
@@ -229,10 +226,7 @@ impl Endpoint {
     /// [`Transport::HTTP`]. The address group carries bootstrap RPCs and
     /// identifies the peer; the RDMA data plane uses the negotiated device
     /// endpoints. Every address must reach the same server state.
-    pub fn rdma(
-        bootstrap: Transport,
-        addrs: impl IntoIterator<Item = SocketAddr>,
-    ) -> crate::Result<Self> {
+    pub fn rdma(bootstrap: Transport, addrs: impl IntoIterator<Item = SocketAddr>) -> Result<Self> {
         let bootstrap = RdmaBootstrap::try_from(bootstrap)?;
         Self::from_parts(EndpointScheme::Rdma(bootstrap), addrs)
     }
@@ -240,7 +234,7 @@ impl Endpoint {
     fn from_parts(
         scheme: EndpointScheme,
         addrs: impl IntoIterator<Item = SocketAddr>,
-    ) -> crate::Result<Self> {
+    ) -> Result<Self> {
         Ok(Self {
             scheme,
             addrs: normalized_addrs(addrs)?,
@@ -290,9 +284,7 @@ impl Endpoint {
     }
 }
 
-fn normalized_addrs(
-    addrs: impl IntoIterator<Item = SocketAddr>,
-) -> crate::Result<Arc<[SocketAddr]>> {
+fn normalized_addrs(addrs: impl IntoIterator<Item = SocketAddr>) -> Result<Arc<[SocketAddr]>> {
     let mut addrs: Vec<_> = addrs.into_iter().collect();
     addrs.sort_unstable();
     addrs.dedup();
@@ -321,7 +313,7 @@ impl fmt::Display for Endpoint {
 impl FromStr for Endpoint {
     type Err = Error;
 
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
         let (scheme, addresses) = value.split_once("://").ok_or_else(|| {
             Error::new(
                 ErrorKind::InvalidArgument,
@@ -339,13 +331,13 @@ impl FromStr for Endpoint {
                     )
                 })
             })
-            .collect::<crate::Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()?;
         Self::from_parts(scheme, addrs)
     }
 }
 
 impl Serialize for Endpoint {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
@@ -364,7 +356,7 @@ impl schemars::JsonSchema for Endpoint {
 }
 
 impl<'de> Deserialize<'de> for Endpoint {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {

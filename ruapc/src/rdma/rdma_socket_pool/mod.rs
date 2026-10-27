@@ -12,8 +12,8 @@ use tokio_util::sync::DropGuard;
 use super::path::RdmaPathInfo;
 use super::{DevicePollers, PollerConfig, RdmaDeviceRefresher, RdmaSocket, RdmaSocketPoolConfig};
 use crate::{
-    BufferPool, Client, Devices, Endpoint, Error, ErrorKind, Result, Socket, SocketPoolConfig,
-    SocketPoolTrait, State, TaskSupervisor,
+    BufferPool, Client, Devices, Endpoint, Error, ErrorKind, RawStream, Result, Socket,
+    SocketPoolConfig, SocketPoolTrait, State, TaskSupervisor,
 };
 
 mod peer;
@@ -182,7 +182,7 @@ impl SocketPoolTrait for RdmaSocketPool {
     async fn handle_new_stream(
         &self,
         _state: &Arc<State>,
-        _stream: crate::RawStream,
+        _stream: RawStream,
         _addr: SocketAddr,
     ) -> Result<()> {
         Err(Error::new(

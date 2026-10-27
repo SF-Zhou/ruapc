@@ -5,7 +5,8 @@ use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use crate::buddy::BuddyBlock;
+use crate::buddy::{BuddyBlock, LEVEL_SIZES, NODES_PER_LEVEL, NUM_LEVELS};
+use crate::slab::{NUM_SLAB_CLASSES, SLAB_BACKING_SIZE, SLAB_CLASS_SIZES};
 use crate::{AsDeviceIndex, BufferPool, MemoryKey, RemoteBufferInfo};
 
 /// A buffer allocated from the pool.
@@ -63,13 +64,13 @@ impl Buffer {
         block: NonNull<BuddyBlock>,
         pool: Arc<BufferPool>,
     ) -> Self {
-        debug_assert!(level < crate::buddy::NUM_LEVELS, "level must be 0-3");
+        debug_assert!(level < NUM_LEVELS, "level must be 0-3");
         debug_assert!(
-            index < crate::buddy::NODES_PER_LEVEL[level],
+            index < NODES_PER_LEVEL[level],
             "index must be less than {}",
-            crate::buddy::NODES_PER_LEVEL[level]
+            NODES_PER_LEVEL[level]
         );
-        let capacity = crate::buddy::LEVEL_SIZES[level];
+        let capacity = LEVEL_SIZES[level];
         Self {
             ptr,
             pool,
@@ -98,16 +99,16 @@ impl Buffer {
         block: NonNull<BuddyBlock>,
         pool: Arc<BufferPool>,
     ) -> Self {
-        debug_assert!(class < crate::slab::NUM_SLAB_CLASSES);
-        let capacity = crate::slab::SLAB_CLASS_SIZES[class];
-        debug_assert!(index < crate::slab::SLAB_BACKING_SIZE / capacity);
+        debug_assert!(class < NUM_SLAB_CLASSES);
+        let capacity = SLAB_CLASS_SIZES[class];
+        debug_assert!(index < SLAB_BACKING_SIZE / capacity);
         Self {
             ptr,
             pool,
             block,
             len: capacity,
             #[allow(clippy::cast_possible_truncation)]
-            level: (crate::buddy::NUM_LEVELS + class) as u8,
+            level: (NUM_LEVELS + class) as u8,
             #[allow(clippy::cast_possible_truncation)]
             index: index as u8,
         }
@@ -153,10 +154,10 @@ impl Buffer {
             return 0;
         }
         let level = self.level as usize;
-        if level < crate::buddy::NUM_LEVELS {
-            crate::buddy::LEVEL_SIZES[level]
+        if level < NUM_LEVELS {
+            LEVEL_SIZES[level]
         } else {
-            crate::slab::SLAB_CLASS_SIZES[level - crate::buddy::NUM_LEVELS]
+            SLAB_CLASS_SIZES[level - NUM_LEVELS]
         }
     }
 
@@ -274,7 +275,7 @@ impl Buffer {
     /// the decrement can never be the final one.
     pub(crate) fn into_raw_parts(self) -> (usize, usize, NonNull<BuddyBlock>) {
         debug_assert!(
-            (self.level as usize) < crate::buddy::NUM_LEVELS,
+            (self.level as usize) < NUM_LEVELS,
             "into_raw_parts is only valid for buddy buffers"
         );
         let this = std::mem::ManuallyDrop::new(self);
@@ -314,12 +315,12 @@ impl Drop for Buffer {
             return;
         }
         let level = self.level as usize;
-        if level < crate::buddy::NUM_LEVELS {
+        if level < NUM_LEVELS {
             self.pool
                 .return_buffer(level, self.index as usize, self.block);
         } else {
             self.pool.return_chunk(
-                level - crate::buddy::NUM_LEVELS,
+                level - NUM_LEVELS,
                 self.ptr,
                 self.index as usize,
                 self.block,
@@ -370,9 +371,9 @@ impl std::fmt::Debug for Buffer {
 mod tests {
     use std::sync::Arc;
 
-    use crate::{BufferPoolBuilder, EmptyDevices};
+    use crate::{BufferPool, BufferPoolBuilder, EmptyDevices};
 
-    fn test_pool() -> Arc<crate::BufferPool> {
+    fn test_pool() -> Arc<BufferPool> {
         BufferPoolBuilder::new(Arc::new(EmptyDevices)).build()
     }
 

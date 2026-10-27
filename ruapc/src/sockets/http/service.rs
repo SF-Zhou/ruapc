@@ -15,7 +15,7 @@ use super::{
 };
 use crate::{
     Error, ErrorKind, Message, MsgFlags, MsgMeta, RawStream, Result, Socket, State,
-    TaskSupervisorHandle,
+    TaskSupervisorHandle, msg::frame::MAX_MSG_SIZE, sockets::ws::web_socket_config,
 };
 
 /// Immutable routing configuration shared by all connections in this pool.
@@ -46,7 +46,7 @@ impl HttpService {
         supervisor: TaskSupervisorHandle,
     ) -> Result<Response<Either<Full<Bytes>, ChannelBody>>> {
         if hyper_tungstenite::is_upgrade_request(&req) {
-            let ws_config = crate::sockets::ws::web_socket_config();
+            let ws_config = web_socket_config();
             let (response, websocket) = hyper_tungstenite::upgrade(&mut req, Some(ws_config))
                 .map_err(|e| Error::new(ErrorKind::HttpUpgradeFailed, e.to_string()))?;
 
@@ -121,8 +121,7 @@ impl HttpService {
         let method = method.to_owned();
         // Cap the request body at the wire-format message limit; an
         // unauthenticated POST must not be able to buffer unbounded data.
-        let limited =
-            http_body_util::Limited::new(req.into_body(), crate::msg::frame::MAX_MSG_SIZE);
+        let limited = http_body_util::Limited::new(req.into_body(), MAX_MSG_SIZE);
         let bytes = match limited.collect().await {
             Ok(collected) => collected.to_bytes(),
             Err(e) if e.is::<http_body_util::LengthLimitError>() => {
@@ -195,12 +194,12 @@ impl HttpService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SocketPoolConfig;
+    use crate::{ListenMode, Router, Server, SocketPoolConfig};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
     async fn unary_body_collection_precedes_waiter_and_handler_budget() {
-        let mut router = crate::Router::default();
+        let mut router = Router::default();
         router.add_method::<(), (u32, u64, usize)>(
             "Budget/check",
             Box::new(|mut ctx, payload| {
@@ -217,12 +216,12 @@ mod tests {
             }),
         );
         let config = SocketPoolConfig {
-            listen_mode: crate::ListenMode::HTTP,
+            listen_mode: ListenMode::HTTP,
             #[cfg(feature = "rdma")]
             rdma: None,
             ..Default::default()
         };
-        let server = crate::Server::create(router, &config).unwrap();
+        let server = Server::create(router, &config).unwrap();
         let addr = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         stream.write_all(

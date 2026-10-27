@@ -88,7 +88,10 @@ mod tests {
     use bytes::BytesMut;
 
     use super::*;
-    use crate::{Message, MsgFlags};
+    use crate::{
+        Message, MsgFlags,
+        msg::frame::{encode, parse_message},
+    };
 
     fn full_queue() -> (ChannelConnection, mpsc::Receiver<Bytes>) {
         let (sender, receiver) = mpsc::channel(1);
@@ -205,7 +208,7 @@ mod tests {
         {
             let sending = connection.send(&mut meta, &waiter, "test", |meta| {
                 serializations.set(serializations.get() + 1);
-                crate::msg::frame::encode(meta, &"payload").map_err(Into::into)
+                encode(meta, &"payload").map_err(Into::into)
             });
             tokio::pin!(sending);
             assert!(futures_util::poll!(sending.as_mut()).is_pending());
@@ -218,12 +221,7 @@ mod tests {
 
         assert_eq!(serializations.get(), 1);
         let mut encoded = BytesMut::from(receiver.try_recv().unwrap().as_ref());
-        let message = Message::parse(
-            crate::msg::frame::parse_message(&mut encoded)
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
+        let message = Message::parse(parse_message(&mut encoded).unwrap().unwrap()).unwrap();
         assert_eq!(message.meta, meta);
         assert!(message.meta.timeout_ms > 0);
         assert!(message.meta.timeout_ms <= 9_980);
@@ -248,7 +246,7 @@ mod tests {
         let (connection, mut receiver) = full_queue();
         {
             let sending = connection.send(&mut meta, &waiter, "test", |meta| {
-                crate::msg::frame::encode(meta, &()).map_err(Into::into)
+                encode(meta, &()).map_err(Into::into)
             });
             tokio::pin!(sending);
             assert!(futures_util::poll!(sending.as_mut()).is_pending());

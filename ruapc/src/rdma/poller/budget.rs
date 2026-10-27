@@ -158,6 +158,7 @@ impl CqDrain {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rdma::{RdmaConnectionConfig, RdmaQueuePairConfig};
 
     fn demand(base: u64, reads: u64) -> Demand {
         Demand {
@@ -170,8 +171,8 @@ mod tests {
     #[test]
     fn default_capacity_scales_with_credits_and_shared_reads() {
         let budget = CqBudget::new(65_536, 32);
-        let config = crate::rdma::RdmaConnectionConfig {
-            qp: crate::rdma::RdmaQueuePairConfig::default(),
+        let config = RdmaConnectionConfig {
+            qp: RdmaQueuePairConfig::default(),
             recv_queue_len: 8,
             max_msg_size: 262_144,
             max_large_msg_size: 0,

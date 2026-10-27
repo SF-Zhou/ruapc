@@ -13,15 +13,17 @@ use super::{
     service::HttpService,
 };
 use crate::{
-    ConnectionMap, Endpoint, Error, ErrorKind, Message, RawStream, Result, Socket,
-    SocketPoolConfig, SocketPoolTrait, State, TaskSupervisor, TaskSupervisorHandle, sockets::tcp,
+    BufferPool, ConnectionMap, Devices, Endpoint, Error, ErrorKind, Message, RawStream, Result,
+    Socket, SocketPoolConfig, SocketPoolTrait, State, TaskSupervisor, TaskSupervisorHandle,
+    msg::frame::FrameDecoder,
+    sockets::{connect::ConnectGroups, tcp},
 };
 
 type HttpSocketMap = ConnectionMap<HttpSocket>;
 
 pub struct HttpSocketPool {
     socket_map: HttpSocketMap,
-    connect_groups: crate::sockets::connect::ConnectGroups,
+    connect_groups: ConnectGroups,
     service: Arc<HttpService>,
     http: Builder<TokioExecutor>,
     task_supervisor: TaskSupervisor,
@@ -30,8 +32,8 @@ pub struct HttpSocketPool {
 impl SocketPoolTrait for HttpSocketPool {
     fn create(
         config: &SocketPoolConfig,
-        _devices: &std::sync::Arc<crate::Devices>,
-        _buffer_pool: &std::sync::Arc<crate::BufferPool>,
+        _devices: &std::sync::Arc<Devices>,
+        _buffer_pool: &std::sync::Arc<BufferPool>,
     ) -> Result<Self> {
         let mut http = Builder::new(TokioExecutor::new());
         http.http1().keep_alive(true);
@@ -226,7 +228,7 @@ impl HttpSocketPool {
     ///
     /// Uses the same wire format as TCP: `[magic][len][body]`.
     async fn recv_loop(mut body: Incoming, socket: &Socket, state: &Arc<State>) -> Result<()> {
-        let mut decoder = crate::msg::frame::FrameDecoder::default();
+        let mut decoder = FrameDecoder::default();
         while let Some(frame) = body.frame().await {
             let frame =
                 frame.map_err(|e| Error::new(ErrorKind::HttpWaitRspFailed, e.to_string()))?;

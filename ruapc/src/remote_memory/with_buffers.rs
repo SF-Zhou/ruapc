@@ -1,6 +1,6 @@
 //! Typed response-with-buffers contract for `remote_write`.
 
-use crate::Buffer;
+use crate::{Buffer, Error};
 
 /// A completed remote-write result, or an explicit no-transfer result from
 /// [`Context::sent_nothing`](crate::Context::sent_nothing).
@@ -180,4 +180,4 @@ impl<T: schemars::JsonSchema> schemars::JsonSchema for WithBuffers<T> {
 /// This is an ordinary type alias — the contract is recognized by the
 /// underlying type, so custom aliases (including ones fixing a custom error
 /// type) work just as well.
-pub type ResultWithBuffers<T, E = crate::Error> = std::result::Result<WithBuffers<T>, E>;
+pub type ResultWithBuffers<T, E = Error> = std::result::Result<WithBuffers<T>, E>;

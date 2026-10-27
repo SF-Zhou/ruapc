@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
-use crate::TaskSupervisor;
+use crate::{Devices, TaskSupervisor};
 
 /// Background task that periodically refreshes RDMA port attributes.
 ///
@@ -11,7 +11,7 @@ pub(crate) struct RdmaDeviceRefresher;
 impl RdmaDeviceRefresher {
     const REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 
-    pub(crate) fn start(devices: Arc<crate::Devices>, task_supervisor: &TaskSupervisor) -> Self {
+    pub(crate) fn start(devices: Arc<Devices>, task_supervisor: &TaskSupervisor) -> Self {
         let guard = task_supervisor.start_async_task();
         tokio::spawn(async move {
             let _guard = guard;
@@ -29,7 +29,7 @@ impl RdmaDeviceRefresher {
         Self
     }
 
-    fn refresh_all(devices: &crate::Devices) {
+    fn refresh_all(devices: &Devices) {
         for dev in devices.devices() {
             if let Err(err) = dev.refresh_port_attrs() {
                 let info = dev.info();

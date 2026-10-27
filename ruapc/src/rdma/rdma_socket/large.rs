@@ -15,7 +15,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 use super::{RdmaSocket, encode::Encoded};
 use crate::{
-    Buffer, Error, ErrorKind, Message, MsgMeta, Result, Socket, State,
+    Buffer, BufferPool, Error, ErrorKind, Message, MsgMeta, Result, Socket, State,
     rdma::frame::{ControlFrame, LargePayloadOffer, encode_control},
     remote_memory::scatter::SpaceLayout,
     sockets::{SendRequest, reserve_send},
@@ -411,7 +411,7 @@ impl RdmaSocket {
             return Ok(());
         }
         let len = usize::try_from(offer.payload_len)?;
-        let capacity = crate::BufferPool::allocation_capacity(len)?;
+        let capacity = BufferPool::allocation_capacity(len)?;
         let permit = self
             .large
             .recv_bytes

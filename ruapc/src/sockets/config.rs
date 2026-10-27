@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "rdma")]
 use crate::rdma::RdmaSocketPoolConfig;
-use crate::{DEFAULT_BUFFER_POOL_MEMORY, ListenMode};
+use crate::{DEFAULT_BUFFER_POOL_MEMORY, Error, ErrorKind, ListenMode, Result};
 
 /// Socket pool configuration.
 ///
@@ -57,20 +57,20 @@ impl Default for SocketPoolConfig {
 }
 
 impl SocketPoolConfig {
-    pub(crate) fn validate(&self) -> crate::Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.buffer_pool_memory == 0 {
-            return Err(crate::Error::new(
-                crate::ErrorKind::InvalidArgument,
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
                 "buffer_pool_memory must be nonzero".into(),
             ));
         }
         Ok(())
     }
 
-    pub(crate) fn normalized_http_base_path(&self) -> crate::Result<String> {
+    pub(crate) fn normalized_http_base_path(&self) -> Result<String> {
         if self.http_base_path.contains(['?', '#']) {
-            return Err(crate::Error::new(
-                crate::ErrorKind::InvalidArgument,
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
                 "http_base_path must not contain a query or fragment".into(),
             ));
         }
@@ -84,8 +84,8 @@ impl SocketPoolConfig {
         format!("http://localhost{path}/_rpc")
             .parse::<hyper::Uri>()
             .map_err(|error| {
-                crate::Error::new(
-                    crate::ErrorKind::InvalidArgument,
+                Error::new(
+                    ErrorKind::InvalidArgument,
                     format!("invalid http_base_path: {error}"),
                 )
             })?;

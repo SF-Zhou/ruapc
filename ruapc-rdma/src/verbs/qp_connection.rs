@@ -1,6 +1,6 @@
 use crate::{
-    Error, ErrorKind, LinkLayer, Result, ibv_gid, ibv_mtu, ibv_qp_attr, ibv_qp_attr_mask,
-    ibv_qp_state,
+    Error, ErrorKind, LinkLayer, Result, ibv_access_flags, ibv_ah_attr, ibv_gid, ibv_global_route,
+    ibv_mtu, ibv_qp_attr, ibv_qp_attr_mask, ibv_qp_state,
 };
 
 /// Negotiated parameters for connecting a reliable-connected queue pair.
@@ -90,9 +90,9 @@ impl QpConnectionConfig {
     pub(super) fn init_attributes(&self) -> (ibv_qp_attr, ibv_qp_attr_mask) {
         // Relaxed ordering is a memory-registration property, not a QP access
         // permission. Only access permissions belong in qp_access_flags.
-        let access_flags = crate::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
-            | crate::ibv_access_flags::IBV_ACCESS_REMOTE_READ
-            | crate::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE;
+        let access_flags = ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
+            | ibv_access_flags::IBV_ACCESS_REMOTE_READ
+            | ibv_access_flags::IBV_ACCESS_REMOTE_WRITE;
         let attr = ibv_qp_attr {
             qp_state: ibv_qp_state::IBV_QPS_INIT,
             pkey_index: self.pkey_index,
@@ -108,7 +108,7 @@ impl QpConnectionConfig {
     }
 
     pub(super) fn receive_attributes(&self) -> (ibv_qp_attr, ibv_qp_attr_mask) {
-        let mut ah_attr = crate::ibv_ah_attr {
+        let mut ah_attr = ibv_ah_attr {
             port_num: self.local_port_num,
             ..Default::default()
         };
@@ -117,7 +117,7 @@ impl QpConnectionConfig {
                 ah_attr.dlid = self.remote_lid;
             }
             LinkLayer::Ethernet => {
-                ah_attr.grh = crate::ibv_global_route {
+                ah_attr.grh = ibv_global_route {
                     dgid: self.remote_gid,
                     flow_label: 0,
                     sgid_index: self.local_gid_index,

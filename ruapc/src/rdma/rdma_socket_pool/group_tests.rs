@@ -3,8 +3,10 @@
 use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
 
 use super::*;
+use crate::core::ContextEndpoint;
+use crate::http::HttpSocket;
 use crate::rdma::{RdmaBootstrapService as _, rdma_service::RDMA_BOOTSTRAP_PROTOCOL_VERSION};
-use crate::{Context, Endpoint, Listener, Router, Server, Transport};
+use crate::{Context, Endpoint, ListenMode, Listener, Router, Server, Transport};
 
 fn pool_without_rdma_devices() -> RdmaSocketPool {
     let devices = Arc::new(Devices::default());
@@ -104,8 +106,8 @@ fn mark_closed(socket: &Socket) -> bool {
     match socket {
         Socket::TCP(socket) => socket.mark_closed(),
         Socket::WS(socket) => socket.mark_closed(),
-        Socket::HTTP(crate::http::HttpSocket::Stream(socket)) => socket.mark_closed(),
-        Socket::HTTP(crate::http::HttpSocket::ForResponse(_)) => false,
+        Socket::HTTP(HttpSocket::Stream(socket)) => socket.mark_closed(),
+        Socket::HTTP(HttpSocket::ForResponse(_)) => false,
         #[cfg(feature = "rdma")]
         Socket::RDMA(_) => false,
     }
@@ -116,7 +118,7 @@ fn bootstrap_config() -> SocketPoolConfig {
     // devices. Discovery and bootstrap entry-point failover require no verbs
     // work, and a UNIFIED listener can serve every bootstrap transport.
     let mut config = SocketPoolConfig {
-        listen_mode: crate::ListenMode::UNIFIED,
+        listen_mode: ListenMode::UNIFIED,
         ..Default::default()
     };
     config.rdma.as_mut().unwrap().path.device_filter =
@@ -150,7 +152,7 @@ async fn bootstrap_group_reconnects_through_another_listener_for_every_transport
         })
         .unwrap();
         let bootstrap = peer.bootstrap_context(&context.state);
-        let crate::core::ContextEndpoint::Endpoint(bootstrap_endpoint) = &bootstrap.endpoint else {
+        let ContextEndpoint::Endpoint(bootstrap_endpoint) = &bootstrap.endpoint else {
             panic!("bootstrap must retain an address group");
         };
         assert_eq!(bootstrap_endpoint.transport(), bootstrap_transport);

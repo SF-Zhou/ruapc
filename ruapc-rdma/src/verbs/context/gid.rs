@@ -121,6 +121,8 @@ fn gid_type_from_raw(gid_type: u32) -> GidType {
 mod tests {
     use super::*;
 
+    use crate::test_utils::open_device;
+
     #[test]
     fn table_entries_decode() {
         let gid = ibv_gid {
@@ -147,7 +149,7 @@ mod tests {
     /// per-index queries and the cached snapshot.
     #[test]
     fn gid_table_matches_per_index_queries() {
-        let dev = crate::test_utils::open_device();
+        let dev = open_device();
         let ctx = dev.context();
         let info = dev.info();
         let capacity = info

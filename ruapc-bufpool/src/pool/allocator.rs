@@ -10,7 +10,9 @@ use std::time::Instant;
 
 use aliasable::boxed::AliasableBox;
 
-use crate::buddy::{BuddyBlock, BuddyState, FreeNode, NUM_LEVELS, NodeState, SIZE_64MIB};
+use crate::buddy::{
+    BuddyBlock, BuddyState, FreeNode, FreeNodeData, NUM_LEVELS, NodeState, SIZE_64MIB,
+};
 use crate::buffer::Buffer;
 use crate::completion as oneshot;
 use crate::intrusive_list::IntrusiveList;
@@ -37,7 +39,7 @@ pub(super) struct BuddyAllocator {
     /// compiler could assume exclusive access through the `Box` and mis-optimize
     /// accesses through the raw pointers.
     pub(super) blocks: Vec<AliasableBox<BuddyBlock>>,
-    pub(super) free_lists: [IntrusiveList<crate::buddy::FreeNodeData>; NUM_LEVELS],
+    pub(super) free_lists: [IntrusiveList<FreeNodeData>; NUM_LEVELS],
     /// Pending-merge lists for lazy buddy merging, one per level.
     ///
     /// `pending_lists[L]` links parent nodes at level `L` that are in the
@@ -49,7 +51,7 @@ pub(super) struct BuddyAllocator {
     /// if and only if all 4 of its children are free. This makes on-demand
     /// coalescing O(number of merges performed), independent of block count.
     /// Level 0 is unused (leaf nodes have no children).
-    pub(super) pending_lists: [IntrusiveList<crate::buddy::FreeNodeData>; NUM_LEVELS],
+    pub(super) pending_lists: [IntrusiveList<FreeNodeData>; NUM_LEVELS],
     waiting_lists: [VecDeque<Waiter>; NUM_LEVELS],
     min_waiting_level: Option<usize>,
     /// Active anti-starvation reservation, if any. See [`Reservation`].

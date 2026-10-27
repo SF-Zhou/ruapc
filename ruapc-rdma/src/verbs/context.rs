@@ -2,7 +2,10 @@
 
 use std::sync::Arc;
 
-use crate::{ErrorKind, Result};
+use crate::{
+    ErrorKind, Result, ibv_context, ibv_device, ibv_device_attr, ibv_port_attr,
+    ruapc_ibv_close_device, ruapc_ibv_open_device, ruapc_ibv_query_device, ruapc_ibv_query_port,
+};
 
 mod gid;
 
@@ -14,7 +17,7 @@ mod gid;
 /// libibverbs internally reference-counts `ibv_device` structs, so the
 /// device list can be safely freed after opening a device.
 pub struct Context {
-    ptr: *mut crate::ibv_context,
+    ptr: *mut ibv_context,
     gid_query: gid::GidQuery,
 }
 
@@ -25,8 +28,8 @@ impl Context {
     ///
     /// `device` must be a valid pointer obtained from `ibv_get_device_list`.
     /// The device list may be freed after this call returns successfully.
-    pub(crate) fn open(device: *mut crate::ibv_device) -> Result<Arc<Self>> {
-        let ptr = unsafe { crate::ruapc_ibv_open_device(device) };
+    pub(crate) fn open(device: *mut ibv_device) -> Result<Arc<Self>> {
+        let ptr = unsafe { ruapc_ibv_open_device(device) };
         if ptr.is_null() {
             return Err(ErrorKind::IBOpenDeviceFail.with_errno());
         }
@@ -37,14 +40,14 @@ impl Context {
     }
 
     /// Returns the raw context pointer.
-    pub fn as_ptr(&self) -> *mut crate::ibv_context {
+    pub fn as_ptr(&self) -> *mut ibv_context {
         self.ptr
     }
 
     /// Queries device attributes.
-    pub fn query_device(&self) -> Result<crate::ibv_device_attr> {
-        let mut attr = crate::ibv_device_attr::default();
-        let ret = unsafe { crate::ruapc_ibv_query_device(self.ptr, &mut attr) };
+    pub fn query_device(&self) -> Result<ibv_device_attr> {
+        let mut attr = ibv_device_attr::default();
+        let ret = unsafe { ruapc_ibv_query_device(self.ptr, &mut attr) };
         if ret != 0 {
             return Err(ErrorKind::IBQueryDeviceFail.with_errno());
         }
@@ -52,11 +55,11 @@ impl Context {
     }
 
     /// Queries port attributes.
-    pub fn query_port(&self, port_num: u8) -> Result<crate::ibv_port_attr> {
+    pub fn query_port(&self, port_num: u8) -> Result<ibv_port_attr> {
         // Keep the out buffer zeroed without constructing a Rust value first:
         // zero is not a valid discriminant for fields such as `ibv_mtu`.
-        let mut attr = std::mem::MaybeUninit::<crate::ibv_port_attr>::uninit();
-        let ret = unsafe { crate::ruapc_ibv_query_port(self.ptr, port_num, attr.as_mut_ptr()) };
+        let mut attr = std::mem::MaybeUninit::<ibv_port_attr>::uninit();
+        let ret = unsafe { ruapc_ibv_query_port(self.ptr, port_num, attr.as_mut_ptr()) };
         if ret != 0 {
             return Err(ErrorKind::IBQueryPortFail.with_errno());
         }
@@ -66,7 +69,7 @@ impl Context {
 
 impl Drop for Context {
     fn drop(&mut self) {
-        let _ = unsafe { crate::ruapc_ibv_close_device(self.ptr) };
+        let _ = unsafe { ruapc_ibv_close_device(self.ptr) };
     }
 }
 
@@ -83,9 +86,10 @@ unsafe impl Sync for Context {}
 mod tests {
     use std::sync::Arc;
 
+    use crate::Context;
     use crate::test_utils::open_device;
 
-    fn ctx() -> Arc<crate::Context> {
+    fn ctx() -> Arc<Context> {
         Arc::clone(open_device().context())
     }
 

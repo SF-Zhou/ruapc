@@ -3,9 +3,14 @@ use std::sync::Arc;
 use ruapc_bufpool::DeviceIndex;
 use serde::Serialize;
 
+#[cfg(feature = "rdma")]
+use crate::rdma::RdmaSocket;
 use crate::{
-    Buffer, Context, CopyOp, MsgMeta, RemoteIoError, RemoteSpace, Result, State, http::HttpSocket,
-    remote_memory::scatter::SpaceLayout, tcp::TcpSocket, ws::WebSocket,
+    Buffer, Context, CopyOp, Error, ErrorKind, MsgMeta, RemoteIoError, RemoteSpace, Result, State,
+    http::HttpSocket,
+    remote_memory::{WriteTarget, inline, scatter::SpaceLayout},
+    tcp::TcpSocket,
+    ws::WebSocket,
 };
 
 /// Socket abstraction supporting multiple transport protocols.
@@ -27,7 +32,7 @@ pub enum Socket {
     HTTP(HttpSocket),
     /// RDMA socket (requires "rdma" feature).
     #[cfg(feature = "rdma")]
-    RDMA(std::sync::Arc<crate::rdma::RdmaSocket>),
+    RDMA(std::sync::Arc<RdmaSocket>),
 }
 
 impl Socket {
@@ -36,8 +41,8 @@ impl Socket {
         match self {
             Self::TCP(socket) => Some(socket.conn_id()),
             Self::WS(socket) => Some(socket.conn_id()),
-            Self::HTTP(crate::http::HttpSocket::Stream(socket)) => Some(socket.conn_id()),
-            Self::HTTP(crate::http::HttpSocket::ForResponse(_)) => None,
+            Self::HTTP(HttpSocket::Stream(socket)) => Some(socket.conn_id()),
+            Self::HTTP(HttpSocket::ForResponse(_)) => None,
             #[cfg(feature = "rdma")]
             Self::RDMA(socket) => Some(socket.conn_id),
         }
@@ -86,7 +91,7 @@ pub trait SocketTrait {
         local: Vec<Buffer>,
         remote: &RemoteSpace<'_>,
     ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
-        crate::remote_memory::inline::read(ctx, ops, local, remote).await
+        inline::read(ctx, ops, local, remote).await
     }
 
     /// Writes to the remote space; RDMA overrides this with client-side READ.
@@ -96,7 +101,7 @@ pub trait SocketTrait {
         ops: &[CopyOp],
         local: Vec<Buffer>,
     ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
-        crate::remote_memory::inline::write(ctx, ops, local).await
+        inline::write(ctx, ops, local).await
     }
 }
 
@@ -121,7 +126,7 @@ impl Socket {
         regions: &[ruapc_bufpool::RemoteBufferInfo],
         src_layout: &SpaceLayout,
         ops: &[CopyOp],
-        target: std::sync::Arc<crate::remote_memory::WriteTarget>,
+        target: std::sync::Arc<WriteTarget>,
         request_deadline: Option<std::time::Instant>,
     ) -> Result<()> {
         match self {
@@ -131,8 +136,8 @@ impl Socket {
                     .read_into_target(regions, src_layout, ops, target, request_deadline)
                     .await
             }
-            _ => Err(crate::Error::new(
-                crate::ErrorKind::InvalidArgument,
+            _ => Err(Error::new(
+                ErrorKind::InvalidArgument,
                 "read_into_target requires RDMA (other transports use write_inline)".into(),
             )),
         }
@@ -164,7 +169,7 @@ impl SocketTrait for Socket {
     ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
         match self {
             Socket::TCP(_) | Socket::WS(_) | Socket::HTTP(_) => {
-                crate::remote_memory::inline::read(ctx, ops, local, remote).await
+                inline::read(ctx, ops, local, remote).await
             }
             #[cfg(feature = "rdma")]
             Socket::RDMA(rdma_socket) => rdma_socket.remote_read(ctx, ops, local, remote).await,
@@ -179,7 +184,7 @@ impl SocketTrait for Socket {
     ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
         match self {
             Socket::TCP(_) | Socket::WS(_) | Socket::HTTP(_) => {
-                crate::remote_memory::inline::write(ctx, ops, local).await
+                inline::write(ctx, ops, local).await
             }
             #[cfg(feature = "rdma")]
             Socket::RDMA(rdma_socket) => rdma_socket.remote_write(ctx, ops, local).await,
@@ -224,15 +229,15 @@ impl From<&HttpSocket> for Socket {
 }
 
 #[cfg(feature = "rdma")]
-impl From<std::sync::Arc<crate::rdma::RdmaSocket>> for Socket {
-    fn from(value: std::sync::Arc<crate::rdma::RdmaSocket>) -> Self {
+impl From<std::sync::Arc<RdmaSocket>> for Socket {
+    fn from(value: std::sync::Arc<RdmaSocket>) -> Self {
         Socket::RDMA(value)
     }
 }
 
 #[cfg(feature = "rdma")]
-impl From<&std::sync::Arc<crate::rdma::RdmaSocket>> for Socket {
-    fn from(value: &std::sync::Arc<crate::rdma::RdmaSocket>) -> Self {
+impl From<&std::sync::Arc<RdmaSocket>> for Socket {
+    fn from(value: &std::sync::Arc<RdmaSocket>) -> Self {
         Socket::RDMA(value.clone())
     }
 }

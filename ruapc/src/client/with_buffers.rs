@@ -4,7 +4,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Buffer, Context,
+    Buffer, Context, Error,
     remote_memory::{ReadSource, WriteTarget},
 };
 
@@ -132,7 +132,7 @@ impl<'a> ClientWithBuffers<'a> {
     where
         Req: Serialize + JsonSchema,
         Rsp: for<'c> Deserialize<'c> + JsonSchema,
-        E: std::error::Error + From<crate::Error> + for<'c> Deserialize<'c>,
+        E: std::error::Error + From<Error> + for<'c> Deserialize<'c>,
     {
         let mut target = match self.write_buffers.lock().unwrap().take() {
             Some(buffers) => Some(WriteTarget::new(buffers)?),
@@ -179,8 +179,9 @@ mod tests {
     #[tokio::test]
     async fn forgotten_request_cannot_release_an_active_read_source() {
         use crate::{
-            MsgMeta, SocketPoolConfig,
+            CopyOp, MsgMeta, Socket, SocketPoolConfig,
             services::{DescribeRequest, ReflectionService as _},
+            tcp::TcpSocket,
         };
         use std::{
             future::Future,
@@ -191,7 +192,7 @@ mod tests {
         let (sender, _receiver) = tokio::sync::mpsc::channel(1);
         let ctx = Context::server_ctx(
             &base.state,
-            crate::Socket::TCP(crate::tcp::TcpSocket::new(sender)),
+            Socket::TCP(TcpSocket::new(sender)),
             MsgMeta {
                 timeout_ms: 30_000,
                 ..Default::default()
@@ -220,7 +221,7 @@ mod tests {
             .expire(std::time::Instant::now() + std::time::Duration::from_secs(60));
         assert!(wrapper.take_read_buffers().is_none());
         assert_eq!(
-            source.read_inline(&[crate::CopyOp::new(0, 0, 4)]).unwrap(),
+            source.read_inline(&[CopyOp::new(0, 0, 4)]).unwrap(),
             b"data"
         );
         drop(source);
@@ -233,7 +234,7 @@ mod tests {
             SocketPoolConfig,
             services::{DescribeRequest, ReflectionService as _},
         };
-        let ctx = crate::Context::create(&SocketPoolConfig::default()).unwrap();
+        let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
         let client = Client::default();
         let mut buf = ctx.state.buffer_pool.allocate(64 * 1024).unwrap();
         buf.set_len(16);

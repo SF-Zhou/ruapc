@@ -157,11 +157,12 @@ impl std::fmt::Debug for RdmaDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rdma::test_utils::open_rdma_device;
     use ruapc_bufpool::Device as _;
 
     #[test]
     fn test_rdma_device_debug_format() {
-        let mut rdma = RdmaDevice::new(crate::rdma::test_utils::open_rdma_device());
+        let mut rdma = RdmaDevice::new(open_rdma_device());
         rdma.set_index(DeviceIndex { magic: 0, index: 3 });
         let debug = format!("{rdma:?}");
         assert!(debug.contains("RdmaDevice"));
@@ -169,7 +170,7 @@ mod tests {
 
     #[test]
     fn test_rdma_device_index_and_inner() {
-        let mut rdma = RdmaDevice::new(crate::rdma::test_utils::open_rdma_device());
+        let mut rdma = RdmaDevice::new(open_rdma_device());
         rdma.set_index(DeviceIndex {
             magic: 0,
             index: 42,
@@ -182,7 +183,7 @@ mod tests {
 
     #[test]
     fn test_bandwidth_limiter_is_shared_per_port() {
-        let rdma = RdmaDevice::new(crate::rdma::test_utils::open_rdma_device());
+        let rdma = RdmaDevice::new(open_rdma_device());
         let config = RdmaSocketPoolConfig::default();
         rdma.configure_bandwidth_limit(&config).unwrap();
         let port_num = rdma.info().ports[0].port_num;

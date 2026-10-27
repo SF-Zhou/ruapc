@@ -1,5 +1,7 @@
 //! Typed accessors and names for capability flag enums.
 
+use crate::{ibv_device_cap_flags, ibv_port_cap_flags, ibv_port_cap_flags2};
+
 macro_rules! impl_flag_name {
     ($ty:ty, $prefix:literal) => {
         impl $ty {
@@ -12,9 +14,9 @@ macro_rules! impl_flag_name {
     };
 }
 
-impl_flag_name!(crate::ibv_device_cap_flags, "IBV_DEVICE_");
-impl_flag_name!(crate::ibv_port_cap_flags, "IBV_PORT_");
-impl_flag_name!(crate::ibv_port_cap_flags2, "IBV_PORT_");
+impl_flag_name!(ibv_device_cap_flags, "IBV_DEVICE_");
+impl_flag_name!(ibv_port_cap_flags, "IBV_PORT_");
+impl_flag_name!(ibv_port_cap_flags2, "IBV_PORT_");
 
 #[cfg(test)]
 mod tests {

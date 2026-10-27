@@ -1,5 +1,6 @@
 use std::{net::SocketAddr, sync::Arc};
 
+use crate::sockets::tcp::configure_stream;
 use crate::{Error, ErrorKind, RawStream, Result, State, TaskSupervisor};
 
 /// TCP accept loops and supervised connection-setup tasks.
@@ -59,7 +60,7 @@ impl Listener {
                 () = async {
                     tracing::info!("start listening: {listener_addr}");
                     while let Ok((stream, addr)) = listener.accept().await {
-                        crate::sockets::tcp::configure_stream(&stream);
+                        configure_stream(&stream);
                         let state = state.clone();
                         let _ = supervisor.try_spawn(async move {
                             state.handle_new_stream(RawStream::TCP(stream), addr).await;

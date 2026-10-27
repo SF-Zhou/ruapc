@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::{
-    Buffer, Context, MAX_REGIONS, SocketTrait,
+    Buffer, Context, MAX_REGIONS, Receiver, SocketTrait,
     core::ContextEndpoint,
     error::{Error, ErrorKind},
     msg::{MsgFlags, MsgMeta},
@@ -57,7 +57,7 @@ impl Client {
     where
         Req: Serialize + JsonSchema,
         Rsp: for<'c> Deserialize<'c> + JsonSchema,
-        E: std::error::Error + From<crate::Error> + for<'c> Deserialize<'c>,
+        E: std::error::Error + From<Error> + for<'c> Deserialize<'c>,
     {
         let metrics = ctx.state.metrics.client_method(method_name).start();
         let result = self
@@ -88,7 +88,7 @@ impl Client {
     where
         Req: Serialize + JsonSchema,
         Rsp: for<'c> Deserialize<'c> + JsonSchema,
-        E: std::error::Error + From<crate::Error> + for<'c> Deserialize<'c>,
+        E: std::error::Error + From<Error> + for<'c> Deserialize<'c>,
     {
         if ctx.is_expired() {
             return Err(Error::new(
@@ -296,12 +296,13 @@ impl Client {
 
 /// A successfully sent request attempt, waiting for its response.
 struct SentRequest<'a> {
-    receiver: crate::Receiver<'a>,
+    receiver: Receiver<'a>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Socket, SocketPoolConfig, tcp::TcpSocket};
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use std::{
         future::Future,
@@ -310,7 +311,7 @@ mod tests {
     };
 
     fn connected_context(sender: tokio::sync::mpsc::Sender<bytes::Bytes>) -> Context {
-        let config = crate::SocketPoolConfig {
+        let config = SocketPoolConfig {
             #[cfg(feature = "rdma")]
             rdma: None,
             ..Default::default()
@@ -318,7 +319,7 @@ mod tests {
         let base = Context::create(&config).unwrap();
         Context::server_ctx(
             &base.state,
-            crate::Socket::TCP(crate::tcp::TcpSocket::new(sender)),
+            Socket::TCP(TcpSocket::new(sender)),
             MsgMeta {
                 timeout_ms: 30_000,
                 ..Default::default()
@@ -424,7 +425,7 @@ mod tests {
 
         let (sender, mut queue) = tokio::sync::mpsc::channel(1);
         let ctx = connected_context(sender);
-        let ContextEndpoint::Connected(crate::Socket::TCP(socket)) = &ctx.endpoint else {
+        let ContextEndpoint::Connected(Socket::TCP(socket)) = &ctx.endpoint else {
             unreachable!();
         };
         let serializations = std::cell::Cell::new(0);
@@ -551,9 +552,9 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_a_pending_request_settles_its_metrics() {
-        let base = Context::create(&crate::SocketPoolConfig::default()).unwrap();
+        let base = Context::create(&SocketPoolConfig::default()).unwrap();
         let (sender, _receiver) = tokio::sync::mpsc::channel(1);
-        let socket = crate::Socket::TCP(crate::tcp::TcpSocket::new(sender));
+        let socket = Socket::TCP(TcpSocket::new(sender));
         let ctx = Context::server_ctx(
             &base.state,
             socket,

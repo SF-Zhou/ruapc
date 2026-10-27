@@ -94,12 +94,12 @@ impl Drop for InflightGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Context, MsgFlags, MsgMeta, SocketPoolConfig};
+    use crate::{Context, MsgFlags, MsgMeta, Socket, SocketPoolConfig, sockets::tcp::TcpSocket};
 
     fn make_ctx(config: &SocketPoolConfig, timeout_ms: u32) -> Context {
         let base = Context::create(config).unwrap();
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let socket = crate::Socket::TCP(crate::sockets::tcp::TcpSocket::new(tx));
+        let socket = Socket::TCP(TcpSocket::new(tx));
         let meta = MsgMeta {
             method: "TestSvc/x".into(),
             flags: MsgFlags::IsReq,
@@ -168,7 +168,7 @@ mod tests {
         let state = ctx.state.clone();
         let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ran_clone = ran.clone();
-        spawn_handler(ctx, "TestSvc/x", crate::Payload::Empty, move |_, _| {
+        spawn_handler(ctx, "TestSvc/x", Payload::Empty, move |_, _| {
             ran_clone.store(true, Ordering::SeqCst);
             async {}
         });
@@ -192,7 +192,7 @@ mod tests {
             .fetch_add(1, Ordering::Relaxed);
         let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ran_clone = ran.clone();
-        spawn_handler(ctx, "TestSvc/x", crate::Payload::Empty, move |_, _| {
+        spawn_handler(ctx, "TestSvc/x", Payload::Empty, move |_, _| {
             ran_clone.store(true, Ordering::SeqCst);
             async {}
         });
@@ -207,7 +207,7 @@ mod tests {
         let ctx = make_ctx(&tcp_config(), 30_000);
         let state = ctx.state.clone();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        spawn_handler(ctx, "TestSvc/x", crate::Payload::Empty, move |_, _| async {
+        spawn_handler(ctx, "TestSvc/x", Payload::Empty, move |_, _| async {
             let _ = done_tx.send(());
         });
         done_rx.await.unwrap();
