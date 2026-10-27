@@ -47,8 +47,8 @@ pub enum ErrorKind {
     TcpSendMsgFailed,
     /// Failed to receive message over TCP.
     TcpRecvMsgFailed,
-    /// Failed to parse TCP message.
-    TcpParseMsgFailed,
+    /// Failed to parse a wire message.
+    ParseMsgFailed,
     /// Failed to establish WebSocket connection.
     WebSocketConnectFailed,
     /// Failed to accept WebSocket connection.
@@ -207,7 +207,7 @@ impl From<ruapc_wire::CodecError> for Error {
             CodecErrorKind::SerializeFailed => ErrorKind::SerializeFailed,
             CodecErrorKind::DeserializeFailed => ErrorKind::DeserializeFailed,
             CodecErrorKind::Json => ErrorKind::SerdeJsonError,
-            CodecErrorKind::InvalidFrame => ErrorKind::TcpParseMsgFailed,
+            CodecErrorKind::InvalidFrame => ErrorKind::ParseMsgFailed,
         };
         Self {
             kind,

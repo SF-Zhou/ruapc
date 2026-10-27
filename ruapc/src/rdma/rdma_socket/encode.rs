@@ -2,6 +2,7 @@
 
 use std::{io::Write, sync::Arc};
 
+use ruapc_wire::frame::{HEADER_LEN, encode_header};
 use serde::Serialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -20,7 +21,7 @@ impl Encoded {
     /// can only shrink as the remaining request budget decreases.
     pub(super) fn refresh_timeout(&mut self, meta: &MsgMeta) -> Result<()> {
         let metadata = rmp_serde::to_vec_named(meta)?;
-        let payload_offset = 8 + metadata.len();
+        let payload_offset = HEADER_LEN + 4 + metadata.len();
         if payload_offset > self.payload_offset {
             return Err(Error::new(
                 ErrorKind::SerializeFailed,
@@ -32,11 +33,11 @@ impl Encoded {
             .copy_within(self.payload_offset..len, payload_offset);
         self.buffer
             .set_len(len - (self.payload_offset - payload_offset));
-        self.buffer[8..payload_offset].copy_from_slice(&metadata);
+        self.buffer[HEADER_LEN + 4..payload_offset].copy_from_slice(&metadata);
         let meta_len = u32::try_from(metadata.len())?;
-        let frame_len = u32::try_from(self.buffer.len() - 4)?;
-        self.buffer[4..8].copy_from_slice(&meta_len.to_be_bytes());
-        self.buffer[..4].copy_from_slice(&frame_len.to_be_bytes());
+        self.buffer[HEADER_LEN..HEADER_LEN + 4].copy_from_slice(&meta_len.to_be_bytes());
+        let header = encode_header(self.buffer.len() - HEADER_LEN)?;
+        self.buffer[..HEADER_LEN].copy_from_slice(&header);
         self.payload_offset = payload_offset;
         Ok(())
     }
@@ -176,14 +177,17 @@ impl SendMsg for GrowingMessage<'_> {
 
     fn prepare(&mut self) -> Result<()> {
         self.encoded.buffer.set_len(0);
-        self.write_all(&[0; 4])?;
+        self.write_all(&[0; HEADER_LEN])?;
         Ok(())
     }
 
     fn finish(&mut self, meta_offset: usize, payload_offset: usize) -> Result<()> {
+        if meta_offset != HEADER_LEN {
+            return Err(ErrorKind::InvalidArgument.into());
+        }
         self.encoded.buffer.finish(meta_offset, payload_offset)?;
-        let frame_len = u32::try_from(self.encoded.buffer.len() - 4)?;
-        self.encoded.buffer[..4].copy_from_slice(&frame_len.to_be_bytes());
+        let header = encode_header(self.encoded.buffer.len() - HEADER_LEN)?;
+        self.encoded.buffer[..HEADER_LEN].copy_from_slice(&header);
         self.encoded.payload_offset = payload_offset;
         Ok(())
     }

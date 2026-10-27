@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::{
     SocketTrait, State,
     error::Result,
-    msg::MsgMeta,
+    msg::{MsgMeta, frame::encode},
     sockets::{ChannelConnection, PoolConnection},
 };
 
@@ -63,9 +63,7 @@ impl SocketTrait for WebSocket {
     ) -> Result<()> {
         self.inner
             .send(meta, &state.waiter, "WebSocket", |meta| {
-                let mut bytes = BytesMut::with_capacity(512);
-                meta.serialize_to(payload, &mut bytes)?;
-                Ok(bytes.freeze())
+                encode(meta, payload).map_err(Into::into)
             })
             .await
     }

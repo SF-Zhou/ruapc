@@ -96,7 +96,7 @@ impl Drop for MethodCall {
 /// [`metrics::Recorder`].
 #[derive(Default)]
 pub(crate) struct Metrics {
-    /// Server-side requests currently in flight across all methods.
+    /// Server-side requests using the shared admission budget across all methods.
     ///
     /// This is dispatch state, not just a metric: load shedding reads it
     /// on every request, and the facade offers no read-back, so it is

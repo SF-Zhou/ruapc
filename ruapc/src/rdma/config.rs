@@ -1,5 +1,6 @@
 //! Public RDMA transport configuration.
 
+use ruapc_wire::frame::MAX_MSG_SIZE;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -39,11 +40,13 @@ pub struct RdmaConnectionTuningConfig {
     pub pkey_index: u16,
     /// Selective signaling interval. Must be nonzero.
     pub send_signal_interval: u32,
-    /// Maximum inline RPC message size. Must be at least 16 KiB.
+    /// Maximum complete inline RPC frame size, including metadata and framing.
+    /// Must be at least 16 KiB and less than 64 MiB.
     pub max_msg_size: u32,
     /// Maximum complete serialized message transferred with RDMA READ.
     /// Zero disables large messages. Otherwise this must cover `max_msg_size`
-    /// and must not exceed 64 MiB, the maximum single pool allocation.
+    /// and be less than 64 MiB, the shared exclusive frame-size limit.
+    /// Registered storage may round up to the maximum 64 MiB pool allocation.
     pub max_large_msg_size: u32,
     /// Per-connection byte budget for large messages, applied independently
     /// to outgoing sources and incoming destinations. Must be nonzero and
@@ -73,7 +76,8 @@ impl Default for RdmaConnectionTuningConfig {
 impl RdmaConnectionTuningConfig {
     pub const MIN_RECV_QUEUE_LEN: u32 = 2;
     pub const MIN_MAX_MSG_SIZE: u32 = 16 * 1024;
-    pub const MAX_LARGE_MSG_SIZE: u32 = 64 * 1024 * 1024;
+    /// Largest complete message accepted by the shared frame codec.
+    pub const MAX_LARGE_MSG_SIZE: u32 = (MAX_MSG_SIZE - 1) as u32;
 
     fn validate(&self) -> Result<()> {
         if self.qp.max_send_wr < Self::MIN_RECV_QUEUE_LEN {
@@ -103,9 +107,9 @@ impl RdmaConnectionTuningConfig {
                 "rdma.connection.send_signal_interval must be nonzero",
             ));
         }
-        if self.max_msg_size < Self::MIN_MAX_MSG_SIZE {
+        if !(Self::MIN_MAX_MSG_SIZE..=Self::MAX_LARGE_MSG_SIZE).contains(&self.max_msg_size) {
             return Err(invalid_config(format!(
-                "rdma.connection.max_msg_size must be at least {}",
+                "rdma.connection.max_msg_size must be at least {} and less than 64 MiB",
                 Self::MIN_MAX_MSG_SIZE
             )));
         }
@@ -113,7 +117,7 @@ impl RdmaConnectionTuningConfig {
             && !(self.max_msg_size..=Self::MAX_LARGE_MSG_SIZE).contains(&self.max_large_msg_size)
         {
             return Err(invalid_config(
-                "rdma.connection.max_large_msg_size must be zero or between max_msg_size and 64 MiB",
+                "rdma.connection.max_large_msg_size must be zero or at least max_msg_size and less than 64 MiB",
             ));
         }
         if self.max_inflight_large_bytes == 0
@@ -529,7 +533,7 @@ mod tests {
     #[test]
     fn large_message_limits_and_byte_budgets_are_validated() {
         let defaults = RdmaConnectionTuningConfig::default();
-        assert_eq!(defaults.max_large_msg_size, 64 * 1024 * 1024);
+        assert_eq!(defaults.max_large_msg_size, 64 * 1024 * 1024 - 1);
         assert_eq!(defaults.max_inflight_large_bytes, 128 * 1024 * 1024);
         defaults.validate().unwrap();
 
@@ -586,6 +590,32 @@ mod tests {
         config.polling = RdmaPollingConfig::default();
         config.remote_memory.max_inflight_read_wrs = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn inline_limits_share_the_frame_boundary_when_large_messages_are_disabled() {
+        let mut config = RdmaConnectionTuningConfig {
+            max_large_msg_size: 0,
+            ..Default::default()
+        };
+        for limit in [
+            RdmaConnectionTuningConfig::MIN_MAX_MSG_SIZE,
+            RdmaConnectionTuningConfig::MAX_LARGE_MSG_SIZE,
+        ] {
+            config.max_msg_size = limit;
+            config.validate().unwrap();
+        }
+        for limit in [
+            RdmaConnectionTuningConfig::MIN_MAX_MSG_SIZE - 1,
+            MAX_MSG_SIZE as u32,
+            u32::MAX,
+        ] {
+            config.max_msg_size = limit;
+            assert_eq!(
+                config.validate().unwrap_err().kind,
+                ErrorKind::InvalidArgument
+            );
+        }
     }
 
     #[test]

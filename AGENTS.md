@@ -23,10 +23,11 @@ Use [DESIGN.md](DESIGN.md) for crate/module ownership and
 - Message metadata, payload codecs, direct serialization and framing belong in
   `ruapc-wire`, which reports codec errors and does not depend on verbs. Keep
   RPC error types and owned `Message` / `Payload` APIs in `ruapc`, converting
-  codec failures at that boundary. TCP and HTTP/2 share the wire `frame` module;
-  pure RDMA framing belongs in its `rdma` module, outside the poll loop. Keep
-  connection binding and queue preparation in `ruapc/src/sockets/channel.rs`,
-  and transfer ownership and completion validation in the runtime.
+  codec failures at that boundary. TCP, WebSocket, HTTP/2 and RDMA share the
+  wire `frame` module; frame parsing stays outside the RDMA poll loop.
+  Keep connection binding and queue preparation in
+  `ruapc/src/sockets/channel.rs`, and transfer ownership and completion
+  validation in the runtime.
 - Each connection has a process-unique `conn_id`. Closing it eagerly fails its
   waiters; eviction must check identity so it cannot remove a replacement.
 - An `Endpoint` is one transport plus a nonempty normalized group of equivalent

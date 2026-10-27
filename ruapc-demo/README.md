@@ -77,7 +77,7 @@ through the same HTTP listener:
 
 ```bash
 curl -s -H 'content-type: application/json' -d 'null' \
-  http://127.0.0.1:8000/RdmaBootstrapService/discover
+  http://127.0.0.1:8000/RdmaService/discover
 ```
 
 The `()` request body is JSON `null`. Other built-ins can require live request

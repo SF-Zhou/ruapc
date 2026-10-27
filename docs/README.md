@@ -29,7 +29,7 @@ Each guide owns a distinct part of the design. Start at
 | Metadata, payload formats and framing | [Wire format](../DESIGN.md#message-ownership-and-framing) |
 | Endpoint strings, complete-group identity and address fallback | [Server endpoints](endpoints.md) |
 | Registration, DMA ownership, source validation and recovery | [Safety boundaries](safe-boundaries.md) |
-| Built-in RPCs, discovery and private payload control fields | [Built-in services](builtin-services.md) |
+| Built-in RPCs, discovery and payload transfer methods | [Built-in services](builtin-services.md) |
 | RDMA bootstrap, negotiation, paths and peer maintenance | [Connection lifecycle](rdma-connection.md) |
 | WRIDs, completion authority and QPN reuse | [Completion identity](wrid.md) |
 | Queue/byte budgets, READ admission and CQ credit retirement | [Capacity](rdma-capacity.md) |

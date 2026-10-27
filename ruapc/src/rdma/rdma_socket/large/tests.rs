@@ -154,28 +154,16 @@ async fn response_sources_do_not_require_a_request_waiter_and_unknown_ids_do_not
 }
 
 #[tokio::test]
-async fn connection_close_fails_confirmations_but_preserves_unconfirmed_sources() {
+async fn connection_close_clears_receivers_but_preserves_unconfirmed_sources() {
     let ctx = context();
     let large = LargeTransfers::new(BYTE_LIMIT);
     let send_budget = large.send_bytes.clone();
     install_source(&large, &ctx.state, SOURCE_ID, None, None);
-    let (sender, receiver) = oneshot::channel();
-    large
-        .receivers
-        .lock()
-        .unwrap()
-        .active
-        .insert(11, Receiving::Confirming(sender));
-    large
-        .receivers
-        .lock()
-        .unwrap()
-        .active
-        .insert(12, Receiving::Reading);
+    large.receivers.lock().unwrap().active.insert(11);
+    large.receivers.lock().unwrap().active.insert(12);
 
     large.close();
     large.close();
-    assert!(receiver.await.is_err());
     assert!(large.send_bytes.is_closed());
     assert!(large.recv_bytes.is_closed());
     assert!(large.receivers.lock().unwrap().active.is_empty());

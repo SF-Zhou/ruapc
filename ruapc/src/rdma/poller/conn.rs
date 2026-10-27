@@ -436,7 +436,7 @@ impl ConnState {
                 // this pass, before publishing them to direct senders.
                 self.drain_pending();
             }
-            if self.pending_sends.is_empty() && !self.socket.has_large_controls() {
+            if self.pending_sends.is_empty() {
                 break;
             }
             match self.socket.state.try_acquire_at(finished) {
@@ -448,21 +448,6 @@ impl ConnState {
                     self.pending_sends.clear();
                     break;
                 }
-            }
-
-            // Finish controls have a separate bounded queue. They consume the
-            // same accounted SEND credits, but cannot sit behind an arbitrary
-            // business backlog while pinning a peer's source buffers.
-            if self.socket.has_large_controls()
-                && let Some(control) = self.socket.take_large_control()
-            {
-                self.post_data(control, ack)?;
-                continue;
-            }
-            if self.pending_sends.is_empty() {
-                // Closure may clear the control queue after the loop check.
-                self.socket.set_error();
-                break;
             }
 
             // Determine the FIFO run that fits one aggregate. The first

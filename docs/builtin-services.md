@@ -12,7 +12,10 @@ MessagePack `nil`.
 
 Every registered method appears in `Router::method_names()`,
 `Router::method_schemas()` and the OpenAPI document. Built-in and application
-methods use the same dispatch, admission control and per-method metrics.
+methods use the same dispatch, `max_inflight_requests` admission limit and
+per-method metrics, including payload-transfer RPCs. Configure enough handler
+capacity for nested calls and their transport RPCs; see
+[large-payload admission](rdma-capacity.md#large-payload-admission-and-cleanup).
 Registration rejects duplicate wire method names instead of replacing handlers.
 
 An HTTP or unified listener serves the OpenAPI 3.0 document at `/openapi.json`
@@ -31,7 +34,7 @@ curl -s http://127.0.0.1:8000/openapi.json
 
 # Requires the rdma feature and an initialized RDMA pool.
 curl -s -H 'content-type: application/json' -d 'null' \
-  http://127.0.0.1:8000/RdmaBootstrapService/discover
+  http://127.0.0.1:8000/RdmaService/discover
 ```
 
 Include the configured `http_base_path` in these URLs when it is nonempty.
@@ -64,21 +67,30 @@ For the meaning of a successful READ, waiter membership, error-buffer contents,
 and source recovery, see
 [read validation and recovery](safe-boundaries.md#application-read-source-validation-and-recovery).
 
-## RDMA bootstrap: `RdmaBootstrapService`
+## RDMA: `RdmaService`
 
-With the `rdma` feature, the connection pool uses these methods over the RDMA
-endpoint's declared bootstrap transport (`tcp`, `ws` or `http`).
-Peers must advertise bootstrap protocol version **2**.
+With the `rdma` feature, `RdmaService` groups connection bootstrap, serialized
+payload transfer and health probes in one built-in service. Its seven methods
+share the router and method directory; each group has its own transport
+prerequisites below. The crate-private trait, payload request types and probe
+reply type are defined in
+[rdma_service.rs](../ruapc/src/rdma/rdma_service.rs).
+
+### Connection bootstrap
+
+The connection pool uses these methods over the RDMA endpoint's declared
+bootstrap transport (`tcp`, `ws` or `http`).
+Peers must advertise bootstrap protocol version **3**.
 Bootstrap RPCs use the endpoint's full equivalent-address group; every address
 must share the acceptor's `State` and lease records. See
 [group identity](endpoints.md#identity-and-caller-obligations).
 
 | Method | Request | Success value | Purpose |
 |---|---|---|---|
-| `RdmaBootstrapService/discover` | `()` | `RdmaPeerAdvertisement` | Protocol version and currently connectable devices. |
-| `RdmaBootstrapService/prepare_connection` | `PrepareConnectionRequest` | `PrepareConnectionResponse` | Acceptor QP endpoint, lease, and actual limits. |
-| `RdmaBootstrapService/commit_connection` | `ConnectionLease` | `()` | Idempotently confirms initiator ownership. |
-| `RdmaBootstrapService/cancel_connection` | `ConnectionLease` | `()` | Best-effort rollback. |
+| `RdmaService/discover` | `()` | `RdmaPeerAdvertisement` | Protocol version and currently connectable devices. |
+| `RdmaService/prepare_connection` | `PrepareConnectionRequest` | `PrepareConnectionResponse` | Acceptor QP endpoint, lease, and actual limits. |
+| `RdmaService/commit_connection` | `ConnectionLease` | `()` | Idempotently confirms initiator ownership. |
+| `RdmaService/cancel_connection` | `ConnectionLease` | `()` | Best-effort rollback. |
 
 The advertisement carries device load, directional limits, ports, and GIDs.
 A lease contains `attempt_id` and `accepted_connection_id`. See
@@ -87,50 +99,56 @@ lease expiry, and rollback; wire types live in
 [rdma_service.rs](../ruapc/src/rdma/rdma_service.rs) and
 [endpoint.rs](../ruapc/src/rdma/endpoint.rs).
 
-## RDMA health probe: `RdmaProbeService`
+### Payload transfer
+
+These methods transfer serialized payloads larger than the negotiated
+inline-message limit. They require the established RDMA
+connection that owns the transfer.
+
+| Method | Request | Success value | Purpose |
+|---|---|---|---|
+| `RdmaService/offer` | `LargePayloadOffer { transfer_id, payload_len, regions, meta }` | `()` | Start receiving immutable transport-owned source bytes with READ. |
+| `RdmaService/finish` | `FinishPayloadRequest { transfer_id }` | `bool` | Release a source after every READ settled, or none was posted, and report whether the payload remains valid. |
+
+Both methods use ordinary RPC metadata, payload codecs, framing, routing and
+response waiters. They appear in the method directory and OpenAPI; unary HTTP
+and other non-RDMA transports receive `InvalidArgument`. There is no separate
+control-frame format. The public RDMA send API reserves these method names for
+transport code; application raw calls cannot assert READ completion. The offer
+preserves original application read/write regions in its metadata and carries
+serialized-payload regions in a separate field. Its successful reply
+acknowledges the receive task, not completed READs or application execution.
+
+The runtime checks negotiated limits and connection-local transfer state.
+Incoming message dispatch is internal to the transports.
+The receiver calls `finish` only after all payload READs completed or none was
+posted, then dispatches the original message only after a positive reply.
+These RPCs do not authenticate a peer: the peer must honor the advertised-memory
+protocol, and a finish request is its assertion that READs no longer need the
+source. Local posted destinations still require CQ-issued completion evidence.
+
+See [framing](../DESIGN.md#message-ownership-and-framing),
+[source ownership](safe-boundaries.md#large-payload-source-ownership), and
+[admission and cleanup](rdma-capacity.md#large-payload-admission-and-cleanup).
+This source-retention protocol does not extend to application attachments.
+
+### Health probe
 
 With the `rdma` feature, both sides of an established RDMA connection use this
 method to check that specific connection. It rejects other transports.
 
 | Method | Request | Success value | Purpose |
 |---|---|---|---|
-| `RdmaProbeService/probe` | RPC nonce (`u64`); eight bytes of read space in `MsgMeta.read_regions` | `ProbeReply { rpc_nonce, read_nonce }` | Validate an ordinary RPC round trip and a remote READ on the same connection. |
+| `RdmaService/probe` | RPC nonce (`u64`); eight bytes of read space in `MsgMeta.read_regions` | `ProbeReply { rpc_nonce, read_nonce }` | Validate an ordinary RPC round trip and a remote READ on the same connection. |
 
 The read-space nonce is a little-endian `u64` and differs from the RPC nonce.
 The caller requires both
 returned values to match; the receiver uses `Context::remote_read`, including
 its post-READ waiter membership check. The method appears in OpenAPI, but a
 unary HTTP call returns an RPC error because it has no established RDMA
-connection. The Rust trait and reply type are
-crate-private, defined in [probe.rs](../ruapc/src/rdma/probe.rs). See
+connection. The handler and `ProbeReply` are defined in
+[rdma_service.rs](../ruapc/src/rdma/rdma_service.rs);
+[probe.rs](../ruapc/src/rdma/probe.rs) owns the client's `probe_connection`
+round trip, nonce verification and total deadline. See
 [periodic connection probes](rdma-connection.md#periodic-connection-probes)
 for scheduling, timeout thresholds and reconnection ownership.
-
-## Private RDMA payload controls
-
-An RDMA connection with large-payload support carries three transport frame
-types in addition to ordinary RPC messages:
-
-| Control | Fields | Purpose |
-|---|---|---|
-| Offer | Transfer ID, serialized payload length, payload regions, original metadata | Advertise immutable transport-owned source bytes for READ. |
-| Finish | Transfer ID | Confirm that all payload READs completed, or that none was posted. |
-| Finish reply | Transfer ID, completion-validity boolean | Report whether the completed payload may be dispatched. |
-
-These named-field MessagePack controls are parsed by the RDMA dispatcher,
-outside service routing; they have no OpenAPI entries or unary HTTP routes,
-and `MemoryService` cannot invoke them. The offer preserves original application
-read/write regions in its metadata and carries serialized-payload regions in a
-separate field.
-Their byte codecs live in [`ruapc-wire`](../ruapc-wire/src/rdma.rs) and are
-available without verbs. These Rust APIs are public for runtime integration;
-"private" describes their exclusion from application RPC routing. See the
-[wire crate guide](../ruapc-wire/README.md) for release pairing and API stability.
-The transport validates connection identity, negotiated
-capabilities and transfer state before acting on a decoded control; decoding
-does not provide completion evidence or authorize releasing advertised memory.
-
-See [framing](../DESIGN.md#message-ownership-and-framing),
-[source ownership](safe-boundaries.md#large-payload-source-ownership), and
-[admission and cleanup](rdma-capacity.md#large-payload-admission-and-cleanup).
-This private completion protocol does not extend to application attachments.

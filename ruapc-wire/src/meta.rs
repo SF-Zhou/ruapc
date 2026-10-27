@@ -1,6 +1,6 @@
 //! Routing metadata and payload-format selection.
 
-use crate::CodecResult;
+use crate::{CodecResult, MAX_DECODE_DEPTH};
 use bitflags::bitflags;
 use ruapc_bufpool::RemoteBufferInfo;
 use serde::{Deserialize, Serialize};
@@ -76,9 +76,14 @@ impl MsgMeta {
     }
 
     /// Decodes metadata encoded by [`encode_to`](Self::encode_to).
+    ///
+    /// Unknown fields are walked and ignored, so decoding enforces
+    /// [`MAX_DECODE_DEPTH`] before recursion can exhaust the stack.
     #[inline]
     pub(super) fn decode(buf: &[u8]) -> CodecResult<Self> {
-        Ok(rmp_serde::from_slice(buf)?)
+        let mut deserializer = rmp_serde::Deserializer::from_read_ref(buf);
+        deserializer.set_max_depth(MAX_DECODE_DEPTH);
+        Ok(Self::deserialize(&mut deserializer)?)
     }
 
     /// Checks if this message is a request.

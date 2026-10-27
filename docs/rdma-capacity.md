@@ -51,7 +51,7 @@ exchange on the minimum receive ring.
 
 Each connection has 1024 ingress slots and a poller FIFO limited to another
 1024 messages. The combined bound is **2048 reserved or accepted, unposted
-business messages**, including large-payload offers. Reserved ingress slots
+messages**, including payload-transfer RPC requests and replies. Reserved ingress slots
 count toward the channel limit. Moving a message into the FIFO frees an
 ingress slot only while there is space in the bounded FIFO; repeated poller
 maintenance cannot move an unlimited backlog out of the channel.
@@ -66,18 +66,18 @@ refill and priority.
 This is a message-count limit on the send queue, not a process-memory limit.
 Caller-owned serialization buffers waiting for admission are outside it.
 Posted WRs use the separate SEND window. Large serialized sources retain their
-byte budget, and finish controls have their own queue below; neither budget
-is released by draining a business queue slot. DMA ownership follows
+byte budget independently of send-queue slots. Draining a queue slot does not
+release that storage budget. DMA ownership follows
 [safety boundaries](safe-boundaries.md#completion-and-destination-ownership).
 
 ## Large-payload admission and cleanup
 
 The encoder serializes each message once into registered storage, growing it
 as needed. Messages within `max_msg_size` keep the inline format; larger ones
-use a [payload offer](builtin-services.md#private-rdma-payload-controls).
+use a [payload offer RPC](builtin-services.md#payload-transfer).
 `max_msg_size` still sizes each posted receive buffer, so large messages do
 not enlarge the receive ring. The complete serialized size includes metadata
-and the ordinary eight-byte RDMA frame prefix; negotiation and compatibility
+and the twelve-byte frame and metadata-length prefix; negotiation and version
 rules are in [connection limits](rdma-connection.md#parameter-negotiation-and-validation).
 
 `rdma.connection.max_inflight_large_bytes` defaults to 128 MiB per connection
@@ -94,14 +94,27 @@ maximum-size message with both allocations present. Payload READs use the
 existing READ permits and bandwidth admission.
 
 Each connection admits at most 128 active outgoing and 128 active incoming
-transfers. Finish and finish-reply controls use a separate bounded queue of
-256 messages; the poller services it before queued business messages. Offers
-and finish/reply controls consume normal data SEND credits, not a separate
-CQ-credit class. Confirmation bypasses application handler admission so a
-handler waiting for a large callback cannot block its own completion. Receiver replay
-tracking retains compressed transfer-ID intervals for the connection's
-lifetime; more than 128 disjoint intervals closes the connection. The source
-keeps at most 256 finished-transfer results for replying to duplicate finishes.
+transfers, plus at most 128 pending offer acknowledgements. An outgoing send
+returns at queue acceptance; a supervised task handles its offer reply without
+holding the sending handler's capacity. Its acknowledgement permit remains held
+even if `finish` has already released the source. Offers start supervised receive
+tasks and acknowledge them immediately; the incoming transfer limit covers those
+tasks after their offer handlers return.
+
+`RdmaService/offer` and `finish` use the same `max_inflight_requests` handler cap
+as every other RPC, with ordinary router dispatch, deadline checks, panic
+containment and per-method metrics. A finite cap must cover handlers still
+running while they await nested or reverse calls, plus those calls and their
+payload-transfer RPCs. Insufficient handler capacity rejects these requests
+with `Overloaded`; transfer failure then follows the cleanup rules below.
+The transfer, acknowledgement-task and byte limits above account for their own
+resources and do not reserve additional handler capacity.
+All payload RPCs and replies use the normal send queue and data SEND credits.
+
+Receiver replay tracking retains compressed transfer-ID intervals for the
+connection's lifetime; more than 128 disjoint intervals closes the connection.
+The source keeps at most 256 finished-transfer results for replying to duplicate
+finishes.
 
 An independent 30-second transfer cleanup deadline bounds retained offers and
 READ/confirmation tasks, including when the business request has expired.

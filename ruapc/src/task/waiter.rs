@@ -71,20 +71,34 @@ pub struct Waiter {
 /// from the waiter's map, preventing memory leaks for requests that don't
 /// receive responses.
 pub struct WaiterCleaner<'a> {
-    waiter: &'a Waiter,
+    waiter: WaiterOwner<'a>,
     msgid: u64,
+}
+
+enum WaiterOwner<'a> {
+    Borrowed(&'a Waiter),
+    #[cfg(feature = "rdma")]
+    Owned(Arc<Waiter>),
+    Disarmed,
 }
 
 impl WaiterCleaner<'_> {
     /// The waiter entry was removed by its completion path already.
-    pub(crate) fn disarm(self) {
-        std::mem::forget(self);
+    pub(crate) fn disarm(mut self) {
+        // Replacing the owner releases an owned Arc, unlike forgetting this
+        // guard. Disarmed cleanup must not remove a future reused entry.
+        self.waiter = WaiterOwner::Disarmed;
     }
 }
 
 impl Drop for WaiterCleaner<'_> {
     fn drop(&mut self) {
-        self.waiter.remove(self.msgid);
+        match &self.waiter {
+            WaiterOwner::Borrowed(waiter) => waiter.remove(self.msgid),
+            #[cfg(feature = "rdma")]
+            WaiterOwner::Owned(waiter) => waiter.remove(self.msgid),
+            WaiterOwner::Disarmed => {}
+        }
     }
 }
 
@@ -98,6 +112,40 @@ impl Waiter {
 
     /// Preserves a caller's existing absolute budget across admission work.
     pub(crate) fn alloc_until(&self, deadline: Instant) -> (u64, Receiver<'_>) {
+        let (msgid, response) = self.alloc_entry(deadline);
+        (
+            msgid,
+            Receiver::new(
+                response,
+                WaiterCleaner {
+                    waiter: WaiterOwner::Borrowed(self),
+                    msgid,
+                },
+            ),
+        )
+    }
+
+    /// Keeps the waiter alive for a supervised transport response observer.
+    /// Ordinary request receivers continue to borrow without cloning an Arc.
+    #[cfg(feature = "rdma")]
+    pub(crate) fn alloc_owned_until(
+        self: &Arc<Self>,
+        deadline: Instant,
+    ) -> (u64, Receiver<'static>) {
+        let (msgid, response) = self.alloc_entry(deadline);
+        (
+            msgid,
+            Receiver::new(
+                response,
+                WaiterCleaner {
+                    waiter: WaiterOwner::Owned(self.clone()),
+                    msgid,
+                },
+            ),
+        )
+    }
+
+    fn alloc_entry(&self, deadline: Instant) -> (u64, oneshot::Receiver<WaiterResult>) {
         let msgid = self.index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.id_map.insert(
@@ -110,16 +158,7 @@ impl Waiter {
                 deadline,
             },
         );
-        (
-            msgid,
-            Receiver::new(
-                rx,
-                WaiterCleaner {
-                    waiter: self,
-                    msgid,
-                },
-            ),
-        )
+        (msgid, rx)
     }
 
     /// Posts a response message to the waiting receiver.
@@ -180,7 +219,7 @@ impl Waiter {
         self.id_map.contains_key(&msgid)
     }
 
-    /// Exact connection and deadline check for private payload confirmation.
+    /// Exact connection and deadline check for payload confirmation.
     #[cfg(feature = "rdma")]
     pub(crate) fn pending_on_connection(&self, msgid: u64, conn_id: u64) -> bool {
         self.deadline_on_connection(msgid, conn_id)

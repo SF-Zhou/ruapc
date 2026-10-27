@@ -28,7 +28,7 @@
 //! regardless of how many messages the buffer carries), so received
 //! buffers accumulate into per-drain batches that are routed to a fixed
 //! pool of long-lived dispatch worker tasks (`rdma.polling.dispatch_workers`),
-//! each receiving through a Tokio mpsc queue; workers walk `[4B len][message]`
+//! each receiving through a Tokio mpsc queue; workers walk the shared `[RUA!][body_len][body]`
 //! frames and parse them on tokio worker threads. Routing is sticky
 //! (spill on pressure, see [`Dispatcher`]) and queue sends never wait.
 //! When every worker is saturated, a one-shot task handles the batch.

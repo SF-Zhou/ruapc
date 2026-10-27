@@ -1,15 +1,19 @@
+use std::{sync::Arc, time::Duration};
+
+use ruapc_bufpool::RemoteBufferInfo;
 use ruapc_rdma::{DeviceInfo, Gid, LinkLayer, Port};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Context, Result,
-    rdma::{self, RdmaSocketPoolConfig},
+    Context, CopyOp, Error, ErrorKind, MsgMeta, Result, Socket,
+    core::ContextEndpoint,
+    rdma::{self, RdmaSocket, RdmaSocketPoolConfig},
     service,
 };
 
 /// Version of the RDMA bootstrap protocol.
-pub(crate) const RDMA_BOOTSTRAP_PROTOCOL_VERSION: u32 = 2;
+pub(crate) const RDMA_BOOTSTRAP_PROTOCOL_VERSION: u32 = 3;
 
 fn port_is_connectable(port: &Port) -> bool {
     port.is_usable() && (!port.port_attr.link_layer.is_ethernet() || !port.gids.is_empty())
@@ -134,13 +138,57 @@ impl RdmaPeerAdvertisement {
     }
 }
 
+pub(super) const PROBE_BYTES: usize = std::mem::size_of::<u64>();
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub(crate) struct ProbeReply {
+    pub(crate) rpc_nonce: u64,
+    pub(crate) read_nonce: u64,
+}
+
+/// An immutable serialized payload exposed for READ on this connection.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(crate) struct LargePayloadOffer {
+    pub(crate) transfer_id: u64,
+    pub(crate) payload_len: u64,
+    pub(crate) regions: Vec<RemoteBufferInfo>,
+    #[schemars(with = "PayloadMetadataSchema")]
+    pub(crate) meta: MsgMeta,
+}
+
+// Schema-only projection: wire metadata has no dependency on schema generation.
+// Keep these field types and defaults aligned with ruapc_wire::MsgMeta.
+#[derive(JsonSchema)]
+#[allow(dead_code)]
+struct PayloadMetadataSchema {
+    #[schemars(default)]
+    method: String,
+    #[schemars(default)]
+    flags: u8,
+    #[schemars(default)]
+    msgid: u64,
+    #[schemars(default)]
+    read_regions: Vec<RemoteBufferInfo>,
+    #[schemars(default)]
+    write_regions: Vec<RemoteBufferInfo>,
+    #[schemars(default)]
+    timeout_ms: u32,
+}
+
+/// Identifies a source whose READs have settled, or were never posted.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(crate) struct FinishPayloadRequest {
+    pub(crate) transfer_id: u64,
+}
+
 /// Service interface for RDMA operations.
 ///
-/// This trait defines the core operations for managing RDMA connections
-/// and querying RDMA device information. It is designed to work with
-/// the service macro for RPC functionality.
+/// Manages RDMA connections, queries device information, checks connection
+/// health, and transfers connection-owned serialized payloads. Payload methods
+/// require delivery through the established RDMA connection. All methods share
+/// the configured handler concurrency limit.
 #[service]
-pub(crate) trait RdmaBootstrapService {
+pub(crate) trait RdmaService {
     /// Discovers the peer's connectable RDMA devices and limits.
     async fn discover(&self, ctx: &Context, _: &()) -> Result<rdma::RdmaPeerAdvertisement>;
 
@@ -162,13 +210,22 @@ pub(crate) trait RdmaBootstrapService {
     /// Best-effort idempotent cleanup when the initiator cannot complete the
     /// confirmation exchange.
     async fn cancel_connection(&self, ctx: &Context, lease: &rdma::ConnectionLease) -> Result<()>;
+
+    /// Checks RPC delivery and reads the attached nonce over the same RDMA connection.
+    async fn probe(&self, ctx: &Context, nonce: &u64) -> Result<ProbeReply>;
+
+    /// Starts receiving a serialized payload on the incoming RDMA connection.
+    async fn offer(&self, ctx: &Context, offer: &LargePayloadOffer) -> Result<()>;
+
+    /// Releases a settled source and reports whether its payload remains valid.
+    async fn finish(&self, ctx: &Context, request: &FinishPayloadRequest) -> Result<bool>;
 }
 
-/// Default implementation of `RdmaBootstrapService` for the unit type.
+/// Default implementation of `RdmaService` for the unit type.
 ///
-/// This implementation delegates all operations to the socket pool
-/// stored in the context's state.
-impl RdmaBootstrapService for () {
+/// Connection management delegates to the socket pool; payload transfers and
+/// health probes operate on the incoming RDMA socket.
+impl RdmaService for () {
     /// Retrieves RDMA device information from the socket pool.
     async fn discover(&self, ctx: &Context, (): &()) -> Result<rdma::RdmaPeerAdvertisement> {
         ctx.state.socket_pool.rdma_peer_advertisement()
@@ -192,6 +249,65 @@ impl RdmaBootstrapService for () {
     async fn cancel_connection(&self, ctx: &Context, lease: &rdma::ConnectionLease) -> Result<()> {
         ctx.state.socket_pool.rdma_cancel_connection(lease)
     }
+
+    async fn probe(&self, ctx: &Context, nonce: &u64) -> Result<ProbeReply> {
+        if !matches!(&ctx.endpoint, ContextEndpoint::Connected(Socket::RDMA(_))) {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "RDMA probe requires an established RDMA connection".into(),
+            ));
+        }
+        if ctx.remote_read_space()?.total_len() != PROBE_BYTES as u64 {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "RDMA probe requires exactly eight bytes of read space".into(),
+            ));
+        }
+        let mut destination = ctx
+            .state
+            .buffer_pool
+            .allocate(PROBE_BYTES)
+            .map_err(|error| Error::new(ErrorKind::InvalidArgument, error.to_string()))?;
+        destination.set_len(PROBE_BYTES);
+        let destinations = ctx
+            .remote_read(&[CopyOp::new(0, 0, PROBE_BYTES as u64)], vec![destination])
+            .await?;
+        let mut read_bytes = [0; PROBE_BYTES];
+        read_bytes.copy_from_slice(&destinations[0]);
+        Ok(ProbeReply {
+            rpc_nonce: *nonce,
+            read_nonce: u64::from_le_bytes(read_bytes),
+        })
+    }
+
+    async fn offer(&self, ctx: &Context, offer: &LargePayloadOffer) -> Result<()> {
+        let socket = payload_socket(ctx)?;
+        let began = ctx
+            .deadline()
+            .and_then(|deadline| {
+                deadline.checked_sub(Duration::from_millis(u64::from(ctx.msg_meta.timeout_ms)))
+            })
+            .ok_or_else(|| Error::kind(ErrorKind::InvalidArgument))?;
+        socket.start_large_receive(offer.clone(), &ctx.state, began)
+    }
+
+    async fn finish(&self, ctx: &Context, request: &FinishPayloadRequest) -> Result<bool> {
+        payload_socket(ctx)?.finish_large(request.transfer_id, &ctx.state)
+    }
+}
+
+fn payload_socket(ctx: &Context) -> Result<&Arc<RdmaSocket>> {
+    match &ctx.endpoint {
+        ContextEndpoint::Connected(Socket::RDMA(socket)) => Ok(socket),
+        _ => Err(Error::new(
+            ErrorKind::InvalidArgument,
+            "RDMA payload transfer requires delivery on an established RDMA connection".into(),
+        )),
+    }
+}
+
+pub(crate) fn is_payload_method(method: &str) -> bool {
+    matches!(method, "RdmaService/offer" | "RdmaService/finish")
 }
 
 #[cfg(test)]
@@ -307,5 +423,58 @@ mod tests {
         };
         let result = ().prepare_connection(&ctx, &request).await;
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod payload_tests {
+    use super::*;
+    use crate::{Client, Endpoint, Router, Server, SocketPoolConfig, Transport};
+
+    fn offer() -> LargePayloadOffer {
+        LargePayloadOffer {
+            transfer_id: 1,
+            payload_len: 1,
+            regions: Vec::new(),
+            meta: MsgMeta::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn payload_methods_reject_unconnected_and_tcp_contexts() {
+        let config = SocketPoolConfig {
+            rdma: None,
+            ..Default::default()
+        };
+        let context = Context::create(&config).unwrap();
+        let finish = FinishPayloadRequest { transfer_id: 1 };
+        assert_eq!(
+            ().offer(&context, &offer()).await.unwrap_err().kind,
+            ErrorKind::InvalidArgument
+        );
+        assert_eq!(
+            ().finish(&context, &finish).await.unwrap_err().kind,
+            ErrorKind::InvalidArgument
+        );
+        let server = Server::create(Router::default(), &config).unwrap();
+        let address = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let context = context.with_endpoint(Endpoint::new(Transport::TCP, [address]).unwrap());
+        for use_msgpack in [true, false] {
+            let client = Client {
+                use_msgpack,
+                ..Default::default()
+            };
+            for error in [
+                client.offer(&context, &offer()).await.unwrap_err(),
+                client.finish(&context, &finish).await.unwrap_err(),
+            ] {
+                assert_eq!(error.kind, ErrorKind::InvalidArgument);
+                assert!(error.msg.contains("established RDMA connection"));
+            }
+        }
+        context.state.socket_pool.stop();
+        context.state.socket_pool.join().await;
+        server.stop();
+        server.join().await;
     }
 }

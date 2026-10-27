@@ -7,8 +7,11 @@ It has no dependency on the RPC runtime, an async executor or `ruapc-rdma`.
 
 Metadata always uses named-field MessagePack. Payloads use MessagePack when
 `MsgFlags::UseMessagePack` is set, and JSON otherwise. See the
-[wire format](../DESIGN.md#message-ownership-and-framing) for frame layouts and
-compatibility rules.
+[wire format](../DESIGN.md#message-ownership-and-framing) for frame layouts.
+Message metadata and MessagePack payloads are decoded with the shared
+`MAX_DECODE_DEPTH` nesting limit, so every
+transport applies the same bound to structure this crate parses; JSON payloads
+are bounded internally by `serde_json` at the same depth.
 
 `MsgMeta::serialize_to` uses the generic `SendMsg` storage interface to write
 directly into a destination and backfill lengths. It returns `Result<(), M::Error>`;
@@ -26,24 +29,25 @@ metadata bytes to validate their contents.
 `parse_body` borrows a message body and returns its metadata and payload offset;
 `deserialize_payload` decodes a borrowed payload slice. The caller retains
 ownership of the storage.
-The `frame` module supports TCP incremental buffers and
-HTTP/2 byte chunks; the `rdma` module handles ordinary and control frames.
+The `frame` module supports TCP incremental buffers, HTTP/2 byte chunks,
+one-frame WebSocket binary messages and complete RDMA SEND aggregates. Every
+carrier uses `[RUA!: 4B][body_len: 4B][meta_len: 4B][meta][payload]` and the
+same frame size limit. `frame::encode_header` lets registered-buffer serializers
+backfill that header without an intermediate allocation.
 
 These codecs describe bytes and owned storage. Connection admission, sending,
 RDMA transfer ownership and completion validation remain in the transport
-runtime. A successfully encoded or decoded control frame is not completion
+runtime. A successfully encoded or decoded RPC message is not completion
 evidence. See [safety boundaries](../docs/safe-boundaries.md) for those contracts.
 
-The `rdma` control types and codecs are public for transport-runtime integration;
-they are not application RPC endpoints. This integration API may change between
-alpha releases. `ruapc` pins `ruapc-wire` to the exact matching release, so the
-runtime and codec cannot be upgraded independently within one build. This does
-not establish compatibility between network peers: wire changes must preserve
-compatibility or be explicitly negotiated through protocol versions and
-capabilities. See [private controls](../docs/builtin-services.md#private-rdma-payload-controls)
-and [connection setup](../docs/rdma-connection.md) for the runtime contracts.
+Large-payload rendezvous uses built-in RPC methods, with its data types and
+transfer state owned by the runtime. There is no separate RDMA frame format or
+control-frame escape. `ruapc` pins `ruapc-wire` to the exact matching release,
+so the runtime and codec cannot be upgraded independently within one build.
+See [built-in services](../docs/builtin-services.md) and
+[connection setup](../docs/rdma-connection.md) for the runtime contracts.
 
-`SendMsg::Error` and the error parameter of `rdma::decode_frames` let transport
+`SendMsg::Error` and the error parameter of `frame::decode_frames` let transport
 hooks and callbacks return their own errors unchanged. Codec failures convert
 into that type through `From<CodecError>`. These interfaces use static dispatch.
 

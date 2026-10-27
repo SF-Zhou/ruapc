@@ -1,22 +1,21 @@
-//! Connection-scoped rendezvous transfers. Only private RDMA receive controls
-//! can finish a published source; ordinary RPCs cannot fabricate that evidence.
+//! Connection-scoped rendezvous transfers using ordinary framed RPCs.
+//! Sources remain owned until a peer finish RPC or provider QP destruction.
 
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    sync::{Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
 
 use bytes::Bytes;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
+use ruapc_wire::frame::{HEADER_LEN, MAX_MSG_SIZE};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::{RdmaSocket, encode::Encoded};
 use crate::{
-    Buffer, BufferPool, Error, ErrorKind, Message, MsgMeta, Result, Socket, State,
-    rdma::frame::{ControlFrame, LargePayloadOffer, encode_control},
+    Buffer, BufferPool, Error, ErrorKind, Message, MsgFlags, MsgMeta, Result, Socket, State,
+    metrics::MethodCall,
+    rdma::rdma_service::{FinishPayloadRequest, LargePayloadOffer},
     remote_memory::scatter::SpaceLayout,
     sockets::{SendRequest, reserve_send},
 };
@@ -53,13 +52,6 @@ struct Seen {
 }
 
 impl Seen {
-    fn contains(&self, id: u64) -> bool {
-        self.ranges
-            .range(..=id)
-            .next_back()
-            .is_some_and(|(_, &end)| id <= end)
-    }
-
     fn insert(&mut self, id: u64) -> Result<()> {
         if id == 0 {
             return Err(protocol_error("zero transfer ID"));
@@ -91,16 +83,10 @@ impl Seen {
     }
 }
 
-#[derive(Debug)]
-enum Receiving {
-    Reading,
-    Confirming(oneshot::Sender<bool>),
-}
-
 #[derive(Debug, Default)]
 struct Receivers {
     seen: Seen,
-    active: HashMap<u64, Receiving>,
+    active: HashSet<u64>,
 }
 
 #[derive(Debug)]
@@ -109,8 +95,9 @@ pub(super) struct LargeTransfers {
     recv_bytes: Arc<Semaphore>,
     sources: Mutex<Sources>,
     receivers: Mutex<Receivers>,
-    controls: Mutex<VecDeque<Buffer>>,
-    controls_pending: AtomicBool,
+    // A finish can retire its source before the offer ACK arrives. Bound
+    // ACK supervision separately so completed transfers cannot bypass it.
+    offers: Arc<Semaphore>,
     // A failed READ may still own its destination in the QP. These byte
     // reservations are retired after provider destruction along with sources.
     failed_receives: Mutex<Vec<OwnedSemaphorePermit>>,
@@ -123,8 +110,7 @@ impl LargeTransfers {
             recv_bytes: Arc::new(Semaphore::new(byte_limit)),
             sources: Mutex::default(),
             receivers: Mutex::default(),
-            controls: Mutex::default(),
-            controls_pending: AtomicBool::new(false),
+            offers: Arc::new(Semaphore::new(MAX_TRANSFERS)),
             failed_receives: Mutex::default(),
         }
     }
@@ -133,9 +119,7 @@ impl LargeTransfers {
         self.send_bytes.close();
         self.recv_bytes.close();
         self.receivers.lock().unwrap().active.clear();
-        let mut controls = self.controls.lock().unwrap();
-        controls.clear();
-        self.controls_pending.store(false, Ordering::Release);
+        self.offers.close();
         // Sources stay immutable and owned until the QP is destroyed.
     }
 
@@ -149,8 +133,8 @@ impl LargeTransfers {
                 && source
                     .request_id
                     .is_none_or(|msgid| state.waiter.pending_on_connection(msgid, conn_id));
-            // This path is called only for a private finish frame received on
-            // the source's QP, after the peer has settled every READ. Even a
+            // This path is called only by a finish RPC received on the
+            // source's QP, after the peer has settled every READ. Even a
             // rejected/expired transfer can now release its source.
             drop(source);
             sources.finished.push_back((id, valid));
@@ -174,15 +158,23 @@ fn protocol_error(message: &str) -> Error {
 
 impl RdmaSocket {
     pub(super) async fn send_large(
-        &self,
+        self: &Arc<Self>,
         meta: &mut MsgMeta,
         encoded: Encoded,
         request: &SendRequest<'_>,
+        state: &Arc<State>,
     ) -> Result<()> {
         let payload_len = encoded.buffer.len() - encoded.payload_offset;
         let business_deadline = request.deadline();
         self.reserve_send_bandwidth(payload_len as u64, business_deadline)
             .await?;
+        let permit = self.large.offers.clone().try_acquire_owned().map_err(|_| {
+            if self.state.is_ok() {
+                Error::kind(ErrorKind::Overloaded)
+            } else {
+                Error::kind(ErrorKind::ConnectionClosed)
+            }
+        })?;
         // Reserve a queue slot before publishing the source. After this await,
         // ownership installation and transport acceptance are one synchronous
         // transaction; cancelling send cannot leave a half-published offer.
@@ -205,160 +197,159 @@ impl RdmaSocket {
             .checked_add(encoded.payload_offset as u64)
             .ok_or_else(|| protocol_error("payload address overflow"))?;
         region.len = payload_len as u64;
-        let mut sources = self.large.sources.lock().unwrap();
-        if sources.active.len() >= MAX_TRANSFERS {
-            return Err(ErrorKind::Overloaded.into());
+        let (msgid, response) = state.waiter.alloc_owned_until(cleanup_deadline);
+        state.waiter.bind_connection(msgid, self.conn_id);
+        {
+            let mut sources = self.large.sources.lock().unwrap();
+            if sources.active.len() >= MAX_TRANSFERS {
+                return Err(ErrorKind::Overloaded.into());
+            }
+            let id = sources
+                .next
+                .checked_add(1)
+                .ok_or_else(|| protocol_error("transfer IDs exhausted"))?;
+            let offer = LargePayloadOffer {
+                transfer_id: id,
+                payload_len: payload_len as u64,
+                regions: vec![region],
+                meta: meta.clone(),
+            };
+            let offer_meta = MsgMeta {
+                method: "RdmaService/offer".into(),
+                flags: MsgFlags::IsReq | MsgFlags::UseMessagePack,
+                msgid,
+                timeout_ms: remaining_ms(cleanup_deadline),
+                ..Default::default()
+            };
+            // Offers must fit inline. Never recursively rendezvous a descriptor.
+            let descriptor = self.serialize_msg(&offer_meta, &offer)?;
+            if descriptor.buffer.len() > self.max_msg_size {
+                return Err(Error::new(
+                    ErrorKind::SerializeFailed,
+                    "RDMA large-payload descriptor exceeds receive buffer".into(),
+                ));
+            }
+            request.check()?;
+            if !self.state.is_ok() {
+                return Err(ErrorKind::ConnectionClosed.into());
+            }
+            sources.next = id;
+            sources.active.insert(
+                id,
+                Source {
+                    _buffer: encoded.buffer,
+                    _permit: encoded
+                        .permit
+                        .expect("large serialization reserves its source bytes"),
+                    request_id: meta.is_req().then_some(meta.msgid),
+                    deadline: business_deadline,
+                    cleanup_at: Instant::now() + TRANSFER_TIMEOUT,
+                },
+            );
+            slot.send(descriptor.buffer);
         }
-        let id = sources
-            .next
-            .checked_add(1)
-            .ok_or_else(|| protocol_error("transfer IDs exhausted"))?;
-        let offer = ControlFrame::Offer(LargePayloadOffer {
-            transfer_id: id,
-            payload_len: payload_len as u64,
-            regions: vec![region],
-            meta: meta.clone(),
-        });
-        let descriptor = self.control_buffer(&offer)?;
-        request.check()?;
-        if !self.state.is_ok() {
-            return Err(ErrorKind::ConnectionClosed.into());
-        }
-        sources.next = id;
-        sources.active.insert(
-            id,
-            Source {
-                _buffer: encoded.buffer,
-                _permit: encoded
-                    .permit
-                    .expect("large serialization reserves its source bytes"),
-                request_id: meta.is_req().then_some(meta.msgid),
-                deadline: business_deadline,
-                cleanup_at: Instant::now() + TRANSFER_TIMEOUT,
-            },
-        );
-        slot.send(descriptor);
-        drop(sources);
         self.poller_waker.wake();
+        // Acceptance is irrevocable. Supervise the ACK independently so an
+        // already delivered response cannot keep its business handler alive.
+        // Failure (including shutdown before the task starts) closes the
+        // connection, while its source table keeps the advertised bytes.
+        let guard = OfferAck {
+            socket: Arc::downgrade(self),
+            _permit: permit,
+            metrics: state.metrics.client_method("RdmaService/offer").start(),
+            acknowledged: false,
+        };
+        state
+            .socket_pool
+            .task_supervisor_handle()
+            .try_spawn(async move {
+                let mut guard = guard;
+                let acknowledged = async {
+                    let (message, _) = response.recv().await?;
+                    message.payload.deserialize::<Result<()>>(&message.meta)?
+                }
+                .await;
+                match acknowledged {
+                    Ok(()) => guard.acknowledged = true,
+                    Err(error) => {
+                        tracing::warn!(%error, "RDMA payload offer RPC failed after acceptance")
+                    }
+                }
+            });
         Ok(())
     }
 
-    fn control_buffer(&self, control: &ControlFrame) -> Result<Buffer> {
-        let bytes = encode_control(control)?;
-        if bytes.len() > self.max_msg_size {
-            return Err(Error::new(
-                ErrorKind::SerializeFailed,
-                "RDMA large-payload descriptor exceeds receive buffer".into(),
-            ));
-        }
-        let mut buffer = self.rdmabuf_pool.allocate(bytes.len())?;
-        buffer.set_len(0);
-        buffer.extend_from_slice(&bytes)?;
-        Ok(buffer)
-    }
-
-    fn send_control(&self, control: ControlFrame) -> Result<()> {
-        let buffer = self.control_buffer(&control)?;
-        let mut controls = self.large.controls.lock().unwrap();
-        if !self.state.is_ok() {
-            return Err(ErrorKind::ConnectionClosed.into());
-        }
-        if controls.len() >= 2 * MAX_TRANSFERS {
-            return Err(ErrorKind::Overloaded.into());
-        }
-        controls.push_back(buffer);
-        self.large.controls_pending.store(true, Ordering::Release);
-        drop(controls);
-        self.poller_waker.wake();
-        Ok(())
-    }
-
-    pub(in crate::rdma) fn take_large_control(&self) -> Option<Buffer> {
-        let mut controls = self.large.controls.lock().unwrap();
-        let buffer = controls.pop_front();
-        self.large
-            .controls_pending
-            .store(!controls.is_empty(), Ordering::Release);
-        buffer
-    }
-
-    pub(in crate::rdma) fn has_large_controls(&self) -> bool {
-        self.large.controls_pending.load(Ordering::Acquire)
-    }
-
-    /// Called exclusively by the private dispatcher of validated RDMA receive
-    /// completions. Never route these controls through public State::handle_recv.
-    pub(in crate::rdma) fn handle_control(
+    /// The RPC handler selects the receiving RDMA connection.
+    pub(crate) fn start_large_receive(
         self: &Arc<Self>,
-        control: ControlFrame,
+        offer: LargePayloadOffer,
         state: &Arc<State>,
+        began: Instant,
     ) -> Result<()> {
+        let result = self.start_large_receive_inner(offer, state, began);
+        if result.is_err() {
+            // A rejected offer must not leave replay tracking or remote READ
+            // sources indefinitely live, even if its peer ignores RPC errors.
+            self.set_error();
+        }
+        result
+    }
+
+    fn start_large_receive_inner(
+        self: &Arc<Self>,
+        offer: LargePayloadOffer,
+        state: &Arc<State>,
+        began: Instant,
+    ) -> Result<()> {
+        self.check_large_connection()?;
+        self.validate_offer(&offer)?;
+        let mut receivers = self.large.receivers.lock().unwrap();
+        if receivers.active.len() >= MAX_TRANSFERS {
+            return Err(ErrorKind::Overloaded.into());
+        }
+        receivers.seen.insert(offer.transfer_id)?;
+        receivers.active.insert(offer.transfer_id);
+        drop(receivers);
+        let guard = ReceiveGuard {
+            socket: self.clone(),
+            id: offer.transfer_id,
+            settled: false,
+        };
+        let state = state.clone();
+        let supervisor = state.socket_pool.task_supervisor_handle();
+        // Release RPC handler admission promptly. READ/confirmation work has
+        // its own transfer-count, byte and cleanup budgets.
+        supervisor
+            .try_spawn(async move {
+                let mut guard = guard;
+                let result = tokio::time::timeout(
+                    TRANSFER_TIMEOUT,
+                    guard.socket.receive_large(offer, &state, began),
+                )
+                .await;
+                match result {
+                    Ok(Ok(())) => guard.settled = true,
+                    Ok(Err(error)) => tracing::warn!(%error, "RDMA large-payload receive failed"),
+                    Err(_) => tracing::warn!("RDMA large-payload confirmation timed out"),
+                }
+            })
+            .ok_or_else(|| Error::kind(ErrorKind::ConnectionClosed))?;
+        Ok(())
+    }
+
+    pub(crate) fn finish_large(&self, id: u64, state: &State) -> Result<bool> {
+        self.check_large_connection()?;
+        Ok(self
+            .large
+            .finish(id, state, self.conn_id, self.state.is_ok()))
+    }
+
+    fn check_large_connection(&self) -> Result<()> {
         if self.max_large_msg_size == 0 {
             return Err(protocol_error("large payloads were not negotiated"));
         }
         if !self.state.is_ok() {
             return Err(ErrorKind::ConnectionClosed.into());
-        }
-        match control {
-            ControlFrame::Offer(offer) => {
-                self.validate_offer(&offer)?;
-                let mut receivers = self.large.receivers.lock().unwrap();
-                if receivers.active.len() >= MAX_TRANSFERS {
-                    return Err(ErrorKind::Overloaded.into());
-                }
-                receivers.seen.insert(offer.transfer_id)?;
-                receivers
-                    .active
-                    .insert(offer.transfer_id, Receiving::Reading);
-                drop(receivers);
-                let guard = ReceiveGuard {
-                    socket: self.clone(),
-                    id: offer.transfer_id,
-                    settled: false,
-                };
-                let state = state.clone();
-                let supervisor = state.socket_pool.task_supervisor_handle();
-                let began = Instant::now();
-                supervisor
-                    .try_spawn(async move {
-                        let mut guard = guard;
-                        let result = tokio::time::timeout(
-                            TRANSFER_TIMEOUT,
-                            guard.socket.receive_large(offer, &state, began),
-                        )
-                        .await;
-                        match result {
-                            Ok(Ok(())) => guard.settled = true,
-                            Ok(Err(error)) => {
-                                tracing::warn!(%error, "RDMA large-payload receive failed")
-                            }
-                            Err(_) => tracing::warn!("RDMA large-payload confirmation timed out"),
-                        }
-                    })
-                    .ok_or_else(|| Error::kind(ErrorKind::ConnectionClosed))?;
-            }
-            ControlFrame::Finish { transfer_id } => {
-                let completed =
-                    self.large
-                        .finish(transfer_id, state, self.conn_id, self.state.is_ok());
-                self.send_control(ControlFrame::FinishReply {
-                    transfer_id,
-                    completed,
-                })?;
-            }
-            ControlFrame::FinishReply {
-                transfer_id,
-                completed,
-            } => {
-                let mut receivers = self.large.receivers.lock().unwrap();
-                match receivers.active.remove(&transfer_id) {
-                    Some(Receiving::Confirming(sender)) => {
-                        let _ = sender.send(completed);
-                    }
-                    None if receivers.seen.contains(transfer_id) => {}
-                    _ => return Err(protocol_error("unexpected large-payload confirmation")),
-                }
-            }
         }
         Ok(())
     }
@@ -372,8 +363,10 @@ impl RdmaSocket {
             || offer
                 .payload_len
                 .checked_add(meta_len)
-                .and_then(|len| len.checked_add(8))
-                .is_none_or(|len| len > self.max_large_msg_size as u64)
+                .and_then(|len| len.checked_add((HEADER_LEN + 4) as u64))
+                .is_none_or(|len| {
+                    len > self.max_large_msg_size as u64 || len >= MAX_MSG_SIZE as u64
+                })
         {
             return Err(protocol_error(
                 "large payload exceeds negotiated message limit",
@@ -407,7 +400,7 @@ impl RdmaSocket {
                     .waiter
                     .pending_on_connection(offer.meta.msgid, self.conn_id));
         if unwanted {
-            self.confirm_payload(offer.transfer_id).await?;
+            self.confirm_payload(offer.transfer_id, state).await?;
             return Ok(());
         }
         let len = usize::try_from(offer.payload_len)?;
@@ -434,7 +427,7 @@ impl RdmaSocket {
                 .take()
                 .expect("destination byte reservation"),
         };
-        let confirmed = self.confirm_payload(offer.transfer_id).await?;
+        let confirmed = self.confirm_payload(offer.transfer_id, state).await?;
         if !confirmed {
             return Ok(());
         }
@@ -451,25 +444,37 @@ impl RdmaSocket {
         )
     }
 
-    async fn confirm_payload(&self, id: u64) -> Result<bool> {
-        let (sender, receiver) = oneshot::channel();
-        {
-            let mut receivers = self.large.receivers.lock().unwrap();
-            let slot = receivers
-                .active
-                .get_mut(&id)
-                .ok_or_else(|| Error::kind(ErrorKind::ConnectionClosed))?;
-            if !matches!(slot, Receiving::Reading) {
-                return Err(protocol_error("duplicate large-payload finish"));
-            }
-            *slot = Receiving::Confirming(sender);
+    async fn confirm_payload(self: &Arc<Self>, id: u64, state: &Arc<State>) -> Result<bool> {
+        // Every submitted READ has completed (or none was posted). Cleanup has
+        // its own budget even if the business request expired while reading.
+        let metrics = state.metrics.client_method("RdmaService/finish").start();
+        let result = self.finish_rpc(id, state).await;
+        if result.is_err() {
+            metrics.failed();
         }
-        // Every submitted READ has completed (or none was posted). This control
-        // both validates the source and tells its owner DMA no longer needs it.
-        self.send_control(ControlFrame::Finish { transfer_id: id })?;
-        receiver
-            .await
-            .map_err(|_| ErrorKind::ConnectionClosed.into())
+        result
+    }
+
+    // Bypass only the public send authorization check, using the same framed
+    // serializer, queue admission, response waiter and result codec as RPCs.
+    async fn finish_rpc(&self, id: u64, state: &Arc<State>) -> Result<bool> {
+        self.check_large_connection()?;
+        let (msgid, receiver) = state.waiter.alloc(TRANSFER_TIMEOUT);
+        let mut meta = MsgMeta {
+            method: "RdmaService/finish".into(),
+            flags: MsgFlags::IsReq | MsgFlags::UseMessagePack,
+            msgid,
+            timeout_ms: TRANSFER_TIMEOUT.as_millis() as u32,
+            ..Default::default()
+        };
+        let request = SendRequest::bind(&mut meta, &state.waiter, self.conn_id)?;
+        let encoded = self.serialize_msg(&meta, &FinishPayloadRequest { transfer_id: id })?;
+        if encoded.buffer.len() > self.max_msg_size {
+            return Err(protocol_error("payload finish RPC exceeds receive buffer"));
+        }
+        self.send_buffer(&mut meta, encoded, &request).await?;
+        let (message, _) = receiver.recv().await?;
+        message.payload.deserialize(&message.meta)?
     }
 
     pub(crate) fn sweep_large_transfers(&self, now: Instant) {
@@ -494,6 +499,25 @@ fn remaining_ms(deadline: Instant) -> u32 {
             .as_millis(),
     )
     .unwrap_or(u32::MAX)
+}
+
+struct OfferAck {
+    // ACK supervision must not delay provider QP destruction.
+    socket: Weak<RdmaSocket>,
+    _permit: OwnedSemaphorePermit,
+    metrics: MethodCall,
+    acknowledged: bool,
+}
+
+impl Drop for OfferAck {
+    fn drop(&mut self) {
+        if !self.acknowledged {
+            self.metrics.failed();
+            if let Some(socket) = self.socket.upgrade() {
+                socket.set_error();
+            }
+        }
+    }
 }
 
 struct ReceivedPayload {

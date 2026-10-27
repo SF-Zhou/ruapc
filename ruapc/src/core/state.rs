@@ -17,6 +17,15 @@ use crate::rdma::{RdmaDevice, RdmaPathPolicyConfig, RdmaPathReport};
 /// Created by [`Server::create`](crate::Server::create) or [`Context::create`]
 /// and shared by their contexts and active connections. Use [`Context::state`]
 /// or [`Server::state`](crate::Server::state) to access it.
+/// Incoming messages are dispatched internally by the transports.
+///
+/// ```compile_fail
+/// use ruapc::{Message, Socket, State};
+/// use std::sync::Arc;
+/// fn inject(state: &Arc<State>, socket: &Socket, message: Message) {
+///     state.handle_recv(socket, message).unwrap();
+/// }
+/// ```
 pub struct State {
     /// Router containing registered service methods.
     pub router: Router,
@@ -31,7 +40,8 @@ pub struct State {
     /// Metric emission helpers (see [`crate::metrics`]); the actual
     /// storage/export belongs to the user-installed [`metrics::Recorder`].
     pub(crate) metrics: Arc<Metrics>,
-    /// Server-side in-flight request cap (0 = unlimited); excess requests
+    /// Shared server-side request cap for all methods (0 = unlimited).
+    /// Excess requests, including built-in payload-transfer RPCs,
     /// are rejected with [`ErrorKind::Overloaded`](crate::ErrorKind).
     pub(crate) max_inflight_requests: usize,
 }
@@ -117,7 +127,7 @@ impl State {
 
     /// Dispatches requests with an incoming deadline, or delivers responses to
     /// their waiter. Messages with neither flag are logged and ignored.
-    pub fn handle_recv(self: &Arc<Self>, socket: &Socket, msg: Message) -> Result<()> {
+    pub(crate) fn handle_recv(self: &Arc<Self>, socket: &Socket, msg: Message) -> Result<()> {
         if msg.meta.is_req() {
             let ctx = Context::server_ctx(self, socket.clone(), msg.meta);
             self.router.dispatch(ctx, msg.payload);

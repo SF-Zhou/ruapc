@@ -291,14 +291,22 @@ async fn json_large_payload_preserves_read_and_write_attachments() {
 }
 
 #[tokio::test]
-async fn large_callback_confirmation_progresses_with_full_handler_capacity() {
+async fn large_callback_completes_with_capacity_for_transport_rpcs() {
     let mut config = config();
-    config.max_inflight_requests = 1;
+    config.max_inflight_requests = 4;
+    // Isolate payload progress from background bootstrap handlers competing
+    // for the same capacity on machines with multiple RDMA NICs.
+    config
+        .rdma
+        .as_mut()
+        .unwrap()
+        .peers
+        .min_connections_per_remote_nic = 0;
     let (_, server, ctx) = setup(&config).await;
     let request = blob(ATTACHMENT_SIZE, 37);
 
-    // The server's only handler waits for a large callback. Its payload
-    // confirmation must progress while that handler still owns admission.
+    // Reserve capacity for the waiting application handler and the payload
+    // RPCs that complete its large callback.
     assert_eq!(
         client(true).callback(&ctx, &request).await.unwrap(),
         request
@@ -392,7 +400,7 @@ async fn negotiated_large_limit_rejects_oversize_before_transport_acceptance() {
 }
 
 #[tokio::test]
-async fn disabled_peer_negotiates_legacy_inline_messages_only() {
+async fn disabled_large_payload_support_keeps_inline_messages_usable() {
     let mut server_config = config();
     server_config
         .rdma

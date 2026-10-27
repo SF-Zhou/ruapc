@@ -1,4 +1,4 @@
-//! Stream framing shared by TCP and HTTP/2.
+//! Message framing shared by TCP, HTTP/2, WebSocket and RDMA.
 
 use bytes::{Buf, Bytes, BytesMut};
 
@@ -6,14 +6,28 @@ use super::SendMsg;
 use crate::{CodecError, CodecErrorKind, CodecResult, MsgMeta};
 use serde::Serialize;
 
-/// Magic prefix shared by TCP and HTTP/2 stream frames.
+/// Magic prefix shared by all framed transports.
 pub const MAGIC_NUM: u32 = u32::from_be_bytes(*b"RUA!");
-/// Exclusive upper bound on the complete stream frame size, in bytes.
+/// Exclusive upper bound on the complete frame size, in bytes.
 pub const MAX_MSG_SIZE: usize = 64 << 20;
-const HEADER_LEN: usize = 8;
+/// Size of `[4B magic][4B body length]`, excluding the metadata length prefix.
+pub const HEADER_LEN: usize = 8;
+
+/// Encodes a frame header after validating the shared complete-frame size limit.
+/// Direct serializers can reserve [`HEADER_LEN`] bytes and backfill this header
+/// once their body has been written into transport-owned storage.
+#[inline]
+pub fn encode_header(body_len: usize) -> CodecResult<[u8; HEADER_LEN]> {
+    check_size(body_len)?;
+    let body_len = u32::try_from(body_len)?;
+    Ok(((u64::from(MAGIC_NUM) << 32) | u64::from(body_len)).to_be_bytes())
+}
 
 /// Encodes directly into the final allocation, including both length prefixes.
-/// The same size limit applies to both stream senders and receivers.
+/// The same size limit applies to all framed senders and receivers.
+///
+/// TCP and HTTP/2 streams carry frames back to back; each WebSocket binary
+/// message carries exactly one frame. One RDMA SEND can carry multiple frames.
 pub fn encode<P: Serialize>(meta: &MsgMeta, payload: &P) -> CodecResult<Bytes> {
     let mut frame = StreamFrame(BytesMut::with_capacity(512));
     meta.serialize_to(payload, &mut frame)?;
@@ -33,17 +47,15 @@ impl SendMsg for StreamFrame {
     #[inline]
     fn prepare(&mut self) -> CodecResult<()> {
         self.0.clear();
-        self.0.extend_from_slice(&MAGIC_NUM.to_be_bytes());
-        self.0.extend_from_slice(&0u32.to_be_bytes());
+        self.0.extend_from_slice(&[0; HEADER_LEN]);
         Ok(())
     }
 
     #[inline]
     fn finish(&mut self, meta_offset: usize, payload_offset: usize) -> CodecResult<()> {
         self.0.finish(meta_offset, payload_offset)?;
-        check_size(self.0.len() - HEADER_LEN)?;
-        let body_len = u32::try_from(self.0.len() - HEADER_LEN)?;
-        self.0[4..HEADER_LEN].copy_from_slice(&body_len.to_be_bytes());
+        let header = encode_header(self.0.len() - HEADER_LEN)?;
+        self.0[..HEADER_LEN].copy_from_slice(&header);
         Ok(())
     }
 
@@ -99,6 +111,43 @@ pub fn parse_message(buffer: &mut BytesMut) -> CodecResult<Option<Bytes>> {
         buffer.advance(HEADER_LEN);
         Ok(Some(buffer.split_to(len).into()))
     }
+}
+
+/// Decodes all complete frames in a bounded transport message, such as an
+/// RDMA SEND. Each callback receives a zero-copy body that owns shared input
+/// storage and remains valid after `frames` is dropped.
+///
+/// Unlike the incremental parsers, this rejects an incomplete header or body.
+/// Callbacks for earlier complete frames may already have run when a later
+/// frame fails validation. Callback errors are returned unchanged and stop
+/// subsequent decoding; framing errors convert through `From<CodecError>`.
+#[inline]
+pub fn decode_frames<E: From<CodecError>>(
+    frames: &Bytes,
+    mut f: impl FnMut(Bytes) -> Result<(), E>,
+) -> Result<(), E> {
+    let mut offset = 0;
+    while offset < frames.len() {
+        let body_len = parse_header(&frames[offset..])?.ok_or_else(|| {
+            CodecError::new(
+                CodecErrorKind::InvalidFrame,
+                format!("truncated frame header at {offset}"),
+            )
+        })?;
+        let body_start = offset + HEADER_LEN;
+        let end = body_start
+            .checked_add(body_len)
+            .filter(|&end| end <= frames.len())
+            .ok_or_else(|| {
+                CodecError::new(
+                    CodecErrorKind::InvalidFrame,
+                    format!("truncated frame body ({body_len}B) at {body_start}"),
+                )
+            })?;
+        f(frames.slice(body_start..end))?;
+        offset = end;
+    }
+    Ok(())
 }
 
 /// Decodes owned chunks without copying frames contained in a single chunk.
@@ -189,6 +238,18 @@ mod tests {
             assert_eq!(frame.0.as_ptr(), pointer);
             assert_eq!(frame.0.capacity(), capacity);
         }
+    }
+
+    #[test]
+    fn encode_and_decode_share_the_frame_size_limit() {
+        // The exclusive limit rejects the first body length that would make a
+        // complete frame reach MAX_MSG_SIZE; the decoder tests pin the same
+        // boundary from the receive side.
+        assert!(check_size(MAX_MSG_SIZE - HEADER_LEN - 1).is_ok());
+        assert_eq!(
+            check_size(MAX_MSG_SIZE - HEADER_LEN).unwrap_err().kind,
+            CodecErrorKind::InvalidFrame
+        );
     }
 
     #[test]

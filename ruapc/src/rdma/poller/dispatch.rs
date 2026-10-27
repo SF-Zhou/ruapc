@@ -6,13 +6,10 @@ use std::sync::{Arc, atomic::Ordering};
 
 use bytes::Bytes;
 
-use crate::{
-    Message, Socket, State,
-    rdma::frame::{Frame, decode_frames},
-};
+use crate::{Message, Socket, State, rdma::frame::decode_frames};
 
 /// One received buffer awaiting dispatch: the connection's shared state,
-/// the socket it arrived on and the raw `[4B len][message]` frames.
+/// the socket it arrived on and the shared `frame.rs` frames.
 type DispatchItem = (Arc<State>, Socket, Bytes);
 
 /// Received buffers dispatched together to amortize queueing and worker wakeups.
@@ -151,15 +148,11 @@ fn run_dispatch_batch(batch: DispatchBatch) {
 /// Handles one dispatched buffer: frame walk + parse + routing to the
 /// router (requests) or waiter (responses) on a runtime worker thread.
 fn dispatch_item((state, socket, frames): DispatchItem) {
-    let result = decode_frames(&frames, |frame| match frame {
-        Frame::Message(bytes) => state.handle_recv(&socket, Message::parse(bytes)?),
-        Frame::Control(control) => match &socket {
-            Socket::RDMA(rdma) => rdma.handle_control(control, &state),
-            _ => unreachable!("RDMA dispatcher receives only RDMA sockets"),
-        },
+    let result = decode_frames(&frames, |bytes| {
+        state.handle_recv(&socket, Message::parse(bytes)?)
     });
     if let Err(error) = result {
-        tracing::warn!(%error, "invalid RDMA message or control frame");
+        tracing::warn!(%error, "invalid RDMA message frame");
         if let Socket::RDMA(socket) = socket {
             socket.set_error();
         }

@@ -50,7 +50,7 @@ application services use the same dispatch and metrics; see
 [built-in services](docs/builtin-services.md#discovery-and-dispatch) for their
 wire names, HTTP discovery and handler prerequisites.
 
-`ruapc-wire` owns `MsgMeta`, `MsgFlags`, direct serialization, stream and RDMA
+`ruapc-wire` owns `MsgMeta`, `MsgFlags`, direct serialization, shared transport
 frame codecs, and `CodecError`. It accepts payload byte slices and reports
 encoding, decoding, framing and argument failures without depending on the
 RPC runtime or verbs. The core owns `Message` / `Payload` storage and the
@@ -91,9 +91,11 @@ See [endpoint identity](docs/endpoints.md) for normalization and caller obligati
 5. Only failures before transport acceptance can retry. After acceptance the
    client waits for one result; ambiguous timeouts and connection loss do not
    trigger automatic retries.
-6. Server dispatch reserves capacity atomically and drops expired requests
-   before execution. Generated handlers contain panics. Running handlers are
-   not cancelled by deadline expiry; they can poll `Context::is_expired()`.
+6. Server dispatch reserves capacity atomically from the shared
+   `max_inflight_requests` cap for built-in and application methods, and drops
+   expired requests before execution. Generated handlers contain panics.
+   Running handlers are not cancelled by deadline expiry; they can poll
+   `Context::is_expired()`.
 7. A response, connection failure, cancellation guard or expiry sweep removes
    the waiter. Response expiry uses a shared 50 ms sweep, subject to scheduler
    delay. Unary HTTP allocates its response waiter after receiving the complete
@@ -124,30 +126,30 @@ the payload view without copying.
 
 | Carrier | Frame |
 |---|---|
-| TCP, HTTP/2 stream | `[RUA!: 4B][body_len: 4B][meta_len: 4B][meta][payload]` |
-| WebSocket binary message | `[meta_len: 4B][meta][payload]` |
-| RDMA inline message | `[frame_len: 4B][meta_len: 4B][meta][payload]` |
-| RDMA large-payload control | `[0: 4B][control_len: 4B][kind: 1B][named MessagePack body]` |
+| TCP, HTTP/2 stream, RDMA | `[RUA!: 4B][body_len: 4B][meta_len: 4B][meta][payload]` |
+| WebSocket binary message | one shared frame per binary message |
 | Unary HTTP | JSON bodies; routing comes from the URL |
 
-Lengths are big-endian `u32`s. `body_len` and `frame_len` count the `meta_len`
-prefix, metadata and payload. `control_len` counts the kind byte and control
-body; kinds are offer (1), finish (2) and finish reply (3).
+Lengths are big-endian `u32`s. `body_len` counts the `meta_len` prefix,
+metadata and payload.
 
-TCP and HTTP/2 share header validation and size limits in
-[`ruapc-wire/src/frame.rs`](ruapc-wire/src/frame.rs).
+TCP, HTTP/2, WebSocket and RDMA share header validation and size limits in
+[`ruapc-wire/src/frame.rs`](ruapc-wire/src/frame.rs); a WebSocket binary message
+carries exactly one stream frame, so every stream carrier rejects oversized
+messages before sending. Message metadata and MessagePack payloads
+are decoded with the shared `MAX_DECODE_DEPTH` nesting limit; JSON
+payloads are bounded internally by `serde_json` at the same depth.
 HTTP/2 decodes complete frames directly from incoming byte chunks; only frames
 that span chunks need a lazily allocated assembly buffer. TCP keeps its
 incremental receive buffer. Both paths split complete bodies without copying.
 HTTP routing and unary JSON responses live in `sockets/http/service.rs`, while
 `http_socket_pool.rs` owns connection acquisition and streaming lifecycles.
-RDMA framing lives in [`ruapc-wire/src/rdma.rs`](ruapc-wire/src/rdma.rs), outside
-the poll loop. The core's `rdma/frame.rs` re-exports the codecs for transport use.
-Inline and control frames can share a receive buffer; the whole SEND consumes
-one receive credit. Decoded controls provide no completion authority; the core
-checks connection identity, negotiated capabilities and transfer state.
-Large payloads use the [private offer/finish controls](docs/builtin-services.md#private-rdma-payload-controls),
-with separate [storage and queue budgets](docs/rdma-capacity.md#large-payload-admission-and-cleanup).
+RDMA dispatch workers decode complete, concatenated frames outside the poll
+loop using the same `frame` module. The whole SEND consumes one receive credit.
+Large payloads use the [offer and finish RPCs](docs/builtin-services.md#payload-transfer),
+with per-connection [storage and transfer budgets](docs/rdma-capacity.md#large-payload-admission-and-cleanup).
+The core checks connection identity, negotiated limits and transfer state;
+decoding an RPC does not provide local DMA completion authority.
 
 ## Remote memory
 
