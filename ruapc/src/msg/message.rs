@@ -1,7 +1,7 @@
 //! Decoding a message body without copying its payload.
 
 use super::MsgMeta;
-use crate::{Error, ErrorKind, Payload, Result};
+use crate::{Payload, Result};
 
 /// RPC message containing metadata and payload.
 ///
@@ -33,6 +33,7 @@ impl Message {
     /// let payload = Payload::default();
     /// let msg = Message::new(meta, payload);
     /// ```
+    #[inline]
     pub fn new(meta: MsgMeta, payload: Payload) -> Self {
         Self { meta, payload }
     }
@@ -65,40 +66,9 @@ impl Message {
     /// let msg = Message::parse(raw_bytes).unwrap();
     /// ```
     pub fn parse(payload: impl Into<Payload>) -> Result<Self> {
-        const S: usize = std::mem::size_of::<u32>();
         let mut payload: Payload = payload.into();
-
-        let len = payload.len();
-        let meta_len = if let Some(b) = payload.get(..S).and_then(|b| b.try_into().ok()) {
-            u32::from_be_bytes(b) as usize
-        } else {
-            return Err(Error::new(
-                ErrorKind::DeserializeFailed,
-                format!("invalid msg length: {len}"),
-            ));
-        };
-
-        if meta_len == 0 {
-            return Err(Error::new(
-                ErrorKind::DeserializeFailed,
-                format!("invalid meta length: {meta_len}"),
-            ));
-        }
-
-        if meta_len > len - S {
-            return Err(Error::new(
-                ErrorKind::DeserializeFailed,
-                format!("invalid meta length: {meta_len}, msg length: {len}"),
-            ));
-        }
-
-        let offset = S + meta_len;
-        let meta = MsgMeta::decode(&payload[S..offset])?;
+        let (meta, offset) = ruapc_wire::parse_body(payload.as_slice())?;
         payload.advance(offset);
         Ok(Message { meta, payload })
     }
 }
-
-#[cfg(test)]
-#[path = "tests.rs"]
-mod tests;

@@ -1,13 +1,8 @@
 mod message;
 pub use message::Message;
 
-mod meta;
-pub use meta::{MsgFlags, MsgMeta};
-
-mod encode;
-pub(crate) use encode::SendMsg;
-
-pub(crate) mod frame;
-
 mod payload;
 pub use payload::Payload;
+
+pub use ruapc_wire::{MsgFlags, MsgMeta};
+pub(crate) use ruapc_wire::{SendMsg, frame};

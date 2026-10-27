@@ -43,9 +43,9 @@ fn controls() -> [ControlFrame; 4] {
     ]
 }
 
-fn collect(bytes: &Bytes) -> Result<Vec<Frame>> {
+fn collect(bytes: &Bytes) -> CodecResult<Vec<Frame>> {
     let mut frames = Vec::new();
-    decode_frames(bytes, |frame| {
+    decode_frames::<CodecError>(bytes, |frame| {
         frames.push(frame);
         Ok(())
     })?;
@@ -125,7 +125,7 @@ fn complete_frame_before_a_truncated_header_is_dispatched() {
     let bytes = Bytes::from_static(&[0, 0, 0, 1, b'x', 0, 0]);
     let mut frames = Vec::new();
     assert!(
-        decode_frames(&bytes, |frame| {
+        decode_frames::<CodecError>(&bytes, |frame| {
             frames.push(frame);
             Ok(())
         })
@@ -141,7 +141,7 @@ fn every_truncated_control_is_rejected_without_dispatch() {
         for end in 1..bytes.len() {
             let mut dispatched = false;
             assert!(
-                decode_frames(&bytes.slice(..end), |_| {
+                decode_frames::<CodecError>(&bytes.slice(..end), |_| {
                     dispatched = true;
                     Ok(())
                 })
@@ -215,9 +215,9 @@ fn callback_failure_stops_before_next_frame() {
     let finish = encode_control(&ControlFrame::Finish { transfer_id: 42 }).unwrap();
     let mut bytes = finish.to_vec();
     bytes.extend_from_slice(&finish);
-    let expected = Error::kind(ErrorKind::ConnectionClosed);
+    let expected = CodecError::kind(CodecErrorKind::InvalidArgument);
     let mut calls = 0;
-    let error = decode_frames(&bytes.into(), |_| {
+    let error = decode_frames::<CodecError>(&bytes.into(), |_| {
         calls += 1;
         Err(expected.clone())
     })

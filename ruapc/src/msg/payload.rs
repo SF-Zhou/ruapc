@@ -1,7 +1,7 @@
 use bytes::{Buf, Bytes, BytesMut};
 use serde::Deserialize;
 
-use crate::{MsgFlags, MsgMeta, Result};
+use crate::{MsgMeta, Result};
 
 /// Message payload supporting different memory backends.
 ///
@@ -35,6 +35,7 @@ impl Payload {
     /// let payload = Payload::from(Bytes::from("hello"));
     /// assert_eq!(payload.len(), 5);
     /// ```
+    #[inline]
     pub fn len(&self) -> usize {
         match self {
             Payload::Empty => 0,
@@ -53,6 +54,7 @@ impl Payload {
     /// let payload = Payload::default();
     /// assert!(payload.is_empty());
     /// ```
+    #[inline]
     pub fn is_empty(&self) -> bool {
         match self {
             Payload::Empty => true,
@@ -72,6 +74,7 @@ impl Payload {
     /// let payload = Payload::from(Bytes::from("hello"));
     /// assert_eq!(payload.as_slice(), b"hello");
     /// ```
+    #[inline]
     pub fn as_slice(&self) -> &[u8] {
         match self {
             Payload::Empty => &[],
@@ -88,6 +91,7 @@ impl Payload {
     /// # Arguments
     ///
     /// * `offset` - Number of bytes to advance
+    #[inline]
     pub fn advance(&mut self, offset: usize) {
         match self {
             Payload::Empty => {}
@@ -114,38 +118,35 @@ impl Payload {
     ///
     /// Returns an error if deserialization fails.
     pub fn deserialize<P: for<'c> Deserialize<'c>>(&self, meta: &MsgMeta) -> Result<P> {
-        if self.is_empty() {
-            // for an empty payload, treat it as a null value, which allows using curl to send body-less requests.
-            Ok(serde_json::from_value(serde_json::Value::Null)?)
-        } else if meta.flags.contains(MsgFlags::UseMessagePack) {
-            Ok(rmp_serde::from_slice(self)?)
-        } else {
-            Ok(serde_json::from_slice(self)?)
-        }
+        ruapc_wire::deserialize_payload(self.as_slice(), meta.flags).map_err(Into::into)
     }
 }
 
 impl std::ops::Deref for Payload {
     type Target = [u8];
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         self.as_slice()
     }
 }
 
 impl From<Bytes> for Payload {
+    #[inline]
     fn from(value: Bytes) -> Self {
         Payload::Normal(value)
     }
 }
 
 impl From<BytesMut> for Payload {
+    #[inline]
     fn from(value: BytesMut) -> Self {
         Payload::Normal(value.into())
     }
 }
 
 impl From<Payload> for Bytes {
+    #[inline]
     fn from(value: Payload) -> Self {
         match value {
             Payload::Empty => Bytes::new(),
@@ -158,6 +159,7 @@ impl From<Payload> for Bytes {
 
 #[cfg(feature = "rdma")]
 impl From<crate::Buffer> for Payload {
+    #[inline]
     fn from(value: crate::Buffer) -> Self {
         Payload::RDMA(value, 0)
     }
@@ -166,6 +168,7 @@ impl From<crate::Buffer> for Payload {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MsgFlags;
     use bytes::Bytes;
 
     fn json_meta() -> MsgMeta {

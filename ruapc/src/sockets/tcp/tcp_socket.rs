@@ -58,7 +58,7 @@ impl SocketTrait for TcpSocket {
     ) -> Result<()> {
         self.inner
             .send(meta, &state.waiter, "TCP", |meta| {
-                crate::msg::frame::encode(meta, payload)
+                crate::msg::frame::encode(meta, payload).map_err(Into::into)
             })
             .await
     }

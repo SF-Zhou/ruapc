@@ -205,7 +205,7 @@ mod tests {
         {
             let sending = connection.send(&mut meta, &waiter, "test", |meta| {
                 serializations.set(serializations.get() + 1);
-                crate::msg::frame::encode(meta, &"payload")
+                crate::msg::frame::encode(meta, &"payload").map_err(Into::into)
             });
             tokio::pin!(sending);
             assert!(futures_util::poll!(sending.as_mut()).is_pending());
@@ -248,7 +248,7 @@ mod tests {
         let (connection, mut receiver) = full_queue();
         {
             let sending = connection.send(&mut meta, &waiter, "test", |meta| {
-                crate::msg::frame::encode(meta, &())
+                crate::msg::frame::encode(meta, &()).map_err(Into::into)
             });
             tokio::pin!(sending);
             assert!(futures_util::poll!(sending.as_mut()).is_pending());

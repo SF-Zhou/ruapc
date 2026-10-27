@@ -11,8 +11,8 @@ Use [DESIGN.md](DESIGN.md) for crate/module ownership and
 - Use enum dispatch for transport selection (`Socket`, `SocketPool`,
   `HttpSocket`) and statically dispatched futures. Application service closures
   and device registration are explicit trait-object extension boundaries.
-- `ruapc` forbids unsafe code. Allocation, registration and verbs operations
-  belong in `ruapc-bufpool` / `ruapc-rdma`. Safe APIs must enforce memory
+- `ruapc` and `ruapc-wire` forbid unsafe code. Allocation, registration and verbs
+  operations belong in `ruapc-bufpool` / `ruapc-rdma`. Safe APIs must enforce memory
   ownership and completion evidence, not accept caller-supplied lifetime promises.
 - `DeviceSet` owns TCP at index zero and assigns additional device indices.
   Safe `Device` wrappers expose an associated `MemoryRegistrar`; custom
@@ -20,9 +20,13 @@ Use [DESIGN.md](DESIGN.md) for crate/module ownership and
 - Keep metadata in named-field MessagePack. Add compatible fields with
   `#[serde(default)]` and `skip_serializing_if`. `UseMessagePack` selects the
   payload decoder only; default clients use MessagePack, otherwise JSON.
-- TCP and HTTP/2 streams share framing in `msg/frame.rs`; TCP/WS/HTTP stream
-  sends share connection binding and queue preparation in `sockets/channel.rs`.
-  RDMA framing belongs in `rdma/frame.rs`, outside the poll loop.
+- Message metadata, payload codecs, direct serialization and framing belong in
+  `ruapc-wire`, which reports codec errors and does not depend on verbs. Keep
+  RPC error types and owned `Message` / `Payload` APIs in `ruapc`, converting
+  codec failures at that boundary. TCP and HTTP/2 share the wire `frame` module;
+  pure RDMA framing belongs in its `rdma` module, outside the poll loop. Keep
+  connection binding and queue preparation in `ruapc/src/sockets/channel.rs`,
+  and transfer ownership and completion validation in the runtime.
 - Each connection has a process-unique `conn_id`. Closing it eagerly fails its
   waiters; eviction must check identity so it cannot remove a replacement.
 - An `Endpoint` is one transport plus a nonempty normalized group of equivalent
@@ -84,7 +88,8 @@ Follow [CONTRIBUTING.md](CONTRIBUTING.md) for prerequisites, workspace checks,
 feature/rustdoc checks and Soft-RoCE setup. Core tests and RPC benchmarks enable
 RDMA through a self dev-dependency even though downstream RDMA is opt-in.
 Always run formatting and Clippy before committing. PRs target `main`; all CI
-checks must pass before merging. Release order is bufpool, macro, schema, RDMA, core.
+checks must pass before merging. Release order is bufpool, macro, schema, RDMA,
+wire, core.
 
 Follow the [documentation ownership rules](docs/README.md#maintaining-the-docs):
 keep each contract in its owning guide, link to it from summaries, and keep

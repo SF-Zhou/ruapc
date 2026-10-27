@@ -168,6 +168,8 @@ impl GrowingMessage<'_> {
 }
 
 impl SendMsg for GrowingMessage<'_> {
+    type Error = Error;
+
     fn size(&self) -> usize {
         self.encoded.buffer.len()
     }
@@ -179,8 +181,7 @@ impl SendMsg for GrowingMessage<'_> {
     }
 
     fn finish(&mut self, meta_offset: usize, payload_offset: usize) -> Result<()> {
-        let meta_len = u32::try_from(payload_offset - meta_offset - 4)?;
-        self.encoded.buffer[meta_offset..meta_offset + 4].copy_from_slice(&meta_len.to_be_bytes());
+        self.encoded.buffer.finish(meta_offset, payload_offset)?;
         let frame_len = u32::try_from(self.encoded.buffer.len() - 4)?;
         self.encoded.buffer[..4].copy_from_slice(&frame_len.to_be_bytes());
         self.encoded.payload_offset = payload_offset;

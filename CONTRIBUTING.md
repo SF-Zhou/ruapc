@@ -7,7 +7,7 @@ Read [DESIGN.md](DESIGN.md) for module boundaries and use the
 
 | Work | Requirements |
 |---|---|
-| Standalone schema tests | Stable Rust; no RDMA libraries or device required |
+| Standalone schema and wire tests | Stable Rust; no RDMA libraries or device required |
 | Downstream TCP/WS/HTTP application | Stable Rust; RDMA disabled by default |
 | Workspace builds, tests and RPC benchmarks | Stable Rust, C compiler, `pkg-config`, libclang and libibverbs development files (`libibverbs-dev` on Debian/Ubuntu) |
 | Tests that open RDMA devices | Usable RDMA NIC or Soft-RoCE and sufficient locked-memory allowance |
@@ -18,15 +18,22 @@ requires libibverbs headers and a runtime library from rdma-core v32 or later.
 
 The core crate's self dev-dependency enables RDMA for its tests and benchmarks.
 Selecting a TCP test does not remove that build dependency. Stream-only demo
-tests and allocator/macro/schema tests can run without an RDMA device:
+tests and allocator, macro, schema and wire tests can run without an
+RDMA device:
 
 ```bash
 cargo test -p ruapc-bufpool -p ruapc-macro -p ruapc-schema
+cargo test -p ruapc-wire
 cargo test -p ruapc-demo --no-default-features
 ```
 
 To check schema generation, OpenAPI projection and reflection without building
 the RPC runtime, run `cargo test -p ruapc-schema`.
+
+`cargo test -p ruapc-wire --all-features` covers message codecs, direct buffer
+serialization and pure RDMA framing without the RDMA build prerequisites.
+Registered-buffer payload ownership and typed RDMA error conversion belong
+to `ruapc` and are covered by its tests.
 
 ## Workflow
 
@@ -80,8 +87,9 @@ create one. With physical RDMA hardware, omit that environment variable.
 - Documentation changes belong in the [owning guide](docs/README.md#maintaining-the-docs).
   Keep examples, links and public API descriptions consistent with the code.
 
-Release tags publish bufpool, macro, schema, RDMA and core in dependency order through
-[the release workflow](.github/workflows/release.yml). The demo is not published.
+Release tags publish bufpool, macro, schema, RDMA, wire and core in dependency
+order through [the release workflow](.github/workflows/release.yml). The demo is
+not published.
 
 <a id="license"></a>
 

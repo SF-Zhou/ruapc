@@ -133,7 +133,7 @@ impl SocketTrait for HttpSocket {
                 stream_socket
                     .inner
                     .send(meta, &state.waiter, "HTTP", |meta| {
-                        crate::msg::frame::encode(meta, payload)
+                        crate::msg::frame::encode(meta, payload).map_err(Into::into)
                     })
                     .await
             }

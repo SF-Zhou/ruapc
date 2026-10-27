@@ -3,16 +3,18 @@
 use bytes::{Buf, Bytes, BytesMut};
 
 use super::SendMsg;
-use crate::{Error, ErrorKind, MsgMeta, Result};
+use crate::{CodecError, CodecErrorKind, CodecResult, MsgMeta};
 use serde::Serialize;
 
-pub(crate) const MAGIC_NUM: u32 = u32::from_be_bytes(*b"RUA!");
-pub(crate) const MAX_MSG_SIZE: usize = 64 << 20;
+/// Magic prefix shared by TCP and HTTP/2 stream frames.
+pub const MAGIC_NUM: u32 = u32::from_be_bytes(*b"RUA!");
+/// Exclusive upper bound on the complete stream frame size, in bytes.
+pub const MAX_MSG_SIZE: usize = 64 << 20;
 const HEADER_LEN: usize = 8;
 
 /// Encodes directly into the final allocation, including both length prefixes.
 /// The same size limit applies to both stream senders and receivers.
-pub(crate) fn encode<P: Serialize>(meta: &MsgMeta, payload: &P) -> Result<Bytes> {
+pub fn encode<P: Serialize>(meta: &MsgMeta, payload: &P) -> CodecResult<Bytes> {
     let mut frame = StreamFrame(BytesMut::with_capacity(512));
     meta.serialize_to(payload, &mut frame)?;
     Ok(frame.0.freeze())
@@ -21,17 +23,23 @@ pub(crate) fn encode<P: Serialize>(meta: &MsgMeta, payload: &P) -> Result<Bytes>
 struct StreamFrame(BytesMut);
 
 impl SendMsg for StreamFrame {
+    type Error = CodecError;
+
+    #[inline]
     fn size(&self) -> usize {
         self.0.len()
     }
 
-    fn prepare(&mut self) -> Result<()> {
+    #[inline]
+    fn prepare(&mut self) -> CodecResult<()> {
+        self.0.clear();
         self.0.extend_from_slice(&MAGIC_NUM.to_be_bytes());
         self.0.extend_from_slice(&0u32.to_be_bytes());
         Ok(())
     }
 
-    fn finish(&mut self, meta_offset: usize, payload_offset: usize) -> Result<()> {
+    #[inline]
+    fn finish(&mut self, meta_offset: usize, payload_offset: usize) -> CodecResult<()> {
         self.0.finish(meta_offset, payload_offset)?;
         check_size(self.0.len() - HEADER_LEN)?;
         let body_len = u32::try_from(self.0.len() - HEADER_LEN)?;
@@ -39,15 +47,17 @@ impl SendMsg for StreamFrame {
         Ok(())
     }
 
+    #[inline]
     fn writer(&mut self) -> impl std::io::Write {
         self.0.writer()
     }
 }
 
-fn check_size(body_len: usize) -> Result<()> {
+#[inline]
+fn check_size(body_len: usize) -> CodecResult<()> {
     if body_len >= MAX_MSG_SIZE - HEADER_LEN {
-        return Err(Error::new(
-            ErrorKind::TcpParseMsgFailed,
+        return Err(CodecError::new(
+            CodecErrorKind::InvalidFrame,
             format!("msg is too long: {body_len}"),
         ));
     }
@@ -55,16 +65,16 @@ fn check_size(body_len: usize) -> Result<()> {
 }
 
 // Keep the successful header path in its callers, including the TCP parser;
-// outlining this Result would add a call and obscure the checked header length.
+// outlining this result would add a call and obscure the checked header length.
 #[inline]
-fn parse_header(buffer: &[u8]) -> Result<Option<usize>> {
+fn parse_header(buffer: &[u8]) -> CodecResult<Option<usize>> {
     if buffer.len() < HEADER_LEN {
         return Ok(None);
     }
     let header = u64::from_be_bytes(buffer[..HEADER_LEN].try_into().unwrap());
     if (header >> 32) as u32 != MAGIC_NUM {
-        return Err(Error::new(
-            ErrorKind::TcpParseMsgFailed,
+        return Err(CodecError::new(
+            CodecErrorKind::InvalidFrame,
             format!("invalid header: {header:08X}"),
         ));
     }
@@ -78,7 +88,8 @@ fn parse_header(buffer: &[u8]) -> Result<Option<usize>> {
 ///
 /// Wire format: `[4B magic][4B len][len bytes body]`.
 /// Returns `Ok(None)` if the buffer doesn't contain a complete message yet.
-pub(crate) fn parse_message(buffer: &mut BytesMut) -> Result<Option<Bytes>> {
+#[inline]
+pub fn parse_message(buffer: &mut BytesMut) -> CodecResult<Option<Bytes>> {
     let Some(len) = parse_header(buffer)? else {
         return Ok(None);
     };
@@ -93,14 +104,15 @@ pub(crate) fn parse_message(buffer: &mut BytesMut) -> Result<Option<Bytes>> {
 /// Decodes owned chunks without copying frames contained in a single chunk.
 /// Only an incomplete frame is buffered; allocation follows received bytes.
 #[derive(Default)]
-pub(crate) struct FrameDecoder {
+pub struct FrameDecoder {
     partial: BytesMut,
 }
 
 impl FrameDecoder {
     /// Consumes up to one frame, leaving any following frames in `input`.
     /// `Ok(None)` means all input was consumed into an incomplete frame.
-    pub(crate) fn decode(&mut self, input: &mut Bytes) -> Result<Option<Bytes>> {
+    #[inline]
+    pub fn decode(&mut self, input: &mut Bytes) -> CodecResult<Option<Bytes>> {
         if self.partial.is_empty() {
             if let Some(len) = parse_header(input)?
                 && input.len() >= HEADER_LEN + len
@@ -150,6 +162,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reused_stream_frame_replaces_header_body_and_old_tail() {
+        for flags in [
+            crate::MsgFlags::IsReq,
+            crate::MsgFlags::IsReq | crate::MsgFlags::UseMessagePack,
+        ] {
+            let mut frame = StreamFrame(BytesMut::with_capacity(8192));
+            let pointer = frame.0.as_ptr();
+            let capacity = frame.0.capacity();
+            let mut meta = MsgMeta {
+                flags,
+                method: "Echo/first".into(),
+                msgid: 1,
+                ..Default::default()
+            };
+            meta.serialize_to(&"x".repeat(4096), &mut frame).unwrap();
+            let previous_len = frame.0.len();
+
+            meta.method = "Echo/second".into();
+            meta.msgid = 2;
+            meta.serialize_to(&"new payload", &mut frame).unwrap();
+
+            assert!(frame.0.len() < previous_len);
+            assert_eq!(
+                frame.0.as_ref(),
+                encode(&meta, &"new payload").unwrap().as_ref()
+            );
+            assert_eq!(frame.0.as_ptr(), pointer);
+            assert_eq!(frame.0.capacity(), capacity);
+        }
+    }
+
+    #[test]
     fn encoded_frames_survive_every_split_and_concatenation() {
         for flags in [
             crate::MsgFlags::IsReq,
@@ -167,14 +211,11 @@ mod tests {
                 received.extend_from_slice(&encoded[split..]);
                 received.extend_from_slice(&encoded);
                 for _ in 0..2 {
-                    let message =
-                        crate::Message::parse(parse_message(&mut received).unwrap().unwrap())
-                            .unwrap();
-                    assert_eq!(message.meta, meta);
+                    let body = parse_message(&mut received).unwrap().unwrap();
+                    let (decoded, offset) = crate::parse_body(&body).unwrap();
+                    assert_eq!(decoded, meta);
                     assert_eq!(
-                        message
-                            .payload
-                            .deserialize::<String>(&message.meta)
+                        crate::deserialize_payload::<String>(&body[offset..], decoded.flags)
                             .unwrap(),
                         "hello"
                     );
@@ -230,12 +271,10 @@ mod tests {
                         // complete frame available without copying its bytes.
                         assert_eq!(body.as_ptr(), next_body.as_ptr());
                     }
-                    let message = crate::Message::parse(body).unwrap();
-                    assert_eq!(message.meta, meta);
+                    let (decoded, offset) = crate::parse_body(&body).unwrap();
+                    assert_eq!(decoded, meta);
                     assert_eq!(
-                        message
-                            .payload
-                            .deserialize::<String>(&message.meta)
+                        crate::deserialize_payload::<String>(&body[offset..], decoded.flags)
                             .unwrap(),
                         "hello"
                     );
@@ -326,7 +365,7 @@ mod tests {
             let mut buffer = BytesMut::from(header.as_ref());
             assert_eq!(
                 parse_message(&mut buffer).unwrap_err().kind,
-                ErrorKind::TcpParseMsgFailed
+                CodecErrorKind::InvalidFrame
             );
             for split in 0..HEADER_LEN {
                 let mut decoder = FrameDecoder::default();
@@ -335,7 +374,7 @@ mod tests {
                 let mut rest = header.slice(split..);
                 assert_eq!(
                     decoder.decode(&mut rest).unwrap_err().kind,
-                    ErrorKind::TcpParseMsgFailed
+                    CodecErrorKind::InvalidFrame
                 );
             }
         }
@@ -387,7 +426,7 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err().kind,
-            crate::error::ErrorKind::TcpParseMsgFailed
+            crate::error::CodecErrorKind::InvalidFrame
         ));
     }
 

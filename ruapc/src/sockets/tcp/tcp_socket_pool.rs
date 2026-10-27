@@ -228,7 +228,7 @@ impl TcpSocketPool {
     }
 
     fn parse_message(buffer: &mut BytesMut) -> Result<Option<Bytes>> {
-        crate::msg::frame::parse_message(buffer)
+        crate::msg::frame::parse_message(buffer).map_err(Into::into)
     }
 
     async fn start_recv_loop(

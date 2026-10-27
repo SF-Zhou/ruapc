@@ -7,6 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 ## [Unreleased]
 
 ### Added
+- `ruapc-wire` provides message metadata, payload codecs, direct serialization,
+  and stream and RDMA framing independently of the RPC runtime and verbs.
+  It reports `CodecError`; `ruapc` retains its owned message/payload APIs and
+  RPC error types, mapping codec failures to the existing error categories.
+  Storage hooks and frame callbacks preserve caller errors through static
+  generic dispatch. Pure RDMA frame codecs need no RDMA libraries.
 - `ruapc-schema` provides schema registration, OpenAPI projection and reflection
   data independently of the RPC runtime. Existing `ruapc::MethodSchema` and
   `ruapc::services` data-type paths remain available through re-exports.
@@ -15,6 +21,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   APIs.
 
 ### Changed
+- `ruapc-wire` serialization into `BytesMut` now starts a fresh message while
+  retaining capacity, matching the `Buffer` implementation. It no longer appends
+  a message after existing contents; transport prefixes belong in a custom
+  `SendMsg::prepare` hook. The built-in length backfill hooks also reject empty
+  metadata spans.
 - The moved schema and reflection types now have `JsonSchema::schema_id()`
   values under `ruapc_schema`; their schema names and reflection wire format
   are unchanged.
