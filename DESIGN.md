@@ -112,8 +112,12 @@ Lengths are big-endian `u32`s. `body_len` and `frame_len` count the `meta_len`
 prefix, metadata and payload. `control_len` counts the kind byte and control
 body; kinds are offer (1), finish (2) and finish reply (3).
 
-TCP and HTTP/2 share the size limit and incremental parser in `msg/frame.rs`.
-Incomplete frames remain buffered; complete bodies are split without copying.
+TCP and HTTP/2 share header validation and size limits in `msg/frame.rs`.
+HTTP/2 decodes complete frames directly from incoming byte chunks; only frames
+that span chunks need a lazily allocated assembly buffer. TCP keeps its
+incremental receive buffer. Both paths split complete bodies without copying.
+HTTP routing and unary JSON responses live in `sockets/http/service.rs`, while
+`http_socket_pool.rs` owns connection acquisition and streaming lifecycles.
 RDMA framing lives in `rdma/frame.rs`, outside the poll loop. Inline and control
 frames can share a receive buffer; the whole SEND consumes one receive credit.
 Large payloads use the [private offer/finish controls](docs/builtin-services.md#private-rdma-payload-controls),

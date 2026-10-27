@@ -447,9 +447,10 @@ async fn test_http_malformed_request_body() {
         .await
         .unwrap();
 
-    // The server should handle this gracefully, but the result may vary
-    // The main thing is that the server doesn't crash
-    assert!(response.status().as_u16() >= 200 && response.status().as_u16() < 600);
+    // Unary HTTP preserves the RPC Result envelope even for invalid JSON.
+    assert_eq!(response.status(), 200);
+    let result: ruapc::Result<String> = response.json().await.unwrap();
+    assert_eq!(result.unwrap_err().kind, ruapc::ErrorKind::SerdeJsonError);
 
     server.stop();
     server.join().await;
@@ -520,12 +521,10 @@ async fn test_http_method_variants() {
             .await
             .unwrap();
 
-        // Non-GET methods should return 404 for static resources or be processed differently
-        assert!(
-            response.status() == 404 || response.status().is_success(),
-            "Method {} failed with status: {}",
-            method_name,
-            response.status()
+        assert_eq!(
+            response.status(),
+            404,
+            "unexpected status for {method_name}"
         );
     }
 
