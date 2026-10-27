@@ -207,6 +207,8 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    use crate::test_utils::open_device;
+
     #[test]
     fn qpn_reuse_starts_above_both_directions_and_failed_posts() {
         let mut registry = IdentityRegistry::default();
@@ -465,7 +467,7 @@ mod tests {
 
     #[test]
     fn poisoned_send_transaction_preserves_watermark_on_drop() {
-        let dev = crate::test_utils::open_device();
+        let dev = open_device();
         let cq = CompletionQueue::create(dev.context(), 16, None).unwrap();
         let lease = cq.register_qp(42).unwrap();
         assert!(

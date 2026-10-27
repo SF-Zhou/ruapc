@@ -9,7 +9,10 @@ use super::{
     context::Context, device_list::DeviceList, memory_region::MemoryRegion,
     protection_domain::ProtectionDomain,
 };
-use crate::{DeviceInfo, Gid, Guid, Port, Result};
+use crate::{
+    DeviceInfo, Gid, Guid, Port, Result, ibv_access_flags, ibv_device, ibv_port_attr,
+    ibv_transport_type, ruapc_ibv_get_device_guid,
+};
 
 /// Lightweight RDMA device handle.
 ///
@@ -19,21 +22,21 @@ use crate::{DeviceInfo, Gid, Guid, Port, Result};
 /// The internal raw pointer is valid only while the originating
 /// [`DeviceList`] exists.
 pub struct Device {
-    ptr: *mut crate::ibv_device,
+    ptr: *mut ibv_device,
     name: String,
     guid: Guid,
-    transport_type: crate::ibv_transport_type,
+    transport_type: ibv_transport_type,
     ibdev_path: std::path::PathBuf,
 }
 
 impl Device {
-    pub(crate) fn from_ptr(ptr: *mut crate::ibv_device) -> Self {
+    pub(crate) fn from_ptr(ptr: *mut ibv_device) -> Self {
         let name = unsafe {
             CStr::from_ptr((*ptr).name.as_ptr())
                 .to_string_lossy()
                 .to_string()
         };
-        let guid = Guid::from_be(unsafe { crate::ruapc_ibv_get_device_guid(ptr) });
+        let guid = Guid::from_be(unsafe { ruapc_ibv_get_device_guid(ptr) });
         let transport_type = unsafe { (*ptr).transport_type };
         let ibdev_path = unsafe {
             Path::new(std::ffi::OsStr::from_bytes(
@@ -153,10 +156,10 @@ impl ActiveDevice {
     /// The returned [`MemoryRegion`] holds a clone of the `Arc`, so the
     /// memory stays alive until the MR is dropped and deregistered.
     pub fn register(&self, memory: &Arc<ruapc_bufpool::AlignedMemory>) -> Result<MemoryRegion> {
-        let access = crate::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0
-            | crate::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE.0
-            | crate::ibv_access_flags::IBV_ACCESS_REMOTE_READ.0
-            | crate::ibv_access_flags::IBV_ACCESS_RELAXED_ORDERING.0;
+        let access = ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0
+            | ibv_access_flags::IBV_ACCESS_REMOTE_WRITE.0
+            | ibv_access_flags::IBV_ACCESS_REMOTE_READ.0
+            | ibv_access_flags::IBV_ACCESS_RELAXED_ORDERING.0;
         MemoryRegion::register(&self.pd, memory, access as _)
     }
 
@@ -215,7 +218,7 @@ impl ActiveDevice {
         Ok(())
     }
 
-    fn collect_port_gids(&self, port_num: u8, port_attr: &crate::ibv_port_attr) -> Vec<Gid> {
+    fn collect_port_gids(&self, port_num: u8, port_attr: &ibv_port_attr) -> Vec<Gid> {
         // GID indices are exchanged as `u8` during connection negotiation, so
         // entries beyond index 255 are unusable and not collected.
         let gid_tbl_len = gid_table_len(port_attr).min(1 + u8::MAX as usize);
@@ -238,7 +241,7 @@ impl ActiveDevice {
 
 /// Buffer capacity for the device-wide table query. It must cover every slot
 /// the kernel may report, including indices the snapshot cannot expose.
-fn gid_table_len(port_attr: &crate::ibv_port_attr) -> usize {
+fn gid_table_len(port_attr: &ibv_port_attr) -> usize {
     port_attr.gid_tbl_len.max(0) as usize
 }
 

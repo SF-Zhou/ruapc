@@ -8,10 +8,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::rdma::test_utils::transport_endpoint as endpoint;
+use crate::rdma::test_utils::{small_rdma_config, transport_endpoint as endpoint};
 use crate::{
     Buffer, Client, Context, Error, ErrorKind, ListenMode, Result, Router, Server, Socket,
-    SocketPoolConfig, State, Transport, core::ContextEndpoint,
+    SocketPoolConfig, State, Transport, core::ContextEndpoint, http::HttpSocket, service,
 };
 
 const BYTES: usize = 64;
@@ -29,7 +29,7 @@ enum Operation {
     Write,
 }
 
-#[crate::service]
+#[service]
 trait TimeoutRpc {
     async fn ping(&self, ctx: &Context, req: &()) -> Result<u64>;
     async fn transfer(&self, ctx: &Context, operation: &Operation) -> Result<()>;
@@ -55,7 +55,7 @@ impl TimeoutRpc for Service {
         if self.transport == Transport::HTTP {
             assert!(matches!(
                 ctx.endpoint,
-                ContextEndpoint::Connected(Socket::HTTP(crate::http::HttpSocket::Stream(_)))
+                ContextEndpoint::Connected(Socket::HTTP(HttpSocket::Stream(_)))
             ));
         }
         let result = match operation {
@@ -104,7 +104,7 @@ struct Fixture {
 impl Fixture {
     async fn new(transport: Transport) -> Self {
         let config = if transport == Transport::RDMA {
-            let mut config = crate::rdma::test_utils::small_rdma_config();
+            let mut config = small_rdma_config();
             let rdma = config.rdma.as_mut().unwrap();
             rdma.remote_memory.read_timeout_ms = 0;
             rdma.remote_memory.bandwidth_limit_ratio = 0.0;

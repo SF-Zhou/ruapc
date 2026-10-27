@@ -433,6 +433,7 @@ impl RdmaSocketPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Devices;
 
     const LEASE_DURATION: Duration = Duration::from_secs(30);
 
@@ -447,7 +448,7 @@ mod tests {
 
     fn make_pool() -> RdmaSocketPool {
         // Lease bookkeeping has no hardware dependency.
-        let devices = Arc::new(crate::Devices::default());
+        let devices = Arc::new(Devices::default());
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         RdmaSocketPool::new(
             devices,

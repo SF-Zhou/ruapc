@@ -5,7 +5,9 @@ use std::{os::raw::c_int, sync::Arc};
 use ruapc_bufpool::AlignedMemory;
 
 use super::protection_domain::ProtectionDomain;
-use crate::{ErrorKind, Result};
+use crate::{
+    Error, ErrorKind, Result, ibv_access_flags, ibv_mr, ruapc_ibv_dereg_mr, ruapc_ibv_reg_mr,
+};
 
 /// A registered memory region (MR).
 ///
@@ -13,7 +15,7 @@ use crate::{ErrorKind, Result};
 /// reference to the [`ProtectionDomain`] and the underlying
 /// [`AlignedMemory`] to keep them alive for the MR's lifetime.
 pub struct MemoryRegion {
-    ptr: *mut crate::ibv_mr,
+    ptr: *mut ibv_mr,
     _pd: Arc<ProtectionDomain>,
     _memory: Arc<AlignedMemory>,
 }
@@ -30,14 +32,14 @@ impl MemoryRegion {
         memory: &Arc<AlignedMemory>,
         access: c_int,
     ) -> Result<Self> {
-        if access & crate::ibv_access_flags::IBV_ACCESS_ZERO_BASED.0 as c_int != 0 {
-            return Err(crate::Error::new(
+        if access & ibv_access_flags::IBV_ACCESS_ZERO_BASED.0 as c_int != 0 {
+            return Err(Error::new(
                 ErrorKind::IBRegMemoryRegionFail,
                 "offset-based memory registration is unsupported".into(),
             ));
         }
         let ptr = unsafe {
-            crate::ruapc_ibv_reg_mr(pd.as_ptr(), memory.as_mut_ptr() as _, memory.size(), access)
+            ruapc_ibv_reg_mr(pd.as_ptr(), memory.as_mut_ptr() as _, memory.size(), access)
         };
         if ptr.is_null() {
             return Err(ErrorKind::IBRegMemoryRegionFail.with_errno());
@@ -50,7 +52,7 @@ impl MemoryRegion {
     }
 
     /// Returns the raw MR pointer.
-    pub fn as_ptr(&self) -> *mut crate::ibv_mr {
+    pub fn as_ptr(&self) -> *mut ibv_mr {
         self.ptr
     }
 
@@ -79,7 +81,7 @@ impl Drop for MemoryRegion {
     fn drop(&mut self) {
         // A failed deregistration must not release the backing memory while
         // the device can still resolve this mapping.
-        if unsafe { crate::ruapc_ibv_dereg_mr(self.ptr) } != 0 {
+        if unsafe { ruapc_ibv_dereg_mr(self.ptr) } != 0 {
             std::process::abort();
         }
     }

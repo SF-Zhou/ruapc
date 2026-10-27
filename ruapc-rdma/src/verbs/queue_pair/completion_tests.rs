@@ -12,7 +12,7 @@ use ruapc_bufpool::{
 use super::*;
 use crate::{
     ActiveDevice, CompletionBatch, GidType, MemoryRegion, ibv_access_flags, ibv_qp_cap,
-    ibv_qp_init_attr, ibv_qp_type, ibv_send_flags,
+    ibv_qp_init_attr, ibv_qp_type, ibv_send_flags, test_utils::open_device,
 };
 
 #[derive(Debug)]
@@ -40,7 +40,7 @@ fn read_completion_sweeps_unsignaled_send_and_settles_read_batch() {
     for success in [true, false] {
         let mut devices = DeviceSet::default();
         devices.push(RegisteredDevice {
-            active: crate::test_utils::open_device(),
+            active: open_device(),
             index: DeviceIndex::default(),
         });
         let devices = Arc::new(devices);

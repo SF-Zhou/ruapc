@@ -3,6 +3,9 @@ use serde::Deserialize;
 
 use crate::{MsgMeta, Result};
 
+#[cfg(feature = "rdma")]
+use crate::Buffer;
+
 /// Message payload supporting different memory backends.
 ///
 /// The payload can be:
@@ -21,7 +24,7 @@ pub enum Payload {
     Normal(Bytes),
     /// Registered buffer payload with offset (requires "rdma" feature).
     #[cfg(feature = "rdma")]
-    RDMA(crate::Buffer, usize),
+    RDMA(Buffer, usize),
 }
 
 impl Payload {
@@ -158,9 +161,9 @@ impl From<Payload> for Bytes {
 }
 
 #[cfg(feature = "rdma")]
-impl From<crate::Buffer> for Payload {
+impl From<Buffer> for Payload {
     #[inline]
-    fn from(value: crate::Buffer) -> Self {
+    fn from(value: Buffer) -> Self {
         Payload::RDMA(value, 0)
     }
 }

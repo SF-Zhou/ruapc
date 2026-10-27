@@ -3,20 +3,20 @@
 use std::ops::Deref;
 
 use super::device::Device;
-use crate::{ErrorKind, Result};
+use crate::{ErrorKind, Result, ibv_device, ruapc_ibv_free_device_list, ruapc_ibv_get_device_list};
 
 /// Device list returned by `ibv_get_device_list`.
 ///
 /// Iterates as `&[Device]` for type-safe device discovery and opening.
 pub struct DeviceList {
     devices: Vec<Device>,
-    raw_ptr: *mut *mut crate::ibv_device,
+    raw_ptr: *mut *mut ibv_device,
 }
 
 impl DeviceList {
     pub fn available() -> Result<Self> {
         let mut num_devices: libc::c_int = 0;
-        let ptr = unsafe { crate::ruapc_ibv_get_device_list(&mut num_devices) };
+        let ptr = unsafe { ruapc_ibv_get_device_list(&mut num_devices) };
         if ptr.is_null() {
             return Err(ErrorKind::IBGetDeviceListFail.with_errno());
         }
@@ -38,7 +38,7 @@ impl DeviceList {
 
 impl Drop for DeviceList {
     fn drop(&mut self) {
-        unsafe { crate::ruapc_ibv_free_device_list(self.raw_ptr) };
+        unsafe { ruapc_ibv_free_device_list(self.raw_ptr) };
     }
 }
 

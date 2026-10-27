@@ -13,7 +13,7 @@ pub(super) use pending::PendingReads;
 
 use super::RdmaSocket;
 use crate::{
-    Buffer, Context, CopyOp, Error, ErrorKind, RemoteIoError, RemoteSpace, Result,
+    Buffer, Client, Context, CopyOp, Error, ErrorKind, RemoteIoError, RemoteSpace, Result,
     remote_memory::{
         WriteTarget,
         scatter::{self, SpaceLayout},
@@ -333,7 +333,7 @@ impl RdmaSocket {
         let request = RequestStatusRequest {
             request_id: ctx.msg_meta.msgid,
         };
-        let client = crate::Client::default();
+        let client = Client::default();
         let pending = match client.request_is_pending(ctx, &request).await {
             Ok(pending) => pending,
             Err(error) => return Err(RemoteIoError::new(error, Some(local))),
@@ -364,7 +364,7 @@ impl RdmaSocket {
             ops: ops.to_vec(),
         };
         let bytes = ops.iter().map(|op| op.len).sum();
-        let client = crate::Client::default();
+        let client = Client::default();
         let mut source = client
             .with_read_buffers(local)
             .with_read_charge_bytes(bytes);

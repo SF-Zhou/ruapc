@@ -11,14 +11,16 @@ use std::{
 use ruapc_bufpool::Device as _;
 use ruapc_rdma::{ReadCompletion, ReadPosting, ReadRequest, ReadSegment};
 
+use crate::{BufferPool, rdma::test_utils::make_rdma_devices};
+
 struct Fixture {
     qp: ruapc_rdma::QueuePair,
-    pool: Arc<crate::BufferPool>,
+    pool: Arc<BufferPool>,
 }
 
 impl Fixture {
     fn new() -> Self {
-        let devices = crate::rdma::test_utils::make_rdma_devices();
+        let devices = make_rdma_devices();
         let device = &devices.devices()[0];
         let cq = ruapc_rdma::CompletionQueue::create(device.context(), 16, None).unwrap();
         let qp = ruapc_rdma::QueuePair::create(

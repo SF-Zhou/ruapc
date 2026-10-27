@@ -13,22 +13,24 @@ use tokio_util::sync::DropGuard;
 
 use super::TcpSocket;
 use crate::{
-    ConnectionMap, Endpoint, Message, RawStream, Socket, SocketPoolConfig, SocketPoolTrait, State,
-    TaskSupervisor,
+    BufferPool, ConnectionMap, Devices, Endpoint, Message, RawStream, Socket, SocketPoolConfig,
+    SocketPoolTrait, State, TaskSupervisor,
     error::{Error, ErrorKind, Result},
+    msg::frame,
+    sockets::connect::ConnectGroups,
 };
 
 pub struct TcpSocketPool {
     socket_map: ConnectionMap<TcpSocket>,
-    connect_groups: crate::sockets::connect::ConnectGroups,
+    connect_groups: ConnectGroups,
     task_supervisor: TaskSupervisor,
 }
 
 impl SocketPoolTrait for TcpSocketPool {
     fn create(
         _config: &SocketPoolConfig,
-        _devices: &Arc<crate::Devices>,
-        _buffer_pool: &Arc<crate::BufferPool>,
+        _devices: &Arc<Devices>,
+        _buffer_pool: &Arc<BufferPool>,
     ) -> Result<Self> {
         Ok(Self::new())
     }
@@ -228,7 +230,7 @@ impl TcpSocketPool {
     }
 
     fn parse_message(buffer: &mut BytesMut) -> Result<Option<Bytes>> {
-        crate::msg::frame::parse_message(buffer).map_err(Into::into)
+        frame::parse_message(buffer).map_err(Into::into)
     }
 
     async fn start_recv_loop(

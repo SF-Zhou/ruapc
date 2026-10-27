@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use super::context::Context;
-use crate::{ErrorKind, Result};
+use crate::{ErrorKind, Result, ibv_pd, ruapc_ibv_alloc_pd, ruapc_ibv_dealloc_pd};
 
 /// A protection domain (PD).
 ///
@@ -11,7 +11,7 @@ use crate::{ErrorKind, Result};
 /// shared reference to the [`Context`] to guarantee the device context
 /// remains valid.
 pub struct ProtectionDomain {
-    ptr: *mut crate::ibv_pd,
+    ptr: *mut ibv_pd,
     /// Prevents the context from being closed while this PD exists.
     _context: Arc<Context>,
 }
@@ -19,7 +19,7 @@ pub struct ProtectionDomain {
 impl ProtectionDomain {
     /// Allocates a new protection domain on the given context.
     pub fn alloc(context: &Arc<Context>) -> Result<Arc<Self>> {
-        let ptr = unsafe { crate::ruapc_ibv_alloc_pd(context.as_ptr()) };
+        let ptr = unsafe { ruapc_ibv_alloc_pd(context.as_ptr()) };
         if ptr.is_null() {
             return Err(ErrorKind::IBAllocPDFail.with_errno());
         }
@@ -30,7 +30,7 @@ impl ProtectionDomain {
     }
 
     /// Returns the raw protection domain pointer.
-    pub fn as_ptr(&self) -> *mut crate::ibv_pd {
+    pub fn as_ptr(&self) -> *mut ibv_pd {
         self.ptr
     }
 
@@ -41,7 +41,7 @@ impl ProtectionDomain {
 
 impl Drop for ProtectionDomain {
     fn drop(&mut self) {
-        let _ = unsafe { crate::ruapc_ibv_dealloc_pd(self.ptr) };
+        let _ = unsafe { ruapc_ibv_dealloc_pd(self.ptr) };
     }
 }
 

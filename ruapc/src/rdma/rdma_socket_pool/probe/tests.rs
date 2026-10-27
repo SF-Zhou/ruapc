@@ -8,11 +8,14 @@ use std::{
 };
 
 use crate::{
-    Client, Context, Endpoint, Error, ErrorKind, MsgMeta, Router, Server, Socket, SocketPoolConfig,
-    State, Transport,
+    Client, Context, Endpoint, Error, ErrorKind, MsgMeta, Result, Router, Server, Socket,
+    SocketPoolConfig, State, Transport,
     core::ContextEndpoint,
-    rdma::{RdmaConnDirection, RdmaSocket, StripePhase},
+    rdma::{
+        RdmaConnDirection, RdmaSocket, StripePhase, probe_connection, test_utils::small_rdma_config,
+    },
     remote_memory::ReadSource,
+    service,
     services::RequestStatusRequest,
 };
 
@@ -90,13 +93,13 @@ fn timeout_threshold_supports_one_and_saturates_without_wrapping() {
     assert_eq!(count, u32::MAX);
 }
 
-#[crate::service]
+#[service]
 trait ProbeTestRpc {
-    async fn ping(&self, ctx: &Context, value: &u32) -> crate::Result<u32>;
+    async fn ping(&self, ctx: &Context, value: &u32) -> Result<u32>;
 }
 
 impl ProbeTestRpc for () {
-    async fn ping(&self, _: &Context, value: &u32) -> crate::Result<u32> {
+    async fn ping(&self, _: &Context, value: &u32) -> Result<u32> {
         Ok(*value)
     }
 }
@@ -230,7 +233,7 @@ impl Observer {
 }
 
 fn config(interval_ms: u64, timeout_ms: u64) -> SocketPoolConfig {
-    let mut config = crate::rdma::test_utils::small_rdma_config();
+    let mut config = small_rdma_config();
     let rdma = config.rdma.as_mut().unwrap();
     rdma.peers.connections_per_peer = 2;
     // Replacement must work even when remote-NIC preconnect and periodic
@@ -414,7 +417,7 @@ async fn both_ends_complete_rpc_and_read_probe_on_every_stripe() {
             *expected
         );
         for socket in sockets {
-            crate::rdma::probe_connection(&socket, state, Duration::from_millis(500))
+            probe_connection(&socket, state, Duration::from_millis(500))
                 .await
                 .expect("every connection must complete RPC and return the real READ nonce");
         }

@@ -11,7 +11,8 @@ use tokio::sync::{OwnedSemaphorePermit, mpsc};
 use super::super::RdmaSocket;
 use crate::{
     Buffer, Client, Context, CopyOp, Endpoint, ErrorKind, Result, ResultWithBuffers, Router,
-    Server, Socket, SocketPoolConfig, Transport, core::ContextEndpoint, remote_memory::WriteTarget,
+    Server, Socket, SocketPoolConfig, Transport, core::ContextEndpoint,
+    rdma::test_utils::small_rdma_config, remote_memory::WriteTarget, service,
     services::ReadIntoTargetRequest,
 };
 
@@ -67,7 +68,7 @@ struct TimeoutService {
     completed: mpsc::UnboundedSender<Completion>,
 }
 
-#[crate::service]
+#[service]
 trait AdmissionTimeoutRpc {
     async fn ping(&self, ctx: &Context, req: &()) -> Result<u64>;
     async fn read(&self, ctx: &Context, req: &()) -> Result<()>;
@@ -132,7 +133,7 @@ struct Fixture {
 
 impl Fixture {
     async fn new(client_router: Router, blocked: AdmissionBlock) -> Self {
-        let mut config: SocketPoolConfig = crate::rdma::test_utils::small_rdma_config();
+        let mut config: SocketPoolConfig = small_rdma_config();
         let rdma = config.rdma.as_mut().unwrap();
         rdma.remote_memory.read_timeout_ms = 0;
         rdma.remote_memory.max_inflight_read_wrs = READ_PERMITS;

@@ -21,6 +21,7 @@ use crate::{
     msg::MsgMeta,
     rdma::poller::{PollerWaker, ReservedQueuePair},
     sockets::{SendRequest, reserve_send},
+    task::next_conn_id,
 };
 
 pub(crate) struct RdmaSocketConfig {
@@ -97,7 +98,7 @@ impl RdmaSocket {
             max_msg_size: config.max_msg_size,
             max_large_msg_size: config.max_large_msg_size,
             path: config.path,
-            conn_id: crate::task::next_conn_id(),
+            conn_id: next_conn_id(),
             activation_requested: AtomicBool::new(false),
             probe_ready: AtomicBool::new(false),
             accept_lease_id: AtomicU64::new(0),

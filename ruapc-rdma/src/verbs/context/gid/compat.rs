@@ -11,7 +11,10 @@ use std::{
 };
 
 use super::{Context, gid_table_entry, gid_type_from_raw, nonempty_gid, query_error};
-use crate::{ErrorKind, Gid, GidType, LinkLayer, Result, ibv_gid, ibv_port_attr};
+use crate::{
+    ErrorKind, Gid, GidType, LinkLayer, Result, ibv_gid, ibv_port_attr, ruapc_ibv_query_gid,
+    ruapc_ibv_query_gid_driver_id, ruapc_ibv_query_gid_entry, ruapc_ibv_query_gid_table,
+};
 
 /// Size of one `QUERY_GID_TABLE` response entry in the kernel UAPI.
 const GID_ENTRY_SIZE: usize = 32;
@@ -136,7 +139,7 @@ impl GidQuery {
         let mut driver_id = 0;
         // SAFETY: the context remains open for this synchronous call; the
         // output points to a live u32.
-        let ret = unsafe { crate::ruapc_ibv_query_gid_driver_id(ctx.as_ptr(), &mut driver_id) };
+        let ret = unsafe { ruapc_ibv_query_gid_driver_id(ctx.as_ptr(), &mut driver_id) };
         if ret == 0 {
             Ok(driver_id)
         } else {
@@ -168,7 +171,7 @@ impl GidQuery {
             // throughout the synchronous ioctl. The shim owns its UAPI
             // response buffer and only copies it out on success.
             let ret = unsafe {
-                crate::ruapc_ibv_query_gid_entry(
+                ruapc_ibv_query_gid_entry(
                     ctx.as_ptr(),
                     driver_id,
                     port_num,
@@ -221,7 +224,7 @@ impl GidQuery {
             // `raw` holds `capacity` writable entries, and the shim only
             // publishes `num_entries` on success.
             let ret = unsafe {
-                crate::ruapc_ibv_query_gid_table(
+                ruapc_ibv_query_gid_table(
                     ctx.as_ptr(),
                     driver_id,
                     raw.as_mut_ptr().cast(),
@@ -265,9 +268,8 @@ impl GidQuery {
 
     fn query_gid_legacy(&self, ctx: &Context, port_num: u8, gid_index: u8) -> Result<ibv_gid> {
         let mut gid = ibv_gid::default();
-        let ret = unsafe {
-            crate::ruapc_ibv_query_gid(ctx.as_ptr(), port_num, i32::from(gid_index), &mut gid)
-        };
+        let ret =
+            unsafe { ruapc_ibv_query_gid(ctx.as_ptr(), port_num, i32::from(gid_index), &mut gid) };
         if ret != 0 {
             let err = if ret > 0 {
                 io::Error::from_raw_os_error(ret)
@@ -365,6 +367,8 @@ fn gid_type_from_sysfs(content: &str, link_layer: LinkLayer) -> GidType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::test_utils::open_device;
 
     #[test]
     fn ioctl_uses_discovered_driver_and_caches_it() {
@@ -488,7 +492,7 @@ mod tests {
 
     #[test]
     fn ioctl_gid_entry_does_not_need_sysfs() {
-        let dev = crate::test_utils::open_device();
+        let dev = open_device();
         let ctx = dev.context();
         let mut checked = false;
         for port in &dev.info().ports {

@@ -7,7 +7,10 @@ use std::{
 };
 
 use super::{comp_channel::CompChannel, context::Context};
-use crate::{ErrorKind, Result, ibv_wc};
+use crate::{
+    Error, ErrorKind, Result, ibv_cq, ibv_wc, ruapc_ibv_ack_cq_events, ruapc_ibv_create_cq,
+    ruapc_ibv_destroy_cq, ruapc_ibv_poll_cq, ruapc_ibv_req_notify_cq,
+};
 
 mod identities;
 pub(super) use identities::IdentityLease;
@@ -111,7 +114,7 @@ impl ExactSizeIterator for Completions<'_> {}
 /// references to the [`Context`] and optional [`CompChannel`] to ensure
 /// they outlive this CQ.
 pub struct CompletionQueue {
-    ptr: *mut crate::ibv_cq,
+    ptr: *mut ibv_cq,
     /// Prevents the context from being closed while this CQ exists.
     _context: Arc<Context>,
     /// Prevents the completion channel from being destroyed while this CQ exists.
@@ -139,7 +142,7 @@ impl CompletionQueue {
         }
         let channel_ptr = channel.map(|c| c.as_ptr()).unwrap_or(ptr::null_mut());
         let ptr = unsafe {
-            crate::ruapc_ibv_create_cq(
+            ruapc_ibv_create_cq(
                 context.as_ptr(),
                 cq_size,
                 ptr::null_mut(), // cq_context
@@ -154,8 +157,8 @@ impl CompletionQueue {
         // capacity for completion-credit admission; it does not limit QPNs.
         let actual_capacity = unsafe { (*ptr).cqe };
         if actual_capacity < cq_size {
-            let _ = unsafe { crate::ruapc_ibv_destroy_cq(ptr) };
-            return Err(crate::Error::new(
+            let _ = unsafe { ruapc_ibv_destroy_cq(ptr) };
+            return Err(Error::new(
                 ErrorKind::IBCreateCompQueueFail,
                 format!("provider CQ capacity {actual_capacity} is below requested {cq_size}"),
             ));
@@ -170,7 +173,7 @@ impl CompletionQueue {
     }
 
     /// Returns the raw CQ pointer.
-    pub fn as_ptr(&self) -> *mut crate::ibv_cq {
+    pub fn as_ptr(&self) -> *mut ibv_cq {
         self.ptr
     }
 
@@ -191,7 +194,7 @@ impl CompletionQueue {
 
     /// Requests notification for the next completion event.
     pub fn req_notify(&self, solicited_only: bool) -> Result<()> {
-        let ret = unsafe { crate::ruapc_ibv_req_notify_cq(self.ptr, solicited_only as c_int) };
+        let ret = unsafe { ruapc_ibv_req_notify_cq(self.ptr, solicited_only as c_int) };
         if ret != 0 {
             return Err(ErrorKind::IBReqNotifyCompQueueFail.with_errno());
         }
@@ -203,7 +206,7 @@ impl CompletionQueue {
     /// Returns the number of completions written to the `wc` slice.
     pub fn poll(&self, wc: &mut [ibv_wc]) -> Result<usize> {
         let count = c_int::try_from(wc.len()).map_err(|_| ErrorKind::IBPollCompQueueFail)?;
-        let ret = unsafe { crate::ruapc_ibv_poll_cq(self.ptr, count, wc.as_mut_ptr()) };
+        let ret = unsafe { ruapc_ibv_poll_cq(self.ptr, count, wc.as_mut_ptr()) };
         if ret < 0 {
             return Err(ErrorKind::IBPollCompQueueFail.with_errno());
         }
@@ -230,13 +233,13 @@ impl CompletionQueue {
 
     /// Acknowledges CQ events received via [`CompChannel::get_event`].
     pub fn ack_events(&self, nevents: u32) {
-        unsafe { crate::ruapc_ibv_ack_cq_events(self.ptr, nevents) };
+        unsafe { ruapc_ibv_ack_cq_events(self.ptr, nevents) };
     }
 }
 
 impl Drop for CompletionQueue {
     fn drop(&mut self) {
-        let _ = unsafe { crate::ruapc_ibv_destroy_cq(self.ptr) };
+        let _ = unsafe { ruapc_ibv_destroy_cq(self.ptr) };
     }
 }
 

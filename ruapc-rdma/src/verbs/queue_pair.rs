@@ -19,7 +19,11 @@ use super::{
     wr_slots::WrSlots,
 };
 use crate::{
-    Error, ErrorKind, QpConnectionConfig, Result, WRID, WRType, ibv_qp_attr, ibv_qp_attr_mask,
+    Error, ErrorKind, QpConnectionConfig, Result, WRID, WRType, ibv_qp, ibv_qp_attr,
+    ibv_qp_attr_mask, ibv_qp_init_attr, ibv_qp_type, ibv_recv_wr, ibv_send_flags, ibv_send_wr,
+    ibv_send_wr__bindgen_ty_1, ibv_send_wr__bindgen_ty_2, ibv_send_wr__bindgen_ty_2__bindgen_ty_1,
+    ibv_sge, ibv_wc, ibv_wr_opcode, ruapc_ibv_create_qp, ruapc_ibv_destroy_qp, ruapc_ibv_modify_qp,
+    ruapc_ibv_post_recv, ruapc_ibv_post_send,
 };
 
 /// Maximum gather-list length accepted by [`QueuePair::send_gather`];
@@ -71,7 +75,7 @@ impl CompletionCursor {
 /// Metadata and owned buffers released by a verified completion.
 #[derive(Debug)]
 pub struct CompletedWork<'a> {
-    pub wc: &'a crate::ibv_wc,
+    pub wc: &'a ibv_wc,
     pub buffer: Option<WrBuffers>,
     /// Earlier data SENDs reclaimed under RC's ordered SQ completion rule.
     pub swept_sends: usize,
@@ -102,12 +106,12 @@ enum SendSignaling {
 
 impl SendSignaling {
     #[inline]
-    fn flags(self, id: u64, interval: u64, flags: crate::ibv_send_flags) -> crate::ibv_send_flags {
-        let signaled = crate::ibv_send_flags::IBV_SEND_SIGNALED;
+    fn flags(self, id: u64, interval: u64, flags: ibv_send_flags) -> ibv_send_flags {
+        let signaled = ibv_send_flags::IBV_SEND_SIGNALED;
         match self {
             Self::Explicit => flags,
             Self::Selective if interval > 1 && !id.is_multiple_of(interval) => {
-                crate::ibv_send_flags(flags.0 & !signaled.0)
+                ibv_send_flags(flags.0 & !signaled.0)
             }
             Self::Selective | Self::Always => flags | signaled,
         }
@@ -115,7 +119,7 @@ impl SendSignaling {
 }
 
 pub struct QueuePair {
-    ptr: *mut crate::ibv_qp,
+    ptr: *mut ibv_qp,
     _pd: Arc<ProtectionDomain>,
     /// CQ-owned QPN identity and both sequence streams. One lease covers SEND,
     /// RECV and READ because this QP posts to a single completion queue.
@@ -146,7 +150,7 @@ pub struct QueuePair {
 /// Setup leases the QPN after the provider assigns it. Drop must destroy the
 /// provider QP before Rust releases that lease.
 struct CreatingQueuePair {
-    ptr: *mut crate::ibv_qp,
+    ptr: *mut ibv_qp,
     identity: Option<IdentityLease>,
 }
 
@@ -166,8 +170,8 @@ impl Drop for CreatingQueuePair {
     }
 }
 
-fn destroy_provider_qp(ptr: *mut crate::ibv_qp) {
-    if unsafe { crate::ruapc_ibv_destroy_qp(ptr) } != 0 {
+fn destroy_provider_qp(ptr: *mut ibv_qp) {
+    if unsafe { ruapc_ibv_destroy_qp(ptr) } != 0 {
         std::process::abort();
     }
 }
@@ -178,12 +182,12 @@ impl QueuePair {
     pub fn create(
         pd: &Arc<ProtectionDomain>,
         cq: &Arc<CompletionQueue>,
-        init_attr: &mut crate::ibv_qp_init_attr,
+        init_attr: &mut ibv_qp_init_attr,
         device_index: DeviceIndex,
     ) -> Result<Self> {
         // Completion of a later SQ request only authorizes the selective
         // SEND sweep for reliable-connected queue pairs.
-        if init_attr.qp_type != crate::ibv_qp_type::IBV_QPT_RC
+        if init_attr.qp_type != ibv_qp_type::IBV_QPT_RC
             || !init_attr.srq.is_null()
             || !init_attr.qp_context.is_null()
             || !Arc::ptr_eq(pd.context(), cq.context())
@@ -192,7 +196,7 @@ impl QueuePair {
         }
         init_attr.send_cq = cq.as_ptr();
         init_attr.recv_cq = cq.as_ptr();
-        let ptr = unsafe { crate::ruapc_ibv_create_qp(pd.as_ptr(), init_attr) };
+        let ptr = unsafe { ruapc_ibv_create_qp(pd.as_ptr(), init_attr) };
         if ptr.is_null() {
             let source = std::io::Error::last_os_error();
             return Err(Error::new(
@@ -257,7 +261,7 @@ impl QueuePair {
             .map_err(|e| Error::new(ErrorKind::IBRegMemoryRegionFail, e.to_string()))
     }
 
-    pub fn as_ptr(&self) -> *mut crate::ibv_qp {
+    pub fn as_ptr(&self) -> *mut ibv_qp {
         self.ptr
     }
 
@@ -275,13 +279,13 @@ impl QueuePair {
     /// [`send_signaled`](Self::send_signaled) instead, or the window slots
     /// stay stranded until an unrelated signaled WR (e.g. a keepalive ACK)
     /// happens to sweep them.
-    pub fn send(&self, buffer: Buffer, flags: crate::ibv_send_flags) -> Result<u64> {
+    pub fn send(&self, buffer: Buffer, flags: ibv_send_flags) -> Result<u64> {
         self.send_buffer(buffer, None, flags, SendSignaling::Selective)
     }
 
     /// Posts a data send with `IBV_SEND_SIGNALED` enforced, bypassing the
     /// selective signaling policy.
-    pub fn send_signaled(&self, buffer: Buffer, flags: crate::ibv_send_flags) -> Result<u64> {
+    pub fn send_signaled(&self, buffer: Buffer, flags: ibv_send_flags) -> Result<u64> {
         self.send_buffer(buffer, None, flags, SendSignaling::Always)
     }
 
@@ -291,10 +295,10 @@ impl QueuePair {
         &self,
         buffer: Buffer,
         imm: Option<u32>,
-        flags: crate::ibv_send_flags,
+        flags: ibv_send_flags,
         signaling: SendSignaling,
     ) -> Result<u64> {
-        let mut sge = [crate::ibv_sge {
+        let mut sge = [ibv_sge {
             addr: buffer.as_ptr() as u64,
             length: buffer.len() as u32,
             lkey: self.lkey(&buffer)?,
@@ -332,9 +336,9 @@ impl QueuePair {
                 ),
             ));
         }
-        let mut sges = [crate::ibv_sge::default(); MAX_GATHER_SGE];
+        let mut sges = [ibv_sge::default(); MAX_GATHER_SGE];
         for (sge, buffer) in sges.iter_mut().zip(buffers.iter()) {
-            *sge = crate::ibv_sge {
+            *sge = ibv_sge {
                 addr: buffer.as_ptr() as u64,
                 length: buffer.len() as u32,
                 lkey: self.lkey(buffer)?,
@@ -345,17 +349,17 @@ impl QueuePair {
             Some(WrBuffers::Many(buffers)),
             &mut sges[..count],
             imm,
-            crate::ibv_send_flags::IBV_SEND_SIGNALED,
+            ibv_send_flags::IBV_SEND_SIGNALED,
             SendSignaling::Always,
         )
     }
 
     /// Posts a send with immediate data and returns its send-queue id.
-    pub fn send_imm(&self, buffer: Buffer, imm: u32, flags: crate::ibv_send_flags) -> Result<u64> {
+    pub fn send_imm(&self, buffer: Buffer, imm: u32, flags: ibv_send_flags) -> Result<u64> {
         self.send_buffer(buffer, Some(imm), flags, SendSignaling::Explicit)
     }
 
-    pub fn send_imm_only(&self, imm: u32, flags: crate::ibv_send_flags) -> Result<()> {
+    pub fn send_imm_only(&self, imm: u32, flags: ibv_send_flags) -> Result<()> {
         self.post_send_buffers(None, &mut [], Some(imm), flags, SendSignaling::Explicit)
             .map(|_| ())
     }
@@ -369,9 +373,9 @@ impl QueuePair {
     fn post_send_buffers(
         &self,
         buffers: Option<WrBuffers>,
-        sges: &mut [crate::ibv_sge],
+        sges: &mut [ibv_sge],
         imm: Option<u32>,
-        flags: crate::ibv_send_flags,
+        flags: ibv_send_flags,
         signaling: SendSignaling,
     ) -> Result<u64> {
         // The sequence guard serializes allocation, ownership registration
@@ -383,12 +387,12 @@ impl QueuePair {
         let (wr_id, opcode, imm_data) = match imm {
             Some(imm) => (
                 route.encode(WRType::SendImm, id),
-                crate::ibv_wr_opcode::IBV_WR_SEND_WITH_IMM,
+                ibv_wr_opcode::IBV_WR_SEND_WITH_IMM,
                 imm.to_be(),
             ),
             None => (
                 route.encode(WRType::SendData, id),
-                crate::ibv_wr_opcode::IBV_WR_SEND,
+                ibv_wr_opcode::IBV_WR_SEND,
                 0,
             ),
         };
@@ -397,7 +401,7 @@ impl QueuePair {
                 .insert(id, buffers)
                 .map_err(|_| ErrorKind::WorkRequestSlotsExhausted)?;
         }
-        let mut wr = crate::ibv_send_wr {
+        let mut wr = ibv_send_wr {
             wr_id,
             sg_list: if sges.is_empty() {
                 ptr::null_mut()
@@ -415,7 +419,7 @@ impl QueuePair {
                     flags,
                 )
                 .0,
-            __bindgen_anon_1: crate::ibv_send_wr__bindgen_ty_1 { imm_data },
+            __bindgen_anon_1: ibv_send_wr__bindgen_ty_1 { imm_data },
             ..Default::default()
         };
         // SAFETY: the slot table owns every SGE's buffer before the NIC can
@@ -461,9 +465,9 @@ impl QueuePair {
                 ),
             ));
         }
-        let mut raw = [crate::ibv_sge::default(); MAX_GATHER_SGE];
+        let mut raw = [ibv_sge::default(); MAX_GATHER_SGE];
         for (dst, sge) in raw.iter_mut().zip(sges.iter()) {
-            *dst = crate::ibv_sge {
+            *dst = ibv_sge {
                 addr: sge.addr,
                 length: sge.len,
                 lkey: sge.lkey,
@@ -475,14 +479,14 @@ impl QueuePair {
         let id = posting.sequence();
         let wr_id = self.identity().encode(WRType::Read, id);
         register(wr_id);
-        let mut wr = crate::ibv_send_wr {
+        let mut wr = ibv_send_wr {
             wr_id,
             sg_list: raw.as_mut_ptr(),
             num_sge,
-            opcode: crate::ibv_wr_opcode::IBV_WR_RDMA_READ,
-            send_flags: crate::ibv_send_flags::IBV_SEND_SIGNALED.0,
-            wr: crate::ibv_send_wr__bindgen_ty_2 {
-                rdma: crate::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 { remote_addr, rkey },
+            opcode: ibv_wr_opcode::IBV_WR_RDMA_READ,
+            send_flags: ibv_send_flags::IBV_SEND_SIGNALED.0,
+            wr: ibv_send_wr__bindgen_ty_2 {
+                rdma: ibv_send_wr__bindgen_ty_2__bindgen_ty_1 { remote_addr, rkey },
             },
             ..Default::default()
         };
@@ -502,12 +506,12 @@ impl QueuePair {
         self.recv_wrs
             .insert(id, buffer.into())
             .map_err(|_| ErrorKind::WorkRequestSlotsExhausted)?;
-        let mut sge = crate::ibv_sge {
+        let mut sge = ibv_sge {
             addr,
             length: len,
             lkey,
         };
-        let mut wr = crate::ibv_recv_wr {
+        let mut wr = ibv_recv_wr {
             wr_id,
             sg_list: &mut sge,
             num_sge: 1,
@@ -562,7 +566,7 @@ impl QueuePair {
 
     /// Applies raw QP attributes, preserving the provider's returned errno.
     pub fn modify(&self, attr: &mut ibv_qp_attr, attr_mask: c_int) -> Result<()> {
-        let ret = unsafe { crate::ruapc_ibv_modify_qp(self.ptr, attr, attr_mask) };
+        let ret = unsafe { ruapc_ibv_modify_qp(self.ptr, attr, attr_mask) };
         if ret != 0 {
             return Err(modify_error(self.qp_num(), attr, attr_mask, ret));
         }
@@ -604,10 +608,10 @@ impl QueuePair {
     /// the corresponding completions are observed.
     pub(crate) unsafe fn post_send(
         &self,
-        wr: *mut crate::ibv_send_wr,
-    ) -> std::result::Result<(), (*mut crate::ibv_send_wr, Error)> {
-        let mut bad_wr: *mut crate::ibv_send_wr = ptr::null_mut();
-        let ret = unsafe { crate::ruapc_ibv_post_send(self.ptr, wr, &mut bad_wr) };
+        wr: *mut ibv_send_wr,
+    ) -> std::result::Result<(), (*mut ibv_send_wr, Error)> {
+        let mut bad_wr: *mut ibv_send_wr = ptr::null_mut();
+        let ret = unsafe { ruapc_ibv_post_send(self.ptr, wr, &mut bad_wr) };
         if ret != 0 {
             return Err((bad_wr, ErrorKind::IBPostSendFail.with_errno()));
         }
@@ -626,10 +630,10 @@ impl QueuePair {
     /// the corresponding completions are observed.
     pub(crate) unsafe fn post_recv(
         &self,
-        wr: *mut crate::ibv_recv_wr,
-    ) -> std::result::Result<(), (*mut crate::ibv_recv_wr, Error)> {
-        let mut bad_wr: *mut crate::ibv_recv_wr = ptr::null_mut();
-        let ret = unsafe { crate::ruapc_ibv_post_recv(self.ptr, wr, &mut bad_wr) };
+        wr: *mut ibv_recv_wr,
+    ) -> std::result::Result<(), (*mut ibv_recv_wr, Error)> {
+        let mut bad_wr: *mut ibv_recv_wr = ptr::null_mut();
+        let ret = unsafe { ruapc_ibv_post_recv(self.ptr, wr, &mut bad_wr) };
         if ret != 0 {
             return Err((bad_wr, ErrorKind::IBPostRecvFail.with_errno()));
         }
@@ -677,6 +681,8 @@ unsafe impl Sync for QueuePair {}
 mod tests {
     use super::*;
 
+    use crate::{ibv_qp_cap, ibv_qp_state, test_utils::open_device};
+
     #[test]
     fn selective_sweep_skips_previous_incarnations_and_already_completed_work() {
         let first = 1 << 47;
@@ -689,10 +695,10 @@ mod tests {
         assert_eq!(cursor.sweep_to(first, first + 7), first + 5..first + 7);
     }
 
-    fn init_attr() -> crate::ibv_qp_init_attr {
-        crate::ibv_qp_init_attr {
-            qp_type: crate::ibv_qp_type::IBV_QPT_RC,
-            cap: crate::ibv_qp_cap {
+    fn init_attr() -> ibv_qp_init_attr {
+        ibv_qp_init_attr {
+            qp_type: ibv_qp_type::IBV_QPT_RC,
+            cap: ibv_qp_cap {
                 max_send_wr: 4,
                 max_recv_wr: 4,
                 max_send_sge: 1,
@@ -705,7 +711,7 @@ mod tests {
 
     #[test]
     fn qp_identity_is_registered_after_creation_and_retires_after_destruction() {
-        let device = crate::test_utils::open_device();
+        let device = open_device();
         let cq = CompletionQueue::create(device.context(), 16, None).unwrap();
         let qp =
             QueuePair::create(device.pd(), &cq, &mut init_attr(), DeviceIndex::default()).unwrap();
@@ -729,7 +735,7 @@ mod tests {
 
     #[test]
     fn cq_capacity_does_not_limit_qps_with_no_posted_work() {
-        let device = crate::test_utils::open_device();
+        let device = open_device();
         let cq = CompletionQueue::create(device.context(), 1, None).unwrap();
         let qps: Vec<_> = (0..cq.capacity() + 2)
             .map(|_| {
@@ -747,12 +753,12 @@ mod tests {
 
     #[test]
     fn failed_identity_registration_destroys_the_provider_qp() {
-        let device = crate::test_utils::open_device();
+        let device = open_device();
         let cq = CompletionQueue::create(device.context(), 16, None).unwrap();
         let mut attrs = init_attr();
         attrs.send_cq = cq.as_ptr();
         attrs.recv_cq = cq.as_ptr();
-        let ptr = unsafe { crate::ruapc_ibv_create_qp(device.pd().as_ptr(), &mut attrs) };
+        let ptr = unsafe { ruapc_ibv_create_qp(device.pd().as_ptr(), &mut attrs) };
         assert!(!ptr.is_null());
         let qp_num = unsafe { (*ptr).qp_num };
         let mut creating = CreatingQueuePair {
@@ -776,7 +782,7 @@ mod tests {
 
     #[test]
     fn qp_creation_rejects_unowned_resources_and_foreign_contexts() {
-        let device = crate::test_utils::open_device();
+        let device = open_device();
         let cq = CompletionQueue::create(device.context(), 16, None).unwrap();
         let mut attrs = init_attr();
         attrs.srq = ptr::dangling_mut();
@@ -789,7 +795,7 @@ mod tests {
         attrs.srq = ptr::null_mut();
         attrs.qp_context = ptr::dangling_mut();
         assert!(QueuePair::create(device.pd(), &cq, &mut attrs, DeviceIndex::default()).is_err());
-        let foreign = crate::test_utils::open_device();
+        let foreign = open_device();
         let foreign_cq = CompletionQueue::create(foreign.context(), 16, None).unwrap();
         assert_eq!(
             QueuePair::create(
@@ -806,7 +812,7 @@ mod tests {
 
     #[test]
     fn signaling_preserves_flags_and_forces_window_tail_completion() {
-        use crate::ibv_send_flags as Flags;
+        use ibv_send_flags as Flags;
         let flags = Flags::IBV_SEND_INLINE | Flags::IBV_SEND_SIGNALED;
         for id in 0..16 {
             let selective = SendSignaling::Selective.flags(id, 4, flags);
@@ -833,7 +839,7 @@ mod tests {
     #[test]
     fn modify_error_reports_provider_errno_and_target_state() {
         let attr = ibv_qp_attr {
-            qp_state: crate::ibv_qp_state::IBV_QPS_ERR,
+            qp_state: ibv_qp_state::IBV_QPS_ERR,
             ..Default::default()
         };
         let error = modify_error(

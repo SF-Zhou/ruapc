@@ -16,31 +16,32 @@ use tokio_util::sync::DropGuard;
 
 use super::WebSocket;
 use crate::{
-    ConnectionMap, Endpoint, Message, RawStream, Socket, SocketPoolConfig, SocketPoolTrait, State,
-    TaskSupervisor,
+    BufferPool, ConnectionMap, Devices, Endpoint, Message, RawStream, Socket, SocketPoolConfig,
+    SocketPoolTrait, State, TaskSupervisor,
     error::{Error, ErrorKind, Result},
-    sockets::tcp,
+    msg::frame::MAX_MSG_SIZE,
+    sockets::{connect::ConnectGroups, tcp},
 };
 
 /// WebSocket protocol limits aligned with the TCP transport's
 /// [`MAX_MSG_SIZE`](crate::msg::frame::MAX_MSG_SIZE).
 pub(crate) fn web_socket_config() -> tungstenite::protocol::WebSocketConfig {
     tungstenite::protocol::WebSocketConfig::default()
-        .max_message_size(Some(crate::msg::frame::MAX_MSG_SIZE))
+        .max_message_size(Some(MAX_MSG_SIZE))
         .max_frame_size(Some(16 << 20))
 }
 
 pub struct WebSocketPool {
     socket_map: ConnectionMap<WebSocket>,
-    connect_groups: crate::sockets::connect::ConnectGroups,
+    connect_groups: ConnectGroups,
     task_supervisor: TaskSupervisor,
 }
 
 impl SocketPoolTrait for WebSocketPool {
     fn create(
         _config: &SocketPoolConfig,
-        _devices: &Arc<crate::Devices>,
-        _buffer_pool: &Arc<crate::BufferPool>,
+        _devices: &Arc<Devices>,
+        _buffer_pool: &Arc<BufferPool>,
     ) -> Result<Self> {
         Ok(Self {
             socket_map: ConnectionMap::default(),
@@ -302,8 +303,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_web_socket_pool_debug_format() {
-        let config = crate::SocketPoolConfig::default();
-        let devices = Arc::new(crate::Devices::default());
+        let config = SocketPoolConfig::default();
+        let devices = Arc::new(Devices::default());
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let pool = WebSocketPool::create(&config, &devices, &buffer_pool).unwrap();
         let debug = format!("{pool:?}");

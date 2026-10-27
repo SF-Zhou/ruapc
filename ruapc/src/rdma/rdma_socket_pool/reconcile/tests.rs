@@ -6,7 +6,10 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 use tokio::{sync::mpsc, time::timeout};
 
 use super::backoff_delay;
-use crate::{Context, Endpoint, Error, ErrorKind, Payload, Router, Server, Socket, Transport};
+use crate::rdma::test_utils::small_rdma_config;
+use crate::{
+    Context, Endpoint, Error, ErrorKind, Payload, Result, Router, Server, Socket, Transport,
+};
 
 #[test]
 fn reconnect_backoff_is_bounded() {
@@ -15,7 +18,7 @@ fn reconnect_backoff_is_bounded() {
     assert!(backoff_delay(100) <= Duration::from_secs(30));
 }
 
-type Handler = Arc<dyn Fn(Context, Payload) -> crate::Result<()> + Send + Sync>;
+type Handler = Arc<dyn Fn(Context, Payload) -> Result<()> + Send + Sync>;
 
 struct PendingPrepare {
     handler: Handler,
@@ -57,7 +60,7 @@ async fn next_prepare(receiver: &mut mpsc::UnboundedReceiver<PendingPrepare>) ->
 }
 
 async fn assert_reconcile_yields_to_foreground(periodic: bool) {
-    let mut config = crate::rdma::test_utils::small_rdma_config();
+    let mut config = small_rdma_config();
     let rdma = config.rdma.as_mut().unwrap();
     rdma.peers.connections_per_peer = 1;
     rdma.peers.min_connections_per_remote_nic = 4;

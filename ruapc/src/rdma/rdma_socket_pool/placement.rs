@@ -994,9 +994,11 @@ mod path_selection_tests {
     use crate::rdma::RdmaSocketPoolConfig;
     use crate::rdma::rdma_service::RDMA_BOOTSTRAP_PROTOCOL_VERSION;
     use crate::rdma::rdma_service::RdmaDeviceInfo;
+    use crate::rdma::test_utils::make_rdma_devices;
+    use crate::{Endpoint, Transport};
 
     fn make_pool() -> RdmaSocketPool {
-        let devices = crate::rdma::test_utils::make_rdma_devices();
+        let devices = make_rdma_devices();
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         RdmaSocketPool::new(devices, buffer_pool, RdmaSocketPoolConfig::default()).unwrap()
     }
@@ -1059,7 +1061,7 @@ mod path_selection_tests {
     }
 
     fn peer() -> PeerState {
-        PeerState::new(crate::Endpoint::rdma(crate::Transport::TCP, [addr()]).unwrap())
+        PeerState::new(Endpoint::rdma(Transport::TCP, [addr()]).unwrap())
     }
 
     fn preference<'a>(
@@ -1137,7 +1139,7 @@ mod path_selection_tests {
 
     #[tokio::test]
     async fn test_rejects_too_short_connect_lease() {
-        let devices = crate::rdma::test_utils::make_rdma_devices();
+        let devices = make_rdma_devices();
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let mut config = RdmaSocketPoolConfig::default();
         config.peers.connect_lease_ms = 14_999;
@@ -1206,7 +1208,7 @@ mod path_selection_tests {
     /// applies the client's requested value verbatim.
     #[tokio::test]
     async fn test_traffic_class_client_decides_server_obeys() {
-        let devices = crate::rdma::test_utils::make_rdma_devices();
+        let devices = make_rdma_devices();
         let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
         let mut config = RdmaSocketPoolConfig::default();
         config.connection.traffic_class = 96;
@@ -1271,8 +1273,7 @@ mod path_selection_tests {
         }
         // The blacklist is per peer: another address is unaffected.
         let other = PeerState::new(
-            crate::Endpoint::rdma(crate::Transport::TCP, ["127.0.0.1:9998".parse().unwrap()])
-                .unwrap(),
+            Endpoint::rdma(Transport::TCP, ["127.0.0.1:9998".parse().unwrap()]).unwrap(),
         );
         assert!(!pool.is_blacklisted(&other, &candidates[0]));
 

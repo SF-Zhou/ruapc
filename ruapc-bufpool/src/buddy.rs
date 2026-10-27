@@ -335,7 +335,7 @@ mod tests {
 
     #[test]
     fn test_buddy_block_creation() {
-        let mem = Arc::new(crate::AlignedMemory::new(SIZE_64MIB).unwrap());
+        let mem = Arc::new(AlignedMemory::new(SIZE_64MIB).unwrap());
         let block = BuddyBlock::new(mem, Vec::new());
 
         // Root is free
@@ -355,7 +355,7 @@ mod tests {
 
     #[test]
     fn test_memory_address_calculation() {
-        let mem = Arc::new(crate::AlignedMemory::new(SIZE_64MIB).unwrap());
+        let mem = Arc::new(AlignedMemory::new(SIZE_64MIB).unwrap());
         let base = mem.as_mut_ptr();
         let block = BuddyBlock::new(mem, Vec::new());
 

@@ -2,7 +2,7 @@
 
 use super::scatter::SpaceLayout;
 use crate::services::{MemoryService, ReadInlineRequest, WriteInlineRequest};
-use crate::{Buffer, Context, CopyOp, RemoteIoError, RemoteSpace};
+use crate::{Buffer, Client, Context, CopyOp, Error, ErrorKind, RemoteIoError, RemoteSpace};
 
 /// Executes a validated batch of reads from the peer's read space into
 /// the `local` buffers (see [`Context::remote_read`] for the space and
@@ -24,7 +24,7 @@ pub(crate) async fn read(
         ops: ops.to_vec(),
         request_id: ctx.msg_meta.msgid,
     };
-    let client = crate::Client::default();
+    let client = Client::default();
     let bytes: Vec<u8> = match client.read_inline(ctx, &req).await {
         Ok(rsp) => rsp.bytes,
         Err(e) => return Err(RemoteIoError::new(e, Some(local))),
@@ -32,8 +32,8 @@ pub(crate) async fn read(
     let expected: u64 = ops.iter().map(|op| op.len).sum();
     if bytes.len() as u64 != expected {
         return Err(RemoteIoError::new(
-            crate::Error::new(
-                crate::ErrorKind::InvalidCopyOp,
+            Error::new(
+                ErrorKind::InvalidCopyOp,
                 format!(
                     "remote read returned {} bytes but the ops requested {expected}",
                     bytes.len()
@@ -99,7 +99,7 @@ pub(crate) async fn write(
         ops: ops.to_vec(),
         bytes,
     };
-    let client = crate::Client::default();
+    let client = Client::default();
     match client.write_inline(ctx, &req).await {
         Ok(()) => Ok(local),
         Err(e) => Err(RemoteIoError::new(e, Some(local))),

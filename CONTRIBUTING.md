@@ -55,6 +55,13 @@ Run formatting and Clippy before committing. PRs target `main`, and all CI
 checks must pass before merging. [CI](.github/workflows/rust.yml) runs formatting,
 release Clippy and coverage on Linux x86-64 and ARM64 with Soft-RoCE.
 
+Prefer file-level imports over inline absolute paths: import the item once
+(`use crate::module::Item;`) and refer to `Item` in the body rather than
+repeating `crate::module::Item`. Keep an inline path for visibility
+restrictions such as `pub(in crate::module)`, for names that would collide in
+the local scope, inside macro-generated token streams, and for feature-gated
+items whose `cfg` cannot be carried by the import unchanged.
+
 For public API, feature or rustdoc changes, also check:
 
 ```bash

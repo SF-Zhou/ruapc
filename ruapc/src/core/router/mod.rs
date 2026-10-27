@@ -252,6 +252,9 @@ mod tests {
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
 
+    #[cfg(feature = "rdma")]
+    use crate::{ListenMode, Server, SocketPoolConfig};
+
     #[derive(Serialize, Deserialize, JsonSchema)]
     struct DummyReq {
         value: String,
@@ -315,12 +318,12 @@ mod tests {
     #[cfg(feature = "rdma")]
     #[tokio::test]
     async fn test_builtin_rdma_probe_is_not_a_unary_http_endpoint() {
-        let config = crate::SocketPoolConfig {
-            listen_mode: crate::ListenMode::UNIFIED,
+        let config = SocketPoolConfig {
+            listen_mode: ListenMode::UNIFIED,
             rdma: None,
             ..Default::default()
         };
-        let server = crate::Server::create(Router::default(), &config).unwrap();
+        let server = Server::create(Router::default(), &config).unwrap();
         let address = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
         assert!(
             !server
@@ -467,7 +470,7 @@ mod tests {
         router.add_method::<DummyReq, DummyRsp>("TestSvc/noop", Box::new(noop_func));
 
         // Build a context so dispatch has something to work with.
-        let ctx = crate::Context::create(&SocketPoolConfig::default()).unwrap();
+        let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
         let mut ctx =
             ctx.with_endpoint(Endpoint::tcp(["127.0.0.1:9999".parse().unwrap()]).unwrap());
         ctx.msg_meta.method = "TestSvc/noop".to_string();
@@ -481,7 +484,7 @@ mod tests {
         use crate::{Endpoint, SocketPoolConfig};
         let router = Router::default();
 
-        let ctx = crate::Context::create(&SocketPoolConfig::default()).unwrap();
+        let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
         let mut ctx =
             ctx.with_endpoint(Endpoint::tcp(["127.0.0.1:9999".parse().unwrap()]).unwrap());
         ctx.msg_meta.method = "UnknownSvc/missing".to_string();

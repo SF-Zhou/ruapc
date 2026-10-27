@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use crate::{Devices, Endpoint, ListenMode, SocketPoolConfig, Transport, rdma::RdmaDevice};
+
 /// Opens the first available RDMA device, honoring the `RUAPC_PREFER_RXE`
 /// env var (used in CI to select the `rxe_0` virtual device).
 pub(crate) fn open_rdma_device() -> ruapc_rdma::ActiveDevice {
@@ -14,7 +16,7 @@ pub(crate) fn open_rdma_device() -> ruapc_rdma::ActiveDevice {
 
 /// Small same-host fixture on one usable device. Background work starts only
 /// when a test explicitly enables it; callers choose their own stripe count.
-pub(crate) fn small_rdma_config() -> crate::SocketPoolConfig {
+pub(crate) fn small_rdma_config() -> SocketPoolConfig {
     let prefer_rxe = std::env::var("RUAPC_PREFER_RXE").is_ok();
     let device = ruapc_rdma::ActiveDevice::available()
         .expect("RDMA devices must be available")
@@ -27,8 +29,8 @@ pub(crate) fn small_rdma_config() -> crate::SocketPoolConfig {
                 })
         })
         .expect("RDMA tests require one connectable device");
-    let mut config = crate::SocketPoolConfig {
-        listen_mode: crate::ListenMode::UNIFIED,
+    let mut config = SocketPoolConfig {
+        listen_mode: ListenMode::UNIFIED,
         buffer_pool_memory: 128 << 20,
         ..Default::default()
     };
@@ -49,29 +51,26 @@ pub(crate) fn small_rdma_config() -> crate::SocketPoolConfig {
 
 /// Builds a [`crate::Devices`] populated with all available RDMA devices,
 /// honoring the `RUAPC_PREFER_RXE` env var.
-pub(crate) fn make_rdma_devices() -> Arc<crate::Devices> {
+pub(crate) fn make_rdma_devices() -> Arc<Devices> {
     let active_devices =
         ruapc_rdma::ActiveDevice::available().expect("RDMA devices should be available");
     let prefer_rxe = std::env::var("RUAPC_PREFER_RXE").is_ok();
-    let mut devices = crate::Devices::default();
+    let mut devices = Devices::default();
     for dev in active_devices {
         if prefer_rxe && !dev.info().name.starts_with("rxe") {
             continue;
         }
-        devices.push(crate::rdma::RdmaDevice::new(dev));
+        devices.push(RdmaDevice::new(dev));
     }
     assert!(!devices.devices().is_empty(), "no RDMA device found");
     Arc::new(devices)
 }
 
 /// Builds an endpoint for a transport loop, using TCP as the RDMA bootstrap.
-pub(crate) fn transport_endpoint(
-    transport: crate::Transport,
-    address: std::net::SocketAddr,
-) -> crate::Endpoint {
-    if transport == crate::Transport::RDMA {
-        crate::Endpoint::rdma(crate::Transport::TCP, [address]).unwrap()
+pub(crate) fn transport_endpoint(transport: Transport, address: std::net::SocketAddr) -> Endpoint {
+    if transport == Transport::RDMA {
+        Endpoint::rdma(Transport::TCP, [address]).unwrap()
     } else {
-        crate::Endpoint::new(transport, [address]).unwrap()
+        Endpoint::new(transport, [address]).unwrap()
     }
 }

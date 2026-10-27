@@ -2,7 +2,11 @@ use ruapc_rdma::{DeviceInfo, Gid, LinkLayer, Port};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{Context, Result, rdma, service};
+use crate::{
+    Context, Result,
+    rdma::{self, RdmaSocketPoolConfig},
+    service,
+};
 
 /// Version of the internal RDMA bootstrap protocol.
 pub(crate) const RDMA_BOOTSTRAP_PROTOCOL_VERSION: u32 = 2;
@@ -45,7 +49,7 @@ pub struct RdmaDeviceInfo {
 impl RdmaDeviceInfo {
     fn from_device_info(
         info: &DeviceInfo,
-        config: &crate::rdma::RdmaSocketPoolConfig,
+        config: &RdmaSocketPoolConfig,
         active_connections: u32,
     ) -> Option<Self> {
         let ports: Vec<_> = info
@@ -107,7 +111,7 @@ impl RdmaPeerAdvertisement {
     /// are already filtered out at collection time.
     pub(crate) fn from_devices(
         devices: &[super::RdmaDevice],
-        config: &crate::rdma::RdmaSocketPoolConfig,
+        config: &RdmaSocketPoolConfig,
         conn_counts: &[std::sync::atomic::AtomicUsize],
     ) -> Self {
         RdmaPeerAdvertisement {
@@ -193,7 +197,7 @@ impl RdmaBootstrapService for () {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SocketPoolConfig;
+    use crate::{ErrorKind, SocketPoolConfig, rdma::RdmaSocketPoolConfig};
 
     #[test]
     fn ethernet_advertisement_requires_a_gid() {
@@ -207,7 +211,7 @@ mod tests {
             gids: Vec::new(),
         };
         assert!(!port_is_connectable(&ethernet));
-        let config = crate::rdma::RdmaSocketPoolConfig::default();
+        let config = RdmaSocketPoolConfig::default();
         let ethernet_only = DeviceInfo {
             name: "ethernet-only".into(),
             ports: vec![ethernet.clone()],
@@ -263,7 +267,7 @@ mod tests {
             accepted_connection_id: u64::MAX,
         };
         let err = ().commit_connection(&ctx, &lease).await.unwrap_err();
-        assert_eq!(err.kind, crate::ErrorKind::InvalidArgument);
+        assert_eq!(err.kind, ErrorKind::InvalidArgument);
         ().cancel_connection(&ctx, &lease).await.unwrap();
     }
 

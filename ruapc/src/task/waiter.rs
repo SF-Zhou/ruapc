@@ -274,6 +274,7 @@ impl std::fmt::Debug for Waiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{CopyOp, ErrorKind};
     use std::sync::Arc;
 
     #[test]
@@ -339,8 +340,9 @@ mod tests {
 
             match completion {
                 Completion::Response => waiter.post(msgid, Message::default()),
-                Completion::ConnectionFailure => waiter
-                    .fail_connection(conn_id, &Error::kind(crate::ErrorKind::ConnectionClosed)),
+                Completion::ConnectionFailure => {
+                    waiter.fail_connection(conn_id, &Error::kind(ErrorKind::ConnectionClosed))
+                }
                 Completion::Expiry => waiter.expire(Instant::now() + Duration::from_secs(2)),
             }
 
@@ -364,10 +366,10 @@ mod tests {
                     assert!(Arc::ptr_eq(&returned.unwrap(), &target));
                 }
                 Completion::ConnectionFailure => {
-                    assert_eq!(result.unwrap_err().kind, crate::ErrorKind::ConnectionClosed);
+                    assert_eq!(result.unwrap_err().kind, ErrorKind::ConnectionClosed);
                 }
                 Completion::Expiry => {
-                    assert_eq!(result.unwrap_err().kind, crate::ErrorKind::Timeout);
+                    assert_eq!(result.unwrap_err().kind, ErrorKind::Timeout);
                 }
             }
             assert_eq!(Arc::strong_count(&source), 1);
@@ -392,7 +394,7 @@ mod tests {
         waiter.expire(Instant::now() + Duration::from_secs(2));
         assert!(waiter.read_source(msgid).is_none());
         assert_eq!(
-            reading.read_inline(&[crate::CopyOp::new(0, 0, 4)]).unwrap(),
+            reading.read_inline(&[CopyOp::new(0, 0, 4)]).unwrap(),
             b"data"
         );
         drop(receiver);
@@ -499,14 +501,11 @@ mod tests {
         let (msgid_diff, _rx_diff) = waiter.alloc(std::time::Duration::from_secs(30));
         waiter.bind_connection(msgid_diff, super::next_conn_id());
 
-        let err = crate::Error::new(
-            crate::ErrorKind::ConnectionClosed,
-            "connection closed".into(),
-        );
+        let err = Error::new(ErrorKind::ConnectionClosed, "connection closed".into());
         waiter.fail_connection(conn_id, &err);
 
         let result = rx_bound.recv().await;
-        assert_eq!(result.unwrap_err().kind, crate::ErrorKind::ConnectionClosed);
+        assert_eq!(result.unwrap_err().kind, ErrorKind::ConnectionClosed);
         assert!(!waiter.contains_message_id(msgid_bound));
         assert!(waiter.contains_message_id(msgid_other));
         assert!(waiter.contains_message_id(msgid_diff));

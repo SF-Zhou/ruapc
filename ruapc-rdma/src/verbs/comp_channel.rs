@@ -3,14 +3,17 @@
 use std::{ptr, sync::Arc};
 
 use super::context::Context;
-use crate::{ErrorKind, Result};
+use crate::{
+    ErrorKind, Result, ibv_comp_channel, ibv_cq, ruapc_ibv_create_comp_channel,
+    ruapc_ibv_destroy_comp_channel, ruapc_ibv_get_cq_event,
+};
 
 /// A completion channel for event-driven CQ notifications.
 ///
 /// Holds a shared reference to the [`Context`] to guarantee the device
 /// context remains valid.
 pub struct CompChannel {
-    ptr: *mut crate::ibv_comp_channel,
+    ptr: *mut ibv_comp_channel,
     /// Prevents the context from being closed while this channel exists.
     _context: Arc<Context>,
 }
@@ -18,7 +21,7 @@ pub struct CompChannel {
 impl CompChannel {
     /// Creates a new completion channel on the given context.
     pub fn create(context: &Arc<Context>) -> Result<Arc<Self>> {
-        let ptr = unsafe { crate::ruapc_ibv_create_comp_channel(context.as_ptr()) };
+        let ptr = unsafe { ruapc_ibv_create_comp_channel(context.as_ptr()) };
         if ptr.is_null() {
             return Err(ErrorKind::IBCreateCompChannelFail.with_errno());
         }
@@ -29,7 +32,7 @@ impl CompChannel {
     }
 
     /// Returns the raw completion channel pointer.
-    pub fn as_ptr(&self) -> *mut crate::ibv_comp_channel {
+    pub fn as_ptr(&self) -> *mut ibv_comp_channel {
         self.ptr
     }
 
@@ -60,10 +63,10 @@ impl CompChannel {
     ///
     /// Returns the raw CQ pointer that received the event. The caller must
     /// acknowledge the event via [`super::CompletionQueue::ack_events`].
-    pub fn get_event(&self) -> Result<*mut crate::ibv_cq> {
-        let mut cq_ptr: *mut crate::ibv_cq = ptr::null_mut();
+    pub fn get_event(&self) -> Result<*mut ibv_cq> {
+        let mut cq_ptr: *mut ibv_cq = ptr::null_mut();
         let mut cq_context: *mut std::ffi::c_void = ptr::null_mut();
-        let ret = unsafe { crate::ruapc_ibv_get_cq_event(self.ptr, &mut cq_ptr, &mut cq_context) };
+        let ret = unsafe { ruapc_ibv_get_cq_event(self.ptr, &mut cq_ptr, &mut cq_context) };
         if ret != 0 {
             return Err(ErrorKind::IBGetCompQueueEventFail.with_errno());
         }
@@ -73,7 +76,7 @@ impl CompChannel {
 
 impl Drop for CompChannel {
     fn drop(&mut self) {
-        let _ = unsafe { crate::ruapc_ibv_destroy_comp_channel(self.ptr) };
+        let _ = unsafe { ruapc_ibv_destroy_comp_channel(self.ptr) };
     }
 }
 

@@ -3,7 +3,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Context, CopyOp, Result,
+    Context, CopyOp, Error, ErrorKind, Result,
     core::ContextEndpoint,
     remote_memory::scatter::{self, SpaceLayout},
 };
@@ -124,8 +124,8 @@ impl MemoryService for () {
             .waiter
             .read_source(req.request_id)
             .ok_or_else(|| {
-                crate::Error::new(
-                    crate::ErrorKind::Timeout,
+                Error::new(
+                    ErrorKind::Timeout,
                     "read_inline: original request is gone or has no read buffers".into(),
                 )
             })?;
@@ -138,8 +138,8 @@ impl MemoryService for () {
         // request already resolved or expired, there is nothing to write
         // into.
         let Some(target) = ctx.state.waiter.write_target(req.request_id) else {
-            return Err(crate::Error::new(
-                crate::ErrorKind::Timeout,
+            return Err(Error::new(
+                ErrorKind::Timeout,
                 "write_inline: original request is gone (timed out, completed, or \
                  attached no write buffers)"
                     .into(),
@@ -149,8 +149,8 @@ impl MemoryService for () {
         // destination side against the pinned write space.
         let total = scatter::validate_ops(&req.ops, u64::MAX, target.total_len())?;
         if total != req.bytes.len() as u64 {
-            return Err(crate::Error::new(
-                crate::ErrorKind::InvalidCopyOp,
+            return Err(Error::new(
+                ErrorKind::InvalidCopyOp,
                 format!(
                     "write_inline carries {} bytes but the ops describe {total}",
                     req.bytes.len()
@@ -171,14 +171,14 @@ impl MemoryService for () {
         // read regions.
         let regions = &ctx.msg_meta.read_regions;
         if regions.is_empty() {
-            return Err(crate::Error::new(
-                crate::ErrorKind::MissingBufferInfo,
+            return Err(Error::new(
+                ErrorKind::MissingBufferInfo,
                 "read_into_target: request metadata carries no read regions".into(),
             ));
         }
         let Some(target) = ctx.state.waiter.write_target(req.request_id) else {
-            return Err(crate::Error::new(
-                crate::ErrorKind::Timeout,
+            return Err(Error::new(
+                ErrorKind::Timeout,
                 "read_into_target: original request is gone (timed out, completed, or \
                  attached no write buffers)"
                     .into(),
@@ -197,8 +197,8 @@ impl MemoryService for () {
                     .read_into_target(regions, &src_layout, &req.ops, target, ctx.deadline)
                     .await
             }
-            _ => Err(crate::Error::new(
-                crate::ErrorKind::NotConnected,
+            _ => Err(Error::new(
+                ErrorKind::NotConnected,
                 "read_into_target requires a connected socket".into(),
             )),
         }
@@ -212,8 +212,8 @@ impl MemoryService for () {
 fn validate_region_addresses(regions: &[RemoteBufferInfo], operation: &str) -> Result<()> {
     for region in regions {
         if region.addr.checked_add(region.len).is_none() {
-            return Err(crate::Error::new(
-                crate::ErrorKind::InvalidCopyOp,
+            return Err(Error::new(
+                ErrorKind::InvalidCopyOp,
                 format!("{operation}: region address + length overflows u64"),
             ));
         }
@@ -224,6 +224,8 @@ fn validate_region_addresses(regions: &[RemoteBufferInfo], operation: &str) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::{SocketPoolConfig, remote_memory::WriteTarget};
 
     /// The bulk fields must go through serde's byte-string channel:
     /// MessagePack `bin` (length header + memcpy), not a per-element
@@ -290,7 +292,7 @@ mod tests {
     /// the ops, and requests without a pinned write target.
     #[tokio::test]
     async fn test_write_inline_validation() {
-        let ctx = Context::create(&crate::SocketPoolConfig::default()).unwrap();
+        let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
 
         // No pending request with a write target.
         let req = WriteInlineRequest {
@@ -299,13 +301,13 @@ mod tests {
             bytes: vec![0; 4],
         };
         let err = ().write_inline(&ctx, &req).await.unwrap_err();
-        assert_eq!(err.kind, crate::ErrorKind::Timeout);
+        assert_eq!(err.kind, ErrorKind::Timeout);
 
         // Pin a 8-byte write target on a pending request.
         let (msgid, _rx) = ctx.state.waiter.alloc(std::time::Duration::from_secs(5));
         let mut buf = ctx.state.buffer_pool.allocate(64 * 1024).unwrap();
         buf.set_len(8);
-        let target = crate::remote_memory::WriteTarget::new(vec![buf]).unwrap();
+        let target = WriteTarget::new(vec![buf]).unwrap();
         ctx.state.waiter.bind_write_target(msgid, target);
 
         // Length mismatch between ops and data.
@@ -315,7 +317,7 @@ mod tests {
             bytes: vec![0; 3],
         };
         let err = ().write_inline(&ctx, &req).await.unwrap_err();
-        assert_eq!(err.kind, crate::ErrorKind::InvalidCopyOp);
+        assert_eq!(err.kind, ErrorKind::InvalidCopyOp);
 
         // Out-of-bounds destination.
         let req = WriteInlineRequest {
@@ -324,7 +326,7 @@ mod tests {
             bytes: vec![0; 4],
         };
         let err = ().write_inline(&ctx, &req).await.unwrap_err();
-        assert_eq!(err.kind, crate::ErrorKind::InvalidCopyOp);
+        assert_eq!(err.kind, ErrorKind::InvalidCopyOp);
 
         // A valid inline write reaches the pinned target.
         let req = WriteInlineRequest {
@@ -336,12 +338,12 @@ mod tests {
         let target = ctx.state.waiter.write_target(msgid).unwrap();
         // The waiter entry still holds a clone, so unwrapping fails here —
         // which is exactly the pinning behavior we want.
-        assert!(crate::remote_memory::WriteTarget::try_into_buffers(target).is_none());
+        assert!(WriteTarget::try_into_buffers(target).is_none());
     }
 
     #[tokio::test]
     async fn test_request_is_pending() {
-        let ctx = Context::create(&crate::SocketPoolConfig::default()).unwrap();
+        let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
         let missing = RequestStatusRequest { request_id: 9999 };
         assert!(!().request_is_pending(&ctx, &missing).await.unwrap());
 

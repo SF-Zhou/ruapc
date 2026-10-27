@@ -3,6 +3,8 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::{Error, ErrorKind, Result};
+
 /// RDMA socket pool configuration grouped by runtime responsibility.
 #[derive(Deserialize, Serialize, Debug, Default, PartialEq, Clone)]
 #[serde(default, deny_unknown_fields)]
@@ -17,7 +19,7 @@ pub struct RdmaSocketPoolConfig {
 }
 
 impl RdmaSocketPoolConfig {
-    pub(crate) fn validate(&self) -> crate::Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         self.connection.validate()?;
         self.polling.validate()?;
         self.peers.validate()?;
@@ -73,7 +75,7 @@ impl RdmaConnectionTuningConfig {
     pub const MIN_MAX_MSG_SIZE: u32 = 16 * 1024;
     pub const MAX_LARGE_MSG_SIZE: u32 = 64 * 1024 * 1024;
 
-    fn validate(&self) -> crate::Result<()> {
+    fn validate(&self) -> Result<()> {
         if self.qp.max_send_wr < Self::MIN_RECV_QUEUE_LEN {
             return Err(invalid_config(format!(
                 "rdma.connection.qp.max_send_wr must be at least {}",
@@ -152,7 +154,7 @@ impl Default for RdmaPollingConfig {
 }
 
 impl RdmaPollingConfig {
-    fn validate(&self) -> crate::Result<()> {
+    fn validate(&self) -> Result<()> {
         if self.device_cq_len == 0 {
             return Err(invalid_config("rdma.polling.device_cq_len must be nonzero"));
         }
@@ -218,7 +220,7 @@ impl Default for RdmaPeerPoolConfig {
 }
 
 impl RdmaPeerPoolConfig {
-    fn validate(&self) -> crate::Result<()> {
+    fn validate(&self) -> Result<()> {
         if self.connections_per_peer == 0 {
             return Err(invalid_config(
                 "rdma.peers.connections_per_peer must be nonzero",
@@ -263,7 +265,7 @@ impl Default for RdmaMaintenanceConfig {
 }
 
 impl RdmaMaintenanceConfig {
-    fn validate(&self) -> crate::Result<()> {
+    fn validate(&self) -> Result<()> {
         if self.rebalance_threshold == 0 {
             return Err(invalid_config(
                 "rdma.maintenance.rebalance_threshold must be nonzero",
@@ -300,7 +302,7 @@ impl Default for RdmaProbeConfig {
 }
 
 impl RdmaProbeConfig {
-    fn validate(&self) -> crate::Result<()> {
+    fn validate(&self) -> Result<()> {
         if self.interval_ms == 0 {
             return Ok(());
         }
@@ -348,7 +350,7 @@ impl Default for RdmaRemoteMemoryConfig {
 }
 
 impl RdmaRemoteMemoryConfig {
-    fn validate(&self) -> crate::Result<()> {
+    fn validate(&self) -> Result<()> {
         if self.max_inflight_read_wrs == 0 {
             return Err(invalid_config(
                 "rdma.remote_memory.max_inflight_read_wrs must be nonzero",
@@ -383,7 +385,7 @@ impl RdmaSubnetDomains {
         self.0.is_empty()
     }
 
-    pub fn try_from_string(value: &str) -> crate::Result<Self> {
+    pub fn try_from_string(value: &str) -> Result<Self> {
         value.parse()
     }
 }
@@ -406,9 +408,9 @@ impl std::fmt::Display for RdmaSubnetDomains {
 }
 
 impl std::str::FromStr for RdmaSubnetDomains {
-    type Err = crate::Error;
+    type Err = Error;
 
-    fn from_str(value: &str) -> crate::Result<Self> {
+    fn from_str(value: &str) -> Result<Self> {
         if value.trim().is_empty() {
             return Ok(Self::default());
         }
@@ -480,14 +482,14 @@ impl Default for RdmaQueuePairConfig {
     }
 }
 
-fn invalid_config(message: impl Into<String>) -> crate::Error {
-    crate::Error::new(crate::ErrorKind::InvalidArgument, message.into())
+fn invalid_config(message: impl Into<String>) -> Error {
+    Error::new(ErrorKind::InvalidArgument, message.into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SocketPoolConfig;
+    use crate::{ErrorKind, SocketPoolConfig};
 
     #[test]
     fn partial_nested_config_uses_struct_defaults() {
@@ -648,7 +650,7 @@ mod tests {
                 ..Default::default()
             };
             let error = config.validate().unwrap_err();
-            assert_eq!(error.kind, crate::ErrorKind::InvalidArgument);
+            assert_eq!(error.kind, ErrorKind::InvalidArgument);
         }
 
         RdmaSocketPoolConfig {
@@ -707,7 +709,7 @@ mod tests {
             "invalid",
         ] {
             let error = RdmaSubnetDomains::try_from_string(value).unwrap_err();
-            assert_eq!(error.kind, crate::ErrorKind::InvalidArgument, "{value}");
+            assert_eq!(error.kind, ErrorKind::InvalidArgument, "{value}");
         }
     }
 }
