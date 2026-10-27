@@ -139,7 +139,7 @@ impl Observer {
         let mut router = Router::default();
         ProbeTestRpc::ruapc_export(Arc::new(()), &mut router);
         let observer = self.clone();
-        router.wrap_method("_ruapc.rdma/probe", move |original| {
+        router.wrap_method("RdmaProbeService/probe", move |original| {
             Box::new(move |ctx, payload| {
                 let qp = socket(&ctx).queue_pair.qp_num();
                 assert_eq!(
@@ -173,7 +173,7 @@ impl Observer {
             })
         });
         let observer = self.clone();
-        router.wrap_method("_ruapc.memory/request_is_pending", move |original| {
+        router.wrap_method("MemoryService/request_is_pending", move |original| {
             Box::new(move |ctx, payload| {
                 let qp = socket(&ctx).queue_pair.qp_num();
                 let drop_response = {

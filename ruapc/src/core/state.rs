@@ -37,7 +37,7 @@ pub struct State {
 }
 
 impl State {
-    /// Validates configuration, discovers devices, builds public schemas, and
+    /// Validates configuration, discovers devices, builds method schemas, and
     /// creates buffer/connection pools and response-waiter expiry tracking.
     /// Requires a Tokio runtime. Built-in methods are registered by
     /// [`Router::default`], before this function receives the router.

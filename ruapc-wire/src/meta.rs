@@ -44,7 +44,7 @@ pub struct MsgMeta {
     /// Regions of the sender's registered memory the receiver may *read*
     /// (RDMA READ or reverse-RPC copy). In order, they form one logical
     /// contiguous space. Attached by `Client::with_read_buffers`; also
-    /// used by the reverse `_ruapc.memory/read_into_target` request to advertise the
+    /// used by the reverse `MemoryService/read_into_target` request to advertise the
     /// server's source buffers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read_regions: Vec<RemoteBufferInfo>,

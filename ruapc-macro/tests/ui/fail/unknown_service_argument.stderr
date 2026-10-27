@@ -1,4 +1,4 @@
-error: unknown `service` argument; expected `name = "..."` or `internal`
+error: unknown `service` argument; expected `name = "..."`
  --> tests/ui/fail/unknown_service_argument.rs:3:18
   |
 3 | #[ruapc::service(public)]

@@ -11,7 +11,7 @@ rustdoc.
 | `ruapc-bufpool` | Allocation, caches and device registration | None |
 | `ruapc-rdma` | Verbs resources, owned work requests and completions | `ruapc-bufpool` |
 | `ruapc-macro` | Service validation and code generation | None at runtime |
-| `ruapc-schema` | Schema registry, OpenAPI projection and reflection data | None |
+| `ruapc-schema` | Schema registry and OpenAPI projection | None |
 | `ruapc-wire` | Message codecs, framing and codec errors | Bufpool |
 | `ruapc` | RPC lifecycle, routing, transports and remote memory | Bufpool, macro, schema, wire; optional RDMA |
 | `ruapc-demo` | Service host, typed caller and verified workloads | `ruapc` |
@@ -43,12 +43,12 @@ the dependencies retain buffer ownership and completion authority.
 | `task` | Background-task supervision and response waiters |
 | `metrics` | Cached recorder handles and scoped request accounting |
 
-`ruapc-schema` owns schema generation, OpenAPI projection, reflection data types
-and description assembly. `Router` retains handler dispatch and delegates schema
-registration to that crate. `services/meta_service.rs` adapts reflection to the
-RPC runtime; `ruapc::services` re-exports its data types. See
-[built-in services](docs/builtin-services.md#public-reflection-_ruapcmeta)
-for the reflection contract.
+`ruapc-schema` owns schema generation and OpenAPI projection. `Router` retains
+handler dispatch and delegates schema registration to that crate. Its method
+directory and OpenAPI document include every registered method. Built-in and
+application services use the same dispatch and metrics; see
+[built-in services](docs/builtin-services.md#discovery-and-dispatch) for their
+wire names, HTTP discovery and handler prerequisites.
 
 `ruapc-wire` owns `MsgMeta`, `MsgFlags`, direct serialization, stream and RDMA
 frame codecs, and `CodecError`. It accepts payload byte slices and reports

@@ -84,9 +84,9 @@ pub(crate) struct RequestStatusRequest {
     pub(crate) request_id: u64,
 }
 
-/// Internal reverse RPCs for inline copies, client-side RDMA READs, and
+/// Reverse RPCs for inline copies, client-side RDMA READs, and
 /// source-request waiter probes.
-#[ruapc_macro::service(name = "_ruapc.memory", internal)]
+#[ruapc_macro::service]
 pub(crate) trait MemoryService {
     /// Reads the original request's owned source (TCP/WS/HTTP fallback).
     /// A local `Arc` retains the source throughout the CPU copy.

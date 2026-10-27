@@ -124,6 +124,12 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Context, Result};
+
+    #[crate::service]
+    pub(super) trait TestService {
+        async fn test_call(&self, ctx: &Context, req: &()) -> Result<()>;
+    }
 
     #[test]
     fn test_default_config() {
@@ -165,13 +171,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_ruapc_request_invalid_endpoint_returns_err() {
-        use crate::{
-            Context, ErrorKind, SocketPoolConfig,
-            services::{DescribeRequest, ReflectionService as _},
-        };
+        use crate::{ErrorKind, SocketPoolConfig};
         let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
         let client = Client::default();
-        let result = client.describe(&ctx, &DescribeRequest::default()).await;
+        let result = client.test_call(&ctx, &()).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.kind, ErrorKind::InvalidArgument);

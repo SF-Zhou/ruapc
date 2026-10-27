@@ -52,7 +52,7 @@ fn test_meta_roundtrip_with_regions() {
         len: 1 << 40,
     };
     let meta = MsgMeta {
-        method: "_ruapc.memory/read_into_target".into(),
+        method: "MemoryService/read_into_target".into(),
         flags: MsgFlags::IsReq | MsgFlags::UseMessagePack,
         msgid: u64::MAX - 1,
         read_regions: vec![region, region],

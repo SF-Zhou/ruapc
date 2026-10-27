@@ -109,12 +109,10 @@ impl HttpService {
             }
         }
 
-        // Unary HTTP is part of the public RPC surface. Internal control
-        // methods remain available to trusted peers over the framed `/_rpc`
-        // stream, but must not be callable (or discoverable) as ordinary
-        // HTTP endpoints.
+        // Unary HTTP uses the same method registry as framed RPC. Handlers
+        // enforce any transport or request-metadata requirements themselves.
         let method = path.trim_start_matches('/');
-        if req.method() != hyper::Method::POST || !state.router.is_public_method(method) {
+        if req.method() != hyper::Method::POST || !state.router.has_method(method) {
             return Ok(Self::not_found());
         }
 

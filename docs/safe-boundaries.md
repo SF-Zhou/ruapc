@@ -88,7 +88,7 @@ addresses.
 ### Read first, then validate
 
 For an RDMA `remote_read` that transfers bytes, the reader waits for all READ
-completions, then calls `_ruapc.memory/request_is_pending` on the source peer.
+completions, then calls `MemoryService/request_is_pending` on the source peer.
 It returns `Ok(buffers)` only if that check succeeds with `true`. Empty or
 all-zero-length operation batches return the local buffers without I/O or
 validation.

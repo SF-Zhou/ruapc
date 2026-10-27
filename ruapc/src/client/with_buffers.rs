@@ -175,14 +175,11 @@ impl<'a> ClientWithBuffers<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::tests::TestService;
 
     #[tokio::test]
     async fn forgotten_request_cannot_release_an_active_read_source() {
-        use crate::{
-            CopyOp, MsgMeta, Socket, SocketPoolConfig,
-            services::{DescribeRequest, ReflectionService as _},
-            tcp::TcpSocket,
-        };
+        use crate::{CopyOp, MsgMeta, Socket, SocketPoolConfig, tcp::TcpSocket};
         use std::{
             future::Future,
             task::{Context as TaskContext, Poll, Waker},
@@ -203,8 +200,7 @@ mod tests {
         buffer.copy_from_slice(b"data");
         let client = Client::default();
         let mut wrapper = client.with_read_buffer(buffer);
-        let request_payload = DescribeRequest::default();
-        let mut request = Box::pin(wrapper.describe(&ctx, &request_payload));
+        let mut request = Box::pin(wrapper.test_call(&ctx, &()));
         assert!(matches!(
             request
                 .as_mut()
@@ -230,17 +226,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_buffers_recoverable_after_failed_call() {
-        use crate::{
-            SocketPoolConfig,
-            services::{DescribeRequest, ReflectionService as _},
-        };
+        use crate::SocketPoolConfig;
         let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
         let client = Client::default();
         let mut buf = ctx.state.buffer_pool.allocate(64 * 1024).unwrap();
         buf.set_len(16);
         let wrapper = client.with_write_buffers(vec![buf]);
         // Invalid endpoint: the call fails before reaching the wire.
-        let result = wrapper.describe(&ctx, &DescribeRequest::default()).await;
+        let result = wrapper.test_call(&ctx, &()).await;
         assert!(result.is_err());
         let recovered = wrapper.take_write_buffers().expect("buffers recoverable");
         assert_eq!(recovered.len(), 1);

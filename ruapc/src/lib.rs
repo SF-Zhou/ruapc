@@ -69,7 +69,7 @@ pub use devices::{Buffer, BufferPool, Devices};
 mod sockets;
 pub use sockets::*;
 
-pub mod services;
+mod services;
 
 pub use ruapc_bufpool::DEFAULT_BUFFER_POOL_MEMORY;
 pub use ruapc_bufpool::Device as _;

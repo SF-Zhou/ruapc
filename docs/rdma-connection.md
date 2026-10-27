@@ -2,7 +2,7 @@
 
 <a id="rdma-连接建立"></a>
 
-RuaPC discovers devices and exchanges QP parameters through `_ruapc.rdma`
+RuaPC discovers devices and exchanges QP parameters through `RdmaBootstrapService`
 RPCs over the endpoint's declared bootstrap transport (`tcp+rdma`, `ws+rdma`,
 or `http+rdma`), then activates the connection through the RDMA data plane.
 A peer is identified by that bootstrap transport and its complete normalized
@@ -19,7 +19,7 @@ another group address. See [endpoint identity and strings](endpoints.md).
 
 This page owns bootstrap, path selection, negotiation, peer maintenance, and
 connection health probes.
-See the [built-in method catalog](builtin-services.md#internal-rdma-bootstrap-_ruapcrdma),
+See the [built-in method catalog](builtin-services.md#rdma-bootstrap-rdmabootstrapservice),
 [capacity budgets](rdma-capacity.md), and [poller routing](qp-registry.md) for
 the adjacent contracts.
 
@@ -38,7 +38,7 @@ Paths are relative to the repository root.
 | `ruapc/src/rdma/rdma_socket_pool/handshake.rs` | One outbound handshake and rollback until publication. |
 | `ruapc/src/rdma/rdma_socket_pool/setup.rs` | Shared negotiation, poller/QP creation, endpoint generation, connection and registration. |
 | `ruapc/src/rdma/rdma_socket_pool/accept.rs` | Acceptor prepare/commit/cancel, leases, expiry. |
-| `ruapc/src/rdma/probe.rs` | Internal health RPC, remote READ validation, per-probe deadline. |
+| `ruapc/src/rdma/probe.rs` | Connection health RPC, remote READ validation, per-probe deadline. |
 | `ruapc/src/rdma/rdma_socket_pool/probe.rs` | Periodic checks of individual connections, timeout counts, reconnect scheduling. |
 | `ruapc/src/rdma/rdma_socket_pool/reconcile.rs` | Shared first-use, periodic and recovery replenishment, single-flight scheduling and backoff. |
 | `ruapc/src/rdma/rdma_socket_pool/peer.rs` | Group state, connection identity checks and recovery intent synchronized with publication. |
@@ -184,8 +184,8 @@ Implementations are `rdma_socket_pool/placement.rs`, `reconcile.rs`,
 
 Both clients and servers periodically probe each published outbound connection
 and each activated inbound connection. A probe uses that exact RDMA socket;
-it does not acquire another stripe or retry the request. The internal
-`_ruapc.rdma/probe` RPC carries a nonce and eight bytes of immutable read space.
+it does not acquire another stripe or retry the request. The
+`RdmaProbeService/probe` RPC carries a nonce and eight bytes of immutable read space.
 The receiver performs `Context::remote_read` on the same connection and returns
 both the RPC nonce and the value read. Success requires both values to match,
 including the normal post-READ source-request validation. Probes from both ends

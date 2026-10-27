@@ -1,0 +1,5 @@
+error: unknown `service` argument; expected `name = "..."`
+ --> tests/ui/fail/internal_service.rs:3:18
+  |
+3 | #[ruapc::service(internal)]
+  |                  ^^^^^^^^

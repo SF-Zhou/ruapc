@@ -1,35 +1,22 @@
-use ruapc_schema::{
-    DescribeRequest, REFLECTION_PROTOCOL_VERSION, SchemaRegistry, ServerDescription,
-};
+use ruapc_schema::SchemaRegistry;
 use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::{Value, json};
 
 #[derive(JsonSchema, Serialize)]
-struct PublicItem {
+struct Item {
     name: String,
 }
 
 #[derive(JsonSchema, Serialize)]
-struct PublicRequest {
-    item: PublicItem,
+struct Request {
+    item: Item,
 }
 
 #[derive(JsonSchema, Serialize)]
-struct PublicResponse {
-    items: Vec<PublicItem>,
-    next: Option<Box<PublicResponse>>,
-}
-
-#[derive(JsonSchema, Serialize)]
-struct SecretDetails {
-    secret: String,
-}
-
-#[derive(JsonSchema, Serialize)]
-#[schemars(rename = "PublicRequest")]
-struct InternalRequest {
-    internal: SecretDetails,
+struct Response {
+    items: Vec<Item>,
+    next: Option<Box<Response>>,
 }
 
 #[derive(JsonSchema, Serialize)]
@@ -68,37 +55,65 @@ fn assert_local_references_resolve(document: &Value) {
 }
 
 #[test]
-fn internal_registration_does_not_change_public_names_or_definitions() {
-    let mut registry = SchemaRegistry::default();
-    registry.register::<InternalRequest, SecretDetails>(false);
-    let public = registry.register::<PublicRequest, PublicResponse>(true);
-    let document = registry
-        .build([("Public/run", &public)].into_iter())
-        .unwrap();
+fn methods_with_matching_schema_names_keep_distinct_request_definitions() {
+    mod messages {
+        #[derive(schemars::JsonSchema, serde::Serialize)]
+        pub struct Request {
+            message: String,
+        }
+    }
 
-    let schemas = &document.components.as_ref().unwrap().schemas;
-    assert!(schemas.contains_key("PublicRequest"));
-    assert!(!schemas.contains_key("PublicRequest2"));
-    assert!(!schemas.contains_key("SecretDetails"));
-    assert_eq!(document.paths.paths.len(), 1);
-    assert!(document.paths.paths.contains_key("/Public/run"));
+    mod counts {
+        #[derive(schemars::JsonSchema, serde::Serialize)]
+        pub struct Request {
+            count: u64,
+        }
+    }
 
-    let mut public_only = SchemaRegistry::default();
-    let expected_schema = public_only.register::<PublicRequest, PublicResponse>(true);
-    let expected = public_only
-        .build([("Public/run", &expected_schema)].into_iter())
-        .unwrap();
     assert_eq!(
-        serde_json::to_value(&document).unwrap(),
-        serde_json::to_value(expected).unwrap()
+        messages::Request::schema_name(),
+        counts::Request::schema_name()
     );
-    assert_local_references_resolve(&serde_json::to_value(document).unwrap());
+    assert_ne!(messages::Request::schema_id(), counts::Request::schema_id());
+
+    let mut registry = SchemaRegistry::default();
+    let message = registry.register::<messages::Request, ()>();
+    let count = registry.register::<counts::Request, ()>();
+    let document = registry
+        .build([("Messages/send", &message), ("Counts/set", &count)].into_iter())
+        .unwrap();
+    let value = serde_json::to_value(document).unwrap();
+    let paths = value["paths"].as_object().unwrap();
+    assert_eq!(paths.len(), 2);
+    assert!(paths.contains_key("/Messages/send"));
+    assert!(paths.contains_key("/Counts/set"));
+
+    let request_ref = |path: &str| {
+        value["paths"][path]["post"]["requestBody"]["content"]["application/json"]["schema"]["$ref"]
+            .as_str()
+            .unwrap()
+    };
+    let message_ref = request_ref("/Messages/send");
+    let count_ref = request_ref("/Counts/set");
+    assert_ne!(message_ref, count_ref);
+
+    for (reference, property, property_type) in [
+        (message_ref, "message", "string"),
+        (count_ref, "count", "integer"),
+    ] {
+        let schema = value.pointer(reference.strip_prefix('#').unwrap()).unwrap();
+        let properties = schema["properties"].as_object().unwrap();
+        assert_eq!(properties.len(), 1);
+        assert_eq!(properties[property]["type"], property_type);
+        assert_eq!(schema["required"], json!([property]));
+    }
+    assert_local_references_resolve(&value);
 }
 
 #[test]
 fn openapi_keeps_response_envelopes_and_definitions_across_rebuilds() {
     let mut registry = SchemaRegistry::default();
-    let first = registry.register::<PublicRequest, Result<PublicResponse, String>>(true);
+    let first = registry.register::<Request, Result<Response, String>>();
     let initial = registry.build([("Svc/first", &first)].into_iter()).unwrap();
     let repeated = registry.build([("Svc/first", &first)].into_iter()).unwrap();
     assert_eq!(
@@ -106,7 +121,7 @@ fn openapi_keeps_response_envelopes_and_definitions_across_rebuilds() {
         serde_json::to_value(repeated).unwrap()
     );
 
-    let second = registry.register::<AdditionalRequest, PublicResponse>(true);
+    let second = registry.register::<AdditionalRequest, Response>();
     let document = registry
         .build([("Svc/second", &second), ("Svc/first", &first)].into_iter())
         .unwrap();
@@ -147,84 +162,6 @@ fn openapi_keeps_response_envelopes_and_definitions_across_rebuilds() {
 }
 
 #[test]
-fn reflection_filters_exact_service_names_and_keeps_references() {
-    let mut registry = SchemaRegistry::default();
-    let schema = registry.register::<PublicRequest, PublicResponse>(true);
-    let methods = [
-        ("SearchV2/find", &schema),
-        ("Search/zebra", &schema),
-        ("Alpha/run", &schema),
-        ("Search/apple", &schema),
-    ];
-    let openapi = registry.build(methods.into_iter()).unwrap();
-    let describe = |service| {
-        ServerDescription::from_methods(
-            "serving-version",
-            &DescribeRequest { service },
-            methods.into_iter(),
-            openapi.components.as_ref(),
-        )
-        .unwrap()
-    };
-
-    let all = describe(None);
-    assert_eq!(all.protocol_version, REFLECTION_PROTOCOL_VERSION);
-    assert_eq!(all.ruapc_version, "serving-version");
-    assert_eq!(
-        all.services
-            .iter()
-            .map(|service| service.name.as_str())
-            .collect::<Vec<_>>(),
-        ["Alpha", "Search", "SearchV2"]
-    );
-    let filtered = describe(Some("Search".into()));
-    assert_eq!(filtered.services.len(), 1);
-    assert_eq!(filtered.services[0].name, "Search");
-    assert_eq!(
-        filtered.services[0]
-            .methods
-            .iter()
-            .map(|method| method.name.as_str())
-            .collect::<Vec<_>>(),
-        ["apple", "zebra"]
-    );
-    assert_eq!(filtered.components, all.components);
-    let value = serde_json::to_value(filtered).unwrap();
-    assert_local_references_resolve(&value);
-    let restored: ServerDescription = serde_json::from_value(value.clone()).unwrap();
-    assert_eq!(serde_json::to_value(restored).unwrap(), value);
-    assert!(describe(Some("Sear".into())).services.is_empty());
-}
-
-#[test]
-fn empty_reflection_has_the_existing_wire_shape() {
-    let description = ServerDescription::from_methods(
-        "implementation-version",
-        &DescribeRequest::default(),
-        std::iter::empty(),
-        None,
-    )
-    .unwrap();
-    assert_eq!(
-        serde_json::to_value(description).unwrap(),
-        json!({
-            "protocol_version": 1,
-            "ruapc_version": "implementation-version",
-            "services": [],
-            "components": {},
-        })
-    );
-    assert_eq!(
-        serde_json::to_value(DescribeRequest::default()).unwrap(),
-        json!({"service": null})
-    );
-    assert_eq!(
-        serde_json::to_value(schemars::schema_for!(DescribeRequest)).unwrap()["description"],
-        "Selects the public services returned by [`ReflectionService::describe`]."
-    );
-}
-
-#[test]
 fn unsupported_openapi_schema_is_returned_as_an_error() {
     struct Unsupported;
 
@@ -239,7 +176,7 @@ fn unsupported_openapi_schema_is_returned_as_an_error() {
     }
 
     let mut registry = SchemaRegistry::default();
-    let schema = registry.register::<Unsupported, ()>(true);
+    let schema = registry.register::<Unsupported, ()>();
     assert!(
         registry
             .build([("Invalid/run", &schema)].into_iter())

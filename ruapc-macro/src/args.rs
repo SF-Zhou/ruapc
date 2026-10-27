@@ -10,7 +10,6 @@ use syn::{
 #[derive(Default)]
 pub(crate) struct ServiceArgs {
     pub(crate) name: Option<LitStr>,
-    pub(crate) internal: bool,
 }
 
 impl Parse for ServiceArgs {
@@ -40,39 +39,19 @@ impl Parse for ServiceArgs {
                     validate_name(&name)?;
                     args.name = Some(name);
                 }
-                Meta::Path(path) if path.is_ident("internal") => {
-                    if args.internal {
-                        return Err(syn::Error::new(
-                            path.span(),
-                            "duplicate `internal` argument",
-                        ));
-                    }
-                    args.internal = true;
-                }
                 Meta::Path(path) if path.is_ident("name") => {
                     return Err(syn::Error::new(
                         path.span(),
                         "`name` requires a string value, for example `name = \"MyService\"`",
                     ));
                 }
-                Meta::NameValue(meta) if meta.path.is_ident("internal") => {
-                    return Err(syn::Error::new(
-                        meta.span(),
-                        "`internal` is a flag and does not take a value",
-                    ));
-                }
-                Meta::List(meta)
-                    if meta.path.is_ident("name") || meta.path.is_ident("internal") =>
-                {
-                    return Err(syn::Error::new(
-                        meta.span(),
-                        "expected `name = \"...\"` or `internal`",
-                    ));
+                Meta::List(meta) if meta.path.is_ident("name") => {
+                    return Err(syn::Error::new(meta.span(), "expected `name = \"...\"`"));
                 }
                 other => {
                     return Err(syn::Error::new(
                         other.span(),
-                        "unknown `service` argument; expected `name = \"...\"` or `internal`",
+                        "unknown `service` argument; expected `name = \"...\"`",
                     ));
                 }
             }

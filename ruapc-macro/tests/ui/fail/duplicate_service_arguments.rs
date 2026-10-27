@@ -5,9 +5,4 @@ pub trait DuplicateName {
     async fn hello(&self, ctx: &ruapc::Context, req: &()) -> ruapc::Result<()>;
 }
 
-#[ruapc::service(internal, internal)]
-pub trait DuplicateInternal {
-    async fn hello(&self, ctx: &ruapc::Context, req: &()) -> ruapc::Result<()>;
-}
-
 fn main() {}

@@ -5,7 +5,7 @@
 
 use std::{str::FromStr, sync::Arc};
 
-use ruapc::{ListenMode, Router, SocketPoolConfig};
+use ruapc::{ErrorKind, ListenMode, Router, SocketPoolConfig};
 
 #[ruapc::service]
 trait TestService {
@@ -29,17 +29,19 @@ fn http_client() -> reqwest::Client {
 }
 
 #[tokio::test]
-async fn test_http_openapi_json_endpoint() {
+async fn test_http_openapi_includes_builtin_methods() {
     let test_service = Arc::new(TestServiceImpl);
     let mut router = Router::default();
     test_service.ruapc_export(&mut router);
 
     let config = SocketPoolConfig {
         listen_mode: ListenMode::UNIFIED,
+        #[cfg(feature = "rdma")]
+        rdma: None,
         ..Default::default()
     };
     let server = ruapc::Server::create(router, &config).unwrap();
-    let addr = std::net::SocketAddr::from_str("0.0.0.0:0").unwrap();
+    let addr = std::net::SocketAddr::from_str("127.0.0.1:0").unwrap();
     let addr = server.listen(addr).await.unwrap();
 
     // Test /openapi.json endpoint
@@ -60,23 +62,110 @@ async fn test_http_openapi_json_endpoint() {
     let openapi_json: serde_json::Value = response.json().await.unwrap();
     assert!(openapi_json.get("openapi").is_some());
     let paths = openapi_json["paths"].as_object().unwrap();
-    assert!(paths.contains_key("/TestService/test_method"));
-    assert!(paths.contains_key("/_ruapc.meta/describe"));
-    assert!(
-        paths
-            .keys()
-            .all(|path| !path.starts_with("/_ruapc.memory/") && !path.starts_with("/_ruapc.rdma/"))
-    );
+    let expected_paths = [
+        "/TestService/test_method",
+        "/MemoryService/read_inline",
+        "/MemoryService/write_inline",
+        "/MemoryService/read_into_target",
+        "/MemoryService/request_is_pending",
+        #[cfg(feature = "rdma")]
+        "/RdmaBootstrapService/discover",
+        #[cfg(feature = "rdma")]
+        "/RdmaBootstrapService/prepare_connection",
+        #[cfg(feature = "rdma")]
+        "/RdmaBootstrapService/commit_connection",
+        #[cfg(feature = "rdma")]
+        "/RdmaBootstrapService/cancel_connection",
+        #[cfg(feature = "rdma")]
+        "/RdmaProbeService/probe",
+    ];
+    assert_eq!(paths.len(), expected_paths.len());
+    for path in expected_paths {
+        assert!(paths.contains_key(path), "missing OpenAPI path: {path}");
+    }
 
-    // Internal control-plane methods remain usable on framed peer RPC
-    // streams, but are not exposed as ordinary unary HTTP endpoints.
+    server.stop();
+    server.join().await;
+}
+
+#[tokio::test]
+async fn test_http_builtin_methods_dispatch_and_validate_context() {
+    let config = SocketPoolConfig {
+        listen_mode: ListenMode::UNIFIED,
+        #[cfg(feature = "rdma")]
+        rdma: None,
+        ..Default::default()
+    };
+    let server = ruapc::Server::create(Router::default(), &config).unwrap();
+    let addr = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let client = http_client();
+
     let response = client
-        .post(format!("http://{}/_ruapc.memory/request_is_pending", addr))
-        .json(&serde_json::json!({ "request_id": 1 }))
+        .post(format!("http://{addr}/MemoryService/request_is_pending"))
+        .json(&serde_json::json!({ "request_id": u64::MAX }))
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), 404);
+    assert_eq!(response.status(), 200);
+    assert!(
+        !response
+            .json::<ruapc::Result<bool>>()
+            .await
+            .unwrap()
+            .unwrap()
+    );
+
+    // Routing succeeds for built-ins; handler-specific prerequisites still
+    // reject absent source requests, missing attachments and non-RDMA sockets.
+    for (path, payload, expected_error) in [
+        (
+            "/MemoryService/read_inline",
+            serde_json::json!({ "request_id": u64::MAX, "ops": [] }),
+            ErrorKind::Timeout,
+        ),
+        (
+            "/MemoryService/write_inline",
+            serde_json::json!({ "request_id": u64::MAX, "ops": [], "bytes": [] }),
+            ErrorKind::Timeout,
+        ),
+        (
+            "/MemoryService/read_into_target",
+            serde_json::json!({ "request_id": u64::MAX, "ops": [] }),
+            ErrorKind::MissingBufferInfo,
+        ),
+        #[cfg(feature = "rdma")]
+        (
+            "/RdmaBootstrapService/discover",
+            serde_json::Value::Null,
+            ErrorKind::InvalidArgument,
+        ),
+        #[cfg(feature = "rdma")]
+        (
+            "/RdmaProbeService/probe",
+            serde_json::json!(17),
+            ErrorKind::InvalidArgument,
+        ),
+    ] {
+        let response = client
+            .post(format!("http://{addr}{path}"))
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "handler not reached: {path}");
+        let result: ruapc::Result<serde_json::Value> = response.json().await.unwrap();
+        assert_eq!(result.unwrap_err().kind, expected_error, "path: {path}");
+    }
+
+    for path in ["/_ruapc.meta/describe", "/_ruapc.meta/openapi"] {
+        let response = client
+            .post(format!("http://{addr}{path}"))
+            .json(&serde_json::Value::Null)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404, "removed reflection method: {path}");
+    }
 
     server.stop();
     server.join().await;

@@ -12,45 +12,32 @@ use crate::rdma::{RdmaBootstrapService, RdmaProbeService};
 use crate::{
     Context, Payload,
     error::{Error, ErrorKind, Result},
-    services::{MemoryService, ReflectionService},
+    services::MemoryService,
 };
 
 /// Type alias for service method handler functions.
 type Func = Box<dyn Fn(Context, Payload) -> Result<()> + Send + Sync>;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MethodVisibility {
-    Public,
-    Internal,
-}
-
-impl MethodVisibility {
-    fn is_public(self) -> bool {
-        self == Self::Public
-    }
-}
-
 /// Internal method representation containing metadata and handler.
 struct Method {
     /// Method schema information.
     schema: MethodSchema,
-    /// Whether this method is exposed through public reflection APIs.
-    visibility: MethodVisibility,
     /// The actual handler function for this method.
     func: Func,
 }
 
-/// Service registry, request dispatch and public method schemas.
+/// Service registry, request dispatch and method schemas.
 ///
 /// Define services with [`#[service]`](crate::service) and call their generated
 /// `ruapc_export` before passing the router to [`Server::create`](crate::Server::create)
-/// or [`Context::create_with_router`]. The default router includes public
-/// reflection and internal remote-memory services, plus RDMA bootstrap and
+/// or [`Context::create_with_router`]. The default router includes
+/// remote-memory services, plus RDMA bootstrap and
 /// connection probes when that feature is enabled.
 ///
-/// Internal methods remain dispatchable but are excluded from
-/// [`method_names`](Self::method_names), [`method_schemas`](Self::method_schemas)
-/// and OpenAPI. Registration rejects duplicate wire names across both visibilities.
+/// All registered methods appear in [`method_names`](Self::method_names),
+/// [`method_schemas`](Self::method_schemas) and OpenAPI, and can be called through
+/// unary HTTP subject to their handler's transport and context requirements.
+/// Registration rejects duplicate wire names.
 pub struct Router {
     schemas: SchemaRegistry,
     /// Registered methods mapped by name (e.g., "ServiceName/method_name").
@@ -68,7 +55,6 @@ impl Default for Router {
             openapi: OpenAPI::default(),
         };
         let dummy = Arc::new(());
-        ReflectionService::ruapc_export(dummy.clone(), &mut this);
         MemoryService::ruapc_export(dummy.clone(), &mut this);
         #[cfg(feature = "rdma")]
         RdmaBootstrapService::ruapc_export(dummy.clone(), &mut this);
@@ -79,7 +65,7 @@ impl Default for Router {
 }
 
 impl Router {
-    /// Interposes on an existing handler without changing its schemas or visibility.
+    /// Interposes on an existing handler without changing its schemas.
     #[cfg(all(test, feature = "rdma"))]
     pub(crate) fn wrap_method(&mut self, name: &str, wrap: impl FnOnce(Func) -> Func) {
         let method = self.methods.get_mut(name).expect("test method must exist");
@@ -87,7 +73,7 @@ impl Router {
         method.func = wrap(original);
     }
 
-    /// Registers a public method and its request/response schemas.
+    /// Registers a method and its request/response schemas.
     ///
     /// Normally called by [`#[service]`](crate::service). `name` is the wire name
     /// `Service/method`; `func` receives the context and undecoded payload.
@@ -99,32 +85,6 @@ impl Router {
     /// with two nonempty components and no surrounding whitespace.
     pub fn add_method<Req, Rsp>(&mut self, name: &str, func: Func)
     where
-        Req: JsonSchema,
-        Rsp: JsonSchema,
-    {
-        self.add_method_with_visibility::<Req, Rsp>(name, func, MethodVisibility::Public);
-    }
-
-    /// Registers a method hidden from unary HTTP, public reflection and OpenAPI.
-    ///
-    /// This is public only because `#[ruapc::service(internal)]` expands in
-    /// downstream crates and must be able to call it. Name validation and
-    /// duplicate-registration panics match [`add_method`](Self::add_method).
-    #[doc(hidden)]
-    pub fn add_internal_method<Req, Rsp>(&mut self, name: &str, func: Func)
-    where
-        Req: JsonSchema,
-        Rsp: JsonSchema,
-    {
-        self.add_method_with_visibility::<Req, Rsp>(name, func, MethodVisibility::Internal);
-    }
-
-    fn add_method_with_visibility<Req, Rsp>(
-        &mut self,
-        name: &str,
-        func: Func,
-        visibility: MethodVisibility,
-    ) where
         Req: JsonSchema,
         Rsp: JsonSchema,
     {
@@ -147,14 +107,13 @@ impl Router {
         self.methods.insert(
             name.to_string(),
             Method {
-                schema: self.schemas.register::<Req, Rsp>(visibility.is_public()),
-                visibility,
+                schema: self.schemas.register::<Req, Rsp>(),
                 func,
             },
         );
     }
 
-    /// Rebuilds [`openapi`](Self::openapi) from public methods as OpenAPI 3.0
+    /// Rebuilds [`openapi`](Self::openapi) from all methods as OpenAPI 3.0
     /// POST endpoints with request, response and referenced component schemas.
     /// Server and context creation call this automatically.
     ///
@@ -175,7 +134,7 @@ impl Router {
         Ok(())
     }
 
-    /// Returns an iterator over publicly discoverable method names.
+    /// Returns an iterator over all registered method names.
     ///
     /// # Examples
     ///
@@ -187,31 +146,19 @@ impl Router {
     /// }
     /// ```
     pub fn method_names(&self) -> impl Iterator<Item = &str> {
-        self.methods
-            .iter()
-            .filter(|(_, method)| method.visibility.is_public())
-            .map(|(name, _)| name.as_str())
-    }
-
-    /// Returns whether `name` identifies a publicly exposed method.
-    pub fn is_public_method(&self, name: &str) -> bool {
-        self.methods
-            .get(name)
-            .is_some_and(|method| method.visibility.is_public())
-    }
-
-    pub(crate) fn all_method_names(&self) -> impl Iterator<Item = &str> {
         self.methods.keys().map(String::as_str)
     }
 
-    /// Returns the schemas of all publicly discoverable methods.
+    /// Returns whether `name` identifies a registered method.
+    pub fn has_method(&self, name: &str) -> bool {
+        self.methods.contains_key(name)
+    }
+
+    /// Returns the schemas of all registered methods.
     pub fn method_schemas(&self) -> impl Iterator<Item = (&str, &MethodSchema)> {
-        self.methods.iter().filter_map(|(name, method)| {
-            method
-                .visibility
-                .is_public()
-                .then_some((name.as_str(), &method.schema))
-        })
+        self.methods
+            .iter()
+            .map(|(name, method)| (name.as_str(), &method.schema))
     }
 
     /// Calls the registered callback for `ctx.msg_meta.method` synchronously.
@@ -220,9 +167,6 @@ impl Router {
     /// deadline checks and panic containment. Custom callbacks supply their own
     /// policies; their returned errors are discarded here. An unknown method
     /// spawns a task to send an [`ErrorKind::InvalidArgument`] response.
-    ///
-    /// This dispatch path includes internal methods. Unary HTTP checks public
-    /// visibility before calling it.
     pub fn dispatch(&self, mut ctx: Context, payload: Payload) {
         if let Some(method) = self.methods.get(&ctx.msg_meta.method) {
             let _ = (method.func)(ctx, payload);
@@ -240,7 +184,7 @@ impl Router {
 impl std::fmt::Debug for Router {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Router")
-            .field("methods", &self.all_method_names().collect::<Vec<_>>())
+            .field("methods", &self.method_names().collect::<Vec<_>>())
             .field("generator", &())
             .finish()
     }
@@ -265,59 +209,71 @@ mod tests {
         result: u64,
     }
 
-    #[derive(Serialize, Deserialize, JsonSchema)]
-    struct InternalReq {
-        secret: String,
-    }
-
     fn noop_func(_ctx: Context, _payload: Payload) -> Result<()> {
         Ok(())
     }
 
     #[test]
     fn test_router_default_has_exact_builtin_methods() {
-        let router = Router::default();
-        let mut public_names: Vec<_> = router.method_names().collect();
-        public_names.sort_unstable();
-        assert_eq!(
-            public_names,
-            ["_ruapc.meta/describe", "_ruapc.meta/openapi"]
-        );
-
-        let mut all_names: Vec<_> = router.all_method_names().collect();
+        let mut router = Router::default();
+        router.build_open_api().unwrap();
+        let mut all_names: Vec<_> = router.method_names().collect();
         all_names.sort_unstable();
         let mut expected = vec![
-            "_ruapc.memory/read_inline",
-            "_ruapc.memory/read_into_target",
-            "_ruapc.memory/request_is_pending",
-            "_ruapc.memory/write_inline",
-            "_ruapc.meta/describe",
-            "_ruapc.meta/openapi",
+            "MemoryService/read_inline",
+            "MemoryService/read_into_target",
+            "MemoryService/request_is_pending",
+            "MemoryService/write_inline",
         ];
         #[cfg(feature = "rdma")]
         expected.extend([
-            "_ruapc.rdma/cancel_connection",
-            "_ruapc.rdma/commit_connection",
-            "_ruapc.rdma/discover",
-            "_ruapc.rdma/prepare_connection",
-            "_ruapc.rdma/probe",
+            "RdmaBootstrapService/cancel_connection",
+            "RdmaBootstrapService/commit_connection",
+            "RdmaBootstrapService/discover",
+            "RdmaBootstrapService/prepare_connection",
+            "RdmaProbeService/probe",
         ]);
         expected.sort_unstable();
         assert_eq!(all_names, expected);
-        #[cfg(feature = "rdma")]
-        {
-            assert!(!router.is_public_method("_ruapc.rdma/probe"));
-            assert!(
-                router
-                    .method_schemas()
-                    .all(|(name, _)| name != "_ruapc.rdma/probe")
-            );
+        let mut schemas: Vec<_> = router.method_schemas().map(|(name, _)| name).collect();
+        schemas.sort_unstable();
+        assert_eq!(schemas, expected);
+        assert_eq!(router.openapi.paths.paths.len(), expected.len());
+        for name in expected {
+            assert!(router.has_method(name));
+            assert!(router.openapi.paths.paths.contains_key(&format!("/{name}")));
+        }
+
+        let document = serde_json::to_value(&router.openapi).unwrap();
+        assert_resolved_references(&document, &document);
+    }
+
+    fn assert_resolved_references(value: &serde_json::Value, document: &serde_json::Value) {
+        match value {
+            serde_json::Value::Object(object) => {
+                if let Some(reference) = object.get("$ref").and_then(serde_json::Value::as_str) {
+                    let pointer = reference.strip_prefix('#').expect("local schema reference");
+                    assert!(
+                        document.pointer(pointer).is_some(),
+                        "unresolved {reference}"
+                    );
+                }
+                for value in object.values() {
+                    assert_resolved_references(value, document);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    assert_resolved_references(value, document);
+                }
+            }
+            _ => {}
         }
     }
 
     #[cfg(feature = "rdma")]
     #[tokio::test]
-    async fn test_builtin_rdma_probe_is_not_a_unary_http_endpoint() {
+    async fn test_builtin_rdma_probe_over_http_requires_rdma_connection() {
         let config = SocketPoolConfig {
             listen_mode: ListenMode::UNIFIED,
             rdma: None,
@@ -326,24 +282,35 @@ mod tests {
         let server = Server::create(Router::default(), &config).unwrap();
         let address = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
         assert!(
-            !server
+            server
                 .state()
                 .router
                 .openapi
                 .paths
                 .paths
-                .contains_key("/_ruapc.rdma/probe")
+                .contains_key("/RdmaProbeService/probe")
         );
         let response = reqwest::Client::builder()
             .no_proxy()
             .build()
             .unwrap()
-            .post(format!("http://{address}/_ruapc.rdma/probe"))
+            .post(format!("http://{address}/RdmaProbeService/probe"))
             .json(&7u64)
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), 404);
+        assert_eq!(response.status(), 200);
+        let error = response
+            .json::<Result<serde_json::Value>>()
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::InvalidArgument);
+        assert!(
+            error
+                .to_string()
+                .contains("requires an established RDMA connection")
+        );
         server.stop();
         server.join().await;
     }
@@ -358,30 +325,8 @@ mod tests {
         let new_count = router.method_names().count();
         assert_eq!(new_count, initial_count + 1);
         assert!(router.method_names().any(|n| n == "TestSvc/do_thing"));
-        assert!(router.is_public_method("TestSvc/do_thing"));
-    }
-
-    #[test]
-    fn test_internal_method_is_dispatchable_but_not_publicly_discoverable() {
-        let mut router = Router::default();
-        let initial_public_count = router.method_names().count();
-        let initial_total_count = router.all_method_names().count();
-
-        router.add_internal_method::<InternalReq, DummyRsp>("Control/secret", Box::new(noop_func));
-
-        assert_eq!(router.method_names().count(), initial_public_count);
-        assert_eq!(router.all_method_names().count(), initial_total_count + 1);
-        assert!(!router.is_public_method("Control/secret"));
-        assert!(
-            router
-                .all_method_names()
-                .any(|name| name == "Control/secret")
-        );
-        assert!(
-            router
-                .method_schemas()
-                .all(|(name, _)| name != "Control/secret")
-        );
+        assert!(router.has_method("TestSvc/do_thing"));
+        assert!(!router.has_method("TestSvc/missing"));
     }
 
     #[test]
@@ -404,17 +349,6 @@ mod tests {
         router.build_open_api().unwrap();
         let second = serde_json::to_value(&router.openapi).unwrap();
         assert_eq!(second, first, "OpenAPI generation should be idempotent");
-    }
-
-    #[test]
-    fn test_build_open_api_excludes_internal_methods_and_schemas() {
-        let mut router = Router::default();
-        router.add_internal_method::<InternalReq, DummyRsp>("Control/secret", Box::new(noop_func));
-        router.build_open_api().unwrap();
-
-        assert!(!router.openapi.paths.paths.contains_key("/Control/secret"));
-        let components = router.openapi.components.as_ref().unwrap();
-        assert!(!components.schemas.contains_key("InternalReq"));
     }
 
     #[test]
@@ -443,10 +377,10 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "RPC method `Duplicate/run` is already registered")]
-    fn test_duplicate_wire_name_is_rejected_across_visibilities() {
+    fn test_duplicate_wire_name_is_rejected() {
         let mut router = Router::default();
         router.add_method::<DummyReq, DummyRsp>("Duplicate/run", Box::new(noop_func));
-        router.add_internal_method::<DummyReq, DummyRsp>("Duplicate/run", Box::new(noop_func));
+        router.add_method::<DummyReq, DummyRsp>("Duplicate/run", Box::new(noop_func));
     }
 
     #[test]
