@@ -139,7 +139,7 @@ impl Fixture {
             .unwrap();
         let descriptor = self.pending.try_recv().expect("accepted offer is queued");
         let mut offer = None;
-        decode_frames(&Bytes::from_owner(descriptor), |frame| {
+        decode_frames(&Bytes::from_owner(descriptor), |frame| -> Result<()> {
             let Frame::Control(ControlFrame::Offer(value)) = frame else {
                 panic!("large request must enqueue a rendezvous offer");
             };

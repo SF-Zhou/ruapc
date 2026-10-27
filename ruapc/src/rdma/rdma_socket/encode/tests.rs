@@ -54,6 +54,37 @@ impl Serialize for CountedPayload<'_> {
 }
 
 #[test]
+fn finish_rejects_invalid_metadata_without_mutating_encoded_state() {
+    let pool = pool();
+    let budget = Arc::new(Semaphore::new(128 * 1024));
+    for bytes in [&[][..], &[42; 16][..]] {
+        let mut message = message(&pool, &budget, INLINE, 256 * 1024);
+        message.write_all(bytes).unwrap();
+        message.encoded.payload_offset = 11;
+
+        for (meta_offset, payload_offset) in [
+            (4, 7),
+            (4, 8),
+            (8, 4),
+            (4, bytes.len() + 1),
+            (usize::MAX, usize::MAX),
+        ] {
+            assert_eq!(
+                message
+                    .finish(meta_offset, payload_offset)
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::InvalidArgument,
+                "offsets ({meta_offset}, {payload_offset}) in {} bytes",
+                bytes.len(),
+            );
+            assert_eq!(&message.encoded.buffer[..], bytes);
+            assert_eq!(message.encoded.payload_offset, 11);
+        }
+    }
+}
+
+#[test]
 fn grows_across_multiple_buffers_without_serializing_user_value_again() {
     let pool = pool();
     for use_msgpack in [true, false] {

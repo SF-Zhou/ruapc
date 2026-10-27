@@ -14,6 +14,7 @@ run `cargo doc -p ruapc --no-deps --open`.
 | Allocate and register buffers | [Buffer pool](../ruapc-bufpool/README.md) |
 | Use the low-level verbs crate | [RDMA crate](../ruapc-rdma/README.md) |
 | Generate schemas and reflection data without the RPC runtime | [Schema crate](../ruapc-schema/README.md) |
+| Encode and decode RPC messages without the RPC runtime | [Wire crate](../ruapc-wire/README.md) |
 | Set up a development or test environment | [Contributing](../CONTRIBUTING.md) |
 | Measure and compare performance | [Benchmarks](benchmark.md) |
 | Upgrade between releases | [Changelog](../CHANGELOG.md) |

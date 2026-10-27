@@ -196,6 +196,24 @@ impl From<std::io::Error> for Error {
     }
 }
 
+impl From<ruapc_wire::CodecError> for Error {
+    fn from(error: ruapc_wire::CodecError) -> Self {
+        use ruapc_wire::CodecErrorKind;
+
+        let kind = match error.kind {
+            CodecErrorKind::InvalidArgument => ErrorKind::InvalidArgument,
+            CodecErrorKind::SerializeFailed => ErrorKind::SerializeFailed,
+            CodecErrorKind::DeserializeFailed => ErrorKind::DeserializeFailed,
+            CodecErrorKind::Json => ErrorKind::SerdeJsonError,
+            CodecErrorKind::InvalidFrame => ErrorKind::TcpParseMsgFailed,
+        };
+        Self {
+            kind,
+            msg: error.msg,
+        }
+    }
+}
+
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.msg.is_empty() {
@@ -305,6 +323,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn error_wire_representation_is_stable() {
+        let error = Error::new(ErrorKind::Timeout, "expired".into());
+        let json = serde_json::json!({"kind": "Timeout", "msg": "expired"});
+        let message_pack: &[u8] = b"\x82\xa4kind\xa7Timeout\xa3msg\xa7expired";
+
+        assert_eq!(serde_json::to_value(&error).unwrap(), json);
+        assert_eq!(serde_json::from_value::<Error>(json).unwrap(), error);
+        assert_eq!(rmp_serde::to_vec_named(&error).unwrap(), message_pack);
+        assert_eq!(rmp_serde::from_slice::<Error>(message_pack).unwrap(), error);
+    }
+
+    #[test]
+    fn unknown_error_names_round_trip_without_a_new_tag() {
+        let error = Error::new(ErrorKind::Unknown("NewError".into()), "future".into());
+        let json = serde_json::json!({"kind": "NewError", "msg": "future"});
+        let message_pack: &[u8] = b"\x82\xa4kind\xa8NewError\xa3msg\xa6future";
+
+        assert_eq!(
+            serde_json::from_value::<Error>(json.clone()).unwrap(),
+            error
+        );
+        assert_eq!(serde_json::to_value(&error).unwrap(), json);
+        assert_eq!(rmp_serde::from_slice::<Error>(message_pack).unwrap(), error);
+        assert_eq!(rmp_serde::to_vec_named(&error).unwrap(), message_pack);
+    }
+
+    #[cfg(feature = "rdma")]
+    #[test]
+    fn rdma_conversion_preserves_the_typed_error_and_wire_tag() {
+        let error: Error = ruapc_rdma::Error::new(
+            ruapc_rdma::ErrorKind::IBOpenDeviceFail,
+            "device unavailable".into(),
+        )
+        .into();
+        assert_eq!(
+            error.kind,
+            ErrorKind::RdmaError(ruapc_rdma::ErrorKind::IBOpenDeviceFail)
+        );
+        assert_eq!(error.msg, "device unavailable");
+        let json = serde_json::json!({
+            "kind": {"RdmaError": "IBOpenDeviceFail"},
+            "msg": "device unavailable",
+        });
+        assert_eq!(serde_json::to_value(&error).unwrap(), json);
+        assert_eq!(serde_json::from_value::<Error>(json).unwrap(), error);
+    }
+
+    #[test]
     fn test_error_kind() {
         let kind = ErrorKind::Timeout;
         let error: Error = kind.into();
@@ -391,5 +457,23 @@ mod tests {
         // kind is Unknown(io_kind_string)
         assert!(matches!(error.kind, ErrorKind::Unknown(_)));
         assert!(!error.msg.is_empty());
+    }
+
+    #[test]
+    fn converting_remote_io_error_returns_recovered_memory_to_the_pool() {
+        const CAPACITY: usize = 64 * 1024 * 1024;
+        let pool =
+            ruapc_bufpool::BufferPoolBuilder::new(std::sync::Arc::new(ruapc_bufpool::EmptyDevices))
+                .max_memory(CAPACITY)
+                .build();
+        let buffer = pool.allocate(CAPACITY).unwrap();
+        let expected = Error::new(ErrorKind::InvalidCopyOp, "invalid range".into());
+        let error = RemoteIoError::new(expected.clone(), Some(vec![buffer]));
+        assert!(pool.allocate(CAPACITY).is_err());
+
+        let plain: Error = error.into();
+
+        assert_eq!(plain, expected);
+        assert!(pool.allocate(CAPACITY).is_ok());
     }
 }

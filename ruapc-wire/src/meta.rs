@@ -1,6 +1,6 @@
 //! Routing metadata and payload-format selection.
 
-use crate::Result;
+use crate::CodecResult;
 use bitflags::bitflags;
 use ruapc_bufpool::RemoteBufferInfo;
 use serde::{Deserialize, Serialize};
@@ -70,13 +70,14 @@ fn is_zero(value: &u32) -> bool {
 
 impl MsgMeta {
     /// Encodes named-field MessagePack metadata.
-    pub(super) fn encode_to<W: Write>(&self, mut w: W) -> Result<()> {
+    pub(super) fn encode_to<W: Write>(&self, mut w: W) -> CodecResult<()> {
         rmp_serde::encode::write_named(&mut w, self)?;
         Ok(())
     }
 
     /// Decodes metadata encoded by [`encode_to`](Self::encode_to).
-    pub(super) fn decode(buf: &[u8]) -> Result<Self> {
+    #[inline]
+    pub(super) fn decode(buf: &[u8]) -> CodecResult<Self> {
         Ok(rmp_serde::from_slice(buf)?)
     }
 
@@ -85,12 +86,13 @@ impl MsgMeta {
     /// # Examples
     ///
     /// ```rust
-    /// # use ruapc::{MsgMeta, MsgFlags};
+    /// # use ruapc_wire::{MsgMeta, MsgFlags};
     /// let mut meta = MsgMeta::default();
     /// meta.flags = MsgFlags::IsReq;
     /// assert!(meta.is_req());
     /// ```
     #[must_use]
+    #[inline]
     pub fn is_req(&self) -> bool {
         self.flags.contains(MsgFlags::IsReq)
     }
@@ -100,12 +102,13 @@ impl MsgMeta {
     /// # Examples
     ///
     /// ```rust
-    /// # use ruapc::{MsgMeta, MsgFlags};
+    /// # use ruapc_wire::{MsgMeta, MsgFlags};
     /// let mut meta = MsgMeta::default();
     /// meta.flags = MsgFlags::IsRsp;
     /// assert!(meta.is_rsp());
     /// ```
     #[must_use]
+    #[inline]
     pub fn is_rsp(&self) -> bool {
         self.flags.contains(MsgFlags::IsRsp)
     }

@@ -12,16 +12,17 @@ rustdoc.
 | `ruapc-rdma` | Verbs resources, owned work requests and completions | `ruapc-bufpool` |
 | `ruapc-macro` | Service validation and code generation | None at runtime |
 | `ruapc-schema` | Schema registry, OpenAPI projection and reflection data | None |
-| `ruapc` | RPC lifecycle, routing, transports and remote memory | Bufpool, macro, schema; optional RDMA |
+| `ruapc-wire` | Message codecs, framing and codec errors | Bufpool |
+| `ruapc` | RPC lifecycle, routing, transports and remote memory | Bufpool, macro, schema, wire; optional RDMA |
 | `ruapc-demo` | Service host, typed caller and verified workloads | `ruapc` |
 
 Transport selection uses concrete enums (`Socket`, `SocketPool`, `HttpSocket`)
 and statically dispatched futures. Registered service closures and device
 registrars are the trait-object extension boundaries.
 
-The core crate forbids unsafe code. Allocation, registration and verbs belong
-in its dependencies, whose APIs enforce local memory ownership and completion
-evidence. See [safety boundaries](docs/safe-boundaries.md) for these contracts
+The core and wire crates forbid unsafe code. Allocation, registration and verbs
+belong in bufpool and RDMA, whose APIs enforce local memory ownership and
+completion evidence. See [safety boundaries](docs/safe-boundaries.md) for these contracts
 and the separate application-source validation scheme.
 Bufpool allocation and RDMA completion futures are runtime independent.
 They share a safe single-value notification implementation in bufpool's hidden
@@ -35,7 +36,7 @@ the dependencies retain buffer ownership and completion authority.
 |---|---|
 | `client` | Settings, attachments, connection acquisition, retries and response decoding |
 | `core` | Contexts, listeners, method registration and handler admission |
-| `msg` | Metadata, payload codecs, direct serialization and stream framing |
+| `msg` | Owned messages and payloads, delegating codecs to `ruapc-wire` |
 | `sockets` | Concrete transports, connection queues, maps and closure |
 | `remote_memory` | Logical copy spaces, validation, inline copies and buffer recovery |
 | `rdma` | Path selection, bootstrap, READ execution and CQ polling |
@@ -48,6 +49,17 @@ registration to that crate. `services/meta_service.rs` adapts reflection to the
 RPC runtime; `ruapc::services` re-exports its data types. See
 [built-in services](docs/builtin-services.md#public-reflection-_ruapcmeta)
 for the reflection contract.
+
+`ruapc-wire` owns `MsgMeta`, `MsgFlags`, direct serialization, stream and RDMA
+frame codecs, and `CodecError`. It accepts payload byte slices and reports
+encoding, decoding, framing and argument failures without depending on the
+RPC runtime or verbs. The core owns `Message` / `Payload` storage and the
+`ErrorKind` / `Error` / `Result` API, including typed RDMA error conversion and
+`RemoteIoError` recovery. `Message::parse` and `Payload::deserialize` delegate to
+wire codecs and retain their `ruapc::Result` signatures, mapping failures to the
+original RPC error categories. Storage hooks and RDMA
+frame callbacks propagate caller errors through static generic dispatch. See
+the [wire crate guide](ruapc-wire/README.md) for these interfaces.
 
 `Context` combines shared `State`, a destination, incoming metadata and a
 deadline. Changing its destination preserves the deadline and clears message
@@ -101,11 +113,14 @@ used for admission control.
 Metadata is always named-field MessagePack. `UseMessagePack` selects only the
 payload decoder; default clients use MessagePack, otherwise JSON. Compatible
 metadata fields use `#[serde(default)]` and omit empty/default values where
-appropriate. See [`MsgMeta`](ruapc/src/msg/meta.rs) for fields and defaults.
+appropriate. See [`MsgMeta`](ruapc-wire/src/meta.rs) for fields and defaults.
 
-`msg/encode.rs` serializes directly into transport storage and backfills lengths.
-`msg/message.rs` validates bounds before decoding metadata and advances the
-payload view without copying.
+[`ruapc-wire/src/encode.rs`](ruapc-wire/src/encode.rs) serializes directly into
+transport storage through the generic `SendMsg` interface and backfills lengths.
+[`message.rs`](ruapc-wire/src/message.rs) validates bounds and returns decoded
+metadata with the payload offset. The core's
+[`Message`](ruapc/src/msg/message.rs) retains its original storage and advances
+the payload view without copying.
 
 | Carrier | Frame |
 |---|---|
@@ -119,14 +134,18 @@ Lengths are big-endian `u32`s. `body_len` and `frame_len` count the `meta_len`
 prefix, metadata and payload. `control_len` counts the kind byte and control
 body; kinds are offer (1), finish (2) and finish reply (3).
 
-TCP and HTTP/2 share header validation and size limits in `msg/frame.rs`.
+TCP and HTTP/2 share header validation and size limits in
+[`ruapc-wire/src/frame.rs`](ruapc-wire/src/frame.rs).
 HTTP/2 decodes complete frames directly from incoming byte chunks; only frames
 that span chunks need a lazily allocated assembly buffer. TCP keeps its
 incremental receive buffer. Both paths split complete bodies without copying.
 HTTP routing and unary JSON responses live in `sockets/http/service.rs`, while
 `http_socket_pool.rs` owns connection acquisition and streaming lifecycles.
-RDMA framing lives in `rdma/frame.rs`, outside the poll loop. Inline and control
-frames can share a receive buffer; the whole SEND consumes one receive credit.
+RDMA framing lives in [`ruapc-wire/src/rdma.rs`](ruapc-wire/src/rdma.rs), outside
+the poll loop. The core's `rdma/frame.rs` re-exports the codecs for transport use.
+Inline and control frames can share a receive buffer; the whole SEND consumes
+one receive credit. Decoded controls provide no completion authority; the core
+checks connection identity, negotiated capabilities and transfer state.
 Large payloads use the [private offer/finish controls](docs/builtin-services.md#private-rdma-payload-controls),
 with separate [storage and queue budgets](docs/rdma-capacity.md#large-payload-admission-and-cleanup).
 

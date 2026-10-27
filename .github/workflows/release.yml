@@ -24,6 +24,7 @@ jobs:
         cargo publish -p ruapc-macro
         cargo publish -p ruapc-schema
         cargo publish -p ruapc-rdma
+        cargo publish -p ruapc-wire
         cargo publish -p ruapc
       env:
         CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

@@ -1,5 +1,5 @@
 use super::*;
-use crate::msg::{MsgFlags, SendMsg};
+use crate::{MsgFlags, SendMsg, deserialize_payload};
 use bytes::Bytes;
 use bytes::BytesMut;
 use serde::Serialize;
@@ -60,8 +60,8 @@ fn test_meta_roundtrip_with_regions() {
         timeout_ms: 1500,
     };
     let buf = serialize_to_bytes(&meta, &serde_json::json!({"x": 1}));
-    let msg = Message::parse(Bytes::from(buf)).unwrap();
-    assert_eq!(msg.meta, meta);
+    let (decoded, _) = parse_body(&buf).unwrap();
+    assert_eq!(decoded, meta);
 }
 
 #[test]
@@ -104,8 +104,8 @@ fn test_minimal_response_meta_roundtrip() {
         timeout_ms: 0,
     };
     let buf = serialize_to_bytes(&meta, &serde_json::json!({"ok": true}));
-    let msg = Message::parse(Bytes::from(buf)).unwrap();
-    assert_eq!(msg.meta, meta);
+    let (decoded, _) = parse_body(&buf).unwrap();
+    assert_eq!(decoded, meta);
 }
 
 #[test]
@@ -134,13 +134,13 @@ fn test_serialize_parse_json_roundtrip() {
 
     let buf = serialize_to_bytes(&meta, &payload_value);
 
-    let msg = Message::parse(Bytes::from(buf)).unwrap();
-    assert_eq!(msg.meta.method, "TestService/hello");
-    assert_eq!(msg.meta.msgid, 42);
-    assert!(msg.meta.is_req());
-    assert!(!msg.meta.flags.contains(MsgFlags::UseMessagePack));
+    let (meta, offset) = parse_body(&buf).unwrap();
+    assert_eq!(meta.method, "TestService/hello");
+    assert_eq!(meta.msgid, 42);
+    assert!(meta.is_req());
+    assert!(!meta.flags.contains(MsgFlags::UseMessagePack));
 
-    let recovered: serde_json::Value = serde_json::from_slice(&msg.payload).unwrap();
+    let recovered: serde_json::Value = deserialize_payload(&buf[offset..], meta.flags).unwrap();
     assert_eq!(recovered, payload_value);
 }
 
@@ -151,11 +151,11 @@ fn test_serialize_parse_msgpack_roundtrip() {
 
     let buf = serialize_to_bytes(&meta, &payload_str);
 
-    let msg = Message::parse(Bytes::from(buf)).unwrap();
-    assert_eq!(msg.meta.method, "TestService/hello");
-    assert!(msg.meta.flags.contains(MsgFlags::UseMessagePack));
+    let (meta, offset) = parse_body(&buf).unwrap();
+    assert_eq!(meta.method, "TestService/hello");
+    assert!(meta.flags.contains(MsgFlags::UseMessagePack));
 
-    let recovered: String = rmp_serde::from_slice(&msg.payload).unwrap();
+    let recovered: String = deserialize_payload(&buf[offset..], meta.flags).unwrap();
     assert_eq!(recovered, payload_str);
 }
 
@@ -163,7 +163,7 @@ fn test_serialize_parse_msgpack_roundtrip() {
 fn test_parse_too_short_returns_error() {
     for len in 0..4 {
         let truncated = Bytes::from(vec![0; len]);
-        assert!(Message::parse(truncated).is_err(), "length {len}");
+        assert!(parse_body(&truncated).is_err(), "length {len}");
     }
 }
 
@@ -171,7 +171,7 @@ fn test_parse_too_short_returns_error() {
 fn test_parse_zero_meta_len_returns_error() {
     // 4 bytes of zeros => meta_len == 0, which is invalid.
     let buf = Bytes::from_static(&[0u8, 0, 0, 0]);
-    assert!(Message::parse(buf).is_err());
+    assert!(parse_body(&buf).is_err());
 }
 
 #[test]
@@ -180,27 +180,30 @@ fn test_parse_meta_len_exceeds_payload_returns_error() {
     let mut buf = BytesMut::new();
     buf.extend_from_slice(&100u32.to_be_bytes()); // meta_len = 100
     buf.extend_from_slice(b"short");
-    assert!(Message::parse(Bytes::from(buf)).is_err());
+    assert!(parse_body(&buf).is_err());
 }
 
 #[test]
-fn test_message_new_and_default() {
-    let msg = Message::default();
-    assert!(msg.meta.method.is_empty());
-    assert!(msg.payload.is_empty());
-
+fn parsing_leaves_raw_payload_bytes_untouched() {
     let meta = MsgMeta {
         method: "Svc/method".into(),
         flags: MsgFlags::IsRsp,
         msgid: 7,
-        read_regions: Vec::new(),
-        write_regions: Vec::new(),
-        timeout_ms: 0,
+        ..Default::default()
     };
-    let payload = crate::Payload::from(bytes::Bytes::from_static(b"data"));
-    let msg2 = Message::new(meta, payload);
-    assert_eq!(msg2.meta.method, "Svc/method");
-    assert!(!msg2.payload.is_empty());
+    let metadata = rmp_serde::to_vec_named(&meta).unwrap();
+    let mut body = u32::try_from(metadata.len())
+        .unwrap()
+        .to_be_bytes()
+        .to_vec();
+    body.extend_from_slice(&metadata);
+    body.extend_from_slice(b"data");
+    let original = body.clone();
+    let (decoded, offset) = parse_body(&body).unwrap();
+    assert_eq!(decoded, meta);
+    assert_eq!(offset, 4 + metadata.len());
+    assert_eq!(&body[offset..], b"data");
+    assert_eq!(body, original);
 }
 
 #[test]
@@ -221,11 +224,14 @@ fn test_msgflags_serde_roundtrip() {
 }
 
 #[test]
-fn test_bytesmut_sendmsg_prepare_is_noop() {
-    // BytesMut::prepare does nothing — the buffer is not cleared.
+fn test_bytesmut_sendmsg_prepare_clears_without_reallocating() {
     let mut buf = BytesMut::from(&b"existing"[..]);
+    let pointer = buf.as_ptr();
+    let capacity = buf.capacity();
     buf.prepare().unwrap();
-    assert_eq!(&buf[..], b"existing");
+    assert!(buf.is_empty());
+    assert_eq!(buf.as_ptr(), pointer);
+    assert_eq!(buf.capacity(), capacity);
 }
 
 #[test]
@@ -244,9 +250,9 @@ fn test_bytesmut_writer_write_and_flush() {
 
 #[test]
 fn test_buffer_sendmsg_serialize() {
-    use crate::Devices;
+    use ruapc_bufpool::DeviceSet;
     use std::sync::Arc;
-    let devices = Arc::new(Devices::default());
+    let devices = Arc::new(DeviceSet::<ruapc_bufpool::TcpDevice>::default());
     let pool = ruapc_bufpool::BufferPoolBuilder::new(devices).build();
     let mut buf = pool.allocate(1024 * 1024).unwrap();
 
@@ -259,10 +265,10 @@ fn test_buffer_sendmsg_serialize() {
 
 #[test]
 fn test_buffer_sendmsg_writer_write_and_flush() {
-    use crate::Devices;
+    use ruapc_bufpool::DeviceSet;
     use std::io::Write as _;
     use std::sync::Arc;
-    let devices = Arc::new(Devices::default());
+    let devices = Arc::new(DeviceSet::<ruapc_bufpool::TcpDevice>::default());
     let pool = ruapc_bufpool::BufferPoolBuilder::new(devices).build();
     let mut buf = pool.allocate(1024 * 1024).unwrap();
     buf.set_len(0);
@@ -274,4 +280,53 @@ fn test_buffer_sendmsg_writer_write_and_flush() {
         w.flush().unwrap();
     }
     assert_eq!(buf.len(), 4);
+}
+
+fn assert_finish_rejects_invalid_offsets<
+    M: SendMsg<Error = CodecError> + std::ops::Deref<Target = [u8]>,
+>(
+    storage: &mut M,
+) {
+    let original = storage.to_vec();
+    for (meta_offset, payload_offset) in [
+        (0, 3),
+        (0, 4),
+        (4, 8),
+        (12, 16),
+        (8, 4),
+        (13, 16),
+        (0, 17),
+        (20, 24),
+        (usize::MAX - 3, usize::MAX),
+        (usize::MAX, usize::MAX),
+    ] {
+        assert_eq!(
+            storage
+                .finish(meta_offset, payload_offset)
+                .unwrap_err()
+                .kind,
+            CodecErrorKind::InvalidArgument,
+            "offsets ({meta_offset}, {payload_offset})"
+        );
+        assert_eq!(&**storage, original.as_slice());
+    }
+
+    storage.finish(4, 12).unwrap();
+    assert_eq!(&storage[..4], &original[..4]);
+    assert_eq!(&storage[4..8], &4u32.to_be_bytes());
+    assert_eq!(&storage[8..], &original[8..]);
+}
+
+#[test]
+fn public_finish_validates_offsets_without_mutating_invalid_frames() {
+    let mut bytes = BytesMut::from(&[42; 16][..]);
+    assert_finish_rejects_invalid_offsets(&mut bytes);
+
+    let devices =
+        std::sync::Arc::new(ruapc_bufpool::DeviceSet::<ruapc_bufpool::TcpDevice>::default());
+    let pool = ruapc_bufpool::BufferPoolBuilder::new(devices).build();
+    let mut buffer = pool.allocate(16).unwrap();
+    buffer.set_len(0);
+    buffer.extend_from_slice(&[42; 16]).unwrap();
+    assert_finish_rejects_invalid_offsets(&mut buffer);
 }

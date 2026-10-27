@@ -115,6 +115,13 @@ These named-field MessagePack controls are parsed by the RDMA dispatcher,
 outside service routing; reflection, unary HTTP, and `_ruapc.memory` cannot
 invoke them. The offer preserves original application read/write regions in
 its metadata and carries serialized-payload regions in a separate field.
+Their byte codecs live in [`ruapc-wire`](../ruapc-wire/src/rdma.rs) and are
+available without verbs. These Rust APIs are public for runtime integration;
+"private" describes their exclusion from application RPC routing. See the
+[wire crate guide](../ruapc-wire/README.md) for release pairing and API stability.
+The transport validates connection identity, negotiated
+capabilities and transfer state before acting on a decoded control; decoding
+does not provide completion evidence or authorize releasing advertised memory.
 
 See [framing](../DESIGN.md#message-ownership-and-framing),
 [source ownership](safe-boundaries.md#large-payload-source-ownership), and

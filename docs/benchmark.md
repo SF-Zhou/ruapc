@@ -63,6 +63,39 @@ excludes setup, initial registration and warmup, and reuses sources and write
 destinations. It includes full-pattern verification and per-call
 `remote_read_all` destination allocation.
 
+## Wire codecs
+
+```bash
+cargo bench -p ruapc-wire --bench codec
+```
+
+This device-free harness calls the wire crate's public APIs from a separate
+benchmark crate, including the optimization boundary between those crates.
+The wire crate has no verbs dependency, so this build needs no RDMA libraries
+or device. Owned `Message` / `Payload` adapters and the runtime's RDMA support
+are exercised by the RPC harnesses.
+
+| Cases | Workload and timed operations |
+|---|---|
+| `encode/{msgpack,json}/{16,4096}B` | Metadata and string payload serialized into a complete stream frame; includes final allocation, growth and destruction |
+| `decode/{msgpack,json}/{16,4096}B` | Pre-encoded body cloned, metadata parsed and string payload decoded; includes owned allocations and destruction, excludes stream-header parsing |
+| `chunks/{whole,header_split,body_split}/4096B` | A fresh stream decoder per operation; input chunks share storage, only fragmented frames need assembly allocation/copying |
+| `rdma/decode/4_frames` | Four aggregated ordinary frames delivered to a `black_box` callback; excludes metadata parsing, verbs and control-frame processing |
+
+Fixtures and correctness checks are outside timing. Results are amortized wall
+time in `ns/op`, not latency distributions or end-to-end RPC costs. Use the RPC
+harnesses to verify effects on actual transports.
+
+| Environment variable | Effect |
+|---|---|
+| `RUAPC_CODEC_BENCH_ITERS` | Positive operation count per case; default 100000 |
+| `RUAPC_CODEC_BENCH_WARMUP` | Warmup operations per case; default 1000, zero allowed |
+| `RUAPC_CODEC_BENCH_FILTER` | Case-name substring; unset runs all 12 cases |
+
+For example, use `RUAPC_CODEC_BENCH_FILTER=chunks` to isolate stream decoding.
+Repeat the process for each sample and keep the same feature configuration when
+comparing versions.
+
 ## RDMA ownership harnesses
 
 ```bash
@@ -251,6 +284,13 @@ Use identical benchmark sources and dependency locks. Build both versions
 before sampling, then run them sequentially in alternating order on the same
 CPU cores, NUMA node and RDMA device. Retain every sample, including skipped
 cases, rather than selecting only the best run.
+
+For crate extraction, keep feature sets identical and exercise the new public
+API from another crate. If a microbenchmark regresses, profile the hot path:
+linking can change the instruction alignment of otherwise identical library
+code. A diagnostic executable containing both implementations can help separate
+that effect from the new crate boundary. Retain the separate-binary results and
+verify the final change with end-to-end RPC measurements as well.
 
 Record the source revision, toolchain, build profile, dependency lock, hardware,
 thread placement, workload settings and raw output outside `docs/`. Report
