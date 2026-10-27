@@ -4,8 +4,8 @@ use foldhash::fast::RandomState;
 use openapiv3::OpenAPI;
 use schemars::JsonSchema;
 
-mod schema;
-pub use schema::MethodSchema;
+pub use ruapc_schema::MethodSchema;
+use ruapc_schema::SchemaRegistry;
 
 #[cfg(feature = "rdma")]
 use crate::rdma::{RdmaBootstrapService, RdmaProbeService};
@@ -52,7 +52,7 @@ struct Method {
 /// [`method_names`](Self::method_names), [`method_schemas`](Self::method_schemas)
 /// and OpenAPI. Registration rejects duplicate wire names across both visibilities.
 pub struct Router {
-    schemas: schema::SchemaRegistry,
+    schemas: SchemaRegistry,
     /// Registered methods mapped by name (e.g., "ServiceName/method_name").
     methods: HashMap<String, Method, RandomState>,
     /// OpenAPI specification populated by [`build_open_api`](Self::build_open_api),
@@ -63,7 +63,7 @@ pub struct Router {
 impl Default for Router {
     fn default() -> Self {
         let mut this = Self {
-            schemas: schema::SchemaRegistry::default(),
+            schemas: SchemaRegistry::default(),
             methods: HashMap::default(),
             openapi: OpenAPI::default(),
         };
@@ -412,6 +412,30 @@ mod tests {
         assert!(!router.openapi.paths.paths.contains_key("/Control/secret"));
         let components = router.openapi.components.as_ref().unwrap();
         assert!(!components.schemas.contains_key("InternalReq"));
+    }
+
+    #[test]
+    fn test_build_open_api_error_preserves_previous_document() {
+        struct Unsupported;
+
+        impl JsonSchema for Unsupported {
+            fn schema_name() -> std::borrow::Cow<'static, str> {
+                "Unsupported".into()
+            }
+
+            fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+                schemars::json_schema!({"properties": 42})
+            }
+        }
+
+        let mut router = Router::default();
+        router.build_open_api().unwrap();
+        let previous = serde_json::to_value(&router.openapi).unwrap();
+        router.add_method::<Unsupported, ()>("Unsupported/run", Box::new(noop_func));
+
+        let error = router.build_open_api().unwrap_err();
+        assert_eq!(error.kind, ErrorKind::SerdeJsonError);
+        assert_eq!(serde_json::to_value(&router.openapi).unwrap(), previous);
     }
 
     #[test]

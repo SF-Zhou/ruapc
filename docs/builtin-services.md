@@ -36,7 +36,11 @@ the full public OpenAPI 3.0 document.
 
 `ReflectionService` and its response types are public Rust APIs. In-process,
 use `Router::method_names()`, `method_schemas()`, or `is_public_method()` for
-the same visibility rules. See [reflection types and handlers](../ruapc/src/services/meta_service.rs).
+the same visibility rules. [`ruapc-schema`](../ruapc-schema/README.md) owns
+the schema registry, OpenAPI projection, reflection data types and description
+assembly, independently of the RPC runtime. The
+[reflection handlers](../ruapc/src/services/meta_service.rs) connect that logic
+to `Router`; `ruapc::services` re-exports the data types through the existing API.
 
 ## Internal remote memory: `_ruapc.memory`
 

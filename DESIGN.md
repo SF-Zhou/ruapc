@@ -11,7 +11,8 @@ rustdoc.
 | `ruapc-bufpool` | Allocation, caches and device registration | None |
 | `ruapc-rdma` | Verbs resources, owned work requests and completions | `ruapc-bufpool` |
 | `ruapc-macro` | Service validation and code generation | None at runtime |
-| `ruapc` | RPC lifecycle, routing, transports and remote memory | Bufpool, macro; optional RDMA |
+| `ruapc-schema` | Schema registry, OpenAPI projection and reflection data | None |
+| `ruapc` | RPC lifecycle, routing, transports and remote memory | Bufpool, macro, schema; optional RDMA |
 | `ruapc-demo` | Service host, typed caller and verified workloads | `ruapc` |
 
 Transport selection uses concrete enums (`Socket`, `SocketPool`, `HttpSocket`)
@@ -34,13 +35,19 @@ the dependencies retain buffer ownership and completion authority.
 |---|---|
 | `client` | Settings, attachments, connection acquisition, retries and response decoding |
 | `core` | Contexts, listeners, method registration and handler admission |
-| `core/router/schema` | Service schemas and OpenAPI projection |
 | `msg` | Metadata, payload codecs, direct serialization and stream framing |
 | `sockets` | Concrete transports, connection queues, maps and closure |
 | `remote_memory` | Logical copy spaces, validation, inline copies and buffer recovery |
 | `rdma` | Path selection, bootstrap, READ execution and CQ polling |
 | `task` | Background-task supervision and response waiters |
 | `metrics` | Cached recorder handles and scoped request accounting |
+
+`ruapc-schema` owns schema generation, OpenAPI projection, reflection data types
+and description assembly. `Router` retains handler dispatch and delegates schema
+registration to that crate. `services/meta_service.rs` adapts reflection to the
+RPC runtime; `ruapc::services` re-exports its data types. See
+[built-in services](docs/builtin-services.md#public-reflection-_ruapcmeta)
+for the reflection contract.
 
 `Context` combines shared `State`, a destination, incoming metadata and a
 deadline. Changing its destination preserves the deadline and clears message

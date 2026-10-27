@@ -5,11 +5,13 @@
 //! - [`ReflectionService`]: public service and schema discovery
 //! - internal remote-memory and RDMA bootstrap services
 
-mod meta_service;
-pub use meta_service::{
-    DescribeRequest, MethodDescription, REFLECTION_PROTOCOL_VERSION, ReflectionService,
-    ServerDescription, ServiceDescription,
+pub use ruapc_schema::{
+    DescribeRequest, MethodDescription, REFLECTION_PROTOCOL_VERSION, ServerDescription,
+    ServiceDescription,
 };
+
+mod meta_service;
+pub use meta_service::ReflectionService;
 
 mod memory_service;
 pub(crate) use memory_service::{MemoryService, ReadInlineRequest, WriteInlineRequest};

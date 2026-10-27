@@ -1,6 +1,5 @@
 //! Schema generation and OpenAPI projection, separate from runtime dispatch.
 
-use crate::Result;
 use indexmap::IndexMap;
 use openapiv3::{
     Components, MediaType, OpenAPI, Operation, Paths, ReferenceOr, RequestBody, Response,
@@ -22,9 +21,14 @@ pub struct MethodSchema {
     pub response_schema: Schema,
 }
 
-pub(super) struct SchemaRegistry {
+/// Generates method schemas with separate public and internal definitions.
+///
+/// Register schemas while constructing a method directory, then pass only its
+/// public entries to [`build`](Self::build). The registry owns the referenced
+/// definitions; callers own method names and enforce their visibility.
+pub struct SchemaRegistry {
     // Generators contain Send-only transform callbacks. The mutex makes a
-    // registered Router shareable; registration itself has exclusive access.
+    // registered directory shareable; registration itself has exclusive access.
     public: Mutex<SchemaGenerator>,
     internal: Mutex<SchemaGenerator>,
 }
@@ -44,10 +48,12 @@ impl Default for SchemaRegistry {
 }
 
 impl SchemaRegistry {
-    pub(super) fn register<Req: JsonSchema, Rsp: JsonSchema>(
-        &mut self,
-        public: bool,
-    ) -> MethodSchema {
+    /// Generates schemas for a method's request and complete wire response.
+    ///
+    /// `public` selects whether referenced definitions belong to the public
+    /// OpenAPI document. Internal definitions are kept in a separate generator
+    /// and are never included by [`build`](Self::build).
+    pub fn register<Req: JsonSchema, Rsp: JsonSchema>(&mut self, public: bool) -> MethodSchema {
         let generator = if public {
             &mut self.public
         } else {
@@ -60,10 +66,19 @@ impl SchemaRegistry {
         }
     }
 
-    pub(super) fn build<'a>(
+    /// Builds an OpenAPI 3.0 document for the supplied public methods.
+    ///
+    /// Each name is a wire name such as `Service/method`. Callers must supply
+    /// only public methods whose schemas were registered with this registry.
+    /// Building snapshots the public definitions without consuming them, so
+    /// repeated builds preserve references and produce the same document.
+    ///
+    /// Returns an error if a generated schema cannot be converted to an OpenAPI
+    /// type.
+    pub fn build<'a>(
         &self,
         methods: impl Iterator<Item = (&'a str, &'a MethodSchema)>,
-    ) -> Result<OpenAPI> {
+    ) -> serde_json::Result<OpenAPI> {
         let mut paths = BTreeMap::new();
         for (name, schema) in methods {
             let operation = Operation {
@@ -102,7 +117,7 @@ impl SchemaRegistry {
         let schemas = definitions
             .into_iter()
             .map(|(name, schema)| Ok((name, serde_json::from_value(schema)?)))
-            .collect::<Result<IndexMap<_, _>>>()?;
+            .collect::<serde_json::Result<IndexMap<_, _>>>()?;
 
         Ok(OpenAPI {
             openapi: "3.0.0".to_string(),
@@ -119,7 +134,7 @@ impl SchemaRegistry {
     }
 }
 
-fn json_content(schema: &Schema) -> Result<IndexMap<String, MediaType>> {
+fn json_content(schema: &Schema) -> serde_json::Result<IndexMap<String, MediaType>> {
     Ok(IndexMap::from([(
         "application/json".into(),
         MediaType {

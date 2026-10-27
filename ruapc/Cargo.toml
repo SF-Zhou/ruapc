@@ -21,6 +21,7 @@ default = []
 ruapc-macro.workspace = true
 ruapc-bufpool.workspace = true
 ruapc-rdma = { workspace = true, optional = true }
+ruapc-schema.workspace = true
 
 arc-swap.workspace = true
 bitflags.workspace = true
@@ -33,7 +34,6 @@ humantime-serde.workspace = true
 hyper.workspace = true
 hyper-tungstenite.workspace = true
 hyper-util.workspace = true
-indexmap.workspace = true
 ipnet.workspace = true
 metrics.workspace = true
 openapiv3.workspace = true

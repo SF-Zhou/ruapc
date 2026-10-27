@@ -7,9 +7,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 ## [Unreleased]
 
 ### Added
+- `ruapc-schema` provides schema registration, OpenAPI projection and reflection
+  data independently of the RPC runtime. Existing `ruapc::MethodSchema` and
+  `ruapc::services` data-type paths remain available through re-exports.
 - `ruapc` adds `rdma-ibv-query-gid-ex`, which enables RDMA and forwards to
   `ruapc-rdma`'s `ibv-query-gid-ex` backend for libibverbs' extended GID query
   APIs.
+
+### Changed
+- The moved schema and reflection types now have `JsonSchema::schema_id()`
+  values under `ruapc_schema`; their schema names and reflection wire format
+  are unchanged.
 
 ## [0.2.0-alpha.7] - 2026-10-25
 
