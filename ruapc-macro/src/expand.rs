@@ -19,7 +19,6 @@ pub(crate) fn service(service: Service) -> syn::Result<TokenStream> {
         ident,
         supertraits,
         name,
-        internal,
         methods,
     } = service;
     let bounds = (!supertraits.is_empty()).then(|| quote!(: #supertraits));
@@ -28,14 +27,7 @@ pub(crate) fn service(service: Service) -> syn::Result<TokenStream> {
         .iter()
         .map(|method| client_method(method, &krate))
         .collect();
-    let register = if internal {
-        quote!(add_internal_method)
-    } else {
-        quote!(add_method)
-    };
-    let registrations = methods
-        .iter()
-        .map(|method| registration(method, &krate, &register));
+    let registrations = methods.iter().map(|method| registration(method, &krate));
 
     Ok(quote! {
         #(#attrs)*
@@ -117,7 +109,7 @@ fn client_method(method: &Method, krate: &TokenStream) -> TokenStream {
     }
 }
 
-fn registration(method: &Method, krate: &TokenStream, register: &TokenStream) -> TokenStream {
+fn registration(method: &Method, krate: &TokenStream) -> TokenStream {
     let conditions = &method.conditions;
     let ident = &method.signature.ident;
     let request = &method.request;
@@ -127,7 +119,7 @@ fn registration(method: &Method, krate: &TokenStream, register: &TokenStream) ->
         #(#conditions)*
         {
             let this = self.clone();
-            router.#register::<#request, #response>(#wire_name, ::std::boxed::Box::new(move |ctx, payload| {
+            router.add_method::<#request, #response>(#wire_name, ::std::boxed::Box::new(move |ctx, payload| {
                 let this = this.clone();
                 #krate::spawn_handler(ctx, #wire_name, payload, move |mut ctx, payload| async move {
                     match payload.deserialize(&ctx.msg_meta) {

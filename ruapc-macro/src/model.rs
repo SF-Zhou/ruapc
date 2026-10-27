@@ -20,7 +20,6 @@ pub(crate) struct Service {
     pub(crate) ident: Ident,
     pub(crate) supertraits: Punctuated<TypeParamBound, Token![+]>,
     pub(crate) name: LitStr,
-    pub(crate) internal: bool,
     pub(crate) methods: Vec<Method>,
 }
 
@@ -76,7 +75,6 @@ impl Service {
             ident: declaration.ident,
             supertraits: declaration.supertraits,
             name,
-            internal: args.internal,
             methods,
         })
     }

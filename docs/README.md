@@ -13,7 +13,7 @@ run `cargo doc -p ruapc --no-deps --open`.
 | Attach buffers, copy logical ranges and recover memory | [Remote memory](remote-memory.md) |
 | Allocate and register buffers | [Buffer pool](../ruapc-bufpool/README.md) |
 | Use the low-level verbs crate | [RDMA crate](../ruapc-rdma/README.md) |
-| Generate schemas and reflection data without the RPC runtime | [Schema crate](../ruapc-schema/README.md) |
+| Generate schemas and OpenAPI documents without the RPC runtime | [Schema crate](../ruapc-schema/README.md) |
 | Encode and decode RPC messages without the RPC runtime | [Wire crate](../ruapc-wire/README.md) |
 | Set up a development or test environment | [Contributing](../CONTRIBUTING.md) |
 | Measure and compare performance | [Benchmarks](benchmark.md) |
@@ -29,7 +29,7 @@ Each guide owns a distinct part of the design. Start at
 | Metadata, payload formats and framing | [Wire format](../DESIGN.md#message-ownership-and-framing) |
 | Endpoint strings, complete-group identity and address fallback | [Server endpoints](endpoints.md) |
 | Registration, DMA ownership, source validation and recovery | [Safety boundaries](safe-boundaries.md) |
-| Reflection, internal RPCs and private payload control fields | [Built-in services](builtin-services.md) |
+| Built-in RPCs, discovery and private payload control fields | [Built-in services](builtin-services.md) |
 | RDMA bootstrap, negotiation, paths and peer maintenance | [Connection lifecycle](rdma-connection.md) |
 | WRIDs, completion authority and QPN reuse | [Completion identity](wrid.md) |
 | Queue/byte budgets, READ admission and CQ credit retirement | [Capacity](rdma-capacity.md) |

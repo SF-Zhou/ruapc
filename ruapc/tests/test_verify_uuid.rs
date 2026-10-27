@@ -14,13 +14,13 @@ use common::endpoint;
 const CLIENT_TIMEOUT: Duration = Duration::from_millis(200);
 
 // A wire-only test proxy: the built-in request-status operation is
-// intentionally not part of RuaPC's public Rust API or reflection surface.
+// not part of RuaPC's public Rust API.
 #[derive(Serialize, Deserialize, JsonSchema)]
 struct RequestStatusRequest {
     request_id: u64,
 }
 
-#[ruapc::service(name = "_ruapc.memory")]
+#[ruapc::service(name = "MemoryService")]
 trait RequestStatusClient {
     async fn request_is_pending(
         &self,

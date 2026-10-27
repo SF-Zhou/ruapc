@@ -1,8 +1,8 @@
-//! Trait-level options can select a stable wire name and internal visibility.
+//! Trait-level options can select a stable wire name.
 
 use std::sync::Arc;
 
-#[ruapc::service(name = "Control", internal)]
+#[ruapc::service(name = "Control")]
 pub trait RenamedControlService {
     async fn ping(&self, ctx: &ruapc::Context, req: &()) -> ruapc::Result<()>;
 }
@@ -24,6 +24,6 @@ fn main() {
     let mut router = ruapc::Router::default();
     Arc::new(ControlImpl).ruapc_export(&mut router);
 
-    assert!(!router.is_public_method("Control/ping"));
-    assert!(!router.method_names().any(|name| name == "Control/ping"));
+    assert!(router.has_method("Control/ping"));
+    assert!(router.method_names().any(|name| name == "Control/ping"));
 }

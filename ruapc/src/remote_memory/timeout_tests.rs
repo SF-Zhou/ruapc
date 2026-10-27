@@ -17,10 +17,10 @@ use crate::{
 const BYTES: usize = 64;
 const GUARD: Duration = Duration::from_secs(5);
 const METHODS: [&str; 4] = [
-    "_ruapc.memory/read_inline",
-    "_ruapc.memory/write_inline",
-    "_ruapc.memory/request_is_pending",
-    "_ruapc.memory/read_into_target",
+    "MemoryService/read_inline",
+    "MemoryService/write_inline",
+    "MemoryService/request_is_pending",
+    "MemoryService/read_into_target",
 ];
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema)]

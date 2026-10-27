@@ -117,7 +117,7 @@ impl Socket {
         }
     }
 
-    /// Executes the client side of `_ruapc.memory/read_into_target`: RDMA
+    /// Executes the client side of `MemoryService/read_into_target`: RDMA
     /// READs from the peer's advertised regions into the request's pinned
     /// write target. Only meaningful on RDMA connections.
     #[allow(unused_variables)]

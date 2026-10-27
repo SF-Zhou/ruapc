@@ -1,17 +1,8 @@
 //! Built-in RPC services.
 //!
-//! This module provides built-in services that are automatically
-//! registered with every RuaPC server, including:
-//! - [`ReflectionService`]: public service and schema discovery
-//! - internal remote-memory and RDMA bootstrap services
-
-pub use ruapc_schema::{
-    DescribeRequest, MethodDescription, REFLECTION_PROTOCOL_VERSION, ServerDescription,
-    ServiceDescription,
-};
-
-mod meta_service;
-pub use meta_service::ReflectionService;
+//! Remote-memory services are automatically registered with every router.
+//! RDMA bootstrap and connection probe services are also registered when
+//! that feature is enabled.
 
 mod memory_service;
 pub(crate) use memory_service::{MemoryService, ReadInlineRequest, WriteInlineRequest};

@@ -54,22 +54,35 @@ The demo client uses JSON by default. Add `--use-msgpack` to select MessagePack
 payloads on any typed transport; no server change is needed. This is a demo CLI
 default: the library's `Client::default()` uses MessagePack.
 
-## HTTP and reflection
+## HTTP and OpenAPI
 
-An ordinary HTTP caller can invoke public methods with JSON:
+An ordinary HTTP caller can invoke registered methods with JSON when the server
+uses `--listen-mode http` or `unified` (the demo default):
 
 ```bash
 curl -s -H 'content-type: application/json' -d '"hello HTTP"' \
   http://127.0.0.1:8000/EchoService/echo
 # {"Ok":"hello HTTP"}
 
-curl -s -H 'content-type: application/json' -d '{}' \
-  http://127.0.0.1:8000/_ruapc.meta/describe
+curl -s http://127.0.0.1:8000/openapi.json
 ```
 
 Open `http://127.0.0.1:8000/rapidoc` for interactive documentation or fetch
-`http://127.0.0.1:8000/openapi.json` for the schema. `Request(String)` serializes
-as a JSON string, which is why the echo request body is `"hello HTTP"`.
+`http://127.0.0.1:8000/openapi.json` for the schema of every registered method,
+including built-ins. `Request(String)` serializes as a JSON string, which is why
+the echo request body is `"hello HTTP"`.
+
+With an RDMA-enabled server and an initialized RDMA pool, discover its devices
+through the same HTTP listener:
+
+```bash
+curl -s -H 'content-type: application/json' -d 'null' \
+  http://127.0.0.1:8000/RdmaBootstrapService/discover
+```
+
+The `()` request body is JSON `null`. Other built-ins can require live request
+attachments or an RDMA connection; their presence in OpenAPI does not remove
+those prerequisites. See the [built-in method catalog](../docs/builtin-services.md).
 
 To mount HTTP endpoints below a prefix, set the same base path on both peers:
 
@@ -81,14 +94,13 @@ cargo run -p ruapc-demo --release --bin client -- http://127.0.0.1:8000 --http-b
 ```
 
 The routes then include `/api/v1/EchoService/echo`,
-`/api/v1/_ruapc.meta/describe`, `/api/v1/openapi.json` and `/api/v1/rapidoc`.
+`/api/v1/openapi.json` and `/api/v1/rapidoc`.
 Pass the prefix separately from the `http://address[,address...]` endpoint.
 This group form is a RuaPC endpoint string; ordinary HTTP callers still use
 a single-address URL.
 RuaPC's typed HTTP client connects to the HTTP/2 bidirectional stream at
 `/api/v1/_rpc`, which supports reverse RPC and remote memory. Ordinary HTTP
-POST calls do not support reverse RPC. See [built-in services](../docs/builtin-services.md)
-for the reflection contract.
+POST calls do not support reverse RPC.
 
 ## Remote read/write
 

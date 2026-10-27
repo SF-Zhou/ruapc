@@ -10,14 +10,12 @@
 //! }
 //! ```
 //!
-//! ## Names and visibility
+//! ## Names
 //!
-//! The wire name defaults to the Rust trait name. `name = "..."` overrides it;
-//! `internal` excludes the service from unary HTTP, reflection, and OpenAPI
-//! while allowing framed peer RPCs:
+//! The wire name defaults to the Rust trait name. `name = "..."` overrides it:
 //!
 //! ```rust,ignore
-//! #[ruapc::service(name = "Control", internal)]
+//! #[ruapc::service(name = "Control")]
 //! pub trait ControlService {
 //!     async fn ping(&self, ctx: &Context, req: &()) -> Result<()>;
 //! }
@@ -25,6 +23,9 @@
 //!
 //! Names must be nonempty, have no leading or trailing whitespace, and exclude
 //! `/`, the separator in wire method names such as `Control/ping`.
+//! All registered methods are included in the router's method directory and
+//! OpenAPI output and can be called through unary HTTP or framed peer RPC.
+//! Handlers enforce any required transport or request context.
 //!
 //! ## Method contract
 //!
@@ -67,8 +68,7 @@ use syn::parse_macro_input;
 
 /// Define an RPC service and its router registration and client implementations.
 ///
-/// `name = "..."` overrides the wire name; `internal` hides the service from
-/// public discovery and OpenAPI output. Methods must be declarations of the form
+/// `name = "..."` overrides the wire name. Methods must be declarations of the form
 /// `async fn method(&self, ctx: &Context, req: &Request) -> ResponseResult`.
 /// The return type may be an alias; RuaPC's call traits enforce its contract.
 /// Unsupported items and signatures produce diagnostics at their source spans.

@@ -27,7 +27,7 @@ cargo test -p ruapc-wire
 cargo test -p ruapc-demo --no-default-features
 ```
 
-To check schema generation, OpenAPI projection and reflection without building
+To check schema generation and OpenAPI projection without building
 the RPC runtime, run `cargo test -p ruapc-schema`.
 
 `cargo test -p ruapc-wire --all-features` covers message codecs, direct buffer

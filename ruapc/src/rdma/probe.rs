@@ -26,7 +26,7 @@ pub(crate) struct ProbeReply {
     pub(crate) read_nonce: u64,
 }
 
-#[service(name = "_ruapc.rdma", internal)]
+#[service]
 pub(crate) trait RdmaProbeService {
     /// Checks RPC delivery and reads the attached nonce over the same RDMA connection.
     async fn probe(&self, ctx: &Context, nonce: &u64) -> Result<ProbeReply>;
@@ -162,7 +162,7 @@ mod tests {
         let forge_reply = Arc::new(AtomicBool::new(false));
         let mut router = Router::default();
         let forge = forge_reply.clone();
-        router.wrap_method("_ruapc.rdma/probe", move |original| {
+        router.wrap_method("RdmaProbeService/probe", move |original| {
             Box::new(move |mut ctx, payload| {
                 if !forge.load(Ordering::Acquire) {
                     return original(ctx, payload);

@@ -80,8 +80,8 @@ async fn test_http() {
     // The test server is local; ignore ambient proxy configuration.
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let req = client
-        .post(format!("http://{}/_ruapc.meta/describe", addr))
-        .json(&ruapc::services::DescribeRequest::default())
+        .post(format!("http://{}/Foo/hello", addr))
+        .json(&"ruapc")
         .build()
         .unwrap();
     let rsp = client
@@ -90,21 +90,11 @@ async fn test_http() {
         .unwrap()
         .error_for_status()
         .unwrap()
-        .json::<ruapc::Result<ruapc::services::ServerDescription>>()
+        .json::<ruapc::Result<String>>()
         .await
         .unwrap()
         .unwrap();
-    let foo = rsp
-        .services
-        .iter()
-        .find(|service| service.name == "Foo")
-        .expect("Foo should be publicly discoverable");
-    assert!(foo.methods.iter().any(|method| method.name == "hello"));
-    assert!(
-        rsp.services
-            .iter()
-            .all(|service| service.name != "_ruapc.memory")
-    );
+    assert_eq!(rsp, "hello ruapc!");
 
     server.stop();
     server.join().await;

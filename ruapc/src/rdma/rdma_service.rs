@@ -8,7 +8,7 @@ use crate::{
     service,
 };
 
-/// Version of the internal RDMA bootstrap protocol.
+/// Version of the RDMA bootstrap protocol.
 pub(crate) const RDMA_BOOTSTRAP_PROTOCOL_VERSION: u32 = 2;
 
 fn port_is_connectable(port: &Port) -> bool {
@@ -139,7 +139,7 @@ impl RdmaPeerAdvertisement {
 /// This trait defines the core operations for managing RDMA connections
 /// and querying RDMA device information. It is designed to work with
 /// the service macro for RPC functionality.
-#[service(name = "_ruapc.rdma", internal)]
+#[service]
 pub(crate) trait RdmaBootstrapService {
     /// Discovers the peer's connectable RDMA devices and limits.
     async fn discover(&self, ctx: &Context, _: &()) -> Result<rdma::RdmaPeerAdvertisement>;

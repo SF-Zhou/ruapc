@@ -241,7 +241,7 @@ async fn server_remote_write_and_client_read_handler_return_at_parent_deadline()
     let mut router = Router::default();
     let gate = blocked.clone();
     let target_observer = observed_target.clone();
-    router.wrap_method("_ruapc.memory/read_into_target", move |original| {
+    router.wrap_method("MemoryService/read_into_target", move |original| {
         Box::new(move |ctx, payload| {
             let request: ReadIntoTargetRequest = payload.deserialize(&ctx.msg_meta)?;
             let target = ctx

@@ -9,7 +9,7 @@ use crate::{Buffer, Client, Context, CopyOp, Error, ErrorKind, RemoteIoError, Re
 /// op semantics; validation already happened there).
 ///
 /// Default implementation (TCP/WS/HTTP): a reverse
-/// `_ruapc.memory/read_inline`
+/// `MemoryService/read_inline`
 /// RPC returns the requested byte ranges inline, which are then
 /// scattered into `local` according to the ops.
 pub(crate) async fn read(
@@ -69,7 +69,7 @@ pub(crate) async fn read(
 /// already happened there).
 ///
 /// Default implementation (TCP/WS/HTTP): the op payloads travel inline
-/// in a reverse `_ruapc.memory/write_inline` RPC and the client copies them
+/// in a reverse `MemoryService/write_inline` RPC and the client copies them
 /// into its pinned write buffers.
 pub(crate) async fn write(
     ctx: &Context,

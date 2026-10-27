@@ -13,9 +13,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   RPC error types, mapping codec failures to the existing error categories.
   Storage hooks and frame callbacks preserve caller errors through static
   generic dispatch. Pure RDMA frame codecs need no RDMA libraries.
-- `ruapc-schema` provides schema registration, OpenAPI projection and reflection
-  data independently of the RPC runtime. Existing `ruapc::MethodSchema` and
-  `ruapc::services` data-type paths remain available through re-exports.
+- `ruapc-schema` provides schema registration and OpenAPI projection independently
+  of the RPC runtime. `ruapc::MethodSchema` remains available through a re-export.
 - `ruapc` adds `rdma-ibv-query-gid-ex`, which enables RDMA and forwards to
   `ruapc-rdma`'s `ibv-query-gid-ex` backend for libibverbs' extended GID query
   APIs.
@@ -26,9 +25,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   a message after existing contents; transport prefixes belong in a custom
   `SendMsg::prepare` hook. The built-in length backfill hooks also reject empty
   metadata spans.
-- The moved schema and reflection types now have `JsonSchema::schema_id()`
-  values under `ruapc_schema`; their schema names and reflection wire format
-  are unchanged.
+- The moved `MethodSchema` type now has a `JsonSchema::schema_id()` under
+  `ruapc_schema`; its schema name is unchanged.
+- **BREAKING**: Built-in services use their trait names on the wire:
+  `MemoryService/*`, `RdmaBootstrapService/*` and `RdmaProbeService/probe` replace
+  the `_ruapc.memory/*` and `_ruapc.rdma/*` names. Peers must use matching names.
+- **BREAKING**: All registered services share one method directory. Router
+  inspection and OpenAPI include built-ins, and unary HTTP dispatches them
+  subject to each handler's transport and request-state prerequisites.
+  `SchemaRegistry::register` no longer takes a visibility argument.
+
+### Removed
+- **BREAKING**: `ReflectionService`, its `_ruapc.meta/describe` and
+  `_ruapc.meta/openapi` RPCs, reflection data types and the `ruapc_info` binary.
+  Query `/openapi.json` through an HTTP or unified listener for service schemas.
+- **BREAKING**: The `#[service(internal)]` flag, `Router::add_internal_method`
+  and `Router::is_public_method`. Use ordinary service registration and
+  `Router::has_method` to test whether a method is registered.
 
 ## [0.2.0-alpha.7] - 2026-10-25
 

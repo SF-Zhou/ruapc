@@ -39,9 +39,9 @@ Use [DESIGN.md](DESIGN.md) for crate/module ownership and
 - Server dispatch reserves capacity atomically, drops expired requests before
   execution and contains handler panics. Deadline expiry does not cancel running
   handlers; long-running handlers can poll `Context::is_expired()`.
-- Schema generation, OpenAPI projection and reflection data belong in
-  `ruapc-schema`, which has no workspace runtime dependencies. Keep handler
-  dispatch and reflection RPC adapters in `ruapc`.
+- Schema generation and OpenAPI projection belong in `ruapc-schema`, which has
+  no workspace runtime dependencies. Keep handler dispatch in `ruapc`; built-in
+  and application services share one method directory and exposure rules.
 - Emit metrics through the `metrics` facade. Keep per-method handles cached per
   `State`; users install a recorder before traffic. Only `server_inflight` has
   a locally tracked value, for admission control.
