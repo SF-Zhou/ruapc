@@ -23,6 +23,11 @@ use ruapc_rdma::{
 mod common;
 use common::{Config, pin_thread};
 
+// Measurements pin jemalloc as the process allocator so samples are comparable
+// across hosts; see docs/benchmark.md#allocator.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 const DEPTH: u32 = 64;
 const BATCH: usize = 32;
 const PIPELINE: usize = 2;

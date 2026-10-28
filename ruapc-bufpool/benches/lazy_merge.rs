@@ -13,6 +13,11 @@ use std::time::{Duration, Instant};
 
 use ruapc_bufpool::{Buffer, BufferPool, BufferPoolBuilder, EmptyDevices};
 
+// Measurements pin jemalloc as the process allocator so samples are comparable
+// across hosts; see docs/benchmark.md#allocator.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 const MIB: usize = 1024 * 1024;
 const LEVEL_SIZES: [usize; 4] = [MIB, 4 * MIB, 16 * MIB, 64 * MIB];
 

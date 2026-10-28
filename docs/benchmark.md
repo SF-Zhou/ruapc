@@ -4,6 +4,30 @@ This guide describes workload definitions, measurement controls and comparison
 methods. For a separately running server and client, use the
 [demo load commands](../ruapc-demo/README.md#load-testing).
 
+<a id="allocator"></a>
+
+## Process allocator
+
+Every benchmark target installs
+[`tikv-jemallocator`](https://crates.io/crates/tikv-jemallocator) as the process
+global allocator; the published crates never select one. The harnesses are
+separate binaries, but they link one allocator build with the same default
+configuration, so their allocation costs rest on one baseline. Absolute numbers
+are not comparable with runs that used the system allocator.
+
+With the default features the crate prefixes jemalloc's symbols with `_rjem_`,
+so runtime options come from `_RJEM_MALLOC_CONF` rather than `MALLOC_CONF`; for
+example `_RJEM_MALLOC_CONF=narenas:1`. Defaults are the crate defaults:
+`background_threads_runtime_support` is compiled in and background threads stay
+disabled at run time. Record any allocator override with the raw output and
+keep it identical when comparing versions; the workload variables documented
+below only select cases, they never change the allocator.
+
+Harnesses that call `std::alloc` directly measure jemalloc as well. In
+[`initialization`](../ruapc-bufpool/benches/initialization.rs) the raw controls
+therefore measure jemalloc while `AlignedMemory` keeps its own mapping path on
+64-bit Linux.
+
 <a id="how-to-run"></a>
 <a id="remote-memory-and-allocation"></a>
 
@@ -208,8 +232,11 @@ These harnesses need no RDMA libraries or device:
   free separately; `ns per alloc+free` is wall time divided by pairs per thread,
   not an individual-operation latency distribution.
 - [`initialization`](../ruapc-bufpool/benches/initialization.rs) compares 64 MiB
-  backing allocation and first full write. It separates demand-paged creation
-  from touching all bytes; it does not measure hot pool reuse or registration.
+  backing allocation and first full write. The `std alloc` cases measure the
+  process global allocator's large-allocation path, `AlignedMemory` cases
+  measure the pool's own mapping path on 64-bit Linux, and the last case adds
+  the first full write. It separates demand-paged creation from touching all
+  bytes; it does not measure hot pool reuse or registration.
 - [`handoff`](../ruapc-bufpool/benches/handoff.rs) compares same-thread
   allocation/free, producer allocation with consumer-thread free, and a
   preallocated-buffer handoff control. Cases use 16 KiB/64 KiB/1 MiB buffers,

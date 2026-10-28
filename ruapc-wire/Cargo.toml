@@ -19,6 +19,10 @@ rmp-serde.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+[dev-dependencies]
+# Installed as the process allocator by the benchmark harness.
+tikv-jemallocator.workspace = true
+
 [lints.rust]
 unsafe_code = "forbid"
 

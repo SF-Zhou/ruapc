@@ -19,6 +19,8 @@ schemars.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
+# Installed as the process allocator by every benchmark harness.
+tikv-jemallocator.workspace = true
 tokio.workspace = true
 
 [[bench]]
