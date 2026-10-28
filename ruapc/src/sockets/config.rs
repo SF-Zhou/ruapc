@@ -28,9 +28,12 @@ pub struct SocketPoolConfig {
     pub listen_mode: ListenMode,
     /// Maximum memory of the shared buffer pool in bytes.
     pub buffer_pool_memory: usize,
-    /// Maximum number of server-side requests processed concurrently;
+    /// Maximum number of server-side requests processed concurrently across
+    /// all methods, including built-in payload-transfer RPCs;
     /// excess requests are rejected immediately with an `Overloaded` error
-    /// response (load shedding). `0` disables the cap.
+    /// response (load shedding). `0` disables the cap. Allow enough capacity
+    /// for handlers awaiting nested or reverse calls, those calls, and their
+    /// transport RPCs.
     pub max_inflight_requests: usize,
     /// Base path for HTTP RPC, streaming, and documentation endpoints.
     /// Empty or `/` serves HTTP endpoints at the root.

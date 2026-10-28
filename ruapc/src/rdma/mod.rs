@@ -29,10 +29,10 @@ mod rdma_device_refresher;
 pub(crate) use rdma_device_refresher::RdmaDeviceRefresher;
 
 mod rdma_service;
-pub(crate) use rdma_service::{RdmaBootstrapService, RdmaPeerAdvertisement};
+pub(crate) use rdma_service::{RdmaPeerAdvertisement, RdmaService};
 
 mod probe;
-pub(crate) use probe::{RdmaProbeService, probe_connection};
+pub(crate) use probe::probe_connection;
 
 mod rdma_state;
 pub(crate) use rdma_state::{RdmaState, SendPermit};

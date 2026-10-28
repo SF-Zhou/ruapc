@@ -8,7 +8,7 @@ use std::{
 };
 
 use super::super::rdma_service::RDMA_BOOTSTRAP_PROTOCOL_VERSION;
-use super::super::{RdmaBootstrapService as _, RdmaPeerAdvertisement, RdmaSocket};
+use super::super::{RdmaPeerAdvertisement, RdmaService as _, RdmaSocket};
 use super::handshake::EstablishedSocket;
 use super::placement::{PathCandidate, PathPreference};
 use super::setup::at_stage;

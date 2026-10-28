@@ -8,7 +8,7 @@ pub use ruapc_schema::MethodSchema;
 use ruapc_schema::SchemaRegistry;
 
 #[cfg(feature = "rdma")]
-use crate::rdma::{RdmaBootstrapService, RdmaProbeService};
+use crate::rdma::RdmaService;
 use crate::{
     Context, Payload,
     error::{Error, ErrorKind, Result},
@@ -31,13 +31,21 @@ struct Method {
 /// Define services with [`#[service]`](crate::service) and call their generated
 /// `ruapc_export` before passing the router to [`Server::create`](crate::Server::create)
 /// or [`Context::create_with_router`]. The default router includes
-/// remote-memory services, plus RDMA bootstrap and
+/// remote-memory services, plus RDMA bootstrap, payload transfers and
 /// connection probes when that feature is enabled.
 ///
 /// All registered methods appear in [`method_names`](Self::method_names),
 /// [`method_schemas`](Self::method_schemas) and OpenAPI, and can be called through
 /// unary HTTP subject to their handler's transport and context requirements.
 /// Registration rejects duplicate wire names.
+/// Incoming dispatch is internal; applications invoke services through clients.
+///
+/// ```compile_fail
+/// use ruapc::{Context, Payload, Router};
+/// fn dispatch(router: &Router, context: Context, payload: Payload) {
+///     router.dispatch(context, payload);
+/// }
+/// ```
 pub struct Router {
     schemas: SchemaRegistry,
     /// Registered methods mapped by name (e.g., "ServiceName/method_name").
@@ -57,9 +65,7 @@ impl Default for Router {
         let dummy = Arc::new(());
         MemoryService::ruapc_export(dummy.clone(), &mut this);
         #[cfg(feature = "rdma")]
-        RdmaBootstrapService::ruapc_export(dummy.clone(), &mut this);
-        #[cfg(feature = "rdma")]
-        RdmaProbeService::ruapc_export(dummy.clone(), &mut this);
+        RdmaService::ruapc_export(dummy.clone(), &mut this);
         this
     }
 }
@@ -167,7 +173,7 @@ impl Router {
     /// deadline checks and panic containment. Custom callbacks supply their own
     /// policies; their returned errors are discarded here. An unknown method
     /// spawns a task to send an [`ErrorKind::InvalidArgument`] response.
-    pub fn dispatch(&self, mut ctx: Context, payload: Payload) {
+    pub(crate) fn dispatch(&self, mut ctx: Context, payload: Payload) {
         if let Some(method) = self.methods.get(&ctx.msg_meta.method) {
             let _ = (method.func)(ctx, payload);
         } else {
@@ -227,11 +233,13 @@ mod tests {
         ];
         #[cfg(feature = "rdma")]
         expected.extend([
-            "RdmaBootstrapService/cancel_connection",
-            "RdmaBootstrapService/commit_connection",
-            "RdmaBootstrapService/discover",
-            "RdmaBootstrapService/prepare_connection",
-            "RdmaProbeService/probe",
+            "RdmaService/cancel_connection",
+            "RdmaService/commit_connection",
+            "RdmaService/discover",
+            "RdmaService/prepare_connection",
+            "RdmaService/finish",
+            "RdmaService/offer",
+            "RdmaService/probe",
         ]);
         expected.sort_unstable();
         assert_eq!(all_names, expected);
@@ -288,13 +296,13 @@ mod tests {
                 .openapi
                 .paths
                 .paths
-                .contains_key("/RdmaProbeService/probe")
+                .contains_key("/RdmaService/probe")
         );
         let response = reqwest::Client::builder()
             .no_proxy()
             .build()
             .unwrap()
-            .post(format!("http://{address}/RdmaProbeService/probe"))
+            .post(format!("http://{address}/RdmaService/probe"))
             .json(&7u64)
             .send()
             .await

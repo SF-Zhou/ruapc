@@ -15,13 +15,13 @@
 //! actual assembly allocation and copies. Input chunks are cloned without
 //! copying their bytes. Every case includes destruction of its outputs.
 //! RDMA decoding measures one four-frame aggregate per operation, without
-//! parsing RPC metadata, collecting frames, posting work or processing controls.
+//! parsing RPC metadata, collecting frames or posting work.
 //! Times are wall time per operation, not latency distributions or RPC timings.
 
 use std::{hint::black_box, time::Instant};
 
 use bytes::{Buf, Bytes};
-use ruapc_wire::{CodecError, MsgFlags, MsgMeta, deserialize_payload, frame, parse_body, rdma};
+use ruapc_wire::{CodecError, MsgFlags, MsgMeta, deserialize_payload, frame, parse_body};
 
 const STREAM_HEADER_LEN: usize = 8;
 const AGGREGATE_FRAMES: usize = 4;
@@ -189,17 +189,13 @@ fn benchmark_chunks(config: &Config) -> usize {
 fn benchmark_rdma(config: &Config) -> usize {
     let encoded = frame::encode(&metadata(true), &"x".repeat(16)).unwrap();
     let body = encoded.slice(STREAM_HEADER_LEN..);
-    let mut aggregate = Vec::with_capacity(AGGREGATE_FRAMES * (4 + body.len()));
+    let mut aggregate = Vec::with_capacity(AGGREGATE_FRAMES * encoded.len());
     for _ in 0..AGGREGATE_FRAMES {
-        aggregate.extend_from_slice(&u32::try_from(body.len()).unwrap().to_be_bytes());
-        aggregate.extend_from_slice(&body);
+        aggregate.extend_from_slice(&encoded);
     }
     let aggregate = Bytes::from(aggregate);
     let mut decoded = 0;
-    rdma::decode_frames::<CodecError>(&aggregate, |frame| {
-        let rdma::Frame::Message(message) = frame else {
-            panic!("expected ordinary RPC frames");
-        };
+    frame::decode_frames::<CodecError>(&aggregate, |message| {
         assert_eq!(message, body);
         decoded += 1;
         Ok(())
@@ -207,8 +203,8 @@ fn benchmark_rdma(config: &Config) -> usize {
     .unwrap();
     assert_eq!(decoded, AGGREGATE_FRAMES);
 
-    config.measure("rdma/decode/4_frames", || {
-        rdma::decode_frames::<CodecError>(black_box(&aggregate), |frame| {
+    config.measure("frame/decode/4_frames", || {
+        frame::decode_frames::<CodecError>(black_box(&aggregate), |frame| {
             drop(black_box(frame));
             Ok(())
         })

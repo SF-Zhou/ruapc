@@ -109,7 +109,7 @@ fn codec_errors_convert_to_rpc_categories_without_copying_the_message() {
     let expected = error.msg.clone();
     let message_pointer = error.msg.as_ptr();
     let error: Error = error.into();
-    assert_eq!(error.kind, ErrorKind::TcpParseMsgFailed);
+    assert_eq!(error.kind, ErrorKind::ParseMsgFailed);
     assert_eq!(error.msg, expected);
     assert_eq!(error.msg.as_ptr(), message_pointer);
 

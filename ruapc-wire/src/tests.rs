@@ -330,3 +330,21 @@ fn public_finish_validates_offsets_without_mutating_invalid_frames() {
     buffer.extend_from_slice(&[42; 16]).unwrap();
     assert_finish_rejects_invalid_offsets(&mut buffer);
 }
+
+#[test]
+fn metadata_decode_rejects_nesting_beyond_the_shared_limit() {
+    // Unknown fields are ignored but still walked, so a deeply nested value
+    // must hit the shared decode limit instead of recursing without bound.
+    let mut metadata = vec![0x81, 0xa1, b'x']; // map(1) { "x": ... }
+    metadata.extend_from_slice(&[0x91u8; crate::MAX_DECODE_DEPTH + 8]); // array(1) * n
+    metadata.push(0x01);
+    let mut body = u32::try_from(metadata.len())
+        .unwrap()
+        .to_be_bytes()
+        .to_vec();
+    body.extend_from_slice(&metadata);
+    assert_eq!(
+        parse_body(&body).unwrap_err().kind,
+        CodecErrorKind::DeserializeFailed
+    );
+}

@@ -19,7 +19,10 @@ use crate::{
     Buffer, BufferPool, Context, CopyOp, Error, RemoteIoError, RemoteSpace, SocketTrait, State,
     error::{ErrorKind, Result},
     msg::MsgMeta,
-    rdma::poller::{PollerWaker, ReservedQueuePair},
+    rdma::{
+        poller::{PollerWaker, ReservedQueuePair},
+        rdma_service::is_payload_method,
+    },
     sockets::{SendRequest, reserve_send},
     task::next_conn_id,
 };
@@ -183,13 +186,21 @@ impl Drop for RdmaSocket {
     }
 }
 
-impl SocketTrait for RdmaSocket {
+impl SocketTrait for Arc<RdmaSocket> {
     async fn send<P: Serialize>(
         &self,
         meta: &mut MsgMeta,
         payload: &P,
         state: &Arc<State>,
     ) -> Result<()> {
+        // Only the transport can promise that its READs have settled. Public
+        // raw calls must not fabricate offer/finish requests on a live QP.
+        if meta.is_req() && is_payload_method(&meta.method) {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "RDMA payload RPCs may only be sent by the transport".into(),
+            ));
+        }
         let request = SendRequest::bind(meta, &state.waiter, self.conn_id);
         if !self.state.is_ok() {
             return Err(ErrorKind::ConnectionClosed.into());
@@ -202,7 +213,7 @@ impl SocketTrait for RdmaSocket {
         if encoded.buffer.len() > self.max_msg_size {
             request.check()?;
             // Keep the rendezvous state out of every inline send's future.
-            return Box::pin(self.send_large(meta, encoded, &request)).await;
+            return Box::pin(self.send_large(meta, encoded, &request, state)).await;
         }
         self.send_buffer(meta, encoded, &request).await
     }

@@ -80,7 +80,7 @@ are exercised by the RPC harnesses.
 | `encode/{msgpack,json}/{16,4096}B` | Metadata and string payload serialized into a complete stream frame; includes final allocation, growth and destruction |
 | `decode/{msgpack,json}/{16,4096}B` | Pre-encoded body cloned, metadata parsed and string payload decoded; includes owned allocations and destruction, excludes stream-header parsing |
 | `chunks/{whole,header_split,body_split}/4096B` | A fresh stream decoder per operation; input chunks share storage, only fragmented frames need assembly allocation/copying |
-| `rdma/decode/4_frames` | Four aggregated ordinary frames delivered to a `black_box` callback; excludes metadata parsing, verbs and control-frame processing |
+| `frame/decode/4_frames` | Four aggregated ordinary frames delivered to a `black_box` callback; excludes metadata parsing, verbs and RPC dispatch |
 
 Fixtures and correctness checks are outside timing. Results are amortized wall
 time in `ns/op`, not latency distributions or end-to-end RPC costs. Use the RPC

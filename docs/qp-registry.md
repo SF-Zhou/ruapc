@@ -66,7 +66,7 @@ channel and wake pipe. Zero disables spinning.
 
 While flushing, the poller refills an empty business FIFO so remaining SEND
 credits can serve ingress messages in the same pass. Queued messages retain
-priority over direct senders; private finish/reply controls run first. Queue
+priority over direct senders. Payload-transfer RPCs use the same queue. Queue
 bounds and deadline admission are in
 [pending business sends](rdma-capacity.md#pending-business-sends).
 

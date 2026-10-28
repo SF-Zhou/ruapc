@@ -5,7 +5,7 @@ use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
 use super::*;
 use crate::core::ContextEndpoint;
 use crate::http::HttpSocket;
-use crate::rdma::{RdmaBootstrapService as _, rdma_service::RDMA_BOOTSTRAP_PROTOCOL_VERSION};
+use crate::rdma::{RdmaService as _, rdma_service::RDMA_BOOTSTRAP_PROTOCOL_VERSION};
 use crate::{Context, Endpoint, ListenMode, Listener, Router, Server, Transport};
 
 fn pool_without_rdma_devices() -> RdmaSocketPool {

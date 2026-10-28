@@ -8,11 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Added
 - `ruapc-wire` provides message metadata, payload codecs, direct serialization,
-  and stream and RDMA framing independently of the RPC runtime and verbs.
+  and shared transport framing independently of the RPC runtime and verbs.
   It reports `CodecError`; `ruapc` retains its owned message/payload APIs and
   RPC error types, mapping codec failures to the existing error categories.
   Storage hooks and frame callbacks preserve caller errors through static
-  generic dispatch. Pure RDMA frame codecs need no RDMA libraries.
+  generic dispatch. Frame codecs need no RDMA libraries.
+- `ruapc-wire` exposes `MAX_DECODE_DEPTH` (128), the nesting limit shared by
+  message metadata and MessagePack payloads.
 - `ruapc-schema` provides schema registration and OpenAPI projection independently
   of the RPC runtime. `ruapc::MethodSchema` remains available through a re-export.
 - `ruapc` adds `rdma-ibv-query-gid-ex`, which enables RDMA and forwards to
@@ -20,15 +22,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   APIs.
 
 ### Changed
+- **BREAKING**: RDMA uses the shared `frame` format and `RdmaService/offer`
+  and `RdmaService/finish` RPCs instead of private large-payload control frames.
+  Connection bootstrap, payload transfer and health probes share `RdmaService`;
+  their wire names include `RdmaService/probe`. Bootstrap protocol version 3
+  requires matching peers.
 - `ruapc-wire` serialization into `BytesMut` now starts a fresh message while
   retaining capacity, matching the `Buffer` implementation. It no longer appends
   a message after existing contents; transport prefixes belong in a custom
   `SendMsg::prepare` hook. The built-in length backfill hooks also reject empty
   metadata spans.
+- Message metadata and MessagePack payloads are decoded
+  with the shared `MAX_DECODE_DEPTH` limit (128) instead of relying on codec
+  defaults; JSON payloads keep `serde_json`'s matching built-in limit.
+- **BREAKING**: WebSocket binary messages carry the shared stream frame
+  (`[RUA!][body_len][meta_len][meta][payload]`), one frame per binary message,
+  instead of a body-only form. TCP, HTTP/2 and WebSocket now share framing,
+  validation and size limits, including the WebSocket frame limit.
+- **BREAKING**: `ErrorKind::TcpParseMsgFailed` is renamed to
+  `ErrorKind::ParseMsgFailed`; it also reports stream frame failures on
+  WebSocket and HTTP/2.
 - The moved `MethodSchema` type now has a `JsonSchema::schema_id()` under
   `ruapc_schema`; its schema name is unchanged.
 - **BREAKING**: Built-in services use their trait names on the wire:
-  `MemoryService/*`, `RdmaBootstrapService/*` and `RdmaProbeService/probe` replace
+  `MemoryService/*` and `RdmaService/*` replace
   the `_ruapc.memory/*` and `_ruapc.rdma/*` names. Peers must use matching names.
 - **BREAKING**: All registered services share one method directory. Router
   inspection and OpenAPI include built-ins, and unary HTTP dispatches them

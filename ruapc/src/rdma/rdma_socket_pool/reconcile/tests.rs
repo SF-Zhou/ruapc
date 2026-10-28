@@ -37,7 +37,7 @@ impl PendingPrepare {
 fn gated_router() -> (Router, mpsc::UnboundedReceiver<PendingPrepare>) {
     let (sender, receiver) = mpsc::unbounded_channel();
     let mut router = Router::default();
-    router.wrap_method("RdmaBootstrapService/prepare_connection", move |original| {
+    router.wrap_method("RdmaService/prepare_connection", move |original| {
         let handler: Handler = Arc::from(original);
         Box::new(move |context, payload| {
             sender

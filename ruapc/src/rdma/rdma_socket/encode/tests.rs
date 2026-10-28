@@ -3,6 +3,7 @@ use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
+use ruapc_wire::frame;
 use serde::{Serializer, ser::SerializeSeq};
 
 use crate::{Devices, Message, MsgFlags};
@@ -65,6 +66,8 @@ fn finish_rejects_invalid_metadata_without_mutating_encoded_state() {
         for (meta_offset, payload_offset) in [
             (4, 7),
             (4, 8),
+            (HEADER_LEN, HEADER_LEN + 3),
+            (HEADER_LEN, HEADER_LEN + 4),
             (8, 4),
             (4, bytes.len() + 1),
             (usize::MAX, usize::MAX),
@@ -116,12 +119,18 @@ fn grows_across_multiple_buffers_without_serializing_user_value_again() {
         let buffer = &message.encoded.buffer;
         assert!(buffer.len() > 16 * 1024);
         assert_eq!(
-            u32::from_be_bytes(buffer[..4].try_into().unwrap()) as usize,
-            buffer.len() - 4
+            u32::from_be_bytes(buffer[4..HEADER_LEN].try_into().unwrap()) as usize,
+            buffer.len() - HEADER_LEN
         );
-        let meta_len = u32::from_be_bytes(buffer[4..8].try_into().unwrap()) as usize;
-        assert_eq!(message.encoded.payload_offset, 8 + meta_len);
-        let decoded = Message::parse(Bytes::copy_from_slice(&buffer[4..])).unwrap();
+        assert_eq!(&buffer[..4], &frame::MAGIC_NUM.to_be_bytes());
+        assert_eq!(
+            buffer.as_ref(),
+            frame::encode(&meta, &chunks).unwrap().as_ref()
+        );
+        let meta_len =
+            u32::from_be_bytes(buffer[HEADER_LEN..HEADER_LEN + 4].try_into().unwrap()) as usize;
+        assert_eq!(message.encoded.payload_offset, HEADER_LEN + 4 + meta_len);
+        let decoded = Message::parse(Bytes::copy_from_slice(&buffer[HEADER_LEN..])).unwrap();
         assert_eq!(decoded.meta, meta);
         assert_eq!(
             decoded.payload.deserialize::<Vec<String>>(&meta).unwrap(),
@@ -252,12 +261,18 @@ fn refreshing_timeout_preserves_payload_across_messagepack_integer_widths() {
                 original_payload.as_slice()
             );
             assert_eq!(
-                u32::from_be_bytes(buffer[..4].try_into().unwrap()) as usize,
-                buffer.len() - 4
+                u32::from_be_bytes(buffer[4..HEADER_LEN].try_into().unwrap()) as usize,
+                buffer.len() - HEADER_LEN
             );
-            let meta_len = u32::from_be_bytes(buffer[4..8].try_into().unwrap()) as usize;
-            assert_eq!(message.encoded.payload_offset, 8 + meta_len);
-            let decoded = Message::parse(Bytes::copy_from_slice(&buffer[4..])).unwrap();
+            assert_eq!(&buffer[..4], &frame::MAGIC_NUM.to_be_bytes());
+            assert_eq!(
+                buffer.as_ref(),
+                frame::encode(&meta, &chunks).unwrap().as_ref()
+            );
+            let meta_len =
+                u32::from_be_bytes(buffer[HEADER_LEN..HEADER_LEN + 4].try_into().unwrap()) as usize;
+            assert_eq!(message.encoded.payload_offset, HEADER_LEN + 4 + meta_len);
+            let decoded = Message::parse(Bytes::copy_from_slice(&buffer[HEADER_LEN..])).unwrap();
             assert_eq!(decoded.meta, meta);
             assert_eq!(
                 decoded.payload.deserialize::<Vec<String>>(&meta).unwrap(),

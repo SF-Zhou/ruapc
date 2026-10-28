@@ -19,16 +19,17 @@ use crate::{
     BufferPool, ConnectionMap, Devices, Endpoint, Message, RawStream, Socket, SocketPoolConfig,
     SocketPoolTrait, State, TaskSupervisor,
     error::{Error, ErrorKind, Result},
-    msg::frame::MAX_MSG_SIZE,
+    msg::frame::{FrameDecoder, MAX_MSG_SIZE},
     sockets::{connect::ConnectGroups, tcp},
 };
 
-/// WebSocket protocol limits aligned with the TCP transport's
-/// [`MAX_MSG_SIZE`](crate::msg::frame::MAX_MSG_SIZE).
+/// WebSocket protocol limits aligned with the shared stream frame limit: one
+/// binary message carries exactly one stream frame, so both the message and its
+/// frame may reach [`MAX_MSG_SIZE`](crate::msg::frame::MAX_MSG_SIZE).
 pub(crate) fn web_socket_config() -> tungstenite::protocol::WebSocketConfig {
     tungstenite::protocol::WebSocketConfig::default()
         .max_message_size(Some(MAX_MSG_SIZE))
-        .max_frame_size(Some(16 << 20))
+        .max_frame_size(Some(MAX_MSG_SIZE))
 }
 
 pub struct WebSocketPool {
@@ -258,11 +259,27 @@ impl WebSocketPool {
         S: AsyncRead + AsyncWrite + Unpin,
     {
         let socket = Socket::WS(web_socket);
+        let mut decoder = FrameDecoder::default();
         while let Some(msg) = recv_stream.next().await {
             let msg = msg.map_err(|e| Error::new(ErrorKind::WebSocketRecvFailed, e.to_string()))?;
             match msg {
                 tungstenite::Message::Binary(bytes) => {
-                    let msg = Message::parse(bytes)?;
+                    // One WebSocket binary message carries exactly one stream
+                    // frame; complete frames are decoded without copying.
+                    let mut input = bytes;
+                    let body = decoder.decode(&mut input)?.ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::ParseMsgFailed,
+                            "incomplete WebSocket frame".into(),
+                        )
+                    })?;
+                    if !input.is_empty() {
+                        return Err(Error::new(
+                            ErrorKind::ParseMsgFailed,
+                            "trailing bytes after WebSocket frame".into(),
+                        ));
+                    }
+                    let msg = Message::parse(body)?;
                     state.handle_recv(&socket, msg)?;
                 }
                 tungstenite::Message::Close(_) => {

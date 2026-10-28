@@ -69,15 +69,19 @@ async fn test_http_openapi_includes_builtin_methods() {
         "/MemoryService/read_into_target",
         "/MemoryService/request_is_pending",
         #[cfg(feature = "rdma")]
-        "/RdmaBootstrapService/discover",
+        "/RdmaService/discover",
         #[cfg(feature = "rdma")]
-        "/RdmaBootstrapService/prepare_connection",
+        "/RdmaService/prepare_connection",
         #[cfg(feature = "rdma")]
-        "/RdmaBootstrapService/commit_connection",
+        "/RdmaService/commit_connection",
         #[cfg(feature = "rdma")]
-        "/RdmaBootstrapService/cancel_connection",
+        "/RdmaService/cancel_connection",
         #[cfg(feature = "rdma")]
-        "/RdmaProbeService/probe",
+        "/RdmaService/probe",
+        #[cfg(feature = "rdma")]
+        "/RdmaService/offer",
+        #[cfg(feature = "rdma")]
+        "/RdmaService/finish",
     ];
     assert_eq!(paths.len(), expected_paths.len());
     for path in expected_paths {
@@ -135,13 +139,25 @@ async fn test_http_builtin_methods_dispatch_and_validate_context() {
         ),
         #[cfg(feature = "rdma")]
         (
-            "/RdmaBootstrapService/discover",
+            "/RdmaService/discover",
             serde_json::Value::Null,
             ErrorKind::InvalidArgument,
         ),
         #[cfg(feature = "rdma")]
         (
-            "/RdmaProbeService/probe",
+            "/RdmaService/offer",
+            serde_json::json!({"transfer_id": 1, "payload_len": 1, "regions": [], "meta": {}}),
+            ErrorKind::InvalidArgument,
+        ),
+        #[cfg(feature = "rdma")]
+        (
+            "/RdmaService/finish",
+            serde_json::json!({"transfer_id": 1}),
+            ErrorKind::InvalidArgument,
+        ),
+        #[cfg(feature = "rdma")]
+        (
+            "/RdmaService/probe",
             serde_json::json!(17),
             ErrorKind::InvalidArgument,
         ),

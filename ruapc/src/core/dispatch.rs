@@ -35,7 +35,6 @@ where
     let state = ctx.state.clone();
     let metrics = &state.metrics;
 
-    // Load shedding: reject before spawning any work.
     let cap = state.max_inflight_requests;
     let inflight = metrics.server_inflight.fetch_add(1, Ordering::Relaxed);
     if cap > 0 && inflight >= cap as i64 {
@@ -44,14 +43,13 @@ where
         tokio::spawn(async move {
             ctx.send_err_rsp(Error::new(
                 ErrorKind::Overloaded,
-                format!("server over capacity ({cap} requests in flight)"),
+                format!("server over capacity ({cap} requests in flight) for {method}"),
             ))
             .await;
         });
         return;
     }
 
-    // Own the reservation before any early return or handler construction.
     let guard = InflightGuard { state };
     let metrics = &guard.state.metrics;
 

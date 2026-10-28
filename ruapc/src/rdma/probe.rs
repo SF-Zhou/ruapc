@@ -8,61 +8,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-
-use super::RdmaSocket;
+use super::{
+    RdmaSocket,
+    rdma_service::{PROBE_BYTES, RdmaService},
+};
 use crate::{
-    Client, Context, CopyOp, Error, ErrorKind, MsgMeta, Result, Socket, State,
-    core::ContextEndpoint, service,
+    Client, Context, Error, ErrorKind, MsgMeta, Result, Socket, State, core::ContextEndpoint,
 };
 
-const PROBE_BYTES: usize = std::mem::size_of::<u64>();
 static NEXT_PROBE_NONCE: AtomicU64 = AtomicU64::new(1);
-
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub(crate) struct ProbeReply {
-    pub(crate) rpc_nonce: u64,
-    pub(crate) read_nonce: u64,
-}
-
-#[service]
-pub(crate) trait RdmaProbeService {
-    /// Checks RPC delivery and reads the attached nonce over the same RDMA connection.
-    async fn probe(&self, ctx: &Context, nonce: &u64) -> Result<ProbeReply>;
-}
-
-impl RdmaProbeService for () {
-    async fn probe(&self, ctx: &Context, nonce: &u64) -> Result<ProbeReply> {
-        if !matches!(&ctx.endpoint, ContextEndpoint::Connected(Socket::RDMA(_))) {
-            return Err(Error::new(
-                ErrorKind::InvalidArgument,
-                "RDMA probe requires an established RDMA connection".into(),
-            ));
-        }
-        if ctx.remote_read_space()?.total_len() != PROBE_BYTES as u64 {
-            return Err(Error::new(
-                ErrorKind::InvalidArgument,
-                "RDMA probe requires exactly eight bytes of read space".into(),
-            ));
-        }
-        let mut destination = ctx
-            .state
-            .buffer_pool
-            .allocate(PROBE_BYTES)
-            .map_err(|error| Error::new(ErrorKind::InvalidArgument, error.to_string()))?;
-        destination.set_len(PROBE_BYTES);
-        let destinations = ctx
-            .remote_read(&[CopyOp::new(0, 0, PROBE_BYTES as u64)], vec![destination])
-            .await?;
-        let mut read_bytes = [0; PROBE_BYTES];
-        read_bytes.copy_from_slice(&destinations[0]);
-        Ok(ProbeReply {
-            rpc_nonce: *nonce,
-            read_nonce: u64::from_le_bytes(read_bytes),
-        })
-    }
-}
 
 /// Probes exactly this socket, without pool acquisition, retries or an inherited deadline.
 pub(crate) async fn probe_connection(
@@ -121,7 +75,9 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     use super::*;
-    use crate::{Endpoint, Router, Server, SocketPoolConfig, Transport};
+    use crate::{
+        Endpoint, Router, Server, SocketPoolConfig, Transport, rdma::rdma_service::ProbeReply,
+    };
 
     async fn stop(server: Server, context: Context) {
         context.state.socket_pool.stop();
@@ -162,7 +118,7 @@ mod tests {
         let forge_reply = Arc::new(AtomicBool::new(false));
         let mut router = Router::default();
         let forge = forge_reply.clone();
-        router.wrap_method("RdmaProbeService/probe", move |original| {
+        router.wrap_method("RdmaService/probe", move |original| {
             Box::new(move |mut ctx, payload| {
                 if !forge.load(Ordering::Acquire) {
                     return original(ctx, payload);

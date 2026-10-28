@@ -1,15 +1,15 @@
-/// Failures in message encoding, decoding and stream framing.
+/// Failures in message encoding, decoding and transport framing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CodecErrorKind {
     /// An offset, length or integer conversion is invalid.
     InvalidArgument,
     /// MessagePack encoding or a direct storage write failed.
     SerializeFailed,
-    /// A message body or RDMA frame is malformed, or MessagePack decoding failed.
+    /// A message body is malformed, or MessagePack decoding failed.
     DeserializeFailed,
     /// JSON encoding or decoding failed.
     Json,
-    /// A stream frame has invalid magic bytes or exceeds the size limit.
+    /// A frame has invalid magic bytes, exceeds the size limit or is truncated.
     InvalidFrame,
 }
 

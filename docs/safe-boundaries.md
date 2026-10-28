@@ -48,31 +48,48 @@ the QP eventually recycles those buffers.
 ## Large-payload source ownership
 
 Large RDMA requests and responses use transport-owned serialized source
-buffers and a private offer/finish protocol. Publishing an offer installs the
+buffers and the built-in `RdmaService/offer` and `finish` RPCs.
+Publishing an offer installs the
 immutable source in its connection's transfer table in the same synchronous
 step that accepts the offer into the send queue. A send failure before that
 step is safe to retry. Once accepted, cancellation, request expiry and
 connection failure cannot trigger an automatic retry or return the source.
+Offer acknowledgements are supervised independently of the business call.
+An acknowledgement failure, expiry or supervision shutdown closes the
+connection without releasing its unconfirmed sources. These tasks hold only
+weak socket references so they cannot delay provider QP destruction.
 
 The receiving connection validates the advertised length, region bounds and
-allocation budget before posting an owned READ plan. It sends finish only
+allocation budget before posting an owned READ plan. It calls `finish` only
 after every READ has completed successfully, or after deciding to post none
-for an unwanted request or response. The source accepts finish only through
-that connection's private RDMA dispatcher. It releases the corresponding
+for an unwanted request or response. The source accepts `finish` on the same
+established RDMA connection.
+It releases the corresponding
 source and replies whether the message remains valid. Request validity checks
 the pending waiter on that exact connection and its deadline. The receiver
 dispatches only after a positive reply and another request-deadline check.
 
+The public RDMA send API rejects application-generated requests for these two
+reserved methods. Only transport code can send them, after source publication
+or READ completion; a raw RPC call cannot fabricate completion evidence.
+
 Transfer IDs are connection-scoped and never wrap. Receiver replay tracking
 persists for the connection's lifetime, including after completed transfers
-leave the active table. Controls cannot be invoked through application RPCs,
-HTTP endpoints or `State::handle_recv`.
+leave the active table. The two methods share ordinary RPC framing, routing,
+response correlation and discovery. Their handlers reject non-RDMA transports;
+incoming message dispatch is internal to the runtime. They share the same
+`max_inflight_requests` cap as other RPCs; see
+[admission and cleanup](rdma-capacity.md#large-payload-admission-and-cleanup)
+for capacity requirements during nested calls.
 
 Cancelling a receive task, abandoning a posted READ, or failing confirmation
 moves the connection to ERR. Unconfirmed sources remain owned until provider
 QP destruction succeeds; `RdmaSocket` destroys its QP before its transfer
 table. Transfer cleanup deadlines close a connection rather than releasing
-memory on a timer. Peers must honor the advertised-memory protocol; access to
+memory on a timer. A successful offer response acknowledges the receive task,
+not READ completion. Peers must honor the advertised-memory protocol: a finish
+RPC asserts that the peer has settled its READs and is not itself a local
+CQ-issued completion token. Access to
 registration keys is a trust boundary, even with this source-retention
 protocol.
 

@@ -122,7 +122,7 @@ impl ReadDeadline {
 
 impl RdmaSocket {
     /// Transport payload READs use the same owned plans and completion evidence
-    /// as remote memory, with a separate private finish protocol for the source.
+    /// as remote memory, with a separate payload finish RPC for the source.
     pub(super) async fn read_payload(
         &self,
         regions: &[RemoteBufferInfo],

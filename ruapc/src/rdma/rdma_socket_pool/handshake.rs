@@ -6,8 +6,8 @@ use std::{sync::Arc, time::Instant};
 use tracing::Instrument as _;
 
 use super::super::{
-    ConnectionLease, DeviceSelection, PrepareConnectionRequest, RdmaBootstrapService as _,
-    RdmaConnectionLimits, RdmaSocket,
+    ConnectionLease, DeviceSelection, PrepareConnectionRequest, RdmaConnectionLimits,
+    RdmaService as _, RdmaSocket,
 };
 use super::placement::PathCandidate;
 use super::setup::at_stage;

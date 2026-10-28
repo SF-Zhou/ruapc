@@ -2,7 +2,7 @@
 
 <a id="rdma-连接建立"></a>
 
-RuaPC discovers devices and exchanges QP parameters through `RdmaBootstrapService`
+RuaPC discovers devices and exchanges QP parameters through `RdmaService`
 RPCs over the endpoint's declared bootstrap transport (`tcp+rdma`, `ws+rdma`,
 or `http+rdma`), then activates the connection through the RDMA data plane.
 A peer is identified by that bootstrap transport and its complete normalized
@@ -19,7 +19,7 @@ another group address. See [endpoint identity and strings](endpoints.md).
 
 This page owns bootstrap, path selection, negotiation, peer maintenance, and
 connection health probes.
-See the [built-in method catalog](builtin-services.md#rdma-bootstrap-rdmabootstrapservice),
+See the [built-in method catalog](builtin-services.md#connection-bootstrap),
 [capacity budgets](rdma-capacity.md), and [poller routing](qp-registry.md) for
 the adjacent contracts.
 
@@ -31,14 +31,14 @@ Paths are relative to the repository root.
 
 | Module | Responsibility |
 |---|---|
-| `ruapc/src/rdma/rdma_service.rs` | Bootstrap methods, protocol version, connectable-device advertisements. |
+| `ruapc/src/rdma/rdma_service.rs` | Connection bootstrap, payload-transfer and health-probe RPCs and types, protocol version, connectable-device advertisements. |
 | `ruapc/src/rdma/endpoint.rs` | Wire types, endpoint validation, directional negotiation, prepare-response validation. |
 | `ruapc/src/rdma/rdma_socket_pool/placement.rs` | Candidate paths, static policy, load ranking, failure preferences. |
 | `ruapc/src/rdma/rdma_socket_pool/connect.rs` | Discovery cache, path failover, stripe-set publication. |
 | `ruapc/src/rdma/rdma_socket_pool/handshake.rs` | One outbound handshake and rollback until publication. |
 | `ruapc/src/rdma/rdma_socket_pool/setup.rs` | Shared negotiation, poller/QP creation, endpoint generation, connection and registration. |
 | `ruapc/src/rdma/rdma_socket_pool/accept.rs` | Acceptor prepare/commit/cancel, leases, expiry. |
-| `ruapc/src/rdma/probe.rs` | Connection health RPC, remote READ validation, per-probe deadline. |
+| `ruapc/src/rdma/probe.rs` | Client health-check round trip, RPC and READ nonce verification, per-probe deadline. |
 | `ruapc/src/rdma/rdma_socket_pool/probe.rs` | Periodic checks of individual connections, timeout counts, reconnect scheduling. |
 | `ruapc/src/rdma/rdma_socket_pool/reconcile.rs` | Shared first-use, periodic and recovery replenishment, single-flight scheduling and backoff. |
 | `ruapc/src/rdma/rdma_socket_pool/peer.rs` | Group state, connection identity checks and recovery intent synchronized with publication. |
@@ -52,7 +52,7 @@ Paths are relative to the repository root.
 
 The first connection to a peer follows this sequence. Healthy stripes are
 reused; replenishment and migration reuse the same single-stripe handshake.
-Discovery must return bootstrap protocol version **2**.
+Discovery must return bootstrap protocol version **3**.
 
 ```mermaid
 sequenceDiagram
@@ -185,7 +185,8 @@ Implementations are `rdma_socket_pool/placement.rs`, `reconcile.rs`,
 Both clients and servers periodically probe each published outbound connection
 and each activated inbound connection. A probe uses that exact RDMA socket;
 it does not acquire another stripe or retry the request. The
-`RdmaProbeService/probe` RPC carries a nonce and eight bytes of immutable read space.
+[`RdmaService/probe`](builtin-services.md#health-probe) RPC carries a nonce and
+eight bytes of immutable read space.
 The receiver performs `Context::remote_read` on the same connection and returns
 both the RPC nonce and the value read. Success requires both values to match,
 including the normal post-READ source-request validation. Probes from both ends
@@ -263,8 +264,8 @@ therefore fail and roll back setup rather than produce incompatible peers.
 | Field | Validation and meaning |
 |---|---|
 | `recv_queue_len` | At least 2 and no greater than either negotiated WR direction. The derived SEND window is defined in [capacity](rdma-capacity.md#completion-credit-budget). |
-| `max_msg_size` | Inline serialized-message limit and each posted receive-buffer size. Minimum 16 KiB; local default 256 KiB. |
-| `max_large_msg_size` | Complete serialized-message limit, including metadata and framing. Local default 64 MiB, the maximum single pool allocation. Zero disables large payloads; otherwise it must cover `max_msg_size` and be at most 64 MiB. |
+| `max_msg_size` | Complete inline frame limit and each posted receive-buffer size. At least 16 KiB and less than 64 MiB; local default 256 KiB. |
+| `max_large_msg_size` | Complete serialized-message limit, including metadata and framing. Local default 64 MiB minus one byte, the largest shared frame. Zero disables large payloads; otherwise it must cover `max_msg_size` and be less than 64 MiB. Registered storage may round up to the maximum single pool allocation of 64 MiB. |
 | `qp_num`, `psn` | 24 bits; QPN must be nonzero. PSN is randomized per QP and may be zero. |
 | `port_num`, `gid_index` | Ports start at 1; the response must match the requested port and GID index. |
 | `link_layer`, `lid`, `gid` | Link layers must match. IB uses a unicast LID and may omit GID; RoCE requires a nonzero unicast GID. |
@@ -274,8 +275,9 @@ therefore fail and roll back setup rather than produce incompatible peers.
 | `attempt_id`, `accepted_connection_id` | Nonzero; the response attempt must match. Together they identify an accepted connection. |
 
 `max_large_msg_size` is an optional named MessagePack field: missing defaults
-to zero, and zero is omitted. An older peer omitting it negotiates inline-only
-operation without changing bootstrap version 2. The local
+to zero, and zero is omitted. Zero selects inline-only operation. Protocol
+version 3 uses shared message frames and the payload-transfer RPCs; earlier
+protocol versions are rejected. The local
 [`max_inflight_large_bytes` budget](rdma-capacity.md#large-payload-admission-and-cleanup)
 is not negotiated. SGE limits, P_Key index, selective signaling, and CQ settings
 also remain local; CQs are shared by device shards.
