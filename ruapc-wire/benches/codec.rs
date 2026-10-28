@@ -23,6 +23,11 @@ use std::{hint::black_box, time::Instant};
 use bytes::{Buf, Bytes};
 use ruapc_wire::{CodecError, MsgFlags, MsgMeta, deserialize_payload, frame, parse_body};
 
+// Measurements pin jemalloc as the process allocator so samples are comparable
+// across hosts; see docs/benchmark.md#allocator.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 const STREAM_HEADER_LEN: usize = 8;
 const AGGREGATE_FRAMES: usize = 4;
 

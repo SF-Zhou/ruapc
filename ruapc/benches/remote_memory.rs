@@ -30,6 +30,11 @@ mod common;
 
 use common::endpoint;
 
+// Measurements pin jemalloc as the process allocator so samples are comparable
+// across hosts; see docs/benchmark.md#allocator.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 const WARMUP_ITERS: usize = 8;
 /// Size in bytes and measured iterations; the larger case moves more bytes.
 const CASES: [(usize, usize); 2] = [(64 * 1024, 512), (1024 * 1024, 128)];

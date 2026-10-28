@@ -27,6 +27,11 @@ use std::{
 
 use ruapc_bufpool::{Buffer, BufferPool, BufferPoolBuilder, EmptyDevices};
 
+// Measurements pin jemalloc as the process allocator so samples are comparable
+// across hosts; see docs/benchmark.md#allocator.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 const SIZE: usize = 64 * 1024 * 1024;
 
 #[derive(Default)]

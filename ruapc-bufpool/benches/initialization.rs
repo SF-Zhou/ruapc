@@ -1,5 +1,8 @@
 //! Compare first allocation cost without charging initialization to the hot pool
 //! reuse path. The raw controls never expose uninitialized memory as byte slices.
+//! `std alloc` cases measure the process global allocator, which every harness
+//! sets to jemalloc; `AlignedMemory` uses its own mapping path on 64-bit Linux.
+//! See `docs/benchmark.md#allocator`.
 //!
 //! Run with: cargo bench -p ruapc-bufpool --bench initialization
 
@@ -8,6 +11,11 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use ruapc_bufpool::AlignedMemory;
+
+// Measurements pin jemalloc as the process allocator so samples are comparable
+// across hosts; see docs/benchmark.md#allocator.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 const SIZE: usize = 64 * 1024 * 1024;
 const ITERATIONS: u32 = 64;
@@ -32,9 +40,9 @@ fn main() {
     let layout = Layout::from_size_align(SIZE, ALIGN).unwrap();
     for zeroed in [false, true] {
         let name = if zeroed {
-            "system alloc_zeroed + free"
+            "std alloc_zeroed + free"
         } else {
-            "system alloc + free (uninitialized)"
+            "std alloc + free (uninitialized)"
         };
         measure(name, || {
             // SAFETY: valid nonzero layout, checked allocation, matching free.

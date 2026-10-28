@@ -51,6 +51,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   inspection and OpenAPI include built-ins, and unary HTTP dispatches them
   subject to each handler's transport and request-state prerequisites.
   `SchemaRegistry::register` no longer takes a visibility argument.
+- Benchmark harnesses install `tikv-jemallocator` as the process global
+  allocator, so measurements no longer depend on the host's system allocator.
+  The `initialization` harness reports its raw controls as `std alloc` because
+  they now use jemalloc as well. See the
+  [benchmark guide](docs/benchmark.md#allocator).
 
 ### Removed
 - **BREAKING**: `ReflectionService`, its `_ruapc.meta/describe` and

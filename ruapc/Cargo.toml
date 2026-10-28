@@ -62,6 +62,8 @@ unsafe_code = "forbid"
 # resolve `ruapc` from the registry before this release is uploaded.
 ruapc = { path = ".", features = ["rdma"] }
 
+# Installed as the process allocator by every benchmark harness.
+tikv-jemallocator.workspace = true
 metrics-util.workspace = true
 reqwest.workspace = true
 

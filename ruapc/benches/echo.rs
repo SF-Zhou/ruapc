@@ -27,6 +27,11 @@ mod common;
 
 use common::endpoint;
 
+// Measurements pin jemalloc as the process allocator so samples are comparable
+// across hosts; see docs/benchmark.md#allocator.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 const WARMUP_ITERS: usize = 1_000;
 const SERIAL_ITERS: usize = 5_000;
 /// Concurrency levels for the closed-loop throughput benchmark.

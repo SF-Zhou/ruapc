@@ -38,6 +38,11 @@ use ruapc_rdma::{
 mod common;
 use common::Config;
 
+// Measurements pin jemalloc as the process allocator so samples are comparable
+// across hosts; see docs/benchmark.md#allocator.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 const CHUNK: u64 = 64;
 const SEGMENT_LEN: usize = 64;
 const LEDGER_WINDOW: u64 = 64;
