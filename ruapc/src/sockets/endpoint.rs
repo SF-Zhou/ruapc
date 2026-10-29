@@ -58,18 +58,67 @@ impl FromStr for Transport {
     }
 }
 
-/// How a server listener interprets accepted TCP streams.
-#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum ListenMode {
-    TCP,
-    WS,
-    HTTP,
-    UNIFIED,
+bitflags::bitflags! {
+    /// Protocols accepted by a server listener on the same port.
+    ///
+    /// Combine flags with `|`, for example `ListenMode::TCP | ListenMode::HTTP`.
+    /// HTTP RPC and documentation routes require [`HTTP`](Self::HTTP), while
+    /// WebSocket upgrades independently require [`WS`](Self::WS).
+    /// [`SocketPoolConfig`](crate::SocketPoolConfig) defaults to TCP and rejects
+    /// empty modes or unknown bits. Outbound transports are unaffected.
+    ///
+    /// Parsing and serde accept case-insensitive names separated by `|`, such as
+    /// `"tcp | http"` or `"unified"`. Display and serialization use uppercase
+    /// protocol names in TCP, HTTP, WS order.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct ListenMode: u8 {
+        /// Framed RuaPC TCP connections.
+        const TCP = 1;
+        /// HTTP streaming, unary RPC and documentation routes.
+        const HTTP = 2;
+        /// WebSocket upgrades and framed WebSocket RPC.
+        const WS = 4;
+        /// All listener protocols: TCP, HTTP and WebSocket.
+        const UNIFIED = Self::TCP.bits() | Self::HTTP.bits() | Self::WS.bits();
+    }
 }
 
 impl fmt::Display for ListenMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(self, f)
+        bitflags::parser::to_writer(self, f)
+    }
+}
+
+impl FromStr for ListenMode {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        value.split('|').try_fold(Self::empty(), |mode, name| {
+            Self::from_name(&name.trim().to_ascii_uppercase())
+                .map(|flag| mode | flag)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidArgument,
+                        format!(
+                            "invalid listener protocol {name:?}: expected TCP, HTTP, WS or UNIFIED separated by '|'"
+                        ),
+                    )
+                })
+        })
+    }
+}
+
+impl Serialize for ListenMode {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for ListenMode {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -369,6 +418,71 @@ impl<'de> Deserialize<'de> for Endpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listen_mode_combinations_roundtrip() {
+        assert_eq!(
+            ListenMode::UNIFIED,
+            ListenMode::TCP | ListenMode::HTTP | ListenMode::WS
+        );
+        for (mode, canonical) in [
+            (ListenMode::TCP, "TCP"),
+            (ListenMode::HTTP, "HTTP"),
+            (ListenMode::WS, "WS"),
+            (ListenMode::TCP | ListenMode::HTTP, "TCP | HTTP"),
+            (ListenMode::TCP | ListenMode::WS, "TCP | WS"),
+            (ListenMode::HTTP | ListenMode::WS, "HTTP | WS"),
+            (ListenMode::UNIFIED, "TCP | HTTP | WS"),
+        ] {
+            assert_eq!(mode.to_string(), canonical);
+            assert_eq!(canonical.parse::<ListenMode>().unwrap(), mode);
+            assert_eq!(
+                canonical
+                    .to_ascii_lowercase()
+                    .parse::<ListenMode>()
+                    .unwrap(),
+                mode
+            );
+            let json = serde_json::to_string(&mode).unwrap();
+            assert_eq!(serde_json::from_str::<String>(&json).unwrap(), canonical);
+            assert_eq!(serde_json::from_str::<ListenMode>(&json).unwrap(), mode);
+            let messagepack = rmp_serde::to_vec(&mode).unwrap();
+            assert_eq!(
+                rmp_serde::from_slice::<String>(&messagepack).unwrap(),
+                canonical
+            );
+            assert_eq!(
+                rmp_serde::from_slice::<ListenMode>(&messagepack).unwrap(),
+                mode
+            );
+        }
+        assert_eq!(
+            "unified".parse::<ListenMode>().unwrap(),
+            ListenMode::UNIFIED
+        );
+        assert_eq!(
+            " ws| Tcp |TCP ".parse::<ListenMode>().unwrap(),
+            ListenMode::TCP | ListenMode::WS
+        );
+    }
+
+    #[test]
+    fn listen_mode_rejects_invalid_protocols() {
+        for value in [
+            "", " ", "rdma", "tcp|", "|http", "tcp||ws", "tcp,ws", "0x01",
+        ] {
+            let error = value.parse::<ListenMode>().unwrap_err();
+            assert_eq!(error.kind, ErrorKind::InvalidArgument, "{value}");
+            assert!(
+                serde_json::from_str::<ListenMode>(&serde_json::to_string(value).unwrap()).is_err(),
+                "{value}"
+            );
+            assert!(
+                rmp_serde::from_slice::<ListenMode>(&rmp_serde::to_vec(value).unwrap()).is_err(),
+                "{value}"
+            );
+        }
+    }
 
     #[test]
     fn endpoint_uri_roundtrip() {

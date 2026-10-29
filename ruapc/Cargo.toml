@@ -26,6 +26,7 @@ ruapc-schema.workspace = true
 ruapc-wire.workspace = true
 
 arc-swap.workspace = true
+bitflags.workspace = true
 bytes.workspace = true
 clap.workspace = true
 dashmap.workspace = true

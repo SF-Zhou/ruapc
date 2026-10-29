@@ -56,7 +56,7 @@ pub struct SocketPool {
     http: HttpSocketPool,
     #[cfg(feature = "rdma")]
     rdma: Option<RdmaSocketPool>,
-    listen_mode: ListenMode,
+    pub listen_mode: ListenMode,
     task_supervisor: TaskSupervisor,
 }
 
@@ -103,6 +103,7 @@ impl SocketPool {
         devices: &Arc<Devices>,
         buffer_pool: &Arc<BufferPool>,
     ) -> Result<Self> {
+        config.validate()?;
         let task_supervisor = TaskSupervisor::create();
         let tcp = TcpSocketPool::create(config, devices, buffer_pool)?;
         let ws = WebSocketPool::create(config, devices, buffer_pool)?;
@@ -265,35 +266,31 @@ impl SocketPool {
         addr: SocketAddr,
     ) -> Result<()> {
         let RawStream::TCP(stream) = stream else {
+            if !self.listen_mode.contains(ListenMode::WS) {
+                return Err(Error::new(
+                    ErrorKind::InvalidArgument,
+                    "WebSocket listener is disabled".into(),
+                ));
+            }
             return self.ws.handle_new_stream(state, stream, addr).await;
         };
-        match self.listen_mode {
-            ListenMode::TCP => {
-                self.tcp
-                    .handle_new_stream(state, RawStream::TCP(stream), addr)
-                    .await
-            }
-            ListenMode::WS => {
-                self.ws
-                    .handle_new_stream(state, RawStream::TCP(stream), addr)
-                    .await
-            }
-            ListenMode::HTTP => {
-                self.http
-                    .handle_new_stream(state, RawStream::TCP(stream), addr)
-                    .await
-            }
-            ListenMode::UNIFIED => {
-                if Self::peek_is_tcp_magic(&stream).await? {
-                    self.tcp
-                        .handle_new_stream(state, RawStream::TCP(stream), addr)
-                        .await
-                } else {
-                    self.http
-                        .handle_new_stream(state, RawStream::TCP(stream), addr)
-                        .await
-                }
-            }
+        if self.listen_mode == ListenMode::TCP
+            || (self.listen_mode.contains(ListenMode::TCP)
+                && Self::peek_is_tcp_magic(&stream).await?)
+        {
+            self.tcp
+                .handle_new_stream(state, RawStream::TCP(stream), addr)
+                .await
+        } else if !self.listen_mode.contains(ListenMode::HTTP) {
+            // Without HTTP routes, preserve the dedicated WebSocket handshake.
+            self.ws
+                .handle_new_stream(state, RawStream::TCP(stream), addr)
+                .await
+        } else {
+            // The HTTP service independently gates WebSocket upgrades.
+            self.http
+                .handle_new_stream(state, RawStream::TCP(stream), addr)
+                .await
         }
     }
 

@@ -16,15 +16,16 @@ use crate::{DEFAULT_BUFFER_POOL_MEMORY, Error, ErrorKind, ListenMode, Result};
 /// use ruapc::{ListenMode, SocketPoolConfig};
 ///
 /// let config = SocketPoolConfig {
-///     listen_mode: ListenMode::TCP,
+///     listen_mode: ListenMode::TCP | ListenMode::HTTP,
 ///     ..Default::default()
 /// };
 /// ```
 #[derive(Deserialize, Serialize, Debug, PartialEq, Clone)]
 #[serde(default, deny_unknown_fields)]
 pub struct SocketPoolConfig {
-    /// How accepted TCP streams are interpreted. Outbound transport is part
-    /// of each [`Endpoint`](crate::Endpoint), not this configuration.
+    /// Nonempty set of accepted protocols, combined with `|`. Defaults to TCP.
+    /// Outbound transport is part of each [`Endpoint`](crate::Endpoint), not
+    /// this configuration.
     pub listen_mode: ListenMode,
     /// Maximum memory of the shared buffer pool in bytes.
     pub buffer_pool_memory: usize,
@@ -61,6 +62,13 @@ impl Default for SocketPoolConfig {
 
 impl SocketPoolConfig {
     pub(crate) fn validate(&self) -> Result<()> {
+        if self.listen_mode.is_empty() || !ListenMode::UNIFIED.contains(self.listen_mode) {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "listen_mode must contain at least one of TCP, HTTP or WS and no unknown bits"
+                    .into(),
+            ));
+        }
         if self.buffer_pool_memory == 0 {
             return Err(Error::new(
                 ErrorKind::InvalidArgument,
@@ -108,6 +116,28 @@ mod tests {
         assert!(config.http_base_path.is_empty());
         #[cfg(feature = "rdma")]
         assert_eq!(config.rdma, Some(RdmaSocketPoolConfig::default()));
+    }
+
+    #[test]
+    fn listen_mode_requires_known_nonempty_protocols() {
+        for listen_mode in [
+            ListenMode::empty(),
+            ListenMode::from_bits_retain(0x80),
+            ListenMode::TCP | ListenMode::from_bits_retain(0x80),
+        ] {
+            let config = SocketPoolConfig {
+                listen_mode,
+                ..Default::default()
+            };
+            assert_eq!(
+                config.validate().unwrap_err().kind,
+                ErrorKind::InvalidArgument
+            );
+        }
+        let config: SocketPoolConfig =
+            serde_json::from_str(r#"{"listen_mode":"http|ws"}"#).unwrap();
+        assert_eq!(config.listen_mode, ListenMode::HTTP | ListenMode::WS);
+        config.validate().unwrap();
     }
 
     #[test]

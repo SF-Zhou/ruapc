@@ -13,7 +13,7 @@ first stable release.**
 <img src="docs/logo.png" alt="RuaPC" width="256" height="256">
 
 - `#[service]` generates typed clients, server dispatch and OpenAPI schemas.
-- A unified listener accepts TCP, WebSocket and HTTP on one port; RDMA bootstrap can use any of them when enabled.
+- A listener accepts any configured combination of TCP, WebSocket and HTTP on one port; RDMA bootstrap can use any enabled protocol.
 - Persistent TCP, WebSocket, HTTP/2 and RDMA connections support reverse RPC.
 - Remote read/write transfers use RDMA READs or inline reverse RPC over the other transports.
 - Payloads use MessagePack by default; clients can select JSON. HTTP POST endpoints accept JSON.
@@ -80,9 +80,11 @@ The macro implements `EchoService` for `Client` and `ClientWithBuffers`.
 Handlers and clients use the same trait and declared return types. When a service
 is defined in another module, import its service trait at the call site.
 
-The default listener accepts TCP. Use `ListenMode::UNIFIED` to accept the other
-protocols, and select the outbound transport in the endpoint, for example
-`"ws://127.0.0.1:8000".parse::<Endpoint>()?`.
+The default listener accepts TCP. Combine flags, such as
+`ListenMode::TCP | ListenMode::HTTP`, to enable selected protocols;
+`ListenMode::UNIFIED` enables all three. See [listener modes](docs/endpoints.md#listener-modes)
+for configuration and HTTP/WebSocket exposure. Select the outbound transport in
+the endpoint, for example `"ws://127.0.0.1:8000".parse::<Endpoint>()?`.
 One endpoint can name equivalent addresses of that same server, such as
 `tcp://127.0.0.1:8000,127.0.0.1:8001`. All transports support this form; see
 [endpoint identity and address fallback](docs/endpoints.md).

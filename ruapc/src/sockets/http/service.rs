@@ -14,7 +14,7 @@ use super::{
     http_socket::{ChannelBody, HttpSocket},
 };
 use crate::{
-    Error, ErrorKind, Message, MsgFlags, MsgMeta, RawStream, Result, Socket, State,
+    Error, ErrorKind, ListenMode, Message, MsgFlags, MsgMeta, RawStream, Result, Socket, State,
     TaskSupervisorHandle, msg::frame::MAX_MSG_SIZE, sockets::ws::web_socket_config,
 };
 
@@ -23,13 +23,15 @@ use crate::{
 /// the current router when requested.
 pub(super) struct HttpService {
     base_path: String,
+    listen_mode: ListenMode,
     rapidoc: OnceLock<Bytes>,
 }
 
 impl HttpService {
-    pub(super) fn new(base_path: String) -> Self {
+    pub(super) fn new(base_path: String, listen_mode: ListenMode) -> Self {
         Self {
             base_path,
+            listen_mode,
             rapidoc: OnceLock::new(),
         }
     }
@@ -46,6 +48,9 @@ impl HttpService {
         supervisor: TaskSupervisorHandle,
     ) -> Result<Response<Either<Full<Bytes>, ChannelBody>>> {
         if hyper_tungstenite::is_upgrade_request(&req) {
+            if !self.listen_mode.contains(ListenMode::WS) {
+                return Ok(Self::not_found());
+            }
             let ws_config = web_socket_config();
             let (response, websocket) = hyper_tungstenite::upgrade(&mut req, Some(ws_config))
                 .map_err(|e| Error::new(ErrorKind::HttpUpgradeFailed, e.to_string()))?;
@@ -63,6 +68,10 @@ impl HttpService {
             });
 
             return Ok(response.map(Either::Left));
+        }
+
+        if !self.listen_mode.contains(ListenMode::HTTP) {
+            return Ok(Self::not_found());
         }
 
         let Some(path) = self.strip_base_path(req.uri().path()) else {

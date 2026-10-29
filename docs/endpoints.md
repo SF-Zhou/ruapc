@@ -9,6 +9,42 @@ RDMA first exchanges discovery and connection metadata over another transport.
 An RDMA endpoint therefore also names its bootstrap transport; the RDMA data
 plane is unchanged. TCP, WebSocket and HTTP can carry bootstrap RPCs.
 
+## Listener modes
+
+`SocketPoolConfig.listen_mode` selects which protocols a server accepts on each
+bound address. Combine `ListenMode::TCP`, `ListenMode::HTTP` and `ListenMode::WS`
+with `|`; all seven nonempty combinations are supported. The default is `TCP`.
+`ListenMode::UNIFIED` is an alias for `TCP | HTTP | WS`. An empty mode is an
+invalid configuration.
+
+```rust
+use ruapc::{ListenMode, SocketPoolConfig};
+
+let config = SocketPoolConfig {
+    listen_mode: ListenMode::TCP | ListenMode::HTTP,
+    ..Default::default()
+};
+```
+
+The flags control exposure independently. `HTTP` enables typed HTTP/2 RPC,
+unary JSON POSTs, OpenAPI and RapiDoc. `WS` enables WebSocket upgrades and RPC;
+its HTTP handshake does not enable the HTTP RPC or documentation routes.
+Enabling `HTTP` alone does not enable WebSocket upgrades. RDMA bootstrap requires
+the flag for the client's chosen bootstrap transport.
+
+`FromStr`, serde and the demo server's `--listen-mode` option accept
+case-insensitive names separated by `|`, with optional surrounding whitespace,
+for example `tcp|http` or `HTTP | WS`. `unified` enables all three. Display and
+serialization use uppercase protocol names in `TCP`, `HTTP`, `WS` order, such
+as `"TCP | HTTP"`. Quote combinations in the shell:
+
+```bash
+cargo run -p ruapc-demo --bin server -- --listen-mode 'tcp|http'
+```
+
+Listener selection does not restrict outbound transports. Each outbound
+`Endpoint` selects its own transport independently.
+
 ## String format
 
 Use one scheme followed by comma-separated IP addresses and ports. RDMA uses
