@@ -1,7 +1,5 @@
-mod common;
-
-use common::{TEST_TIMEOUT, TestServer, config};
 use ruapc::{Buffer, Client, Context, Endpoint, Transport};
+use ruapc_demo::test_support::{TEST_TIMEOUT, TestServer, config};
 use ruapc_demo::{
     EchoService, GreetService, MemBenchService, ReadCrcReq, Request, WriteCrcReq, crc32c_of,
 };
@@ -21,7 +19,7 @@ async fn demo_services_round_trip_over_stream_transports() {
         (Transport::HTTP, ""),
         (Transport::HTTP, "/demo"),
     ] {
-        let server = TestServer::start(base_path).await;
+        let server = TestServer::start(env!("CARGO_BIN_EXE_server"), base_path).await;
         let ctx = Context::create(&config(base_path))
             .unwrap()
             .with_endpoint(Endpoint::new(transport, [server.addr]).unwrap());

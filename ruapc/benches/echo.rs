@@ -23,10 +23,6 @@ use std::{str::FromStr, sync::Arc, time::Instant};
 
 use ruapc::{Client, Context, Endpoint, ListenMode, Router, Server, SocketPoolConfig, Transport};
 
-mod common;
-
-use common::endpoint;
-
 // Measurements pin jemalloc as the process allocator so samples are comparable
 // across hosts; see docs/benchmark.md#allocator.
 #[global_allocator]
@@ -190,18 +186,18 @@ async fn run(options: BenchOptions) {
     let base_ctx = Context::create(&config).unwrap();
 
     let transports = [
-        Transport::TCP,
-        Transport::WS,
-        Transport::HTTP,
+        (Transport::TCP, "tcp"),
+        (Transport::WS, "ws"),
+        (Transport::HTTP, "http"),
         #[cfg(feature = "rdma")]
-        Transport::RDMA,
+        (Transport::RDMA, "tcp+rdma"),
     ];
-    for transport in transports {
+    for (transport, scheme) in transports {
         if !options.includes(transport) {
             continue;
         }
         println!("{transport:?}");
-        let ctx = base_ctx.with_endpoint(endpoint(transport, addr));
+        let ctx = base_ctx.with_endpoint(format!("{scheme}://{addr}").parse().unwrap());
 
         // Probe the transport once: environments without e.g. a usable RDMA
         // device should skip instead of failing the whole benchmark.

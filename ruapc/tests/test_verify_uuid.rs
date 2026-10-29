@@ -5,11 +5,7 @@ use std::{str::FromStr, sync::Arc, time::Duration};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use ruapc::{Client, ListenMode, SocketPoolConfig, Transport};
-
-mod common;
-
-use common::endpoint;
+use ruapc::{Client, ListenMode, SocketPoolConfig};
 
 const CLIENT_TIMEOUT: Duration = Duration::from_millis(200);
 
@@ -63,11 +59,11 @@ impl Foo for FooImpl {
 async fn test_verify_message_id() {
     tracing_subscriber::fmt().init();
 
-    for transport in [
-        Transport::TCP,
-        Transport::WS,
+    for scheme in [
+        "tcp",
+        "ws",
         #[cfg(feature = "rdma")]
-        Transport::RDMA,
+        "tcp+rdma",
     ] {
         let foo = Arc::new(FooImpl);
         let mut router = ruapc::Router::default();
@@ -82,7 +78,7 @@ async fn test_verify_message_id() {
         let addr = server.listen(addr).await.unwrap();
         let ctx = ruapc::Context::create(&config)
             .unwrap()
-            .with_endpoint(endpoint(transport, addr));
+            .with_endpoint(format!("{scheme}://{addr}").parse().unwrap());
 
         let client = ruapc::Client {
             timeout: CLIENT_TIMEOUT,

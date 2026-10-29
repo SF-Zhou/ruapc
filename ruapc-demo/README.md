@@ -230,6 +230,7 @@ configuration details.
 |---|---|
 | [`src/lib.rs`](src/lib.rs) | Shared service contracts, request types, CRC and pattern helpers. |
 | [`src/app.rs`](src/app.rs) | Tracing, Tokio runtime and shared pool/RDMA CLI configuration. |
+| [`src/test_support.rs`](src/test_support.rs) | Integration-test process fixtures, enabled by the internal `test-support` feature. |
 | [`src/bin/server.rs`](src/bin/server.rs) | Private service implementation, registration, listener setup and shutdown. |
 | [`src/bin/client.rs`](src/bin/client.rs) | CLI validation, individual calls, echo/read/write buffer reuse and verification, and load reporting. |
 | [`tests/`](tests/) | Server process lifecycle, stream RPC contracts, CLI failures and workload verification. |

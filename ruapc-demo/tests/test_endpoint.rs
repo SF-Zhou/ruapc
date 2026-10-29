@@ -1,11 +1,9 @@
 //! Endpoint configuration stays portable across transport feature sets.
 
-mod common;
-
 use std::time::Duration;
 
-use common::{TEST_TIMEOUT, TestServer, config};
 use ruapc::{Client, Context, Endpoint, Error, ErrorKind, SocketPool, SocketPoolConfig, Transport};
+use ruapc_demo::test_support::{TEST_TIMEOUT, TestServer, config};
 use ruapc_demo::{EchoService, Request};
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
@@ -69,7 +67,7 @@ fn application_endpoint_caches_use_normalized_strings_for_every_transport() {
 
 #[tokio::test]
 async fn restored_stream_endpoints_can_be_passed_directly_to_rpc_contexts() {
-    let server = TestServer::start("").await;
+    let server = TestServer::start(env!("CARGO_BIN_EXE_server"), "").await;
     let base = Context::create(&stream_config()).unwrap();
     let client = Client::default();
     let result = timeout(TEST_TIMEOUT, async {

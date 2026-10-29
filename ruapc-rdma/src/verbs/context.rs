@@ -86,8 +86,8 @@ unsafe impl Sync for Context {}
 mod tests {
     use std::sync::Arc;
 
-    use crate::Context;
     use crate::test_utils::open_device;
+    use crate::{CompChannel, CompletionQueue, Context, ibv_wc};
 
     fn ctx() -> Arc<Context> {
         Arc::clone(open_device().context())
@@ -119,5 +119,42 @@ mod tests {
         let ctx = ctx();
         let debug = format!("{:?}", ctx);
         assert!(debug.contains("Context"));
+    }
+
+    /// Drop only the parent context while children are still alive.
+    #[test]
+    fn test_context_dropped_while_children_alive() {
+        let dev = open_device();
+        let ctx = Arc::clone(dev.context());
+        let pd = Arc::clone(dev.pd());
+
+        let cq = CompletionQueue::create(&ctx, 16, None).unwrap();
+        let cc = CompChannel::create(&ctx).unwrap();
+
+        drop(ctx);
+
+        let mut wc = [ibv_wc::default(); 1];
+        let n = cq.poll(&mut wc).unwrap();
+        assert_eq!(n, 0);
+        assert!(!cc.as_ptr().is_null());
+        assert!(!pd.as_ptr().is_null());
+    }
+
+    /// Create multiple CQs sharing a context, drop them independently.
+    #[test]
+    fn test_multiple_cqs_shared_context() {
+        let dev = open_device();
+        let ctx = Arc::clone(dev.context());
+
+        let cq1 = CompletionQueue::create(&ctx, 16, None).unwrap();
+        let cq2 = CompletionQueue::create(&ctx, 16, None).unwrap();
+        let cq3 = CompletionQueue::create(&ctx, 16, None).unwrap();
+
+        drop(ctx);
+        drop(cq2);
+
+        let mut wc = [ibv_wc::default(); 1];
+        assert_eq!(cq1.poll(&mut wc).unwrap(), 0);
+        assert_eq!(cq3.poll(&mut wc).unwrap(), 0);
     }
 }

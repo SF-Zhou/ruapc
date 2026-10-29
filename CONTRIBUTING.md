@@ -70,6 +70,24 @@ restrictions such as `pub(in crate::module)`, for names that would collide in
 the local scope, inside macro-generated token streams, and for feature-gated
 items whose `cfg` cannot be carried by the import unchanged.
 
+Use `module.rs` instead of `module/mod.rs` when a module has no child source
+files. Re-export shared items from their owning module rather than introducing
+another module only to forward imports.
+
+Keep all unit tests under `src/` inline after the production code in the tested
+source file, inside `#[cfg(test)] mod tests` or topic-specific test modules.
+Do not create separate unit-test files or directories under `src/`. Shared
+test helpers may live in a `test_utils.rs` module. Integration tests stay under
+`tests/`, with entry files named `test_<topic>.rs`; trybuild fixtures keep their
+paired source and diagnostic filenames.
+Keep Cargo's automatic test and benchmark discovery enabled. Inline trivial
+setup expressions at their call sites. Shared harness helpers that need a
+module belong under `src/`, behind a test-support or benchmark feature, and
+are imported through the crate rather than `#[path]`. A self dev-dependency
+can enable the test-support feature for integration tests without enabling it
+in normal builds. Keep explicit benchmark entries only for settings such as
+`harness = false` and `required-features`.
+
 For public API, feature or rustdoc changes, also check:
 
 ```bash

@@ -12,7 +12,7 @@ use crate::rdma::RdmaService;
 use crate::{
     Context, Payload,
     error::{Error, ErrorKind, Result},
-    services::MemoryService,
+    remote_memory::MemoryService,
 };
 
 /// Type alias for service method handler functions.

@@ -1,3 +1,7 @@
+//! Shared setup for the demo integration tests.
+
+//! Process fixtures and configuration for the demo's integration tests.
+
 use std::{net::SocketAddr, process::Stdio, time::Duration};
 
 use ruapc::{ListenMode, SocketPoolConfig};
@@ -26,8 +30,8 @@ pub struct TestServer {
 }
 
 impl TestServer {
-    pub async fn start(base_path: &str) -> Self {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_server"));
+    pub async fn start(server_binary: &str, base_path: &str) -> Self {
+        let mut command = Command::new(server_binary);
         command
             .args([
                 "127.0.0.1:0",

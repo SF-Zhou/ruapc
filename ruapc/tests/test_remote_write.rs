@@ -6,10 +6,6 @@ use ruapc::*;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-mod common;
-
-use common::endpoint;
-
 // ==========================================================================
 // Service definition
 // ==========================================================================
@@ -183,8 +179,8 @@ struct TestCase {
     delay_ms: u64,
     /// Client timeout duration.
     client_timeout: Duration,
-    /// Client transport.
-    transport: Transport,
+    /// Endpoint scheme, including the bootstrap transport for RDMA.
+    scheme: &'static str,
     /// Which method to call.
     method: Method,
     /// Expected outcome.
@@ -219,7 +215,7 @@ async fn run_test(tc: TestCase) {
     let addr = server.clone().listen(addr).await.unwrap();
     let ctx = Context::create(&config)
         .unwrap()
-        .with_endpoint(endpoint(tc.transport, addr));
+        .with_endpoint(format!("{}://{addr}", tc.scheme).parse().unwrap());
 
     let client = Client {
         timeout: tc.client_timeout,
@@ -293,7 +289,7 @@ async fn test_tcp_remote_write() {
         write_splits: &[1024],
         delay_ms: 0,
         client_timeout: Duration::from_secs(5),
-        transport: Transport::TCP,
+        scheme: "tcp",
         method: Method::PushData,
         expect: Expected::Ok,
     })
@@ -307,7 +303,7 @@ async fn test_tcp_remote_write_multi_buffer() {
         write_splits: &[10, 0, 25, 100],
         delay_ms: 0,
         client_timeout: Duration::from_secs(5),
-        transport: Transport::TCP,
+        scheme: "tcp",
         method: Method::PushData,
         expect: Expected::Ok,
     })
@@ -321,7 +317,7 @@ async fn test_tcp_remote_write_vectored() {
         write_splits: &[7, 13],
         delay_ms: 0,
         client_timeout: Duration::from_secs(5),
-        transport: Transport::TCP,
+        scheme: "tcp",
         method: Method::PushSwapped,
         expect: Expected::OkSwapped,
     })
@@ -335,7 +331,7 @@ async fn test_tcp_remote_write_timeout() {
         write_splits: &[64],
         delay_ms: 200,
         client_timeout: Duration::from_millis(100),
-        transport: Transport::TCP,
+        scheme: "tcp",
         method: Method::PushData,
         expect: Expected::Err(ErrorKind::Timeout),
     })
@@ -350,7 +346,7 @@ async fn test_rdma_remote_write() {
         write_splits: &[1024],
         delay_ms: 0,
         client_timeout: Duration::from_secs(5),
-        transport: Transport::RDMA,
+        scheme: "tcp+rdma",
         method: Method::PushData,
         expect: Expected::Ok,
     })
@@ -365,7 +361,7 @@ async fn test_rdma_remote_write_multi_buffer() {
         write_splits: &[64 * 1024, 96 * 1024, 64 * 1024],
         delay_ms: 0,
         client_timeout: Duration::from_secs(5),
-        transport: Transport::RDMA,
+        scheme: "tcp+rdma",
         method: Method::PushData,
         expect: Expected::Ok,
     })
@@ -380,7 +376,7 @@ async fn test_rdma_remote_write_vectored() {
         write_splits: &[11, 21],
         delay_ms: 0,
         client_timeout: Duration::from_secs(5),
-        transport: Transport::RDMA,
+        scheme: "tcp+rdma",
         method: Method::PushSwapped,
         expect: Expected::OkSwapped,
     })
@@ -395,7 +391,7 @@ async fn test_rdma_remote_write_timeout() {
         write_splits: &[64],
         delay_ms: 200,
         client_timeout: Duration::from_millis(100),
-        transport: Transport::RDMA,
+        scheme: "tcp+rdma",
         method: Method::PushData,
         expect: Expected::Err(ErrorKind::Timeout),
     })
@@ -403,7 +399,7 @@ async fn test_rdma_remote_write_timeout() {
 }
 
 /// Spawns a server and returns (server, client ctx).
-async fn setup(transport: Transport) -> (Arc<Server>, Context) {
+async fn setup(scheme: &str) -> (Arc<Server>, Context) {
     let config = SocketPoolConfig {
         listen_mode: ListenMode::UNIFIED,
         ..Default::default()
@@ -416,7 +412,7 @@ async fn setup(transport: Transport) -> (Arc<Server>, Context) {
     let addr = server.clone().listen(addr).await.unwrap();
     let ctx = Context::create(&config)
         .unwrap()
-        .with_endpoint(endpoint(transport, addr));
+        .with_endpoint(format!("{scheme}://{addr}").parse().unwrap());
     (server, ctx)
 }
 
@@ -424,17 +420,17 @@ async fn setup(transport: Transport) -> (Arc<Server>, Context) {
 /// takes place, and the client's buffers come back untouched.
 #[tokio::test]
 async fn test_tcp_reply_without_transfer() {
-    run_empty_test(Transport::TCP).await;
+    run_empty_test("tcp").await;
 }
 
 #[cfg(feature = "rdma")]
 #[tokio::test]
 async fn test_rdma_reply_without_transfer() {
-    run_empty_test(Transport::RDMA).await;
+    run_empty_test("tcp+rdma").await;
 }
 
-async fn run_empty_test(transport: Transport) {
-    let (server, ctx) = setup(transport).await;
+async fn run_empty_test(scheme: &str) {
+    let (server, ctx) = setup(scheme).await;
     let client = Client::default();
     let req = WriteReq {
         data: vec![],
@@ -478,7 +474,7 @@ async fn run_empty_test(transport: Transport) {
 /// `MissingBufferInfo` (surfaced through the RPC response).
 #[tokio::test]
 async fn test_tcp_write_without_attached_buffers_fails() {
-    let (server, ctx) = setup(Transport::TCP).await;
+    let (server, ctx) = setup("tcp").await;
     let client = Client::default();
     let req = WriteReq {
         data: b"data".to_vec(),
@@ -494,7 +490,7 @@ async fn test_tcp_write_without_attached_buffers_fails() {
 /// `InvalidCopyOp`.
 #[tokio::test]
 async fn test_tcp_write_space_too_small_fails() {
-    let (server, ctx) = setup(Transport::TCP).await;
+    let (server, ctx) = setup("tcp").await;
     let client = Client::default();
     let req = WriteReq {
         data: vec![0x77; 256],
@@ -519,7 +515,7 @@ async fn test_tcp_write_space_too_small_fails() {
 /// wrote nothing: the client simply gets its buffers back untouched.
 #[tokio::test]
 async fn test_tcp_no_write_returns_buffers_untouched() {
-    let (server, ctx) = setup(Transport::TCP).await;
+    let (server, ctx) = setup("tcp").await;
     let client = Client::default();
     let req = WriteReq {
         data: vec![],
@@ -544,7 +540,7 @@ async fn test_tcp_no_write_returns_buffers_untouched() {
 /// types: recognition is by type identity, not by name.
 #[tokio::test]
 async fn test_custom_alias_and_error_type() {
-    let (server, ctx) = setup(Transport::TCP).await;
+    let (server, ctx) = setup("tcp").await;
     let client = Client::default();
     let req = WriteReq {
         data: b"alias + custom error".to_vec(),
@@ -571,13 +567,13 @@ async fn test_custom_alias_and_error_type() {
 /// attached to the same request.
 #[tokio::test]
 async fn test_tcp_read_and_write_in_one_call() {
-    run_roundtrip_test(Transport::TCP).await;
+    run_roundtrip_test("tcp").await;
 }
 
 #[cfg(feature = "rdma")]
 #[tokio::test]
 async fn test_rdma_read_and_write_in_one_call() {
-    run_roundtrip_test(Transport::RDMA).await;
+    run_roundtrip_test("tcp+rdma").await;
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -610,7 +606,7 @@ impl EchoBufService for EchoBufImpl {
     }
 }
 
-async fn run_roundtrip_test(transport: Transport) {
+async fn run_roundtrip_test(scheme: &str) {
     let config = SocketPoolConfig {
         listen_mode: ListenMode::UNIFIED,
         ..Default::default()
@@ -622,7 +618,7 @@ async fn run_roundtrip_test(transport: Transport) {
     let addr = server.clone().listen(addr).await.unwrap();
     let ctx = Context::create(&config)
         .unwrap()
-        .with_endpoint(endpoint(transport, addr));
+        .with_endpoint(format!("{scheme}://{addr}").parse().unwrap());
     let client = Client::default();
 
     let payload = b"palindrome-me";

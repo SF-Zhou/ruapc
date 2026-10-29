@@ -1,9 +1,7 @@
-mod common;
-
 use std::{process::Output, sync::Arc};
 
-use common::{TEST_TIMEOUT, TestServer, config};
 use ruapc::{BufferReply, Context, Result, Router, Server};
+use ruapc_demo::test_support::{TEST_TIMEOUT, TestServer, config};
 use ruapc_demo::{EchoService, MemBenchService, ReadCrcReq, Request, WriteCrcReq};
 use tokio::{process::Command, time::timeout};
 
@@ -34,7 +32,7 @@ async fn rejects(args: &[&str], message: &str) {
 
 #[tokio::test]
 async fn client_runs_individual_calls_and_load_modes() {
-    let server = TestServer::start("").await;
+    let server = TestServer::start(env!("CARGO_BIN_EXE_server"), "").await;
     let endpoint = format!("tcp://{}", server.addr);
     for rpc in ["echo", "read", "write"] {
         let output = client(&[&endpoint, "--rpc", rpc, "--buffer-size", "4097"]).await;
@@ -71,7 +69,7 @@ async fn client_runs_individual_calls_and_load_modes() {
 
 #[tokio::test]
 async fn client_accepts_one_address_group_and_rejects_multiple_schemes() {
-    let server = TestServer::start("").await;
+    let server = TestServer::start(env!("CARGO_BIN_EXE_server"), "").await;
     let unavailable = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dead = unavailable.local_addr().unwrap();
     drop(unavailable);

@@ -17,11 +17,8 @@ use ruapc_bufpool::{BufferPool, BufferPoolBuilder, EmptyDevices};
 
 use ruapc_rdma::{
     CompletionCursor, WrBuffers,
-    bench_support::{self, WrSlots},
+    bench_support::{self, Config, WrSlots, pin_thread},
 };
-
-mod common;
-use common::{Config, pin_thread};
 
 // Measurements pin jemalloc as the process allocator so samples are comparable
 // across hosts; see docs/benchmark.md#allocator.

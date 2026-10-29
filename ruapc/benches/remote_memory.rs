@@ -26,10 +26,6 @@ use ruapc::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-mod common;
-
-use common::endpoint;
-
 // Measurements pin jemalloc as the process allocator so samples are comparable
 // across hosts; see docs/benchmark.md#allocator.
 #[global_allocator]
@@ -260,18 +256,18 @@ async fn run(options: BenchOptions) {
     let addr = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let base_ctx = Context::create(&config).unwrap();
 
-    for transport in [
-        Transport::TCP,
-        Transport::WS,
-        Transport::HTTP,
+    for (transport, scheme) in [
+        (Transport::TCP, "tcp"),
+        (Transport::WS, "ws"),
+        (Transport::HTTP, "http"),
         #[cfg(feature = "rdma")]
-        Transport::RDMA,
+        (Transport::RDMA, "tcp+rdma"),
     ] {
         if !options.includes(transport) {
             continue;
         }
         println!("{transport:?}");
-        let ctx = base_ctx.with_endpoint(endpoint(transport, addr));
+        let ctx = base_ctx.with_endpoint(format!("{scheme}://{addr}").parse().unwrap());
         let probe = Client {
             timeout: Duration::from_secs(1),
             connect_timeout: Duration::from_secs(5),
