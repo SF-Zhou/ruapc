@@ -58,7 +58,12 @@ impl Listener {
                     tracing::info!("stop accept loop");
                 }
                 () = async {
-                    tracing::info!("start listening: {listener_addr}");
+                    let listen_mode = state.socket_pool.listen_mode;
+                    #[cfg(feature = "rdma")]
+                    let rdma_enabled = state.socket_pool.rdma_pool().is_some();
+                    #[cfg(not(feature = "rdma"))]
+                    let rdma_enabled = false;
+                    tracing::info!("Listening on {listener_addr} [{listen_mode}; RDMA: {rdma_enabled}]");
                     while let Ok((stream, addr)) = listener.accept().await {
                         configure_stream(&stream);
                         let state = state.clone();

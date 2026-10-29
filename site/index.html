@@ -415,7 +415,7 @@
               <h3>Bind once. Speak four protocols.</h3>
               <ul>
                 <li>Register services before creating the server.</li>
-                <li><code>UNIFIED</code> serves TCP, WebSocket and HTTP on one port.</li>
+                <li>Combine <code>TCP | HTTP | WS</code> flags on one port; <code>UNIFIED</code> enables all three.</li>
                 <li>RDMA bootstraps over TCP, WebSocket, HTTP or a <code>UNIFIED</code> listener.</li>
               </ul>
               <a class="text-link" href="https://github.com/SF-Zhou/ruapc/blob/main/docs/rdma-connection.md" target="_blank" rel="noopener">Connection lifecycle <svg class="icon icon--tiny" aria-hidden="true"><use href="#i-arrow-up-right"/></svg></a>
@@ -441,7 +441,7 @@
           <p class="kicker reveal"><span class="kicker-num">03</span> The wires</p>
           <div class="section-head-main">
             <h2 class="reveal">Pick a wire.<br><span class="serif-accent">Keep the code.</span></h2>
-            <p class="section-lede reveal">Every transport is a typed endpoint. Persistent transports add reverse RPC; RDMA adds kernel bypass and READ-based transfers. A unified listener can speak TCP, WebSocket and HTTP on the same port.</p>
+            <p class="section-lede reveal">Every transport is a typed endpoint. Persistent transports add reverse RPC; RDMA adds kernel bypass and READ-based transfers. A listener can serve any combination of TCP, WebSocket and HTTP on the same port.</p>
           </div>
         </div>
 
@@ -506,8 +506,8 @@
         <div class="unified-strip reveal">
           <svg class="icon icon--large" aria-hidden="true"><use href="#i-server"/></svg>
           <div>
-            <strong>Unified listener</strong>
-            <p>One port accepts TCP, WebSocket and HTTP. With RDMA enabled, the same listener carries bootstrap.</p>
+            <strong>Configurable listener</strong>
+            <p>Choose any combination of TCP, WebSocket and HTTP on one port. With RDMA enabled, the selected protocols also carry bootstrap.</p>
           </div>
           <code>ListenMode::UNIFIED</code>
         </div>

@@ -20,7 +20,7 @@ struct Args {
     #[arg(default_value = "0.0.0.0:8000")]
     addr: std::net::SocketAddr,
 
-    /// Listener protocol mode.
+    /// Listener protocols: tcp, http or ws, combined with |; unified enables all.
     #[arg(long, default_value = "unified")]
     listen_mode: ListenMode,
 
@@ -114,4 +114,28 @@ async fn run(args: Args) -> Result<()> {
     server.stop();
     server.join().await;
     result.map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_accepts_listener_combinations() {
+        assert_eq!(
+            Args::try_parse_from(["server"]).unwrap().listen_mode,
+            ListenMode::UNIFIED,
+        );
+        for (value, expected) in [
+            ("tcp|http", ListenMode::TCP | ListenMode::HTTP),
+            ("HTTP | Ws", ListenMode::HTTP | ListenMode::WS),
+            ("unified", ListenMode::UNIFIED),
+        ] {
+            let args = Args::try_parse_from(["server", "--listen-mode", value]).unwrap();
+            assert_eq!(args.listen_mode, expected);
+        }
+        for value in ["", "tcp|rdma", "tcp|", "tcp,http"] {
+            assert!(Args::try_parse_from(["server", "--listen-mode", value]).is_err());
+        }
+    }
 }

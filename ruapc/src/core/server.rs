@@ -43,8 +43,8 @@ impl Server {
     /// Returns configuration, schema-generation or socket-pool initialization
     /// errors.
     ///
-    /// With RDMA enabled, bind a listener mode that serves the client's
-    /// bootstrap transport: TCP, WS, HTTP or [`crate::ListenMode::UNIFIED`].
+    /// With RDMA enabled, include the client's bootstrap transport (TCP, WS
+    /// or HTTP) in the configured [`ListenMode`](crate::ListenMode).
     pub fn create(router: Router, config: &SocketPoolConfig) -> Result<Self> {
         let (state, drop_guard) = State::create(router, config)?;
 
@@ -105,6 +105,9 @@ mod tests {
             ListenMode::TCP,
             ListenMode::WS,
             ListenMode::HTTP,
+            ListenMode::TCP | ListenMode::WS,
+            ListenMode::TCP | ListenMode::HTTP,
+            ListenMode::HTTP | ListenMode::WS,
             ListenMode::UNIFIED,
         ] {
             let config = SocketPoolConfig {

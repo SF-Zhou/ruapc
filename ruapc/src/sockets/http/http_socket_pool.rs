@@ -40,7 +40,10 @@ impl SocketPoolTrait for HttpSocketPool {
         Ok(Self {
             socket_map: ConnectionMap::default(),
             connect_groups: Default::default(),
-            service: Arc::new(HttpService::new(config.normalized_http_base_path()?)),
+            service: Arc::new(HttpService::new(
+                config.normalized_http_base_path()?,
+                config.listen_mode,
+            )),
             http,
             task_supervisor: TaskSupervisor::create(),
         })

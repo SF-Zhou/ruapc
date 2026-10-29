@@ -46,7 +46,12 @@ schemes inside a group are rejected. See
 [endpoint identity and address fallback](../docs/endpoints.md) for the same-server
 contract, independent overlapping groups and canonical string format.
 
-Use `--listen-mode tcp`, `ws` or `http` on the server to select one protocol.
+Use `--listen-mode tcp`, `ws` or `http` on the server to select one protocol, or
+combine them with `|`, for example `--listen-mode 'tcp|http'`. Names are
+case-insensitive; quote combinations to protect `|` from the shell.
+`unified` is the alias for `tcp|http|ws`. See
+[listener modes](../docs/endpoints.md#listener-modes) for HTTP and WebSocket
+exposure rules.
 The server stops and joins its background tasks on Ctrl-C. RPC, setup and
 workload failures make the client exit with a nonzero status.
 
@@ -57,7 +62,7 @@ default: the library's `Client::default()` uses MessagePack.
 ## HTTP and OpenAPI
 
 An ordinary HTTP caller can invoke registered methods with JSON when the server
-uses `--listen-mode http` or `unified` (the demo default):
+enables `http`, either alone or in a combination (`unified` is the demo default):
 
 ```bash
 curl -s -H 'content-type: application/json' -d '"hello HTTP"' \
@@ -201,10 +206,11 @@ cargo run -p ruapc-demo --release --features rdma --bin client -- \
   tcp+rdma://127.0.0.1:8000 --rdma-devices mlx5_0
 ```
 
-With the feature enabled, `server` initializes RDMA by default. It must serve
-the bootstrap transport named by the client endpoint: `tcp`, `ws`, `http` or
-`unified`. Add `--no-rdma` to run that build without opening RDMA devices,
-including with a dedicated HTTP or WebSocket listener:
+With the feature enabled, `server` initializes RDMA by default. Its listener
+mode must include the bootstrap transport named by the client endpoint: `tcp`,
+`ws` or `http`; `unified` includes all three. Add `--no-rdma` to run that build
+without opening RDMA devices, including with a dedicated HTTP or WebSocket
+listener:
 
 ```bash
 cargo run -p ruapc-demo --features rdma --bin server -- --no-rdma --listen-mode http

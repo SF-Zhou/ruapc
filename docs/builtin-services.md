@@ -18,16 +18,16 @@ capacity for nested calls and their transport RPCs; see
 [large-payload admission](rdma-capacity.md#large-payload-admission-and-cleanup).
 Registration rejects duplicate wire method names instead of replacing handlers.
 
-An HTTP or unified listener serves the OpenAPI 3.0 document at `/openapi.json`
-and interactive documentation at `/rapidoc`. It accepts unary JSON POSTs at
+Any [listener mode](endpoints.md#listener-modes) containing `ListenMode::HTTP`
+serves the OpenAPI 3.0 document at `/openapi.json` and interactive documentation
+at `/rapidoc`. It accepts unary JSON POSTs at
 `/Service/method` for every registered method. Framed TCP, WebSocket, HTTP/2
 stream and RDMA calls use the same method directory. Each handler still checks
 its required transport, request state and buffer metadata; discovery does not
 promise that a method can succeed over every transport. Routing does not
 authenticate callers.
 
-For a server listening on `127.0.0.1:8000` in `ListenMode::HTTP` or
-`ListenMode::UNIFIED`:
+For a server listening on `127.0.0.1:8000` with `ListenMode::HTTP` enabled:
 
 ```bash
 curl -s http://127.0.0.1:8000/openapi.json
@@ -38,7 +38,7 @@ curl -s -H 'content-type: application/json' -d 'null' \
 ```
 
 Include the configured `http_base_path` in these URLs when it is nonempty.
-A TCP-only listener does not serve these HTTP routes.
+These routes are unavailable when the `HTTP` flag is absent.
 [`ruapc-schema`](../ruapc-schema/README.md) owns schema registration and OpenAPI
 projection independently of the RPC runtime.
 

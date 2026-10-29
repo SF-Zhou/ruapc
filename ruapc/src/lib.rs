@@ -7,9 +7,11 @@
 //! ## Configuration
 //!
 //! [`SocketPoolConfig`] controls listeners, connection resources and handler
-//! admission. TCP is the default listener; [`ListenMode::UNIFIED`] accepts
-//! multiple protocols on one port. [`Client`] controls connection/response
-//! budgets, retries and payload format. Payloads default to MessagePack;
+//! admission. TCP is the default listener; combine [`ListenMode`] flags with
+//! `|` to select protocols on one port, or use [`ListenMode::UNIFIED`] for all
+//! three. HTTP routes and WebSocket upgrades are enabled independently.
+//! [`Client`] controls connection/response budgets, retries and payload format.
+//! Payloads default to MessagePack;
 //! setting [`Client::use_msgpack`] to `false` selects JSON.
 //!
 //! The optional `rdma` feature requires libibverbs development files. With
