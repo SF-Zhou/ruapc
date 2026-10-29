@@ -4,6 +4,10 @@
 
 pub mod app;
 
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod test_support;
+
 use ruapc::{BufferReply, Context, Result};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

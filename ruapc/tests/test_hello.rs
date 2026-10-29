@@ -7,10 +7,6 @@ use std::{str::FromStr, sync::Arc};
 
 use ruapc::{Endpoint, ListenMode, SocketPoolConfig, Transport};
 
-mod common;
-
-use common::endpoint;
-
 #[ruapc::service]
 trait Foo {
     async fn hello(&self, _: &ruapc::Context, req: &String) -> ruapc::Result<String>;
@@ -28,12 +24,12 @@ impl Foo for FooImpl {
 async fn test_hello() {
     tracing_subscriber::fmt().init();
 
-    for transport in [
-        Transport::TCP,
-        Transport::WS,
-        Transport::HTTP,
+    for scheme in [
+        "tcp",
+        "ws",
+        "http",
         #[cfg(feature = "rdma")]
-        Transport::RDMA,
+        "tcp+rdma",
     ] {
         let foo = Arc::new(FooImpl);
         let mut router = ruapc::Router::default();
@@ -50,7 +46,7 @@ async fn test_hello() {
         let client = ruapc::Client::default();
         let ctx = ruapc::Context::create(&config)
             .unwrap()
-            .with_endpoint(endpoint(transport, addr));
+            .with_endpoint(format!("{scheme}://{addr}").parse().unwrap());
         let rsp = client.hello(&ctx, &"ruapc".to_string()).await.unwrap();
         assert_eq!(rsp, "hello ruapc!");
 

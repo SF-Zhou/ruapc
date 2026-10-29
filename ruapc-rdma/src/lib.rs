@@ -68,10 +68,10 @@ pub use verbs::{
     WrBuffers,
 };
 
-#[cfg(test)]
-mod test_utils;
-
 /// Internal ownership components used by the standalone benchmarks.
 #[cfg(feature = "bench-internals")]
 #[doc(hidden)]
 pub mod bench_support;
+
+#[cfg(test)]
+mod test_utils;

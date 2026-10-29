@@ -273,6 +273,295 @@ pub(super) fn choose_rebalance(
         .then_some((victim.index, replacement.index))
 }
 
+impl RdmaSocketPool {
+    /// Enumerates locally usable NIC pairs with negotiable connection limits.
+    ///
+    /// Configured subnet domains retain every matching GID pair for later
+    /// selection; otherwise each port pair keeps its preferred GID pair.
+    /// Link class preference is applied after request constraints and
+    /// reachability filters, keeping lower classes available as fallbacks.
+    pub(super) fn enumerate_path_candidates(
+        &self,
+        remote_info: &RdmaPeerAdvertisement,
+    ) -> Result<Vec<PathCandidate>> {
+        let local_devices = self.devices.devices();
+        if local_devices.is_empty() {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "no local RDMA device available".into(),
+            ));
+        }
+
+        let mut matches = Vec::new();
+        let mut remote_ports = 0usize;
+        let mut local_usable_ports = 0usize;
+        let mut link_layer_matches = 0usize;
+
+        // Remote ports are pre-filtered: peers only advertise usable ports.
+        for remote_device in &remote_info.devices {
+            let compatible_local_devices: Vec<_> = local_devices
+                .iter()
+                .enumerate()
+                .filter(|(_, local_device)| {
+                    if let Err(err) = self.resolve_connection_config(
+                        local_device,
+                        remote_device.limits,
+                        self.config.connection.traffic_class,
+                    ) {
+                        tracing::debug!(
+                            local = %local_device.info().name,
+                            remote = %remote_device.name,
+                            %err,
+                            "skipping RDMA NIC pair with incompatible connection limits"
+                        );
+                        return false;
+                    }
+                    true
+                })
+                .collect();
+            for remote_port in &remote_device.ports {
+                remote_ports += 1;
+
+                for &(local_device_index, local_device) in &compatible_local_devices {
+                    let local_info = local_device.info();
+                    for local_port in &local_info.ports {
+                        if !local_port.is_usable() {
+                            continue;
+                        }
+                        local_usable_ports += 1;
+                        if local_port.port_attr.link_layer != remote_port.link_layer {
+                            continue;
+                        }
+                        link_layer_matches += 1;
+
+                        let gid_pairs = Self::match_gid_pairs(local_port, remote_port);
+                        let pair_limit = if self.config.path.subnets.is_empty() {
+                            1
+                        } else {
+                            gid_pairs.len()
+                        };
+                        for (local_gid_index, remote_gid_index) in
+                            gid_pairs.into_iter().take(pair_limit)
+                        {
+                            let local_ip = local_port
+                                .find_gid(local_gid_index)
+                                .and_then(|gid| gid_ip(&gid.gid));
+                            let remote_ip = remote_port
+                                .gids
+                                .iter()
+                                .find(|gid| gid.index == remote_gid_index)
+                                .and_then(|gid| gid_ip(&gid.gid));
+                            let same_connectivity_domain = addresses_share_connectivity_domain(
+                                local_ip,
+                                remote_ip,
+                                &self.config.path.subnets,
+                            );
+                            let class = match local_port.port_attr.link_layer {
+                                LinkLayer::InfiniBand => PathClass::InfiniBand,
+                                LinkLayer::Ethernet
+                                    if Self::gid_index_is_rocev2(local_port, local_gid_index) =>
+                                {
+                                    PathClass::RoceV2
+                                }
+                                LinkLayer::Ethernet => PathClass::RoceOther,
+                                LinkLayer::Unspecified => continue,
+                            };
+                            matches.push(PathCandidate {
+                                local_device_index,
+                                remote: DeviceSelection {
+                                    device_name: remote_device.name.clone(),
+                                    port_num: remote_port.port_num,
+                                    gid_index: remote_gid_index,
+                                },
+                                remote_limits: remote_device.limits,
+                                class,
+                                path: RdmaPathInfo {
+                                    local: RdmaNicInfo {
+                                        device: local_info.name.clone(),
+                                        port_num: local_port.port_num,
+                                        gid_index: local_gid_index,
+                                        ip: local_ip,
+                                    },
+                                    remote: RdmaNicInfo {
+                                        device: remote_device.name.clone(),
+                                        port_num: remote_port.port_num,
+                                        gid_index: remote_gid_index,
+                                        ip: remote_ip,
+                                    },
+                                    same_connectivity_domain,
+                                },
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        if matches.is_empty() {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                format!(
+                    "no compatible RDMA device/port/GID pair found: remote_devices={} local_devices={} remote_ports={} local_usable_ports={} link_layer_matches={}",
+                    remote_info.devices.len(),
+                    local_devices.len(),
+                    remote_ports,
+                    local_usable_ports,
+                    link_layer_matches
+                ),
+            ));
+        }
+        Ok(matches)
+    }
+
+    /// Picks the path for a new stripe.
+    ///
+    /// Remote NIC: power-of-two-choices over the peer's advertised per-NIC
+    /// connection counts (plus our own healthy stripes to this peer, which
+    /// the possibly-stale advertisement may not include yet). P2C keeps
+    /// clients from herding onto the same "least loaded" server NIC when
+    /// they all act on the same cached snapshot.
+    ///
+    /// Local NIC: plain least-connections over the live per-device
+    /// counters — they are exact, and equal counts self-balance because
+    /// every placement increments the chosen device's counter.
+    pub(super) fn select_candidate(
+        &self,
+        peer: &PeerState,
+        candidates: &[PathCandidate],
+        preference: PathPreference<'_>,
+        remote_info: &RdmaPeerAdvertisement,
+        peer_stripes: &[Stripe],
+    ) -> Result<PathCandidate> {
+        let views: Vec<placement::Candidate<'_>> = candidates
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                let advertised = remote_info
+                    .devices
+                    .iter()
+                    .find(|device| device.name == candidate.path.remote.device)
+                    .map_or(0, |device| u64::from(device.active_connections));
+                let ours = peer_stripes
+                    .iter()
+                    .filter(|stripe| {
+                        stripe.socket.state.is_ok()
+                            && stripe.socket.path.remote.device == candidate.path.remote.device
+                    })
+                    .count() as u64;
+                placement::Candidate {
+                    index,
+                    local_index: candidate.local_device_index,
+                    remote: &candidate.path.remote.device,
+                    same_connectivity_domain: candidate.path.same_connectivity_domain,
+                    class: candidate.class,
+                    blacklisted: self.is_blacklisted(peer, candidate),
+                    local_load: self
+                        .conn_counts
+                        .get(candidate.local_device_index)
+                        .map_or(0, |count| count.load(Ordering::Acquire) as u64),
+                    remote_load: advertised + ours,
+                }
+            })
+            .collect();
+        let index = placement::choose_path(
+            &views,
+            placement::Selection {
+                required_remote: preference.remote_device,
+                avoided_remotes: preference.avoided_remote_nics,
+                subnet_policy: self.config.path.subnet_policy,
+            },
+            [self.pseudo_random(), self.pseudo_random()],
+        )
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidArgument,
+                format!(
+                    "no compatible RDMA path matches remote device {:?}",
+                    preference.remote_device
+                ),
+            )
+        })?;
+        Ok(candidates[index].clone())
+    }
+
+    fn gid_index_is_rocev2(port: &Port, gid_index: u8) -> bool {
+        port.find_gid(gid_index)
+            .is_some_and(|gid| gid.gid_type == GidType::RoCEv2)
+    }
+
+    /// Selects a (local, remote) GID index pair for the given port pair.
+    ///
+    /// Both GID tables only contain usable GIDs — unusable ones (RoCE v2
+    /// loopback / link-local) are filtered out at collection time on each
+    /// side (see `query_device_info`).
+    fn match_gid_pairs(local_port: &Port, remote_port: &RdmaPortInfo) -> Vec<(u8, u8)> {
+        let (local_gids, remote_gids) = (&local_port.gids[..], &remote_port.gids[..]);
+        match local_port.port_attr.link_layer {
+            LinkLayer::InfiniBand => vec![(
+                Self::first_gid(local_gids, |_| true).unwrap_or(0),
+                Self::first_gid(remote_gids, |_| true).unwrap_or(0),
+            )],
+            LinkLayer::Ethernet => Self::match_roce_gid_pairs(local_gids, remote_gids),
+            LinkLayer::Unspecified => Vec::new(),
+        }
+    }
+
+    fn match_roce_gid_pairs(local_gids: &[Gid], remote_gids: &[Gid]) -> Vec<(u8, u8)> {
+        let mut pairs = Vec::new();
+        // Prefer RoCE v2 pairs, then RoCE v1 pairs, while retaining every
+        // compatible pair so subnet preference can select the right GID.
+        for wanted in [GidType::RoCEv2, GidType::RoCEv1] {
+            for local in local_gids.iter().filter(|gid| gid.gid_type == wanted) {
+                for remote in remote_gids.iter().filter(|gid| gid.gid_type == wanted) {
+                    pairs.push((local.index, remote.index));
+                }
+            }
+        }
+
+        // Then every other pair with matching GID types.
+        for local in local_gids
+            .iter()
+            .filter(|gid| !matches!(gid.gid_type, GidType::RoCEv2 | GidType::RoCEv1))
+        {
+            for remote in remote_gids
+                .iter()
+                .filter(|remote| remote.gid_type == local.gid_type)
+            {
+                pairs.push((local.index, remote.index));
+            }
+        }
+
+        pairs
+    }
+
+    /// Returns the index of the first GID matching `predicate`.
+    fn first_gid(gids: &[Gid], mut predicate: impl FnMut(&Gid) -> bool) -> Option<u8> {
+        gids.iter().find(|gid| predicate(gid)).map(|gid| gid.index)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct PathPreference<'a> {
+    pub(super) remote_device: Option<&'a str>,
+    pub(super) avoided_remote_nics: &'a HashSet<String>,
+}
+
+/// One compatible (local NIC, remote NIC) pair a new connection could use.
+#[derive(Clone, Debug)]
+pub(super) struct PathCandidate {
+    /// Index of the local device in `devices.devices()`.
+    pub(super) local_device_index: usize,
+    /// Remote device/port/GID to request in `prepare_connection`.
+    pub(super) remote: DeviceSelection,
+    /// Remote per-connection resource limits advertised for that device.
+    pub(super) remote_limits: RdmaConnectionLimits,
+    /// Preferred transport class, considered after hard constraints and
+    /// reachability filters so lower classes remain valid fallbacks.
+    pub(super) class: PathClass,
+    /// Full NIC-pair identity of this candidate.
+    pub(super) path: RdmaPathInfo,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -692,295 +981,6 @@ mod tests {
             },
         }
     }
-}
-
-impl RdmaSocketPool {
-    /// Enumerates locally usable NIC pairs with negotiable connection limits.
-    ///
-    /// Configured subnet domains retain every matching GID pair for later
-    /// selection; otherwise each port pair keeps its preferred GID pair.
-    /// Link class preference is applied after request constraints and
-    /// reachability filters, keeping lower classes available as fallbacks.
-    pub(super) fn enumerate_path_candidates(
-        &self,
-        remote_info: &RdmaPeerAdvertisement,
-    ) -> Result<Vec<PathCandidate>> {
-        let local_devices = self.devices.devices();
-        if local_devices.is_empty() {
-            return Err(Error::new(
-                ErrorKind::InvalidArgument,
-                "no local RDMA device available".into(),
-            ));
-        }
-
-        let mut matches = Vec::new();
-        let mut remote_ports = 0usize;
-        let mut local_usable_ports = 0usize;
-        let mut link_layer_matches = 0usize;
-
-        // Remote ports are pre-filtered: peers only advertise usable ports.
-        for remote_device in &remote_info.devices {
-            let compatible_local_devices: Vec<_> = local_devices
-                .iter()
-                .enumerate()
-                .filter(|(_, local_device)| {
-                    if let Err(err) = self.resolve_connection_config(
-                        local_device,
-                        remote_device.limits,
-                        self.config.connection.traffic_class,
-                    ) {
-                        tracing::debug!(
-                            local = %local_device.info().name,
-                            remote = %remote_device.name,
-                            %err,
-                            "skipping RDMA NIC pair with incompatible connection limits"
-                        );
-                        return false;
-                    }
-                    true
-                })
-                .collect();
-            for remote_port in &remote_device.ports {
-                remote_ports += 1;
-
-                for &(local_device_index, local_device) in &compatible_local_devices {
-                    let local_info = local_device.info();
-                    for local_port in &local_info.ports {
-                        if !local_port.is_usable() {
-                            continue;
-                        }
-                        local_usable_ports += 1;
-                        if local_port.port_attr.link_layer != remote_port.link_layer {
-                            continue;
-                        }
-                        link_layer_matches += 1;
-
-                        let gid_pairs = Self::match_gid_pairs(local_port, remote_port);
-                        let pair_limit = if self.config.path.subnets.is_empty() {
-                            1
-                        } else {
-                            gid_pairs.len()
-                        };
-                        for (local_gid_index, remote_gid_index) in
-                            gid_pairs.into_iter().take(pair_limit)
-                        {
-                            let local_ip = local_port
-                                .find_gid(local_gid_index)
-                                .and_then(|gid| gid_ip(&gid.gid));
-                            let remote_ip = remote_port
-                                .gids
-                                .iter()
-                                .find(|gid| gid.index == remote_gid_index)
-                                .and_then(|gid| gid_ip(&gid.gid));
-                            let same_connectivity_domain = addresses_share_connectivity_domain(
-                                local_ip,
-                                remote_ip,
-                                &self.config.path.subnets,
-                            );
-                            let class = match local_port.port_attr.link_layer {
-                                LinkLayer::InfiniBand => PathClass::InfiniBand,
-                                LinkLayer::Ethernet
-                                    if Self::gid_index_is_rocev2(local_port, local_gid_index) =>
-                                {
-                                    PathClass::RoceV2
-                                }
-                                LinkLayer::Ethernet => PathClass::RoceOther,
-                                LinkLayer::Unspecified => continue,
-                            };
-                            matches.push(PathCandidate {
-                                local_device_index,
-                                remote: DeviceSelection {
-                                    device_name: remote_device.name.clone(),
-                                    port_num: remote_port.port_num,
-                                    gid_index: remote_gid_index,
-                                },
-                                remote_limits: remote_device.limits,
-                                class,
-                                path: RdmaPathInfo {
-                                    local: RdmaNicInfo {
-                                        device: local_info.name.clone(),
-                                        port_num: local_port.port_num,
-                                        gid_index: local_gid_index,
-                                        ip: local_ip,
-                                    },
-                                    remote: RdmaNicInfo {
-                                        device: remote_device.name.clone(),
-                                        port_num: remote_port.port_num,
-                                        gid_index: remote_gid_index,
-                                        ip: remote_ip,
-                                    },
-                                    same_connectivity_domain,
-                                },
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        if matches.is_empty() {
-            return Err(Error::new(
-                ErrorKind::InvalidArgument,
-                format!(
-                    "no compatible RDMA device/port/GID pair found: remote_devices={} local_devices={} remote_ports={} local_usable_ports={} link_layer_matches={}",
-                    remote_info.devices.len(),
-                    local_devices.len(),
-                    remote_ports,
-                    local_usable_ports,
-                    link_layer_matches
-                ),
-            ));
-        }
-        Ok(matches)
-    }
-
-    /// Picks the path for a new stripe.
-    ///
-    /// Remote NIC: power-of-two-choices over the peer's advertised per-NIC
-    /// connection counts (plus our own healthy stripes to this peer, which
-    /// the possibly-stale advertisement may not include yet). P2C keeps
-    /// clients from herding onto the same "least loaded" server NIC when
-    /// they all act on the same cached snapshot.
-    ///
-    /// Local NIC: plain least-connections over the live per-device
-    /// counters — they are exact, and equal counts self-balance because
-    /// every placement increments the chosen device's counter.
-    pub(super) fn select_candidate(
-        &self,
-        peer: &PeerState,
-        candidates: &[PathCandidate],
-        preference: PathPreference<'_>,
-        remote_info: &RdmaPeerAdvertisement,
-        peer_stripes: &[Stripe],
-    ) -> Result<PathCandidate> {
-        let views: Vec<placement::Candidate<'_>> = candidates
-            .iter()
-            .enumerate()
-            .map(|(index, candidate)| {
-                let advertised = remote_info
-                    .devices
-                    .iter()
-                    .find(|device| device.name == candidate.path.remote.device)
-                    .map_or(0, |device| u64::from(device.active_connections));
-                let ours = peer_stripes
-                    .iter()
-                    .filter(|stripe| {
-                        stripe.socket.state.is_ok()
-                            && stripe.socket.path.remote.device == candidate.path.remote.device
-                    })
-                    .count() as u64;
-                placement::Candidate {
-                    index,
-                    local_index: candidate.local_device_index,
-                    remote: &candidate.path.remote.device,
-                    same_connectivity_domain: candidate.path.same_connectivity_domain,
-                    class: candidate.class,
-                    blacklisted: self.is_blacklisted(peer, candidate),
-                    local_load: self
-                        .conn_counts
-                        .get(candidate.local_device_index)
-                        .map_or(0, |count| count.load(Ordering::Acquire) as u64),
-                    remote_load: advertised + ours,
-                }
-            })
-            .collect();
-        let index = placement::choose_path(
-            &views,
-            placement::Selection {
-                required_remote: preference.remote_device,
-                avoided_remotes: preference.avoided_remote_nics,
-                subnet_policy: self.config.path.subnet_policy,
-            },
-            [self.pseudo_random(), self.pseudo_random()],
-        )
-        .ok_or_else(|| {
-            Error::new(
-                ErrorKind::InvalidArgument,
-                format!(
-                    "no compatible RDMA path matches remote device {:?}",
-                    preference.remote_device
-                ),
-            )
-        })?;
-        Ok(candidates[index].clone())
-    }
-
-    fn gid_index_is_rocev2(port: &Port, gid_index: u8) -> bool {
-        port.find_gid(gid_index)
-            .is_some_and(|gid| gid.gid_type == GidType::RoCEv2)
-    }
-
-    /// Selects a (local, remote) GID index pair for the given port pair.
-    ///
-    /// Both GID tables only contain usable GIDs — unusable ones (RoCE v2
-    /// loopback / link-local) are filtered out at collection time on each
-    /// side (see `query_device_info`).
-    fn match_gid_pairs(local_port: &Port, remote_port: &RdmaPortInfo) -> Vec<(u8, u8)> {
-        let (local_gids, remote_gids) = (&local_port.gids[..], &remote_port.gids[..]);
-        match local_port.port_attr.link_layer {
-            LinkLayer::InfiniBand => vec![(
-                Self::first_gid(local_gids, |_| true).unwrap_or(0),
-                Self::first_gid(remote_gids, |_| true).unwrap_or(0),
-            )],
-            LinkLayer::Ethernet => Self::match_roce_gid_pairs(local_gids, remote_gids),
-            LinkLayer::Unspecified => Vec::new(),
-        }
-    }
-
-    fn match_roce_gid_pairs(local_gids: &[Gid], remote_gids: &[Gid]) -> Vec<(u8, u8)> {
-        let mut pairs = Vec::new();
-        // Prefer RoCE v2 pairs, then RoCE v1 pairs, while retaining every
-        // compatible pair so subnet preference can select the right GID.
-        for wanted in [GidType::RoCEv2, GidType::RoCEv1] {
-            for local in local_gids.iter().filter(|gid| gid.gid_type == wanted) {
-                for remote in remote_gids.iter().filter(|gid| gid.gid_type == wanted) {
-                    pairs.push((local.index, remote.index));
-                }
-            }
-        }
-
-        // Then every other pair with matching GID types.
-        for local in local_gids
-            .iter()
-            .filter(|gid| !matches!(gid.gid_type, GidType::RoCEv2 | GidType::RoCEv1))
-        {
-            for remote in remote_gids
-                .iter()
-                .filter(|remote| remote.gid_type == local.gid_type)
-            {
-                pairs.push((local.index, remote.index));
-            }
-        }
-
-        pairs
-    }
-
-    /// Returns the index of the first GID matching `predicate`.
-    fn first_gid(gids: &[Gid], mut predicate: impl FnMut(&Gid) -> bool) -> Option<u8> {
-        gids.iter().find(|gid| predicate(gid)).map(|gid| gid.index)
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct PathPreference<'a> {
-    pub(super) remote_device: Option<&'a str>,
-    pub(super) avoided_remote_nics: &'a HashSet<String>,
-}
-
-/// One compatible (local NIC, remote NIC) pair a new connection could use.
-#[derive(Clone, Debug)]
-pub(super) struct PathCandidate {
-    /// Index of the local device in `devices.devices()`.
-    pub(super) local_device_index: usize,
-    /// Remote device/port/GID to request in `prepare_connection`.
-    pub(super) remote: DeviceSelection,
-    /// Remote per-connection resource limits advertised for that device.
-    pub(super) remote_limits: RdmaConnectionLimits,
-    /// Preferred transport class, considered after hard constraints and
-    /// reachability filters so lower classes remain valid fallbacks.
-    pub(super) class: PathClass,
-    /// Full NIC-pair identity of this candidate.
-    pub(super) path: RdmaPathInfo,
 }
 
 #[cfg(test)]

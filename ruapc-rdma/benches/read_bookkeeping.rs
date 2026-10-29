@@ -32,11 +32,11 @@ use ruapc_bufpool::{Buffer, BufferPool, BufferPoolBuilder, EmptyDevices};
 
 use ruapc_rdma::{
     ReadCompletion, ReadFailure, ReadRequest, ReadSegment, WRID,
-    bench_support::read::{Batch, Ledger, prepare},
+    bench_support::{
+        Config, pin_thread,
+        read::{Batch, Ledger, prepare},
+    },
 };
-
-mod common;
-use common::Config;
 
 // Measurements pin jemalloc as the process allocator so samples are comparable
 // across hosts; see docs/benchmark.md#allocator.
@@ -265,7 +265,7 @@ fn ledger_threads(config: &Config, name: &str, pool: &Arc<BufferPool>, wrs: u64)
         // This handshake is used once, outside warmup and measured work.
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
         scope.spawn(|| {
-            common::pin_thread(1);
+            pin_thread(1);
             ready_tx.send(()).unwrap();
             drop(ready_tx);
             let mut sequence = 0;
@@ -357,7 +357,7 @@ fn main() {
         return;
     }
     let config = Config::from_env();
-    common::pin_thread(0);
+    pin_thread(0);
     let pool = pool();
     println!(
         "READ benchmarks: no QP/provider/CQ polling; prepare uses a constant lkey; \

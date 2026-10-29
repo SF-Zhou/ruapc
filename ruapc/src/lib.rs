@@ -68,8 +68,6 @@ pub use task::{TaskSupervisor, TaskSupervisorHandle, Waiter, WaiterCleaner};
 mod sockets;
 pub use sockets::*;
 
-mod services;
-
 pub use ruapc_bufpool::Buffer;
 pub use ruapc_bufpool::BufferPool;
 pub use ruapc_bufpool::DEFAULT_BUFFER_POOL_MEMORY;

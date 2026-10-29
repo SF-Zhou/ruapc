@@ -6,10 +6,6 @@ use ruapc::*;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-mod common;
-
-use common::endpoint;
-
 // ==========================================================================
 // Service definition
 // ==========================================================================
@@ -154,8 +150,8 @@ struct TestCase {
     delay_ms: u64,
     /// Client timeout duration.
     client_timeout: Duration,
-    /// Client transport.
-    transport: Transport,
+    /// Endpoint scheme, including the bootstrap transport for RDMA.
+    scheme: &'static str,
     /// Which service method to call.
     method: Method,
     /// Expected outcome.
@@ -190,7 +186,7 @@ async fn run_test(tc: TestCase) {
     let addr = server.clone().listen(addr).await.unwrap();
     let ctx = Context::create(&config)
         .unwrap()
-        .with_endpoint(endpoint(tc.transport, addr));
+        .with_endpoint(format!("{}://{addr}", tc.scheme).parse().unwrap());
 
     // Fill the client buffers and set their logical lengths; together
     // they form the read space the server operates on.
@@ -260,7 +256,7 @@ async fn test_tcp_read_single_buffer() {
         splits: &[15],
         delay_ms: 50,
         client_timeout: Duration::from_secs(5),
-        transport: Transport::TCP,
+        scheme: "tcp",
         method: Method::All,
         expect: Expected::Ok,
     })
@@ -274,7 +270,7 @@ async fn test_tcp_read_multi_buffer() {
         splits: &[7, 0, 21, 8],
         delay_ms: 0,
         client_timeout: Duration::from_secs(5),
-        transport: Transport::TCP,
+        scheme: "tcp",
         method: Method::All,
         expect: Expected::Ok,
     })
@@ -288,7 +284,7 @@ async fn test_tcp_read_vectored_ops() {
         splits: &[9, 11],
         delay_ms: 0,
         client_timeout: Duration::from_secs(5),
-        transport: Transport::TCP,
+        scheme: "tcp",
         method: Method::Swapped,
         expect: Expected::OkSwapped,
     })
@@ -302,7 +298,7 @@ async fn test_tcp_read_liveness_timeout() {
         splits: &[15],
         delay_ms: 200,
         client_timeout: Duration::from_millis(100),
-        transport: Transport::TCP,
+        scheme: "tcp",
         method: Method::All,
         expect: Expected::Err(ErrorKind::Timeout),
     })
@@ -319,7 +315,7 @@ async fn test_tcp_read_out_of_bounds() {
         splits: &[128 * 1024],
         delay_ms: 0,
         client_timeout: Duration::from_secs(5),
-        transport: Transport::TCP,
+        scheme: "tcp",
         method: Method::OutOfBounds,
         expect: Expected::Err(ErrorKind::InvalidCopyOp),
     })
@@ -334,7 +330,7 @@ async fn test_rdma_read_single_buffer() {
         splits: &[14],
         delay_ms: 50,
         client_timeout: Duration::from_secs(5),
-        transport: Transport::RDMA,
+        scheme: "tcp+rdma",
         method: Method::All,
         expect: Expected::Ok,
     })
@@ -349,7 +345,7 @@ async fn test_rdma_read_multi_buffer() {
         splits: &[100 * 1024, 64 * 1024, 136 * 1024],
         delay_ms: 0,
         client_timeout: Duration::from_secs(5),
-        transport: Transport::RDMA,
+        scheme: "tcp+rdma",
         method: Method::All,
         expect: Expected::Ok,
     })
@@ -364,7 +360,7 @@ async fn test_rdma_read_vectored_ops() {
         splits: &[13, 19],
         delay_ms: 0,
         client_timeout: Duration::from_secs(5),
-        transport: Transport::RDMA,
+        scheme: "tcp+rdma",
         method: Method::Swapped,
         expect: Expected::OkSwapped,
     })
@@ -383,7 +379,7 @@ async fn test_rdma_read_exceeds_device_read_budget() {
         splits: &[1024; 48],
         delay_ms: 0,
         client_timeout: Duration::from_secs(5),
-        transport: Transport::RDMA,
+        scheme: "tcp+rdma",
         method: Method::All,
         expect: Expected::Ok,
     })
@@ -398,7 +394,7 @@ async fn test_rdma_read_liveness_timeout() {
         splits: &[14],
         delay_ms: 200,
         client_timeout: Duration::from_millis(100),
-        transport: Transport::RDMA,
+        scheme: "tcp+rdma",
         method: Method::All,
         expect: Expected::Err(ErrorKind::Timeout),
     })
@@ -413,7 +409,7 @@ async fn test_rdma_read_out_of_bounds() {
         splits: &[128 * 1024],
         delay_ms: 0,
         client_timeout: Duration::from_secs(5),
-        transport: Transport::RDMA,
+        scheme: "tcp+rdma",
         method: Method::OutOfBounds,
         expect: Expected::Err(ErrorKind::InvalidCopyOp),
     })
