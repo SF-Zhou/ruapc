@@ -11,9 +11,10 @@ Use [DESIGN.md](DESIGN.md) for crate/module ownership and
 - Use enum dispatch for transport selection (`Socket`, `SocketPool`,
   `HttpSocket`) and statically dispatched futures. Application service closures
   and device registration are explicit trait-object extension boundaries.
-- `ruapc` and `ruapc-wire` forbid unsafe code. Allocation, registration and verbs
-  operations belong in `ruapc-bufpool` / `ruapc-rdma`. Safe APIs must enforce memory
-  ownership and completion evidence, not accept caller-supplied lifetime promises.
+- `ruapc`, `ruapc-memory` and `ruapc-wire` forbid unsafe code. Allocation,
+  registration and verbs operations belong in `ruapc-bufpool` / `ruapc-rdma`.
+  Safe APIs must enforce memory ownership and completion evidence, not accept
+  caller-supplied lifetime promises.
 - `DeviceSet` owns TCP at index zero and assigns additional device indices.
   Safe `Device` wrappers expose an associated `MemoryRegistrar`; custom
   registrars and `Devices` collections must uphold their unsafe contracts.
@@ -43,12 +44,19 @@ Use [DESIGN.md](DESIGN.md) for crate/module ownership and
 - Schema generation and OpenAPI projection belong in `ruapc-schema`, which has
   no workspace runtime dependencies. Keep handler dispatch in `ruapc`; built-in
   and application services share one method directory and exposure rules.
+- Handlers and typed clients share the declared service trait and method return
+  types. Generated client implementations must preserve that public contract.
 - Emit metrics through the `metrics` facade. Keep per-method handles cached per
   `State`; users install a recorder before traffic. Only `server_inflight` has
   a locally tracked value, for admission control.
 
 ## Remote-memory invariants
 
+- Logical spaces, copy validation/planning, synchronous CPU gather/scatter and
+  immutable read sources belong in `ruapc-memory`, with no RPC runtime, async
+  executor or verbs dependency.
+  Keep RPC errors, write-target checkout, completion witnesses, waiter binding
+  and transport execution in `ruapc`; convert memory errors at that boundary.
 - Read/write spaces concatenate buffer lengths. Validate bounds, overflow,
   region/op limits and destination overlap before transferring `CopyOp`s.
 - Read attachments own immutable buffers and replace the wrapper's source list.
@@ -63,7 +71,8 @@ Use [DESIGN.md](DESIGN.md) for crate/module ownership and
   A write target transfers its entire destination vector into the owned READ
   plan and excludes CPU copies or competing READs until buffers are restored.
   Cancellation or failure can leave the target empty after the QP recycles it.
-- `SentBuffers` witnesses a completed write or explicit `sent_nothing()`;
+- `WriteReceipt` records a completed write or explicit `sent_nothing()`.
+  Keep transfer success separate from local source/destination availability;
   successful calls return available destinations only when uniquely held.
 - Dropping a posting cursor accounts for unposted work. Posted buffers and
   READ permits remain held until completions settle or QP destruction succeeds.
@@ -89,8 +98,8 @@ Follow [CONTRIBUTING.md](CONTRIBUTING.md) for prerequisites, workspace checks,
 feature/rustdoc checks and Soft-RoCE setup. Core tests and RPC benchmarks enable
 RDMA through a self dev-dependency even though downstream RDMA is opt-in.
 Always run formatting and Clippy before committing. PRs target `main`; all CI
-checks must pass before merging. Release order is bufpool, macro, schema, RDMA,
-wire, core.
+checks must pass before merging. Release order is bufpool, memory, macro,
+schema, RDMA, wire, core.
 
 Follow the [documentation ownership rules](docs/README.md#maintaining-the-docs):
 keep each contract in its owning guide, link to it from summaries, and keep

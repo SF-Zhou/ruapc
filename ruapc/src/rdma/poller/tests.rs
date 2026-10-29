@@ -1,8 +1,10 @@
 use super::*;
+use ruapc_memory::BufferSet;
 
 use std::sync::{atomic::AtomicUsize, mpsc};
 
 use ruapc_bufpool::Device as _;
+use ruapc_memory::CopyBatch;
 use ruapc_rdma::{QueuePair, ibv_qp_attr, ibv_qp_attr_mask, ibv_qp_state};
 
 use crate::{
@@ -561,7 +563,8 @@ async fn close_between_receive_health_check_and_post_is_flushed_by_poller() {
 
 #[tokio::test]
 async fn read_deadlines_bound_first_nic_admission_and_restore_unposted_targets() {
-    use crate::remote_memory::{CopyOp, WriteTarget, scatter::SpaceLayout};
+    use crate::remote_memory::{CopyOp, WriteTarget};
+    use ruapc_memory::RemoteSpace;
 
     let devices = make_rdma_devices();
     let device = &devices.devices()[0];
@@ -605,24 +608,24 @@ async fn read_deadlines_bound_first_nic_admission_and_restore_unposted_targets()
         source.set_len(64);
         source.fill(0x5a);
         let regions = [source.remote_buffer_info(&device.index()).unwrap()];
-        let layout = SpaceLayout::from_lens([64]).unwrap();
+        let remote = RemoteSpace::new(&regions).unwrap();
         let ops = [CopyOp::new(0, 0, 64)];
         let mut other_destination = pool.allocate(64).unwrap();
         other_destination.set_len(64);
-        let other_target = WriteTarget::new(vec![other_destination]).unwrap();
+        let other_target = WriteTarget::new(BufferSet::try_new(vec![other_destination]).unwrap());
+        let validated = CopyBatch::new(&ops).unwrap();
         let mut other_read =
-            Box::pin(peer.read_into_target(&regions, &layout, &ops, other_target, None));
+            Box::pin(peer.read_into_target(&remote, &validated, other_target, None));
         assert!(futures_util::poll!(&mut other_read).is_pending());
         assert_eq!(peer.queue_pair.pending_read_count(), 1);
 
         let mut destination = pool.allocate(64).unwrap();
         destination.set_len(64);
         destination.fill(0xa5);
-        let target = WriteTarget::new(vec![destination]).unwrap();
+        let target = WriteTarget::new(BufferSet::try_new(vec![destination]).unwrap());
         let mut read = Box::pin(socket.read_into_target(
-            &regions,
-            &layout,
-            &ops,
+            &remote,
+            &validated,
             target.clone(),
             parent_remaining.map(|remaining| Instant::now() + remaining),
         ));
@@ -659,7 +662,8 @@ async fn read_deadlines_bound_first_nic_admission_and_restore_unposted_targets()
 
 #[tokio::test]
 async fn read_deadlines_bound_partial_posting_without_releasing_dma() {
-    use crate::remote_memory::{CopyOp, WriteTarget, scatter::SpaceLayout};
+    use crate::remote_memory::{CopyOp, WriteTarget};
+    use ruapc_memory::RemoteSpace;
 
     let devices = make_rdma_devices();
     let device = &devices.devices()[0];
@@ -702,7 +706,7 @@ async fn read_deadlines_bound_partial_posting_without_releasing_dma() {
         source.set_len(192);
         source.fill(0x5a);
         let regions = [source.remote_buffer_info(&device.index()).unwrap()];
-        let layout = SpaceLayout::from_lens([192]).unwrap();
+        let remote = RemoteSpace::new(&regions).unwrap();
         let ops = [
             CopyOp::new(0, 0, 64),
             CopyOp::new(64, 64, 64),
@@ -714,12 +718,12 @@ async fn read_deadlines_bound_partial_posting_without_releasing_dma() {
         let destination_lifetime = Arc::downgrade(&destination_pool);
         let mut destination = destination_pool.allocate(192).unwrap();
         destination.set_len(192);
-        let target = WriteTarget::new(vec![destination]).unwrap();
+        let target = WriteTarget::new(BufferSet::try_new(vec![destination]).unwrap());
         drop(destination_pool);
+        let validated = CopyBatch::new(&ops).unwrap();
         let mut read = Box::pin(socket.read_into_target(
-            &regions,
-            &layout,
-            &ops,
+            &remote,
+            &validated,
             target.clone(),
             parent_remaining.map(|remaining| Instant::now() + remaining),
         ));
@@ -728,10 +732,11 @@ async fn read_deadlines_bound_partial_posting_without_releasing_dma() {
 
         let mut other_destination = pool.allocate(64).unwrap();
         other_destination.set_len(64);
-        let other_target = WriteTarget::new(vec![other_destination]).unwrap();
+        let other_target = WriteTarget::new(BufferSet::try_new(vec![other_destination]).unwrap());
         let other_ops = [CopyOp::new(0, 0, 64)];
+        let other_validated = CopyBatch::new(&other_ops).unwrap();
         let mut other_read =
-            Box::pin(peer.read_into_target(&regions, &layout, &other_ops, other_target, None));
+            Box::pin(peer.read_into_target(&remote, &other_validated, other_target, None));
         assert!(futures_util::poll!(&mut other_read).is_pending());
         assert_eq!(peer.queue_pair.pending_read_count(), 0);
 
@@ -786,7 +791,8 @@ async fn cancelled_read_completion_preserves_the_hard_watchdog() {
 }
 
 async fn completion_watchdog_survives_waiter(cancel_receiver: bool) {
-    use crate::remote_memory::{CopyOp, WriteTarget, scatter::SpaceLayout};
+    use crate::remote_memory::{CopyOp, WriteTarget};
+    use ruapc_memory::RemoteSpace;
 
     let devices = make_rdma_devices();
     let device = &devices.devices()[0];
@@ -819,30 +825,24 @@ async fn completion_watchdog_survives_waiter(cancel_receiver: bool) {
     let mut source = pool.allocate(64).unwrap();
     source.set_len(64);
     let regions = [source.remote_buffer_info(&device.index()).unwrap()];
-    let layout = SpaceLayout::from_lens([64]).unwrap();
+    let remote = RemoteSpace::new(&regions).unwrap();
     let mut destination = pool.allocate(64).unwrap();
     destination.set_len(64);
-    let target = WriteTarget::new(vec![destination]).unwrap();
+    let target = WriteTarget::new(BufferSet::try_new(vec![destination]).unwrap());
     let ops = [CopyOp::new(0, 0, 64)];
+    let validated = CopyBatch::new(&ops).unwrap();
     // An expired absolute request deadline cannot post even when both
     // resources are immediately available, and leaves the target reusable.
     let error = socket
-        .read_into_target(
-            &regions,
-            &layout,
-            &ops,
-            target.clone(),
-            Some(Instant::now()),
-        )
+        .read_into_target(&remote, &validated, target.clone(), Some(Instant::now()))
         .await
         .unwrap_err();
     assert_eq!(error.kind, ErrorKind::Timeout);
     assert_eq!(socket.queue_pair.pending_read_count(), 0);
     assert_eq!(permits.available_permits(), 1);
     let mut read = Box::pin(socket.read_into_target(
-        &regions,
-        &layout,
-        &ops,
+        &remote,
+        &validated,
         target.clone(),
         Some(Instant::now() + Duration::from_millis(50)),
     ));
@@ -879,7 +879,8 @@ async fn completion_watchdog_survives_waiter(cancel_receiver: bool) {
 
 #[tokio::test]
 async fn closing_a_posted_read_without_a_watchdog_wakes_before_any_completion() {
-    use crate::remote_memory::{CopyOp, WriteTarget, scatter::SpaceLayout};
+    use crate::remote_memory::{CopyOp, WriteTarget};
+    use ruapc_memory::RemoteSpace;
 
     let devices = make_rdma_devices();
     let device = &devices.devices()[0];
@@ -903,15 +904,16 @@ async fn closing_a_posted_read_without_a_watchdog_wakes_before_any_completion() 
     let mut source = pool.allocate(64).unwrap();
     source.set_len(64);
     let regions = [source.remote_buffer_info(&device.index()).unwrap()];
-    let layout = SpaceLayout::from_lens([64]).unwrap();
+    let remote = RemoteSpace::new(&regions).unwrap();
     let destination_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
     let destination_lifetime = Arc::downgrade(&destination_pool);
     let mut destination = destination_pool.allocate(64).unwrap();
     destination.set_len(64);
-    let target = WriteTarget::new(vec![destination]).unwrap();
+    let target = WriteTarget::new(BufferSet::try_new(vec![destination]).unwrap());
     drop(destination_pool);
     let ops = [CopyOp::new(0, 0, 64)];
-    let mut read = Box::pin(socket.read_into_target(&regions, &layout, &ops, target.clone(), None));
+    let validated = CopyBatch::new(&ops).unwrap();
+    let mut read = Box::pin(socket.read_into_target(&remote, &validated, target.clone(), None));
     assert!(futures_util::poll!(&mut read).is_pending());
     assert_eq!(socket.queue_pair.pending_read_count(), 1);
     socket.set_error();
@@ -935,7 +937,8 @@ async fn closing_a_posted_read_without_a_watchdog_wakes_before_any_completion() 
 
 #[tokio::test]
 async fn shutdown_returns_unpolled_read_credits_only_after_qp_destruction() {
-    use crate::remote_memory::{CopyOp, WriteTarget, scatter::SpaceLayout};
+    use crate::remote_memory::{CopyOp, WriteTarget};
+    use ruapc_memory::RemoteSpace;
 
     let devices = make_rdma_devices();
     let device = &devices.devices()[0];
@@ -966,13 +969,13 @@ async fn shutdown_returns_unpolled_read_credits_only_after_qp_destruction() {
         source.set_len(128);
         source.fill(0x5a);
         let regions = [source.remote_buffer_info(&device.index()).unwrap()];
-        let layout = SpaceLayout::from_lens([128]).unwrap();
+        let remote = RemoteSpace::new(&regions).unwrap();
         let mut destination = pool.allocate(128).unwrap();
         destination.set_len(128);
-        let target = WriteTarget::new(vec![destination]).unwrap();
+        let target = WriteTarget::new(BufferSet::try_new(vec![destination]).unwrap());
         let ops = [CopyOp::new(0, 0, 64), CopyOp::new(64, 64, 64)];
-        let mut read =
-            Box::pin(socket.read_into_target(&regions, &layout, &ops, target.clone(), None));
+        let validated = CopyBatch::new(&ops).unwrap();
+        let mut read = Box::pin(socket.read_into_target(&remote, &validated, target.clone(), None));
         assert!(futures_util::poll!(&mut read).is_pending());
         assert_eq!(socket.queue_pair.pending_read_count(), 1);
         assert_eq!(permits.available_permits(), 0);
@@ -997,7 +1000,8 @@ async fn shutdown_returns_unpolled_read_credits_only_after_qp_destruction() {
                 .await
                 .expect("processed READ completions must settle their waiter")
                 .unwrap();
-            let buffers = target.take_for_read().unwrap();
+            let ((), buffers) = target.checkout(|_| Ok(())).unwrap();
+            let buffers = buffers.into_buffers();
             assert_eq!(&buffers[0][..], &source[..]);
         } else {
             poll_loop.shutdown_cleanup();
@@ -1031,7 +1035,8 @@ async fn shutdown_returns_unpolled_read_credits_only_after_qp_destruction() {
 
 #[tokio::test]
 async fn shutdown_closes_live_connections_before_refunding_incoming_reads() {
-    use crate::remote_memory::{CopyOp, WriteTarget, scatter::SpaceLayout};
+    use crate::remote_memory::{CopyOp, WriteTarget};
+    use ruapc_memory::RemoteSpace;
     use std::task::{Context, Wake, Waker};
 
     struct RefundProbe {
@@ -1073,12 +1078,13 @@ async fn shutdown_closes_live_connections_before_refunding_incoming_reads() {
     let mut source = pool.allocate(64).unwrap();
     source.set_len(64);
     let regions = [source.remote_buffer_info(&device.index()).unwrap()];
-    let layout = SpaceLayout::from_lens([64]).unwrap();
+    let remote = RemoteSpace::new(&regions).unwrap();
     let mut destination = pool.allocate(64).unwrap();
     destination.set_len(64);
-    let target = WriteTarget::new(vec![destination]).unwrap();
+    let target = WriteTarget::new(BufferSet::try_new(vec![destination]).unwrap());
     let ops = [CopyOp::new(0, 0, 64)];
-    let mut read = Box::pin(incoming.read_into_target(&regions, &layout, &ops, target, None));
+    let validated = CopyBatch::new(&ops).unwrap();
+    let mut read = Box::pin(incoming.read_into_target(&remote, &validated, target, None));
     assert!(futures_util::poll!(&mut read).is_pending());
     drop(read);
     assert_eq!(incoming.queue_pair.pending_read_count(), 1);

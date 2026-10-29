@@ -1,6 +1,6 @@
 # Safety boundaries
 
-`ruapc` forbids unsafe Rust in its library, tests and benchmarks. Allocation,
+`ruapc`, `ruapc-memory` and `ruapc-wire` forbid unsafe Rust. Allocation,
 registration and verbs operations live in `ruapc-bufpool` and `ruapc-rdma`.
 Their safe interfaces retain posted local buffers until completion evidence
 or successful QP destruction permits reclamation. Application remote sources
@@ -39,10 +39,13 @@ release buffers. See [WRID ownership](wrid.md) for token validation, posting
 cursors and reclamation, and [capacity](rdma-capacity.md) for permits and CQ
 retirement.
 
+Inline CPU writes hold the `WriteTarget` mutex for the entire validated batch.
 `WriteTarget` removes its entire destination vector before handing it to an
-owned READ plan. CPU copies and competing transfers fail with `BuffersInUse`
-while the target is empty. Only buffers returned by the dependency can be
-restored; failed or cancelled transfers can leave the target empty even after
+owned READ plan. CPU copies and competing transfers that access bytes fail
+with `BuffersInUse` while the target is empty. Empty and all-zero batches still
+validate the request, spaces and operations, then succeed without checkout.
+Only buffers returned by the dependency can be restored; failed or cancelled
+transfers can leave the target empty even after
 the QP eventually recycles those buffers.
 
 ## Large-payload source ownership
@@ -107,8 +110,9 @@ addresses.
 For an RDMA `remote_read` that transfers bytes, the reader waits for all READ
 completions, then calls `MemoryService/request_is_pending` on the source peer.
 It returns `Ok(buffers)` only if that check succeeds with `true`. Empty or
-all-zero-length operation batches return the local buffers without I/O or
-validation.
+all-zero-length batches validate the connected request, advertised space and
+copy ranges, then return the local buffers without I/O or a source-membership
+probe.
 
 Success depends on the original waiter retaining the immutable source and
 its request ID not being reused during the operation. A positive check after
@@ -136,8 +140,9 @@ registered:
 | 4 | Pending probe returns `false`. | Returns an error instead of a successful read result. |
 
 An unsuccessful probe, including a probe RPC error, can return completed
-destinations in `RemoteIoError`. Its `buffers()`, `take_buffers()` and
-`into_parts()` expose their bytes without clearing them. Recovery permits
+destinations in `RemoteIoError`. Its `recovered_buffers()`,
+`take_recovered_buffers()` and `into_parts()` expose their bytes without clearing
+them. Recovery permits
 reuse, **not acceptance as a valid transfer result**.
 
 This protocol assumes cooperating peers. It rejects invalid read results but
@@ -163,7 +168,9 @@ extend that source-retention contract to application read attachments or
 
 ## Validation
 
-The application paths are implemented in [client attachments](../ruapc/src/client/with_buffers.rs),
+Logical spaces and immutable read sources live in
+[`ruapc-memory`](../ruapc-memory/README.md). The application paths are implemented
+in [client attachments](../ruapc/src/client/with_buffers.rs),
 [write targets](../ruapc/src/remote_memory/write_target.rs) and
 [RDMA transfers](../ruapc/src/rdma/rdma_socket/read.rs).
 

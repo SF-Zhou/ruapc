@@ -1,64 +1,45 @@
-//! Client-side pre-pinned destination for server-initiated remote writes.
+//! RPC-owned destination checkout around a checked buffer set.
 
 use std::sync::{Arc, Mutex};
 
 use ruapc_bufpool::{AsDeviceIndex, RemoteBufferInfo};
+#[cfg(feature = "rdma")]
+use ruapc_memory::SpaceLayout;
+use ruapc_memory::{BufferSet, CopyBatch};
 
-use crate::{Buffer, Error, ErrorKind, Result, remote_memory::scatter::SpaceLayout};
+#[cfg(test)]
+use crate::CopyOp;
+use crate::{Buffer, Error, ErrorKind, Result};
 
-/// The buffers a client hands over for the duration of one request so the
-/// server can write into them (via `read_into_target` or `write_inline`).
+/// The owned destination shared by the original waiter and reverse-RPC handlers.
 ///
-/// Shared as `Arc<WriteTarget>` between the pending request's waiter entry
-/// and any in-flight `MemoryService::read_into_target` / `write_inline`
-/// handler. CPU writers borrow the buffers under the mutex. An RDMA READ
-/// moves them into the queue pair, leaving this target empty until completion;
-/// competing writers cannot access the destination during DMA. The queue pair
-/// retains the allocation through every completion, including timeout flushes.
-/// Completed buffers are restored here and can be recovered only when the last
-/// target clone is unwrapped ([`try_into_buffers`]). Failed in-flight transfers
-/// leave recovery unavailable and release their memory after DMA completes.
-///
-/// The logical write space is defined by each buffer's logical length at
-/// construction time (the usual rule: spaces are concatenations of
-/// `Buffer::len()`), and is immutable afterwards.
-///
-/// [`try_into_buffers`]: WriteTarget::try_into_buffers
+/// CPU copies borrow the complete set under one mutex. RDMA checkout removes
+/// the set and leaves the target unavailable until settled buffers return from
+/// the dependency. Request expiry, cancellation and ERR state do not authorize
+/// restoring buffers still owned by DMA. Failed transfers may leave no set to
+/// recover, even after the QP eventually recycles its buffers.
 #[derive(Debug)]
 pub(crate) struct WriteTarget {
-    /// The pinned buffers. Locked only for the brief moments a writer
-    /// needs CPU access or moves ownership into an RDMA operation. `None`
-    /// excludes CPU access and competing DMA while the QP owns the buffers.
-    buffers: Mutex<Option<Vec<Buffer>>>,
-    /// Segment lengths frozen at construction.
-    layout: SpaceLayout,
+    buffers: Mutex<Option<BufferSet>>,
+    /// The advertised logical length remains available during DMA checkout.
+    total_len: u64,
 }
 
 impl WriteTarget {
-    /// Wraps the buffers, freezing their logical lengths as the write
-    /// space definition.
-    pub fn new(buffers: Vec<Buffer>) -> Result<Arc<Self>> {
-        let layout = SpaceLayout::from_lens(buffers.iter().map(|b| b.len() as u64))?;
-        Ok(Arc::new(Self {
+    /// Installs an already checked destination set.
+    pub fn new(buffers: BufferSet) -> Arc<Self> {
+        let total_len = buffers.layout().total();
+        Arc::new(Self {
             buffers: Mutex::new(Some(buffers)),
-            layout,
-        }))
+            total_len,
+        })
     }
 
-    /// Total length of the write space in bytes.
     pub fn total_len(&self) -> u64 {
-        self.layout.total()
+        self.total_len
     }
 
-    /// Layout of the write space (consumed by the RDMA read planner).
-    #[cfg_attr(not(feature = "rdma"), allow(dead_code))]
-    pub fn layout(&self) -> &SpaceLayout {
-        &self.layout
-    }
-
-    /// Exports the per-segment region info for the given device, in
-    /// segment order. Used by the client to advertise the write space in
-    /// request metadata.
+    /// Exports actual available buffers for metadata on the selected device.
     pub fn export_regions(
         &self,
         device_index: &impl AsDeviceIndex,
@@ -67,23 +48,41 @@ impl WriteTarget {
         buffers
             .as_ref()
             .ok_or_else(Self::busy)?
+            .buffers()
             .iter()
-            .map(|buf| {
-                buf.remote_buffer_info(device_index)
-                    .map_err(|e| Error::new(ErrorKind::InvalidArgument, e.to_string()))
+            .map(|buffer| {
+                buffer
+                    .remote_buffer_info(device_index)
+                    .map_err(|error| Error::new(ErrorKind::InvalidArgument, error.to_string()))
             })
             .collect()
     }
 
-    /// Moves the destination into the transport until all DMA has completed.
-    /// CPU copies and competing transfers cannot access a checked-out target.
+    /// Plans against the available set's layout, then removes the whole set
+    /// under the same lock, excluding CPU copies and competing DMA. Planning
+    /// is synchronous; an error leaves the original buffers available.
     #[cfg(feature = "rdma")]
-    pub fn take_for_read(&self) -> Result<Vec<Buffer>> {
-        self.buffers.lock().unwrap().take().ok_or_else(Self::busy)
+    pub fn checkout<R>(
+        &self,
+        plan: impl FnOnce(&SpaceLayout) -> Result<R>,
+    ) -> Result<(R, BufferSet)> {
+        let mut slot = self.buffers.lock().unwrap();
+        let buffers = slot.as_ref().ok_or_else(Self::busy)?;
+        let planned = plan(buffers.layout())?;
+        let buffers = slot
+            .take()
+            .expect("write target remains available while locked");
+        Ok((planned, buffers))
     }
 
+    /// Restores owned buffers returned by a settled transfer or a pre-post error.
     #[cfg(feature = "rdma")]
-    pub fn restore_after_read(&self, buffers: Vec<Buffer>) {
+    pub fn restore(&self, buffers: BufferSet) {
+        assert_eq!(
+            buffers.layout().total(),
+            self.total_len,
+            "restored write target length changed"
+        );
         let mut slot = self.buffers.lock().unwrap();
         assert!(slot.is_none(), "write target already contains buffers");
         *slot = Some(buffers);
@@ -92,33 +91,45 @@ impl WriteTarget {
     fn busy() -> Error {
         Error::new(
             ErrorKind::BuffersInUse,
-            "write target is owned by an in-flight transfer".into(),
+            "write target buffers are unavailable".into(),
         )
     }
 
-    /// Copies `data` into the write space at `dst_offset` (`write_inline` path).
-    ///
-    /// The range must have been validated against
-    /// [`total_len`](Self::total_len) beforehand.
-    pub fn copy_in(&self, dst_offset: u64, data: &[u8]) -> Result<()> {
+    /// Validates destination bounds and packed length before any target access.
+    /// A zero-byte batch succeeds after validation without borrowing DMA-owned
+    /// buffers. Nonempty copies hold the mutex for the whole batch.
+    pub fn copy_inline(&self, batch: &CopyBatch<'_>, bytes: &[u8]) -> Result<()> {
+        batch.check_destination(self.total_len)?;
+        if bytes.len() as u64 != batch.byte_count() {
+            return Err(Error::new(
+                ErrorKind::InvalidCopyOp,
+                format!(
+                    "inline payload contains {} bytes but copy operations describe {}",
+                    bytes.len(),
+                    batch.byte_count()
+                ),
+            ));
+        }
+        if batch.byte_count() == 0 {
+            return Ok(());
+        }
         let mut buffers = self.buffers.lock().unwrap();
         let buffers = buffers.as_mut().ok_or_else(Self::busy)?;
-        let mut cursor = 0usize;
-        self.layout
-            .for_each_slice(dst_offset, data.len() as u64, |seg, off, slice| {
-                let (off, slice) = (off as usize, slice as usize);
-                buffers[seg][off..off + slice].copy_from_slice(&data[cursor..cursor + slice]);
-                cursor += slice;
-                Ok(())
-            })
+        Ok(buffers.scatter(batch, bytes)?)
     }
 
-    /// Recovers completed buffers when this is the last live clone. An active
-    /// handler or a destination still owned by the queue pair prevents recovery.
+    #[cfg(test)]
+    pub fn copy_in(&self, dst_offset: u64, data: &[u8]) -> Result<()> {
+        let operations = [CopyOp::new(0, dst_offset, data.len() as u64)];
+        self.copy_inline(&CopyBatch::new(&operations)?, data)
+    }
+
+    /// Returns available destinations only when no waiter or handler shares them.
     pub fn try_into_buffers(this: Arc<Self>) -> Option<Vec<Buffer>> {
         Arc::try_unwrap(this)
             .ok()
             .and_then(|target| target.buffers.into_inner().unwrap())
+            .map(BufferSet::into_buffers)
     }
 }
 
@@ -139,7 +150,7 @@ mod tests {
         let mut b = pool.allocate(64 * 1024).unwrap();
         a.set_len(4);
         b.set_len(4);
-        let target = WriteTarget::new(vec![a, b]).unwrap();
+        let target = WriteTarget::new(BufferSet::try_new(vec![a, b]).unwrap());
         assert_eq!(target.total_len(), 8);
         target.copy_in(2, b"wxyz").unwrap();
         let buffers = WriteTarget::try_into_buffers(target).unwrap();
@@ -152,10 +163,37 @@ mod tests {
         let pool = pool();
         let mut a = pool.allocate(64 * 1024).unwrap();
         a.set_len(1);
-        let target = WriteTarget::new(vec![a]).unwrap();
+        let target = WriteTarget::new(BufferSet::try_new(vec![a]).unwrap());
         let clone = target.clone();
         assert!(WriteTarget::try_into_buffers(target).is_none());
         assert!(WriteTarget::try_into_buffers(clone).is_some());
+    }
+
+    #[cfg(feature = "rdma")]
+    #[test]
+    fn failed_planning_preserves_the_complete_target() {
+        let pool = pool();
+        let mut a = pool.allocate(4).unwrap();
+        let mut b = pool.allocate(4).unwrap();
+        a.set_len(4);
+        b.set_len(4);
+        a.copy_from_slice(b"keep");
+        b.copy_from_slice(b"both");
+        let pointers = [a.as_ptr(), b.as_ptr()];
+        let target = WriteTarget::new(BufferSet::try_new(vec![a, b]).unwrap());
+        let error = target
+            .checkout::<()>(|layout| {
+                assert_eq!(layout.total(), 8);
+                Err(Error::kind(ErrorKind::InvalidCopyOp))
+            })
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::InvalidCopyOp);
+        let buffers = WriteTarget::try_into_buffers(target).unwrap();
+        assert_eq!(buffers.len(), 2);
+        assert_eq!(buffers[0].as_ptr(), pointers[0]);
+        assert_eq!(buffers[1].as_ptr(), pointers[1]);
+        assert_eq!(buffers[0].as_slice(), b"keep");
+        assert_eq!(buffers[1].as_slice(), b"both");
     }
 
     #[cfg(feature = "rdma")]
@@ -164,17 +202,21 @@ mod tests {
         let pool = pool();
         let mut buffer = pool.allocate(64 * 1024).unwrap();
         buffer.set_len(4);
-        let target = WriteTarget::new(vec![buffer]).unwrap();
-        let buffers = target.take_for_read().unwrap();
+        let target = WriteTarget::new(BufferSet::try_new(vec![buffer]).unwrap());
+        let (planned_len, buffers) = target.checkout(|layout| Ok(layout.total())).unwrap();
+        assert_eq!(planned_len, 4);
         assert_eq!(
             target.copy_in(0, b"data").unwrap_err().kind,
             ErrorKind::BuffersInUse
         );
         assert_eq!(
-            target.take_for_read().unwrap_err().kind,
+            target
+                .checkout::<()>(|_| panic!("busy targets must not invoke the planner"))
+                .unwrap_err()
+                .kind,
             ErrorKind::BuffersInUse
         );
-        target.restore_after_read(buffers);
+        target.restore(buffers);
         target.copy_in(0, b"data").unwrap();
         let buffers = WriteTarget::try_into_buffers(target).unwrap();
         assert_eq!(buffers[0].as_slice(), b"data");

@@ -9,21 +9,22 @@ rustdoc.
 | Crate | Responsibility | Workspace dependencies |
 |---|---|---|
 | `ruapc-bufpool` | Allocation, caches and device registration | None |
+| `ruapc-memory` | Logical copy spaces, validation, planning, CPU copies and immutable read sources | Bufpool |
 | `ruapc-rdma` | Verbs resources, owned work requests and completions | `ruapc-bufpool` |
 | `ruapc-macro` | Service validation and code generation | None at runtime |
 | `ruapc-schema` | Schema registry and OpenAPI projection | None |
 | `ruapc-wire` | Message codecs, framing and codec errors | Bufpool |
-| `ruapc` | RPC lifecycle, routing, transports and remote memory | Bufpool, macro, schema, wire; optional RDMA |
+| `ruapc` | RPC lifecycle, routing, transports and remote-memory execution | Bufpool, memory, macro, schema, wire; optional RDMA |
 | `ruapc-demo` | Service host, typed caller and verified workloads | `ruapc` |
 
 Transport selection uses concrete enums (`Socket`, `SocketPool`, `HttpSocket`)
 and statically dispatched futures. Registered service closures and device
 registrars are the trait-object extension boundaries.
 
-The core and wire crates forbid unsafe code. Allocation, registration and verbs
-belong in bufpool and RDMA, whose APIs enforce local memory ownership and
-completion evidence. See [safety boundaries](docs/safe-boundaries.md) for these contracts
-and the separate application-source validation scheme.
+The core, memory and wire crates forbid unsafe code. Allocation, registration
+and verbs belong in bufpool and RDMA, whose APIs enforce local memory ownership
+and completion evidence. See [safety boundaries](docs/safe-boundaries.md) for these
+contracts and the separate application-source validation scheme.
 Bufpool allocation and RDMA completion futures are runtime independent.
 They share a safe single-value notification implementation in bufpool's hidden
 `completion` module; it supplies notification, not completion authority.
@@ -38,7 +39,7 @@ the dependencies retain buffer ownership and completion authority.
 | `core` | Contexts, listeners, method registration and handler admission |
 | `msg` | Owned messages and payloads, delegating codecs to `ruapc-wire` |
 | `sockets` | Concrete transports, connection queues, maps and closure |
-| `remote_memory` | Logical copy spaces, validation, inline copies and buffer recovery |
+| `remote_memory` | Context transfer APIs, inline reverse RPCs, write targets and completion witnesses |
 | `rdma` | Path selection, bootstrap, READ execution and CQ polling |
 | `task` | Background-task supervision and response waiters |
 | `metrics` | Cached recorder handles and scoped request accounting |
@@ -49,6 +50,12 @@ directory and OpenAPI document include every registered method. Built-in and
 application services use the same dispatch and metrics; see
 [built-in services](docs/builtin-services.md#discovery-and-dispatch) for their
 wire names, HTTP discovery and handler prerequisites.
+
+The service macro implements each declared service trait for `Client` and
+`ClientWithBuffers`. Handlers and clients share the same method return types;
+the internal response contract selects decoding and buffer recovery without
+changing those types. See the [service macro](ruapc-macro/src/lib.rs) for the
+declaration rules.
 
 `ruapc-wire` owns `MsgMeta`, `MsgFlags`, direct serialization, shared transport
 frame codecs, and `CodecError`. It accepts payload byte slices and reports
@@ -155,19 +162,48 @@ decoding an RPC does not provide local DMA completion authority.
 
 Client attachments and local buffer lists form logical spaces by concatenating
 buffer lengths. `CopyOp` addresses those spaces independently of segmentation.
-`remote_memory/scatter.rs` validates bounds, overflow, region/op limits and
-destination overlap, then fragments operations at buffer boundaries. The RDMA
-dependency independently validates the owned destination plan before posting.
+[`ruapc-memory`](ruapc-memory/README.md) validates bounds, overflow, region/op
+limits and destination overlap, then fragments operations at buffer boundaries.
+`SpaceLayout::from_buffers` supplies the common layout constructor for local
+buffers, and the memory crate owns synchronous CPU gather/scatter operations.
+`CopyBatch` checks operation structure once and caches the required source and
+destination extents. Gather checks the actual source, scatter checks the actual
+destination and packed byte count, and planning checks both real layouts.
+`BufferSet` owns buffers with a cached layout; callers can change buffer lengths
+only by consuming the set. Slice traversal validates its range before invoking
+callbacks. The crate also owns `RemoteSpace` and immutable `ReadSource` buffers,
+independently of the RPC runtime, async executors and verbs. `ruapc` re-exports
+the public copy-space types and converts memory errors into RPC errors.
+The RDMA dependency independently validates the owned destination plan before
+posting.
 
 | Component | Role |
 |---|---|
-| `read_source.rs` | Immutable sources shared by wrappers, pending requests and inline readers |
+| `ruapc-memory` | Space validation and planning, CPU gather/scatter and immutable sources shared by wrappers, pending requests and inline readers |
+| `context.rs` | Public transfer APIs |
+| `transfer.rs` | Owned preparation, convenience allocation and centralized enum dispatch |
+| `rpc_transfer.rs` | Reverse-RPC protocol, handlers and TCP/WS/HTTP fallback |
 | `write_target.rs` | Exclusive destination checkout for CPU copies or owned RDMA READ plans |
-| `inline.rs`, `services/memory_service.rs` | Reverse-RPC fallback over TCP/WS/HTTP |
-| `with_buffers.rs` | Completed-write witnesses and typed buffer-returning responses |
+| `reply.rs` | Write receipts and shared reply types with local destination availability |
 | `rdma/rdma_socket/read.rs` | Concrete READ planning and execution |
 | `rdma/rdma_socket/read/credits.rs` | SQ/NIC admission, closure and completion credits |
 | `rdma/rdma_socket/read/pending.rs` | Weak READ tracking, deadline policy and failure notification |
+
+Public `Context` methods prepare each transfer once. Preparation binds the
+request context, remote space, checked batch and owned local buffers with their
+layout through private read/write objects. The executor selects the transport through the
+`Socket` enum; `SocketTrait` only sends messages. Incoming reverse RPCs validate
+their own peer inputs. Empty batches follow the same preparation checks and then
+skip target checkout and I/O.
+
+Write-target checkout and `WriteReceipt` construction remain private to the
+core runtime. A receipt creates a `BufferReply<T>`, the return type shared by
+handlers and clients. It carries the application response and local destination
+availability; only the application response is serialized. Waiters retain source
+and target ownership through the request lifecycle. Inline writes hold a target's
+mutex for the complete batch and copy through its cached `BufferSet`. Read sources likewise
+cache their validated layouts. The memory crate supplies these synchronous
+operations without its own request registry or completion authority.
 
 RDMA transfers use READ in both directions: `remote_write` asks the client to
 read the server's source. Application reads validate the original waiter after

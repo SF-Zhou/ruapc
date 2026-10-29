@@ -7,6 +7,9 @@
 
 A Rust RPC library with a shared service API for TCP, WebSocket, HTTP and optional RDMA.
 
+RuaPC is under rapid development. **API stability is not guaranteed before the
+first stable release.**
+
 <img src="docs/logo.png" alt="RuaPC" width="256" height="256">
 
 - `#[service]` generates typed clients, server dispatch and OpenAPI schemas.
@@ -73,6 +76,10 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+The macro implements `EchoService` for `Client` and `ClientWithBuffers`.
+Handlers and clients use the same trait and declared return types. When a service
+is defined in another module, import its service trait at the call site.
+
 The default listener accepts TCP. Use `ListenMode::UNIFIED` to accept the other
 protocols, and select the outbound transport in the endpoint, for example
 `"ws://127.0.0.1:8000".parse::<Endpoint>()?`.
@@ -104,8 +111,9 @@ RuaPC's typed HTTP client uses an HTTP/2 stream that supports reverse RPC.
 
 Clients attach owned read sources and write destinations. Handlers address
 those buffers through logical `CopyOp` ranges, using RDMA READ or inline
-reverse RPC over the other transports. `WithBuffers<T>` pairs a response with
-recoverable client write buffers.
+reverse RPC over the other transports. Handlers return `BufferReply<T>` from a
+completed `WriteReceipt`; clients receive the same `BufferReply<T>` type with
+explicit destination-buffer availability.
 
 The [remote-memory guide](docs/remote-memory.md) shows a complete service and
 client call, buffer sizing and recovery. The [safety contract](docs/safe-boundaries.md)

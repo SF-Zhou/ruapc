@@ -1,5 +1,5 @@
 //! A well-formed service compiles: the trait keeps its methods, the router
-//! registration and the generated `Client` / `ClientWithBuffer` impls all
+//! registration and the generated `Client` / `ClientWithBuffers` impls all
 //! type-check.
 
 use std::sync::Arc;
@@ -30,6 +30,8 @@ fn main() {
     let mut router = ruapc::Router::default();
     Arc::new(GreeterImpl).ruapc_export(&mut router);
 
-    // The macro implements the trait for the RPC clients as well.
+    // Handlers and clients implement exactly the declared trait.
+    assert_impls_greeter::<GreeterImpl>();
     assert_impls_greeter::<ruapc::Client>();
+    assert_impls_greeter::<ruapc::ClientWithBuffers<'static>>();
 }

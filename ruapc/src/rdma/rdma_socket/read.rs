@@ -4,6 +4,7 @@
 use std::{sync::Arc, time::Instant};
 
 use ruapc_bufpool::RemoteBufferInfo;
+use ruapc_memory::{BufferSet, CopyBatch, SpaceLayout};
 use ruapc_rdma::{ReadCompletion, ReadFailure, ReadPosting, ReadRequest, ReadSegment};
 
 mod credits;
@@ -13,25 +14,21 @@ pub(super) use pending::PendingReads;
 
 use super::RdmaSocket;
 use crate::{
-    Buffer, Client, Context, CopyOp, Error, ErrorKind, RemoteIoError, RemoteSpace, Result,
-    remote_memory::{
-        WriteTarget,
-        scatter::{self, SpaceLayout},
-    },
-    services::{MemoryService, ReadIntoTargetRequest, RequestStatusRequest},
+    Buffer, Client, CopyOp, Error, ErrorKind, RemoteIoError, RemoteSpace, Result,
+    remote_memory::{WriteTarget, transfer::PreparedRead},
+    services::{MemoryService, RequestStatusRequest},
 };
 
 fn build_planned_reads(
-    regions: &[RemoteBufferInfo],
-    src_layout: &SpaceLayout,
+    source: &RemoteSpace<'_>,
     dst_layout: &SpaceLayout,
-    ops: &[CopyOp],
+    ops: &CopyBatch<'_>,
     max_sge: usize,
 ) -> Result<Vec<ReadRequest>> {
-    scatter::plan_chunks(src_layout, dst_layout, ops, max_sge.max(1))
+    ops.plan_chunks(source.layout(), dst_layout, max_sge.max(1))?
         .into_iter()
         .map(|chunk| {
-            let region = &regions[chunk.seg];
+            let region = &source.regions()[chunk.seg];
             let segments = chunk
                 .dst
                 .into_iter()
@@ -129,11 +126,11 @@ impl RdmaSocket {
         buffer: Buffer,
         request_deadline: Option<Instant>,
     ) -> Result<Buffer> {
-        let src = SpaceLayout::from_lens(regions.iter().map(|region| region.len))?;
+        let src = RemoteSpace::new(regions)?;
         let dst = SpaceLayout::from_lens([buffer.len() as u64])?;
         let ops = [CopyOp::new(0, 0, buffer.len() as u64)];
-        scatter::validate_ops(&ops, src.total(), dst.total())?;
-        let reads = build_planned_reads(regions, &src, &dst, &ops, self.queue_pair.gather_limit())?;
+        let batch = CopyBatch::new(&ops)?;
+        let reads = build_planned_reads(&src, &dst, &batch, self.queue_pair.gather_limit())?;
         let mut buffers = self
             .execute_reads(reads, vec![buffer], request_deadline)
             .await?;
@@ -270,62 +267,60 @@ impl RdmaSocket {
 
     pub(crate) async fn read_into_target(
         &self,
-        regions: &[RemoteBufferInfo],
-        src_layout: &SpaceLayout,
-        ops: &[CopyOp],
+        source: &RemoteSpace<'_>,
+        ops: &CopyBatch<'_>,
         target: Arc<WriteTarget>,
         request_deadline: Option<Instant>,
     ) -> Result<()> {
-        let planned = build_planned_reads(
-            regions,
-            src_layout,
-            target.layout(),
-            ops,
-            self.queue_pair.gather_limit(),
-        )?;
-        if planned.is_empty() {
+        ops.check_bounds(source.total_len(), target.total_len())?;
+        if ops.byte_count() == 0 {
             return Ok(());
         }
-        let buffers = target.take_for_read()?;
-        match self.execute_reads(planned, buffers, request_deadline).await {
+        let (planned, buffers) = target.checkout(|layout| {
+            build_planned_reads(source, layout, ops, self.queue_pair.gather_limit())
+        })?;
+        match self
+            .execute_reads(planned, buffers.into_buffers(), request_deadline)
+            .await
+        {
             Ok(buffers) => {
-                target.restore_after_read(buffers);
+                target.restore(BufferSet::try_new(buffers).expect("READ preserves buffer layout"));
                 Ok(())
             }
             Err(mut error) => {
-                if let Some(buffers) = error.take_buffers() {
-                    target.restore_after_read(buffers);
+                if let Some(buffers) = error.take_recovered_buffers() {
+                    target.restore(
+                        BufferSet::try_new(buffers).expect("READ preserves buffer layout"),
+                    );
                 }
                 Err(error.into())
             }
         }
     }
 
-    pub(super) async fn read_remote(
+    pub(crate) async fn read_remote(
         &self,
-        ctx: &Context,
-        ops: &[CopyOp],
-        local: Vec<Buffer>,
-        remote: &RemoteSpace<'_>,
+        prepared: PreparedRead<'_, '_>,
     ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
-        let layout = SpaceLayout::from_lens(local.iter().map(|buffer| buffer.len() as u64));
-        let planned = layout.and_then(|layout| {
-            build_planned_reads(
-                remote.regions(),
-                remote.layout(),
-                &layout,
-                ops,
-                self.queue_pair.gather_limit(),
-            )
-        });
-        let planned = match planned {
+        let transfer = prepared.into_parts();
+        let planned = match build_planned_reads(
+            &transfer.remote,
+            transfer.local.layout(),
+            &transfer.ops,
+            self.queue_pair.gather_limit(),
+        ) {
             Ok(planned) => planned,
-            Err(error) => return Err(RemoteIoError::new(error, Some(local))),
+            Err(error) => {
+                return Err(RemoteIoError::new(
+                    error,
+                    Some(transfer.local.into_buffers()),
+                ));
+            }
         };
-        if planned.is_empty() {
-            return Ok(local);
-        }
-        let local = self.execute_reads(planned, local, ctx.deadline).await?;
+        let ctx = transfer.ctx;
+        let local = self
+            .execute_reads(planned, transfer.local.into_buffers(), ctx.deadline)
+            .await?;
 
         // Validate after READ completion; see Context::remote_read for the
         // immutable-source and request-identity assumptions. Error destinations
@@ -348,41 +343,6 @@ impl RdmaSocket {
             ));
         }
         Ok(local)
-    }
-
-    pub(super) async fn write_remote(
-        &self,
-        ctx: &Context,
-        ops: &[CopyOp],
-        local: Vec<Buffer>,
-    ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
-        // Retain the source until the reverse RPC replies after client READs.
-        // Failure recovery still proves only local uniqueness; Context::remote_write
-        // documents the distinction from remote completion.
-        let req = ReadIntoTargetRequest {
-            request_id: ctx.msg_meta.msgid,
-            ops: ops.to_vec(),
-        };
-        let bytes = ops.iter().map(|op| op.len).sum();
-        let client = Client::default();
-        let mut source = client
-            .with_read_buffers(local)
-            .with_read_charge_bytes(bytes);
-        let result = source.read_into_target(ctx, &req).await;
-        let buffers = source.take_read_buffers();
-        match result {
-            Ok(()) => buffers.ok_or_else(|| {
-                RemoteIoError::new(
-                    Error::new(
-                        ErrorKind::BuffersInUse,
-                        "RDMA write completed while its source buffers still have active readers"
-                            .into(),
-                    ),
-                    None,
-                )
-            }),
-            Err(e) => Err(RemoteIoError::new(e, buffers)),
-        }
     }
 }
 

@@ -1,3 +1,4 @@
+use ruapc_memory::{BufferSetError, MemoryError, MemoryErrorKind};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -140,6 +141,16 @@ impl Error {
 
 impl std::error::Error for Error {}
 
+impl From<MemoryError> for Error {
+    fn from(value: MemoryError) -> Self {
+        let kind = match value.kind {
+            MemoryErrorKind::InvalidCopyOp => ErrorKind::InvalidCopyOp,
+            MemoryErrorKind::InvalidArgument => ErrorKind::InvalidArgument,
+        };
+        Self::new(kind, value.msg)
+    }
+}
+
 impl From<ErrorKind> for Error {
     fn from(kind: ErrorKind) -> Self {
         Self::kind(kind)
@@ -226,7 +237,7 @@ impl std::fmt::Display for Error {
     }
 }
 
-/// Error from a remote read/write operation.
+/// Error from a remote-memory attachment or read/write operation.
 ///
 /// Remote reads and writes consume local buffers. This error returns them
 /// when ownership is recoverable. `None` can mean an active reader or DMA
@@ -257,12 +268,12 @@ impl RemoteIoError {
 
     /// Returns the recovered local buffers, if any.
     #[must_use]
-    pub fn buffers(&self) -> Option<&[Buffer]> {
+    pub fn recovered_buffers(&self) -> Option<&[Buffer]> {
         self.buffers.as_deref()
     }
 
     /// Takes the recovered local buffers, if any.
-    pub fn take_buffers(&mut self) -> Option<Vec<Buffer>> {
+    pub fn take_recovered_buffers(&mut self) -> Option<Vec<Buffer>> {
         self.buffers.take()
     }
 
@@ -285,6 +296,13 @@ impl From<Error> for RemoteIoError {
             error,
             buffers: None,
         }
+    }
+}
+
+impl From<BufferSetError> for RemoteIoError {
+    fn from(error: BufferSetError) -> Self {
+        let (error, buffers) = error.into_parts();
+        Self::new(error.into(), Some(buffers))
     }
 }
 

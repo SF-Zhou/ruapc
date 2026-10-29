@@ -1,70 +1,7 @@
 //! Request-attached memory spaces and transfer validation.
 
-use super::scatter::{self, SpaceLayout};
-use crate::core::ContextEndpoint;
-use crate::{
-    Buffer, Context, CopyOp, Error, ErrorKind, RemoteIoError, Result, SentBuffers, Socket,
-    SocketTrait,
-};
-use ruapc_bufpool::RemoteBufferInfo;
-
-/// A read or write view of the remote peer's registered memory, built from
-/// the regions attached to the current request.
-///
-/// The regions form one logical contiguous space (in region order, each
-/// contributing its advertised length); [`CopyOp`] offsets address this
-/// space. Obtained via [`Context::remote_read_space`] /
-/// [`Context::remote_write_space`].
-#[derive(Debug)]
-pub struct RemoteSpace<'a> {
-    regions: &'a [RemoteBufferInfo],
-    layout: SpaceLayout,
-}
-
-impl<'a> RemoteSpace<'a> {
-    pub(crate) fn new(regions: &'a [RemoteBufferInfo]) -> Result<Self> {
-        for region in regions {
-            if region.addr.checked_add(region.len).is_none() {
-                return Err(Error::new(
-                    ErrorKind::InvalidCopyOp,
-                    "remote region addr + len overflows u64".into(),
-                ));
-            }
-        }
-        let layout = SpaceLayout::from_lens(regions.iter().map(|r| r.len))?;
-        Ok(Self { regions, layout })
-    }
-
-    /// Total length of the logical space in bytes.
-    #[must_use]
-    pub fn total_len(&self) -> u64 {
-        self.layout.total()
-    }
-
-    /// The raw regions composing the space, in order.
-    #[must_use]
-    pub fn regions(&self) -> &'a [RemoteBufferInfo] {
-        self.regions
-    }
-
-    /// Number of regions.
-    #[must_use]
-    pub fn region_count(&self) -> usize {
-        self.regions.len()
-    }
-
-    /// Only the RDMA read planner consumes the layout directly.
-    #[cfg_attr(not(feature = "rdma"), allow(dead_code))]
-    pub(crate) fn layout(&self) -> &SpaceLayout {
-        &self.layout
-    }
-}
-
-/// Builds the logical-space layout of a set of local buffers (each
-/// contributing its logical length).
-fn local_layout(buffers: &[Buffer]) -> Result<SpaceLayout> {
-    SpaceLayout::from_lens(buffers.iter().map(|b| b.len() as u64))
-}
+use super::{BufferAvailability, WriteReceipt, transfer};
+use crate::{Buffer, Context, CopyOp, Error, ErrorKind, RemoteIoError, RemoteSpace, Result};
 
 impl Context {
     /// Returns the *read space* the client attached to the current request
@@ -85,7 +22,7 @@ impl Context {
                     .into(),
             ));
         }
-        RemoteSpace::new(&self.msg_meta.read_regions)
+        Ok(RemoteSpace::new(&self.msg_meta.read_regions)?)
     }
 
     /// Returns the *write space* the client attached to the current request
@@ -106,7 +43,7 @@ impl Context {
                     .into(),
             ));
         }
-        RemoteSpace::new(&self.msg_meta.write_regions)
+        Ok(RemoteSpace::new(&self.msg_meta.write_regions)?)
     }
 
     /// Executes a batch of reads from the client's read space into `local`.
@@ -117,9 +54,9 @@ impl Context {
     /// (destination). Each [`CopyOp`] copies `len` bytes from
     /// `src_offset` (client space) to `dst_offset` (local space).
     ///
-    /// Nonempty transfers validate bounds, overflow, operation count, and
-    /// destination overlap before copying. An empty batch or one containing
-    /// only zero-length operations returns `local` without validation or I/O.
+    /// All transfers validate the connection, attached space, bounds, overflow,
+    /// operation count and destination overlap. An empty or zero-byte batch
+    /// returns `local` after validation without I/O.
     /// RDMA uses one-sided READs; TCP/WS/HTTP use a reverse inline-copy RPC.
     ///
     /// Returns the same buffers with the requested ranges filled. Failures
@@ -142,14 +79,7 @@ impl Context {
         ops: &[CopyOp],
         local: Vec<Buffer>,
     ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
-        if ops.iter().all(|op| op.len == 0) {
-            return Ok(local);
-        }
-        let (socket, space) = match self.prepare_transfer(ops, &local, Direction::Read) {
-            Ok(transfer) => transfer,
-            Err(error) => return Err(RemoteIoError::new(error, Some(local))),
-        };
-        socket.remote_read(self, ops, local, &space).await
+        transfer::read(self, ops, local).await
     }
 
     /// Reads the client's entire read space into freshly allocated
@@ -161,33 +91,11 @@ impl Context {
     /// lengths equal the transferred sizes; zero-length regions are
     /// skipped.
     pub async fn remote_read_all(&self) -> Result<Vec<Buffer>> {
-        let space = self.remote_read_space()?;
-        let total = space.total_len();
-        let mut local = Vec::new();
-        for region in space.regions() {
-            if region.len == 0 {
-                continue;
-            }
-            let mut buf = self
-                .state
-                .buffer_pool
-                .allocate(usize::try_from(region.len).map_err(|_| {
-                    Error::new(ErrorKind::InvalidArgument, "region too large".into())
-                })?)
-                .map_err(|e| Error::new(ErrorKind::InvalidArgument, e.to_string()))?;
-            buf.set_len(region.len as usize);
-            local.push(buf);
-        }
-        if total == 0 {
-            return Ok(local);
-        }
-        // The buffers are pool-allocated internally, so there is nothing
-        // for the caller to recover on failure: flatten to a plain Error.
-        Ok(self.remote_read(&[CopyOp::new(0, 0, total)], local).await?)
+        transfer::read_all(self).await
     }
 
     /// Executes a batch of writes from `local` into the client's write
-    /// space and returns a [`SentBuffers`](crate::SentBuffers) witness of
+    /// space and returns a [`WriteReceipt`](crate::WriteReceipt) witness of
     /// the completed transfer.
     ///
     /// Both sides are logical contiguous spaces: the concatenation of the
@@ -197,7 +105,7 @@ impl Context {
     /// copies `len` bytes from `src_offset` (local space) to `dst_offset`
     /// (client space).
     ///
-    /// Nonempty transfers validate bounds, overflow, operation count, and
+    /// All transfers validate the connection, attached space, bounds, overflow, operation count, and
     /// destination overlap within the batch. Callers coordinate writes across
     /// separate calls. RDMA uses a reverse RPC: the client READs `local` into
     /// owned destinations and replies after completion. The source is retained
@@ -208,92 +116,45 @@ impl Context {
     ///
     /// The transfer happens *here*, inside the handler, so its latency and
     /// errors are directly observable. Pair the witness with a response
-    /// value afterwards; several writes combine via
-    /// [`SentBuffers::merge`](crate::SentBuffers::merge):
+    /// value afterwards:
     ///
     /// ```rust,ignore
     /// let t0 = std::time::Instant::now();
     /// let sent = ctx.remote_write_all(bufs).await?;
-    /// Ok(sent.reply(Stats { push_micros: t0.elapsed().as_micros() as u64 }))
+    /// Ok(sent.into_reply(Stats { push_micros: t0.elapsed().as_micros() as u64 }))
     /// ```
     ///
-    /// An empty batch or one containing only zero-length operations returns
-    /// a witness without validation or I/O. Failures return recoverable local
-    /// buffers in [`RemoteIoError`].
+    /// An empty or zero-byte batch returns a receipt after validation without I/O.
+    /// A successful receipt records completion even if its source buffers cannot
+    /// currently be recovered. Failures return recoverable local buffers in
+    /// [`RemoteIoError`].
     pub async fn remote_write(
         &self,
         ops: &[CopyOp],
         local: Vec<Buffer>,
-    ) -> std::result::Result<SentBuffers, RemoteIoError> {
-        if ops.iter().all(|op| op.len == 0) {
-            return Ok(SentBuffers::new(local));
-        }
-        let (socket, _) = match self.prepare_transfer(ops, &local, Direction::Write) {
-            Ok(transfer) => transfer,
-            Err(error) => return Err(RemoteIoError::new(error, Some(local))),
-        };
-        let buffers = socket.remote_write(self, ops, local).await?;
-        Ok(SentBuffers::new(buffers))
+    ) -> std::result::Result<WriteReceipt, RemoteIoError> {
+        transfer::write(self, ops, local).await
     }
 
     /// Writes the entire logical content of `local` to the beginning of
     /// the client's write space (a single 1:1 [`CopyOp`]).
     ///
-    /// Zero total length (including an empty `local`) short-circuits
-    /// without touching the network.
+    /// Zero total length (including an empty `local`) skips I/O after validating
+    /// the connection and both memory spaces.
     pub async fn remote_write_all(
         &self,
         local: Vec<Buffer>,
-    ) -> std::result::Result<SentBuffers, RemoteIoError> {
-        let total = match local_layout(&local) {
-            Ok(layout) => layout.total(),
-            Err(e) => return Err(RemoteIoError::new(e, Some(local))),
-        };
-        if total == 0 {
-            return Ok(SentBuffers::new(local));
-        }
-        self.remote_write(&[CopyOp::new(0, 0, total)], local).await
+    ) -> std::result::Result<WriteReceipt, RemoteIoError> {
+        transfer::write_all(self, local).await
     }
 
-    /// All validation happens while the caller still owns `local`. Only a
-    /// prepared transfer may move those buffers into transport execution.
-    fn prepare_transfer(
-        &self,
-        ops: &[CopyOp],
-        local: &[Buffer],
-        direction: Direction,
-    ) -> Result<(&Socket, RemoteSpace<'_>)> {
-        let remote = match direction {
-            Direction::Read => self.remote_read_space()?,
-            Direction::Write => self.remote_write_space()?,
-        };
-        let local_len = local_layout(local)?.total();
-        let (src_len, dst_len) = match direction {
-            Direction::Read => (remote.total_len(), local_len),
-            Direction::Write => (local_len, remote.total_len()),
-        };
-        scatter::validate_ops(ops, src_len, dst_len)?;
-        let ContextEndpoint::Connected(socket) = &self.endpoint else {
-            return Err(Error::new(
-                ErrorKind::NotConnected,
-                "remote memory transfers require a connected handler context".into(),
-            ));
-        };
-        Ok((socket, remote))
-    }
-
-    /// Produces an empty [`SentBuffers`](crate::SentBuffers) witness for
+    /// Produces an empty [`WriteReceipt`](crate::WriteReceipt) witness for
     /// handler paths that have nothing to transfer, fulfilling a
-    /// `Result<WithBuffers<T>, E>` contract without touching the network.
+    /// `Result<BufferReply<T>, E>` contract without touching the network.
     #[must_use]
-    pub fn sent_nothing(&self) -> SentBuffers {
-        SentBuffers::new(Vec::new())
+    pub fn sent_nothing(&self) -> WriteReceipt {
+        WriteReceipt::new(BufferAvailability::Available(Vec::new()))
     }
-}
-
-enum Direction {
-    Read,
-    Write,
 }
 
 #[cfg(test)]

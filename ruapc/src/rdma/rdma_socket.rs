@@ -16,7 +16,7 @@ use tokio::sync::mpsc::Sender;
 
 use super::{RdmaBandwidthLimiter, RdmaPathInfo, RdmaState, SendPermit};
 use crate::{
-    Buffer, BufferPool, Context, CopyOp, Error, RemoteIoError, RemoteSpace, SocketTrait, State,
+    Buffer, BufferPool, Error, SocketTrait, State,
     error::{ErrorKind, Result},
     msg::MsgMeta,
     rdma::{
@@ -216,25 +216,6 @@ impl SocketTrait for Arc<RdmaSocket> {
             return Box::pin(self.send_large(meta, encoded, &request, state)).await;
         }
         self.send_buffer(meta, encoded, &request).await
-    }
-
-    async fn remote_read(
-        &self,
-        ctx: &Context,
-        ops: &[CopyOp],
-        local: Vec<Buffer>,
-        remote: &RemoteSpace<'_>,
-    ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
-        self.read_remote(ctx, ops, local, remote).await
-    }
-
-    async fn remote_write(
-        &self,
-        ctx: &Context,
-        ops: &[CopyOp],
-        local: Vec<Buffer>,
-    ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
-        self.write_remote(ctx, ops, local).await
     }
 }
 

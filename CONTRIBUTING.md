@@ -7,7 +7,8 @@ Read [DESIGN.md](DESIGN.md) for module boundaries and use the
 
 | Work | Requirements |
 |---|---|
-| Standalone schema and wire tests | Stable Rust; no RDMA libraries or device required |
+| Standalone schema tests | Stable Rust; no RDMA libraries or device required |
+| Standalone memory and wire tests or benchmarks | Stable Rust and a C compiler for the jemalloc dev-dependency; no RDMA libraries or device required |
 | Downstream TCP/WS/HTTP application | Stable Rust; RDMA disabled by default |
 | Workspace builds, tests and RPC benchmarks | Stable Rust, C compiler, `pkg-config`, libclang and libibverbs development files (`libibverbs-dev` on Debian/Ubuntu) |
 | Tests that open RDMA devices | Usable RDMA NIC or Soft-RoCE and sufficient locked-memory allowance |
@@ -18,17 +19,23 @@ requires libibverbs headers and a runtime library from rdma-core v32 or later.
 
 The core crate's self dev-dependency enables RDMA for its tests and benchmarks.
 Selecting a TCP test does not remove that build dependency. Stream-only demo
-tests and allocator, macro, schema and wire tests can run without an
+tests and allocator, memory, macro, schema and wire tests can run without an
 RDMA device:
 
 ```bash
 cargo test -p ruapc-bufpool -p ruapc-macro -p ruapc-schema
+cargo test -p ruapc-memory
 cargo test -p ruapc-wire
 cargo test -p ruapc-demo --no-default-features
 ```
 
 To check schema generation and OpenAPI projection without building
 the RPC runtime, run `cargo test -p ruapc-schema`.
+
+`cargo test -p ruapc-memory` covers logical-space validation, copy planning and
+immutable source copies without building the RPC runtime or verbs. Transfer
+execution, write-target recovery and completion witnesses remain covered by
+the core and RDMA tests.
 
 `cargo test -p ruapc-wire --all-features` covers message codecs, direct buffer
 serialization and pure RDMA framing without the RDMA build prerequisites.
@@ -53,7 +60,8 @@ the all-feature workspace checks exercise the libibverbs backend.
 
 Run formatting and Clippy before committing. PRs target `main`, and all CI
 checks must pass before merging. [CI](.github/workflows/rust.yml) runs formatting,
-release Clippy and coverage on Linux x86-64 and ARM64 with Soft-RoCE.
+release Clippy and coverage on Linux x86-64 and ARM64 with Soft-RoCE, plus
+standalone memory tests, Clippy and rustdoc without RDMA setup.
 
 Prefer file-level imports over inline absolute paths: import the item once
 (`use crate::module::Item;`) and refer to `Item` in the body rather than
@@ -94,9 +102,9 @@ create one. With physical RDMA hardware, omit that environment variable.
 - Documentation changes belong in the [owning guide](docs/README.md#maintaining-the-docs).
   Keep examples, links and public API descriptions consistent with the code.
 
-Release tags publish bufpool, macro, schema, RDMA, wire and core in dependency
-order through [the release workflow](.github/workflows/release.yml). The demo is
-not published.
+Release tags publish bufpool, memory, macro, schema, RDMA, wire and core in
+dependency order through [the release workflow](.github/workflows/release.yml).
+The demo is not published.
 
 <a id="license"></a>
 

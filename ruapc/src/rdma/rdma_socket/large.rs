@@ -8,6 +8,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use ruapc_memory::SpaceLayout;
 use ruapc_wire::frame::{HEADER_LEN, MAX_MSG_SIZE};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -16,7 +17,6 @@ use crate::{
     Buffer, BufferPool, Error, ErrorKind, Message, MsgFlags, MsgMeta, Result, Socket, State,
     metrics::MethodCall,
     rdma::rdma_service::{FinishPayloadRequest, LargePayloadOffer},
-    remote_memory::scatter::SpaceLayout,
     sockets::{SendRequest, reserve_send},
 };
 

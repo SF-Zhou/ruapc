@@ -3,7 +3,7 @@ mod common;
 use std::{process::Output, sync::Arc};
 
 use common::{TEST_TIMEOUT, TestServer, config};
-use ruapc::{Context, Result, Router, Server, WithBuffers};
+use ruapc::{BufferReply, Context, Result, Router, Server};
 use ruapc_demo::{EchoService, MemBenchService, ReadCrcReq, Request, WriteCrcReq};
 use tokio::{process::Command, time::timeout};
 
@@ -139,8 +139,8 @@ impl MemBenchService for CorruptService {
     async fn read_crc(&self, _: &Context, _: &ReadCrcReq) -> Result<u32> {
         Ok(1)
     }
-    async fn write_crc(&self, ctx: &Context, _: &WriteCrcReq) -> Result<WithBuffers<u32>> {
-        Ok(ctx.sent_nothing().reply(1))
+    async fn write_crc(&self, ctx: &Context, _: &WriteCrcReq) -> Result<BufferReply<u32>> {
+        Ok(ctx.sent_nothing().into_reply(1))
     }
 }
 

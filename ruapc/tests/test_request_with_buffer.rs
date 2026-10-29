@@ -103,7 +103,7 @@ async fn test_upload_with_read_buffer_tcp() {
     let req = UploadReq {};
 
     // Move the source into a wrapper that can reuse it across requests.
-    let mut source = client.with_read_buffer(buf);
+    let mut source = client.with_read_buffer(buf).unwrap();
     let rsp: UploadRsp = source.upload(&ctx, &req).await.unwrap();
     assert_eq!(rsp.data, test_data);
 
@@ -113,6 +113,7 @@ async fn test_upload_with_read_buffer_tcp() {
     assert_eq!(&source.read_buffers()[0][..], test_data);
     let recovered = source
         .take_read_buffers()
+        .into_available()
         .expect("completed reads release the source for reuse");
     assert_eq!(&recovered[0][..], test_data);
     assert!(source.read_buffers().is_empty());
@@ -155,6 +156,7 @@ async fn test_upload_with_read_buffer_websocket() {
 
     let rsp: UploadRsp = client
         .with_read_buffer(buf)
+        .unwrap()
         .upload(&ctx, &req)
         .await
         .unwrap();
@@ -192,6 +194,7 @@ async fn test_upload_with_read_buffer_http() {
 
     let rsp: UploadRsp = client
         .with_read_buffer(buf)
+        .unwrap()
         .upload(&ctx, &req)
         .await
         .unwrap();
