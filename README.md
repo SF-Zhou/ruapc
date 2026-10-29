@@ -7,6 +7,9 @@
 
 A Rust RPC library with a shared service API for TCP, WebSocket, HTTP and optional RDMA.
 
+RuaPC is under rapid development. **API stability is not guaranteed before the
+first stable release.**
+
 <img src="docs/logo.png" alt="RuaPC" width="256" height="256">
 
 - `#[service]` generates typed clients, server dispatch and OpenAPI schemas.

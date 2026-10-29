@@ -7,6 +7,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 ## [Unreleased]
 
 ### Added
+- `ruapc-memory` provides logical spaces, copy validation and planning,
+  synchronous CPU gather/scatter, and immutable read sources without the RPC
+  runtime, an async executor or verbs. `CopyBatch` reuses structural validation;
+  `BufferSet` caches checked buffer layouts. Memory errors are converted to RPC
+  errors by `ruapc`, which retains transfer execution and completion witnesses.
+  See the [memory crate guide](ruapc-memory/README.md).
+- Standalone memory planning and CPU-copy benchmarks cover fragmented spaces,
+  reusable batches, cached layouts and inline-write receiver copies.
 - `ruapc-wire` provides message metadata, payload codecs, direct serialization,
   and shared transport framing independently of the RPC runtime and verbs.
   It reports `CodecError`; `ruapc` retains its owned message/payload APIs and
@@ -22,6 +30,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   APIs.
 
 ### Changed
+- **BREAKING**: `SentBuffers`, `WithBuffers<T>` and `ResultWithBuffers<T>`
+  are replaced by `WriteReceipt`, `BufferReply<T>` and `ResultBufferReply<T>`.
+  `Context::remote_write`, `remote_write_all` and `sent_nothing` return receipts;
+  use `into_reply` instead of `reply`, and `source_buffers` / `take_sources`
+  instead of `buffers` / `take_buffers`. Replies expose `response()` instead
+  of `rsp()`. Handlers, `Client` and `ClientWithBuffers` share the declared
+  result type through static response dispatch, including aliases and custom
+  errors. Only the application response is serialized. See the
+  [remote-memory guide](docs/remote-memory.md).
+- **BREAKING**: `ClientWithBuffers::take_read_buffers` and `take_write_buffers`
+  return `BufferAvailability` instead of `Option<Vec<Buffer>>`.
+  `BufferReply::destinations()` reports this state, and `into_parts()` returns
+  `(T, BufferAvailability)`. `NotAttached`, `Available(Vec<Buffer>)` and
+  `Unavailable` distinguish missing attachments, recoverable sets (including
+  explicitly attached empty sets), and unavailable memory. Transfer success
+  is separate from local buffer availability.
+- **BREAKING**: `with_read_buffer` and `with_read_buffers` on `Client` and
+  `ClientWithBuffers` validate attachments immediately and return
+  `Result<_, RemoteIoError>`. Errors retain the supplied buffers; a failed
+  consuming replacement releases the wrapper's previous attachments.
+- **BREAKING**: `RemoteIoError::buffers` and `take_buffers` are renamed to
+  `recovered_buffers` and `take_recovered_buffers`; their return types remain
+  `Option`.
+- **BREAKING**: Empty and all-zero remote-memory transfers now validate the
+  connected context, attached spaces, layouts and operation limits before
+  skipping checkout and I/O. Use `ctx.sent_nothing().into_reply(value)` for an
+  intentional no-transfer reply that does not access remote memory.
+- `CopyOp`, `RemoteSpace` and the region/operation limits move to `ruapc-memory`
+  and remain re-exported by `ruapc`. `CopyOp::schema_id()` now uses the
+  `ruapc_memory` module prefix; its schema name and wire fields are unchanged.
+- Remote-memory execution reuses checked batches and cached layouts. Read
+  bandwidth charges are resolved once per request and reused across retries;
+  RDMA write-target planning and checkout use one mutex guard, preserving
+  the complete target when planning fails.
 - **BREAKING**: RDMA uses the shared `frame` format and `RdmaService/offer`
   and `RdmaService/finish` RPCs instead of private large-payload control frames.
   Connection bootstrap, payload transfer and health probes share `RdmaService`;
@@ -58,6 +100,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   [benchmark guide](docs/benchmark.md#allocator).
 
 ### Removed
+- **BREAKING**: `SentBuffers::merge` and `WithBuffers::into_buffers`. Use
+  `WriteReceipt::take_sources` to recover sources from each receipt and
+  `reply.into_parts().1.into_available()` to extract available
+  destinations.
+- **BREAKING**: `SocketTrait::remote_read` and `SocketTrait::remote_write`.
+  Execute transfers through the corresponding `Context` methods.
 - **BREAKING**: `ReflectionService`, its `_ruapc.meta/describe` and
   `_ruapc.meta/openapi` RPCs, reflection data types and the `ruapc_info` binary.
   Query `/openapi.json` through an HTTP or unified listener for service schemas.
