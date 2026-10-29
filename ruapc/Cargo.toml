@@ -20,6 +20,7 @@ default = []
 # crates must be paired exactly (same reason serde pins serde_derive).
 ruapc-macro.workspace = true
 ruapc-bufpool.workspace = true
+ruapc-memory.workspace = true
 ruapc-rdma = { workspace = true, optional = true }
 ruapc-schema.workspace = true
 ruapc-wire.workspace = true

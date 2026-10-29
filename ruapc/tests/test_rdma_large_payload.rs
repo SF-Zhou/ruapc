@@ -8,7 +8,7 @@ use std::sync::{
 use std::time::Duration;
 
 use ruapc::{
-    Buffer, Client, Context, Endpoint, ErrorKind, ListenMode, Result, ResultWithBuffers, Router,
+    Buffer, Client, Context, Endpoint, ErrorKind, ListenMode, Result, ResultBufferReply, Router,
     Server, SocketPoolConfig, Transport,
 };
 use schemars::JsonSchema;
@@ -73,7 +73,7 @@ trait LargePayloadService {
     async fn upload(&self, ctx: &Context, req: &Blob) -> Result<Digest>;
     async fn download(&self, ctx: &Context, req: &Download) -> Result<Blob>;
     async fn echo(&self, ctx: &Context, req: &Blob) -> Result<Blob>;
-    async fn exchange_attached(&self, ctx: &Context, req: &Blob) -> ResultWithBuffers<Blob>;
+    async fn exchange_attached(&self, ctx: &Context, req: &Blob) -> ResultBufferReply<Blob>;
     async fn callback(&self, ctx: &Context, req: &Blob) -> Result<Blob>;
     async fn hold(&self, ctx: &Context, req: &Blob) -> Result<Blob>;
 }
@@ -102,7 +102,7 @@ impl LargePayloadService for LargePayloadServiceImpl {
         Ok(req.clone())
     }
 
-    async fn exchange_attached(&self, ctx: &Context, req: &Blob) -> ResultWithBuffers<Blob> {
+    async fn exchange_attached(&self, ctx: &Context, req: &Blob) -> ResultBufferReply<Blob> {
         // Transport payload regions must never replace application regions.
         assert_eq!(ctx.msg_meta.read_regions.len(), 2);
         assert_eq!(ctx.msg_meta.write_regions.len(), 2);
@@ -114,7 +114,7 @@ impl LargePayloadService for LargePayloadServiceImpl {
         source[..data.len()].copy_from_slice(&data);
         source.set_len(data.len());
         let sent = ctx.remote_write_all(vec![source]).await?;
-        Ok(sent.reply(req.clone()))
+        Ok(sent.into_reply(req.clone()))
     }
 
     async fn callback(&self, ctx: &Context, req: &Blob) -> Result<Blob> {
@@ -258,12 +258,14 @@ async fn payload_with_attachments(use_msgpack: bool) {
         .collect();
     let mut wrapper = client
         .with_read_buffers(sources)
+        .unwrap()
         .with_write_buffers(destinations);
     let (response, buffers) = wrapper
         .exchange_attached(&ctx, &request)
         .await
         .unwrap()
         .into_parts();
+    let buffers = buffers.into_available().expect("destinations available");
     assert_eq!(response, request);
     assert_eq!(buffers.len(), 2);
     assert_eq!(
@@ -272,6 +274,7 @@ async fn payload_with_attachments(use_msgpack: bool) {
     );
     let recovered = wrapper
         .take_read_buffers()
+        .into_available()
         .expect("completed application READs release the attachment owner");
     assert_eq!(flatten(&recovered), attachment);
     drop(wrapper);

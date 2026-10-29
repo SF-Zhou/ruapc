@@ -21,6 +21,7 @@ jobs:
         sudo apt install -y pkg-config libibverbs-dev ibverbs-utils
         # Publish in dependency order. Any failure fails the release.
         cargo publish -p ruapc-bufpool
+        cargo publish -p ruapc-memory
         cargo publish -p ruapc-macro
         cargo publish -p ruapc-schema
         cargo publish -p ruapc-rdma

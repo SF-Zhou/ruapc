@@ -1,5 +1,5 @@
 [workspace]
-members = ["ruapc", "ruapc-bufpool", "ruapc-demo", "ruapc-macro", "ruapc-rdma", "ruapc-schema", "ruapc-wire"]
+members = ["ruapc", "ruapc-bufpool", "ruapc-demo", "ruapc-macro", "ruapc-memory", "ruapc-rdma", "ruapc-schema", "ruapc-wire"]
 resolver = "2"
 
 [workspace.package]
@@ -51,6 +51,7 @@ rmp-serde = "1.3"
 ruapc = { version = "=0.2.0-alpha.7", path = "ruapc" }
 ruapc-bufpool = { version = "=0.2.0-alpha.7", path = "ruapc-bufpool" }
 ruapc-macro = { version = "=0.2.0-alpha.7", path = "ruapc-macro" }
+ruapc-memory = { version = "=0.2.0-alpha.7", path = "ruapc-memory" }
 ruapc-rdma = { version = "=0.2.0-alpha.7", path = "ruapc-rdma" }
 ruapc-schema = { version = "=0.2.0-alpha.7", path = "ruapc-schema" }
 ruapc-wire = { version = "=0.2.0-alpha.7", path = "ruapc-wire" }

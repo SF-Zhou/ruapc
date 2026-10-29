@@ -62,7 +62,7 @@ returns an RPC error. Unary HTTP also lacks the reverse-RPC stream used by the
 remote-memory API.
 
 Inline byte fields use MessagePack `bin` encoding. The request layouts and
-validation handlers are in [memory_service.rs](../ruapc/src/services/memory_service.rs).
+validation handlers are in [rpc_transfer.rs](../ruapc/src/remote_memory/rpc_transfer.rs).
 For the meaning of a successful READ, waiter membership, error-buffer contents,
 and source recovery, see
 [read validation and recovery](safe-boundaries.md#application-read-source-validation-and-recovery).

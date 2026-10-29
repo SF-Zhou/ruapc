@@ -129,7 +129,7 @@ impl RemoteReadService for RemoteReadServiceImpl {
             Err(mut e) => {
                 // The consumed buffers must be recoverable on this
                 // validation-failure path.
-                if e.take_buffers().is_none() {
+                if e.take_recovered_buffers().is_none() {
                     return Err(Error::new(
                         ErrorKind::InvalidArgument,
                         "buffers not recovered from RemoteIoError".into(),
@@ -213,7 +213,7 @@ async fn run_test(tc: TestCase) {
         delay_ms: tc.delay_ms,
     };
 
-    let c = client.with_read_buffers(bufs);
+    let c = client.with_read_buffers(bufs).unwrap();
     let result: Result<ReadRsp> = match tc.method {
         Method::All => c.read_all(&ctx, &req).await,
         Method::Swapped => c.read_swapped(&ctx, &req).await,

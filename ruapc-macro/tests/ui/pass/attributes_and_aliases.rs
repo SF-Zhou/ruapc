@@ -45,7 +45,12 @@ impl ConditionalService for Handler {
     }
 }
 
+fn assert_service<T: ConditionalService>() {}
+
 fn main() {
+    assert_service::<Handler>();
+    assert_service::<ruapc::Client>();
+    assert_service::<ruapc::ClientWithBuffers<'static>>();
     let mut router = ruapc::Router::default();
     Arc::new(Handler).ruapc_export(&mut router);
     assert_eq!(

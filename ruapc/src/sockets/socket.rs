@@ -5,13 +5,7 @@ use serde::Serialize;
 
 #[cfg(feature = "rdma")]
 use crate::rdma::RdmaSocket;
-use crate::{
-    Buffer, Context, CopyOp, Error, ErrorKind, MsgMeta, RemoteIoError, RemoteSpace, Result, State,
-    http::HttpSocket,
-    remote_memory::{WriteTarget, inline, scatter::SpaceLayout},
-    tcp::TcpSocket,
-    ws::WebSocket,
-};
+use crate::{MsgMeta, Result, State, http::HttpSocket, tcp::TcpSocket, ws::WebSocket};
 
 /// Socket abstraction supporting multiple transport protocols.
 ///
@@ -82,27 +76,6 @@ pub trait SocketTrait {
         payload: &P,
         state: &Arc<State>,
     ) -> Result<()>;
-
-    /// Reads from the remote space; stream transports use reverse RPCs.
-    async fn remote_read(
-        &self,
-        ctx: &Context,
-        ops: &[CopyOp],
-        local: Vec<Buffer>,
-        remote: &RemoteSpace<'_>,
-    ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
-        inline::read(ctx, ops, local, remote).await
-    }
-
-    /// Writes to the remote space; RDMA overrides this with client-side READ.
-    async fn remote_write(
-        &self,
-        ctx: &Context,
-        ops: &[CopyOp],
-        local: Vec<Buffer>,
-    ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
-        inline::write(ctx, ops, local).await
-    }
 }
 
 impl Socket {
@@ -114,32 +87,6 @@ impl Socket {
             }
             #[cfg(feature = "rdma")]
             Socket::RDMA(rdma_socket) => rdma_socket.queue_pair.device_index,
-        }
-    }
-
-    /// Executes the client side of `MemoryService/read_into_target`: RDMA
-    /// READs from the peer's advertised regions into the request's pinned
-    /// write target. Only meaningful on RDMA connections.
-    #[allow(unused_variables)]
-    pub(crate) async fn read_into_target(
-        &self,
-        regions: &[ruapc_bufpool::RemoteBufferInfo],
-        src_layout: &SpaceLayout,
-        ops: &[CopyOp],
-        target: std::sync::Arc<WriteTarget>,
-        request_deadline: Option<std::time::Instant>,
-    ) -> Result<()> {
-        match self {
-            #[cfg(feature = "rdma")]
-            Socket::RDMA(rdma_socket) => {
-                rdma_socket
-                    .read_into_target(regions, src_layout, ops, target, request_deadline)
-                    .await
-            }
-            _ => Err(Error::new(
-                ErrorKind::InvalidArgument,
-                "read_into_target requires RDMA (other transports use write_inline)".into(),
-            )),
         }
     }
 }
@@ -157,37 +104,6 @@ impl SocketTrait for Socket {
             Socket::HTTP(http_socket) => http_socket.send(meta, payload, state).await,
             #[cfg(feature = "rdma")]
             Socket::RDMA(rdma_socket) => rdma_socket.send(meta, payload, state).await,
-        }
-    }
-
-    async fn remote_read(
-        &self,
-        ctx: &Context,
-        ops: &[CopyOp],
-        local: Vec<Buffer>,
-        remote: &RemoteSpace<'_>,
-    ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
-        match self {
-            Socket::TCP(_) | Socket::WS(_) | Socket::HTTP(_) => {
-                inline::read(ctx, ops, local, remote).await
-            }
-            #[cfg(feature = "rdma")]
-            Socket::RDMA(rdma_socket) => rdma_socket.remote_read(ctx, ops, local, remote).await,
-        }
-    }
-
-    async fn remote_write(
-        &self,
-        ctx: &Context,
-        ops: &[CopyOp],
-        local: Vec<Buffer>,
-    ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
-        match self {
-            Socket::TCP(_) | Socket::WS(_) | Socket::HTTP(_) => {
-                inline::write(ctx, ops, local).await
-            }
-            #[cfg(feature = "rdma")]
-            Socket::RDMA(rdma_socket) => rdma_socket.remote_write(ctx, ops, local).await,
         }
     }
 }

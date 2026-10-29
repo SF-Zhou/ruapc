@@ -4,7 +4,6 @@
 //! RDMA bootstrap and connection probe services are also registered when
 //! that feature is enabled.
 
-mod memory_service;
-pub(crate) use memory_service::{MemoryService, ReadInlineRequest, WriteInlineRequest};
+pub(crate) use crate::remote_memory::rpc_transfer::MemoryService;
 #[cfg(feature = "rdma")]
-pub(crate) use memory_service::{ReadIntoTargetRequest, RequestStatusRequest};
+pub(crate) use crate::remote_memory::rpc_transfer::RequestStatusRequest;

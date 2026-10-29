@@ -1,12 +1,16 @@
 mod attempt;
 mod call;
-pub use call::{CallPlain, CallWithBuffer, RawCall, RpcCall};
+pub use call::{RawCall, ResponseContract};
 mod with_buffers;
 
 pub use with_buffers::ClientWithBuffers;
 
-use crate::Buffer;
+#[cfg(feature = "rdma")]
+use crate::remote_memory::ReadSource;
+use crate::{Buffer, RemoteIoError};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "rdma")]
+use std::sync::Arc;
 use std::time::Duration;
 
 mod request;
@@ -66,9 +70,14 @@ impl Default for Client {
 }
 
 impl Client {
+    #[cfg(feature = "rdma")]
+    pub(crate) fn with_read_source(&self, source: Arc<ReadSource>) -> ClientWithBuffers<'_> {
+        ClientWithBuffers::from_read_source(self, source)
+    }
+
     /// Creates a [`ClientWithBuffers`] wrapper attaching one *read* buffer
     /// to requests; see [`with_read_buffers`](Self::with_read_buffers).
-    pub fn with_read_buffer(&self, buffer: Buffer) -> ClientWithBuffers<'_> {
+    pub fn with_read_buffer(&self, buffer: Buffer) -> Result<ClientWithBuffers<'_>, RemoteIoError> {
         ClientWithBuffers::new(self).with_read_buffer(buffer)
     }
 
@@ -84,13 +93,17 @@ impl Client {
     /// it when locally unique; this does not prove remote DMA completion.
     /// See [`Context::remote_read`](crate::Context::remote_read) for RDMA
     /// validation and recovery limits.
+    /// Invalid attachments return their original buffers in [`RemoteIoError`].
     ///
     /// # Examples
     ///
     /// ```rust,ignore
-    /// let rsp = client.with_read_buffers(bufs).upload(&ctx, &req).await?;
+    /// let rsp = client.with_read_buffers(bufs)?.upload(&ctx, &req).await?;
     /// ```
-    pub fn with_read_buffers(&self, buffers: Vec<Buffer>) -> ClientWithBuffers<'_> {
+    pub fn with_read_buffers(
+        &self,
+        buffers: Vec<Buffer>,
+    ) -> Result<ClientWithBuffers<'_>, RemoteIoError> {
         ClientWithBuffers::new(self).with_read_buffers(buffers)
     }
 
@@ -103,7 +116,7 @@ impl Client {
     /// The next call consumes the set; in-flight RDMA retains destination
     /// ownership even if that call times out or is cancelled.
     ///
-    /// A `Result<WithBuffers<T>, E>` response returns the buffers when the
+    /// A `Result<BufferReply<T>, E>` response returns the buffers when the
     /// target is available and uniquely held. After failure, recover any
     /// available set with [`ClientWithBuffers::take_write_buffers`].
     ///

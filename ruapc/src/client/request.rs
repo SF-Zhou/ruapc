@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::{
-    Buffer, Context, MAX_REGIONS, Receiver, SocketTrait,
+    Buffer, BufferAvailability, Context, Receiver, SocketTrait,
     core::ContextEndpoint,
     error::{Error, ErrorKind},
     msg::{MsgFlags, MsgMeta},
@@ -22,22 +22,20 @@ use super::Client;
 #[derive(Clone, Copy)]
 pub(crate) struct ReadAttachment<'a> {
     source: Option<&'a Arc<ReadSource>>,
-    charge_bytes: Option<u64>,
+    charge_bytes: u64,
 }
 
 impl<'a> ReadAttachment<'a> {
-    pub(crate) const fn new(
-        source: Option<&'a Arc<ReadSource>>,
-        charge_bytes: Option<u64>,
-    ) -> Self {
+    pub(crate) fn new(source: Option<&'a Arc<ReadSource>>, charge_bytes: Option<u64>) -> Self {
         Self {
             source,
-            charge_bytes,
+            charge_bytes: charge_bytes
+                .unwrap_or_else(|| source.map_or(0, |source| source.layout().total())),
         }
     }
 
     fn buffers(self) -> &'a [Buffer] {
-        self.source.map_or(&[], |source| source.buffers.as_slice())
+        self.source.map_or(&[], |source| source.buffers())
     }
 }
 
@@ -51,7 +49,7 @@ impl Client {
         req: &Req,
         read_attachment: ReadAttachment<'_>,
         write_target: &mut Option<Arc<WriteTarget>>,
-        write_buffers_slot: Option<&mut Vec<Buffer>>,
+        write_buffers_slot: Option<&mut BufferAvailability>,
         method_name: &str,
     ) -> std::result::Result<Rsp, E>
     where
@@ -82,7 +80,7 @@ impl Client {
         req: &Req,
         read_attachment: ReadAttachment<'_>,
         write_target: &mut Option<Arc<WriteTarget>>,
-        write_buffers_slot: Option<&mut Vec<Buffer>>,
+        write_buffers_slot: Option<&mut BufferAvailability>,
         method_name: &str,
     ) -> std::result::Result<Rsp, E>
     where
@@ -94,17 +92,6 @@ impl Client {
             return Err(Error::new(
                 ErrorKind::Timeout,
                 "request deadline already expired".to_string(),
-            )
-            .into());
-        }
-
-        if read_attachment.buffers().len() > MAX_REGIONS {
-            return Err(Error::new(
-                ErrorKind::InvalidCopyOp,
-                format!(
-                    "too many read buffers: {} (limit {MAX_REGIONS})",
-                    read_attachment.buffers().len()
-                ),
             )
             .into());
         }
@@ -123,11 +110,13 @@ impl Client {
         let (response, returned_target) = sent.receiver.recv().await?;
         // Drop our clone before trying to recover the target. A handler still
         // holding it, or DMA still owning its buffers, prevents recovery.
-        drop(write_target.take());
+        let had_attachment = write_target.take().is_some();
         if let Some(slot) = write_buffers_slot {
-            *slot = returned_target
-                .and_then(WriteTarget::try_into_buffers)
-                .unwrap_or_default();
+            *slot = match returned_target.and_then(WriteTarget::try_into_buffers) {
+                Some(buffers) => BufferAvailability::Available(buffers),
+                None if had_attachment => BufferAvailability::Unavailable,
+                None => BufferAvailability::NotAttached,
+            };
         }
         response.payload.deserialize(&response.meta)?
     }
@@ -237,9 +226,7 @@ impl Client {
 
         let (read_regions, write_regions) =
             export_attached_regions(&socket, &ctx.state, read_attachment.buffers(), write_target)?;
-        let read_bytes = read_attachment
-            .charge_bytes
-            .unwrap_or_else(|| read_regions.iter().map(|region| region.len).sum::<u64>());
+        let read_bytes = read_attachment.charge_bytes;
         if let Err(err) = socket
             .reserve_rdma_send_bandwidth(read_bytes, Some(response_deadline))
             .await
@@ -304,11 +291,41 @@ mod tests {
     use super::*;
     use crate::{Socket, SocketPoolConfig, tcp::TcpSocket};
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use ruapc_bufpool::{BufferPool, EmptyDevices};
     use std::{
         future::Future,
         task::{Context as TaskContext, Poll, Waker},
         time::Duration,
     };
+
+    #[test]
+    fn read_bandwidth_charge_uses_logical_lengths_unless_overridden() {
+        let pool = BufferPool::new(Arc::new(EmptyDevices));
+        let buffers = [4, 0, 7]
+            .into_iter()
+            .map(|len| {
+                let mut buffer = pool.allocate(64).unwrap();
+                buffer.set_len(len);
+                buffer
+            })
+            .collect();
+        let source = Arc::new(ReadSource::try_new(buffers).unwrap());
+        let empty = Arc::new(ReadSource::try_new(Vec::new()).unwrap());
+
+        for (source, charge_bytes, expected) in [
+            (None, None, 0),
+            (Some(&empty), None, 0),
+            (Some(&source), None, 11),
+            (Some(&source), Some(3), 3),
+            (Some(&source), Some(0), 0),
+            (None, Some(3), 3),
+        ] {
+            assert_eq!(
+                ReadAttachment::new(source, charge_bytes).charge_bytes,
+                expected
+            );
+        }
+    }
 
     fn connected_context(sender: tokio::sync::mpsc::Sender<bytes::Bytes>) -> Context {
         let config = SocketPoolConfig {
@@ -335,9 +352,7 @@ mod tests {
         let mut buffer = ctx.state.buffer_pool.allocate(4).unwrap();
         buffer.set_len(4);
         buffer.copy_from_slice(b"read");
-        let source = Arc::new(ReadSource {
-            buffers: vec![buffer],
-        });
+        let source = Arc::new(ReadSource::try_new(vec![buffer]).unwrap());
         let client = Client {
             max_retries: 2,
             ..Default::default()
@@ -360,7 +375,7 @@ mod tests {
         let (next_id, _receiver) = ctx.state.waiter.alloc(Duration::from_secs(1));
         assert_eq!(next_id, 3, "two retries permit exactly three send attempts");
         let source = Arc::try_unwrap(source).expect("failed attempts must release their source");
-        assert_eq!(&source.buffers[0][..], b"read");
+        assert_eq!(&source.buffers()[0][..], b"read");
     }
 
     #[tokio::test]

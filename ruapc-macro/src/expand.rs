@@ -100,9 +100,7 @@ fn client_method(method: &Method, krate: &TokenStream) -> TokenStream {
         #(#attrs)*
         #signature {
             async move {
-                use #krate::{CallPlain as _, CallWithBuffer as _};
-                (&#krate::RpcCall::<#response>::new())
-                    .ruapc_call(self, #ctx, #req, #wire_name)
+                <#response as #krate::ResponseContract>::call(self, #ctx, #req, #wire_name)
                     .await
             }
         }

@@ -142,7 +142,7 @@ impl<'a> Workload<'a> {
                 fill_pattern(&mut buffer, seed);
                 let expected_crc = crc32c_of([&buffer]);
                 Operation::Read {
-                    source: client.with_read_buffer(buffer),
+                    source: client.with_read_buffer(buffer)?,
                     expected_crc,
                 }
             }
@@ -182,6 +182,12 @@ impl<'a> Workload<'a> {
                 match call.write_crc(ctx, &WriteCrcReq { len: *len }).await {
                     Ok(response) => {
                         let (expected_crc, returned) = response.into_parts();
+                        let returned = returned.into_available().ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::BuffersInUse,
+                                "completed write destinations unavailable".into(),
+                            )
+                        })?;
                         let received_len: usize = returned.iter().map(|buffer| buffer.len()).sum();
                         let crc = crc32c_of(&returned);
                         *buffers = Some(returned);
@@ -196,7 +202,7 @@ impl<'a> Workload<'a> {
                     Err(error) => {
                         // A failed transfer may leave the target empty even
                         // after DMA settles. Allocate replacements if needed.
-                        *buffers = call.take_write_buffers();
+                        *buffers = call.take_write_buffers().into_available();
                         Err(error)
                     }
                 }

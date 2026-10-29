@@ -167,7 +167,7 @@ impl Fixture {
             ..Default::default()
         };
         let mut attached = match operation {
-            Operation::Read => client.with_read_buffer(buffer(&self.client.state)),
+            Operation::Read => client.with_read_buffer(buffer(&self.client.state)).unwrap(),
             Operation::Write => client.with_write_buffers(vec![buffer(&self.client.state)]),
         };
         // Keep the read source wrapper alive until both observations settle.
@@ -207,8 +207,8 @@ impl Fixture {
         assert_eq!(self.server.state().waiter.pending_count(), 0);
         assert_eq!(self.client.state.waiter.pending_count(), 0);
         let recovered = match operation {
-            Operation::Read => attached.take_read_buffers(),
-            Operation::Write => attached.take_write_buffers(),
+            Operation::Read => attached.take_read_buffers().into_available(),
+            Operation::Write => attached.take_write_buffers().into_available(),
         }
         .expect("no DMA or inline copy remains after the injected reverse-RPC fault");
         assert_eq!(recovered.len(), 1);

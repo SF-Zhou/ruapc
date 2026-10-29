@@ -6,7 +6,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use ruapc::{Context, Error, ErrorKind, ListenMode, Result, Router, Server, WithBuffers};
+use ruapc::{BufferReply, Context, Error, ErrorKind, ListenMode, Result, Router, Server};
 use ruapc_demo::{
     EchoService, GreetService, MemBenchService, ReadCrcReq, Request, WriteCrcReq,
     app::{PoolOptions, RuntimeOptions, init_tracing},
@@ -74,9 +74,9 @@ impl MemBenchService for DemoImpl {
         Ok(crc32c_of(&data))
     }
 
-    async fn write_crc(&self, ctx: &Context, request: &WriteCrcReq) -> Result<WithBuffers<u32>> {
+    async fn write_crc(&self, ctx: &Context, request: &WriteCrcReq) -> Result<BufferReply<u32>> {
         if request.len == 0 {
-            return Ok(ctx.sent_nothing().reply(crc32c_of([b"".as_slice()])));
+            return Ok(ctx.sent_nothing().into_reply(crc32c_of([b"".as_slice()])));
         }
         let mut buf = ctx
             .state
@@ -88,7 +88,7 @@ impl MemBenchService for DemoImpl {
         buf.set_len(request.len);
         let crc = crc32c_of([&buf]);
         let sent = ctx.remote_write_all(vec![buf]).await?;
-        Ok(sent.reply(crc))
+        Ok(sent.into_reply(crc))
     }
 }
 

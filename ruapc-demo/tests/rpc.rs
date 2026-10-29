@@ -52,7 +52,7 @@ async fn demo_services_round_trip_over_stream_transports() {
                         *byte = (i % 251) as u8;
                     }
                     let expected = crc32c_of([&data]);
-                    let source = client.with_read_buffer(data);
+                    let source = client.with_read_buffer(data).unwrap();
                     let mut destinations = vec![buffer(&ctx, len)];
                     for _ in 0..3 {
                         assert_eq!(
@@ -65,6 +65,7 @@ async fn demo_services_round_trip_over_stream_transports() {
                             .await
                             .unwrap();
                         let (expected, returned) = response.into_parts();
+                        let returned = returned.into_available().expect("destinations available");
                         assert_eq!(returned.iter().map(|buf| buf.len()).sum::<usize>(), len);
                         assert_eq!(crc32c_of(&returned), expected);
                         destinations = returned;

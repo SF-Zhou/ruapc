@@ -559,7 +559,7 @@
               <div class="mem-column mem-column--right">
                 <span class="mem-label">Handler</span>
                 <div class="mem-chip mem-chip--primary">local buffer</div>
-                <div class="mem-chip mem-chip--ghost">WithBuffers&lt;T&gt;</div>
+                <div class="mem-chip mem-chip--ghost">BufferReply&lt;T&gt;</div>
               </div>
             </div>
             <div class="mem-card-foot">
@@ -574,7 +574,7 @@
 <span class="tok-k">let</span> total = data.iter()
     .map(|b| b.len() <span class="tok-k">as</span> <span class="tok-t">u64</span>).sum();
 <span class="tok-k">let</span> sent = ctx.remote_write_all(data).<span class="tok-k">await</span>?;
-<span class="tok-t">Ok</span>(sent.reply(total))</code></pre>
+<span class="tok-t">Ok</span>(sent.into_reply(total))</code></pre>
           </div>
         </div>
       </div>

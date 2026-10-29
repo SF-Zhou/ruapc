@@ -20,5 +20,7 @@ syn.workspace = true
 [dev-dependencies]
 # Used by trybuild UI tests to compile expanded code end-to-end.
 ruapc = { path = "../ruapc" }
+schemars.workspace = true
+serde.workspace = true
 tokio.workspace = true
 trybuild.workspace = true

@@ -1,11 +1,22 @@
-use ruapc_bufpool::RemoteBufferInfo;
+//! Reverse-RPC requests, handlers and transport execution for remote memory.
+
+#[cfg(feature = "rdma")]
+use std::sync::Arc;
+
+#[cfg(feature = "rdma")]
+use ruapc_memory::ReadSource;
+use ruapc_memory::{CopyBatch, RemoteSpace};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use super::{
+    BufferAvailability,
+    transfer::{PreparedRead, PreparedWrite},
+};
+#[cfg(feature = "rdma")]
+use crate::Socket;
 use crate::{
-    Context, CopyOp, Error, ErrorKind, Result,
-    core::ContextEndpoint,
-    remote_memory::scatter::{self, SpaceLayout},
+    Buffer, Client, Context, CopyOp, Error, ErrorKind, RemoteIoError, Result, core::ContextEndpoint,
 };
 
 /// Request to read byte ranges of the client's read space (TCP/WS/HTTP
@@ -129,7 +140,8 @@ impl MemoryService for () {
                     "read_inline: original request is gone or has no read buffers".into(),
                 )
             })?;
-        let bytes = source.read_inline(&req.ops)?;
+        let batch = CopyBatch::new(&req.ops)?;
+        let bytes = source.gather(&batch)?;
         Ok(ReadInlineResponse { bytes })
     }
 
@@ -147,23 +159,8 @@ impl MemoryService for () {
         };
         // The source space is server-local and opaque here; validate the
         // destination side against the pinned write space.
-        let total = scatter::validate_ops(&req.ops, u64::MAX, target.total_len())?;
-        if total != req.bytes.len() as u64 {
-            return Err(Error::new(
-                ErrorKind::InvalidCopyOp,
-                format!(
-                    "write_inline carries {} bytes but the ops describe {total}",
-                    req.bytes.len()
-                ),
-            ));
-        }
-        let mut cursor = 0usize;
-        for op in &req.ops {
-            let len = op.len as usize;
-            target.copy_in(op.dst_offset, &req.bytes[cursor..cursor + len])?;
-            cursor += len;
-        }
-        Ok(())
+        let batch = CopyBatch::new(&req.ops)?;
+        target.copy_inline(&batch, &req.bytes)
     }
 
     async fn read_into_target(&self, ctx: &Context, req: &ReadIntoTargetRequest) -> Result<()> {
@@ -184,19 +181,26 @@ impl MemoryService for () {
                     .into(),
             ));
         };
-        validate_region_addresses(regions, "read_into_target")?;
-        let src_layout = SpaceLayout::from_lens(regions.iter().map(|r| r.len))?;
-        scatter::validate_ops(&req.ops, src_layout.total(), target.total_len())?;
+        let source = RemoteSpace::new(regions)?;
+        let batch = CopyBatch::new(&req.ops)?;
+        batch.check_bounds(source.total_len(), target.total_len())?;
 
         // The RDMA path moves destinations from this target into the QP.
         // Request expiry or handler cancellation cannot release posted DMA
         // memory; only completion or successful QP destruction can do that.
         match &ctx.endpoint {
-            ContextEndpoint::Connected(socket) => {
-                socket
-                    .read_into_target(regions, &src_layout, &req.ops, target, ctx.deadline)
-                    .await
-            }
+            ContextEndpoint::Connected(socket) => match socket {
+                #[cfg(feature = "rdma")]
+                Socket::RDMA(socket) => {
+                    socket
+                        .read_into_target(&source, &batch, target, ctx.deadline)
+                        .await
+                }
+                _ => Err(Error::new(
+                    ErrorKind::InvalidArgument,
+                    "read_into_target requires RDMA (other transports use write_inline)".into(),
+                )),
+            },
             _ => Err(Error::new(
                 ErrorKind::NotConnected,
                 "read_into_target requires a connected socket".into(),
@@ -209,23 +213,84 @@ impl MemoryService for () {
     }
 }
 
-fn validate_region_addresses(regions: &[RemoteBufferInfo], operation: &str) -> Result<()> {
-    for region in regions {
-        if region.addr.checked_add(region.len).is_none() {
-            return Err(Error::new(
-                ErrorKind::InvalidCopyOp,
-                format!("{operation}: region address + length overflows u64"),
-            ));
-        }
+/// Consumes a prepared stream read and recovers its local destinations.
+pub(crate) async fn read(
+    prepared: PreparedRead<'_, '_>,
+) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
+    let transfer = prepared.into_parts();
+    let mut local = transfer.local;
+    let request = ReadInlineRequest {
+        ops: transfer.ops.ops().to_vec(),
+        request_id: transfer.ctx.msg_meta.msgid,
+    };
+    let client = Client::default();
+    let response = match client.read_inline(transfer.ctx, &request).await {
+        Ok(response) => response,
+        Err(error) => return Err(RemoteIoError::new(error, Some(local.into_buffers()))),
+    };
+    if let Err(error) = local.scatter(&transfer.ops, &response.bytes) {
+        return Err(RemoteIoError::new(error.into(), Some(local.into_buffers())));
     }
-    Ok(())
+    Ok(local.into_buffers())
+}
+
+/// Consumes a prepared stream write; a successful reply follows its CPU copy.
+pub(crate) async fn write(
+    prepared: PreparedWrite<'_, '_>,
+) -> std::result::Result<BufferAvailability, RemoteIoError> {
+    let transfer = prepared.into_parts();
+    let local = transfer.local;
+    let bytes = match local.gather(&transfer.ops) {
+        Ok(bytes) => bytes,
+        Err(error) => return Err(RemoteIoError::new(error.into(), Some(local.into_buffers()))),
+    };
+    let request = WriteInlineRequest {
+        ops: transfer.ops.ops().to_vec(),
+        request_id: transfer.ctx.msg_meta.msgid,
+        bytes,
+    };
+    let client = Client::default();
+    match client.write_inline(transfer.ctx, &request).await {
+        Ok(()) => Ok(BufferAvailability::Available(local.into_buffers())),
+        Err(error) => Err(RemoteIoError::new(error, Some(local.into_buffers()))),
+    }
+}
+
+/// Asks the peer to READ the prepared source into its attached write target.
+#[cfg(feature = "rdma")]
+pub(crate) async fn write_via_read(
+    prepared: PreparedWrite<'_, '_>,
+) -> std::result::Result<BufferAvailability, RemoteIoError> {
+    let transfer = prepared.into_parts();
+    let request = ReadIntoTargetRequest {
+        request_id: transfer.ctx.msg_meta.msgid,
+        ops: transfer.ops.ops().to_vec(),
+    };
+    // Retain the source until the reverse RPC replies after the peer's READs.
+    // Error recovery proves local uniqueness, not remote completion; see
+    // Context::remote_write for the source reuse and result-validity contract.
+    let client = Client::default();
+    let mut source = client
+        .with_read_source(Arc::new(ReadSource::from(transfer.local)))
+        .with_read_charge_bytes(transfer.ops.byte_count());
+    let result = source.read_into_target(transfer.ctx, &request).await;
+    let buffers = source.take_read_buffers();
+    match result {
+        Ok(()) => Ok(buffers),
+        Err(error) => Err(RemoteIoError::new(error, buffers.into_available())),
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use ruapc_bufpool::RemoteBufferInfo;
+    use ruapc_memory::BufferSet;
+
     use super::*;
 
-    use crate::{SocketPoolConfig, remote_memory::WriteTarget};
+    use crate::{Socket, SocketPoolConfig, remote_memory::WriteTarget, tcp::TcpSocket};
 
     /// The bulk fields must go through serde's byte-string channel:
     /// MessagePack `bin` (length header + memcpy), not a per-element
@@ -304,10 +369,10 @@ mod tests {
         assert_eq!(err.kind, ErrorKind::Timeout);
 
         // Pin a 8-byte write target on a pending request.
-        let (msgid, _rx) = ctx.state.waiter.alloc(std::time::Duration::from_secs(5));
+        let (msgid, _rx) = ctx.state.waiter.alloc(Duration::from_secs(5));
         let mut buf = ctx.state.buffer_pool.allocate(64 * 1024).unwrap();
         buf.set_len(8);
-        let target = WriteTarget::new(vec![buf]).unwrap();
+        let target = WriteTarget::new(BufferSet::try_new(vec![buf]).unwrap());
         ctx.state.waiter.bind_write_target(msgid, target);
 
         // Length mismatch between ops and data.
@@ -342,12 +407,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zero_byte_read_into_target_validates_attachments_and_connection() {
+        for ops in [Vec::new(), vec![CopyOp::new(u64::MAX, u64::MAX, 0)]] {
+            let config = SocketPoolConfig {
+                #[cfg(feature = "rdma")]
+                rdma: None,
+                ..Default::default()
+            };
+            let mut ctx = Context::create(&config).unwrap();
+            let (request_id, _rx) = ctx.state.waiter.alloc(Duration::from_secs(5));
+            let request = ReadIntoTargetRequest { request_id, ops };
+
+            assert_eq!(
+                ().read_into_target(&ctx, &request).await.unwrap_err().kind,
+                ErrorKind::MissingBufferInfo,
+            );
+            ctx.msg_meta.read_regions = vec![RemoteBufferInfo {
+                addr: 0x1000,
+                len: 4,
+                ..Default::default()
+            }];
+            assert_eq!(
+                ().read_into_target(&ctx, &request).await.unwrap_err().kind,
+                ErrorKind::Timeout,
+            );
+
+            let mut buffer = ctx.state.buffer_pool.allocate(4).unwrap();
+            buffer.set_len(4);
+            let target = WriteTarget::new(BufferSet::try_new(vec![buffer]).unwrap());
+            ctx.state.waiter.bind_write_target(request_id, target);
+            assert_eq!(
+                ().read_into_target(&ctx, &request).await.unwrap_err().kind,
+                ErrorKind::NotConnected,
+            );
+
+            ctx.endpoint = ContextEndpoint::Endpoint("tcp://127.0.0.1:8000".parse().unwrap());
+            assert_eq!(
+                ().read_into_target(&ctx, &request).await.unwrap_err().kind,
+                ErrorKind::NotConnected,
+            );
+
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+            ctx.endpoint = ContextEndpoint::Connected(Socket::TCP(TcpSocket::new(sender)));
+            assert_eq!(
+                ().read_into_target(&ctx, &request).await.unwrap_err().kind,
+                ErrorKind::InvalidArgument,
+            );
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
     async fn test_request_is_pending() {
         let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
         let missing = RequestStatusRequest { request_id: 9999 };
         assert!(!().request_is_pending(&ctx, &missing).await.unwrap());
 
-        let (request_id, _rx) = ctx.state.waiter.alloc(std::time::Duration::from_secs(1));
+        let (request_id, _rx) = ctx.state.waiter.alloc(Duration::from_secs(1));
         let pending = RequestStatusRequest { request_id };
         assert!(().request_is_pending(&ctx, &pending).await.unwrap());
     }

@@ -1,0 +1,32 @@
+[package]
+name = "ruapc-memory"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "RuaPC logical memory spaces, copy planning and immutable buffer sources"
+readme = "README.md"
+license.workspace = true
+keywords = ["rpc", "memory", "scatter-gather"]
+categories = ["network-programming", "memory-management"]
+
+[dependencies]
+ruapc-bufpool.workspace = true
+schemars.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+# Installed as the process allocator by every benchmark harness.
+tikv-jemallocator.workspace = true
+
+[[bench]]
+name = "planning"
+harness = false
+
+[[bench]]
+name = "copy"
+harness = false
+
+[lints.rust]
+unsafe_code = "forbid"

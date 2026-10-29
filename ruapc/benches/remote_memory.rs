@@ -20,7 +20,7 @@ use std::{
 };
 
 use ruapc::{
-    Buffer, BufferPool, Client, Context, ListenMode, Result, ResultWithBuffers, Router, Server,
+    Buffer, BufferPool, Client, Context, ListenMode, Result, ResultBufferReply, Router, Server,
     SocketPoolConfig, Transport,
 };
 use schemars::JsonSchema;
@@ -87,7 +87,7 @@ struct BenchRequest {
 trait RemoteMemoryBench {
     async fn probe(&self, ctx: &Context, req: &()) -> Result<()>;
     async fn read_all(&self, ctx: &Context, req: &BenchRequest) -> Result<usize>;
-    async fn write_all(&self, ctx: &Context, req: &BenchRequest) -> ResultWithBuffers<usize>;
+    async fn write_all(&self, ctx: &Context, req: &BenchRequest) -> ResultBufferReply<usize>;
 }
 
 struct Case {
@@ -130,7 +130,7 @@ impl RemoteMemoryBench for BenchService {
         Ok(expected.len())
     }
 
-    async fn write_all(&self, ctx: &Context, req: &BenchRequest) -> ResultWithBuffers<usize> {
+    async fn write_all(&self, ctx: &Context, req: &BenchRequest) -> ResultBufferReply<usize> {
         let case = &self.cases[req.case];
         let source = case
             .write_source
@@ -139,8 +139,8 @@ impl RemoteMemoryBench for BenchService {
             .take()
             .expect("serial benchmark must have one reusable write source");
         let mut sent = ctx.remote_write_all(source).await?;
-        *case.write_source.lock().unwrap() = Some(sent.take_buffers());
-        Ok(sent.reply(case.expected.len()))
+        *case.write_source.lock().unwrap() = sent.take_sources().into_available();
+        Ok(sent.into_reply(case.expected.len()))
     }
 }
 
@@ -186,7 +186,7 @@ async fn bench_read(
 ) {
     let buffers = make_buffers(&ctx.state.buffer_pool, expected);
     let client = Client::default();
-    let source = client.with_read_buffers(buffers);
+    let source = client.with_read_buffers(buffers).unwrap();
     for _ in 0..warmup {
         assert_eq!(source.read_all(ctx, req).await.unwrap(), expected.len());
     }
@@ -213,6 +213,7 @@ async fn bench_write(
             .await
             .unwrap()
             .into_parts();
+        let returned = returned.into_available().expect("destinations available");
         assert_eq!(written, expected.len());
         verify(&returned, expected);
         destinations = returned;
@@ -225,6 +226,7 @@ async fn bench_write(
             .await
             .unwrap()
             .into_parts();
+        let returned = returned.into_available().expect("destinations available");
         assert_eq!(written, expected.len());
         verify(&returned, expected);
         destinations = returned;

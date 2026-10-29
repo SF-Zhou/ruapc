@@ -13,6 +13,24 @@ env:
   RUAPC_PREFER_RXE: "1"
 
 jobs:
+  memory:
+    name: Standalone memory crate
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy
+
+    # Keep this job independent of verbs libraries and Soft-RoCE setup.
+    - name: Check memory crate
+      run: |
+        cargo test -p ruapc-memory
+        cargo clippy -p ruapc-memory --all-targets -- -D warnings
+        RUSTDOCFLAGS='-D warnings' cargo doc -p ruapc-memory --no-deps
+
   build:
     name: Build and test (${{ matrix.runner }})
     strategy:

@@ -85,7 +85,10 @@ Concurrent timing includes task creation; its `us/op` divides total wall time
 by requests per task, not individual latency samples. Remote-memory timing
 excludes setup, initial registration and warmup, and reuses sources and write
 destinations. It includes full-pattern verification and per-call
-`remote_read_all` destination allocation.
+`remote_read_all` destination allocation. Each transfer uses one full-span copy
+operation with one source and destination buffer. Fragmented, multi-operation
+RPCs are not measured by this harness; the standalone memory benchmarks isolate
+those CPU and planning workloads.
 
 ## Wire codecs
 
@@ -119,6 +122,101 @@ harnesses to verify effects on actual transports.
 For example, use `RUAPC_CODEC_BENCH_FILTER=chunks` to isolate stream decoding.
 Repeat the process for each sample and keep the same feature configuration when
 comparing versions.
+
+## Memory spaces
+
+```bash
+cargo bench -p ruapc-memory --bench planning
+```
+
+This device-free harness calls the memory crate's public APIs from a separate
+benchmark crate. Each timed batch creates a `CopyBatch`, calls its `plan_chunks`
+method and destroys the resulting plan. Batch construction checks operation
+structure; planning checks source and destination bounds against the supplied
+layouts. It includes the crate boundary, and requires neither
+the RPC runtime nor RDMA build libraries or a device.
+
+Every fixture describes 1 MiB of logical memory, without allocating or copying
+payload buffers. The 12 cases combine operation counts of 1, 64 and 1024;
+source/destination region counts of 1/1 and 4/64; and scatter limits of 1 and 16.
+Operations cover the destination once in a permuted order. The 4/64 layout uses
+unequal destination segments to exercise crossings of segment boundaries.
+
+Fixture construction and checks of every planned source/destination slice are
+outside timing. Warmup precedes each repeat. Timing includes validation, plan
+allocations and destruction, but excludes layout construction, buffer copies,
+registration, posting, completions and RPCs. `ns_per_batch` is elapsed wall time
+divided by whole batches, **not latency samples** or time per individual
+`CopyOp`. Raw elapsed nanoseconds and iteration counts accompany every sample.
+
+| Environment variable | Effect |
+|---|---|
+| `RUAPC_MEMORY_BENCH_ITERS` | Positive measured batch count per repeat; default 10000 |
+| `RUAPC_MEMORY_BENCH_WARMUP` | Warmup batches before each repeat; default 500, zero allowed |
+| `RUAPC_MEMORY_BENCH_REPEATS` | Positive sample count per case; default 5 |
+| `RUAPC_MEMORY_BENCH_FILTER` | Case-name substring; unset runs all 12 cases |
+
+For example, `RUAPC_MEMORY_BENCH_FILTER=ops=1024` selects the largest batches.
+Pin CPU and memory externally, run compared binaries serially, and keep allocator
+settings, fixtures and iteration counts identical. Use the RPC harnesses to
+check effects on complete transfers; planning costs alone do not predict RPC
+latency or throughput.
+
+### CPU copies
+
+```bash
+cargo bench -p ruapc-memory --bench copy
+```
+
+This harness copies actual bytes through the public gather/scatter helpers.
+Its 108 cases combine 64 KiB and 1 MiB copied payloads, 1/64/1024 operations,
+1/1 or 4/64 source/destination regions, and these nine paths:
+
+| Path | Timed work |
+|---|---|
+| `gather/prepared` | Gather with a reused batch, including layout construction and packed-output allocation/destruction |
+| `gather/validate_copy` | Construct a batch, then run the same raw gather path |
+| `scatter/prepared` | Scatter with a reused batch, including layout construction, into existing destinations |
+| `scatter/validate_copy` | Construct a batch, then run the same raw scatter path |
+| `gather/cached_prepared`, `scatter/cached_prepared` | Reuse both the batch and a `BufferSet` with its cached layout |
+| `gather/cached_validate_copy`, `scatter/cached_validate_copy` | Construct a batch and copy through a reused `BufferSet` |
+| `receiver/validate_copy` | Construct a batch, acquire one uncontended mutex, and scatter into a reused `BufferSet` |
+
+Raw paths build the local layout inside every timed copy. Cached paths and the
+receiver construct the `BufferSet` and its layout before timing; they measure
+repeated use of an already prepared buffer set. Both families check the actual
+source bounds for gather, or destination bounds and packed length for scatter.
+Compare these scopes separately: excluding reusable layout preparation does not
+measure the cost of a complete attachment or one-shot transfer. Gather always
+includes packed-output allocation and destruction.
+
+The receiver case models the CPU-copy portion of an inline-write handler with
+an available target and an uncontended mutex. It excludes request lookup,
+admission, RPC dispatch, unavailable-target handling and DMA ownership. Use the
+RPC harness for those runtime costs.
+
+The operations use a permuted destination order with 16 bytes of untouched space
+around each operation. Logical spaces are therefore larger than the reported
+copied payload. Fixture setup allocates sources and destinations from one 64 MiB
+pool without registered devices. Sources contain a deterministic byte pattern;
+every gathered byte and every destination byte, including untouched gaps, is
+checked before and after measurement. Fixtures, allocation of pool buffers and
+these correctness checks are outside timing. Scatter destinations are reused
+without clearing between batches. These are warm, serial CPU-copy workloads.
+
+| Environment variable | Effect |
+|---|---|
+| `RUAPC_COPY_BENCH_ITERS` | Positive measured batch count per repeat; default 1000 |
+| `RUAPC_COPY_BENCH_WARMUP` | Warmup batches before each repeat; default 100, zero allowed |
+| `RUAPC_COPY_BENCH_REPEATS` | Positive sample count per case; default 5 |
+| `RUAPC_COPY_BENCH_FILTER` | Case-name substring; unset runs all 108 cases |
+
+For example, `RUAPC_COPY_BENCH_FILTER=receiver` selects the receiver model.
+Output includes raw elapsed nanoseconds and iteration counts. `ns_per_batch`
+reports amortized wall time for one complete batch, not individual latency
+samples or time per copied byte. Keep the same fixture and allocator settings
+when comparing implementations, and use actual error types in any old-code
+adapter because changing `Result` layout can affect successful paths too.
 
 ## RDMA ownership harnesses
 

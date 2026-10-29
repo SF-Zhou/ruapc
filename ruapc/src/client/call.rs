@@ -1,47 +1,21 @@
-//! Type-driven dispatch glue for `#[service]`-generated client methods.
-//!
-//! The macro emits one uniform body for every client method:
-//!
-//! ```rust,ignore
-//! (&RpcCall::<ReturnType>::new()).ruapc_call(self, ctx, req, "Svc/method").await
-//! ```
-//!
-//! Which implementation runs is decided by the *type system*, not by the
-//! macro (no name-based detection, so type aliases and custom error types
-//! work):
-//!
-//! - [`CallWithBuffer`] is implemented for
-//!   `RpcCall<Result<WithBuffers<T>, E>>` and additionally returns the
-//!   write buffers the caller attached to the request.
-//! - [`CallPlain`] is implemented for `&RpcCall<Result<T, E>>` and performs
-//!   an ordinary request.
-//!
-//! The two impl sets cannot overlap: `WithBuffers<T>` is deliberately not
-//! `Deserialize`, so it never satisfies the plain impl's bounds, while the
-//! buffer impl only exists for `Result<WithBuffers<T>, E>`. Method
-//! resolution prefers `CallWithBuffer` (fewer autorefs) whenever it
-//! applies.
-
-use std::marker::PhantomData;
+//! Type-driven calls that preserve the declared service result.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::client::ReadAttachment;
-use crate::{Buffer, Client, ClientWithBuffers, Context, Error, WithBuffers};
+use crate::{BufferAvailability, BufferReply, Client, ClientWithBuffers, Context, Error};
 
-/// Uniform request entry point implemented by [`Client`] and
-/// [`ClientWithBuffers`]; used by the generated call glue.
+/// Uniform request entry point used by generated client methods.
 #[doc(hidden)]
 pub trait RawCall {
-    /// Sends a request and places any recovered write buffers in `slot`.
     async fn ruapc_raw_call<Req, Rsp, E>(
         &self,
         ctx: &Context,
         req: &Req,
-        slot: Option<&mut Vec<Buffer>>,
+        slot: Option<&mut BufferAvailability>,
         method_name: &str,
-    ) -> std::result::Result<Rsp, E>
+    ) -> Result<Rsp, E>
     where
         Req: Serialize + JsonSchema,
         Rsp: for<'c> Deserialize<'c> + JsonSchema,
@@ -53,9 +27,9 @@ impl RawCall for Client {
         &self,
         ctx: &Context,
         req: &Req,
-        slot: Option<&mut Vec<Buffer>>,
+        slot: Option<&mut BufferAvailability>,
         method_name: &str,
-    ) -> std::result::Result<Rsp, E>
+    ) -> Result<Rsp, E>
     where
         Req: Serialize + JsonSchema,
         Rsp: for<'c> Deserialize<'c> + JsonSchema,
@@ -78,9 +52,9 @@ impl RawCall for ClientWithBuffers<'_> {
         &self,
         ctx: &Context,
         req: &Req,
-        slot: Option<&mut Vec<Buffer>>,
+        slot: Option<&mut BufferAvailability>,
         method_name: &str,
-    ) -> std::result::Result<Rsp, E>
+    ) -> Result<Rsp, E>
     where
         Req: Serialize + JsonSchema,
         Rsp: for<'c> Deserialize<'c> + JsonSchema,
@@ -90,106 +64,46 @@ impl RawCall for ClientWithBuffers<'_> {
     }
 }
 
-/// Zero-sized dispatcher tag parameterized by a method's return type.
+/// Executes a call returning exactly the declared service result.
+///
+/// Aliases and custom errors retain their meaning. `BufferReply` deliberately
+/// does not implement `Deserialize`, so these two implementations cannot overlap.
 #[doc(hidden)]
-pub struct RpcCall<Rt>(PhantomData<Rt>);
-
-impl<Rt> RpcCall<Rt> {
-    #[must_use]
-    pub const fn new() -> Self {
-        Self(PhantomData)
-    }
-}
-
-impl<Rt> Default for RpcCall<Rt> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Call glue for methods returning `Result<WithBuffers<T>, E>`.
-#[doc(hidden)]
-pub trait CallWithBuffer {
-    type Rsp;
-    type Err;
-
-    async fn ruapc_call<C, Req>(
-        &self,
-        client: &C,
-        ctx: &Context,
-        req: &Req,
-        method_name: &str,
-    ) -> std::result::Result<WithBuffers<Self::Rsp>, Self::Err>
+pub trait ResponseContract: Sized {
+    async fn call<C, Req>(client: &C, ctx: &Context, req: &Req, method_name: &str) -> Self
     where
         C: RawCall,
         Req: Serialize + JsonSchema;
 }
 
-impl<T, E> CallWithBuffer for RpcCall<std::result::Result<WithBuffers<T>, E>>
+impl<T, E> ResponseContract for Result<T, E>
 where
     T: for<'c> Deserialize<'c> + JsonSchema,
     E: std::error::Error + From<Error> + for<'c> Deserialize<'c>,
 {
-    type Rsp = T;
-    type Err = E;
-
-    async fn ruapc_call<C, Req>(
-        &self,
-        client: &C,
-        ctx: &Context,
-        req: &Req,
-        method_name: &str,
-    ) -> std::result::Result<WithBuffers<T>, E>
-    where
-        C: RawCall,
-        Req: Serialize + JsonSchema,
-    {
-        let mut slot: Vec<Buffer> = Vec::new();
-        let result: std::result::Result<T, E> = client
-            .ruapc_raw_call(ctx, req, Some(&mut slot), method_name)
-            .await;
-        // `slot` is empty if no buffers were attached or recovery was unavailable.
-        result.map(|rsp| WithBuffers::assemble(rsp, slot))
-    }
-}
-
-/// Call glue for plain `Result<T, E>` methods.
-#[doc(hidden)]
-pub trait CallPlain {
-    type Rsp;
-    type Err;
-
-    async fn ruapc_call<C, Req>(
-        &self,
-        client: &C,
-        ctx: &Context,
-        req: &Req,
-        method_name: &str,
-    ) -> std::result::Result<Self::Rsp, Self::Err>
-    where
-        C: RawCall,
-        Req: Serialize + JsonSchema;
-}
-
-impl<T, E> CallPlain for &RpcCall<std::result::Result<T, E>>
-where
-    T: for<'c> Deserialize<'c> + JsonSchema,
-    E: std::error::Error + From<Error> + for<'c> Deserialize<'c>,
-{
-    type Rsp = T;
-    type Err = E;
-
-    async fn ruapc_call<C, Req>(
-        &self,
-        client: &C,
-        ctx: &Context,
-        req: &Req,
-        method_name: &str,
-    ) -> std::result::Result<T, E>
+    async fn call<C, Req>(client: &C, ctx: &Context, req: &Req, method_name: &str) -> Self
     where
         C: RawCall,
         Req: Serialize + JsonSchema,
     {
         client.ruapc_raw_call(ctx, req, None, method_name).await
+    }
+}
+
+impl<T, E> ResponseContract for Result<BufferReply<T>, E>
+where
+    T: for<'c> Deserialize<'c> + JsonSchema,
+    E: std::error::Error + From<Error> + for<'c> Deserialize<'c>,
+{
+    async fn call<C, Req>(client: &C, ctx: &Context, req: &Req, method_name: &str) -> Self
+    where
+        C: RawCall,
+        Req: Serialize + JsonSchema,
+    {
+        let mut destinations = BufferAvailability::NotAttached;
+        let result: Result<T, E> = client
+            .ruapc_raw_call(ctx, req, Some(&mut destinations), method_name)
+            .await;
+        result.map(|response| BufferReply::new(response, destinations))
     }
 }

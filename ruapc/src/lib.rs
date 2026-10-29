@@ -20,8 +20,9 @@
 //!
 //! [`ClientWithBuffers`] attaches owned read sources and write destinations.
 //! Handlers use [`Context::remote_read`] and [`Context::remote_write`] with
-//! logical [`CopyOp`] ranges. [`WithBuffers`] returns a response with available
-//! write buffers; [`RemoteIoError`] describes recovery after a failed transfer.
+//! logical [`CopyOp`] ranges. Handlers and clients share the declared service
+//! trait and [`BufferReply`] result type, with explicit local destination availability.
+//! [`RemoteIoError`] describes recovery after a failed transfer.
 //!
 //! See the [quick start](https://github.com/SF-Zhou/ruapc#example) for a complete
 //! service and the [documentation index](https://github.com/SF-Zhou/ruapc/blob/main/docs/README.md)
@@ -46,14 +47,15 @@ pub use client::{Client, ClientWithBuffers};
 
 mod core;
 #[doc(hidden)]
-pub use client::{CallPlain, CallWithBuffer, RawCall, RpcCall};
+pub use client::{RawCall, ResponseContract};
 pub use core::{Context, Listener, MethodSchema, Router, Server, State};
 #[doc(hidden)]
 pub use core::{catch_handler_panic, spawn_handler};
 
 mod remote_memory;
 pub use remote_memory::{
-    CopyOp, MAX_COPY_OPS, MAX_REGIONS, RemoteSpace, ResultWithBuffers, SentBuffers, WithBuffers,
+    BufferAvailability, BufferReply, CopyOp, MAX_COPY_OPS, MAX_REGIONS, RemoteSpace,
+    ResultBufferReply, WriteReceipt,
 };
 
 mod metrics;
@@ -63,17 +65,24 @@ mod task;
 pub(crate) use task::Receiver;
 pub use task::{TaskSupervisor, TaskSupervisorHandle, Waiter, WaiterCleaner};
 
-mod devices;
-pub use devices::{Buffer, BufferPool, Devices};
-
 mod sockets;
 pub use sockets::*;
 
 mod services;
 
+pub use ruapc_bufpool::Buffer;
+pub use ruapc_bufpool::BufferPool;
 pub use ruapc_bufpool::DEFAULT_BUFFER_POOL_MEMORY;
 pub use ruapc_bufpool::Device as _;
 pub use ruapc_bufpool::Devices as _;
 
 #[cfg(feature = "rdma")]
 pub mod rdma;
+
+/// The TCP registration device and the configured RDMA devices.
+#[cfg(feature = "rdma")]
+pub type Devices = ruapc_bufpool::DeviceSet<rdma::RdmaDevice>;
+
+/// The TCP registration device for stream transports.
+#[cfg(not(feature = "rdma"))]
+pub type Devices = ruapc_bufpool::DeviceSet;

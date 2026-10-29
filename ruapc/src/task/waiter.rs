@@ -314,6 +314,7 @@ impl std::fmt::Debug for Waiter {
 mod tests {
     use super::*;
     use crate::{CopyOp, ErrorKind};
+    use ruapc_memory::{BufferSet, CopyBatch};
     use std::sync::Arc;
 
     #[test]
@@ -356,10 +357,9 @@ mod tests {
             Completion::Expiry,
         ] {
             // These two owners stand in for the caller's client wrapper.
-            let source = Arc::new(ReadSource {
-                buffers: vec![pool.allocate(16).unwrap()],
-            });
-            let target = WriteTarget::new(vec![pool.allocate(16).unwrap()]).unwrap();
+            let source = Arc::new(ReadSource::try_new(vec![pool.allocate(16).unwrap()]).unwrap());
+            let target =
+                WriteTarget::new(BufferSet::try_new(vec![pool.allocate(16).unwrap()]).unwrap());
             let waiter = Waiter::default();
             let (msgid, receiver) = waiter.alloc(Duration::from_secs(1));
             let conn_id = next_conn_id();
@@ -422,9 +422,7 @@ mod tests {
         let mut buffer = pool.allocate(16).unwrap();
         buffer.set_len(4);
         buffer.copy_from_slice(b"data");
-        let source = Arc::new(ReadSource {
-            buffers: vec![buffer],
-        });
+        let source = Arc::new(ReadSource::try_new(vec![buffer]).unwrap());
         let weak = Arc::downgrade(&source);
         let waiter = Waiter::default();
         let (msgid, receiver) = waiter.alloc(Duration::from_secs(1));
@@ -433,7 +431,9 @@ mod tests {
         waiter.expire(Instant::now() + Duration::from_secs(2));
         assert!(waiter.read_source(msgid).is_none());
         assert_eq!(
-            reading.read_inline(&[CopyOp::new(0, 0, 4)]).unwrap(),
+            reading
+                .gather(&CopyBatch::new(&[CopyOp::new(0, 0, 4)]).unwrap())
+                .unwrap(),
             b"data"
         );
         drop(receiver);
@@ -488,7 +488,7 @@ mod tests {
         // Bind a write target while the request is pending.
         let mut buf = pool.allocate(1024 * 1024).unwrap();
         buf.set_len(5);
-        let target = WriteTarget::new(vec![buf]).unwrap();
+        let target = WriteTarget::new(BufferSet::try_new(vec![buf]).unwrap());
         waiter.bind_write_target(msgid, target);
 
         // A handler-side clone writes into the target.
@@ -515,7 +515,10 @@ mod tests {
         let (msgid, rx) = waiter.alloc(std::time::Duration::from_secs(30));
         let mut buf = pool.allocate(1024 * 1024).unwrap();
         buf.set_len(1);
-        waiter.bind_write_target(msgid, WriteTarget::new(vec![buf]).unwrap());
+        waiter.bind_write_target(
+            msgid,
+            WriteTarget::new(BufferSet::try_new(vec![buf]).unwrap()),
+        );
 
         // Drop receiver (simulates timeout cleanup).
         drop(rx);

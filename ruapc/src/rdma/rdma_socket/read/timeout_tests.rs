@@ -10,10 +10,10 @@ use tokio::sync::{OwnedSemaphorePermit, mpsc};
 
 use super::super::RdmaSocket;
 use crate::{
-    Buffer, Client, Context, CopyOp, Endpoint, ErrorKind, Result, ResultWithBuffers, Router,
+    Buffer, Client, Context, CopyOp, Endpoint, ErrorKind, Result, ResultBufferReply, Router,
     Server, Socket, SocketPoolConfig, Transport, core::ContextEndpoint,
-    rdma::test_utils::small_rdma_config, remote_memory::WriteTarget, service,
-    services::ReadIntoTargetRequest,
+    rdma::test_utils::small_rdma_config, remote_memory::WriteTarget,
+    remote_memory::rpc_transfer::ReadIntoTargetRequest, service,
 };
 
 const READ_PERMITS: u32 = 1;
@@ -72,7 +72,7 @@ struct TimeoutService {
 trait AdmissionTimeoutRpc {
     async fn ping(&self, ctx: &Context, req: &()) -> Result<u64>;
     async fn read(&self, ctx: &Context, req: &()) -> Result<()>;
-    async fn write(&self, ctx: &Context, req: &()) -> ResultWithBuffers<()>;
+    async fn write(&self, ctx: &Context, req: &()) -> ResultBufferReply<()>;
 }
 
 impl AdmissionTimeoutRpc for TimeoutService {
@@ -105,7 +105,7 @@ impl AdmissionTimeoutRpc for TimeoutService {
         Err(error)
     }
 
-    async fn write(&self, ctx: &Context, _: &()) -> ResultWithBuffers<()> {
+    async fn write(&self, ctx: &Context, _: &()) -> ResultBufferReply<()> {
         let mut source = ctx.state.buffer_pool.allocate(64).unwrap();
         source.set_len(64);
         source.fill(0x5a);
@@ -208,6 +208,7 @@ async fn server_remote_read_returns_when_nic_admission_exceeds_parent_deadline()
         source.fill(0x5a);
         client
             .with_read_buffers(vec![source])
+            .unwrap()
             .read(&context, &())
             .await
     });
@@ -282,7 +283,7 @@ async fn server_remote_write_and_client_read_handler_return_at_parent_deadline()
                 .and_then(Weak::upgrade);
             if let Some(target) = target
                 && target
-                    .copy_in(0, &[])
+                    .export_regions(fixture.context.state.devices.tcp_device())
                     .is_err_and(|e| e.kind == ErrorKind::BuffersInUse)
             {
                 break;

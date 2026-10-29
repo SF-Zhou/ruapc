@@ -1,7 +1,8 @@
 //! RPC service declarations, router registration, and client implementations.
 //!
-//! `#[service]` generates `ruapc_export` and implements the service trait for
-//! `ruapc::Client` and `ruapc::ClientWithBuffers`.
+//! `#[service]` generates `ruapc_export` and implements the declared service trait
+//! for `ruapc::Client` and `ruapc::ClientWithBuffers`. Both use the same method
+//! signatures and return types as the service implementation.
 //!
 //! ```rust,ignore
 //! #[ruapc::service]
@@ -40,12 +41,14 @@
 //!
 //! ## Responses with buffers
 //!
-//! `Result<WithBuffers<T>, E>` returns a response plus recovered client write
-//! buffers. Type aliases such as `ruapc::ResultWithBuffers<T>` work because
-//! dispatch uses the underlying type, not its spelling.
+//! Declare `Result<BufferReply<T>, E>` to return an application response together
+//! with the client's local destination availability. The handler and both client
+//! types implement this same signature. Type aliases such as
+//! `ruapc::ResultBufferReply<T>` work because dispatch uses the underlying type,
+//! not its spelling.
 //!
 //! The handler awaits `ctx.remote_write` or `ctx.remote_write_all`, then calls
-//! `SentBuffers::reply` to form its response. `ctx.sent_nothing().reply(...)`
+//! `WriteReceipt::into_reply` to form its response. `ctx.sent_nothing().into_reply(...)`
 //! handles paths with no transfer. The client attaches destination buffers:
 //!
 //! ```rust,ignore
