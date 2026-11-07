@@ -1,16 +1,23 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use foldhash::fast::RandomState;
 
 use crate::{Endpoint, task::next_conn_id};
 use tokio::sync::RwLock;
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 /// Identity and close-once state shared by stream transports.
 #[derive(Debug)]
 pub(crate) struct ConnectionLifecycle {
     conn_id: u64,
-    closed: std::sync::atomic::AtomicBool,
+    closed: AtomicBool,
+    teardown_started: AtomicBool,
     close_notification: CancellationToken,
 }
 
@@ -18,7 +25,8 @@ impl ConnectionLifecycle {
     pub(crate) fn new() -> Self {
         Self {
             conn_id: next_conn_id(),
-            closed: std::sync::atomic::AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            teardown_started: AtomicBool::new(false),
             close_notification: CancellationToken::new(),
         }
     }
@@ -28,19 +36,49 @@ impl ConnectionLifecycle {
     }
 
     pub(crate) fn is_closed(&self) -> bool {
-        self.closed.load(std::sync::atomic::Ordering::Acquire)
+        self.closed.load(Ordering::Acquire)
+    }
+
+    /// Close admission and wake every stream owner before bookkeeping starts.
+    /// Keep the live send path on an atomic read, not the token's internal lock.
+    pub(crate) fn request_close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.close_notification.cancel();
     }
 
     pub(crate) fn close_once(&self) -> bool {
-        if self.closed.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            return false;
-        }
-        self.close_notification.cancel();
-        true
+        self.request_close();
+        !self.teardown_started.swap(true, Ordering::AcqRel)
+    }
+
+    pub(crate) fn close_guard(self: &Arc<Self>) -> ConnectionCloseGuard {
+        ConnectionCloseGuard(Some(self.clone()))
+    }
+
+    pub(crate) fn closed_owned(&self) -> WaitForCancellationFutureOwned {
+        self.close_notification.clone().cancelled_owned()
     }
 
     pub(crate) async fn closed(&self) {
         self.close_notification.cancelled().await;
+    }
+}
+
+/// Requests closure without claiming transport-specific teardown bookkeeping.
+/// It retains only lifecycle state, never a sender or a queued payload.
+pub(crate) struct ConnectionCloseGuard(Option<Arc<ConnectionLifecycle>>);
+
+impl ConnectionCloseGuard {
+    pub(crate) fn disarm(mut self) {
+        self.0.take();
+    }
+}
+
+impl Drop for ConnectionCloseGuard {
+    fn drop(&mut self) {
+        if let Some(lifecycle) = &self.0 {
+            lifecycle.request_close();
+        }
     }
 }
 
@@ -124,6 +162,20 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+
+    #[tokio::test]
+    async fn close_guard_closes_admission_before_teardown_and_can_be_disarmed() {
+        let lifecycle = Arc::new(ConnectionLifecycle::new());
+        lifecycle.close_guard().disarm();
+        assert!(!lifecycle.is_closed());
+        let guard = lifecycle.close_guard();
+        let notified = lifecycle.closed_owned();
+        drop(guard);
+        assert!(lifecycle.is_closed());
+        notified.await;
+        assert!(lifecycle.close_once());
+        assert!(!lifecycle.close_once());
+    }
 
     #[derive(Clone)]
     struct TestConnection {

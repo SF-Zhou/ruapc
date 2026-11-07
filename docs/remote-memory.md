@@ -9,6 +9,14 @@ For standalone logical-space validation, copy planning and immutable buffer
 sources, see the [memory crate](../ruapc-memory/README.md). RPC applications keep
 using the `ruapc` types and `Context` methods shown here.
 
+TCP and HTTP/2 send immutable source slices with a small control prefix,
+without gathering or serializing the bulk bytes into a temporary buffer.
+WebSocket coalesces them once into its binary message. Receivers scatter directly
+from the received payload into the destination buffers, without decoding bulk
+bytes into a separate vector. Socket/kernel buffering, WebSocket masking and
+HTTP/2 frame assembly can still copy data; this is not kernel zero-copy I/O.
+See the [inline protocol](builtin-services.md#remote-memory-memoryservice).
+
 ## Spaces and copy operations
 
 A buffer list forms a logical space by concatenating its buffers' `len()` values.
@@ -152,6 +160,26 @@ unavailable response, write-attachment state or receipt is not a handle that
 can later recover buffers. Only the read-attachment wrapper retains a shared
 source after an unsuccessful `take_read_buffers()` attempt, allowing that
 specific recovery attempt to be repeated.
+
+Stream send queues and in-progress socket writes retain immutable source slices.
+Cancelling or timing out the RPC does not release those owners while a send can
+still access the bytes. Response admission waits for queue capacity or connection
+closure, with no independent timeout. A peer that stops reading can therefore
+retain sources indefinitely and keep handlers waiting to enqueue responses in
+their server admission slots.
+`remote_write` recovers its sources only if they are
+unique when it returns; even a successful receipt can report `Unavailable` if
+the transport still holds a source. Read-attachment recovery can be retried once
+those owners finish or the connection drops its queue.
+
+Received `Payload` values and their `Bytes` conversions share the original
+allocation; cloning or slicing `Bytes` does not release that owner. Keeping even
+a small slice in a cache can therefore retain an entire registered buffer or
+RDMA receive allocation. Large RDMA payloads also retain their receive-byte
+budget until the last owner is dropped. For long-lived storage that should not
+occupy transport capacity, explicitly copy the needed bytes, for example with
+`Bytes::copy_from_slice(payload.as_slice())`, then release the original payload
+and any shared views. See [large-payload admission](rdma-capacity.md#large-payload-admission-and-cleanup).
 
 Posted READ destinations remain owned until completion or successful QP
 destruction. Cancellation or failure can make recovery unavailable even after

@@ -112,7 +112,9 @@ impl Context {
     /// while awaiting that response; this path does not use the pending probe
     /// described in [`remote_read`](Self::remote_read). Failure or cancellation
     /// can still recover the source before remote DMA finishes. TCP/WS/HTTP
-    /// instead send the bytes in an inline-copy RPC.
+    /// instead send raw bytes in a reverse RPC. Their send queues retain
+    /// immutable source slices until the transport releases them, so a timeout
+    /// or even a successful peer reply can leave local sources unavailable.
     ///
     /// The transfer happens *here*, inside the handler, so its latency and
     /// errors are directly observable. Pair the witness with a response
@@ -166,26 +168,22 @@ mod tests {
 
     use bytes::{Bytes, BytesMut};
     use ruapc_bufpool::RemoteBufferInfo;
-    use serde::Serialize;
 
     #[cfg(feature = "rdma")]
-    use crate::remote_memory::{MemoryService, WriteTarget, rpc_transfer::WriteInlineRequest};
+    use crate::remote_memory::{
+        WriteTarget,
+        rpc_transfer::{WriteInlineRequest, write_inline},
+    };
     use crate::{
         BufferReply, Error, ErrorKind, MAX_COPY_OPS, Message, MsgFlags, MsgMeta, Payload, Socket,
         SocketPoolConfig, msg::frame, tcp::TcpSocket,
     };
 
-    #[derive(Serialize)]
-    struct PackedReadReply {
-        #[serde(with = "serde_bytes")]
-        bytes: Vec<u8>,
-    }
-
     #[tokio::test]
-    async fn test_send_rsp_invalid_endpoint_logs_and_does_not_panic() {
+    async fn send_err_rsp_without_endpoint_does_not_panic() {
         // Context starts without a destination by default.
         let mut ctx = Context::create(&SocketPoolConfig::default()).unwrap();
-        // This should log an error and silently return (no panic).
+        // Framework failure delivery remains best-effort without an endpoint.
         ctx.send_err_rsp(Error::kind(ErrorKind::Timeout)).await;
     }
 
@@ -197,7 +195,9 @@ mod tests {
         ctx
     }
 
-    fn connected_context(meta: MsgMeta) -> (Context, tokio::sync::mpsc::Receiver<Bytes>) {
+    fn connected_context(
+        meta: MsgMeta,
+    ) -> (Context, tokio::sync::mpsc::Receiver<frame::SendFrame>) {
         let config = SocketPoolConfig {
             #[cfg(feature = "rdma")]
             rdma: None,
@@ -418,21 +418,33 @@ mod tests {
             let original_pointer = local.as_ptr();
             let ops = [CopyOp::new(2, 4, 2), CopyOp::new(0, 0, 2)];
             let peer = async {
-                let encoded = queue.recv().await.unwrap();
+                let encoded = queue.recv().await.unwrap().into_bytes();
                 let mut encoded = BytesMut::from(encoded.as_ref());
                 let request =
                     Message::parse(frame::parse_message(&mut encoded).unwrap().unwrap()).unwrap();
                 assert_eq!(request.meta.method, "MemoryService/read_inline");
-                let response = reply.map(|bytes| PackedReadReply { bytes });
+                let mut flags = MsgFlags::UseMessagePack | MsgFlags::IsRsp;
+                let response = match reply {
+                    Ok(bytes) => {
+                        flags.insert(MsgFlags::HasRawBytes);
+                        let mut payload =
+                            ruapc_wire::raw::encode_header(&Ok::<(), Error>(()), flags)
+                                .unwrap()
+                                .to_vec();
+                        payload.extend_from_slice(&bytes);
+                        payload
+                    }
+                    Err(error) => rmp_serde::to_vec_named(&Err::<(), Error>(error)).unwrap(),
+                };
                 ctx.state.waiter.post(
                     request.meta.msgid,
                     Message::new(
                         MsgMeta {
                             msgid: request.meta.msgid,
-                            flags: MsgFlags::UseMessagePack | MsgFlags::IsRsp,
+                            flags,
                             ..Default::default()
                         },
-                        Payload::from(Bytes::from(rmp_serde::to_vec_named(&response).unwrap())),
+                        Payload::from(Bytes::from(response)),
                     ),
                 );
             };
@@ -483,13 +495,9 @@ mod tests {
                 ErrorKind::InvalidCopyOp,
             ),
         ] {
-            let request = WriteInlineRequest {
-                request_id,
-                ops,
-                bytes,
-            };
+            let request = WriteInlineRequest { request_id, ops };
             assert_eq!(
-                ().write_inline(&ctx, &request).await.unwrap_err().kind,
+                write_inline(&ctx, &request, &bytes).unwrap_err().kind,
                 expected
             );
         }

@@ -1,7 +1,7 @@
 //! Server-side handler dispatch: the glue between the router's method table
 //! and user handler futures.
 //!
-//! [`spawn_handler`] wraps every handler execution with:
+//! [`spawn_handler_result`] wraps every handler execution with:
 //!
 //! - **load shedding** — when `max_inflight_requests` is reached the request
 //!   is rejected immediately with [`ErrorKind::Overloaded`];
@@ -17,20 +17,34 @@
 
 use std::sync::atomic::Ordering;
 
-use crate::{Context, Error, ErrorKind, Payload, State};
+use super::catch_handler_panic;
+use crate::{Context, Error, ErrorKind, Payload, Result, State};
 
-/// Spawns a request handler with dispatch policies applied.
-///
-/// `f` receives the context and payload and must perform the complete
-/// handling (deserialize, invoke, respond); it is produced by the
-/// `#[ruapc::service]` macro.
-///
-/// Hidden from docs: this is macro plumbing, not a public API.
-#[doc(hidden)]
-pub fn spawn_handler<F, Fut>(mut ctx: Context, method: &'static str, payload: Payload, f: F)
+/// Test helper for bodies that perform their own response delivery.
+#[cfg(test)]
+pub(crate) fn spawn_handler<F, Fut>(ctx: Context, method: &'static str, payload: Payload, f: F)
 where
-    F: FnOnce(Context, Payload) -> Fut,
+    F: FnOnce(Context, Payload) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
+{
+    spawn_handler_result(ctx, method, payload, move |ctx, payload| {
+        let future = f(ctx, payload);
+        async move {
+            future.await;
+            Ok(())
+        }
+    });
+}
+
+/// Common execution boundary for generated and explicitly registered handlers.
+pub(crate) fn spawn_handler_result<F, Fut>(
+    mut ctx: Context,
+    method: &'static str,
+    payload: Payload,
+    f: F,
+) where
+    F: FnOnce(Context, Payload) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
 {
     let state = ctx.state.clone();
     let metrics = &state.metrics;
@@ -63,14 +77,27 @@ where
         return;
     }
 
-    let method_call = metrics.server_method(method).start();
-    let fut = f(ctx, payload);
     tokio::spawn(async move {
         // The guard lives inside the task: normal completion and panic
         // both run its Drop.
-        let _guard = guard;
-        let _method_call = method_call;
-        fut.await;
+        let execution_guard = guard;
+        // Admission and execution can be separated by an arbitrarily long
+        // scheduler delay. Do not construct the application's future if its
+        // budget expired while this task was waiting to run.
+        if ctx.is_expired() {
+            execution_guard.state.metrics.request_expired();
+            return;
+        }
+        let _method_call = execution_guard.state.metrics.server_method(method).start();
+        let response_target = ctx.response_target();
+        let result = catch_handler_panic(async move { f(ctx, payload).await })
+            .await
+            .unwrap_or_else(Err);
+        if let Err(error) = result {
+            response_target
+                .send_err_rsp(&execution_guard.state, method, error)
+                .await;
+        }
     });
 }
 
@@ -124,7 +151,7 @@ mod tests {
             },
             30_000,
         );
-        let admitted = std::sync::atomic::AtomicUsize::new(0);
+        let admitted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let barrier = std::sync::Barrier::new(THREADS);
         let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
         let runtime = tokio::runtime::Handle::current();
@@ -134,7 +161,8 @@ mod tests {
                     let _entered = runtime.enter();
                     barrier.wait();
                     let release = release.clone();
-                    spawn_handler(ctx.clone(), "TestSvc/x", Payload::Empty, |_, _| {
+                    let admitted = admitted.clone();
+                    spawn_handler(ctx.clone(), "TestSvc/x", Payload::default(), move |_, _| {
                         admitted.fetch_add(1, Ordering::Relaxed);
                         async move {
                             let _permit = release.acquire().await.unwrap();
@@ -143,6 +171,13 @@ mod tests {
                 });
             }
         });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while admitted.load(Ordering::Relaxed) != CAP {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(admitted.load(Ordering::Relaxed), CAP);
         assert_eq!(
             ctx.state.metrics.server_inflight.load(Ordering::Relaxed),
@@ -158,6 +193,26 @@ mod tests {
         .unwrap();
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_expiring_in_scheduler_queue_never_constructs_handler() {
+        let ctx = make_ctx(&tcp_config(), 10);
+        let state = ctx.state.clone();
+        let constructed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = constructed.clone();
+        assert!(!ctx.is_expired());
+        spawn_handler_result(ctx, "TestSvc/x", Payload::default(), move |_, _| {
+            observed.store(true, Ordering::SeqCst);
+            async { Ok(()) }
+        });
+        assert_eq!(state.metrics.server_inflight.load(Ordering::Relaxed), 1);
+        // Deliberately keep this sole runtime thread occupied until the queued
+        // request expires, then allow the task to receive its first poll.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        tokio::task::yield_now().await;
+        assert!(!constructed.load(Ordering::SeqCst));
+        assert_eq!(state.metrics.server_inflight.load(Ordering::Relaxed), 0);
+    }
+
     #[tokio::test]
     async fn test_expired_request_is_dropped() {
         let ctx = make_ctx(&tcp_config(), 0);
@@ -166,7 +221,7 @@ mod tests {
         let state = ctx.state.clone();
         let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ran_clone = ran.clone();
-        spawn_handler(ctx, "TestSvc/x", Payload::Empty, move |_, _| {
+        spawn_handler(ctx, "TestSvc/x", Payload::default(), move |_, _| {
             ran_clone.store(true, Ordering::SeqCst);
             async {}
         });
@@ -190,7 +245,7 @@ mod tests {
             .fetch_add(1, Ordering::Relaxed);
         let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ran_clone = ran.clone();
-        spawn_handler(ctx, "TestSvc/x", Payload::Empty, move |_, _| {
+        spawn_handler(ctx, "TestSvc/x", Payload::default(), move |_, _| {
             ran_clone.store(true, Ordering::SeqCst);
             async {}
         });
@@ -205,7 +260,7 @@ mod tests {
         let ctx = make_ctx(&tcp_config(), 30_000);
         let state = ctx.state.clone();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        spawn_handler(ctx, "TestSvc/x", Payload::Empty, move |_, _| async {
+        spawn_handler(ctx, "TestSvc/x", Payload::default(), move |_, _| async {
             let _ = done_tx.send(());
         });
         done_rx.await.unwrap();

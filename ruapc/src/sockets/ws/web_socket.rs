@@ -7,7 +7,10 @@ use tokio::sync::mpsc;
 use crate::{
     SocketTrait, State,
     error::Result,
-    msg::{MsgMeta, frame::encode},
+    msg::{
+        MsgMeta,
+        frame::{SendFrame, encode, encode_raw},
+    },
     sockets::{ChannelConnection, PoolConnection},
 };
 
@@ -17,10 +20,24 @@ pub struct WebSocket {
 }
 
 impl WebSocket {
-    pub fn new(stream: mpsc::Sender<Bytes>) -> Self {
+    pub fn new(stream: mpsc::Sender<SendFrame>) -> Self {
         Self {
             inner: Arc::new(ChannelConnection::new(stream)),
         }
+    }
+
+    pub(crate) async fn send_raw<P: Serialize>(
+        &self,
+        meta: &mut MsgMeta,
+        control: &P,
+        parts: &[Bytes],
+        state: &Arc<State>,
+    ) -> Result<()> {
+        self.inner
+            .send(meta, &state.waiter, "WebSocket", |meta| {
+                encode_raw(meta, control, parts).map_err(Into::into)
+            })
+            .await
     }
 
     /// Unique id of the underlying connection.
@@ -37,6 +54,10 @@ impl WebSocket {
     /// and recv loops both report failures — teardown must run once).
     pub(crate) fn mark_closed(&self) -> bool {
         self.inner.close_once()
+    }
+
+    pub(crate) async fn closed(&self) {
+        self.inner.closed().await;
     }
 
     pub(crate) fn is_closed(&self) -> bool {
@@ -63,7 +84,7 @@ impl SocketTrait for WebSocket {
     ) -> Result<()> {
         self.inner
             .send(meta, &state.waiter, "WebSocket", |meta| {
-                encode(meta, payload).map_err(Into::into)
+                encode(meta, payload).map(Into::into).map_err(Into::into)
             })
             .await
     }

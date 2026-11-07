@@ -573,7 +573,7 @@ impl Drop for ReceiveGuard {
 mod tests {
     use super::*;
 
-    use crate::{Context, SocketPoolConfig};
+    use crate::{Context, Payload, SocketPoolConfig};
 
     const SOURCE_ID: u64 = 7;
     const CONNECTION_ID: u64 = 41;
@@ -830,6 +830,9 @@ mod tests {
             buffer,
             _permit: permit,
         });
+        let payload = Payload::from(bytes);
+        assert_eq!(large.recv_bytes.available_permits(), 0);
+        let bytes = Bytes::from(payload);
         let cloned = bytes.clone();
         let slice = bytes.slice(1..4);
         assert_eq!(slice.as_ref(), b"ayl");
@@ -917,7 +920,7 @@ mod lifecycle_tests {
                 let gate = ack_gate.clone();
                 tokio::spawn(async move {
                     gate.notified().await;
-                    ctx.send_rsp::<(), Error>(Ok(())).await;
+                    ctx.send_rsp::<(), Error>(Ok(())).await.unwrap();
                 });
                 Ok(())
             })
@@ -1174,13 +1177,18 @@ mod lifecycle_tests {
                 },
             );
             let held = release.clone();
-            spawn_handler(context.clone(), method, Payload::Empty, |_, _| async move {
-                let permit = held.acquire().await.unwrap();
-                permit.forget();
-            });
+            spawn_handler(
+                context.clone(),
+                method,
+                Payload::default(),
+                |_, _| async move {
+                    let permit = held.acquire().await.unwrap();
+                    permit.forget();
+                },
+            );
             assert_eq!(state.metrics.server_inflight.load(Ordering::Relaxed), 1);
             context.msg_meta.method = rejected.into();
-            spawn_handler(context, rejected, Payload::Empty, |_, _| async {
+            spawn_handler(context, rejected, Payload::default(), |_, _| async {
                 panic!("all handlers must share the same capacity");
             });
             let response = tokio::time::timeout(Duration::from_secs(2), fixture.pending.recv())

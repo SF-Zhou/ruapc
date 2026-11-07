@@ -50,9 +50,12 @@ pub use client::{Client, ClientWithBuffers};
 mod core;
 #[doc(hidden)]
 pub use client::{RawCall, ResponseContract};
-pub use core::{Context, Listener, MethodSchema, Router, Server, State};
-#[doc(hidden)]
-pub use core::{catch_handler_panic, spawn_handler};
+#[cfg(test)]
+pub(crate) use core::spawn_handler;
+pub use core::{
+    Context, Listener, MethodContext, MethodProtocol, MethodSchema, MethodTransport, PayloadFormat,
+    Router, Server, State,
+};
 
 mod remote_memory;
 pub use remote_memory::{

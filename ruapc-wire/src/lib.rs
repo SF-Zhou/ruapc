@@ -46,5 +46,6 @@ mod encode;
 pub use encode::SendMsg;
 
 pub mod frame;
+pub mod raw;
 
 pub(crate) use ruapc_bufpool::Buffer;

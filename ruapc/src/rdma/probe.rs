@@ -132,7 +132,8 @@ mod tests {
                         // never pass as the independently attached READ nonce.
                         read_nonce: nonce,
                     }))
-                    .await;
+                    .await
+                    .unwrap();
                 });
                 Ok(())
             })

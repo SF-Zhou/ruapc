@@ -10,4 +10,6 @@
 
 mod schema;
 
-pub use schema::{MethodSchema, SchemaRegistry};
+pub use schema::{
+    MethodContext, MethodProtocol, MethodSchema, MethodTransport, PayloadFormat, SchemaRegistry,
+};

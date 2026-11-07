@@ -6,26 +6,12 @@ use crate::{MsgMeta, Result};
 #[cfg(feature = "rdma")]
 use crate::Buffer;
 
-/// Message payload supporting different memory backends.
+/// Owned, immutable message payload.
 ///
-/// The payload can be:
-/// - **Empty**: No data
-/// - **Normal**: Standard heap-allocated bytes
-/// - **RDMA**: Zero-copy registered buffer (requires "rdma" feature)
-///
-/// This abstraction allows efficient handling of different memory types
-/// while providing a uniform interface.
+/// Parsing and conversion to [`Bytes`] retain the underlying allocation without
+/// copying its contents, including registered buffers and custom byte owners.
 #[derive(Debug, Default)]
-pub enum Payload {
-    /// Empty payload (no data).
-    #[default]
-    Empty,
-    /// Normal heap-allocated payload.
-    Normal(Bytes),
-    /// Registered buffer payload with offset (requires "rdma" feature).
-    #[cfg(feature = "rdma")]
-    RDMA(Buffer, usize),
-}
+pub struct Payload(Bytes);
 
 impl Payload {
     /// Returns the length of the payload in bytes.
@@ -40,12 +26,7 @@ impl Payload {
     /// ```
     #[inline]
     pub fn len(&self) -> usize {
-        match self {
-            Payload::Empty => 0,
-            Payload::Normal(bytes) => bytes.len(),
-            #[cfg(feature = "rdma")]
-            Payload::RDMA(buffer, off) => buffer.len() - off,
-        }
+        self.0.len()
     }
 
     /// Checks if the payload is empty.
@@ -59,12 +40,7 @@ impl Payload {
     /// ```
     #[inline]
     pub fn is_empty(&self) -> bool {
-        match self {
-            Payload::Empty => true,
-            Payload::Normal(bytes) => bytes.is_empty(),
-            #[cfg(feature = "rdma")]
-            Payload::RDMA(buffer, off) => buffer.len() == *off,
-        }
+        self.0.is_empty()
     }
 
     /// Returns the payload data as a byte slice.
@@ -79,12 +55,7 @@ impl Payload {
     /// ```
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
-        match self {
-            Payload::Empty => &[],
-            Payload::Normal(bytes) => bytes,
-            #[cfg(feature = "rdma")]
-            Payload::RDMA(buffer, off) => &buffer[*off..],
-        }
+        &self.0
     }
 
     /// Advances the internal position by the specified offset.
@@ -94,14 +65,13 @@ impl Payload {
     /// # Arguments
     ///
     /// * `offset` - Number of bytes to advance
+    ///
+    /// # Panics
+    ///
+    /// Panics if `offset` exceeds the remaining payload length.
     #[inline]
     pub fn advance(&mut self, offset: usize) {
-        match self {
-            Payload::Empty => {}
-            Payload::Normal(bytes) => bytes.advance(offset),
-            #[cfg(feature = "rdma")]
-            Payload::RDMA(_, off) => *off += offset,
-        }
+        self.0.advance(offset);
     }
 
     /// Deserializes the payload into a specific type.
@@ -137,26 +107,21 @@ impl std::ops::Deref for Payload {
 impl From<Bytes> for Payload {
     #[inline]
     fn from(value: Bytes) -> Self {
-        Payload::Normal(value)
+        Self(value)
     }
 }
 
 impl From<BytesMut> for Payload {
     #[inline]
     fn from(value: BytesMut) -> Self {
-        Payload::Normal(value.into())
+        Self(value.into())
     }
 }
 
 impl From<Payload> for Bytes {
     #[inline]
     fn from(value: Payload) -> Self {
-        match value {
-            Payload::Empty => Bytes::new(),
-            Payload::Normal(bytes) => bytes,
-            #[cfg(feature = "rdma")]
-            Payload::RDMA(buffer, off) => Bytes::copy_from_slice(&buffer[off..]),
-        }
+        value.0
     }
 }
 
@@ -164,12 +129,14 @@ impl From<Payload> for Bytes {
 impl From<Buffer> for Payload {
     #[inline]
     fn from(value: Buffer) -> Self {
-        Payload::RDMA(value, 0)
+        Self(Bytes::from_owner(value))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
     use super::*;
     use crate::MsgFlags;
     use bytes::Bytes;
@@ -213,7 +180,7 @@ mod tests {
 
     #[test]
     fn test_payload_into_bytes_empty() {
-        let p = Payload::Empty;
+        let p = Payload::default();
         let b: Bytes = p.into();
         assert!(b.is_empty());
     }
@@ -231,19 +198,40 @@ mod tests {
         p.advance(3);
         assert_eq!(p.as_slice(), b"def");
         assert_eq!(p.len(), 3);
+        p.advance(3);
+        assert!(p.is_empty());
+        p.advance(0);
     }
 
     #[test]
     fn test_advance_empty_is_noop() {
-        let mut p = Payload::Empty;
+        let mut p = Payload::default();
         p.advance(0); // should not panic
         assert!(p.is_empty());
     }
 
     #[test]
+    fn advancing_past_the_end_panics_without_changing_the_payload() {
+        for mut payload in [
+            Payload::default(),
+            Payload::from(Bytes::from_static(b"abc")),
+        ] {
+            let original = payload.as_slice().to_vec();
+            let offset = payload.len() + 1;
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| {
+                    payload.advance(offset);
+                }))
+                .is_err()
+            );
+            assert_eq!(payload.as_slice(), original);
+        }
+    }
+
+    #[test]
     fn test_deserialize_empty_payload_as_null() {
         // Empty payload is treated as JSON null (→ Option<String>::None etc.)
-        let p = Payload::Empty;
+        let p = Payload::default();
         let v: Option<String> = p.deserialize(&json_meta()).unwrap();
         assert!(v.is_none());
     }

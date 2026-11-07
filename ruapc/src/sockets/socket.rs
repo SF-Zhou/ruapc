@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
+use bytes::Bytes;
 use ruapc_bufpool::DeviceIndex;
 use serde::Serialize;
 
 #[cfg(feature = "rdma")]
-use crate::rdma::RdmaSocket;
-use crate::{MsgMeta, Result, State, http::HttpSocket, tcp::TcpSocket, ws::WebSocket};
+use crate::{Error, ErrorKind, rdma::RdmaSocket};
+use crate::{MsgFlags, MsgMeta, Result, State, http::HttpSocket, tcp::TcpSocket, ws::WebSocket};
 
 /// Socket abstraction supporting multiple transport protocols.
 ///
@@ -30,6 +31,27 @@ pub enum Socket {
 }
 
 impl Socket {
+    /// Encodes control fields after queue admission and retains raw byte owners.
+    pub(crate) async fn send_raw<P: Serialize>(
+        &self,
+        meta: &mut MsgMeta,
+        control: &P,
+        parts: &[Bytes],
+        state: &Arc<State>,
+    ) -> Result<()> {
+        meta.flags.insert(MsgFlags::HasRawBytes);
+        match self {
+            Self::TCP(socket) => socket.send_raw(meta, control, parts, state).await,
+            Self::WS(socket) => socket.send_raw(meta, control, parts, state).await,
+            Self::HTTP(socket) => socket.send_raw(meta, control, parts, state).await,
+            #[cfg(feature = "rdma")]
+            Self::RDMA(_) => Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "segmented stream payloads do not support RDMA".into(),
+            )),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn conn_id(&self) -> Option<u64> {
         match self {

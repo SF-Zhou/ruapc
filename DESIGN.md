@@ -100,16 +100,27 @@ See [endpoint identity](docs/endpoints.md) for normalization and caller obligati
    trigger automatic retries.
 6. Server dispatch reserves capacity atomically from the shared
    `max_inflight_requests` cap for built-in and application methods, and drops
-   expired requests before execution. Generated handlers contain panics.
-   Running handlers are not cancelled by deadline expiry; they can poll
-   `Context::is_expired()`.
+   expired requests before execution. Registered asynchronous handlers share
+   one execution boundary for admission, deadlines, metrics and framework
+   failures. It catches panics during future construction, payload decoding,
+   handler execution and response encoding. Running handlers are not cancelled
+   when their deadline expires; they can poll `Context::is_expired()`.
 7. A response, connection failure, cancellation guard or expiry sweep removes
    the waiter. Response expiry uses a shared 50 ms sweep, subject to scheduler
    delay. Unary HTTP allocates its response waiter after receiving the complete
    request body.
 
 Connection closure is idempotent and eagerly fails its waiters. Eviction checks
-connection identity so an old connection cannot remove its replacement. RDMA
+connection identity so an old connection cannot remove its replacement. TCP and
+WebSocket bind both I/O tasks to that connection's close signal: ending either
+side cancels the other and drops queued or partially sent frames, independently
+of pool shutdown. HTTP/2 RPC streams bind their request/response bodies and
+receive task to the same signal; the client's dedicated connection driver also
+ends with the stream. On the server, each HTTP/2 response pipe is supervised
+separately and exits on closure even when blocked by flow control. Closing a
+body resets that stream and releases queued bytes; other streams on the shared
+HTTP/2 connection remain available. Closing a connection does not cancel running
+handlers. RDMA
 shutdown additionally follows the [poller and DMA cleanup rules](docs/qp-registry.md#closing-a-connection).
 
 Metrics use the `metrics` facade; applications install a recorder before
@@ -123,6 +134,15 @@ Metadata is always named-field MessagePack. `UseMessagePack` selects only the
 payload decoder; default clients use MessagePack, otherwise JSON. Compatible
 metadata fields use `#[serde(default)]` and omit empty/default values where
 appropriate. See [`MsgMeta`](ruapc-wire/src/meta.rs) for fields and defaults.
+
+Framework failures carry `IsFrameworkError` (bit 16) and an ordinary encoded
+`Err::<(), Error>(error)` payload, without `HasRawBytes`. Typed clients decode
+this branch before the declared application `Result<T, E>` and convert it with
+`E::from(error)`. Business errors retain the application's declared format and
+do not set the flag. Unary HTTP carries the same distinction in the
+`x-ruapc-framework-error: true` response header. Existing `Error` clients can
+still decode the unchanged error body; a new client cannot recover this
+distinction from an older server that omits the flag when using a custom `E`.
 
 [`ruapc-wire/src/encode.rs`](ruapc-wire/src/encode.rs) serializes directly into
 transport storage through the generic `SendMsg` interface and backfills lengths.
@@ -151,6 +171,12 @@ that span chunks need a lazily allocated assembly buffer. TCP keeps its
 incremental receive buffer. Both paths split complete bodies without copying.
 HTTP routing and unary JSON responses live in `sockets/http/service.rs`, while
 `http_socket_pool.rs` owns connection acquisition and streaming lifecycles.
+Remote-memory stream RPCs use a length-prefixed control value followed by raw
+bytes. `ruapc-wire::raw` owns that codec; `frame::SendFrame` retains an encoded
+prefix and owned `Bytes` segments. TCP uses bounded vectored writes, HTTP/2
+moves segments into DATA chunks, and WebSocket coalesces one binary message.
+The [built-in protocol](docs/builtin-services.md#remote-memory-memoryservice)
+defines control values and flags.
 RDMA dispatch workers decode complete, concatenated frames outside the poll
 loop using the same `frame` module. The whole SEND consumes one receive credit.
 Large payloads use the [offer and finish RPCs](docs/builtin-services.md#payload-transfer),
@@ -202,7 +228,9 @@ handlers and clients. It carries the application response and local destination
 availability; only the application response is serialized. Waiters retain source
 and target ownership through the request lifecycle. Inline writes hold a target's
 mutex for the complete batch and copy through its cached `BufferSet`. Read sources likewise
-cache their validated layouts. The memory crate supplies these synchronous
+cache their validated layouts and expose owned immutable slices for stream
+senders. Incoming raw payloads are scattered without a bulk decoding allocation.
+The memory crate supplies these synchronous
 operations without its own request registry or completion authority.
 
 RDMA transfers use READ in both directions: `remote_write` asks the client to

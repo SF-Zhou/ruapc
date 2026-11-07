@@ -6,7 +6,9 @@ mod server;
 pub use server::Server;
 
 mod router;
-pub use router::{MethodSchema, Router};
+pub use router::{
+    MethodContext, MethodProtocol, MethodSchema, MethodTransport, PayloadFormat, Router,
+};
 
 mod state;
 pub use state::State;
@@ -15,7 +17,8 @@ mod listener;
 pub use listener::Listener;
 
 mod panic_guard;
-pub use panic_guard::catch_handler_panic;
+pub(crate) use panic_guard::catch_handler_panic;
 
 mod dispatch;
-pub use dispatch::spawn_handler;
+#[cfg(test)]
+pub(crate) use dispatch::spawn_handler;

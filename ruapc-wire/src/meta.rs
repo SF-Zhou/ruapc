@@ -20,6 +20,15 @@ bitflags! {
         const IsRsp = 2;
         /// Encode the payload as MessagePack; otherwise use JSON.
         const UseMessagePack = 4;
+        /// Payload is a length-prefixed control value followed by raw bytes.
+        /// `UseMessagePack` selects the control value's codec. Decode with
+        /// [`crate::raw::decode`], not the ordinary payload decoder.
+        const HasRawBytes = 8;
+        /// Response contains a framework failure, independent of the declared
+        /// application error type. The RPC runtime decodes its ordinary error
+        /// payload before decoding an application response. Never combines
+        /// with `HasRawBytes` or `IsReq`.
+        const IsFrameworkError = 16;
     }
 }
 

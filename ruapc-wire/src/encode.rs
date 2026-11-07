@@ -65,6 +65,13 @@ impl MsgMeta {
         msg: &mut M,
     ) -> Result<(), M::Error> {
         msg.prepare()?;
+        if self.flags.contains(MsgFlags::HasRawBytes) {
+            return Err(CodecError::new(
+                CodecErrorKind::InvalidArgument,
+                "raw payloads require the raw frame encoder".into(),
+            )
+            .into());
+        }
 
         let meta_offset = msg.size();
         // Reserve the metadata length; `finish` backfills it after encoding.

@@ -1,22 +1,23 @@
 //! Shared send-queue ownership for TCP, WebSocket and HTTP/2 connections.
 
-use bytes::Bytes;
+use std::sync::Arc;
+
 use tokio::sync::mpsc;
 
 use super::{ConnectionLifecycle, SendRequest, reserve_send};
-use crate::{Error, ErrorKind, MsgMeta, Result, Waiter};
+use crate::{Error, ErrorKind, MsgMeta, Result, Waiter, msg::frame::SendFrame};
 
 #[derive(Debug)]
 pub(crate) struct ChannelConnection {
-    sender: mpsc::Sender<Bytes>,
-    lifecycle: ConnectionLifecycle,
+    sender: mpsc::Sender<SendFrame>,
+    lifecycle: Arc<ConnectionLifecycle>,
 }
 
 impl ChannelConnection {
-    pub(crate) fn new(sender: mpsc::Sender<Bytes>) -> Self {
+    pub(crate) fn new(sender: mpsc::Sender<SendFrame>) -> Self {
         Self {
             sender,
-            lifecycle: ConnectionLifecycle::new(),
+            lifecycle: Arc::new(ConnectionLifecycle::new()),
         }
     }
 
@@ -32,6 +33,14 @@ impl ChannelConnection {
         self.lifecycle.is_closed() || self.sender.is_closed()
     }
 
+    pub(crate) async fn closed(&self) {
+        self.lifecycle.closed().await;
+    }
+
+    pub(crate) fn close_handle(&self) -> Arc<ConnectionLifecycle> {
+        self.lifecycle.clone()
+    }
+
     /// Reserves capacity within the request's budget, then encodes and commits
     /// without yielding. Responses have no local response waiter or deadline.
     pub(crate) async fn send(
@@ -39,7 +48,7 @@ impl ChannelConnection {
         meta: &mut MsgMeta,
         waiter: &Waiter,
         transport: &'static str,
-        encode: impl FnOnce(&MsgMeta) -> Result<Bytes>,
+        encode: impl FnOnce(&MsgMeta) -> Result<SendFrame>,
     ) -> Result<()> {
         // Bind before checking closure: a concurrent teardown must see this
         // request, or this check must reject it. Reversing the order loses
@@ -85,7 +94,7 @@ impl ChannelConnection {
 mod tests {
     use std::{cell::Cell, time::Duration};
 
-    use bytes::BytesMut;
+    use bytes::{Bytes, BytesMut};
 
     use super::*;
     use crate::{
@@ -93,9 +102,11 @@ mod tests {
         msg::frame::{encode, parse_message},
     };
 
-    fn full_queue() -> (ChannelConnection, mpsc::Receiver<Bytes>) {
+    fn full_queue() -> (ChannelConnection, mpsc::Receiver<SendFrame>) {
         let (sender, receiver) = mpsc::channel(1);
-        sender.try_send(Bytes::from_static(b"occupied")).unwrap();
+        sender
+            .try_send(Bytes::from_static(b"occupied").into())
+            .unwrap();
         (ChannelConnection::new(sender), receiver)
     }
 
@@ -126,7 +137,7 @@ mod tests {
 
         assert_eq!(result.unwrap_err().kind, ErrorKind::Timeout);
         assert!(waiter.contains_message_id(msgid));
-        assert_eq!(receiver.try_recv().unwrap(), b"occupied"[..]);
+        assert_eq!(receiver.try_recv().unwrap().into_bytes(), b"occupied"[..]);
         assert_eq!(receiver.try_recv(), Err(mpsc::error::TryRecvError::Empty));
     }
 
@@ -163,7 +174,7 @@ mod tests {
 
         // Both the deadline and capacity are ready before send is polled again.
         tokio::time::sleep(Duration::from_millis(30)).await;
-        assert_eq!(receiver.try_recv().unwrap(), b"occupied"[..]);
+        assert_eq!(receiver.try_recv().unwrap().into_bytes(), b"occupied"[..]);
         assert_eq!(sending.await.unwrap_err().kind, ErrorKind::Timeout);
         assert_eq!(receiver.try_recv(), Err(mpsc::error::TryRecvError::Empty));
     }
@@ -183,7 +194,7 @@ mod tests {
 
             if release_capacity {
                 // Test closure and capacity becoming ready in the same poll.
-                assert_eq!(receiver.try_recv().unwrap(), b"occupied"[..]);
+                assert_eq!(receiver.try_recv().unwrap().into_bytes(), b"occupied"[..]);
             }
             assert!(connection.close_once());
             let result = tokio::time::timeout(Duration::from_secs(1), sending)
@@ -192,7 +203,7 @@ mod tests {
             assert_eq!(result.unwrap_err().kind, ErrorKind::ConnectionClosed);
 
             if !release_capacity {
-                assert_eq!(receiver.try_recv().unwrap(), b"occupied"[..]);
+                assert_eq!(receiver.try_recv().unwrap().into_bytes(), b"occupied"[..]);
             }
             assert_eq!(receiver.try_recv(), Err(mpsc::error::TryRecvError::Empty));
         }
@@ -208,19 +219,19 @@ mod tests {
         {
             let sending = connection.send(&mut meta, &waiter, "test", |meta| {
                 serializations.set(serializations.get() + 1);
-                encode(meta, &"payload").map_err(Into::into)
+                encode(meta, &"payload").map(Into::into).map_err(Into::into)
             });
             tokio::pin!(sending);
             assert!(futures_util::poll!(sending.as_mut()).is_pending());
             assert_eq!(serializations.get(), 0);
 
             tokio::time::sleep(Duration::from_millis(20)).await;
-            assert_eq!(receiver.try_recv().unwrap(), b"occupied"[..]);
+            assert_eq!(receiver.try_recv().unwrap().into_bytes(), b"occupied"[..]);
             sending.await.unwrap();
         }
 
         assert_eq!(serializations.get(), 1);
-        let mut encoded = BytesMut::from(receiver.try_recv().unwrap().as_ref());
+        let mut encoded = BytesMut::from(receiver.try_recv().unwrap().into_bytes().as_ref());
         let message = Message::parse(parse_message(&mut encoded).unwrap().unwrap()).unwrap();
         assert_eq!(message.meta, meta);
         assert!(message.meta.timeout_ms > 0);
@@ -246,11 +257,11 @@ mod tests {
         let (connection, mut receiver) = full_queue();
         {
             let sending = connection.send(&mut meta, &waiter, "test", |meta| {
-                encode(meta, &()).map_err(Into::into)
+                encode(meta, &()).map(Into::into).map_err(Into::into)
             });
             tokio::pin!(sending);
             assert!(futures_util::poll!(sending.as_mut()).is_pending());
-            assert_eq!(receiver.try_recv().unwrap(), b"occupied"[..]);
+            assert_eq!(receiver.try_recv().unwrap().into_bytes(), b"occupied"[..]);
             sending.await.unwrap();
         }
 
@@ -270,7 +281,7 @@ mod tests {
         let error = connection
             .send(&mut meta, &waiter, "test", |_| {
                 std::thread::sleep(Duration::from_millis(30));
-                Ok(Bytes::from_static(b"expired"))
+                Ok(Bytes::from_static(b"expired").into())
             })
             .await
             .unwrap_err();
@@ -290,7 +301,7 @@ mod tests {
         let error = connection
             .send(&mut meta, &waiter, "test", |_| {
                 drop(response);
-                Ok(Bytes::from_static(b"cancelled"))
+                Ok(Bytes::from_static(b"cancelled").into())
             })
             .await
             .unwrap_err();
@@ -312,7 +323,7 @@ mod tests {
         let error = connection
             .send(&mut meta, &waiter, "test", |_| {
                 assert!(connection.close_once());
-                Ok(Bytes::from_static(b"closed"))
+                Ok(Bytes::from_static(b"closed").into())
             })
             .await
             .unwrap_err();

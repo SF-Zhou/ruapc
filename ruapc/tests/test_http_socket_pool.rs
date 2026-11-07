@@ -88,6 +88,43 @@ async fn test_http_openapi_includes_builtin_methods() {
         assert!(paths.contains_key(path), "missing OpenAPI path: {path}");
     }
 
+    for (method, transport) in [
+        ("read_inline", "stream"),
+        ("write_inline", "stream"),
+        ("read_into_target", "rdma"),
+    ] {
+        let operation = &paths[&format!("/MemoryService/{method}")]["post"];
+        assert_eq!(operation["x-ruapc-transport"], transport, "{method}");
+        assert_eq!(operation["x-ruapc-context"], "original_peer", "{method}");
+    }
+    let pending = &paths["/MemoryService/request_is_pending"]["post"];
+    assert!(pending.get("x-ruapc-transport").is_none());
+    assert_eq!(pending["x-ruapc-context"], "original_peer");
+    assert!(!pending["description"].as_str().unwrap().contains("cannot"));
+    let raw_read = &paths["/MemoryService/read_inline"]["post"]["responses"]["200"]["content"];
+    let raw_write = &paths["/MemoryService/write_inline"]["post"]["requestBody"]["content"];
+    for content in [raw_read, raw_write] {
+        assert!(content.get("application/json").is_none());
+        let media = &content["application/octet-stream"];
+        assert_eq!(media["schema"]["type"], "string");
+        assert_eq!(media["schema"]["format"], "binary");
+        let reference = media["x-ruapc-control-schema"]["$ref"].as_str().unwrap();
+        assert!(
+            openapi_json
+                .pointer(reference.strip_prefix('#').unwrap())
+                .is_some()
+        );
+    }
+    let framework_error = &openapi_json["x-ruapc-framework-error"];
+    assert_eq!(framework_error["flag"], 16);
+    assert_eq!(framework_error["payload_format"], "serialized");
+    let reference = framework_error["schema"]["$ref"].as_str().unwrap();
+    let envelope = openapi_json
+        .pointer(reference.strip_prefix('#').unwrap())
+        .unwrap();
+    assert_eq!(envelope["oneOf"][0]["required"], serde_json::json!(["Ok"]));
+    assert_eq!(envelope["oneOf"][1]["required"], serde_json::json!(["Err"]));
+
     server.stop();
     server.join().await;
 }
@@ -121,6 +158,8 @@ async fn test_http_builtin_methods_dispatch_and_validate_context() {
 
     // Routing succeeds for built-ins; handler-specific prerequisites still
     // reject absent source requests, missing attachments and non-RDMA sockets.
+    // Raw writes additionally require the stream envelope and cannot decode a
+    // unary JSON body as a control header plus trailing bytes.
     for (path, payload, expected_error) in [
         (
             "/MemoryService/read_inline",
@@ -129,8 +168,8 @@ async fn test_http_builtin_methods_dispatch_and_validate_context() {
         ),
         (
             "/MemoryService/write_inline",
-            serde_json::json!({ "request_id": u64::MAX, "ops": [], "bytes": [] }),
-            ErrorKind::Timeout,
+            serde_json::json!({ "request_id": u64::MAX, "ops": [] }),
+            ErrorKind::DeserializeFailed,
         ),
         (
             "/MemoryService/read_into_target",

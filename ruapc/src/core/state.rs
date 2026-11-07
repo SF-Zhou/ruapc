@@ -320,7 +320,7 @@ mod tests {
                 write_regions: Vec::new(),
                 timeout_ms: 0,
             },
-            payload: Payload::Empty,
+            payload: Payload::default(),
         };
 
         let result = state.handle_recv(&socket, msg);

@@ -1,11 +1,12 @@
 //! Request execution: validate, acquire/send with retries, receive exactly once.
 
+use bytes::Bytes;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::{
-    Buffer, BufferAvailability, Context, Receiver, SocketTrait,
+    Buffer, BufferAvailability, Context, Message, Receiver, SocketTrait,
     core::ContextEndpoint,
     error::{Error, ErrorKind},
     msg::{MsgFlags, MsgMeta},
@@ -39,7 +40,42 @@ impl<'a> ReadAttachment<'a> {
     }
 }
 
+pub(crate) enum RequestPayload<'a, P> {
+    Serialized(&'a P),
+    Raw { control: &'a P, data: &'a [Bytes] },
+}
+
+/// Local ownership accompanying one logical call, shared by all attempts.
+struct Attachments<'a> {
+    read: ReadAttachment<'a>,
+    write: &'a mut Option<Arc<WriteTarget>>,
+    returned: Option<&'a mut BufferAvailability>,
+}
+
 impl Client {
+    /// Internal raw-memory calls share acquisition, queue admission, waiter
+    /// cleanup and the same no-retry-after-acceptance rule as typed calls.
+    pub(crate) async fn request_message<Req: Serialize, Rsp>(
+        &self,
+        ctx: &Context,
+        payload: RequestPayload<'_, Req>,
+        method: &str,
+        decode: impl FnOnce(Message) -> Result<Rsp, Error>,
+    ) -> Result<Rsp, Error> {
+        self.execute_request(
+            ctx,
+            payload,
+            Attachments {
+                read: ReadAttachment::new(None, None),
+                write: &mut None,
+                returned: None,
+            },
+            method,
+            decode,
+        )
+        .await
+    }
+
     /// Executes one logical call, including pre-wire retries and metrics.
     /// `write_buffers_slot` receives the target only if it is available and
     /// uniquely held when the response arrives.
@@ -57,68 +93,89 @@ impl Client {
         Rsp: for<'c> Deserialize<'c> + JsonSchema,
         E: std::error::Error + From<Error> + for<'c> Deserialize<'c>,
     {
+        self.execute_request(
+            ctx,
+            RequestPayload::Serialized(req),
+            Attachments {
+                read: read_attachment,
+                write: write_target,
+                returned: write_buffers_slot,
+            },
+            method_name,
+            |response| {
+                response
+                    .payload
+                    .deserialize(&response.meta)
+                    .map_err(E::from)?
+            },
+        )
+        .await
+    }
+
+    async fn execute_request<Req, Rsp, E>(
+        &self,
+        ctx: &Context,
+        payload: RequestPayload<'_, Req>,
+        attachments: Attachments<'_>,
+        method_name: &str,
+        decode: impl FnOnce(Message) -> std::result::Result<Rsp, E>,
+    ) -> std::result::Result<Rsp, E>
+    where
+        Req: Serialize,
+        E: From<Error>,
+    {
         let metrics = ctx.state.metrics.client_method(method_name).start();
-        let result = self
-            .request_inner(
-                ctx,
-                req,
-                read_attachment,
-                write_target,
-                write_buffers_slot,
-                method_name,
-            )
-            .await;
+        let result = async {
+            if ctx.is_expired() {
+                return Err(Error::new(
+                    ErrorKind::Timeout,
+                    "request deadline already expired".to_string(),
+                )
+                .into());
+            }
+
+            let sent = self
+                .send_with_retries(
+                    ctx,
+                    &payload,
+                    attachments.read,
+                    attachments.write.as_ref(),
+                    method_name,
+                )
+                .await?;
+            // Never retry after send: a missing response cannot tell us whether
+            // the peer executed the request.
+            let (response, returned_target) = sent.receiver.recv().await?;
+            // Drop our clone before trying to recover the target. A handler still
+            // holding it, or DMA still owning its buffers, prevents recovery.
+            let had_attachment = attachments.write.take().is_some();
+            if let Some(slot) = attachments.returned {
+                *slot = match returned_target.and_then(WriteTarget::try_into_buffers) {
+                    Some(buffers) => BufferAvailability::Available(buffers),
+                    None if had_attachment => BufferAvailability::Unavailable,
+                    None => BufferAvailability::NotAttached,
+                };
+            }
+            if response.meta.flags.contains(MsgFlags::IsFrameworkError) {
+                let error = response
+                    .payload
+                    .deserialize::<Result<(), Error>>(&response.meta)?
+                    .err()
+                    .unwrap_or_else(|| {
+                        Error::new(
+                            ErrorKind::InvalidArgument,
+                            "framework error response contains a success value".into(),
+                        )
+                    });
+                return Err(error.into());
+            }
+            decode(response)
+        }
+        .await;
         if result.is_err() {
             metrics.failed();
         }
         result
-    }
-
-    async fn request_inner<Req, Rsp, E>(
-        &self,
-        ctx: &Context,
-        req: &Req,
-        read_attachment: ReadAttachment<'_>,
-        write_target: &mut Option<Arc<WriteTarget>>,
-        write_buffers_slot: Option<&mut BufferAvailability>,
-        method_name: &str,
-    ) -> std::result::Result<Rsp, E>
-    where
-        Req: Serialize + JsonSchema,
-        Rsp: for<'c> Deserialize<'c> + JsonSchema,
-        E: std::error::Error + From<Error> + for<'c> Deserialize<'c>,
-    {
-        if ctx.is_expired() {
-            return Err(Error::new(
-                ErrorKind::Timeout,
-                "request deadline already expired".to_string(),
-            )
-            .into());
-        }
-
-        let sent = self
-            .send_with_retries(
-                ctx,
-                req,
-                read_attachment,
-                write_target.as_ref(),
-                method_name,
-            )
-            .await?;
-        // Never retry after send: a missing response cannot tell us whether
-        // the peer executed the request.
-        let (response, returned_target) = sent.receiver.recv().await?;
-        // Drop our clone before trying to recover the target. A handler still
-        // holding it, or DMA still owning its buffers, prevents recovery.
-        let had_attachment = write_target.take().is_some();
-        if let Some(slot) = write_buffers_slot {
-            *slot = match returned_target.and_then(WriteTarget::try_into_buffers) {
-                Some(buffers) => BufferAvailability::Available(buffers),
-                None if had_attachment => BufferAvailability::Unavailable,
-                None => BufferAvailability::NotAttached,
-            };
-        }
-        response.payload.deserialize(&response.meta)?
     }
 
     /// Acquires a socket and sends the request, retrying only failures that
@@ -126,13 +183,13 @@ impl Client {
     async fn send_with_retries<'a, Req>(
         &self,
         ctx: &'a Context,
-        req: &Req,
+        payload: &RequestPayload<'_, Req>,
         read_attachment: ReadAttachment<'_>,
         write_target: Option<&Arc<WriteTarget>>,
         method_name: &str,
     ) -> Result<SentRequest<'a>, Error>
     where
-        Req: Serialize + JsonSchema,
+        Req: Serialize,
     {
         let connect_deadline = capped_deadline(
             std::time::Instant::now(),
@@ -154,7 +211,7 @@ impl Client {
             let result = self
                 .try_send(
                     ctx,
-                    req,
+                    payload,
                     read_attachment,
                     write_target,
                     method_name,
@@ -193,14 +250,14 @@ impl Client {
     async fn try_send<'a, Req>(
         &self,
         ctx: &'a Context,
-        req: &Req,
+        payload: &RequestPayload<'_, Req>,
         read_attachment: ReadAttachment<'_>,
         write_target: Option<&Arc<WriteTarget>>,
         method_name: &str,
         attempt: AttemptOptions<'_>,
     ) -> std::result::Result<SentRequest<'a>, AttemptFailure>
     where
-        Req: Serialize + JsonSchema,
+        Req: Serialize,
     {
         let AttemptOptions {
             endpoint,
@@ -266,7 +323,13 @@ impl Client {
             // tree inherits the shrunk deadline.
             timeout_ms: wire_timeout_ms(timeout),
         };
-        if let Err(err) = socket.send(&mut meta, req, &ctx.state).await {
+        let send_result = match payload {
+            RequestPayload::Raw { control, data } => {
+                socket.send_raw(&mut meta, control, data, &ctx.state).await
+            }
+            RequestPayload::Serialized(req) => socket.send(&mut meta, req, &ctx.state).await,
+        };
+        if let Err(err) = send_result {
             // Closure and expiry can race while waiting for capacity. An
             // exhausted response budget must not start another send attempt.
             if std::time::Instant::now() >= response_deadline {
@@ -289,7 +352,7 @@ struct SentRequest<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Socket, SocketPoolConfig, tcp::TcpSocket};
+    use crate::{Socket, SocketPoolConfig, msg::frame::SendFrame, tcp::TcpSocket};
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use ruapc_bufpool::{BufferPool, EmptyDevices};
     use std::{
@@ -327,7 +390,7 @@ mod tests {
         }
     }
 
-    fn connected_context(sender: tokio::sync::mpsc::Sender<bytes::Bytes>) -> Context {
+    fn connected_context(sender: tokio::sync::mpsc::Sender<SendFrame>) -> Context {
         let config = SocketPoolConfig {
             #[cfg(feature = "rdma")]
             rdma: None,
@@ -342,6 +405,77 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    #[tokio::test]
+    async fn raw_requests_use_selected_codec_and_the_common_response_path() {
+        for use_msgpack in [false, true] {
+            for framework_error in [false, true] {
+                let (sender, mut queue) = tokio::sync::mpsc::channel(1);
+                let ctx = connected_context(sender);
+                let client = Client {
+                    use_msgpack,
+                    ..Default::default()
+                };
+                let parts = [Bytes::from_static(b"raw data")];
+                let mut call = Box::pin(client.request_message(
+                    &ctx,
+                    RequestPayload::Raw {
+                        control: &42u64,
+                        data: &parts,
+                    },
+                    "Test/raw",
+                    |message| {
+                        assert!(
+                            !framework_error,
+                            "framework errors precede application decoding"
+                        );
+                        message
+                            .payload
+                            .deserialize::<Result<u64, Error>>(&message.meta)?
+                    },
+                ));
+                assert!(futures_util::poll!(call.as_mut()).is_pending());
+                let frame = queue.try_recv().unwrap().into_bytes();
+                let request = Message::parse(frame.slice(ruapc_wire::frame::HEADER_LEN..)).unwrap();
+                assert_eq!(
+                    request.meta.flags.contains(MsgFlags::UseMessagePack),
+                    use_msgpack
+                );
+                let (control, data) =
+                    ruapc_wire::raw::decode::<u64>(&request.payload, request.meta.flags).unwrap();
+                assert_eq!(control, 42);
+                assert_eq!(data, b"raw data");
+
+                let mut meta = MsgMeta {
+                    msgid: request.meta.msgid,
+                    flags: MsgFlags::IsRsp | (request.meta.flags & MsgFlags::UseMessagePack),
+                    ..Default::default()
+                };
+                let response = if framework_error {
+                    meta.flags.insert(MsgFlags::IsFrameworkError);
+                    Err(Error::kind(ErrorKind::Overloaded))
+                } else {
+                    Ok(7u64)
+                };
+                let bytes = ruapc_wire::frame::encode(&meta, &response).unwrap();
+                ctx.state.waiter.post(
+                    meta.msgid,
+                    Message::parse(bytes.slice(ruapc_wire::frame::HEADER_LEN..)).unwrap(),
+                );
+                let result = call.await;
+                if framework_error {
+                    assert_eq!(result.unwrap_err().kind, ErrorKind::Overloaded);
+                } else {
+                    assert_eq!(result.unwrap(), 7);
+                }
+                assert_eq!(ctx.state.waiter.pending_count(), 0);
+                assert!(
+                    queue.try_recv().is_err(),
+                    "accepted calls must not be retried"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -382,7 +516,7 @@ mod tests {
     async fn full_send_queue_observes_parent_deadline_without_retrying() {
         let (sender, mut queue) = tokio::sync::mpsc::channel(1);
         sender
-            .send(bytes::Bytes::from_static(b"occupied"))
+            .send(bytes::Bytes::from_static(b"occupied").into())
             .await
             .unwrap();
         let mut ctx = connected_context(sender);
@@ -408,7 +542,7 @@ mod tests {
         .expect("full queue must not hide the request deadline");
         assert_eq!(result.unwrap_err().kind, ErrorKind::Timeout);
         assert_eq!(ctx.state.waiter.pending_count(), 0);
-        assert_eq!(queue.recv().await.unwrap(), b"occupied"[..]);
+        assert_eq!(queue.recv().await.unwrap().into_bytes(), b"occupied"[..]);
         assert!(
             queue.try_recv().is_err(),
             "expired request was never accepted"
@@ -538,7 +672,7 @@ mod tests {
     async fn cancelling_queue_admission_removes_waiter_without_sending() {
         let (sender, mut queue) = tokio::sync::mpsc::channel(1);
         sender
-            .send(bytes::Bytes::from_static(b"occupied"))
+            .send(bytes::Bytes::from_static(b"occupied").into())
             .await
             .unwrap();
         let ctx = connected_context(sender);
@@ -561,7 +695,7 @@ mod tests {
         assert_eq!(ctx.state.waiter.pending_count(), 1);
         drop(request);
         assert_eq!(ctx.state.waiter.pending_count(), 0);
-        assert_eq!(queue.recv().await.unwrap(), b"occupied"[..]);
+        assert_eq!(queue.recv().await.unwrap().into_bytes(), b"occupied"[..]);
         assert!(queue.try_recv().is_err());
     }
 
@@ -618,5 +752,88 @@ mod tests {
             matches!(value("ruapc_client_latency_seconds"), DebugValue::Histogram(values) if values.len() == 1)
         );
         assert_eq!(ctx.state.waiter.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn framework_error_recovers_write_buffers_before_converting_custom_error() {
+        #[derive(Debug, Deserialize)]
+        struct ApplicationError {
+            framework: Error,
+        }
+
+        impl std::fmt::Display for ApplicationError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.framework.fmt(f)
+            }
+        }
+
+        impl std::error::Error for ApplicationError {}
+
+        impl From<Error> for ApplicationError {
+            fn from(framework: Error) -> Self {
+                Self { framework }
+            }
+        }
+
+        for use_msgpack in [false, true] {
+            let (sender, mut queue) = tokio::sync::mpsc::channel(1);
+            let ctx = connected_context(sender);
+            let mut buffer = ctx.state.buffer_pool.allocate(8).unwrap();
+            buffer.set_len(8);
+            buffer.copy_from_slice(b"original");
+            let pointer = buffer.as_ptr();
+            let client = Client {
+                use_msgpack,
+                ..Default::default()
+            };
+            let attached = client.with_write_buffers(vec![buffer]);
+            let mut call = Box::pin(attached.ruapc_request::<(), (), ApplicationError>(
+                &ctx,
+                &(),
+                None,
+                "Test/framework_with_target",
+            ));
+            assert!(futures_util::poll!(call.as_mut()).is_pending());
+            let frame = queue.try_recv().unwrap().into_bytes();
+            let request = Message::parse(frame.slice(ruapc_wire::frame::HEADER_LEN..)).unwrap();
+            assert_eq!(request.meta.write_regions.len(), 1);
+            assert_eq!(ctx.state.waiter.pending_count(), 1);
+
+            let meta = MsgMeta {
+                msgid: request.meta.msgid,
+                flags: MsgFlags::IsRsp
+                    | MsgFlags::IsFrameworkError
+                    | (request.meta.flags & MsgFlags::UseMessagePack),
+                ..Default::default()
+            };
+            let response = Err::<(), Error>(Error::new(
+                ErrorKind::Overloaded,
+                "admission refused".into(),
+            ));
+            let frame = ruapc_wire::frame::encode(&meta, &response).unwrap();
+            ctx.state.waiter.post(
+                meta.msgid,
+                Message::parse(frame.slice(ruapc_wire::frame::HEADER_LEN..)).unwrap(),
+            );
+            let error = call.await.unwrap_err().framework;
+            assert_eq!(error.kind, ErrorKind::Overloaded);
+            assert_eq!(error.msg, "admission refused");
+
+            let BufferAvailability::Available(buffers) = attached.take_write_buffers() else {
+                panic!("framework failure must return an available write target");
+            };
+            assert_eq!(buffers.len(), 1);
+            assert_eq!(buffers[0].as_ptr(), pointer);
+            assert_eq!(&buffers[0][..], b"original");
+            assert!(matches!(
+                attached.take_write_buffers(),
+                BufferAvailability::NotAttached
+            ));
+            assert_eq!(ctx.state.waiter.pending_count(), 0);
+            assert!(
+                queue.try_recv().is_err(),
+                "accepted calls must not be retried"
+            );
+        }
     }
 }

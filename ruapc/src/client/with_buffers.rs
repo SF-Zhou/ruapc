@@ -197,7 +197,7 @@ impl<'a> ClientWithBuffers<'a> {
             }
         } else if had_attachment {
             // Before a response arrives, the caller still holds the target.
-            // Afterwards, request_inner has already tried to recover it.
+            // Afterwards, the request executor has already tried to recover it.
             let recovered = match target.take() {
                 Some(target) => match WriteTarget::try_into_buffers(target) {
                     Some(buffers) => BufferAvailability::Available(buffers),
@@ -324,7 +324,7 @@ mod tests {
         buffer.copy_from_slice(b"keep");
         let wrapper = client.with_write_buffers(vec![buffer]);
         let peer = async {
-            let encoded = queue.recv().await.unwrap();
+            let encoded = queue.recv().await.unwrap().into_bytes();
             let mut encoded = BytesMut::from(encoded.as_ref());
             let request =
                 Message::parse(frame::parse_message(&mut encoded).unwrap().unwrap()).unwrap();

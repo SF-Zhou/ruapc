@@ -8,7 +8,9 @@ pub(crate) use send_queue::{SendRequest, reserve_send};
 mod connect;
 pub(crate) use channel::ChannelConnection;
 mod lifecycle;
-pub(crate) use lifecycle::{ConnectionLifecycle, ConnectionMap, PoolConnection};
+pub(crate) use lifecycle::{
+    ConnectionCloseGuard, ConnectionLifecycle, ConnectionMap, PoolConnection,
+};
 
 mod endpoint;
 pub use endpoint::{Endpoint, ListenMode, Transport};

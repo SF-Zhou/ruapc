@@ -38,6 +38,15 @@
 //!
 //! Methods become `fn -> impl Future<Output = ...> + Send`. Implementations
 //! may still use `async fn`; the compiler checks that their futures are `Send`.
+//! Registration delegates to `Router::add_handler`, so generated services and
+//! explicitly registered asynchronous handlers share admission, deadline,
+//! metrics and failure handling. Panics during decoding, future construction,
+//! handler execution or response encoding become framework errors. A running
+//! handler is not cancelled when its deadline expires.
+//!
+//! Application errors retain the declared `E`. Framework errors, including
+//! overload and panic, have a separate response marker and reach the client
+//! through `E::from(ruapc::Error)` rather than being deserialized as `E`.
 //!
 //! ## Responses with buffers
 //!

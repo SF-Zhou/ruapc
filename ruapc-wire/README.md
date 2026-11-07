@@ -12,6 +12,7 @@ Message metadata and MessagePack payloads are decoded with the shared
 `MAX_DECODE_DEPTH` nesting limit, so every
 transport applies the same bound to structure this crate parses; JSON payloads
 are bounded internally by `serde_json` at the same depth.
+Metadata preserves flag bits without validating their combinations.
 
 `MsgMeta::serialize_to` uses the generic `SendMsg` storage interface to write
 directly into a destination and backfill lengths. It returns `Result<(), M::Error>`;
@@ -34,6 +35,29 @@ one-frame WebSocket binary messages and complete RDMA SEND aggregates. Every
 carrier uses `[RUA!: 4B][body_len: 4B][meta_len: 4B][meta][payload]` and the
 same frame size limit. `frame::encode_header` lets registered-buffer serializers
 backfill that header without an intermediate allocation.
+
+`frame::encode_parts` returns a `SendFrame` containing a small encoded prefix
+and cloned `Bytes` owners, without copying payload segments. The combined frame
+obeys the same size limit as contiguous encoding. `SendFrame::into_bytes`
+coalesces only when the transport needs contiguous storage.
+`SendFrame::from(Bytes)` only wraps caller-validated, already framed bytes,
+such as the output of `frame::encode`; it does not validate untrusted input.
+Frame equality compares the complete bytes regardless of segmentation.
+
+Use `frame::encode_raw` for control values followed by unencoded byte segments.
+It writes metadata and the control prefix into one allocation, selects the
+control codec from the same metadata, and retains the data's `Bytes` owners.
+The message must carry `HasRawBytes`. Ordinary `frame::encode` and
+`MsgMeta::serialize_to` reject that flag, so a typed payload cannot accidentally
+be sent as a raw payload. `encode_parts` remains the low-level framing entry
+for callers that already own a complete, correctly encoded payload.
+
+`raw::encode_header` writes only a length-prefixed control value. `raw::decode`
+validates the control length and codec and borrows the trailing raw bytes from
+the input. These payloads require `MsgFlags::HasRawBytes`; the ordinary payload
+decoder rejects them. The control codec still follows `UseMessagePack`.
+Callers must validate the raw byte count against their transfer plan before
+using it. See the [remote-memory protocol](../docs/builtin-services.md#remote-memory-memoryservice).
 
 These codecs describe bytes and owned storage. Connection admission, sending,
 RDMA transfer ownership and completion validation remain in the transport

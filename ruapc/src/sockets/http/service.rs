@@ -169,8 +169,11 @@ impl HttpService {
             .await
             .map_err(|e| Error::new(ErrorKind::HttpWaitRspFailed, e.to_string()))?;
 
-        Ok(Response::builder()
-            .header("Content-Type", "application/json")
+        let mut response = Response::builder().header("Content-Type", "application/json");
+        if msg.meta.flags.contains(MsgFlags::IsFrameworkError) {
+            response = response.header("x-ruapc-framework-error", "true");
+        }
+        Ok(response
             .body(Either::Left(Full::new(msg.payload.into())))
             .unwrap())
     }
@@ -217,7 +220,7 @@ mod tests {
                         ctx.remaining_time().unwrap().as_millis() as u64,
                         ctx.state.waiter.pending_count(),
                     );
-                    ctx.send_rsp::<_, Error>(Ok(observed)).await;
+                    ctx.send_rsp::<_, Error>(Ok(observed)).await.unwrap();
                 });
                 Ok(())
             }),

@@ -188,7 +188,7 @@ async fn test_rdma() {
 
     let mut ctx = ruapc::Context::create(&config).unwrap();
     client.hello(&ctx, &"ruapc".to_string()).await.unwrap_err();
-    ctx.send_rsp(Result::Ok(())).await;
+    assert!(ctx.send_rsp(Result::Ok(())).await.is_err());
 
     let ctx = ctx.with_endpoint(Endpoint::rdma(Transport::TCP, [addr]).unwrap());
     for _ in 0..256 {

@@ -27,7 +27,7 @@ pub(crate) fn service(service: Service) -> syn::Result<TokenStream> {
         .iter()
         .map(|method| client_method(method, &krate))
         .collect();
-    let registrations = methods.iter().map(|method| registration(method, &krate));
+    let registrations = methods.iter().map(registration);
 
     Ok(quote! {
         #(#attrs)*
@@ -107,7 +107,7 @@ fn client_method(method: &Method, krate: &TokenStream) -> TokenStream {
     }
 }
 
-fn registration(method: &Method, krate: &TokenStream) -> TokenStream {
+fn registration(method: &Method) -> TokenStream {
     let conditions = &method.conditions;
     let ident = &method.signature.ident;
     let request = &method.request;
@@ -117,21 +117,14 @@ fn registration(method: &Method, krate: &TokenStream) -> TokenStream {
         #(#conditions)*
         {
             let this = self.clone();
-            router.add_method::<#request, #response>(#wire_name, ::std::boxed::Box::new(move |ctx, payload| {
+            router.add_handler::<#request, #response, _, _>(#wire_name, move |mut ctx, payload| {
                 let this = this.clone();
-                #krate::spawn_handler(ctx, #wire_name, payload, move |mut ctx, payload| async move {
-                    match payload.deserialize(&ctx.msg_meta) {
-                        Ok(req) => {
-                            match #krate::catch_handler_panic(this.#ident(&ctx, &req)).await {
-                                Ok(result) => ctx.send_rsp(result).await,
-                                Err(err) => ctx.send_err_rsp(err).await,
-                            }
-                        }
-                        Err(err) => ctx.send_err_rsp(err).await,
-                    }
-                });
-                Ok(())
-            }));
+                async move {
+                    let req = payload.deserialize(&ctx.msg_meta)?;
+                    let result = this.#ident(&ctx, &req).await;
+                    ctx.send_rsp(result).await
+                }
+            });
         }
     }
 }

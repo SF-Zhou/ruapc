@@ -1,6 +1,5 @@
 use std::{net::SocketAddr, sync::Arc};
 
-use bytes::Bytes;
 use futures_util::{
     SinkExt, StreamExt,
     stream::{SplitSink, SplitStream},
@@ -19,7 +18,7 @@ use crate::{
     BufferPool, ConnectionMap, Devices, Endpoint, Message, RawStream, Socket, SocketPoolConfig,
     SocketPoolTrait, State, TaskSupervisor,
     error::{Error, ErrorKind, Result},
-    msg::frame::{FrameDecoder, MAX_MSG_SIZE},
+    msg::frame::{FrameDecoder, MAX_MSG_SIZE, SendFrame},
     sockets::{connect::ConnectGroups, tcp},
 };
 
@@ -172,6 +171,8 @@ impl WebSocketPool {
             let state = state.clone();
             async move {
                 let error = tokio::select! {
+                    biased;
+                    () = web_socket.closed() => return,
                     () = task_supervisor.stopped() => {
                         Error::new(ErrorKind::ConnectionClosed, "WebSocket pool stopped".into())
                     }
@@ -201,6 +202,8 @@ impl WebSocketPool {
             let state = state.clone();
             async move {
                 let error = tokio::select! {
+                    biased;
+                    () = web_socket.closed() => return,
                     () = recv_task.stopped() => {
                         Error::new(ErrorKind::ConnectionClosed, "WebSocket pool stopped".into())
                     }
@@ -293,14 +296,17 @@ impl WebSocketPool {
 
     async fn start_send_loop<S>(
         mut send_stream: SplitSink<WebSocketStream<S>, tungstenite::Message>,
-        mut receiver: mpsc::Receiver<Bytes>,
+        mut receiver: mpsc::Receiver<SendFrame>,
     ) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
         while let Some(bytes) = receiver.recv().await {
+            // Tungstenite accepts one contiguous binary message. Coalesce a
+            // segmented frame exactly once here; its framing/masking may copy
+            // again internally, but ordinary frames keep their allocation.
             send_stream
-                .send(tungstenite::Message::Binary(bytes))
+                .send(tungstenite::Message::Binary(bytes.into_bytes()))
                 .await
                 .map_err(|e| Error::new(ErrorKind::WebSocketSendFailed, e.to_string()))?;
         }
@@ -317,6 +323,76 @@ impl std::fmt::Debug for WebSocketPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Context, MsgFlags, MsgMeta};
+    use bytes::Bytes;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn receive_eof_cancels_blocked_writer_and_releases_queued_sources() {
+        struct Owner(Arc<Vec<u8>>);
+        impl AsRef<[u8]> for Owner {
+            fn as_ref(&self) -> &[u8] {
+                self.0.as_slice()
+            }
+        }
+        let ctx = Context::create(&SocketPoolConfig {
+            rdma: None,
+            ..Default::default()
+        })
+        .unwrap();
+        let weak_state = Arc::downgrade(&ctx.state);
+        let pool = WebSocketPool::create(
+            &SocketPoolConfig::default(),
+            &ctx.state.devices,
+            &ctx.state.buffer_pool,
+        )
+        .unwrap();
+        let (stream, mut peer) = tokio::io::duplex(16);
+        let stream =
+            WebSocketStream::from_raw_socket(stream, tungstenite::protocol::Role::Server, None)
+                .await;
+        let socket = pool
+            .add_socket(None, "127.0.0.1:1".parse().unwrap(), stream, &ctx.state)
+            .unwrap();
+        let source = Arc::new(vec![7; 1024]);
+        let transport = Socket::WS(socket.clone());
+        // Tungstenite coalesces the first frame before blocking on its tiny
+        // output stream. A second frame stays queued with its original owner.
+        for _ in 0..2 {
+            transport
+                .send_raw(
+                    &mut MsgMeta {
+                        flags: MsgFlags::IsRsp,
+                        ..Default::default()
+                    },
+                    &(),
+                    &[Bytes::from_owner(Owner(source.clone()))],
+                    &ctx.state,
+                )
+                .await
+                .unwrap();
+        }
+        let mut prefix = [0; 8];
+        peer.read_exact(&mut prefix).await.unwrap();
+        assert!(Arc::strong_count(&source) > 1);
+        peer.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), socket.closed())
+            .await
+            .unwrap();
+        drop(transport);
+        drop(socket);
+        drop(ctx);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while weak_state.strong_count() != 0 || Arc::strong_count(&source) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both WebSocket tasks and queued sources must leave with the connection");
+        pool.stop();
+        pool.join().await;
+    }
 
     #[tokio::test]
     async fn test_web_socket_pool_debug_format() {

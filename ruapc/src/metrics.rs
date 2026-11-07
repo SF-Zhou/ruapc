@@ -6,9 +6,9 @@
 //! emission is a no-op.
 //!
 //! Per-method handles are interned in a [`dashmap::DashMap`] so the hot
-//! path costs one lock-free lookup instead of label allocation. Handles
-//! bind to the recorder installed at first use: install the recorder
-//! before serving traffic.
+//! path uses a shard read lock and clones cached handles instead of allocating
+//! labels. Handles bind to the recorder installed at first use: install the
+//! recorder before serving traffic.
 //!
 //! # Emitted metrics
 //!
@@ -25,6 +25,7 @@
 //! | `ruapc_connections` | gauge | `transport` |
 //! | `ruapc_requests_rejected_total` | counter | |
 //! | `ruapc_requests_expired_total` | counter | |
+//! | `ruapc_framework_response_send_failures_total` | counter | |
 //! | `ruapc_waiter_pending` | gauge | |
 
 use std::sync::atomic::AtomicI64;
@@ -151,6 +152,12 @@ impl Metrics {
     /// execution.
     pub(crate) fn request_expired(&self) {
         counter!("ruapc_requests_expired_total").increment(1);
+    }
+
+    /// A framework failure could not be delivered to its caller. Separate from
+    /// the method's error count, which already includes the original failure.
+    pub(crate) fn framework_response_send_failed(&self) {
+        counter!("ruapc_framework_response_send_failures_total").increment(1);
     }
 }
 

@@ -109,6 +109,13 @@ transfer-completion evidence.
 failure returns the same `BufferSetError` recovery contract. Sources can be
 shared through `Arc<ReadSource>`; recovering owned buffers requires uniqueness.
 
+`ReadSource::slices(&CopyBatch)` checks the entire source batch and returns
+owned `ReadSlice` views in operation order, split at buffer boundaries. It
+allocates view metadata without copying source bytes. Each view implements
+`AsRef<[u8]>` and retains the immutable source, allowing transports to queue
+source ranges safely. Source recovery requires all views to be dropped, even
+if the request that created them has already completed or been cancelled.
+
 RuaPC keeps write-target checkout, RPC attachments and waiter registration,
 reverse RPCs, deadlines, READ execution and completion witnesses in `ruapc`.
 An inline write holds the target's mutex for the complete scatter batch. The

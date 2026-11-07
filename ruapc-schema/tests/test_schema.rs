@@ -1,4 +1,6 @@
-use ruapc_schema::SchemaRegistry;
+use ruapc_schema::{
+    MethodContext, MethodProtocol, MethodSchema, MethodTransport, PayloadFormat, SchemaRegistry,
+};
 use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -182,4 +184,129 @@ fn unsupported_openapi_schema_is_returned_as_an_error() {
             .build([("Invalid/run", &schema)].into_iter())
             .is_err()
     );
+}
+
+#[test]
+fn legacy_method_descriptions_default_to_serialized_standalone_calls() {
+    let mut registry = SchemaRegistry::default();
+    let schema = registry.register::<Request, Response>();
+    let legacy = serde_json::to_value(&schema).unwrap();
+    assert_eq!(legacy.as_object().unwrap().len(), 2);
+    assert!(legacy.get("protocol").is_none());
+    let restored: MethodSchema = serde_json::from_value(legacy).unwrap();
+    assert_eq!(restored.protocol, MethodProtocol::default());
+
+    let restored: MethodSchema = serde_json::from_value(json!({
+        "request_schema": schema.request_schema,
+        "response_schema": schema.response_schema,
+        "protocol": { "response_format": "raw" }
+    }))
+    .unwrap();
+    assert_eq!(restored.protocol.response_format, PayloadFormat::Raw);
+    assert_eq!(restored.protocol.request_format, PayloadFormat::Serialized);
+    assert_eq!(restored.protocol.transport, MethodTransport::Any);
+    assert_eq!(restored.protocol.context, MethodContext::Standalone);
+}
+
+#[test]
+fn raw_payloads_project_control_schemas_and_connection_requirements() {
+    let mut registry = SchemaRegistry::default();
+    registry.register_framework_error::<Result<(), String>>();
+    let mut read = registry.register::<Request, Result<(), String>>();
+    read.protocol = MethodProtocol {
+        response_format: PayloadFormat::Raw,
+        transport: MethodTransport::Stream,
+        context: MethodContext::OriginalPeer,
+        ..Default::default()
+    };
+    let mut write = registry.register::<Request, Result<(), String>>();
+    write.protocol = MethodProtocol {
+        request_format: PayloadFormat::Raw,
+        ..read.protocol
+    };
+    write.protocol.response_format = PayloadFormat::Serialized;
+    let mut rdma = registry.register::<Request, Result<(), String>>();
+    rdma.protocol = MethodProtocol {
+        transport: MethodTransport::Rdma,
+        context: MethodContext::OriginalPeer,
+        ..Default::default()
+    };
+
+    let encoded = serde_json::to_value(&read).unwrap();
+    assert!(encoded["protocol"].get("request_format").is_none());
+    assert_eq!(encoded["protocol"]["response_format"], "raw");
+    let restored: MethodSchema = serde_json::from_value(encoded).unwrap();
+    assert_eq!(restored.protocol, read.protocol);
+
+    let build = || {
+        serde_json::to_value(
+            registry
+                .build(
+                    [
+                        ("Memory/read", &read),
+                        ("Memory/write", &write),
+                        ("Memory/rdma", &rdma),
+                    ]
+                    .into_iter(),
+                )
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    let document = build();
+    assert_eq!(document, build());
+    let read_op = &document["paths"]["/Memory/read"]["post"];
+    let write_op = &document["paths"]["/Memory/write"]["post"];
+    for operation in [read_op, write_op] {
+        assert_eq!(operation["x-ruapc-transport"], "stream");
+        assert_eq!(operation["x-ruapc-context"], "original_peer");
+        assert!(
+            operation["description"]
+                .as_str()
+                .unwrap()
+                .contains("cannot be used as an independent unary JSON call")
+        );
+    }
+    assert!(
+        read_op["requestBody"]["content"]
+            .get("application/json")
+            .is_some()
+    );
+    assert!(
+        write_op["responses"]["200"]["content"]
+            .get("application/json")
+            .is_some()
+    );
+    for (content, control) in [
+        (
+            &read_op["responses"]["200"]["content"],
+            &read.response_schema,
+        ),
+        (&write_op["requestBody"]["content"], &write.request_schema),
+    ] {
+        assert!(content.get("application/json").is_none());
+        let media = &content["application/octet-stream"];
+        assert_eq!(media["schema"]["type"], "string");
+        assert_eq!(media["schema"]["format"], "binary");
+        assert_eq!(
+            media["x-ruapc-control-schema"],
+            serde_json::to_value(control).unwrap()
+        );
+    }
+    assert_eq!(
+        document["paths"]["/Memory/rdma"]["post"]["x-ruapc-transport"],
+        "rdma"
+    );
+    let framework_error = &document["x-ruapc-framework-error"];
+    assert_eq!(framework_error["flag"], 16);
+    assert_eq!(framework_error["payload_format"], "serialized");
+    assert_eq!(
+        framework_error["unary_header"],
+        json!({ "name": "x-ruapc-framework-error", "value": "true" })
+    );
+    assert_eq!(
+        framework_error["schema"],
+        serde_json::to_value(&read.response_schema).unwrap()
+    );
+    assert_local_references_resolve(&document);
 }

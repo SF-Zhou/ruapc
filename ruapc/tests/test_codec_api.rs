@@ -25,7 +25,7 @@ fn encode_body(meta: &MsgMeta, payload: &impl Serialize) -> Bytes {
 fn public_message_and_payload_apis_keep_rpc_result_types() {
     let Message { meta, payload } = Message::default();
     assert_eq!(meta, MsgMeta::default());
-    assert!(matches!(payload, Payload::Empty));
+    assert!(payload.is_empty());
 
     let meta = MsgMeta {
         method: "Example/echo".into(),
@@ -92,7 +92,7 @@ fn empty_payloads_keep_null_semantics_for_both_formats() {
             flags,
             ..Default::default()
         };
-        for payload in [Payload::Empty, Payload::from(Bytes::new())] {
+        for payload in [Payload::default(), Payload::from(Bytes::new())] {
             assert_eq!(
                 deserialize_payload::<Option<String>>(&payload, &meta).unwrap(),
                 None
@@ -159,7 +159,7 @@ fn rpc_error_envelope_and_schema_identity_keep_the_original_contract() {
 
 #[cfg(feature = "rdma")]
 #[test]
-fn registered_payload_parsing_retains_the_buffer_until_drop() {
+fn registered_payload_parsing_and_extraction_retain_the_buffer_until_drop() {
     const CAPACITY: usize = 64 * 1024 * 1024;
     let pool =
         ruapc_bufpool::BufferPoolBuilder::new(std::sync::Arc::new(ruapc_bufpool::EmptyDevices))
@@ -173,7 +173,6 @@ fn registered_payload_parsing_retains_the_buffer_until_drop() {
     let expected_pointer = buffer[buffer.len() - encoded_payload.len()..].as_ptr();
 
     let message = parse_message(buffer).unwrap();
-    assert!(matches!(&message.payload, Payload::RDMA(_, _)));
     assert_eq!(message.payload.as_ptr(), expected_pointer);
     assert_eq!(message.payload.as_slice(), encoded_payload);
     assert_eq!(
@@ -181,7 +180,15 @@ fn registered_payload_parsing_retains_the_buffer_until_drop() {
         "registered payload"
     );
     assert!(pool.allocate(CAPACITY).is_err());
-    drop(message);
+
+    let retained: Bytes = message.payload.into();
+    assert_eq!(retained.as_ptr(), expected_pointer);
+    assert_eq!(retained.as_ref(), encoded_payload);
+    let view = retained.slice(1..retained.len() - 1);
+    drop(retained);
+    assert_eq!(view.as_ref(), b"registered payload");
+    assert!(pool.allocate(CAPACITY).is_err());
+    drop(view);
     assert!(pool.allocate(CAPACITY).is_ok());
 }
 

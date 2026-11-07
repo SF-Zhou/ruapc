@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod request;
-pub(crate) use request::ReadAttachment;
+pub(crate) use request::{ReadAttachment, RequestPayload};
 
 /// Configuration shared by generated RPC client methods.
 ///

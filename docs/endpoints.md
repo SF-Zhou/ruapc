@@ -29,6 +29,8 @@ let config = SocketPoolConfig {
 The flags control exposure independently. `HTTP` enables typed HTTP/2 RPC,
 unary JSON POSTs, OpenAPI and RapiDoc. `WS` enables WebSocket upgrades and RPC;
 its HTTP handshake does not enable the HTTP RPC or documentation routes.
+The bidirectional `POST /_rpc` endpoint requires HTTP/2 and rejects HTTP/1 with
+400; unary JSON and documentation routes also support HTTP/1.
 Enabling `HTTP` alone does not enable WebSocket upgrades. RDMA bootstrap requires
 the flag for the client's chosen bootstrap transport.
 

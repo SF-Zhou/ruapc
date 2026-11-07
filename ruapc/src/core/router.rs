@@ -1,29 +1,43 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::Arc,
+};
 
 use foldhash::fast::RandomState;
 use openapiv3::OpenAPI;
 use schemars::JsonSchema;
 
-pub use ruapc_schema::MethodSchema;
 use ruapc_schema::SchemaRegistry;
+pub use ruapc_schema::{
+    MethodContext, MethodProtocol, MethodSchema, MethodTransport, PayloadFormat,
+};
 
+use super::{dispatch::spawn_handler_result, panic_guard::handler_panic};
 #[cfg(feature = "rdma")]
 use crate::rdma::RdmaService;
 use crate::{
     Context, Payload,
     error::{Error, ErrorKind, Result},
-    remote_memory::MemoryService,
+    remote_memory::{MemoryService, register_inline},
 };
 
 /// Type alias for service method handler functions.
 type Func = Box<dyn Fn(Context, Payload) -> Result<()> + Send + Sync>;
+
+enum MethodHandler {
+    /// The runtime applies admission, panic containment and failure responses.
+    Managed(Box<dyn Fn(Context, Payload) + Send + Sync>),
+    /// An explicit scheduling escape hatch, also used by fault-injection tests.
+    LowLevel(Func),
+}
 
 /// Internal method representation containing metadata and handler.
 struct Method {
     /// Method schema information.
     schema: MethodSchema,
     /// The actual handler function for this method.
-    func: Func,
+    handler: MethodHandler,
 }
 
 /// Service registry, request dispatch and method schemas.
@@ -62,28 +76,139 @@ impl Default for Router {
             methods: HashMap::default(),
             openapi: OpenAPI::default(),
         };
+        this.schemas.register_framework_error::<Result<()>>();
         let dummy = Arc::new(());
         MemoryService::ruapc_export(dummy.clone(), &mut this);
+        this.set_method_protocol(
+            "MemoryService/read_into_target",
+            MethodProtocol {
+                transport: MethodTransport::Rdma,
+                context: MethodContext::OriginalPeer,
+                ..Default::default()
+            },
+        );
+        this.set_method_protocol(
+            "MemoryService/request_is_pending",
+            MethodProtocol {
+                context: MethodContext::OriginalPeer,
+                ..Default::default()
+            },
+        );
+        register_inline(&mut this);
         #[cfg(feature = "rdma")]
-        RdmaService::ruapc_export(dummy.clone(), &mut this);
+        {
+            RdmaService::ruapc_export(dummy, &mut this);
+            this.set_method_protocol(
+                "RdmaService/probe",
+                MethodProtocol {
+                    transport: MethodTransport::Rdma,
+                    ..Default::default()
+                },
+            );
+            for method in ["RdmaService/offer", "RdmaService/finish"] {
+                this.set_method_protocol(
+                    method,
+                    MethodProtocol {
+                        transport: MethodTransport::Rdma,
+                        context: MethodContext::OriginalPeer,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
         this
     }
 }
 
 impl Router {
+    /// Registers an asynchronous method with the shared execution policies.
+    ///
+    /// The handler decodes its payload, invokes the service and sends its
+    /// response. Returned errors and panics in future construction or execution
+    /// produce framework error responses. Admission, deadlines and metrics are
+    /// applied once around the complete handler. Futures remain statically
+    /// dispatched; only the registered service closure is type-erased.
+    ///
+    /// Send at most one response, and return `Ok(())` after a successful send.
+    /// Returning `Err` or panicking after sending a response causes the boundary
+    /// to attempt a second, framework-error response; it does not track replies.
+    /// Complete fallible work before sending, and normally return the result of
+    /// [`Context::send_rsp`] as the handler's final expression.
+    pub fn add_handler<Req, Rsp, F, Fut>(&mut self, name: &'static str, handler: F)
+    where
+        Req: JsonSchema,
+        Rsp: JsonSchema,
+        F: Fn(Context, Payload) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        self.add_handler_with_protocol::<Req, Rsp, F, Fut>(
+            name,
+            MethodProtocol::default(),
+            handler,
+        );
+    }
+
+    /// Registers a handler with its payload representation and call prerequisites.
+    /// These annotations describe the same method in discovery and OpenAPI;
+    /// the handler remains responsible for validating its prerequisites.
+    /// The single-response contract of [`add_handler`](Self::add_handler) applies.
+    pub fn add_handler_with_protocol<Req, Rsp, F, Fut>(
+        &mut self,
+        name: &'static str,
+        protocol: MethodProtocol,
+        handler: F,
+    ) where
+        Req: JsonSchema,
+        Rsp: JsonSchema,
+        F: Fn(Context, Payload) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        let handler = Arc::new(handler);
+        self.register_method::<Req, Rsp>(
+            name,
+            protocol,
+            MethodHandler::Managed(Box::new(move |ctx, payload| {
+                let handler = handler.clone();
+                spawn_handler_result(ctx, name, payload, move |ctx, payload| {
+                    handler(ctx, payload)
+                });
+            })),
+        );
+    }
+
     /// Interposes on an existing handler without changing its schemas.
     #[cfg(all(test, feature = "rdma"))]
     pub(crate) fn wrap_method(&mut self, name: &str, wrap: impl FnOnce(Func) -> Func) {
         let method = self.methods.get_mut(name).expect("test method must exist");
-        let original = std::mem::replace(&mut method.func, Box::new(|_, _| Ok(())));
-        method.func = wrap(original);
+        let original = std::mem::replace(
+            &mut method.handler,
+            MethodHandler::Managed(Box::new(|_, _| {})),
+        );
+        let original = match original {
+            MethodHandler::Managed(handler) => Box::new(move |ctx, payload| {
+                handler(ctx, payload);
+                Ok(())
+            }) as Func,
+            MethodHandler::LowLevel(handler) => handler,
+        };
+        method.handler = MethodHandler::LowLevel(wrap(original));
     }
 
     /// Registers a method and its request/response schemas.
     ///
-    /// Normally called by [`#[service]`](crate::service). `name` is the wire name
-    /// `Service/method`; `func` receives the context and undecoded payload.
-    /// Custom callbacks are responsible for scheduling and response delivery.
+    /// Low-level scheduling callback; prefer [`add_handler`](Self::add_handler)
+    /// for the shared admission, deadline and execution policies. `name` is
+    /// the wire name `Service/method`; `func` receives the context and undecoded
+    /// payload. Callbacks are responsible for scheduling and response delivery.
+    /// A returned error or synchronous panic produces a framework error response.
+    /// The callback must not return an error after sending or scheduling a response.
+    ///
+    /// This path does not reserve admission capacity, discard expired requests,
+    /// or record per-method request counts, in-flight gauges or latency. Panics
+    /// in tasks spawned by the callback are not contained. Response-error counts
+    /// can still be emitted, so they need not be bounded by request counts here.
+    /// Use [`add_handler`](Self::add_handler) to obtain all shared policies;
+    /// low-level callbacks must implement any desired equivalents themselves.
     ///
     /// # Panics
     ///
@@ -91,6 +216,22 @@ impl Router {
     /// with two nonempty components and no surrounding whitespace.
     pub fn add_method<Req, Rsp>(&mut self, name: &str, func: Func)
     where
+        Req: JsonSchema,
+        Rsp: JsonSchema,
+    {
+        self.register_method::<Req, Rsp>(
+            name,
+            MethodProtocol::default(),
+            MethodHandler::LowLevel(func),
+        );
+    }
+
+    fn register_method<Req, Rsp>(
+        &mut self,
+        name: &str,
+        protocol: MethodProtocol,
+        handler: MethodHandler,
+    ) where
         Req: JsonSchema,
         Rsp: JsonSchema,
     {
@@ -110,13 +251,25 @@ impl Router {
             "RPC method `{name}` is already registered"
         );
 
-        self.methods.insert(
-            name.to_string(),
-            Method {
-                schema: self.schemas.register::<Req, Rsp>(),
-                func,
-            },
-        );
+        let mut schema = self.schemas.register::<Req, Rsp>();
+        schema.protocol = protocol;
+        self.methods
+            .insert(name.to_string(), Method { schema, handler });
+    }
+
+    /// Updates the wire representation and call prerequisites of a registered
+    /// method, including methods registered by [`#[service]`](crate::service).
+    /// Rebuild OpenAPI after changing a router whose document was already built.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` is not registered.
+    pub fn set_method_protocol(&mut self, name: &str, protocol: MethodProtocol) {
+        self.methods
+            .get_mut(name)
+            .unwrap_or_else(|| panic!("RPC method `{name}` is not registered"))
+            .schema
+            .protocol = protocol;
     }
 
     /// Rebuilds [`openapi`](Self::openapi) from all methods as OpenAPI 3.0
@@ -169,13 +322,25 @@ impl Router {
 
     /// Calls the registered callback for `ctx.msg_meta.method` synchronously.
     ///
-    /// Generated callbacks schedule handler execution with admission control,
-    /// deadline checks and panic containment. Custom callbacks supply their own
-    /// policies; their returned errors are discarded here. An unknown method
+    /// Managed callbacks schedule handler execution with admission control,
+    /// deadline checks and panic containment. Low-level callbacks supply their
+    /// own scheduling; errors and synchronous panics trigger framework responses.
+    /// An unknown method
     /// spawns a task to send an [`ErrorKind::InvalidArgument`] response.
     pub(crate) fn dispatch(&self, mut ctx: Context, payload: Payload) {
-        if let Some(method) = self.methods.get(&ctx.msg_meta.method) {
-            let _ = (method.func)(ctx, payload);
+        if let Some((name, method)) = self.methods.get_key_value(&ctx.msg_meta.method) {
+            match &method.handler {
+                MethodHandler::Managed(handler) => handler(ctx, payload),
+                MethodHandler::LowLevel(handler) => {
+                    let mut response_ctx = ctx.response_context();
+                    let result = catch_unwind(AssertUnwindSafe(|| handler(ctx, payload)))
+                        .unwrap_or_else(|panic| Err(handler_panic(panic)));
+                    if let Err(error) = result {
+                        response_ctx.msg_meta.method.clone_from(name);
+                        tokio::spawn(async move { response_ctx.send_err_rsp(error).await });
+                    }
+                }
+            }
         } else {
             tokio::spawn(async move {
                 let m = format!("method not found: {}", ctx.msg_meta.method);
@@ -418,7 +583,7 @@ mod tests {
         ctx.msg_meta.method = "TestSvc/noop".to_string();
 
         // dispatch() calls the func synchronously when the method is found.
-        router.dispatch(ctx, Payload::Empty);
+        router.dispatch(ctx, Payload::default());
     }
 
     #[tokio::test]
@@ -434,7 +599,7 @@ mod tests {
         // dispatch() spawns a tokio task that tries to send an error response for unknown
         // methods. The task will fail silently since there is no connected socket endpoint.
         // We just verify dispatch() can be called without panicking.
-        router.dispatch(ctx, Payload::Empty);
+        router.dispatch(ctx, Payload::default());
         // Yield to give the runtime a chance to poll the spawned task.
         tokio::task::yield_now().await;
     }

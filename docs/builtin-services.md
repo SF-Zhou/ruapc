@@ -4,9 +4,9 @@ Built-in and application services default to their Rust trait name as their
 wire name. Services can choose a different wire name with
 `#[ruapc::service(name = "...")]`.
 
-This page catalogs wire methods and their exposure. The methods return
-serialized `Result<T, Error>` envelopes; a `()` request is JSON `null` or
-MessagePack `nil`.
+This page catalogs wire methods and their exposure. Ordinary responses use
+serialized `Result<T, Error>` envelopes; the inline memory methods also use
+raw payloads described below. A `()` request is JSON `null` or MessagePack `nil`.
 
 ## Discovery and dispatch
 
@@ -20,12 +20,24 @@ Registration rejects duplicate wire method names instead of replacing handlers.
 
 Any [listener mode](endpoints.md#listener-modes) containing `ListenMode::HTTP`
 serves the OpenAPI 3.0 document at `/openapi.json` and interactive documentation
-at `/rapidoc`. It accepts unary JSON POSTs at
-`/Service/method` for every registered method. Framed TCP, WebSocket, HTTP/2
-stream and RDMA calls use the same method directory. Each handler still checks
-its required transport, request state and buffer metadata; discovery does not
-promise that a method can succeed over every transport. Routing does not
-authenticate callers.
+at `/rapidoc`. Unary JSON POSTs at `/Service/method` and framed TCP, WebSocket,
+HTTP/2 stream and RDMA calls use the same method directory. Each handler checks
+its required transport, request state, payload format and buffer metadata.
+Raw methods and methods requiring an established peer connection cannot be
+used as independent unary JSON calls. OpenAPI retains their paths and records
+these prerequisites as `x-ruapc-transport` and `x-ruapc-context`; raw payloads
+use `application/octet-stream` with `x-ruapc-control-schema` describing the
+control value. Routing does not authenticate callers.
+
+Framework failures, including admission rejection, decoding errors and
+handler panics, carry `MsgFlags::IsFrameworkError` (value `16`). Their payload
+is an ordinary serialized `Result<(), Error>`, independent of the method's
+declared response type or raw format. The OpenAPI document records this shared
+envelope once in `x-ruapc-framework-error`. An application's declared
+`Result<T, Error>` response remains its ordinary unflagged response envelope.
+Unary HTTP reports framework failures with the
+`x-ruapc-framework-error: true` response header, since its response body carries
+no RPC metadata. Ordinary application errors do not add this header.
 
 For a server listening on `127.0.0.1:8000` with `ListenMode::HTTP` enabled:
 
@@ -49,20 +61,42 @@ Their Rust trait and request types are crate-private.
 
 | Method | Request | Success value | Data path |
 |---|---|---|---|
-| `MemoryService/read_inline` | Original request ID and `CopyOp` batch | `ReadInlineResponse { bytes }` in operation order | TCP/WS/HTTP read; data in response. |
-| `MemoryService/write_inline` | Original request ID, `CopyOp` batch, bytes | `()` | TCP/WS/HTTP write; data in request. |
+| `MemoryService/read_inline` | Original request ID and `CopyOp` batch | `()` control plus raw bytes in operation order | TCP/WS/HTTP read; data in response. |
+| `MemoryService/write_inline` | Original request ID and `CopyOp` control; raw bytes follow | `()` | TCP/WS/HTTP write; data in request. |
 | `MemoryService/read_into_target` | Original request ID and `CopyOp` batch; source in `MsgMeta.read_regions` | `()` | Client RDMA-READs server buffers into its pinned target. |
 | `MemoryService/request_is_pending` | Original request ID | `bool` | Post-READ source-request waiter membership check. |
 
-Inline reads and writes require the original request's retained source or
-write target and valid copy ranges. `read_into_target` additionally requires an
+Inline reads and writes require a bidirectional connection to the original
+peer, the original request's retained source or write target, and valid copy
+ranges. `request_is_pending` queries that peer's waiter table; a missing waiter
+legitimately returns `false`. `read_into_target` additionally requires an
 established RDMA connection and advertised read regions. An ordinary HTTP POST
 cannot supply those RDMA prerequisites; the route reaches the handler, which
 returns an RPC error. Unary HTTP also lacks the reverse-RPC stream used by the
 remote-memory API.
 
-Inline byte fields use MessagePack `bin` encoding. The request layouts and
-validation handlers are in [rpc_transfer.rs](../ruapc/src/remote_memory/rpc_transfer.rs).
+`read_inline` sends an ordinary encoded request and a successful raw response;
+`write_inline` sends a raw request and an ordinary `Result<(), Error>` response.
+Raw payloads carry `MsgFlags::HasRawBytes` and use
+`[control_len: u32 BE][control][raw bytes]`. `UseMessagePack` selects named-field
+MessagePack or JSON for the control value only. Read-response control is
+`Result<(), Error>`; write-request control contains `request_id` and `ops`.
+The raw tail concatenates operation bytes in operation order, independent of
+source segmentation; its exact length must match the checked batch before any
+scatter. Both inline methods send decoding, validation and transfer failures,
+including missing original requests and dispatch rejection, as ordinary encoded
+`Result<(), Error>` responses with `IsFrameworkError` and without `HasRawBytes`.
+Successful read control is `Ok(())`; successful writes send an ordinary unflagged
+`Ok(())` response. Clients also accept unflagged Result errors and raw read
+control errors from earlier peers. These layouts replace the former encoded
+byte fields; both peers must use this protocol. `MethodSchema.protocol` identifies each
+raw request or response so its corresponding schema is understood as the
+control schema. OpenAPI describes the complete raw payload as binary data
+with the control schema in `x-ruapc-control-schema`.
+
+The [wire codec](../ruapc-wire/src/raw.rs) owns this payload format; request
+validation and execution live in
+[rpc_transfer.rs](../ruapc/src/remote_memory/rpc_transfer.rs).
 For the meaning of a successful READ, waiter membership, error-buffer contents,
 and source recovery, see
 [read validation and recovery](safe-boundaries.md#application-read-source-validation-and-recovery).

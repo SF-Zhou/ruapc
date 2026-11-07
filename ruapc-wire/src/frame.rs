@@ -3,7 +3,7 @@
 use bytes::{Buf, Bytes, BytesMut};
 
 use super::SendMsg;
-use crate::{CodecError, CodecErrorKind, CodecResult, MsgMeta};
+use crate::{CodecError, CodecErrorKind, CodecResult, MsgMeta, raw};
 use serde::Serialize;
 
 /// Magic prefix shared by all framed transports.
@@ -32,6 +32,139 @@ pub fn encode<P: Serialize>(meta: &MsgMeta, payload: &P) -> CodecResult<Bytes> {
     let mut frame = StreamFrame(BytesMut::with_capacity(512));
     meta.serialize_to(payload, &mut frame)?;
     Ok(frame.0.freeze())
+}
+
+/// An owned stream frame whose payload may retain several immutable allocations.
+///
+/// Transports can send [`chunks`](Self::chunks) in order without copying their
+/// bytes. Ownership lasts until the last chunk is released, including when a
+/// queued request is cancelled before the transport finishes sending it.
+///
+/// Equality compares wire bytes, independent of the chunk boundaries.
+#[derive(Clone, Debug, Eq)]
+pub struct SendFrame {
+    prefix: Bytes,
+    parts: Vec<Bytes>,
+}
+
+impl From<Bytes> for SendFrame {
+    /// Wraps an already encoded contiguous frame without revalidating it.
+    ///
+    /// The caller supplies one complete frame, including its header and size
+    /// checks; [`encode`] produces suitable bytes. This conversion is an owned
+    /// storage adapter, not a validation boundary for untrusted input.
+    fn from(prefix: Bytes) -> Self {
+        Self {
+            prefix,
+            parts: Vec::new(),
+        }
+    }
+}
+
+impl PartialEq for SendFrame {
+    fn eq(&self, other: &Self) -> bool {
+        let mut left_chunks = self.chunks().filter(|part| !part.is_empty());
+        let mut right_chunks = other.chunks().filter(|part| !part.is_empty());
+        let mut left = left_chunks.next().map(Bytes::as_ref);
+        let mut right = right_chunks.next().map(Bytes::as_ref);
+        while let (Some(a), Some(b)) = (left, right) {
+            let len = a.len().min(b.len());
+            if a[..len] != b[..len] {
+                return false;
+            }
+            left = if len == a.len() {
+                left_chunks.next().map(Bytes::as_ref)
+            } else {
+                Some(&a[len..])
+            };
+            right = if len == b.len() {
+                right_chunks.next().map(Bytes::as_ref)
+            } else {
+                Some(&b[len..])
+            };
+        }
+        left.is_none() && right.is_none()
+    }
+}
+
+impl SendFrame {
+    /// Returns all chunks in wire order. Chunks must not be interleaved with
+    /// another frame's bytes.
+    pub fn chunks(&self) -> impl Iterator<Item = &Bytes> {
+        std::iter::once(&self.prefix).chain(&self.parts)
+    }
+
+    /// Transfers the prefix and trailing chunks to a streaming body.
+    pub fn into_parts(self) -> (Bytes, Vec<Bytes>) {
+        (self.prefix, self.parts)
+    }
+
+    /// Coalesces a segmented frame for transports requiring contiguous storage.
+    /// An already contiguous frame retains its original allocation.
+    pub fn into_bytes(self) -> Bytes {
+        if self.parts.is_empty() {
+            return self.prefix;
+        }
+        let len = self.chunks().map(Bytes::len).sum();
+        let mut bytes = BytesMut::with_capacity(len);
+        for part in self.chunks() {
+            bytes.extend_from_slice(part);
+        }
+        bytes.freeze()
+    }
+}
+
+/// Frames already encoded payload chunks without copying them.
+///
+/// Only the frame and named-field MessagePack metadata prefixes are allocated.
+/// The caller supplies the complete payload encoding, in order. This checks
+/// overflow and the same complete-frame size limit as [`encode`], and retains
+/// cloned `Bytes` owners until the transport releases the frame.
+pub fn encode_parts(meta: &MsgMeta, parts: &[Bytes]) -> CodecResult<SendFrame> {
+    encode_with_prefix(meta, parts, |_| Ok(()))
+}
+
+/// Encodes a raw control value and retains the trailing byte owners.
+///
+/// `meta` must carry [`crate::MsgFlags::HasRawBytes`]. The metadata and control
+/// prefix share one allocation; control encoding follows the metadata's codec
+/// flag. Raw bytes are neither encoded nor copied.
+pub fn encode_raw<P: Serialize>(
+    meta: &MsgMeta,
+    control: &P,
+    parts: &[Bytes],
+) -> CodecResult<SendFrame> {
+    encode_with_prefix(meta, parts, |prefix| {
+        raw::encode_into(control, meta.flags, prefix)
+    })
+}
+
+fn encode_with_prefix(
+    meta: &MsgMeta,
+    parts: &[Bytes],
+    append: impl FnOnce(&mut BytesMut) -> CodecResult<()>,
+) -> CodecResult<SendFrame> {
+    let mut prefix = BytesMut::with_capacity(128);
+    prefix.extend_from_slice(&[0; HEADER_LEN + 4]);
+    meta.encode_to(prefix.writer())?;
+    let meta_len = u32::try_from(prefix.len() - HEADER_LEN - 4)?;
+    prefix[HEADER_LEN..HEADER_LEN + 4].copy_from_slice(&meta_len.to_be_bytes());
+    append(&mut prefix)?;
+    let body_len = parts
+        .iter()
+        .try_fold(prefix.len() - HEADER_LEN, |len, part| {
+            len.checked_add(part.len())
+                .ok_or_else(|| CodecError::kind(CodecErrorKind::InvalidFrame))
+        })?;
+    prefix[..HEADER_LEN].copy_from_slice(&encode_header(body_len)?);
+    Ok(SendFrame {
+        prefix: prefix.freeze(),
+        parts: parts
+            .iter()
+            .filter(|part| !part.is_empty())
+            .cloned()
+            .collect(),
+    })
 }
 
 struct StreamFrame(BytesMut);
@@ -210,6 +343,120 @@ impl FrameDecoder {
 mod tests {
     use super::*;
     use crate::{MsgFlags, deserialize_payload, parse_body};
+
+    #[test]
+    fn raw_frame_uses_metadata_codec_and_retains_data_storage() {
+        for codec in [MsgFlags::empty(), MsgFlags::UseMessagePack] {
+            let meta = MsgMeta {
+                flags: MsgFlags::IsReq | MsgFlags::HasRawBytes | codec,
+                method: "MemoryService/write_inline".into(),
+                ..Default::default()
+            };
+            let data = Bytes::from_static(&[0, 255, 193, 42]);
+            let frame = encode_raw(&meta, &42u64, std::slice::from_ref(&data)).unwrap();
+            let chunks: Vec<_> = frame.chunks().collect();
+            assert_eq!(chunks.len(), 2, "control shares the metadata allocation");
+            assert_eq!(chunks[1].as_ptr(), data.as_ptr());
+            let bytes = frame.into_bytes();
+            let (decoded, offset) = parse_body(&bytes[HEADER_LEN..]).unwrap();
+            assert_eq!(decoded, meta);
+            let (control, tail) =
+                raw::decode::<u64>(&bytes[HEADER_LEN + offset..], decoded.flags).unwrap();
+            assert_eq!(control, 42);
+            assert_eq!(tail, data.as_ref());
+            assert_eq!(
+                encode(&meta, &42u64).unwrap_err().kind,
+                CodecErrorKind::InvalidArgument
+            );
+        }
+        assert_eq!(
+            encode_raw(&MsgMeta::default(), &(), &[]).unwrap_err().kind,
+            CodecErrorKind::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn segmented_frame_preserves_payload_storage_and_matches_regular_encoding() {
+        for flags in [MsgFlags::IsReq, MsgFlags::IsReq | MsgFlags::UseMessagePack] {
+            let meta = MsgMeta {
+                flags,
+                method: "Test/call".into(),
+                ..Default::default()
+            };
+            let payload = if flags.contains(MsgFlags::UseMessagePack) {
+                rmp_serde::to_vec_named(&"payload").unwrap()
+            } else {
+                serde_json::to_vec(&"payload").unwrap()
+            };
+            let payload = Bytes::from(payload);
+            let parts = [payload.slice(..2), Bytes::new(), payload.slice(2..)];
+            let segmented = encode_parts(&meta, &parts).unwrap();
+            let chunks: Vec<_> = segmented.chunks().collect();
+            assert_eq!(chunks.len(), 3);
+            assert_eq!(chunks[1].as_ptr(), parts[0].as_ptr());
+            assert_eq!(chunks[2].as_ptr(), parts[2].as_ptr());
+            let contiguous = encode(&meta, &"payload").unwrap();
+            assert_eq!(segmented, SendFrame::from(contiguous.clone()));
+            assert_eq!(segmented.into_bytes(), contiguous);
+        }
+    }
+
+    #[test]
+    fn frame_equality_ignores_chunk_boundaries_but_preserves_bytes_and_length() {
+        let bytes = Bytes::from_static(b"abcdefgh");
+        let contiguous = SendFrame::from(bytes.clone());
+        for split in 0..=bytes.len() {
+            let segmented = SendFrame {
+                prefix: bytes.slice(..split),
+                parts: vec![Bytes::new(), bytes.slice(split..), Bytes::new()],
+            };
+            assert_eq!(segmented, contiguous);
+            assert_eq!(contiguous, segmented);
+            assert_ne!(segmented, SendFrame::from(Bytes::from_static(b"abcdefgi")));
+            assert_ne!(segmented, SendFrame::from(bytes.slice(..7)));
+            assert_ne!(segmented, SendFrame::from(Bytes::new()));
+        }
+    }
+
+    #[test]
+    fn segmented_frames_retain_owners_and_validate_combined_size() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        struct Owner {
+            bytes: Vec<u8>,
+            drops: Arc<AtomicUsize>,
+        }
+        impl AsRef<[u8]> for Owner {
+            fn as_ref(&self) -> &[u8] {
+                &self.bytes
+            }
+        }
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let part = Bytes::from_owner(Owner {
+            bytes: vec![7; 1024],
+            drops: drops.clone(),
+        });
+        let frame = encode_parts(&MsgMeta::default(), std::slice::from_ref(&part)).unwrap();
+        drop(part);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(frame);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        // Repeated views share one allocation but their wire lengths add up.
+        let parts = vec![Bytes::from(vec![0; 1 << 20]); 64];
+        assert_eq!(
+            encode_parts(&MsgMeta::default(), &parts).unwrap_err().kind,
+            CodecErrorKind::InvalidFrame
+        );
+    }
 
     #[test]
     fn reused_stream_frame_replaces_header_body_and_old_tail() {

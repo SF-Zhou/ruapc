@@ -57,7 +57,6 @@ ruapc-schema = { version = "=0.2.0-alpha.7", path = "ruapc-schema" }
 ruapc-wire = { version = "=0.2.0-alpha.7", path = "ruapc-wire" }
 schemars = "1.2"
 serde = { version = "1.0", features = ["derive"] }
-serde_bytes = "0.11"
 serde-inline-default = "1.0"
 serde_json = { version = "1.0" }
 socket2 = "0.6"

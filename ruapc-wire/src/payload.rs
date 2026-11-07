@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-use crate::{CodecResult, MAX_DECODE_DEPTH, MsgFlags};
+use crate::{CodecError, CodecErrorKind, CodecResult, MAX_DECODE_DEPTH, MsgFlags};
 
 /// Decodes a borrowed payload according to its message flags.
 ///
@@ -20,6 +20,12 @@ pub fn deserialize_payload<P: for<'de> Deserialize<'de>>(
     payload: &[u8],
     flags: MsgFlags,
 ) -> CodecResult<P> {
+    if flags.contains(MsgFlags::HasRawBytes) {
+        return Err(CodecError::new(
+            CodecErrorKind::DeserializeFailed,
+            "raw bytes require the raw payload decoder".into(),
+        ));
+    }
     if payload.is_empty() {
         Ok(serde_json::from_value(serde_json::Value::Null)?)
     } else if flags.contains(MsgFlags::UseMessagePack) {

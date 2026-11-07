@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
+use bytes::Bytes;
 use serde::Serialize;
 use tokio_util::sync::DropGuard;
 
 use crate::{
-    Endpoint, Error, Result, Router, Socket, SocketPoolConfig, SocketTrait, State,
+    Endpoint, Error, ErrorKind, Result, Router, Socket, SocketPoolConfig, SocketTrait, State,
     msg::{MsgFlags, MsgMeta},
 };
 
@@ -18,6 +19,36 @@ pub(crate) enum ContextEndpoint {
     Connected(Socket),
     /// One server's transport and equivalent addresses.
     Endpoint(Endpoint),
+}
+
+/// Response routing retained across handler execution without duplicating its
+/// metadata, deadline or shared state. The execution guard already owns State.
+pub(super) struct ReplyTarget {
+    socket: Option<Socket>,
+    msgid: u64,
+    codec: MsgFlags,
+    drop_guard: Option<Arc<DropGuard>>,
+}
+
+impl ReplyTarget {
+    pub(super) async fn send_err_rsp(self, state: &Arc<State>, method: &str, error: Error) {
+        // Only a failed call needs an owned response context and method name.
+        let mut ctx = Context {
+            state: state.clone(),
+            endpoint: self
+                .socket
+                .map_or(ContextEndpoint::Invalid, ContextEndpoint::Connected),
+            drop_guard: self.drop_guard,
+            msg_meta: MsgMeta {
+                method: method.into(),
+                flags: self.codec,
+                msgid: self.msgid,
+                ..Default::default()
+            },
+            deadline: None,
+        };
+        ctx.send_err_rsp(error).await;
+    }
 }
 
 /// RPC context carrying request metadata and connection information.
@@ -149,57 +180,156 @@ impl Context {
         }
     }
 
+    /// Keeps only the identity and connection needed for a fallback response.
+    /// Incoming method names and memory-region vectors are irrelevant to
+    /// response delivery. The error path fills the method name for metrics.
+    pub(crate) fn response_context(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+            endpoint: self.endpoint.clone(),
+            drop_guard: self.drop_guard.clone(),
+            msg_meta: MsgMeta {
+                flags: self.msg_meta.flags,
+                msgid: self.msg_meta.msgid,
+                ..Default::default()
+            },
+            deadline: self.deadline,
+        }
+    }
+
+    pub(super) fn response_target(&self) -> ReplyTarget {
+        ReplyTarget {
+            socket: match &self.endpoint {
+                ContextEndpoint::Connected(socket) => Some(socket.clone()),
+                ContextEndpoint::Invalid | ContextEndpoint::Endpoint(_) => None,
+            },
+            msgid: self.msg_meta.msgid,
+            codec: self.msg_meta.flags & MsgFlags::UseMessagePack,
+            drop_guard: self.drop_guard.clone(),
+        }
+    }
+
     /// Attempts to send a response on this context's connection.
     ///
     /// Generated service handlers normally call this. It preserves the request
-    /// ID and payload encoding; transport send errors are discarded.
-    pub async fn send_rsp<Rsp, E>(&mut self, rsp: std::result::Result<Rsp, E>)
+    /// ID and payload encoding. Encoding and transport errors are returned to
+    /// the handler execution boundary, which sends a framework error response.
+    pub async fn send_rsp<Rsp, E>(&mut self, rsp: std::result::Result<Rsp, E>) -> Result<()>
     where
         Rsp: Serialize,
         E: std::error::Error + From<Error> + Serialize,
     {
-        // Error accounting for the method being handled (server side).
-        if rsp.is_err() && !self.msg_meta.method.is_empty() {
+        self.send_response(&rsp, MsgFlags::empty()).await?;
+        if rsp.is_err() {
+            self.record_response_error();
+        }
+        Ok(())
+    }
+
+    fn response_meta(&self, flags: MsgFlags) -> MsgMeta {
+        // Responses are correlated by msgid alone: drop the request's method
+        // and regions so the response meta stays minimal (flags + msgid
+        // only; absent fields are skipped by the meta encoding).
+        MsgMeta {
+            method: String::new(),
+            flags: MsgFlags::IsRsp | (self.msg_meta.flags & MsgFlags::UseMessagePack) | flags,
+            msgid: self.msg_meta.msgid,
+            read_regions: Vec::new(),
+            write_regions: Vec::new(),
+            timeout_ms: 0,
+        }
+    }
+
+    async fn send_response<P: Serialize>(&mut self, payload: &P, flags: MsgFlags) -> Result<()> {
+        let mut meta = self.response_meta(flags);
+        match &mut self.endpoint {
+            ContextEndpoint::Connected(socket) => {
+                socket.send(&mut meta, payload, &self.state).await
+            }
+            _ => Err(Error::new(
+                ErrorKind::NotConnected,
+                "send response without a connected socket".into(),
+            )),
+        }
+    }
+
+    /// Sends successful raw control and byte parts with the request's codec.
+    /// Framework failures use [`send_err_rsp`](Self::send_err_rsp) instead.
+    pub(crate) async fn send_raw_rsp<Control: Serialize>(
+        &mut self,
+        control: &Control,
+        parts: &[Bytes],
+    ) -> Result<()> {
+        let mut meta = self.response_meta(MsgFlags::HasRawBytes);
+        match &mut self.endpoint {
+            ContextEndpoint::Connected(socket) => {
+                socket
+                    .send_raw(&mut meta, control, parts, &self.state)
+                    .await
+            }
+            _ => Err(Error::new(
+                ErrorKind::NotConnected,
+                "send raw response without a connected socket".into(),
+            )),
+        }
+    }
+
+    fn record_response_error(&self) {
+        if !self.msg_meta.method.is_empty() {
             self.state
                 .metrics
                 .server_method(&self.msg_meta.method)
                 .errors
                 .increment(1);
         }
-
-        // Responses are correlated by msgid alone: drop the request's method
-        // and regions so the response meta stays minimal (flags + msgid
-        // only; absent fields are skipped by the meta encoding).
-        let mut meta = MsgMeta {
-            method: String::new(),
-            flags: self.msg_meta.flags,
-            msgid: self.msg_meta.msgid,
-            read_regions: Vec::new(),
-            write_regions: Vec::new(),
-            timeout_ms: 0,
-        };
-        meta.flags.remove(MsgFlags::IsReq);
-        meta.flags.insert(MsgFlags::IsRsp);
-        match &mut self.endpoint {
-            ContextEndpoint::Connected(socket) => {
-                let _ = socket.send(&mut meta, &rsp, &self.state).await;
-            }
-            _ => {
-                tracing::error!("invalid argument: send rsp without connected socket");
-            }
-        }
     }
 
-    /// Sends an error through [`send_rsp`](Self::send_rsp), with the same
-    /// best-effort delivery behavior.
+    /// Best-effort delivery of a framework failure, separate from the declared
+    /// application error type. The ordinary payload is `Err::<(), Error>(err)`;
+    /// [`MsgFlags::IsFrameworkError`] directs typed clients to convert the
+    /// decoded framework error with their application's `From<Error>`.
     pub async fn send_err_rsp(&mut self, err: Error) {
-        self.send_rsp::<(), Error>(Err(err)).await;
+        self.record_response_error();
+        let response = Err::<(), &Error>(&err);
+        if let Err(error) = self
+            .send_response(&response, MsgFlags::IsFrameworkError)
+            .await
+        {
+            self.state.metrics.framework_response_send_failed();
+            tracing::warn!(
+                method = %self.msg_meta.method, msgid = self.msg_meta.msgid,
+                framework_error = %err, %error,
+                "failed to send framework error response"
+            );
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_framework_response_is_observable_without_double_counting_error() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let mut ctx = client_context();
+        ctx.msg_meta.method = "Test/failure".into();
+        ctx.send_err_rsp(Error::kind(ErrorKind::HandlerPanic)).await;
+        let snapshot = snapshotter.snapshot().into_vec();
+        for name in [
+            "ruapc_framework_response_send_failures_total",
+            "ruapc_server_errors_total",
+        ] {
+            let (_, _, _, value) = snapshot
+                .iter()
+                .find(|(key, _, _, _)| key.key().name() == name)
+                .unwrap();
+            assert!(matches!(value, DebugValue::Counter(1)));
+        }
+    }
 
     fn client_context() -> Context {
         Context::create(&SocketPoolConfig {

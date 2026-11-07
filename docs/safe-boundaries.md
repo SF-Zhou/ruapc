@@ -101,7 +101,14 @@ protocol.
 ## Application read-source validation and recovery
 
 An immutable `ReadSource` is shared by the client wrapper, pending requests and
-inline reverse-RPC readers. This keeps memory alive during local CPU copies.
+inline reverse-RPC readers and stream send queues. Checked `ReadSlice`s own the
+immutable source, so transport acceptance can outlive the handler or original
+waiter without borrowing released memory. Cancellation, timeout or a successful
+peer response alone does not permit source recovery: all local send owners must
+also be gone. TCP retires consumed slices as writes progress; HTTP/2 transfers
+owners to its body writer; WebSocket releases them after coalescing its message.
+Receivers validate the full raw byte count and batch before scattering directly
+from the received payload under the write target's mutex.
 `read_inline` accepts a request ID and logical operations, not peer-provided
 addresses.
 

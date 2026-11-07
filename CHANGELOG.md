@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 ## [Unreleased]
 
 ### Added
+- Method descriptors include payload formats and connection/context requirements.
+  OpenAPI describes raw control schemas and the common framework-error envelope.
+- `Router::add_handler` applies the same admission, deadline and panic policies
+  to generated services and manually registered asynchronous handlers.
 - `ruapc-memory` provides logical spaces, copy validation and planning,
   synchronous CPU gather/scatter, and immutable read sources without the RPC
   runtime, an async executor or verbs. `CopyBatch` reuses structural validation;
@@ -30,6 +34,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   APIs.
 
 ### Changed
+- **BREAKING**: `Payload` is an opaque `Bytes` owner instead of an enum of
+  storage backends. Use `Payload::default()` and `Payload::from(...)` to
+  construct it. Conversion to `Bytes` preserves registered-buffer ownership
+  without copying; advancing beyond the remaining length always panics.
+- **BREAKING**: `Context::send_rsp` returns encoding/transport failures as `Result<()>`;
+  generated handlers pass them to the common execution boundary.
+- Raw sends encode control fields after queue admission using the message's
+  codec, and share request execution with typed calls. `frame::encode_raw`
+  stores metadata and control in one prefix while retaining the raw owners;
+  ordinary serialization rejects the `HasRawBytes` flag.
 - **BREAKING**: `SentBuffers`, `WithBuffers<T>` and `ResultWithBuffers<T>`
   are replaced by `WriteReceipt`, `BufferReply<T>` and `ResultBufferReply<T>`.
   `Context::remote_write`, `remote_write_all` and `sent_nothing` return receipts;
@@ -98,6 +112,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   The `initialization` harness reports its raw controls as `std alloc` because
   they now use jemalloc as well. See the
   [benchmark guide](docs/benchmark.md#allocator).
+
+### Fixed
+- Closing a TCP, WebSocket or HTTP/2 RPC stream terminates both I/O directions
+  and releases queued owners without waiting for the entire pool to stop.
+- Framework failures carry `IsFrameworkError` so typed clients convert the
+  original `ruapc::Error` through `E::from` instead of trying to decode it as
+  the application's error type. Unary HTTP exposes the same distinction with
+  `x-ruapc-framework-error: true`. Mixed-version peers need the new server
+  marker and client decoding to preserve custom error contracts.
+- Handler panic containment includes payload decoding, future construction
+  and response serialization; low-level registration errors are returned to
+  the caller instead of being discarded.
 
 ### Removed
 - **BREAKING**: `SentBuffers::merge` and `WithBuffers::into_buffers`. Use
