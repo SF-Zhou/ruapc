@@ -18,9 +18,14 @@
 //! parsing RPC metadata, collecting frames or posting work.
 //! Times are wall time per operation, not latency distributions or RPC timings.
 
-use std::{hint::black_box, time::Instant};
+use std::{
+    hint::black_box,
+    mem::{size_of, size_of_val},
+    time::Instant,
+};
 
 use bytes::{Buf, Bytes};
+use ruapc_bufpool::{MemoryKey, RemoteBufferInfo};
 use ruapc_wire::{CodecError, MsgFlags, MsgMeta, deserialize_payload, frame, parse_body};
 
 // Measurements pin jemalloc as the process allocator so samples are comparable
@@ -140,6 +145,51 @@ fn benchmark_messages(config: &Config) -> usize {
     cases
 }
 
+fn benchmark_regions(config: &Config) -> usize {
+    let mut cases = 0;
+    let payload = "x".repeat(16);
+    for count in [0_u64, 1, 16] {
+        let mut meta = metadata(true);
+        meta.read_regions = (0..count)
+            .map(|index| RemoteBufferInfo {
+                key: MemoryKey {
+                    lkey: 0x1122_3344,
+                    rkey: 0x5566_7788,
+                },
+                addr: 0x1000_0000 + index * 4096,
+                len: 4096,
+            })
+            .collect();
+        meta.write_regions = meta.read_regions.clone();
+        let encoded = frame::encode(&meta, &payload).unwrap();
+        let body = encoded.slice(STREAM_HEADER_LEN..);
+        let (parsed_meta, payload_offset) = parse_body(&body).unwrap();
+        assert_eq!(parsed_meta, meta);
+        assert_eq!(
+            deserialize_payload::<String>(&body[payload_offset..], parsed_meta.flags).unwrap(),
+            payload
+        );
+        drop(parsed_meta);
+
+        cases += config.measure(&format!("regions/encode/{count}+{count}"), || {
+            drop(black_box(
+                frame::encode(black_box(&meta), black_box(&payload)).unwrap(),
+            ));
+        });
+        cases += config.measure(&format!("regions/decode/{count}+{count}"), || {
+            let mut owned = black_box(body.clone());
+            let (parsed_meta, payload_offset) = parse_body(&owned).unwrap();
+            owned.advance(payload_offset);
+            let decoded =
+                deserialize_payload::<String>(&owned, black_box(&parsed_meta).flags).unwrap();
+            drop(black_box(decoded));
+            drop(parsed_meta);
+            drop(owned);
+        });
+    }
+    cases
+}
+
 fn decode_whole(encoded: &Bytes) -> Bytes {
     let mut decoder = frame::FrameDecoder::default();
     let mut input = encoded.clone();
@@ -223,12 +273,23 @@ pub fn main() {
         "Wire codecs: {} iterations, {} warmups; filter={:?}",
         config.iters, config.warmup, config.filter,
     );
+    let layout = MsgMeta::default();
+    println!(
+        "Inline sizes: MsgMeta={} B, read_regions={} B, write_regions={} B, RemoteBufferInfo={} B (heap allocations excluded).",
+        size_of::<MsgMeta>(),
+        size_of_val(&layout.read_regions),
+        size_of_val(&layout.write_regions),
+        size_of::<RemoteBufferInfo>(),
+    );
     println!(
         "Encode includes final-frame allocation/growth/drop; message decode includes owned decoding/drop."
     );
     println!(
         "Chunk cases create a decoder per operation; only fragmented storage is allocated. RDMA op = four frames."
     );
-    let cases = benchmark_messages(&config) + benchmark_chunks(&config) + benchmark_rdma(&config);
+    let cases = benchmark_messages(&config)
+        + benchmark_regions(&config)
+        + benchmark_chunks(&config)
+        + benchmark_rdma(&config);
     assert!(cases > 0, "RUAPC_CODEC_BENCH_FILTER matched no cases");
 }

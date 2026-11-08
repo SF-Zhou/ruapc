@@ -157,7 +157,8 @@ pub(crate) struct LargePayloadOffer {
 }
 
 // Schema-only projection: wire metadata has no dependency on schema generation.
-// Keep these field types and defaults aligned with ruapc_wire::MsgMeta.
+// Keep these wire shapes and defaults aligned with ruapc_wire::MsgMeta;
+// Vec projects the array representation of its ThinVec region containers.
 #[derive(JsonSchema)]
 #[allow(dead_code)]
 struct PayloadMetadataSchema {

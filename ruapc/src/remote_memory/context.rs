@@ -191,7 +191,7 @@ mod tests {
 
     fn ctx_with_read_regions(regions: Vec<RemoteBufferInfo>) -> Context {
         let (ctx, _) = connected_context(MsgMeta {
-            read_regions: regions,
+            read_regions: regions.into(),
             ..Default::default()
         });
         ctx
@@ -235,7 +235,7 @@ mod tests {
     #[tokio::test]
     async fn test_remote_read_invalid_endpoint_returns_err() {
         let mut ctx = Context::create(&SocketPoolConfig::default()).unwrap();
-        ctx.msg_meta.read_regions = vec![region(8)];
+        ctx.msg_meta.read_regions = [region(8)].into();
         let mut local = ctx.state.buffer_pool.allocate(1024 * 1024).unwrap();
         local.set_len(8);
         let result = ctx.remote_read(&[CopyOp::new(0, 0, 8)], vec![local]).await;
@@ -274,8 +274,8 @@ mod tests {
         let disconnected = Context::create(&SocketPoolConfig::default()).unwrap();
         let (missing, mut missing_queue) = connected_context(MsgMeta::default());
         let (connected, mut queue) = connected_context(MsgMeta {
-            read_regions: vec![region(8)],
-            write_regions: vec![region(8)],
+            read_regions: [region(8)].into(),
+            write_regions: [region(8)].into(),
             ..Default::default()
         });
         for ops in [vec![], vec![CopyOp::new(u64::MAX, u64::MAX, 0)]] {
@@ -344,7 +344,7 @@ mod tests {
     #[tokio::test]
     async fn test_remote_write_invalid_endpoint_returns_err() {
         let mut ctx = Context::create(&SocketPoolConfig::default()).unwrap();
-        ctx.msg_meta.write_regions = vec![region(1024)];
+        ctx.msg_meta.write_regions = [region(1024)].into();
         let mut local = ctx.state.buffer_pool.allocate(1024 * 1024).unwrap();
         local.set_len(1024);
         let result = ctx
@@ -363,7 +363,7 @@ mod tests {
     #[tokio::test]
     async fn test_remote_write_zero_total_short_circuits() {
         let (ctx, mut queue) = connected_context(MsgMeta {
-            write_regions: vec![region(0)],
+            write_regions: [region(0)].into(),
             ..Default::default()
         });
         let sent = ctx.remote_write_all(vec![]).await.unwrap();
@@ -407,7 +407,7 @@ mod tests {
                 Socket::TCP(TcpSocket::new(sender)),
                 MsgMeta {
                     msgid: 123,
-                    read_regions: vec![region(4)],
+                    read_regions: [region(4)].into(),
                     timeout_ms: 5_000,
                     ..Default::default()
                 },

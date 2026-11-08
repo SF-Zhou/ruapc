@@ -422,11 +422,12 @@ mod tests {
                 ().read_into_target(&ctx, &request).await.unwrap_err().kind,
                 ErrorKind::MissingBufferInfo,
             );
-            ctx.msg_meta.read_regions = vec![RemoteBufferInfo {
+            ctx.msg_meta.read_regions = [RemoteBufferInfo {
                 addr: 0x1000,
                 len: 4,
                 ..Default::default()
-            }];
+            }]
+            .into();
             assert_eq!(
                 ().read_into_target(&ctx, &request).await.unwrap_err().kind,
                 ErrorKind::Timeout,

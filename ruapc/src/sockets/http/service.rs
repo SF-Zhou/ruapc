@@ -155,8 +155,8 @@ impl HttpService {
             method,
             flags: MsgFlags::IsReq,
             msgid,
-            read_regions: Vec::new(),
-            write_regions: Vec::new(),
+            read_regions: Default::default(),
+            write_regions: Default::default(),
             timeout_ms: u32::try_from(UNARY_TIMEOUT.as_millis()).unwrap_or(u32::MAX),
         };
         let msg = Message::new(meta, bytes.into());

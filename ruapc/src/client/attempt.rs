@@ -5,6 +5,7 @@
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use ruapc_bufpool::RemoteBufferInfo;
+use thin_vec::ThinVec;
 
 use crate::{
     Buffer, Endpoint, Socket, State,
@@ -204,9 +205,9 @@ pub(super) fn export_attached_regions(
     state: &State,
     read_buffers: &[Buffer],
     write_target: Option<&Arc<WriteTarget>>,
-) -> std::result::Result<(Vec<RemoteBufferInfo>, Vec<RemoteBufferInfo>), AttemptFailure> {
-    let mut read_regions = Vec::new();
-    let mut write_regions = Vec::new();
+) -> std::result::Result<(ThinVec<RemoteBufferInfo>, ThinVec<RemoteBufferInfo>), AttemptFailure> {
+    let mut read_regions = ThinVec::new();
+    let mut write_regions = ThinVec::new();
     if read_buffers.is_empty() && write_target.is_none() {
         return Ok((read_regions, write_regions));
     }

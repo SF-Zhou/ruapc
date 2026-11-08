@@ -62,8 +62,8 @@ mod tests {
             method: method.to_string(),
             flags,
             msgid: 42,
-            read_regions: Vec::new(),
-            write_regions: Vec::new(),
+            read_regions: Default::default(),
+            write_regions: Default::default(),
             timeout_ms: 0,
         }
     }
@@ -104,8 +104,8 @@ mod tests {
             method: "MemoryService/read_into_target".into(),
             flags: MsgFlags::IsReq | MsgFlags::UseMessagePack,
             msgid: u64::MAX - 1,
-            read_regions: vec![region, region],
-            write_regions: vec![region],
+            read_regions: [region, region].into(),
+            write_regions: [region].into(),
             timeout_ms: 1500,
         };
         let buf = serialize_to_bytes(&meta, &serde_json::json!({"x": 1}));
@@ -148,8 +148,8 @@ mod tests {
             method: String::new(),
             flags: MsgFlags::IsRsp,
             msgid: 42,
-            read_regions: Vec::new(),
-            write_regions: Vec::new(),
+            read_regions: Default::default(),
+            write_regions: Default::default(),
             timeout_ms: 0,
         };
         let buf = serialize_to_bytes(&meta, &serde_json::json!({"ok": true}));

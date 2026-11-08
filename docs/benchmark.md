@@ -106,20 +106,25 @@ are exercised by the RPC harnesses.
 |---|---|
 | `encode/{msgpack,json}/{16,4096}B` | Metadata and string payload serialized into a complete stream frame; includes final allocation, growth and destruction |
 | `decode/{msgpack,json}/{16,4096}B` | Pre-encoded body cloned, metadata parsed and string payload decoded; includes owned allocations and destruction, excludes stream-header parsing |
+| `regions/{encode,decode}/{0+0,1+1,16+16}` | The same encoding/decoding operations with a 16 B MessagePack string and 0, 1 or 16 descriptors in each of the read and write region lists; decoding includes region allocation and destruction |
 | `chunks/{whole,header_split,body_split}/4096B` | A fresh stream decoder per operation; input chunks share storage, only fragmented frames need assembly allocation/copying |
 | `frame/decode/4_frames` | Four aggregated ordinary frames delivered to a `black_box` callback; excludes metadata parsing, verbs and RPC dispatch |
 
 Fixtures and correctness checks are outside timing. Results are amortized wall
 time in `ns/op`, not latency distributions or end-to-end RPC costs. Use the RPC
 harnesses to verify effects on actual transports.
+The harness also prints inline sizes for `MsgMeta`, both region containers and
+`RemoteBufferInfo`. These sizes exclude heap allocations, including container
+headers stored alongside nonempty region arrays.
 
 | Environment variable | Effect |
 |---|---|
 | `RUAPC_CODEC_BENCH_ITERS` | Positive operation count per case; default 100000 |
 | `RUAPC_CODEC_BENCH_WARMUP` | Warmup operations per case; default 1000, zero allowed |
-| `RUAPC_CODEC_BENCH_FILTER` | Case-name substring; unset runs all 12 cases |
+| `RUAPC_CODEC_BENCH_FILTER` | Case-name substring; unset runs all 18 cases |
 
 For example, use `RUAPC_CODEC_BENCH_FILTER=chunks` to isolate stream decoding.
+Use `RUAPC_CODEC_BENCH_FILTER=regions` to compare region metadata workloads.
 Repeat the process for each sample and keep the same feature configuration when
 comparing versions.
 

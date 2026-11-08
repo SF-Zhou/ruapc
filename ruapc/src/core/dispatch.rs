@@ -102,8 +102,8 @@ mod tests {
             method: "TestSvc/x".into(),
             flags: MsgFlags::IsReq,
             msgid: 1,
-            read_regions: Vec::new(),
-            write_regions: Vec::new(),
+            read_regions: Default::default(),
+            write_regions: Default::default(),
             timeout_ms,
         };
         Context::server_ctx(&base.state, socket, meta)
