@@ -152,8 +152,18 @@ impl Context {
     /// Attempts to send a response on this context's connection.
     ///
     /// Generated service handlers normally call this. It preserves the request
-    /// ID and payload encoding; transport send errors are discarded.
+    /// ID and payload encoding; transport send errors are discarded. An `Err`
+    /// here uses the application's declared error type. Use
+    /// [`send_err_rsp`](Self::send_err_rsp) for framework-generated errors.
     pub async fn send_rsp<Rsp, E>(&mut self, rsp: std::result::Result<Rsp, E>)
+    where
+        Rsp: Serialize,
+        E: std::error::Error + From<Error> + Serialize,
+    {
+        self.send_rsp_inner(rsp, MsgFlags::empty()).await;
+    }
+
+    async fn send_rsp_inner<Rsp, E>(&mut self, rsp: std::result::Result<Rsp, E>, flags: MsgFlags)
     where
         Rsp: Serialize,
         E: std::error::Error + From<Error> + Serialize,
@@ -178,8 +188,9 @@ impl Context {
             write_regions: Default::default(),
             timeout_ms: 0,
         };
-        meta.flags.remove(MsgFlags::IsReq);
-        meta.flags.insert(MsgFlags::IsRsp);
+        meta.flags
+            .remove(MsgFlags::IsReq | MsgFlags::IsFrameworkError);
+        meta.flags.insert(MsgFlags::IsRsp | flags);
         match &mut self.endpoint {
             ContextEndpoint::Connected(socket) => {
                 let _ = socket.send(&mut meta, &rsp, &self.state).await;
@@ -190,16 +201,83 @@ impl Context {
         }
     }
 
-    /// Sends an error through [`send_rsp`](Self::send_rsp), with the same
-    /// best-effort delivery behavior.
+    /// Sends a framework-generated error with best-effort delivery.
+    ///
+    /// Marks the response so typed clients decode [`Error`] first, then convert
+    /// it through the application's `From<Error>` implementation. The payload
+    /// retains the same `Result::Err` envelope as [`send_rsp`](Self::send_rsp).
     pub async fn send_err_rsp(&mut self, err: Error) {
-        self.send_rsp::<(), Error>(Err(err)).await;
+        self.send_rsp_inner::<(), Error>(Err(err), MsgFlags::IsFrameworkError)
+            .await;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ErrorKind, Message, msg::frame::FrameDecoder, tcp::TcpSocket};
+
+    #[tokio::test]
+    async fn response_flags_preserve_extensions_and_classify_errors_by_origin() {
+        let base = client_context();
+        let extension_flag = MsgFlags::from_bits_retain(0x80);
+        for format in [MsgFlags::empty(), MsgFlags::UseMessagePack] {
+            let (sender, mut queue) = tokio::sync::mpsc::channel(1);
+            let request_meta = MsgMeta {
+                method: "Test/reply".into(),
+                // Even a request carrying the response-only flag must not
+                // cause ordinary application replies to be misclassified.
+                flags: MsgFlags::IsReq | format | MsgFlags::IsFrameworkError | extension_flag,
+                msgid: 42,
+                timeout_ms: 30_000,
+                ..Default::default()
+            };
+            let mut ctx = Context::server_ctx(
+                &base.state,
+                Socket::TCP(TcpSocket::new(sender)),
+                request_meta.clone(),
+            );
+            let error = Error::new(ErrorKind::HandlerPanic, "handler panicked".into());
+            for (framework_error, expected) in [
+                (true, Err(error.clone())),
+                (false, Err(error.clone())),
+                (false, Ok(7_u32)),
+            ] {
+                if framework_error {
+                    ctx.send_err_rsp(expected.clone().unwrap_err()).await;
+                } else {
+                    ctx.send_rsp(expected.clone()).await;
+                }
+                let mut encoded = queue.try_recv().unwrap();
+                let body = FrameDecoder::default()
+                    .decode(&mut encoded)
+                    .unwrap()
+                    .unwrap();
+                let response = Message::parse(body).unwrap();
+                let mut flags = MsgFlags::IsRsp | format | extension_flag;
+                flags.set(MsgFlags::IsFrameworkError, framework_error);
+                assert_eq!(
+                    response.meta,
+                    MsgMeta {
+                        flags,
+                        msgid: request_meta.msgid,
+                        ..Default::default()
+                    }
+                );
+                // Framework errors retain the Result envelope understood by
+                // existing clients whose declared error type is Error.
+                assert_eq!(
+                    response
+                        .payload
+                        .deserialize::<Result<u32>>(&response.meta)
+                        .unwrap(),
+                    expected
+                );
+                assert_eq!(ctx.msg_meta, request_meta);
+                assert!(encoded.is_empty());
+            }
+        }
+    }
 
     fn client_context() -> Context {
         Context::create(&SocketPoolConfig {

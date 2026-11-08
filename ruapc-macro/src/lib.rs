@@ -35,6 +35,11 @@
 //! where clauses, default bodies, and unsafe traits or methods are unsupported.
 //! Return types may be `Result<T, E>` or aliases, including `ruapc::Result<T>`.
 //! The generated call traits enforce serialization, schema, and error bounds.
+//! Custom errors must implement `From<ruapc::Error>`. Clients use this conversion
+//! for local failures and marked framework error responses, such as overload,
+//! request decoding failures, or handler panics. Handler-returned errors are
+//! deserialized directly as `E`. Receiving framework errors as custom errors
+//! requires a server that emits the framework error flag.
 //!
 //! Methods become `fn -> impl Future<Output = ...> + Send`. Implementations
 //! may still use `async fn`; the compiler checks that their futures are `Send`.

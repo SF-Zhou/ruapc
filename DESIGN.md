@@ -124,6 +124,14 @@ payload decoder; default clients use MessagePack, otherwise JSON. Compatible
 metadata fields use `#[serde(default)]` and omit empty/default values where
 appropriate. See [`MsgMeta`](ruapc-wire/src/meta.rs) for fields and defaults.
 
+Responses preserve the serialized `Result` envelope. Framework-generated errors
+set `MsgFlags::IsFrameworkError`: clients decode their error value as
+`ruapc::Error`, then convert it through the declared error type's
+`From<ruapc::Error>` implementation. Unflagged responses use the declared
+application result type, including handler-returned errors. This distinction
+requires upgraded clients and servers; clients do not infer framework errors
+from unflagged responses sent by older servers.
+
 [`ruapc-wire/src/encode.rs`](ruapc-wire/src/encode.rs) serializes directly into
 transport storage through the generic `SendMsg` interface and backfills lengths.
 [`message.rs`](ruapc-wire/src/message.rs) validates bounds and returns decoded

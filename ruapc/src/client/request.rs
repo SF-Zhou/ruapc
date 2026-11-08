@@ -118,7 +118,16 @@ impl Client {
                 None => BufferAvailability::NotAttached,
             };
         }
-        response.payload.deserialize(&response.meta)?
+        if response.meta.flags.contains(MsgFlags::IsFrameworkError) {
+            // Framework failures use Error regardless of the service's E.
+            // Keep the Result envelope shared with application responses.
+            response
+                .payload
+                .deserialize::<Result<Rsp, Error>>(&response.meta)?
+                .map_err(Into::into)
+        } else {
+            response.payload.deserialize(&response.meta)?
+        }
     }
 
     /// Acquires a socket and sends the request, retrying only failures that

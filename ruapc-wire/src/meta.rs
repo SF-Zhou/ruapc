@@ -21,6 +21,11 @@ bitflags! {
         const IsRsp = 2;
         /// Encode the payload as MessagePack; otherwise use JSON.
         const UseMessagePack = 4;
+        /// Response carries a framework-generated error in its `Result::Err`
+        /// payload. The runtime decodes it as `ruapc::Error` before converting
+        /// it to the application's error type. Never set on requests or
+        /// application-returned errors.
+        const IsFrameworkError = 8;
     }
 }
 
