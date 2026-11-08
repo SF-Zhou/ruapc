@@ -30,6 +30,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   APIs.
 
 ### Changed
+- **BREAKING**: `MsgMeta::read_regions` and `write_regions` now use
+  `thin_vec::ThinVec<RemoteBufferInfo>` instead of `Vec`, reducing inline
+  metadata size. Use `.into()` or iterator `.collect()` when constructing
+  these fields. Named-field MessagePack encoding and defaults are unchanged.
 - **BREAKING**: `SentBuffers`, `WithBuffers<T>` and `ResultWithBuffers<T>`
   are replaced by `WriteReceipt`, `BufferReply<T>` and `ResultBufferReply<T>`.
   `Context::remote_write`, `remote_write_all` and `sent_nothing` return receipts;

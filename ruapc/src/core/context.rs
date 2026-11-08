@@ -174,8 +174,8 @@ impl Context {
             method: String::new(),
             flags: self.msg_meta.flags,
             msgid: self.msg_meta.msgid,
-            read_regions: Vec::new(),
-            write_regions: Vec::new(),
+            read_regions: Default::default(),
+            write_regions: Default::default(),
             timeout_ms: 0,
         };
         meta.flags.remove(MsgFlags::IsReq);

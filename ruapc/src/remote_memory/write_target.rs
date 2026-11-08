@@ -6,6 +6,7 @@ use ruapc_bufpool::{AsDeviceIndex, RemoteBufferInfo};
 #[cfg(feature = "rdma")]
 use ruapc_memory::SpaceLayout;
 use ruapc_memory::{BufferSet, CopyBatch};
+use thin_vec::ThinVec;
 
 #[cfg(test)]
 use crate::CopyOp;
@@ -43,7 +44,7 @@ impl WriteTarget {
     pub fn export_regions(
         &self,
         device_index: &impl AsDeviceIndex,
-    ) -> Result<Vec<RemoteBufferInfo>> {
+    ) -> Result<ThinVec<RemoteBufferInfo>> {
         let buffers = self.buffers.lock().unwrap();
         buffers
             .as_ref()

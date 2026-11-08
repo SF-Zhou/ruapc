@@ -46,6 +46,7 @@ serde-inline-default.workspace = true
 serde_bytes.workspace = true
 serde_json.workspace = true
 socket2.workspace = true
+thin-vec.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true

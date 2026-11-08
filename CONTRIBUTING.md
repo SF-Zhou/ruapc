@@ -63,6 +63,11 @@ checks must pass before merging. [CI](.github/workflows/rust.yml) runs formattin
 release Clippy and coverage on Linux x86-64 and ARM64 with Soft-RoCE, plus
 standalone memory tests, Clippy and rustdoc without RDMA setup.
 
+Use two-component `x.y` version requirements for dependencies by default
+(for example, `"0.2"`). Use a patch-level minimum or an exact requirement only
+when necessary, and document the reason. Keep workspace crate dependencies
+pinned to the shared release version as described in the root `Cargo.toml`.
+
 Prefer file-level imports over inline absolute paths: import the item once
 (`use crate::module::Item;`) and refer to `Item` in the body rather than
 repeating `crate::module::Item`. Keep an inline path for visibility

@@ -5,6 +5,7 @@ use bitflags::bitflags;
 use ruapc_bufpool::RemoteBufferInfo;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
+use thin_vec::ThinVec;
 
 /// Request/response markers and payload-format selection.
 #[derive(Deserialize, Serialize, Debug, Default, PartialEq, Eq, Clone, Copy)]
@@ -46,14 +47,14 @@ pub struct MsgMeta {
     /// contiguous space. Attached by `Client::with_read_buffers`; also
     /// used by the reverse `MemoryService/read_into_target` request to advertise the
     /// server's source buffers.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub read_regions: Vec<RemoteBufferInfo>,
+    #[serde(default, skip_serializing_if = "ThinVec::is_empty")]
+    pub read_regions: ThinVec<RemoteBufferInfo>,
     /// Regions of the sender's registered memory the receiver may *write*
     /// (through the internal remote-memory protocol). In order, they form one logical
     /// contiguous space. Attached by `Client::with_write_buffers`; active RDMA
     /// retains the destination even if the request has already resolved.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub write_regions: Vec<RemoteBufferInfo>,
+    #[serde(default, skip_serializing_if = "ThinVec::is_empty")]
+    pub write_regions: ThinVec<RemoteBufferInfo>,
     /// Remaining time budget of the request in milliseconds, set by the
     /// client. The server derives a deadline from it on arrival (relative
     /// budgets avoid clock-skew issues of absolute timestamps), drops the
