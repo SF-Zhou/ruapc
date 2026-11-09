@@ -1,12 +1,13 @@
 //! Serve the echo, greeting and verified remote-memory examples.
 
 use clap::Parser;
+use std::slice;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
 
-use ruapc::{BufferReply, Context, Error, ErrorKind, ListenMode, Result, Router, Server};
+use ruapc::{Context, Error, ErrorKind, ListenMode, Result, Router, Server};
 use ruapc_demo::{
     EchoService, GreetService, MemBenchService, ReadCrcReq, Request, WriteCrcReq,
     app::{PoolOptions, RuntimeOptions, init_tracing},
@@ -70,13 +71,13 @@ impl GreetService for DemoImpl {
 
 impl MemBenchService for DemoImpl {
     async fn read_crc(&self, ctx: &Context, _request: &ReadCrcReq) -> Result<u32> {
-        let data = ctx.remote_read_all().await?;
+        let data = ctx.remote_read_allocated().await?;
         Ok(crc32c_of(&data))
     }
 
-    async fn write_crc(&self, ctx: &Context, request: &WriteCrcReq) -> Result<BufferReply<u32>> {
+    async fn write_crc(&self, ctx: &Context, request: &WriteCrcReq) -> Result<u32> {
         if request.len == 0 {
-            return Ok(ctx.sent_nothing().into_reply(crc32c_of([b"".as_slice()])));
+            return Ok(crc32c_of([b"".as_slice()]));
         }
         let mut buf = ctx
             .state
@@ -87,8 +88,8 @@ impl MemBenchService for DemoImpl {
         fill_pattern(&mut buf[..request.len], seed);
         buf.set_len(request.len);
         let crc = crc32c_of([&buf]);
-        let sent = ctx.remote_write_all(vec![buf]).await?;
-        Ok(sent.into_reply(crc))
+        ctx.remote_write_all(slice::from_ref(&buf)).await?;
+        Ok(crc)
     }
 }
 

@@ -20,11 +20,16 @@
 //!
 //! ## Remote memory
 //!
-//! [`ClientWithBuffers`] attaches owned read sources and write destinations.
-//! Handlers use [`Context::remote_read`] and [`Context::remote_write`] with
-//! logical [`CopyOp`] ranges. Handlers and clients share the declared service
-//! trait and [`BufferReply`] result type, with explicit local destination availability.
-//! [`RemoteIoError`] describes recovery after a failed transfer.
+//! [`Client::with_buffers`] scopes buffered calls through [`OwnedBuffers::run`],
+//! borrowing sources and returning recovered destinations alongside either result. After recovery grace,
+//! owned calls may return without buffers while the runtime retains pending DMA.
+//! [`Context::own_buffers`] provides owned remote read destinations; source writes
+//! use safe references through [`Context::remote_write`]. Both accept logical
+//! [`CopyOp`] ranges. Handlers and clients retain ordinary service result types.
+//! Advanced destination borrowing lives in the separate `ruapc-unsafe`
+//! crate; their caller explicitly guarantees lifetime and access through completion.
+//! Both modes share transport execution; borrowed calls wait for local destination
+//! settlement before returning, while owned calls may defer reclamation.
 //!
 //! See the [quick start](https://github.com/SF-Zhou/ruapc#example) for a complete
 //! service and the [documentation index](https://github.com/SF-Zhou/ruapc/blob/main/docs/README.md)
@@ -39,13 +44,15 @@
 pub use ruapc_macro::service;
 
 mod error;
-pub use error::{Error, ErrorKind, RemoteIoError, Result};
+pub use error::{Error, ErrorKind, Result};
 
 mod msg;
 pub use msg::{Message, MsgFlags, MsgMeta, Payload};
 
 mod client;
-pub use client::{Client, ClientWithBuffers};
+#[doc(hidden)]
+pub use client::BufferScope;
+pub use client::{Client, ClientWithBuffers, Completed, OwnedBuffers};
 
 mod core;
 #[doc(hidden)]
@@ -55,10 +62,7 @@ pub use core::{Context, Listener, MethodSchema, Router, Server, State};
 pub use core::{catch_handler_panic, spawn_handler};
 
 mod remote_memory;
-pub use remote_memory::{
-    BufferAvailability, BufferReply, CopyOp, MAX_COPY_OPS, MAX_REGIONS, RemoteSpace,
-    ResultBufferReply, WriteReceipt,
-};
+pub use remote_memory::{CopyOp, MAX_COPY_OPS, MAX_REGIONS, RemoteBuffers, RemoteSpace};
 
 mod metrics;
 pub(crate) use metrics::Metrics;

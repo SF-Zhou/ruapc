@@ -3,7 +3,7 @@
 
 use std::{sync::Arc, time::Instant};
 
-use ruapc_bufpool::RemoteBufferInfo;
+use ruapc_bufpool::{RemoteBufferInfo, WriteBuffer};
 use ruapc_memory::{BufferSet, CopyBatch, SpaceLayout};
 use ruapc_rdma::{ReadCompletion, ReadFailure, ReadPosting, ReadRequest, ReadSegment};
 
@@ -14,8 +14,10 @@ pub(super) use pending::PendingReads;
 
 use super::RdmaSocket;
 use crate::{
-    Buffer, Client, CopyOp, Error, ErrorKind, RemoteIoError, RemoteSpace, Result,
-    remote_memory::{MemoryService, RequestStatusRequest, WriteTarget, transfer::PreparedRead},
+    Buffer, Client, Completed, CopyOp, Error, ErrorKind, RemoteSpace, Result,
+    remote_memory::{
+        MemoryService, Recovery, RequestStatusRequest, WriteTarget, transfer::PreparedRead,
+    },
 };
 
 fn build_planned_reads(
@@ -89,7 +91,7 @@ fn read_closed_error() -> Error {
     )
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct ReadDeadline {
     at: Instant,
     reason: ReadFailure,
@@ -107,12 +109,43 @@ impl ReadDeadline {
     }
 
     fn check(deadline: Option<Self>) -> Result<()> {
-        if let Some(deadline) = deadline
-            && Instant::now() >= deadline.at
-        {
+        if let Some(deadline) = Self::expired(deadline, Instant::now()) {
             return Err(read_failure_error(deadline.reason));
         }
         Ok(())
+    }
+
+    fn expired(deadline: Option<Self>, now: Instant) -> Option<Self> {
+        deadline.filter(|deadline| deadline.at <= now)
+    }
+
+    /// Use an already expired deadline; otherwise start cleanup at the first
+    /// observation. A late observer must not restart an expired budget's grace.
+    fn failure_start(deadline: Option<Self>, now: Instant) -> Instant {
+        Self::expired(deadline, now).map_or(now, |deadline| deadline.at)
+    }
+
+    async fn wait(deadline: Option<Self>) -> ReadFailure {
+        let Some(deadline) = deadline else {
+            return std::future::pending().await;
+        };
+        tokio::time::sleep_until(deadline.at.into()).await;
+        deadline.reason
+    }
+}
+
+/// Internal settlement error; public borrowed calls return ordinary Error.
+#[derive(Debug)]
+struct ReadError {
+    error: Error,
+    buffers: Option<Vec<WriteBuffer>>,
+}
+impl ReadError {
+    fn new(error: Error, buffers: Vec<WriteBuffer>) -> Self {
+        Self {
+            error,
+            buffers: Some(buffers),
+        }
     }
 }
 
@@ -131,9 +164,19 @@ impl RdmaSocket {
         let batch = CopyBatch::new(&ops)?;
         let reads = build_planned_reads(&src, &dst, &batch, self.queue_pair.gather_limit())?;
         let mut buffers = self
-            .execute_reads(reads, vec![buffer], request_deadline)
-            .await?;
-        Ok(buffers.pop().expect("one owned payload destination"))
+            .execute_reads(
+                reads,
+                vec![WriteBuffer::from(buffer)],
+                request_deadline,
+                Recovery::Wait,
+            )
+            .await
+            .map_err(|e| e.error)?;
+        Ok(buffers
+            .pop()
+            .expect("one payload destination")
+            .into_owned()
+            .expect("owned payload"))
     }
 
     pub(crate) fn fail_read_batches(&self) {
@@ -141,33 +184,24 @@ impl RdmaSocket {
     }
 
     pub(crate) fn expire_read_batches(&self, now: Instant) -> bool {
-        self.pending_reads.expire(now)
+        self.pending_reads.expire(now, self.settle_grace())
     }
 
-    pub(crate) fn register_read_batch(
-        &self,
-        posting: &ReadPosting,
-        read_deadline: Option<Instant>,
-        request_deadline: Option<Instant>,
-    ) {
-        self.pending_reads
-            .register(posting.handle(), read_deadline, request_deadline);
-    }
-
-    /// Preparation takes real buffer ownership; local addresses and keys never
+    /// Preparation transfers storage capabilities; local addresses and keys never
     /// cross this layer's interface. Failed/cancelled batches stay in the QP
     /// until all posted requests complete or it is successfully destroyed.
     async fn execute_reads(
         &self,
         reads: Vec<ReadRequest>,
-        local: Vec<Buffer>,
+        local: Vec<WriteBuffer>,
         request_deadline: Option<Instant>,
-    ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
+        recovery: Recovery,
+    ) -> std::result::Result<Vec<WriteBuffer>, ReadError> {
         if !self.state.is_ok() {
-            return Err(RemoteIoError::new(read_closed_error(), Some(local)));
+            return Err(ReadError::new(read_closed_error(), local));
         }
-        // Admission consumes the same absolute budgets as completion. Keep
-        // both: request expiry must not disable the connection's READ watchdog.
+        // Admission, completion and the poller's independent watchdog share
+        // the earliest absolute READ/request deadline and its failure reason.
         let now = Instant::now();
         let read_deadline = self.read_timeout.map(|timeout| now + timeout);
         let deadline = ReadDeadline::earliest(read_deadline, request_deadline);
@@ -176,11 +210,12 @@ impl RdmaSocket {
             .flat_map(|read| &read.segments)
             .map(|segment| segment.len as u64)
             .sum();
-        if let Err(error) = self
-            .bandwidth_limiter
-            .reserve_recv(bytes, deadline.map(|deadline| deadline.at))
-            .await
-        {
+        let admission = tokio::select! {
+            biased;
+            result = self.bandwidth_limiter.reserve_recv(bytes, deadline.map(|deadline| deadline.at)) => result,
+            () = self.read_credits.closed() => Err(read_closed_error()),
+        };
+        if let Err(error) = admission {
             // The shaper rejects a wait beyond the supplied budget as Timeout,
             // including when the tighter budget came from the READ watchdog.
             let error = if error.kind == ErrorKind::Timeout {
@@ -188,60 +223,135 @@ impl RdmaSocket {
             } else {
                 error
             };
-            return Err(RemoteIoError::new(error, Some(local)));
+            return Err(ReadError::new(error, local));
         }
         if let Err(error) = ReadDeadline::check(deadline) {
-            return Err(RemoteIoError::new(error, Some(local)));
+            return Err(ReadError::new(error, local));
         }
         let (mut posting, receiver) = self
             .queue_pair
             .prepare_reads(local, reads)
-            .map_err(|(error, buffers)| RemoteIoError::new(plan_error(error), Some(buffers)))?;
+            .map_err(|(error, buffers)| ReadError::new(plan_error(error), buffers))?;
         let mut registered = false;
         while posting.remaining() != 0 {
             if let Err(error) = self.post_read(&mut posting, deadline).await {
-                // The cursor returns buffers only before the first post;
-                // otherwise it accounts the suffix and preserves posted DMA.
-                let buffers = posting.cancel();
-                // Waiting for admission does not prove a QP failure. The
-                // poller still applies the independent READ watchdog to any
-                // outstanding work after this caller's deadline has expired.
-                if buffers.is_none()
-                    && !matches!(error.kind, ErrorKind::Timeout | ErrorKind::RdmaReadTimeout)
+                let reason = match error.kind {
+                    ErrorKind::Timeout => ReadFailure::RequestTimeout,
+                    ErrorKind::RdmaReadTimeout => ReadFailure::Timeout,
+                    ErrorKind::ConnectionClosed => ReadFailure::ConnectionClosed,
+                    _ => ReadFailure::Completion,
+                };
+                posting.handle().fail(reason);
+                if registered
+                    && !matches!(reason, ReadFailure::Timeout | ReadFailure::RequestTimeout)
                 {
                     self.set_error();
                 }
-                return Err(RemoteIoError::new(error, buffers));
+                // Account every unposted WR before waiting. Published READs
+                // retain their original destinations through their CQEs.
+                drop(posting);
+                return Err(self
+                    .settle_failed_read(receiver, error, deadline, recovery)
+                    .await);
             }
             if !registered {
                 // Publish after the first provider-accepted WR and before the
                 // next await, including admission for a later WR. Cancellation
                 // cannot skip registration while leaving posted DMA behind.
-                self.register_read_batch(&posting, read_deadline, request_deadline);
+                self.pending_reads.register(posting.handle(), deadline);
                 registered = true;
             }
         }
-        let result = self.await_read_batch(receiver).await;
+        let result = self
+            .await_read_batch(receiver, &posting, deadline, recovery)
+            .await;
         // Retain the posting owner's Arc until notification so the runtime
         // task, rather than the CQ poller, normally destroys the batch.
         drop(posting);
-        result.map_err(Into::into)
+        result
     }
 
     /// Waits after posting finishes or its unposted suffix has been cancelled.
-    pub(crate) async fn await_read_batch(&self, receiver: ReadCompletion) -> Result<Vec<Buffer>> {
-        // A task may pass its final health check, then record its READ only
-        // after shutdown has scanned the pending list. Recheck only once per
-        // batch, after posting, so that late work receives a failure even when
-        // no poller remains. If shutdown scans after publication instead, the
-        // registered batch fails there. Registration follows the first
-        // provider-accepted post and precedes this recheck, so one of the two
-        // observers always sees the batch. Failure notification leaves the DMA
-        // holds in the QP.
+    async fn await_read_batch(
+        &self,
+        mut receiver: ReadCompletion,
+        posting: &ReadPosting,
+        deadline: Option<ReadDeadline>,
+        recovery: Recovery,
+    ) -> std::result::Result<Vec<WriteBuffer>, ReadError> {
+        // Publication can race software closure after the provider accepted
+        // the first READ. Record closure for this late batch as well; the
+        // poller still drains it before destroying the QP.
         if !self.state.is_ok() {
             self.fail_read_batches();
         }
-        receiver.await.map_err(read_failure_error)
+        let outcome = if recovery == Recovery::Wait {
+            receiver.await
+        } else {
+            tokio::select! {
+                biased;
+                outcome = &mut receiver => outcome,
+                reason = async {
+                    tokio::select! {
+                        biased;
+                        () = self.read_credits.closed() => ReadFailure::ConnectionClosed,
+                        reason = ReadDeadline::wait(deadline) => reason,
+                    }
+                } => {
+                    let handle = posting.handle();
+                    handle.fail(reason);
+                    let reason = handle.failure().unwrap_or(reason);
+                    return Err(self.settle_failed_read(
+                        receiver, read_failure_error(reason), deadline, recovery,
+                    ).await);
+                }
+            }
+        };
+        if matches!(outcome.result, Err(ReadFailure::Completion)) {
+            self.set_error();
+        }
+        if recovery == Recovery::Wait && !self.state.is_ok() {
+            self.queue_pair.wait_destroyed().await;
+        }
+        match outcome.result {
+            Ok(()) => Ok(outcome.buffers),
+            Err(reason) => Err(ReadError::new(read_failure_error(reason), outcome.buffers)),
+        }
+    }
+
+    /// A failed owned operation may abandon recovery after its grace. The QP
+    /// ledger keeps every posted allocation and permit until authentic CQEs
+    /// settle it, independently of this receiver and its caller's lifetime.
+    async fn settle_failed_read(
+        &self,
+        receiver: ReadCompletion,
+        error: Error,
+        deadline: Option<ReadDeadline>,
+        recovery: Recovery,
+    ) -> ReadError {
+        let outcome = if recovery == Recovery::Wait {
+            receiver.await
+        } else {
+            // A late poll must not restart the same deadline's recovery grace.
+            let failed_at = ReadDeadline::failure_start(deadline, Instant::now());
+            match tokio::time::timeout_at((failed_at + self.settle_grace()).into(), receiver).await
+            {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    self.set_error();
+                    return ReadError {
+                        error,
+                        buffers: None,
+                    };
+                }
+            }
+        };
+        // A completed batch's own destinations are locally safe. Owned calls
+        // need not wait for unrelated QP work before returning those buffers.
+        if recovery == Recovery::Wait && !self.state.is_ok() {
+            self.queue_pair.wait_destroyed().await;
+        }
+        ReadError::new(error, outcome.buffers)
     }
 
     async fn post_read(
@@ -256,16 +366,22 @@ impl RdmaSocket {
         // Covers uncontended admission and credits becoming ready together
         // with expiry, without creating a timer for the fast path.
         ReadDeadline::check(deadline)?;
-        // The held SQ permit keeps the completion route registered even if
-        // closing the connection races this final check and the actual post.
-        self.queue_pair.post_read(posting).map_err(plan_error)?;
+        // The synchronous QP gate orders this post before provider ERR, or
+        // rejects it after closure. A permit alone is not permission to post.
+        self.queue_pair.post_read(posting).map_err(|error| {
+            if self.state.is_ok() {
+                plan_error(error)
+            } else {
+                read_closed_error()
+            }
+        })?;
         sq_permit.forget();
         device_permit.forget();
         Ok(())
     }
 
     pub(crate) async fn read_into_target(
-        &self,
+        self: &Arc<Self>,
         source: &RemoteSpace<'_>,
         ops: &CopyBatch<'_>,
         target: Arc<WriteTarget>,
@@ -275,33 +391,64 @@ impl RdmaSocket {
         if ops.byte_count() == 0 {
             return Ok(());
         }
-        let (planned, buffers) = target.checkout(|layout| {
+        let task = self
+            .supervisor
+            .try_start_async_task()
+            .ok_or_else(read_closed_error)?;
+        let (planned, buffers) = target.checkout_rdma(self.clone(), |layout| {
             build_planned_reads(source, layout, ops, self.queue_pair.gather_limit())
         })?;
-        match self
-            .execute_reads(planned, buffers.into_buffers(), request_deadline)
-            .await
-        {
-            Ok(buffers) => {
-                target.restore(BufferSet::try_new(buffers).expect("READ preserves buffer layout"));
-                Ok(())
-            }
-            Err(mut error) => {
-                if let Some(buffers) = error.take_recovered_buffers() {
-                    target.restore(
-                        BufferSet::try_new(buffers).expect("READ preserves buffer layout"),
-                    );
+        let socket = self.clone();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        // Ownership recovery must outlive the reverse-RPC handler. Dropping its
+        // future abandons only the notification, never the task restoring the
+        // complete destination vector after CQE settlement.
+        tokio::spawn(async move {
+            let transfer = socket.execute_reads(
+                planned,
+                buffers.into_buffers(),
+                request_deadline,
+                Recovery::Wait,
+            );
+            tokio::pin!(transfer);
+            // The supervisor tracks this task through restoration. Shutdown
+            // closes admission but does not drop the buffer-owning future.
+            let outcome = tokio::select! {
+                biased;
+                outcome = transfer.as_mut() => outcome,
+                () = task.stopped() => {
+                    socket.set_error();
+                    transfer.await
                 }
-                Err(error.into())
-            }
-        }
+            };
+            let (buffers, result): (_, Result<()>) = match outcome {
+                Ok(buffers) => (buffers, Ok(())),
+                Err(error) => (
+                    error
+                        .buffers
+                        .expect("target restoration waits for its buffers"),
+                    Err(error.error),
+                ),
+            };
+            target.restore_with_error(
+                BufferSet::try_new(buffers).expect("READ preserves buffer layout"),
+                result.as_ref().err().cloned(),
+            );
+            let _ = sender.send(result);
+        });
+        receiver.await.map_err(|_| {
+            Error::new(
+                ErrorKind::ConnectionClosed,
+                "RDMA destination recovery task stopped".into(),
+            )
+        })?
     }
 
     pub(crate) async fn read_remote(
         &self,
         prepared: PreparedRead<'_, '_>,
-    ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
-        let transfer = prepared.into_parts();
+    ) -> crate::remote_memory::transfer::TransferCompletion<WriteBuffer> {
+        let transfer = prepared;
         let planned = match build_planned_reads(
             &transfer.remote,
             transfer.local.layout(),
@@ -310,38 +457,45 @@ impl RdmaSocket {
         ) {
             Ok(planned) => planned,
             Err(error) => {
-                return Err(RemoteIoError::new(
-                    error,
-                    Some(transfer.local.into_buffers()),
-                ));
+                return Completed {
+                    result: Err(error),
+                    buffers: Some(transfer.local.into_buffers()),
+                };
             }
         };
         let ctx = transfer.ctx;
-        let local = self
-            .execute_reads(planned, transfer.local.into_buffers(), ctx.deadline)
-            .await?;
-
-        // Validate after READ completion; see Context::remote_read for the
-        // immutable-source and request-identity assumptions. Error destinations
-        // below are recoverable memory, not validated transfer results.
+        let buffers = match self
+            .execute_reads(
+                planned,
+                transfer.local.into_buffers(),
+                ctx.deadline,
+                transfer.recovery,
+            )
+            .await
+        {
+            Ok(buffers) => buffers,
+            Err(error) => {
+                return Completed {
+                    result: Err(error.error),
+                    buffers: error.buffers,
+                };
+            }
+        };
         let request = RequestStatusRequest {
             request_id: ctx.msg_meta.msgid,
         };
-        let client = Client::default();
-        let pending = match client.request_is_pending(ctx, &request).await {
-            Ok(pending) => pending,
-            Err(error) => return Err(RemoteIoError::new(error, Some(local))),
+        let result = match Client::default().request_is_pending(ctx, &request).await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(Error::new(
+                ErrorKind::Timeout,
+                "RDMA read completed but client request has already timed out".into(),
+            )),
+            Err(error) => Err(error),
         };
-        if !pending {
-            return Err(RemoteIoError::new(
-                Error::new(
-                    ErrorKind::Timeout,
-                    "RDMA read completed but client request has already timed out".into(),
-                ),
-                Some(local),
-            ));
+        Completed {
+            result,
+            buffers: Some(buffers),
         }
-        Ok(local)
     }
 }
 
@@ -359,8 +513,8 @@ mod timeout_tests {
 
     use super::super::RdmaSocket;
     use crate::{
-        Buffer, Client, Context, CopyOp, Endpoint, ErrorKind, Result, ResultBufferReply, Router,
-        Server, Socket, SocketPoolConfig, Transport,
+        Buffer, Client, Context, CopyOp, Endpoint, ErrorKind, Result, Router, Server, Socket,
+        SocketPoolConfig, Transport,
         core::ContextEndpoint,
         rdma::test_utils::small_rdma_config,
         remote_memory::{ReadIntoTargetRequest, WriteTarget},
@@ -423,7 +577,7 @@ mod timeout_tests {
     trait AdmissionTimeoutRpc {
         async fn ping(&self, ctx: &Context, req: &()) -> Result<u64>;
         async fn read(&self, ctx: &Context, req: &()) -> Result<()>;
-        async fn write(&self, ctx: &Context, req: &()) -> ResultBufferReply<()>;
+        async fn write(&self, ctx: &Context, req: &()) -> Result<()>;
     }
 
     impl AdmissionTimeoutRpc for TimeoutService {
@@ -437,16 +591,17 @@ mod timeout_tests {
             destination.set_len(64);
             destination.fill(0xa5);
             let ops = [CopyOp::new(0, 0, 64)];
-            let reading = ctx.remote_read(&ops, vec![destination]);
-            tokio::pin!(reading);
-            assert!(
-                futures_util::poll!(&mut reading).is_pending(),
-                "the handler must enter READ admission before its deadline"
-            );
-            let error = reading
-                .await
-                .expect_err("the NIC permit stays held until this call has returned");
-            let (error, recovered) = error.into_parts();
+            let error = {
+                let reading = ctx.own_buffers(vec![destination]).remote_read(&ops);
+                tokio::pin!(reading);
+                assert!(
+                    futures_util::poll!(&mut reading).is_pending(),
+                    "the handler must enter READ admission before its deadline"
+                );
+                reading.await
+            };
+            let recovered = error.buffers;
+            let error = error.result.expect_err("READ admission must expire");
             self.completed
                 .send(Completion {
                     kind: error.kind.clone(),
@@ -456,15 +611,15 @@ mod timeout_tests {
             Err(error)
         }
 
-        async fn write(&self, ctx: &Context, _: &()) -> ResultBufferReply<()> {
+        async fn write(&self, ctx: &Context, _: &()) -> Result<()> {
             let mut source = ctx.state.buffer_pool.allocate(64).unwrap();
             source.set_len(64);
             source.fill(0x5a);
             let error = ctx
-                .remote_write(&[CopyOp::new(0, 0, 64)], vec![source])
+                .remote_write(&[CopyOp::new(0, 0, 64)], std::slice::from_ref(&source))
                 .await
                 .expect_err("the client cannot admit the reverse READ before its deadline");
-            let (error, recovered) = error.into_parts();
+            let recovered = Some(vec![source]);
             self.completed
                 .send(Completion {
                     kind: error.kind.clone(),
@@ -558,10 +713,10 @@ mod timeout_tests {
             source.set_len(64);
             source.fill(0x5a);
             client
-                .with_read_buffers(vec![source])
-                .unwrap()
-                .read(&context, &())
+                .with_buffers(std::slice::from_ref(&source), Vec::new())
+                .run(async |rpc| rpc.read(&context, &()).await)
                 .await
+                .result
         });
 
         // The outer client's own Timeout is not evidence that its handler exited.
@@ -618,9 +773,10 @@ mod timeout_tests {
             let mut destination = context.state.buffer_pool.allocate(64).unwrap();
             destination.set_len(64);
             client
-                .with_write_buffers(vec![destination])
-                .write(&context, &())
+                .with_buffers(&[], vec![destination])
+                .run(async |rpc| rpc.write(&context, &()).await)
                 .await
+                .result
         });
 
         // Prove that the actual reverse handler checked out its destination,

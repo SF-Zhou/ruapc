@@ -1,34 +1,22 @@
-//! A transfer binds validated memory to the request and connection that own it.
+//! Validated, request-bound transfers sharing one executor across input modes.
 
-use ruapc_memory::{BufferSet, CopyBatch};
-
-use super::{BufferAvailability, WriteReceipt, rpc_transfer};
+use super::{Recovery, rpc_transfer};
 use crate::{
-    Buffer, Context, CopyOp, Error, ErrorKind, RemoteIoError, RemoteSpace, Result, Socket,
+    Buffer, Completed, Context, CopyOp, Error, ErrorKind, RemoteSpace, Result, Socket,
     core::ContextEndpoint,
 };
+use ruapc_bufpool::WriteBuffer;
+use ruapc_memory::{BorrowedSource, BufferSet, CopyBatch};
 
-enum Direction {
-    Read,
-    Write,
-}
-
-/// Only preparation in this module constructs a transfer. Executors consume it,
-/// so they cannot select a different request, connection, or memory space.
-pub(crate) struct Transfer<'ctx, 'ops> {
+pub(crate) struct PreparedRead<'ctx, 'ops> {
     pub(crate) ctx: &'ctx Context,
     socket: &'ctx Socket,
     #[cfg(feature = "rdma")]
     pub(crate) remote: RemoteSpace<'ctx>,
     pub(crate) ops: CopyBatch<'ops>,
-    pub(crate) local: BufferSet,
-}
-
-fn buffer_set(local: Vec<Buffer>) -> std::result::Result<BufferSet, RemoteIoError> {
-    BufferSet::try_new(local).map_err(|error| {
-        let (error, buffers) = error.into_parts();
-        RemoteIoError::new(error.into(), Some(buffers))
-    })
+    pub(crate) local: BufferSet<WriteBuffer>,
+    #[cfg(feature = "rdma")]
+    pub(crate) recovery: Recovery,
 }
 
 fn connection(ctx: &Context) -> Result<&Socket> {
@@ -41,26 +29,24 @@ fn connection(ctx: &Context) -> Result<&Socket> {
     }
 }
 
-impl<'ctx, 'ops> Transfer<'ctx, 'ops> {
+pub(crate) type TransferCompletion<B> = Completed<Result<()>, Vec<B>>;
+
+impl<'ctx, 'ops> PreparedRead<'ctx, 'ops> {
     fn prepare(
         ctx: &'ctx Context,
         remote: Result<RemoteSpace<'ctx>>,
         ops: &'ops [CopyOp],
-        local: BufferSet,
-        direction: Direction,
-    ) -> std::result::Result<Self, RemoteIoError> {
-        let validation = (|| {
+        local: BufferSet<WriteBuffer>,
+        _recovery: Recovery,
+    ) -> std::result::Result<Self, TransferCompletion<WriteBuffer>> {
+        let checked = (|| {
             let socket = connection(ctx)?;
             let remote = remote?;
             let ops = CopyBatch::new(ops)?;
-            let (source, destination) = match direction {
-                Direction::Read => (remote.total_len(), local.layout().total()),
-                Direction::Write => (local.layout().total(), remote.total_len()),
-            };
-            ops.check_bounds(source, destination)?;
+            ops.check_bounds(remote.total_len(), local.layout().total())?;
             Ok::<_, Error>((socket, remote, ops))
         })();
-        match validation {
+        match checked {
             Ok((socket, _remote, ops)) => Ok(Self {
                 ctx,
                 socket,
@@ -68,25 +54,26 @@ impl<'ctx, 'ops> Transfer<'ctx, 'ops> {
                 remote: _remote,
                 ops,
                 local,
+                #[cfg(feature = "rdma")]
+                recovery: _recovery,
             }),
-            Err(error) => Err(RemoteIoError::new(error, Some(local.into_buffers()))),
+            Err(error) => Err(Completed {
+                result: Err(error),
+                buffers: Some(local.into_buffers()),
+            }),
         }
     }
 }
 
-pub(crate) struct PreparedRead<'ctx, 'ops>(Transfer<'ctx, 'ops>);
-pub(crate) struct PreparedWrite<'ctx, 'ops>(Transfer<'ctx, 'ops>);
-
-impl<'ctx, 'ops> PreparedRead<'ctx, 'ops> {
-    pub(crate) fn into_parts(self) -> Transfer<'ctx, 'ops> {
-        self.0
-    }
-
-    async fn execute(self) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
-        if self.0.ops.byte_count() == 0 {
-            return Ok(self.0.local.into_buffers());
+impl PreparedRead<'_, '_> {
+    async fn execute(self) -> TransferCompletion<WriteBuffer> {
+        if self.ops.byte_count() == 0 {
+            return Completed {
+                result: Ok(()),
+                buffers: Some(self.local.into_buffers()),
+            };
         }
-        match self.0.socket {
+        match self.socket {
             Socket::TCP(_) | Socket::WS(_) | Socket::HTTP(_) => rpc_transfer::read(self).await,
             #[cfg(feature = "rdma")]
             Socket::RDMA(socket) => socket.read_remote(self).await,
@@ -94,100 +81,91 @@ impl<'ctx, 'ops> PreparedRead<'ctx, 'ops> {
     }
 }
 
-impl<'ctx, 'ops> PreparedWrite<'ctx, 'ops> {
-    pub(crate) fn into_parts(self) -> Transfer<'ctx, 'ops> {
-        self.0
-    }
-
-    async fn execute(self) -> std::result::Result<WriteReceipt, RemoteIoError> {
-        let sources = if self.0.ops.byte_count() == 0 {
-            BufferAvailability::Available(self.0.local.into_buffers())
-        } else {
-            match self.0.socket {
-                Socket::TCP(_) | Socket::WS(_) | Socket::HTTP(_) => {
-                    rpc_transfer::write(self).await?
-                }
-                #[cfg(feature = "rdma")]
-                Socket::RDMA(_) => rpc_transfer::write_via_read(self).await?,
-            }
-        };
-        Ok(WriteReceipt::new(sources))
-    }
+fn checked_buffers(
+    buffers: Vec<WriteBuffer>,
+) -> std::result::Result<BufferSet<WriteBuffer>, TransferCompletion<WriteBuffer>> {
+    BufferSet::try_new(buffers).map_err(|e| {
+        let (error, buffers) = e.into_parts();
+        Completed {
+            result: Err(error.into()),
+            buffers: Some(buffers),
+        }
+    })
 }
 
 pub(super) async fn read(
     ctx: &Context,
-    ops: &[CopyOp],
-    local: Vec<Buffer>,
-) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
-    PreparedRead(Transfer::prepare(
-        ctx,
-        ctx.remote_read_space(),
-        ops,
-        buffer_set(local)?,
-        Direction::Read,
-    )?)
-    .execute()
-    .await
+    ops: Option<&[CopyOp]>,
+    local: Vec<WriteBuffer>,
+    recovery: Recovery,
+) -> TransferCompletion<WriteBuffer> {
+    read_from(ctx, ctx.remote_read_space(), ops, local, recovery).await
 }
 
-pub(super) async fn write(
-    ctx: &Context,
-    ops: &[CopyOp],
-    local: Vec<Buffer>,
-) -> std::result::Result<WriteReceipt, RemoteIoError> {
-    PreparedWrite(Transfer::prepare(
-        ctx,
-        ctx.remote_write_space(),
-        ops,
-        buffer_set(local)?,
-        Direction::Write,
-    )?)
-    .execute()
-    .await
+async fn read_from<'ctx>(
+    ctx: &'ctx Context,
+    remote: Result<RemoteSpace<'ctx>>,
+    ops: Option<&[CopyOp]>,
+    local: Vec<WriteBuffer>,
+    recovery: Recovery,
+) -> TransferCompletion<WriteBuffer> {
+    let all = [CopyOp::new(
+        0,
+        0,
+        remote.as_ref().map_or(0, RemoteSpace::total_len),
+    )];
+    let ops = ops.unwrap_or(&all);
+    match checked_buffers(local)
+        .and_then(|local| PreparedRead::prepare(ctx, remote, ops, local, recovery))
+    {
+        Ok(prepared) => prepared.execute().await,
+        Err(completed) => completed,
+    }
+}
+/// Sources stay borrowed by this future only. Stream requests carry copied
+/// payloads; RDMA requests carry metadata and never publish local CPU access.
+pub(super) async fn write(ctx: &Context, ops: Option<&[CopyOp]>, local: &[Buffer]) -> Result<()> {
+    let socket = connection(ctx)?;
+    let remote = ctx.remote_write_space()?;
+    let source = BorrowedSource::new(local)?;
+    let all = [CopyOp::new(0, 0, source.layout().total())];
+    let batch = CopyBatch::new(ops.unwrap_or(&all))?;
+    batch.check_bounds(source.layout().total(), remote.total_len())?;
+    if batch.byte_count() == 0 {
+        return Ok(());
+    }
+    match socket {
+        Socket::TCP(_) | Socket::WS(_) | Socket::HTTP(_) => {
+            // Every CPU read finishes synchronously before the request can be
+            // queued or awaited. Dropping or forgetting it leaves owned bytes.
+            let bytes = source.gather(&batch)?;
+            rpc_transfer::write(ctx, batch, bytes).await
+        }
+        #[cfg(feature = "rdma")]
+        Socket::RDMA(_) => rpc_transfer::write_via_read(ctx, batch, local).await,
+    }
 }
 
-pub(super) async fn read_all(ctx: &Context) -> Result<Vec<Buffer>> {
+pub(super) async fn read_allocated(ctx: &Context) -> Result<Vec<Buffer>> {
     connection(ctx)?;
     let remote = ctx.remote_read_space()?;
     let mut local = Vec::with_capacity(remote.regions().len());
     for region in remote.regions().iter().filter(|region| region.len != 0) {
-        let len = usize::try_from(region.len)
-            .map_err(|_| Error::new(ErrorKind::InvalidArgument, "region too large".into()))?;
+        let len = usize::try_from(region.len)?;
         let mut buffer = ctx
             .state
             .buffer_pool
             .allocate(len)
-            .map_err(|error| Error::new(ErrorKind::InvalidArgument, error.to_string()))?;
+            .map_err(|e| Error::new(ErrorKind::InvalidArgument, e.to_string()))?;
         buffer.set_len(len);
-        local.push(buffer);
+        local.push(WriteBuffer::from(buffer));
     }
-    let ops = [CopyOp::new(0, 0, remote.total_len())];
-    // Internally allocated destinations have no caller that needs recovery.
-    Ok(PreparedRead(Transfer::prepare(
-        ctx,
-        Ok(remote),
-        &ops,
-        buffer_set(local)?,
-        Direction::Read,
-    )?)
-    .execute()
-    .await?)
-}
-
-pub(super) async fn write_all(
-    ctx: &Context,
-    local: Vec<Buffer>,
-) -> std::result::Result<WriteReceipt, RemoteIoError> {
-    let local = buffer_set(local)?;
-    let ops = [CopyOp::new(0, 0, local.layout().total())];
-    PreparedWrite(Transfer::prepare(
-        ctx,
-        ctx.remote_write_space(),
-        &ops,
-        local,
-        Direction::Write,
-    )?)
-    .execute()
-    .await
+    let completed = read_from(ctx, Ok(remote), None, local, Recovery::DetachOwned).await;
+    completed.result?;
+    Ok(completed
+        .buffers
+        .expect("successful reads return their destinations")
+        .into_iter()
+        .map(|buffer| buffer.into_owned().expect("allocated read destinations"))
+        .collect())
 }

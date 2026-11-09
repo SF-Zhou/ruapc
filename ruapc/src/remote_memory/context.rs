@@ -1,159 +1,118 @@
-//! Request-attached memory spaces and transfer validation.
-
-use super::{BufferAvailability, WriteReceipt, transfer};
-use crate::{Buffer, Context, CopyOp, Error, ErrorKind, RemoteIoError, RemoteSpace, Result};
+//! Safe source references, destination adapters and shared transfer boundaries.
+use super::{Recovery, transfer};
+use crate::{Buffer, Completed, Context, CopyOp, Error, ErrorKind, RemoteSpace, Result};
+use ruapc_bufpool::WriteBuffer;
 
 impl Context {
-    /// Returns the *read space* the client attached to the current request
-    /// via [`Client::with_read_buffers`](crate::Client::with_read_buffers):
-    /// the logical concatenation of the advertised regions, readable with
-    /// [`remote_read`](Self::remote_read).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ErrorKind::MissingBufferInfo`](crate::ErrorKind::MissingBufferInfo)
-    /// if the request carries no read regions.
+    /// The concatenated immutable source space attached to this request.
     pub fn remote_read_space(&self) -> Result<RemoteSpace<'_>> {
         if self.msg_meta.read_regions.is_empty() {
             return Err(Error::new(
                 ErrorKind::MissingBufferInfo,
-                "request carries no read regions; client must attach buffers \
-                 via with_read_buffers()"
-                    .into(),
+                "request carries no read regions".into(),
             ));
         }
         Ok(RemoteSpace::new(&self.msg_meta.read_regions)?)
     }
 
-    /// Returns the *write space* the client attached to the current request
-    /// via [`Client::with_write_buffers`](crate::Client::with_write_buffers):
-    /// the logical concatenation of the pinned destination regions,
-    /// writable with [`remote_write`](Self::remote_write).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ErrorKind::MissingBufferInfo`](crate::ErrorKind::MissingBufferInfo)
-    /// if the request carries no write regions.
+    /// The concatenated write destination space attached to this request.
     pub fn remote_write_space(&self) -> Result<RemoteSpace<'_>> {
         if self.msg_meta.write_regions.is_empty() {
             return Err(Error::new(
                 ErrorKind::MissingBufferInfo,
-                "request carries no write regions; client must attach buffers \
-                 via with_write_buffers()"
-                    .into(),
+                "request carries no write regions".into(),
             ));
         }
         Ok(RemoteSpace::new(&self.msg_meta.write_regions)?)
     }
 
-    /// Executes a batch of reads from the client's read space into `local`.
-    ///
-    /// Both sides are logical contiguous spaces: the client's attached
-    /// read buffers (source, see [`remote_read_space`](Self::remote_read_space))
-    /// and the concatenation of the `local` buffers' logical lengths
-    /// (destination). Each [`CopyOp`] copies `len` bytes from
-    /// `src_offset` (client space) to `dst_offset` (local space).
-    ///
-    /// All transfers validate the connection, attached space, bounds, overflow,
-    /// operation count and destination overlap. An empty or zero-byte batch
-    /// returns `local` after validation without I/O.
-    /// RDMA uses one-sided READs; TCP/WS/HTTP use a reverse inline-copy RPC.
-    ///
-    /// Returns the same buffers with the requested ranges filled. Failures
-    /// return recoverable buffers in [`RemoteIoError`]; in-flight RDMA can
-    /// retain them beyond the call. Converting the error with `?` to [`Error`]
-    /// drops any returned buffers.
-    ///
-    /// For transfers that copy bytes, RDMA validates the completed READs with
-    /// an original-request waiter membership probe. With the original immutable
-    /// source still held and no request-ID reuse, a positive probe validates
-    /// the copy. It is not a precise deadline check.
-    ///
-    /// Source recovery after cancellation does not wait for remote DMA.
-    /// Failed validation can return readable destinations in [`RemoteIoError`];
-    /// those bytes are not a valid transfer result. See the
-    /// [source contract](https://github.com/SF-Zhou/ruapc/blob/main/docs/safe-boundaries.md#application-read-source-validation-and-recovery)
-    /// for the success argument and failure behavior.
-    pub async fn remote_read(
+    /// Allocates destinations and reads the complete remote source space.
+    /// Failed reads may leave destinations held by the runtime for background
+    /// settlement after the configured recovery grace.
+    pub async fn remote_read_allocated(&self) -> Result<Vec<Buffer>> {
+        transfer::read_allocated(self).await
+    }
+
+    /// Moves local destinations into the common READ executor.
+    /// Both result branches return original buffers when locally settled. If
+    /// recovery exceeds its grace, `buffers` is `None` and the runtime retains
+    /// outstanding destinations until DMA settles.
+    /// Cancellation retains posted read destinations until local settlement.
+    pub fn own_buffers(&self, buffers: Vec<Buffer>) -> RemoteBuffers<'_> {
+        RemoteBuffers { ctx: self, buffers }
+    }
+
+    /// Established storage boundary for the separate unsafe borrowing facade.
+    /// Owned capabilities retain their destination allocations through local
+    /// DMA settlement. Borrowed capabilities still require their unsafe
+    /// constructor's lifetime and exclusive-access guarantees; this bridge adds
+    /// no allocation keepalive and does not make their cancellation safe.
+    /// `None` operations select the complete remote source space.
+    #[doc(hidden)]
+    pub async fn read_buffer_storage(
         &self,
-        ops: &[CopyOp],
-        local: Vec<Buffer>,
-    ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
-        transfer::read(self, ops, local).await
+        ops: Option<&[CopyOp]>,
+        buffers: Vec<WriteBuffer>,
+    ) -> Completed<Result<()>, Vec<WriteBuffer>> {
+        transfer::read(self, ops, buffers, Recovery::Wait).await
     }
 
-    /// Reads the client's entire read space into freshly allocated
-    /// buffers, one per region (mirroring the client's segmentation).
+    /// Writes from borrowed sources into the client's advertised destinations.
     ///
-    /// Convenience wrapper around
-    /// [`remote_read_space`](Self::remote_read_space) and
-    /// [`remote_read`](Self::remote_read). The returned buffers' logical
-    /// lengths equal the transferred sizes; zero-length regions are
-    /// skipped.
-    pub async fn remote_read_all(&self) -> Result<Vec<Buffer>> {
-        transfer::read_all(self).await
+    /// The original handles stay in place. Stream transports copy the requested
+    /// bytes before awaiting I/O; RDMA exports metadata without publishing local
+    /// CPU access. Cancelling or forgetting the future is memory-safe. A normal
+    /// successful return acknowledges the destination transfer; failure or
+    /// cancellation does not prove that remote READs have finished.
+    pub async fn remote_write(&self, ops: &[CopyOp], local: &[Buffer]) -> Result<()> {
+        transfer::write(self, Some(ops), local).await
     }
 
-    /// Executes a batch of writes from `local` into the client's write
-    /// space and returns a [`WriteReceipt`](crate::WriteReceipt) witness of
-    /// the completed transfer.
-    ///
-    /// Both sides are logical contiguous spaces: the concatenation of the
-    /// `local` buffers' logical lengths (source) and the client's pinned
-    /// write buffers (destination, see
-    /// [`remote_write_space`](Self::remote_write_space)). Each [`CopyOp`]
-    /// copies `len` bytes from `src_offset` (local space) to `dst_offset`
-    /// (client space).
-    ///
-    /// All transfers validate the connection, attached space, bounds, overflow, operation count, and
-    /// destination overlap within the batch. Callers coordinate writes across
-    /// separate calls. RDMA uses a reverse RPC: the client READs `local` into
-    /// owned destinations and replies after completion. The source is retained
-    /// while awaiting that response; this path does not use the pending probe
-    /// described in [`remote_read`](Self::remote_read). Failure or cancellation
-    /// can still recover the source before remote DMA finishes. TCP/WS/HTTP
-    /// instead send the bytes in an inline-copy RPC.
-    ///
-    /// The transfer happens *here*, inside the handler, so its latency and
-    /// errors are directly observable. Pair the witness with a response
-    /// value afterwards:
-    ///
-    /// ```rust,ignore
-    /// let t0 = std::time::Instant::now();
-    /// let sent = ctx.remote_write_all(bufs).await?;
-    /// Ok(sent.into_reply(Stats { push_micros: t0.elapsed().as_micros() as u64 }))
-    /// ```
-    ///
-    /// An empty or zero-byte batch returns a receipt after validation without I/O.
-    /// A successful receipt records completion even if its source buffers cannot
-    /// currently be recovered. Failures return recoverable local buffers in
-    /// [`RemoteIoError`].
-    pub async fn remote_write(
-        &self,
-        ops: &[CopyOp],
-        local: Vec<Buffer>,
-    ) -> std::result::Result<WriteReceipt, RemoteIoError> {
-        transfer::write(self, ops, local).await
+    /// Writes the entire borrowed source space to the remote destination prefix.
+    pub async fn remote_write_all(&self, local: &[Buffer]) -> Result<()> {
+        transfer::write(self, None, local).await
+    }
+}
+
+/// Owned remote READ destinations using the common executor.
+///
+/// Cancellation retains local READ destinations through settlement.
+#[must_use]
+pub struct RemoteBuffers<'a> {
+    ctx: &'a Context,
+    buffers: Vec<Buffer>,
+}
+impl RemoteBuffers<'_> {
+    /// Reads into owned destinations. Success returns the originals; failure
+    /// returns them if locally settled within the recovery grace, otherwise
+    /// returns `buffers: None` while the runtime continues holding them.
+    /// Dropping the future does not release destinations still used by local DMA.
+    pub async fn remote_read(self, ops: &[CopyOp]) -> Completed<Result<()>, Vec<Buffer>> {
+        self.read(Some(ops)).await
     }
 
-    /// Writes the entire logical content of `local` to the beginning of
-    /// the client's write space (a single 1:1 [`CopyOp`]).
-    ///
-    /// Zero total length (including an empty `local`) skips I/O after validating
-    /// the connection and both memory spaces.
-    pub async fn remote_write_all(
-        &self,
-        local: Vec<Buffer>,
-    ) -> std::result::Result<WriteReceipt, RemoteIoError> {
-        transfer::write_all(self, local).await
+    /// Reads the whole remote source space into owned destinations.
+    pub async fn remote_read_all(self) -> Completed<Result<()>, Vec<Buffer>> {
+        self.read(None).await
     }
 
-    /// Produces an empty [`WriteReceipt`](crate::WriteReceipt) witness for
-    /// handler paths that have nothing to transfer, fulfilling a
-    /// `Result<BufferReply<T>, E>` contract without touching the network.
-    #[must_use]
-    pub fn sent_nothing(&self) -> WriteReceipt {
-        WriteReceipt::new(BufferAvailability::Available(Vec::new()))
+    async fn read(self, ops: Option<&[CopyOp]>) -> Completed<Result<()>, Vec<Buffer>> {
+        let completed = transfer::read(
+            self.ctx,
+            ops,
+            self.buffers.into_iter().map(WriteBuffer::from).collect(),
+            Recovery::DetachOwned,
+        )
+        .await;
+        Completed {
+            result: completed.result,
+            buffers: completed.buffers.map(|buffers| {
+                buffers
+                    .into_iter()
+                    .map(|b| b.into_owned().expect("owned destinations"))
+                    .collect()
+            }),
+        }
     }
 }
 
@@ -171,7 +130,7 @@ mod tests {
     #[cfg(feature = "rdma")]
     use crate::remote_memory::{MemoryService, WriteTarget, rpc_transfer::WriteInlineRequest};
     use crate::{
-        BufferReply, Error, ErrorKind, MAX_COPY_OPS, Message, MsgFlags, MsgMeta, Payload, Socket,
+        Error, ErrorKind, MAX_COPY_OPS, Message, MsgFlags, MsgMeta, Payload, Socket,
         SocketPoolConfig, msg::frame, tcp::TcpSocket,
     };
 
@@ -223,29 +182,43 @@ mod tests {
     async fn test_remote_read_missing_regions_recovers_buffers() {
         let ctx = ctx_with_read_regions(vec![]);
         let local = vec![ctx.state.buffer_pool.allocate(1024 * 1024).unwrap()];
-        let result = ctx.remote_read(&[CopyOp::new(0, 0, 1)], local).await;
-        let mut err = result.unwrap_err();
-        assert_eq!(err.error.kind, ErrorKind::MissingBufferInfo);
-        let recovered = err
-            .take_recovered_buffers()
-            .expect("buffers should be recovered");
-        assert_eq!(recovered.len(), 1);
+        let pointer = local[0].as_ptr();
+        let len = local[0].len();
+        let Completed {
+            result,
+            buffers: local,
+        } = ctx
+            .own_buffers(local)
+            .remote_read(&[CopyOp::new(0, 0, 1)])
+            .await;
+        let local = local.unwrap();
+        let error = result.unwrap_err();
+        assert_eq!(error.kind, ErrorKind::MissingBufferInfo);
+        assert_eq!(local[0].as_ptr(), pointer);
+        assert_eq!(local[0].len(), len);
     }
 
     #[tokio::test]
     async fn test_remote_read_invalid_endpoint_returns_err() {
         let mut ctx = Context::create(&SocketPoolConfig::default()).unwrap();
         ctx.msg_meta.read_regions = [region(8)].into();
-        let mut local = ctx.state.buffer_pool.allocate(1024 * 1024).unwrap();
-        local.set_len(8);
-        let result = ctx.remote_read(&[CopyOp::new(0, 0, 8)], vec![local]).await;
-        let mut err = result.unwrap_err();
-        assert_eq!(err.error.kind, ErrorKind::NotConnected);
-        // The consumed buffers are recoverable from the error.
-        let recovered = err
-            .take_recovered_buffers()
-            .expect("buffers should be recovered");
-        assert_eq!(recovered[0].capacity(), 1024 * 1024);
+        let mut local = vec![ctx.state.buffer_pool.allocate(1024 * 1024).unwrap()];
+        local[0].set_len(8);
+        local[0].copy_from_slice(b"original");
+        let pointer = local[0].as_ptr();
+        let Completed {
+            result,
+            buffers: local,
+        } = ctx
+            .own_buffers(local)
+            .remote_read(&[CopyOp::new(0, 0, 8)])
+            .await;
+        let local = local.unwrap();
+        let error = result.unwrap_err();
+        assert_eq!(error.kind, ErrorKind::NotConnected);
+        assert_eq!(local[0].as_ptr(), pointer);
+        assert_eq!(local[0].capacity(), 1024 * 1024);
+        assert_eq!(local[0].as_slice(), b"original");
     }
 
     #[tokio::test]
@@ -254,19 +227,21 @@ mod tests {
         let space = ctx.remote_read_space().unwrap();
         assert_eq!(space.total_len(), 16);
         assert_eq!(space.region_count(), 2);
-
-        let mut local = ctx.state.buffer_pool.allocate(1024 * 1024).unwrap();
-        local.set_len(16);
-        // Source range exceeds the 16-byte remote space.
-        let result = ctx.remote_read(&[CopyOp::new(9, 0, 8)], vec![local]).await;
-        let mut err = result.unwrap_err();
-        assert_eq!(err.error.kind, ErrorKind::InvalidCopyOp);
-        let local = err.take_recovered_buffers().unwrap();
-
-        // Overlapping destination ranges are rejected.
-        let ops = [CopyOp::new(0, 0, 8), CopyOp::new(8, 4, 8)];
-        let err = ctx.remote_read(&ops, local).await.unwrap_err();
-        assert_eq!(err.error.kind, ErrorKind::InvalidCopyOp);
+        let mut local = vec![ctx.state.buffer_pool.allocate(1024 * 1024).unwrap()];
+        local[0].set_len(16);
+        local[0].fill(0x5a);
+        let pointer = local[0].as_ptr();
+        for ops in [
+            vec![CopyOp::new(9, 0, 8)],
+            vec![CopyOp::new(0, 0, 8), CopyOp::new(8, 4, 8)],
+        ] {
+            let completed = ctx.own_buffers(local).remote_read(&ops).await;
+            local = completed.buffers.unwrap();
+            let error = completed.result.unwrap_err();
+            assert_eq!(error.kind, ErrorKind::InvalidCopyOp);
+            assert_eq!(local[0].as_ptr(), pointer);
+            assert_eq!(local[0].as_slice(), &[0x5a; 16]);
+        }
     }
 
     #[tokio::test]
@@ -284,58 +259,43 @@ mod tests {
                 (&missing, ErrorKind::MissingBufferInfo),
             ] {
                 assert_eq!(
-                    ctx.remote_read(&ops, Vec::new())
+                    ctx.own_buffers(vec![])
+                        .remote_read(&ops)
                         .await
+                        .result
                         .unwrap_err()
-                        .error
                         .kind,
                     expected
                 );
                 assert_eq!(
-                    ctx.remote_write(&ops, Vec::new())
-                        .await
-                        .unwrap_err()
-                        .error
-                        .kind,
+                    ctx.remote_write(&ops, &[]).await.unwrap_err().kind,
                     expected
                 );
             }
-            assert!(
-                connected
-                    .remote_read(&ops, Vec::new())
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
-            assert!(
-                connected
-                    .remote_write(&ops, Vec::new())
-                    .await
-                    .unwrap()
-                    .source_buffers()
-                    .available()
-                    .unwrap()
-                    .is_empty()
-            );
+            connected
+                .own_buffers(vec![])
+                .remote_read(&ops)
+                .await
+                .result
+                .unwrap();
+            connected.remote_write(&ops, &[]).await.unwrap();
         }
         let ops = vec![CopyOp::new(0, 0, 0); MAX_COPY_OPS + 1];
         for write in [false, true] {
-            let mut buffer = connected.state.buffer_pool.allocate(4).unwrap();
-            buffer.set_len(4);
-            buffer.copy_from_slice(b"keep");
-            let pointer = buffer.as_ptr();
-            let mut error = if write {
-                connected
-                    .remote_write(&ops, vec![buffer])
-                    .await
-                    .unwrap_err()
+            let mut local = vec![connected.state.buffer_pool.allocate(4).unwrap()];
+            local[0].set_len(4);
+            local[0].copy_from_slice(b"keep");
+            let pointer = local[0].as_ptr();
+            let (result, local) = if write {
+                (connected.remote_write(&ops, &local).await, local)
             } else {
-                connected.remote_read(&ops, vec![buffer]).await.unwrap_err()
+                let completed = connected.own_buffers(local).remote_read(&ops).await;
+                (completed.result, completed.buffers.unwrap())
             };
-            assert_eq!(error.error.kind, ErrorKind::InvalidCopyOp);
-            let recovered = error.take_recovered_buffers().unwrap();
-            assert_eq!(recovered[0].as_ptr(), pointer);
-            assert_eq!(recovered[0].as_slice(), b"keep");
+            let error = result.unwrap_err();
+            assert_eq!(error.kind, ErrorKind::InvalidCopyOp);
+            assert_eq!(local[0].as_ptr(), pointer);
+            assert_eq!(local[0].as_slice(), b"keep");
         }
         assert!(queue.try_recv().is_err());
         assert!(missing_queue.try_recv().is_err());
@@ -345,19 +305,16 @@ mod tests {
     async fn test_remote_write_invalid_endpoint_returns_err() {
         let mut ctx = Context::create(&SocketPoolConfig::default()).unwrap();
         ctx.msg_meta.write_regions = [region(1024)].into();
-        let mut local = ctx.state.buffer_pool.allocate(1024 * 1024).unwrap();
-        local.set_len(1024);
-        let result = ctx
-            .remote_write(&[CopyOp::new(0, 0, 1024)], vec![local])
-            .await;
-        let mut err = result.unwrap_err();
-        assert_eq!(err.error.kind, ErrorKind::NotConnected);
-        assert!(err.take_recovered_buffers().is_some());
-        // Once taken, the buffers are gone.
-        assert!(err.take_recovered_buffers().is_none());
-        // Converting to Error drops any remaining buffers and keeps the kind.
-        let plain: Error = err.into();
-        assert_eq!(plain.kind, ErrorKind::NotConnected);
+        let mut local = vec![ctx.state.buffer_pool.allocate(1024 * 1024).unwrap()];
+        local[0].set_len(1024);
+        local[0].fill(0x5a);
+        let pointer = local[0].as_ptr();
+        let result = ctx.remote_write(&[CopyOp::new(0, 0, 1024)], &local).await;
+        let error = result.unwrap_err();
+        assert_eq!(error.kind, ErrorKind::NotConnected);
+        assert_eq!(local[0].as_ptr(), pointer);
+        assert_eq!(local[0].len(), 1024);
+        assert!(local[0].iter().all(|&byte| byte == 0x5a));
     }
 
     #[tokio::test]
@@ -366,12 +323,8 @@ mod tests {
             write_regions: [region(0)].into(),
             ..Default::default()
         });
-        let sent = ctx.remote_write_all(vec![]).await.unwrap();
+        ctx.remote_write_all(&[]).await.unwrap();
         assert!(queue.try_recv().is_err());
-        assert!(sent.source_buffers().available().unwrap().is_empty());
-        let _rsp: BufferReply<u32> = sent.into_reply(7);
-        // The explicit no-op witness works the same way.
-        let _rsp: BufferReply<u32> = ctx.sent_nothing().into_reply(7);
     }
 
     #[tokio::test]
@@ -386,7 +339,7 @@ mod tests {
             ErrorKind::MissingBufferInfo
         );
         // remote_read_all surfaces the same error.
-        let err = ctx.remote_read_all().await.unwrap_err();
+        let err = ctx.remote_read_allocated().await.unwrap_err();
         assert_eq!(err.kind, ErrorKind::MissingBufferInfo);
     }
 
@@ -437,17 +390,274 @@ mod tests {
                 );
             };
             let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
-                tokio::join!(ctx.remote_read(&ops, vec![local]), peer)
+                tokio::join!(ctx.own_buffers(vec![local]).remote_read(&ops), peer)
             })
             .await
             .unwrap();
-            let mut error = result.unwrap_err();
-            assert_eq!(error.error.kind, expected);
-            let recovered = error.take_recovered_buffers().unwrap();
-            assert_eq!(recovered.len(), 1);
-            assert_eq!(recovered[0].as_ptr(), original_pointer);
-            assert_eq!(recovered[0].as_slice(), b"........");
+            let Completed { result, buffers } = result;
+            let buffers = buffers.unwrap();
+            let local = &buffers[0];
+            let error = result.unwrap_err();
+            assert_eq!(error.kind, expected);
+            assert_eq!(local.as_ptr(), original_pointer);
+            assert_eq!(local.as_slice(), b"........");
         }
+    }
+
+    fn local_buffers(ctx: &Context, bytes: &[u8]) -> Vec<Buffer> {
+        let mut buffer = ctx.state.buffer_pool.allocate(bytes.len().max(1)).unwrap();
+        buffer.set_len(bytes.len());
+        buffer.copy_from_slice(bytes);
+        vec![buffer]
+    }
+
+    fn identity(buffers: &[Buffer]) -> Vec<(usize, usize, usize)> {
+        buffers
+            .iter()
+            .map(|buffer| (buffer.as_ptr() as usize, buffer.len(), buffer.capacity()))
+            .collect()
+    }
+
+    fn post_inline_reply(ctx: &Context, msgid: u64, encoded: Vec<u8>) {
+        ctx.state.waiter.post(
+            msgid,
+            Message::new(
+                MsgMeta {
+                    msgid,
+                    flags: MsgFlags::UseMessagePack | MsgFlags::IsRsp,
+                    ..Default::default()
+                },
+                Payload::from(Bytes::from(encoded)),
+            ),
+        );
+    }
+
+    #[tokio::test]
+    async fn transfers_preserve_original_buffers_on_validation_errors() {
+        let (ctx, mut queue) = connected_context(MsgMeta {
+            read_regions: [region(4)].into(),
+            write_regions: [region(4)].into(),
+            ..Default::default()
+        });
+        for operation in 0..4 {
+            let len = match operation {
+                2 => 3,
+                3 => 5,
+                _ => 4,
+            };
+            let local = local_buffers(&ctx, &vec![0x5a; len]);
+            let original = identity(&local);
+            let ops = [CopyOp::new(4, 0, 1)];
+            let (result, buffers) = match operation {
+                0 | 2 => {
+                    let owned = ctx.own_buffers(local);
+                    let completed = if operation == 0 {
+                        owned.remote_read(&ops).await
+                    } else {
+                        owned.remote_read_all().await
+                    };
+                    (completed.result, completed.buffers.unwrap())
+                }
+                1 => (ctx.remote_write(&ops, &local).await, local),
+                _ => (ctx.remote_write_all(&local).await, local),
+            };
+            assert_eq!(result.unwrap_err().kind, ErrorKind::InvalidCopyOp);
+            assert_eq!(identity(&buffers), original);
+            assert_eq!(buffers[0].as_slice(), vec![0x5a; len]);
+        }
+        assert!(
+            queue.try_recv().is_err(),
+            "invalid plans cannot send reverse RPCs"
+        );
+    }
+
+    #[tokio::test]
+    async fn borrowed_sources_and_owned_destinations_use_the_inline_copy_engine() {
+        use crate::remote_memory::rpc_transfer::{ReadInlineRequest, WriteInlineRequest};
+
+        for operation in 0..4 {
+            let (ctx, mut queue) = connected_context(MsgMeta {
+                msgid: 123,
+                read_regions: [region(4)].into(),
+                write_regions: [region(8)].into(),
+                timeout_ms: 5_000,
+                ..Default::default()
+            });
+            let write = operation >= 2;
+            let all = operation % 2 != 0;
+            let initial: &[u8] = if write {
+                b"Rua!"
+            } else if all {
+                b"......"
+            } else {
+                b"...."
+            };
+            let local = local_buffers(&ctx, initial);
+            let original = identity(&local);
+            let ops = [CopyOp::new(1, 2, 2)];
+            let expected_ops = if all {
+                vec![CopyOp::new(0, 0, 4)]
+            } else {
+                ops.to_vec()
+            };
+            let expected_bytes: &[u8] = if all { b"Rua!" } else { b"ua" };
+            let peer = async {
+                let encoded = queue.recv().await.unwrap();
+                let mut encoded = BytesMut::from(encoded.as_ref());
+                let request =
+                    Message::parse(frame::parse_message(&mut encoded).unwrap().unwrap()).unwrap();
+                let reply = if write {
+                    assert_eq!(request.meta.method, "MemoryService/write_inline");
+                    let body: WriteInlineRequest =
+                        request.payload.deserialize(&request.meta).unwrap();
+                    assert_eq!(body.request_id, 123);
+                    assert_eq!(body.ops, expected_ops);
+                    assert_eq!(body.bytes, expected_bytes);
+                    rmp_serde::to_vec_named(&Ok::<(), Error>(())).unwrap()
+                } else {
+                    assert_eq!(request.meta.method, "MemoryService/read_inline");
+                    let body: ReadInlineRequest =
+                        request.payload.deserialize(&request.meta).unwrap();
+                    assert_eq!(body.request_id, 123);
+                    assert_eq!(body.ops, expected_ops);
+                    rmp_serde::to_vec_named(&Ok::<_, Error>(PackedReadReply {
+                        bytes: expected_bytes.to_vec(),
+                    }))
+                    .unwrap()
+                };
+                post_inline_reply(&ctx, request.meta.msgid, reply);
+            };
+            let transfer = async {
+                match operation {
+                    0 | 1 => {
+                        let owned = ctx.own_buffers(local);
+                        let completed = if operation == 0 {
+                            owned.remote_read(&ops).await
+                        } else {
+                            owned.remote_read_all().await
+                        };
+                        (completed.result, completed.buffers.unwrap())
+                    }
+                    2 => (ctx.remote_write(&ops, &local).await, local),
+                    _ => (ctx.remote_write_all(&local).await, local),
+                }
+            };
+            let ((result, buffers), ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(transfer, peer)
+            })
+            .await
+            .unwrap();
+            result.unwrap();
+            assert_eq!(identity(&buffers), original);
+            let expected: &[u8] = if write {
+                b"Rua!"
+            } else if all {
+                b"Rua!.."
+            } else {
+                b"..ua"
+            };
+            assert_eq!(buffers[0].as_slice(), expected);
+
+            assert_eq!(ctx.state.waiter.pending_count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_or_forgotten_writes_leave_only_owned_payloads() {
+        use crate::remote_memory::{
+            MemoryService,
+            rpc_transfer::{ReadInlineRequest, WriteInlineRequest},
+        };
+
+        for forget in [false, true] {
+            let (ctx, mut queue) = connected_context(MsgMeta {
+                msgid: 123,
+                write_regions: [region(4)].into(),
+                timeout_ms: 5_000,
+                ..Default::default()
+            });
+            let mut source = local_buffers(&ctx, b"old!");
+            let mut writing = Box::pin(ctx.remote_write_all(&source));
+            assert!(futures_util::poll!(writing.as_mut()).is_pending());
+            let encoded = queue.recv().await.unwrap();
+            let mut encoded = BytesMut::from(encoded.as_ref());
+            let request =
+                Message::parse(frame::parse_message(&mut encoded).unwrap().unwrap()).unwrap();
+            assert!(ctx.state.waiter.contains_message_id(request.meta.msgid));
+            assert!(ctx.state.waiter.read_source(request.meta.msgid).is_none());
+
+            if forget {
+                std::mem::forget(writing);
+            } else {
+                drop(writing);
+                assert!(!ctx.state.waiter.contains_message_id(request.meta.msgid));
+            }
+            // Both actions end the safe Rust borrow. There is no borrowed
+            // snapshot in the waiter for another task to dereference later.
+            source[0].copy_from_slice(b"new!");
+            drop(source);
+            let body: WriteInlineRequest = request.payload.deserialize(&request.meta).unwrap();
+            assert_eq!(body.bytes, b"old!");
+            let read = ReadInlineRequest {
+                request_id: request.meta.msgid,
+                ops: vec![CopyOp::new(0, 0, 4)],
+            };
+            assert_eq!(
+                ().read_inline(&ctx, &read).await.unwrap_err().kind,
+                ErrorKind::Timeout
+            );
+            ctx.state
+                .waiter
+                .expire(std::time::Instant::now() + Duration::from_secs(60));
+            assert_eq!(ctx.state.waiter.pending_count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn allocated_read_preserves_nonempty_region_lengths_and_skips_empty_regions() {
+        use crate::remote_memory::rpc_transfer::ReadInlineRequest;
+
+        let (ctx, mut queue) = connected_context(MsgMeta {
+            msgid: 321,
+            read_regions: [region(2), region(0), region(3)].into(),
+            timeout_ms: 5_000,
+            ..Default::default()
+        });
+        let peer = async {
+            let encoded = queue.recv().await.unwrap();
+            let mut encoded = BytesMut::from(encoded.as_ref());
+            let request =
+                Message::parse(frame::parse_message(&mut encoded).unwrap().unwrap()).unwrap();
+            assert_eq!(request.meta.method, "MemoryService/read_inline");
+            let body: ReadInlineRequest = request.payload.deserialize(&request.meta).unwrap();
+            assert_eq!(body.request_id, 321);
+            assert_eq!(body.ops, [CopyOp::new(0, 0, 5)]);
+            post_inline_reply(
+                &ctx,
+                request.meta.msgid,
+                rmp_serde::to_vec_named(&Ok::<_, Error>(PackedReadReply {
+                    bytes: b"abcde".to_vec(),
+                }))
+                .unwrap(),
+            );
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(ctx.remote_read_allocated(), peer)
+        })
+        .await
+        .unwrap();
+        let buffers = result.unwrap();
+        assert_eq!(buffers.iter().map(Buffer::len).collect::<Vec<_>>(), [2, 3]);
+        assert_eq!(buffers[0].as_slice(), b"ab");
+        assert_eq!(buffers[1].as_slice(), b"cde");
+        assert!(queue.try_recv().is_err());
+
+        let (empty, mut empty_queue) = connected_context(MsgMeta {
+            read_regions: [region(0), region(0)].into(),
+            ..Default::default()
+        });
+        assert!(empty.remote_read_allocated().await.unwrap().is_empty());
+        assert!(empty_queue.try_recv().is_err());
     }
 
     #[cfg(feature = "rdma")]
@@ -457,7 +667,7 @@ mod tests {
         let mut buffer = ctx.state.buffer_pool.allocate(4).unwrap();
         buffer.set_len(4);
         buffer.copy_from_slice(b"keep");
-        let target = WriteTarget::new(BufferSet::try_new(vec![buffer]).unwrap());
+        let target = WriteTarget::from_owned(BufferSet::try_new(vec![buffer]).unwrap());
         let (request_id, _receiver) = ctx.state.waiter.alloc(Duration::from_secs(5));
         ctx.state
             .waiter
@@ -513,7 +723,7 @@ mod timeout_tests {
 
     use crate::rdma::test_utils::{small_rdma_config, transport_endpoint as endpoint};
     use crate::{
-        Buffer, Client, Context, Error, ErrorKind, ListenMode, Result, Router, Server, Socket,
+        Buffer, Client, Context, ErrorKind, ListenMode, Result, Router, Server, Socket,
         SocketPoolConfig, State, Transport, core::ContextEndpoint, http::HttpSocket, service,
     };
 
@@ -562,12 +772,8 @@ mod timeout_tests {
                 ));
             }
             let result = match operation {
-                Operation::Read => ctx.remote_read_all().await.map(|_| ()),
-                Operation::Write => ctx
-                    .remote_write_all(vec![buffer(&ctx.state)])
-                    .await
-                    .map(|_| ())
-                    .map_err(Error::from),
+                Operation::Read => ctx.remote_read_allocated().await.map(|_| ()),
+                Operation::Write => ctx.remote_write_all(&[buffer(&ctx.state)]).await,
             };
             self.reports
                 .send(Report {
@@ -669,15 +875,21 @@ mod timeout_tests {
                 max_retries: 0,
                 ..Default::default()
             };
-            let mut attached = match operation {
-                Operation::Read => client.with_read_buffer(buffer(&self.client.state)).unwrap(),
-                Operation::Write => client.with_write_buffers(vec![buffer(&self.client.state)]),
+            let (read, write) = match operation {
+                Operation::Read => (vec![buffer(&self.client.state)], Vec::new()),
+                Operation::Write => (Vec::new(), vec![buffer(&self.client.state)]),
             };
-            // Keep the read source wrapper alive until both observations settle.
-            // A client-side timeout alone does not prove that the server stopped.
+            let identity = read
+                .iter()
+                .chain(&write)
+                .map(|b| (b.as_ptr(), b.len(), b.capacity()))
+                .collect::<Vec<_>>();
+            let attached = client.with_buffers(&read, write);
+            // Both observations must settle independently; the owning adapter
+            // returns its original attachments even when the RPC times out.
             let (result, report) = tokio::time::timeout(GUARD, async {
                 tokio::join!(
-                    attached.transfer(&self.client, &operation),
+                    attached.run(async |rpc| rpc.transfer(&self.client, &operation).await),
                     self.reports.recv(),
                 )
             })
@@ -688,7 +900,7 @@ mod timeout_tests {
                     self.transport
                 )
             });
-            assert_eq!(result.unwrap_err().kind, ErrorKind::Timeout);
+            assert_eq!(result.result.unwrap_err().kind, ErrorKind::Timeout);
             let report = report.expect("server must independently report its remote I/O result");
             assert_eq!(report.error, Some(ErrorKind::Timeout));
             let default_timeout = Client::default().timeout;
@@ -709,13 +921,20 @@ mod timeout_tests {
             );
             assert_eq!(self.server.state().waiter.pending_count(), 0);
             assert_eq!(self.client.state.waiter.pending_count(), 0);
-            let recovered = match operation {
-                Operation::Read => attached.take_read_buffers().into_available(),
-                Operation::Write => attached.take_write_buffers().into_available(),
-            }
-            .expect("no DMA or inline copy remains after the injected reverse-RPC fault");
-            assert_eq!(recovered.len(), 1);
-            assert!(recovered[0].iter().all(|&byte| byte == 0x5a));
+            let original = match operation {
+                Operation::Read => &read,
+                Operation::Write => result.buffers.as_ref().unwrap(),
+            };
+            assert_eq!(original.len(), 1);
+            assert_eq!(
+                (
+                    original[0].as_ptr(),
+                    original[0].len(),
+                    original[0].capacity()
+                ),
+                identity[0]
+            );
+            assert!(original[0].iter().all(|&byte| byte == 0x5a));
             // A request deadline must not tear down the healthy connection.
             assert_eq!(
                 Client::default().ping(&self.client, &()).await.unwrap(),

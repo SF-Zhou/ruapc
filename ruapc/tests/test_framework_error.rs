@@ -4,8 +4,8 @@
 use std::{fmt, sync::Arc, time::Duration};
 
 use ruapc::{
-    BufferReply, Client, Context, Endpoint, Error, ErrorKind, ListenMode, Router, Server,
-    SocketPoolConfig, Transport,
+    Client, Context, Endpoint, Error, ErrorKind, ListenMode, Router, Server, SocketPoolConfig,
+    Transport,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -32,7 +32,7 @@ impl fmt::Display for AppError {
 impl std::error::Error for AppError {}
 
 type AppResult = Result<u32, AppError>;
-type BufferResult = Result<BufferReply<u32>, AppError>;
+type BufferResult = Result<u32, AppError>;
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 enum Request {
@@ -73,8 +73,8 @@ impl FrameworkErrors for Service {
         execute(req)
     }
 
-    async fn buffered(&self, ctx: &Context, req: &Request) -> BufferResult {
-        Ok(ctx.sent_nothing().into_reply(execute(req)?))
+    async fn buffered(&self, _ctx: &Context, req: &Request) -> BufferResult {
+        execute(req)
     }
 
     async fn hold(&self, _: &Context, _: &()) -> AppResult {
@@ -169,21 +169,22 @@ async fn framework_and_application_errors_keep_their_types_across_transports_and
                 Ok(7)
             );
 
-            // A framework failure also preserves the BufferReply contract and
-            // returns untouched write destinations through the wrapper.
+            // Framework failures return every original destination.
             let mut buffer = ctx.state.buffer_pool.allocate(4).unwrap();
             buffer[..4].copy_from_slice(b"kept");
             buffer.set_len(4);
-            let attached = client.with_write_buffers(vec![buffer]);
-            let error = attached.buffered(&ctx, &Request::Panic).await.unwrap_err();
-            framework_error(error, ErrorKind::HandlerPanic);
-            let recovered = attached.take_write_buffers().into_available().unwrap();
-            assert_eq!(&recovered[0][..], b"kept");
-
-            let attached = client.with_write_buffers(recovered);
-            let reply = attached.buffered(&ctx, &Request::Value(9)).await.unwrap();
-            assert_eq!(*reply.response(), 9);
-            assert_eq!(&reply.destinations().available().unwrap()[0][..], b"kept");
+            let completed = client
+                .with_buffers(&[], vec![buffer])
+                .run(async |attached| attached.buffered(&ctx, &Request::Panic).await)
+                .await;
+            framework_error(completed.result.unwrap_err(), ErrorKind::HandlerPanic);
+            assert_eq!(&completed.buffers.as_ref().unwrap()[0][..], b"kept");
+            let completed = client
+                .with_buffers(&[], completed.buffers.unwrap())
+                .run(async |attached| attached.buffered(&ctx, &Request::Value(9)).await)
+                .await;
+            assert_eq!(completed.result.unwrap(), 9);
+            assert_eq!(&completed.buffers.unwrap()[0][..], b"kept");
         }
     }
 

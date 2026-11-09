@@ -2,7 +2,8 @@
 //!
 //! `#[service]` generates `ruapc_export` and implements the declared service trait
 //! for `ruapc::Client` and `ruapc::ClientWithBuffers`. Both use the same method
-//! signatures and return types as the service implementation.
+//! signatures and return types as the service implementation. Buffered clients
+//! are available only as references inside a buffer builder's `run` callback.
 //!
 //! ```rust,ignore
 //! #[ruapc::service]
@@ -44,28 +45,22 @@
 //! Methods become `fn -> impl Future<Output = ...> + Send`. Implementations
 //! may still use `async fn`; the compiler checks that their futures are `Send`.
 //!
-//! ## Responses with buffers
+//! ## Calls with buffers
 //!
-//! Declare `Result<BufferReply<T>, E>` to return an application response together
-//! with the client's local destination availability. The handler and both client
-//! types implement this same signature. Type aliases such as
-//! `ruapc::ResultBufferReply<T>` work because dispatch uses the underlying type,
-//! not its spelling.
-//!
-//! The handler awaits `ctx.remote_write` or `ctx.remote_write_all`, then calls
-//! `WriteReceipt::into_reply` to form its response. `ctx.sent_nothing().into_reply(...)`
-//! handles paths with no transfer. The client attaches destination buffers:
+//! Buffer attachments preserve the service's declared `Result<T, E>` type.
+//! Handlers await `ctx.remote_write_all(&data)`, then return their
+//! ordinary application response. Owning client adapters return the unchanged
+//! result and optional recovered original buffers on either branch:
 //!
 //! ```rust,ignore
-//! let (rsp, buffers) = client
-//!     .with_write_buffers(destinations)
-//!     .download(&ctx, &req)
-//!     .await?
-//!     .into_parts();
+//! let completed = client.with_buffers(&sources, destinations)
+//!     .run(async |rpc| rpc.download(&ctx, &req).await).await;
+//! let response = completed.result?;
+//! let destinations = completed.buffers.expect("buffers recovered");
 //! ```
 //!
-//! Recovery requires an available, uniquely held target. See
-//! `ruapc::ClientWithBuffers` for cancellation and in-flight DMA behavior.
+//! Advanced borrowing is provided separately by `ruapc-unsafe`; ordinary core
+//! clients remain cancellation-safe without adding unsafe code to generated calls.
 
 mod args;
 mod expand;

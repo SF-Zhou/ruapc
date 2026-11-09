@@ -52,15 +52,7 @@ impl ReadCredits {
         tokio::select! {
             biased;
             () = self.closed() => Err(read_closed_error()),
-            error = async {
-                match deadline {
-                    Some(deadline) => {
-                        tokio::time::sleep_until(deadline.at.into()).await;
-                        read_failure_error(deadline.reason)
-                    }
-                    None => std::future::pending().await,
-                }
-            } => Err(error),
+            reason = ReadDeadline::wait(deadline) => Err(read_failure_error(reason)),
             permits = async {
                 // A congested connection must not reserve the whole NIC's capacity.
                 let sq = self.sq.acquire().await.map_err(|_| read_closed_error())?;

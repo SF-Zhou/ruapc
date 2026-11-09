@@ -1,22 +1,25 @@
-//! Owned RDMA READ plans. Posted destinations stay held through completion
-//! or successful QP destruction; failure notification does not release them.
+//! RDMA READ plans owning destination capabilities through completion or QP
+//! destruction. Owned capabilities retain their allocations; unsafe borrowed
+//! capabilities rely on their constructor's lifetime and exclusive-access contract.
 
 #[cfg(feature = "bench-internals")]
 #[doc(hidden)]
 pub mod bench_support;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, hash_map::Entry},
     future::Future,
     pin::Pin,
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
 };
 
+#[cfg(any(test, feature = "bench-internals"))]
 use ruapc_bufpool::Buffer;
+use ruapc_bufpool::WriteBuffer;
 use ruapc_bufpool::completion as oneshot;
 
 use super::super::wr_slots::SlotTable;
@@ -86,15 +89,16 @@ impl ReadState {
         if let Err(batch) = self.batches.insert(sequence, batch) {
             self.spills.fetch_add(1, Ordering::Relaxed);
             let mut overflow = self.lock_overflow();
-            debug_assert!(
-                !overflow.contains_key(&sequence),
-                "READ sequence {sequence} recorded twice"
-            );
-            let vacant = overflow.insert(sequence, batch).is_none();
-            if vacant {
-                self.overflow_len.fetch_add(1, Ordering::Release);
+            match overflow.entry(sequence) {
+                Entry::Vacant(entry) => {
+                    entry.insert(batch);
+                    self.overflow_len.fetch_add(1, Ordering::Release);
+                    return true;
+                }
+                // Preserve the earlier WR's DMA hold. The posting caller must
+                // reject this invariant violation before exposing another WR.
+                Entry::Occupied(_) => return false,
             }
-            return vacant;
         }
         true
     }
@@ -127,6 +131,24 @@ impl ReadState {
     fn spills(&self) -> usize {
         self.spills.load(Ordering::Relaxed)
     }
+
+    /// The provider QP has been destroyed, so every recorded WR can settle.
+    fn finish_destroyed(&mut self) {
+        for batch in self.batches.drain() {
+            batch.fail(ReadFailure::ConnectionClosed);
+            batch.complete_one(false);
+        }
+        for (_, batch) in self
+            .overflow
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain()
+        {
+            batch.fail(ReadFailure::ConnectionClosed);
+            batch.complete_one(false);
+        }
+        *self.overflow_len.get_mut() = 0;
+    }
 }
 
 /// A destination slice addressed by buffer index, never by a caller's pointer.
@@ -137,7 +159,7 @@ pub struct ReadSegment {
     pub len: usize,
 }
 
-/// A contiguous remote range scattered into owned local buffers.
+/// A contiguous remote range scattered into exclusive destination capabilities.
 #[derive(Debug)]
 pub struct ReadRequest {
     pub remote_addr: u64,
@@ -161,9 +183,11 @@ struct PreparedRead {
 /// connection failures are labels supplied by higher-layer policy through
 /// [`ReadHandle::fail`]; this crate neither runs timers nor closes connections.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum ReadFailure {
-    Completion,
-    /// The READ watchdog expired; the connection must be closed.
+    Completion = 1,
+    /// The READ watchdog expired; the runtime's settlement policy decides
+    /// when outstanding work requires closing the connection.
     Timeout,
     /// The caller's request deadline expired without proving a connection fault.
     RequestTimeout,
@@ -171,34 +195,80 @@ pub enum ReadFailure {
     Cancelled,
 }
 
-/// Runtime-independent result of an owned READ plan.
-///
-/// Successful buffers are returned only after every READ has completed.
-/// Failure notification may precede completion; the QP retains DMA ownership.
-/// Dropping this future does not release posted buffers. Producer disappearance
-/// (including cancellation before posting) resolves to [`ReadFailure::Cancelled`].
-#[derive(Debug)]
-pub struct ReadCompletion {
-    receiver: oneshot::Receiver<std::result::Result<Vec<Buffer>, ReadFailure>>,
-}
-
-impl ReadCompletion {
-    /// Takes a ready result without waiting. `None` means it is still pending.
-    pub fn try_recv(&mut self) -> Option<std::result::Result<Vec<Buffer>, ReadFailure>> {
-        match self.receiver.try_recv() {
-            Ok(result) => result,
-            Err(_) => Some(Err(ReadFailure::Cancelled)),
+impl ReadFailure {
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => None,
+            1 => Some(Self::Completion),
+            2 => Some(Self::Timeout),
+            3 => Some(Self::RequestTimeout),
+            4 => Some(Self::ConnectionClosed),
+            5 => Some(Self::Cancelled),
+            _ => unreachable!("invalid READ failure code"),
         }
     }
 }
 
+/// A settled READ plan and its original destination capabilities.
+///
+/// Both success and failure return every original capability in order. Borrowed
+/// capabilities do not own their allocation: their unsafe construction contract
+/// must remain satisfied. Failure does not establish a valid transfer result.
+#[derive(Debug)]
+pub struct ReadOutcome {
+    pub result: std::result::Result<(), ReadFailure>,
+    pub buffers: Vec<WriteBuffer>,
+}
+
+/// Runtime-independent completion of a READ plan owning write capabilities.
+///
+/// A result requires every posted READ to complete or its provider QP to be
+/// destroyed, plus accounting for the unposted suffix. Dropping the future
+/// records cancellation but does not release owned memory while DMA can continue.
+/// Borrowed memory remains governed by the capability's unsafe contract.
+#[derive(Debug)]
+pub struct ReadCompletion {
+    receiver: oneshot::Receiver<ReadOutcome>,
+    batch: Option<Weak<ReadBatch>>,
+}
+
+impl ReadCompletion {
+    /// Takes a ready result without waiting. `None` means it is still pending.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the outcome has already been taken.
+    pub fn try_recv(&mut self) -> Option<ReadOutcome> {
+        let outcome = self
+            .receiver
+            .try_recv()
+            .expect("READ completion consumed or producer lost its buffers");
+        if outcome.is_some() {
+            self.batch = None;
+        }
+        outcome
+    }
+}
+
 impl Future for ReadCompletion {
-    type Output = std::result::Result<Vec<Buffer>, ReadFailure>;
+    type Output = ReadOutcome;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.receiver)
+        let outcome = Pin::new(&mut self.receiver)
             .poll(cx)
-            .map(|result| result.unwrap_or(Err(ReadFailure::Cancelled)))
+            .map(|result| result.expect("READ completion consumed or producer lost its buffers"));
+        if outcome.is_ready() {
+            self.batch = None;
+        }
+        outcome
+    }
+}
+
+impl Drop for ReadCompletion {
+    fn drop(&mut self) {
+        if let Some(batch) = self.batch.as_ref().and_then(Weak::upgrade) {
+            batch.fail(ReadFailure::Cancelled);
+        }
     }
 }
 
@@ -207,8 +277,8 @@ impl Future for ReadCompletion {
 /// The handle neither owns destination buffers nor grants completion authority.
 /// It allows a higher layer to implement deadlines and connection failure
 /// policy without retaining a completed batch. The posting cursor and QP own
-/// the batch; an observation can temporarily extend that lifetime. Failure
-/// notification cannot authorize memory recovery.
+/// the batch; an observation can temporarily extend that lifetime. Recording
+/// failure cannot authorize memory recovery.
 #[derive(Clone, Debug)]
 pub struct ReadHandle(Weak<ReadBatch>);
 
@@ -236,11 +306,15 @@ impl ReadHandle {
         self.observe().is_some_and(|batch| batch.has_in_flight())
     }
 
-    /// Sends a caller-selected failure if the result is not yet published.
-    /// Buffers remain held until completion or successful QP destruction.
-    /// Returns whether this call took the still-open result sender.
+    /// Records the first failure without completing the result early.
+    /// Returns whether this call recorded the batch's first failure.
     pub fn fail(&self, reason: ReadFailure) -> bool {
         self.observe().is_some_and(|batch| batch.fail(reason))
+    }
+
+    /// Returns the first recorded failure while the batch remains observable.
+    pub fn failure(&self) -> Option<ReadFailure> {
+        self.observe().and_then(|batch| batch.failure())
     }
 }
 
@@ -263,9 +337,14 @@ impl ReadObservation {
         self.0.has_in_flight()
     }
 
-    /// Notifies a failure without releasing destination ownership.
+    /// Records a failure without releasing destination ownership.
     pub fn fail(&self, reason: ReadFailure) -> bool {
         self.0.fail(reason)
+    }
+
+    /// Returns the first recorded failure, independently of DMA settlement.
+    pub fn failure(&self) -> Option<ReadFailure> {
+        self.0.failure()
     }
 }
 
@@ -297,15 +376,12 @@ impl ReadPosting {
         self.reads.len() - self.next
     }
 
-    /// Recovers buffers only if no request reached the NIC. Otherwise the QP
-    /// retains them through completion or destruction, even without a receiver.
-    pub fn cancel(mut self) -> Option<Vec<Buffer>> {
-        if self.next == 0 {
-            self.next = self.reads.len();
-            self.batch.cancel_unposted()
-        } else {
-            None
-        }
+    /// Records cancellation and accounts for the unposted suffix.
+    ///
+    /// Recover the original storage through the accompanying
+    /// [`ReadCompletion`]. Posted work still has to settle before it is ready.
+    pub fn cancel(self) {
+        self.batch.fail(ReadFailure::Cancelled);
     }
 }
 
@@ -330,7 +406,7 @@ pub(super) struct ReadBatch {
     /// WRs not yet settled by completion or unposted cancellation.
     remaining: AtomicUsize,
     total: usize,
-    failed: AtomicBool,
+    failure: AtomicU8,
     inner: Mutex<ReadBatchInner>,
     /// WRs the provider accepted. Written only by the posting cursor.
     accepted: AtomicUsize,
@@ -340,19 +416,19 @@ pub(super) struct ReadBatch {
 
 #[derive(Debug)]
 struct ReadBatchInner {
-    buffers: Option<Vec<Buffer>>,
-    tx: Option<oneshot::Sender<std::result::Result<Vec<Buffer>, ReadFailure>>>,
+    buffers: Option<Vec<WriteBuffer>>,
+    tx: Option<oneshot::Sender<ReadOutcome>>,
 }
 
 impl ReadBatch {
-    fn new(count: usize, buffers: Vec<Buffer>) -> (Arc<Self>, ReadCompletion) {
+    fn new(count: usize, buffers: Vec<WriteBuffer>) -> (Arc<Self>, ReadCompletion) {
         let (tx, receiver) = oneshot::channel();
         let batch = Arc::new(Self {
             total: count,
             remaining: AtomicUsize::new(count),
             accepted: AtomicUsize::new(0),
             aborted: AtomicUsize::new(0),
-            failed: AtomicBool::new(false),
+            failure: AtomicU8::new(0),
             inner: Mutex::new(ReadBatchInner {
                 buffers: Some(buffers),
                 tx: Some(tx),
@@ -361,13 +437,23 @@ impl ReadBatch {
         if count == 0 {
             batch.finish();
         }
-        (batch, ReadCompletion { receiver })
+        let completion = ReadCompletion {
+            receiver,
+            batch: Some(Arc::downgrade(&batch)),
+        };
+        (batch, completion)
+    }
+
+    #[cfg(test)]
+    fn new_owned(count: usize, buffers: Vec<Buffer>) -> (Arc<Self>, ReadCompletion) {
+        let buffers = buffers.into_iter().map(WriteBuffer::from).collect();
+        Self::new(count, buffers)
     }
 
     #[inline]
     fn complete_one(&self, success: bool) {
         if !success {
-            self.failed.store(true, Ordering::Release);
+            self.record_failure(ReadFailure::Completion);
         }
         if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.finish();
@@ -375,7 +461,7 @@ impl ReadBatch {
     }
 
     fn abort_unposted(&self, count: usize) {
-        self.failed.store(true, Ordering::Release);
+        self.record_failure(ReadFailure::Cancelled);
         if self.remaining.fetch_sub(count, Ordering::AcqRel) == count {
             self.finish();
         }
@@ -415,41 +501,55 @@ impl ReadBatch {
     }
 
     fn finish(&self) {
-        let (buffers, tx) = {
+        let (outcome, tx) = {
             let mut inner = self.inner.lock().unwrap();
-            (inner.buffers.take(), inner.tx.take())
-        };
-        let result = if self.failed.load(Ordering::Acquire) {
-            drop(buffers);
-            Err(ReadFailure::Completion)
-        } else {
-            buffers.ok_or(ReadFailure::Cancelled)
+            let Some(buffers) = inner.buffers.take() else {
+                return;
+            };
+            (
+                ReadOutcome {
+                    result: self.failure().map_or(Ok(()), Err),
+                    buffers,
+                },
+                inner.tx.take(),
+            )
         };
         if let Some(tx) = tx {
-            let _ = tx.send(result);
+            let _ = tx.send(outcome);
         }
     }
 
     fn fail(&self, reason: ReadFailure) -> bool {
-        let tx = self.inner.lock().unwrap().tx.take();
-        if let Some(tx) = tx {
-            let _ = tx.send(Err(reason));
-            true
-        } else {
-            false
-        }
+        // Serialize policy failures with publication of the final outcome.
+        let inner = self.inner.lock().unwrap();
+        inner.buffers.is_some() && self.record_failure(reason)
     }
 
-    fn cancel_unposted(&self) -> Option<Vec<Buffer>> {
-        // The cursor proves no WR reached the provider, so no completion can
-        // race this settlement. Existing observers must also see cancellation.
-        self.remaining.store(0, Ordering::Release);
-        let (buffers, tx) = {
-            let mut inner = self.inner.lock().unwrap();
-            (inner.buffers.take(), inner.tx.take())
-        };
-        drop(tx);
-        buffers
+    fn record_failure(&self, reason: ReadFailure) -> bool {
+        self.failure
+            .compare_exchange(0, reason as u8, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn failure(&self) -> Option<ReadFailure> {
+        ReadFailure::from_code(self.failure.load(Ordering::Acquire))
+    }
+}
+
+impl Drop for ReadBatch {
+    fn drop(&mut self) {
+        // A posted WR retains this batch in its QP ledger. The last owner can
+        // disappear with buffers left only before posting or after provider QP
+        // destruction. Preserve recovery even if a producer abandons its plan.
+        let inner = self.inner.get_mut().unwrap();
+        if let (Some(buffers), Some(tx)) = (inner.buffers.take(), inner.tx.take()) {
+            let reason =
+                ReadFailure::from_code(*self.failure.get_mut()).unwrap_or(ReadFailure::Cancelled);
+            let _ = tx.send(ReadOutcome {
+                result: Err(reason),
+                buffers,
+            });
+        }
     }
 }
 
@@ -457,11 +557,37 @@ fn invalid(message: &str) -> Error {
     Error::new(ErrorKind::InvalidReadPlan, message.into())
 }
 
-fn prepare(
-    buffers: &[Buffer],
+trait ReadDestination {
+    fn len(&self) -> usize;
+    fn as_ptr(&self) -> *const u8;
+}
+
+impl ReadDestination for WriteBuffer {
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.as_ptr()
+    }
+}
+
+#[cfg(any(test, feature = "bench-internals"))]
+impl ReadDestination for Buffer {
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.as_ptr()
+    }
+}
+
+fn prepare<B: ReadDestination>(
+    buffers: &[B],
     requests: Vec<ReadRequest>,
     gather_limit: usize,
-    mut lkey: impl FnMut(&Buffer) -> Result<u32>,
+    mut lkey: impl FnMut(&B) -> Result<u32>,
 ) -> Result<(Vec<PreparedRead>, Vec<ReadSge>)> {
     if buffers.len() > u32::MAX as usize {
         return Err(invalid("READ destination buffer count overflows"));
@@ -551,19 +677,30 @@ fn prepare(
 }
 
 impl QueuePair {
-    /// Validates all destination bounds/overlaps and resolves local keys from
-    /// owned buffers. Invalid plans return every buffer without posting.
+    /// Called only after provider QP destruction has succeeded.
+    pub(super) fn finish_destroyed_reads(&mut self) {
+        self.read_state.finish_destroyed();
+    }
+
+    /// Prepares READs using owned or unsafely borrowed destination capabilities.
+    /// An invalid plan returns every capability without posting.
     ///
-    /// The returned completion is independent of any async runtime. The caller
-    /// may use [`ReadPosting::handle`] to observe progress and notify failures;
-    /// request deadlines and connection watchdogs belong to that higher layer.
+    /// Owned capabilities retain allocations independently of the caller.
+    /// Borrowed capabilities require their constructor's lifetime and access
+    /// obligations to remain satisfied, including across cancellation. Posting
+    /// and completion are independent of the async runtime. Use
+    /// [`ReadPosting::handle`] to observe progress and record policy failures;
+    /// recording failure never completes outstanding DMA early.
     pub fn prepare_reads(
         &self,
-        buffers: Vec<Buffer>,
+        buffers: Vec<WriteBuffer>,
         requests: Vec<ReadRequest>,
-    ) -> std::result::Result<(ReadPosting, ReadCompletion), (Error, Vec<Buffer>)> {
+    ) -> std::result::Result<(ReadPosting, ReadCompletion), (Error, Vec<WriteBuffer>)> {
         let (reads, sges) = match prepare(&buffers, requests, self.gather_limit(), |buffer| {
-            self.lkey(buffer)
+            buffer
+                .memory_key(self.device_index)
+                .map(|key| key.lkey)
+                .map_err(|error| Error::new(ErrorKind::IBRegMemoryRegionFail, error.to_string()))
         }) {
             Ok(prepared) => prepared,
             Err(error) => return Err((error, buffers)),
@@ -591,9 +728,11 @@ impl QueuePair {
             .reads
             .get(posting.next)
             .ok_or_else(|| invalid("READ plan already fully posted"))?;
-        // SAFETY: prepare validated every range against the owned buffers and
+        // SAFETY: prepare validated every range against its write capability and
         // resolved keys on this QP. The exclusive cursor posts each range once.
-        // This QP keeps the batch through an authentic completion or destruction.
+        // This QP keeps the batch through an authentic completion or destruction;
+        // owned capabilities retain memory, while borrowed constructors require
+        // the caller to keep their allocation and registration alive throughout.
         let sges = &posting.sges[read.sge_start..read.sge_end];
         unsafe {
             self.read_sges(
@@ -601,8 +740,15 @@ impl QueuePair {
                 read.remote_addr,
                 read.rkey,
                 |wr_id| {
-                    self.read_state
-                        .insert(wr_id.sequence(), posting.batch.clone());
+                    // Registration precedes provider posting. Keep this check
+                    // active in release builds: a duplicate must never submit
+                    // another WR or replace the original batch's DMA hold.
+                    assert!(
+                        self.read_state
+                            .insert(wr_id.sequence(), posting.batch.clone()),
+                        "READ sequence {} recorded twice",
+                        wr_id.sequence()
+                    );
                 },
                 |wr_id| {
                     self.read_state.remove(wr_id.sequence());
@@ -730,36 +876,71 @@ mod tests {
     #[test]
     fn only_last_completion_returns_owned_memory() {
         let (buffers, lifetime) = buffers();
-        let (batch, mut rx) = ReadBatch::new(2, buffers);
+        let original_bytes = buffers[0].as_ptr();
+        let (batch, mut rx) = ReadBatch::new_owned(2, buffers);
         batch.complete_one(true);
         assert!(rx.try_recv().is_none());
         assert!(lifetime.upgrade().is_some());
         batch.complete_one(true);
-        let returned = rx.try_recv().unwrap().unwrap();
-        assert_eq!(returned[0].len(), 16);
-        drop(returned);
+        let outcome = rx.try_recv().unwrap();
+        assert_eq!(outcome.result, Ok(()));
+        assert_eq!(outcome.buffers[0].as_ptr(), original_bytes);
+        assert_eq!(outcome.buffers[0].len(), 16);
+        drop(outcome);
         assert!(lifetime.upgrade().is_none());
     }
 
     #[test]
-    fn failure_notifies_once_and_holds_memory_through_flush() {
+    fn failure_records_once_and_returns_original_memory_after_flush() {
+        for reason in [
+            ReadFailure::Timeout,
+            ReadFailure::RequestTimeout,
+            ReadFailure::ConnectionClosed,
+            ReadFailure::Cancelled,
+        ] {
+            let (buffers, lifetime) = buffers();
+            let original_bytes = buffers[0].as_ptr();
+            let (batch, mut rx) = ReadBatch::new_owned(2, buffers);
+            let handle = ReadHandle(Arc::downgrade(&batch));
+            assert!(handle.fail(reason));
+            assert!(!handle.fail(ReadFailure::ConnectionClosed));
+            assert_eq!(handle.failure(), Some(reason));
+            assert!(rx.try_recv().is_none());
+            batch.complete_one(false);
+            assert!(rx.try_recv().is_none());
+            assert!(lifetime.upgrade().is_some());
+            batch.complete_one(false);
+            let outcome = rx.try_recv().unwrap();
+            assert_eq!(outcome.result, Err(reason));
+            assert_eq!(outcome.buffers[0].as_ptr(), original_bytes);
+            assert!(!handle.is_pending());
+            assert!(!handle.fail(ReadFailure::Timeout));
+            drop(outcome);
+            assert!(lifetime.upgrade().is_none());
+        }
+    }
+
+    #[test]
+    fn failed_completion_returns_memory_after_every_other_completion() {
         let (buffers, lifetime) = buffers();
-        let (batch, mut rx) = ReadBatch::new(2, buffers);
-        let handle = ReadHandle(Arc::downgrade(&batch));
-        assert!(handle.fail(ReadFailure::Timeout));
-        assert!(!handle.fail(ReadFailure::ConnectionClosed));
-        assert_eq!(rx.try_recv().unwrap().unwrap_err(), ReadFailure::Timeout);
+        let original_bytes = buffers[0].as_ptr();
+        let (batch, mut rx) = ReadBatch::new_owned(2, buffers);
         batch.complete_one(false);
-        assert!(lifetime.upgrade().is_some());
-        batch.complete_one(false);
+        assert!(rx.try_recv().is_none());
+        assert!(!batch.fail(ReadFailure::Timeout));
+        batch.complete_one(true);
+        let outcome = rx.try_recv().unwrap();
+        assert_eq!(outcome.result, Err(ReadFailure::Completion));
+        assert_eq!(outcome.buffers[0].as_ptr(), original_bytes);
+        drop(outcome);
         assert!(lifetime.upgrade().is_none());
-        assert!(!handle.is_pending());
     }
 
     #[test]
     fn cancelled_poster_accounts_the_unposted_suffix() {
         let (buffers, lifetime) = buffers();
-        let (batch, mut rx) = ReadBatch::new(3, buffers);
+        let original_bytes = buffers[0].as_ptr();
+        let (batch, mut rx) = ReadBatch::new_owned(3, buffers);
         let reads = (0..3)
             .map(|_| PreparedRead {
                 remote_addr: 0,
@@ -782,7 +963,10 @@ mod tests {
         assert!(rx.try_recv().is_none());
         assert!(lifetime.upgrade().is_some());
         batch.complete_one(true);
-        assert_eq!(rx.try_recv().unwrap().unwrap_err(), ReadFailure::Completion);
+        let outcome = rx.try_recv().unwrap();
+        assert_eq!(outcome.result, Err(ReadFailure::Cancelled));
+        assert_eq!(outcome.buffers[0].as_ptr(), original_bytes);
+        drop(outcome);
         assert!(lifetime.upgrade().is_none());
         assert!(!handle.has_in_flight());
         assert!(!handle.is_pending());
@@ -791,31 +975,85 @@ mod tests {
     #[test]
     fn partial_failure_after_early_completions_settles_once() {
         let (buffers, lifetime) = buffers();
-        let (batch, mut rx) = ReadBatch::new(3, buffers);
+        let original_bytes = buffers[0].as_ptr();
+        let (batch, mut rx) = ReadBatch::new_owned(3, buffers);
         batch.complete_one(true);
         batch.complete_one(true);
         assert!(rx.try_recv().is_none());
         batch.abort_unposted(1);
-        assert_eq!(rx.try_recv().unwrap().unwrap_err(), ReadFailure::Completion);
+        let outcome = rx.try_recv().unwrap();
+        assert_eq!(outcome.result, Err(ReadFailure::Cancelled));
+        assert_eq!(outcome.buffers[0].as_ptr(), original_bytes);
+        drop(outcome);
         assert!(lifetime.upgrade().is_none());
     }
 
     #[test]
     fn dropped_receiver_cannot_release_inflight_memory() {
         let (buffers, lifetime) = buffers();
-        let (batch, rx) = ReadBatch::new(1, buffers);
+        let (batch, rx) = ReadBatch::new_owned(1, buffers);
         drop(rx);
+        assert_eq!(batch.failure(), Some(ReadFailure::Cancelled));
         assert!(lifetime.upgrade().is_some());
         batch.complete_one(true);
         assert!(lifetime.upgrade().is_none());
     }
 
     #[test]
+    fn omitted_receiver_drop_cannot_release_inflight_memory() {
+        let (buffers, lifetime) = buffers();
+        let (batch, rx) = ReadBatch::new_owned(1, buffers);
+        // Model a forgotten consumer without leaking its allocation from this
+        // test. Neither posting nor completion may rely on its destructor.
+        let receiver = std::mem::ManuallyDrop::new(rx);
+        assert!(lifetime.upgrade().is_some());
+        assert_eq!(batch.failure(), None);
+        batch.complete_one(true);
+        assert!(lifetime.upgrade().is_some());
+        drop(std::mem::ManuallyDrop::into_inner(receiver));
+        assert!(lifetime.upgrade().is_none());
+    }
+
+    #[test]
+    fn destroyed_qp_settles_ledger_and_spills_but_waits_for_unposted_suffix() {
+        let (buffers_a, lifetime_a) = buffers();
+        let (buffers_b, lifetime_b) = buffers();
+        let original_a = buffers_a[0].as_ptr();
+        let original_b = buffers_b[0].as_ptr();
+        let (batch_a, mut rx_a) = ReadBatch::new_owned(3, buffers_a);
+        let (batch_b, mut rx_b) = ReadBatch::new_owned(1, buffers_b);
+        let mut state = ReadState::new(1);
+        let capacity = SlotTable::<Arc<ReadBatch>>::new(1).capacity() as u64;
+        assert!(state.insert(0, batch_a.clone()));
+        assert!(state.insert(1, batch_a.clone()));
+        assert!(state.insert(capacity, batch_b.clone()));
+        batch_a.mark_accepted(2);
+        batch_b.mark_accepted(1);
+        assert!(batch_a.fail(ReadFailure::Timeout));
+        state.finish_destroyed();
+        assert!(state.is_empty());
+        assert!(rx_a.try_recv().is_none());
+        assert!(!batch_a.has_in_flight());
+        assert_eq!(batch_a.remaining.load(Ordering::Acquire), 1);
+        let outcome_b = rx_b.try_recv().unwrap();
+        assert_eq!(outcome_b.result, Err(ReadFailure::ConnectionClosed));
+        assert_eq!(outcome_b.buffers[0].as_ptr(), original_b);
+        batch_a.abort_unposted(1);
+        let outcome_a = rx_a.try_recv().unwrap();
+        assert_eq!(outcome_a.result, Err(ReadFailure::Timeout));
+        assert_eq!(outcome_a.buffers[0].as_ptr(), original_a);
+        drop(outcome_a);
+        drop(outcome_b);
+        assert!(lifetime_a.upgrade().is_none());
+        assert!(lifetime_b.upgrade().is_none());
+    }
+
+    #[test]
     fn ledger_spills_colliding_sequences_without_losing_ownership() {
         let (buffers_a, lifetime_a) = buffers();
         let (buffers_b, lifetime_b) = buffers();
-        let (batch_a, _rx_a) = ReadBatch::new(1, buffers_a);
-        let (batch_b, _rx_b) = ReadBatch::new(1, buffers_b);
+        let (batch_a, rx_a) = ReadBatch::new_owned(1, buffers_a);
+        let (batch_b, rx_b) = ReadBatch::new_owned(1, buffers_b);
         let state = ReadState::new(64);
         let capacity = SlotTable::<Arc<ReadBatch>>::new(64).capacity() as u64;
         assert!(state.insert(0, batch_a.clone()));
@@ -831,14 +1069,96 @@ mod tests {
         assert_eq!(state.spills(), 1);
         drop(batch_a);
         drop(batch_b);
+        drop(rx_a);
+        drop(rx_b);
         assert!(lifetime_a.upgrade().is_none());
+        assert!(lifetime_b.upgrade().is_none());
+    }
+
+    #[test]
+    fn duplicate_overflow_sequence_preserves_original_completion_owner() {
+        let (buffers_a, _) = buffers();
+        let (buffers_b, lifetime_b) = buffers();
+        let (buffers_c, _) = buffers();
+        let original_b = buffers_b[0].as_ptr();
+        let original_c = buffers_c[0].as_ptr();
+        let (batch_a, mut rx_a) = ReadBatch::new_owned(1, buffers_a);
+        let (batch_b, mut rx_b) = ReadBatch::new_owned(1, buffers_b);
+        let (batch_c, mut rx_c) = ReadBatch::new_owned(1, buffers_c);
+        let state = ReadState::new(1);
+        let capacity = SlotTable::<Arc<ReadBatch>>::new(1).capacity() as u64;
+        assert!(state.insert(0, batch_a));
+        assert!(state.insert(capacity, batch_b));
+
+        // Model an invalid reused sequence before provider posting. The old
+        // batch has no other strong owner: replacing its entry would publish
+        // its buffers without completion evidence.
+        assert!(!state.insert(capacity, batch_c.clone()));
+        assert_eq!(state.len(), 2);
+        assert_eq!(state.overflow_len.load(Ordering::Acquire), 1);
+        assert!(rx_b.try_recv().is_none());
+        assert!(rx_c.try_recv().is_none());
+        assert!(lifetime_b.upgrade().is_some());
+
+        state.remove(capacity).unwrap().complete_one(true);
+        let original = rx_b.try_recv().unwrap();
+        assert_eq!(original.result, Ok(()));
+        assert_eq!(original.buffers[0].as_ptr(), original_b);
+        assert!(rx_c.try_recv().is_none());
+        // Rejected work never reached the provider; only its unposted
+        // accounting can return the new batch's buffers.
+        batch_c.abort_unposted(1);
+        let rejected = rx_c.try_recv().unwrap();
+        assert_eq!(rejected.result, Err(ReadFailure::Cancelled));
+        assert_eq!(rejected.buffers[0].as_ptr(), original_c);
+        state.remove(0).unwrap().complete_one(true);
+        assert_eq!(rx_a.try_recv().unwrap().result, Ok(()));
+        assert!(state.is_empty());
+        drop(original);
+        assert!(lifetime_b.upgrade().is_none());
+    }
+
+    #[test]
+    fn destroyed_qp_recovers_poisoned_overflow_without_losing_buffers() {
+        let (buffers_a, _) = buffers();
+        let (buffers_b, lifetime_b) = buffers();
+        let original_b = buffers_b[0].as_ptr();
+        let (batch_a, mut rx_a) = ReadBatch::new_owned(1, buffers_a);
+        let (batch_b, mut rx_b) = ReadBatch::new_owned(1, buffers_b);
+        let mut state = ReadState::new(1);
+        let capacity = SlotTable::<Arc<ReadBatch>>::new(1).capacity() as u64;
+        assert!(state.insert(0, batch_a));
+        assert!(state.insert(capacity, batch_b));
+        let overflow = &state.overflow;
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _guard = overflow.lock().unwrap();
+                panic!("inject READ overflow lock poisoning");
+            })
+            .is_err()
+        );
+        assert!(state.overflow.is_poisoned());
+        assert!(rx_b.try_recv().is_none());
+
+        // Successful provider destruction is already established at this
+        // boundary. Poisoning must not skip settlement or lose the originals.
+        state.finish_destroyed();
+        assert!(state.is_empty());
+        assert_eq!(
+            rx_a.try_recv().unwrap().result,
+            Err(ReadFailure::ConnectionClosed)
+        );
+        let outcome = rx_b.try_recv().unwrap();
+        assert_eq!(outcome.result, Err(ReadFailure::ConnectionClosed));
+        assert_eq!(outcome.buffers[0].as_ptr(), original_b);
+        drop(outcome);
         assert!(lifetime_b.upgrade().is_none());
     }
 
     #[test]
     fn handle_observes_only_provider_accepted_work_as_in_flight() {
         let (buffers, _) = buffers();
-        let (batch, _rx) = ReadBatch::new(2, buffers);
+        let (batch, _rx) = ReadBatch::new_owned(2, buffers);
         let handle = ReadHandle(Arc::downgrade(&batch));
         assert!(handle.is_pending());
         assert!(!handle.has_in_flight());
@@ -865,7 +1185,8 @@ mod tests {
             }
         }
         let (buffers, lifetime) = buffers();
-        let (batch, mut rx) = ReadBatch::new(1, buffers);
+        let original_bytes = buffers[0].as_ptr();
+        let (batch, mut rx) = ReadBatch::new_owned(1, buffers);
         let handle = ReadHandle(Arc::downgrade(&batch));
         let counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
         let waker = Waker::from(counter.clone());
@@ -873,14 +1194,17 @@ mod tests {
         assert!(Pin::new(&mut rx).poll(&mut cx).is_pending());
         drop(batch);
         assert_eq!(counter.0.load(Ordering::Relaxed), 1);
-        assert!(lifetime.upgrade().is_none());
+        assert!(lifetime.upgrade().is_some());
         assert!(!handle.is_pending());
         assert!(!handle.has_in_flight());
         assert!(!handle.fail(ReadFailure::ConnectionClosed));
-        assert!(matches!(
-            Pin::new(&mut rx).poll(&mut cx),
-            Poll::Ready(Err(ReadFailure::Cancelled))
-        ));
+        let Poll::Ready(outcome) = Pin::new(&mut rx).poll(&mut cx) else {
+            panic!("producer disappearance did not settle its buffers");
+        };
+        assert_eq!(outcome.result, Err(ReadFailure::Cancelled));
+        assert_eq!(outcome.buffers[0].as_ptr(), original_bytes);
+        drop(outcome);
+        assert!(lifetime.upgrade().is_none());
     }
 
     /// The posting cursor's per-WR store must never land on the line a
@@ -899,9 +1223,10 @@ mod tests {
     }
 
     #[test]
-    fn unposted_cancel_recovers_memory_and_closes_receiver() {
+    fn unposted_cancel_returns_original_memory_through_completion() {
         let (buffers, lifetime) = buffers();
-        let (batch, mut rx) = ReadBatch::new(1, buffers);
+        let original_bytes = buffers[0].as_ptr();
+        let (batch, mut rx) = ReadBatch::new_owned(1, buffers);
         let posting = ReadPosting {
             owner: 1,
             reads: vec![PreparedRead {
@@ -915,11 +1240,13 @@ mod tests {
             batch,
         };
         let observation = posting.handle().observe().unwrap();
-        let returned = posting.cancel().unwrap();
+        posting.cancel();
         assert!(!observation.is_pending());
         assert!(!observation.has_in_flight());
-        assert_eq!(rx.try_recv().unwrap().unwrap_err(), ReadFailure::Cancelled);
-        drop(returned);
+        let outcome = rx.try_recv().unwrap();
+        assert_eq!(outcome.result, Err(ReadFailure::Cancelled));
+        assert_eq!(outcome.buffers[0].as_ptr(), original_bytes);
+        drop(outcome);
         assert!(lifetime.upgrade().is_none());
     }
 }

@@ -4,12 +4,18 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+#[cfg(feature = "rdma")]
+use crate::Buffer;
+use ruapc_bufpool::RemoteBufferInfo;
+use ruapc_memory::BorrowedSource;
+use thin_vec::ThinVec;
+
 use crate::{
-    Buffer, BufferAvailability, Context, Receiver,
+    Context, Receiver, Socket,
     core::ContextEndpoint,
     error::{Error, ErrorKind},
     msg::{MsgFlags, MsgMeta},
-    remote_memory::{ReadSource, WriteTarget},
+    remote_memory::{SourceRequests, SourceSender, WriteTarget},
 };
 
 use super::attempt::{
@@ -21,35 +27,89 @@ use super::Client;
 
 #[derive(Clone, Copy)]
 pub(crate) struct ReadAttachment<'a> {
-    source: Option<&'a Arc<ReadSource>>,
+    source: ReadAttachmentSource<'a>,
     charge_bytes: u64,
+    confirm_source: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ReadAttachmentSource<'a> {
+    Shared(Option<&'a BorrowedSource<'a>>),
+    /// A direct remote_write exports only metadata; no waiter or local reader
+    /// may retain access to these caller-owned buffers.
+    #[cfg(feature = "rdma")]
+    Remote(&'a [Buffer]),
 }
 
 impl<'a> ReadAttachment<'a> {
-    pub(crate) fn new(source: Option<&'a Arc<ReadSource>>, charge_bytes: Option<u64>) -> Self {
+    pub(crate) fn new(source: Option<&'a BorrowedSource<'a>>, charge_bytes: Option<u64>) -> Self {
         Self {
-            source,
+            source: ReadAttachmentSource::Shared(source),
             charge_bytes: charge_bytes
                 .unwrap_or_else(|| source.map_or(0, |source| source.layout().total())),
+            confirm_source: true,
         }
     }
 
-    fn buffers(self) -> &'a [Buffer] {
-        self.source.map_or(&[], |source| source.buffers())
+    pub(crate) fn with_confirmation(mut self, confirm: bool) -> Self {
+        self.confirm_source = confirm;
+        self
+    }
+
+    #[cfg(feature = "rdma")]
+    pub(crate) fn remote_source(source: &'a [Buffer], charge_bytes: u64) -> Self {
+        Self {
+            source: ReadAttachmentSource::Remote(source),
+            charge_bytes,
+            confirm_source: false,
+        }
+    }
+
+    fn shared_source(self) -> Option<&'a BorrowedSource<'a>> {
+        match self.source {
+            ReadAttachmentSource::Shared(source) => source,
+            #[cfg(feature = "rdma")]
+            ReadAttachmentSource::Remote(_) => None,
+        }
+    }
+
+    fn export_regions(
+        self,
+        socket: &Socket,
+        target: Option<&Arc<WriteTarget>>,
+    ) -> std::result::Result<(ThinVec<RemoteBufferInfo>, ThinVec<RemoteBufferInfo>), AttemptFailure>
+    {
+        match self.source {
+            ReadAttachmentSource::Shared(source) => {
+                export_attached_regions(socket, source.map_or(&[], BorrowedSource::buffers), target)
+            }
+            #[cfg(feature = "rdma")]
+            ReadAttachmentSource::Remote(source) => {
+                // Only read_into_target consumes this form. Streams use an
+                // owned inline payload rather than delayed source access.
+                if !matches!(socket, Socket::RDMA(_)) {
+                    return Err(Error::new(
+                        ErrorKind::InvalidArgument,
+                        "metadata-only read sources require RDMA".into(),
+                    )
+                    .into());
+                }
+                export_attached_regions(socket, source, target)
+            }
+        }
     }
 }
 
 impl Client {
     /// Executes one logical call, including pre-wire retries and metrics.
-    /// `write_buffers_slot` receives the target only if it is available and
-    /// uniquely held when the response arrives.
+    /// Settles destination access, or leaves owned destinations with the runtime
+    /// after their recovery grace expires.
     pub(crate) async fn ruapc_request<Req, Rsp, E>(
         &self,
         ctx: &Context,
         req: &Req,
         read_attachment: ReadAttachment<'_>,
-        write_target: &mut Option<Arc<WriteTarget>>,
-        write_buffers_slot: Option<&mut BufferAvailability>,
+        write_target: Option<&Arc<WriteTarget>>,
         method_name: &str,
     ) -> std::result::Result<Rsp, E>
     where
@@ -58,16 +118,22 @@ impl Client {
         E: std::error::Error + From<Error> + for<'c> Deserialize<'c>,
     {
         let metrics = ctx.state.metrics.client_method(method_name).start();
-        let result = self
-            .request_inner(
-                ctx,
-                req,
-                read_attachment,
-                write_target,
-                write_buffers_slot,
-                method_name,
-            )
+        let mut result = self
+            .request_inner(ctx, req, read_attachment, write_target, method_name)
             .await;
+        // The waiter has been removed on every terminal path. A reverse RPC
+        // may still own the destinations. Strict borrowed storage waits for the
+        // exact buffers; owning adapters may abandon recovery after the grace.
+        if let Some(target) = write_target {
+            let closed = target.close().await;
+            if result.is_ok() {
+                if let Err(error) = closed {
+                    result = Err(error.into());
+                } else if let Some(error) = target.failure() {
+                    result = Err(error.into());
+                }
+            }
+        }
         if result.is_err() {
             metrics.failed();
         }
@@ -79,8 +145,7 @@ impl Client {
         ctx: &Context,
         req: &Req,
         read_attachment: ReadAttachment<'_>,
-        write_target: &mut Option<Arc<WriteTarget>>,
-        write_buffers_slot: Option<&mut BufferAvailability>,
+        write_target: Option<&Arc<WriteTarget>>,
         method_name: &str,
     ) -> std::result::Result<Rsp, E>
     where
@@ -96,28 +161,35 @@ impl Client {
             .into());
         }
 
-        let sent = self
-            .send_with_retries(
-                ctx,
-                req,
-                read_attachment,
-                write_target.as_ref(),
-                method_name,
-            )
+        let SentRequest {
+            receiver,
+            msgid,
+            source_requests,
+        } = self
+            .send_with_retries(ctx, req, read_attachment, write_target, method_name)
             .await?;
-        // Never retry after send: a missing response cannot tell us whether
-        // the peer executed the request.
-        let (response, returned_target) = sent.receiver.recv().await?;
-        // Drop our clone before trying to recover the target. A handler still
-        // holding it, or DMA still owning its buffers, prevents recovery.
-        let had_attachment = write_target.take().is_some();
-        if let Some(slot) = write_buffers_slot {
-            *slot = match returned_target.and_then(WriteTarget::try_into_buffers) {
-                Some(buffers) => BufferAvailability::Available(buffers),
-                None if had_attachment => BufferAvailability::Unavailable,
-                None => BufferAvailability::NotAttached,
-            };
-        }
+        // Never retry after send. Source access stays in this same future: a
+        // forgotten call can retain its mailbox, but cannot answer commands.
+        let response = if let Some(mut requests) = source_requests {
+            let source = read_attachment
+                .shared_source()
+                .expect("source mailbox has a borrowed source");
+            let response = receiver.recv();
+            tokio::pin!(response);
+            loop {
+                tokio::select! {
+                    biased;
+                    result = response.as_mut() => break result?,
+                    available = requests.serve_next(source, &ctx.state.waiter, msgid) => {
+                        if !available {
+                            break response.await?;
+                        }
+                    }
+                }
+            }
+        } else {
+            receiver.recv().await?
+        };
         if response.meta.flags.contains(MsgFlags::IsFrameworkError) {
             // Framework failures use Error regardless of the service's E.
             // Keep the Result envelope shared with application responses.
@@ -234,7 +306,7 @@ impl Client {
         }
 
         let (read_regions, write_regions) =
-            export_attached_regions(&socket, read_attachment.buffers(), write_target)?;
+            read_attachment.export_regions(&socket, write_target)?;
         let read_bytes = read_attachment.charge_bytes;
         if let Err(err) = socket
             .reserve_rdma_send_bandwidth(read_bytes, Some(response_deadline))
@@ -253,9 +325,16 @@ impl Client {
         // Response waiting uses the periodic sweep. A full transport queue
         // separately bounds admission by this same absolute deadline.
         let (msgid, receiver) = ctx.state.waiter.alloc_until(response_deadline);
-        if let Some(source) = read_attachment.source {
-            ctx.state.waiter.bind_read_source(msgid, source.clone());
-        }
+        let source_requests = read_attachment.shared_source().and_then(|source| {
+            // Empty sources cannot be accessed; avoid a mailbox for destination-only calls.
+            if source.layout().total() == 0 {
+                return None;
+            }
+            let (source, requests) =
+                SourceSender::channel_with_confirmation(read_attachment.confirm_source);
+            ctx.state.waiter.bind_read_source(msgid, source);
+            Some(requests)
+        });
         if let Some(target) = write_target {
             // Pin the write buffers to the pending request so remote-memory
             // handlers can reach (and keep alive) the destination memory.
@@ -286,13 +365,19 @@ impl Client {
                 socket.rdma_remote_device().map(str::to_owned),
             ));
         }
-        Ok(SentRequest { receiver })
+        Ok(SentRequest {
+            receiver,
+            msgid,
+            source_requests,
+        })
     }
 }
 
 /// A successfully sent request attempt, waiting for its response.
 struct SentRequest<'a> {
     receiver: Receiver<'a>,
+    msgid: u64,
+    source_requests: Option<SourceRequests>,
 }
 
 #[cfg(test)]
@@ -317,9 +402,9 @@ mod tests {
                 buffer.set_len(len);
                 buffer
             })
-            .collect();
-        let source = Arc::new(ReadSource::try_new(buffers).unwrap());
-        let empty = Arc::new(ReadSource::try_new(Vec::new()).unwrap());
+            .collect::<Vec<_>>();
+        let source = BorrowedSource::new(&buffers).unwrap();
+        let empty = BorrowedSource::new(&[]).unwrap();
 
         for (source, charge_bytes, expected) in [
             (None, None, 0),
@@ -361,18 +446,17 @@ mod tests {
         let mut buffer = ctx.state.buffer_pool.allocate(4).unwrap();
         buffer.set_len(4);
         buffer.copy_from_slice(b"read");
-        let source = Arc::new(ReadSource::try_new(vec![buffer]).unwrap());
+        let buffers = [buffer];
+        let source = BorrowedSource::new(&buffers).unwrap();
         let client = Client {
             max_retries: 2,
             ..Default::default()
         };
-        let mut target = None;
         let error = client
             .ruapc_request::<(), (), Error>(
                 &ctx,
                 &(),
                 ReadAttachment::new(Some(&source), None),
-                &mut target,
                 None,
                 "Test/rejected",
             )
@@ -383,8 +467,7 @@ mod tests {
         assert_eq!(ctx.state.waiter.pending_count(), 0);
         let (next_id, _receiver) = ctx.state.waiter.alloc(Duration::from_secs(1));
         assert_eq!(next_id, 3, "two retries permit exactly three send attempts");
-        let source = Arc::try_unwrap(source).expect("failed attempts must release their source");
-        assert_eq!(&source.buffers()[0][..], b"read");
+        assert_eq!(&buffers[0][..], b"read");
     }
 
     #[tokio::test]
@@ -401,14 +484,12 @@ mod tests {
             max_retries: 10,
             ..Default::default()
         };
-        let mut target = None;
         let result = tokio::time::timeout(
             Duration::from_secs(2),
             client.ruapc_request::<(), (), Error>(
                 &ctx,
                 &(),
                 ReadAttachment::new(None, None),
-                &mut target,
                 None,
                 "Test/queue_timeout",
             ),
@@ -471,13 +552,11 @@ mod tests {
             max_retries: 10,
             ..Default::default()
         };
-        let mut target = None;
         let error = client
             .ruapc_request::<_, (), Error>(
                 &ctx,
                 &payload,
                 ReadAttachment::new(None, None),
-                &mut target,
                 None,
                 "Test/close_at_deadline",
             )
@@ -506,12 +585,10 @@ mod tests {
             max_retries: 10,
             ..Default::default()
         };
-        let mut target = None;
         let mut request = Box::pin(client.ruapc_request::<(), (), Error>(
             &ctx,
             &(),
             ReadAttachment::new(None, None),
-            &mut target,
             None,
             "Test/accepted",
         ));
@@ -552,12 +629,10 @@ mod tests {
             .unwrap();
         let ctx = connected_context(sender);
         let client = Client::default();
-        let mut target = None;
         let mut request = Box::pin(client.ruapc_request::<(), (), Error>(
             &ctx,
             &(),
             ReadAttachment::new(None, None),
-            &mut target,
             None,
             "Test/cancel_admission",
         ));
@@ -590,12 +665,10 @@ mod tests {
         let recorder = DebuggingRecorder::new();
         let snapshot = recorder.snapshotter();
         let client = Client::default();
-        let mut target = None;
         let mut request = Box::pin(client.ruapc_request::<(), (), Error>(
             &ctx,
             &(),
             ReadAttachment::new(None, None),
-            &mut target,
             None,
             "Test/pending",
         ));

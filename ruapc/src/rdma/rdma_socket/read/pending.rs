@@ -1,8 +1,13 @@
 //! READ failure policy. The verbs crate alone owns and settles DMA work.
 
-use std::{sync::Mutex, time::Instant};
+use std::{
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 use ruapc_rdma::{ReadFailure, ReadHandle, ReadObservation};
+
+use super::ReadDeadline;
 
 /// Bound weak metadata even when idle connections skip deadline sweeps.
 const PRUNE_INTERVAL: usize = 64;
@@ -28,28 +33,28 @@ struct PendingRead {
 
 #[derive(Debug)]
 struct Deadlines {
-    read: Option<Instant>,
-    request: Option<Instant>,
-    watchdog_reported: bool,
+    deadline: Option<ReadDeadline>,
+    failed_at: Option<Instant>,
+    close_reported: bool,
 }
 
 impl Deadlines {
-    fn expire(&mut self, now: Instant) -> (Option<ReadFailure>, bool) {
-        let read_expired = self.read.is_some_and(|deadline| deadline <= now);
-        let failure = if self
-            .request
-            .is_some_and(|request| request <= now && self.read.is_none_or(|read| request <= read))
-        {
-            Some(ReadFailure::RequestTimeout)
-        } else if read_expired {
-            Some(ReadFailure::Timeout)
-        } else {
-            None
-        };
-        // Request expiry or a dropped receiver must never disarm the READ
-        // watchdog. The boolean belongs to the registry, not to its sender.
-        let close = read_expired && !self.watchdog_reported;
-        self.watchdog_reported |= read_expired;
+    fn expire(
+        &mut self,
+        now: Instant,
+        grace: Duration,
+        recorded: Option<ReadFailure>,
+    ) -> (Option<ReadFailure>, bool) {
+        let failure = recorded
+            .or_else(|| ReadDeadline::expired(self.deadline, now).map(|deadline| deadline.reason));
+        if failure.is_some() && self.failed_at.is_none() {
+            self.failed_at = Some(ReadDeadline::failure_start(self.deadline, now));
+        }
+        let close = !self.close_reported
+            && self
+                .failed_at
+                .is_some_and(|at| now.saturating_duration_since(at) >= grace);
+        self.close_reported |= close;
         (failure, close)
     }
 }
@@ -61,12 +66,7 @@ impl PendingReads {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    pub(super) fn register(
-        &self,
-        handle: ReadHandle,
-        read: Option<Instant>,
-        request: Option<Instant>,
-    ) {
+    pub(super) fn register(&self, handle: ReadHandle, deadline: Option<ReadDeadline>) {
         let mut inner = self.lock();
         inner.registrations += 1;
         let scan = if inner.registrations >= PRUNE_INTERVAL {
@@ -78,9 +78,9 @@ impl PendingReads {
         inner.entries.push(PendingRead {
             handle,
             deadlines: Deadlines {
-                read,
-                request,
-                watchdog_reported: false,
+                deadline,
+                failed_at: None,
+                close_reported: false,
             },
         });
         drop(inner);
@@ -135,13 +135,13 @@ impl PendingReads {
         self.restore(scan);
     }
 
-    pub(super) fn expire(&self, now: Instant) -> bool {
+    pub(super) fn expire(&self, now: Instant, grace: Duration) -> bool {
         let mut expired = false;
         let scan = Self::collect(&mut self.lock(), |entry, observation| {
             // Remaining includes admission-blocked work. A deadline can imply
             // a QP fault only while the provider still has an accepted READ.
             if observation.has_in_flight() {
-                let (reason, close) = entry.deadlines.expire(now);
+                let (reason, close) = entry.deadlines.expire(now, grace, observation.failure());
                 expired |= close;
                 reason
             } else {
@@ -215,7 +215,7 @@ mod tests {
             buffer.set_len(64);
             self.qp
                 .prepare_reads(
-                    vec![buffer],
+                    vec![buffer.into()],
                     vec![ReadRequest {
                         remote_addr: 1024,
                         rkey: 7,
@@ -231,8 +231,9 @@ mod tests {
     }
 
     #[test]
-    fn delayed_sweep_reports_the_earlier_deadline_and_closes_only_once() {
+    fn deadline_failure_waits_for_grace_before_closing() {
         let now = Instant::now();
+        let grace = Duration::from_millis(100);
         for (read, request, reason) in [
             (
                 now + Duration::from_secs(1),
@@ -243,43 +244,79 @@ mod tests {
             (now, now, ReadFailure::RequestTimeout),
         ] {
             let mut deadlines = Deadlines {
-                read: Some(read),
-                request: Some(request),
-                watchdog_reported: false,
+                deadline: ReadDeadline::earliest(Some(read), Some(request)),
+                failed_at: None,
+                close_reported: false,
             };
-            let sweep = now + Duration::from_secs(2);
-            assert_eq!(deadlines.expire(sweep), (Some(reason), true));
-            assert_eq!(deadlines.expire(sweep), (Some(reason), false));
+            assert_eq!(deadlines.expire(now, grace, None), (Some(reason), false));
+            assert_eq!(
+                deadlines.expire(now + grace, grace, Some(reason)),
+                (Some(reason), true)
+            );
+            assert_eq!(
+                deadlines.expire(now + grace, grace, Some(reason)),
+                (Some(reason), false)
+            );
         }
     }
 
     #[test]
-    fn request_expiry_does_not_disarm_the_read_watchdog() {
-        let request = Instant::now();
-        let read = request + Duration::from_secs(1);
+    fn cancelled_read_has_a_grace_even_without_deadlines() {
+        let now = Instant::now();
+        let grace = Duration::from_millis(100);
         let mut deadlines = Deadlines {
-            read: Some(read),
-            request: Some(request),
-            watchdog_reported: false,
+            deadline: None,
+            failed_at: None,
+            close_reported: false,
         };
+        assert_eq!(deadlines.expire(now, grace, None), (None, false));
         assert_eq!(
-            deadlines.expire(request),
-            (Some(ReadFailure::RequestTimeout), false)
+            deadlines.expire(now, grace, Some(ReadFailure::Cancelled)),
+            (Some(ReadFailure::Cancelled), false)
         );
         assert_eq!(
-            deadlines.expire(read),
-            (Some(ReadFailure::RequestTimeout), true)
+            deadlines.expire(now + grace, grace, Some(ReadFailure::Cancelled)),
+            (Some(ReadFailure::Cancelled), true)
         );
-        assert_eq!(
-            deadlines.expire(read),
-            (Some(ReadFailure::RequestTimeout), false)
-        );
-        deadlines.read = None;
-        deadlines.watchdog_reported = false;
-        assert_eq!(
-            deadlines.expire(read),
-            (Some(ReadFailure::RequestTimeout), false)
-        );
+    }
+
+    #[test]
+    fn recorded_failure_keeps_its_reason_and_the_original_cleanup_clock() {
+        let start = Instant::now();
+        let grace = Duration::from_millis(100);
+        for (at, observed, reason, expected_start) in [
+            // A failure first observed after an expired deadline uses that
+            // earlier clock, without replacing the recorded completion error.
+            (start, start + grace / 2, ReadFailure::Completion, start),
+            // Cancellation can precede the budget. Later sweeps must not move
+            // cleanup to the future READ deadline or restart the grace.
+            (
+                start + Duration::from_secs(1),
+                start,
+                ReadFailure::Cancelled,
+                start,
+            ),
+        ] {
+            let mut deadlines = Deadlines {
+                deadline: ReadDeadline::earliest(Some(at), None),
+                failed_at: None,
+                close_reported: false,
+            };
+            assert_eq!(
+                deadlines.expire(observed, grace, Some(reason)),
+                (Some(reason), false)
+            );
+            assert_eq!(deadlines.failed_at, Some(expected_start));
+            assert_eq!(
+                deadlines.expire(expected_start + grace, grace, Some(reason)),
+                (Some(reason), true)
+            );
+            assert_eq!(deadlines.failed_at, Some(expected_start));
+            assert_eq!(
+                deadlines.expire(expected_start + grace * 2, grace, Some(reason)),
+                (Some(reason), false)
+            );
+        }
     }
 
     #[test]
@@ -288,11 +325,19 @@ mod tests {
         let (posting, mut completion) = fixture.plan();
         let pending = PendingReads::default();
         let now = Instant::now();
-        pending.register(posting.handle(), Some(now), Some(now));
-        assert!(!pending.expire(now));
+        pending.register(
+            posting.handle(),
+            ReadDeadline::earliest(Some(now), Some(now)),
+        );
+        assert!(!pending.expire(now, Duration::ZERO));
         assert!(completion.try_recv().is_none());
-        assert!(posting.cancel().is_some());
-        assert!(!pending.expire(now));
+        posting.cancel();
+        let outcome = completion
+            .try_recv()
+            .expect("unposted cancellation settles immediately");
+        assert_eq!(outcome.result, Err(ReadFailure::Cancelled));
+        assert_eq!(outcome.buffers.len(), 1);
+        assert!(!pending.expire(now, Duration::ZERO));
         assert!(pending.lock().entries.is_empty());
     }
 
@@ -302,7 +347,7 @@ mod tests {
         let pending = PendingReads::default();
         for _ in 0..10_000 {
             let (posting, completion) = fixture.qp.prepare_reads(Vec::new(), Vec::new()).unwrap();
-            pending.register(posting.handle(), None, None);
+            pending.register(posting.handle(), None);
             drop(posting);
             drop(completion);
         }
@@ -319,7 +364,7 @@ mod tests {
         for _ in 0..4 {
             let (posting, completion) = fixture.plan();
             let handle = posting.handle();
-            pending.register(handle.clone(), None, None);
+            pending.register(handle.clone(), None);
             plans.push((posting, completion));
             handles.push(handle);
         }
@@ -328,7 +373,7 @@ mod tests {
         assert!(pending.lock().scan.is_empty());
         drop(plans);
         assert!(handles.iter().all(|handle| handle.observe().is_none()));
-        assert!(!pending.expire(Instant::now()));
+        assert!(!pending.expire(Instant::now(), Duration::ZERO));
         assert!(pending.lock().entries.is_empty());
         assert!(pending.lock().scan.capacity() >= 4);
     }
@@ -345,11 +390,13 @@ mod tests {
         .join()
         .unwrap_err();
         let (posting, mut completion) = fixture.plan();
-        pending.register(posting.handle(), None, None);
+        pending.register(posting.handle(), None);
         pending.fail();
+        assert!(completion.try_recv().is_none());
+        drop(posting);
         assert_eq!(
-            completion.try_recv().unwrap().unwrap_err(),
-            ReadFailure::ConnectionClosed
+            completion.try_recv().unwrap().result,
+            Err(ReadFailure::ConnectionClosed)
         );
     }
 
@@ -368,14 +415,16 @@ mod tests {
         let fixture = Fixture::new();
         let pending = Arc::new(PendingReads::default());
         let (posting, mut completion) = fixture.plan();
-        pending.register(posting.handle(), None, None);
+        pending.register(posting.handle(), None);
         let waker = Waker::from(Arc::new(LockProbe(pending.clone())));
         let mut context = Context::from_waker(&waker);
         assert!(Pin::new(&mut completion).poll(&mut context).is_pending());
         pending.fail();
+        assert!(completion.try_recv().is_none());
+        drop(posting);
         assert_eq!(
-            completion.try_recv().unwrap().unwrap_err(),
-            ReadFailure::ConnectionClosed
+            completion.try_recv().unwrap().result,
+            Err(ReadFailure::ConnectionClosed)
         );
     }
 }

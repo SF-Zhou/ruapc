@@ -7,7 +7,7 @@
 //! `RUAPC_BENCH_WARMUP_ITERS` overrides the warmup count.
 //!
 //! Setup, registration, buffer initialization and warmup are outside timing.
-//! Read-source wrappers, server write sources and client write destinations are
+//! Client read sources, server write sources and client write destinations are
 //! reused. `remote_read_all` retains its normal pool-allocation behavior.
 //! Every operation verifies the complete deterministic byte pattern; reported
 //! time includes that verification. Bulk bytes use remote memory, with only a
@@ -20,8 +20,8 @@ use std::{
 };
 
 use ruapc::{
-    Buffer, BufferPool, Client, Context, ListenMode, Result, ResultBufferReply, Router, Server,
-    SocketPoolConfig, Transport,
+    Buffer, BufferPool, Client, Context, ListenMode, Result, Router, Server, SocketPoolConfig,
+    Transport,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -83,7 +83,7 @@ struct BenchRequest {
 trait RemoteMemoryBench {
     async fn probe(&self, ctx: &Context, req: &()) -> Result<()>;
     async fn read_all(&self, ctx: &Context, req: &BenchRequest) -> Result<usize>;
-    async fn write_all(&self, ctx: &Context, req: &BenchRequest) -> ResultBufferReply<usize>;
+    async fn write_all(&self, ctx: &Context, req: &BenchRequest) -> Result<usize>;
 }
 
 struct Case {
@@ -120,13 +120,13 @@ impl RemoteMemoryBench for BenchService {
     }
 
     async fn read_all(&self, ctx: &Context, req: &BenchRequest) -> Result<usize> {
-        let buffers = ctx.remote_read_all().await?;
+        let buffers = ctx.remote_read_allocated().await?;
         let expected = &self.cases[req.case].expected;
         verify(&buffers, expected);
         Ok(expected.len())
     }
 
-    async fn write_all(&self, ctx: &Context, req: &BenchRequest) -> ResultBufferReply<usize> {
+    async fn write_all(&self, ctx: &Context, req: &BenchRequest) -> Result<usize> {
         let case = &self.cases[req.case];
         let source = case
             .write_source
@@ -134,9 +134,10 @@ impl RemoteMemoryBench for BenchService {
             .unwrap()
             .take()
             .expect("serial benchmark must have one reusable write source");
-        let mut sent = ctx.remote_write_all(source).await?;
-        *case.write_source.lock().unwrap() = sent.take_sources().into_available();
-        Ok(sent.into_reply(case.expected.len()))
+        let result = ctx.remote_write_all(&source).await;
+        *case.write_source.lock().unwrap() = Some(source);
+        result?;
+        Ok(case.expected.len())
     }
 }
 
@@ -182,15 +183,19 @@ async fn bench_read(
 ) {
     let buffers = make_buffers(&ctx.state.buffer_pool, expected);
     let client = Client::default();
-    let source = client.with_read_buffers(buffers).unwrap();
-    for _ in 0..warmup {
-        assert_eq!(source.read_all(ctx, req).await.unwrap(), expected.len());
-    }
-    let start = Instant::now();
-    for _ in 0..iters {
-        assert_eq!(source.read_all(ctx, req).await.unwrap(), expected.len());
-    }
-    report("remote_read_all", expected.len(), iters, start.elapsed());
+    let _completed = client
+        .with_buffers(&buffers, vec![])
+        .run(async |source| {
+            for _ in 0..warmup {
+                assert_eq!(source.read_all(ctx, req).await.unwrap(), expected.len());
+            }
+            let start = Instant::now();
+            for _ in 0..iters {
+                assert_eq!(source.read_all(ctx, req).await.unwrap(), expected.len());
+            }
+            report("remote_read_all", expected.len(), iters, start.elapsed());
+        })
+        .await;
 }
 
 async fn bench_write(
@@ -203,29 +208,27 @@ async fn bench_write(
     let mut destinations = make_buffers(&ctx.state.buffer_pool, &vec![0; expected.len()]);
     let client = Client::default();
     for _ in 0..warmup {
-        let (written, returned) = client
-            .with_write_buffers(destinations)
-            .write_all(ctx, req)
-            .await
-            .unwrap()
-            .into_parts();
-        let returned = returned.into_available().expect("destinations available");
-        assert_eq!(written, expected.len());
-        verify(&returned, expected);
-        destinations = returned;
+        let completed = client
+            .with_buffers(&[], destinations)
+            .run(async |target| target.write_all(ctx, req).await)
+            .await;
+        destinations = completed
+            .buffers
+            .expect("benchmark destinations must be recovered");
+        assert_eq!(completed.result.unwrap(), expected.len());
+        verify(&destinations, expected);
     }
     let start = Instant::now();
     for _ in 0..iters {
-        let (written, returned) = client
-            .with_write_buffers(destinations)
-            .write_all(ctx, req)
-            .await
-            .unwrap()
-            .into_parts();
-        let returned = returned.into_available().expect("destinations available");
-        assert_eq!(written, expected.len());
-        verify(&returned, expected);
-        destinations = returned;
+        let completed = client
+            .with_buffers(&[], destinations)
+            .run(async |target| target.write_all(ctx, req).await)
+            .await;
+        destinations = completed
+            .buffers
+            .expect("benchmark destinations must be recovered");
+        assert_eq!(completed.result.unwrap(), expected.len());
+        verify(&destinations, expected);
     }
     report("remote_write_all", expected.len(), iters, start.elapsed());
 }

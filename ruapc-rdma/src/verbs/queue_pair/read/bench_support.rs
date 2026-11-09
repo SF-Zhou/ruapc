@@ -37,7 +37,8 @@ pub struct Batch(Arc<ReadBatch>);
 impl Batch {
     #[inline]
     pub fn new(count: usize, buffers: Vec<Buffer>) -> (Self, ReadCompletion) {
-        let (batch, receiver) = ReadBatch::new(count, buffers);
+        let (batch, receiver) =
+            ReadBatch::new(count, buffers.into_iter().map(WriteBuffer::from).collect());
         (Self(batch), receiver)
     }
 

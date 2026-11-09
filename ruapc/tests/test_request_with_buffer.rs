@@ -2,6 +2,7 @@
 // reference (`&String`), so `&str` is not an option here.
 #![allow(clippy::ptr_arg)]
 
+use std::slice;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -33,7 +34,7 @@ impl UploadService for UploadServiceImpl {
         // Allocates right-sized local buffers and reads exactly the
         // client's logical data. Returns MissingBufferInfo if the client
         // did not attach buffers.
-        let local = ctx.remote_read_all().await?;
+        let local = ctx.remote_read_allocated().await?;
 
         // Return the data read from the client's buffers.
         let mut data = Vec::new();
@@ -71,7 +72,7 @@ impl PingService for PingServiceImpl {
 // --------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_upload_with_read_buffer_tcp() {
+async fn test_upload_with_source_reference_tcp() {
     let upload_svc = Arc::new(UploadServiceImpl);
     let ping_svc = Arc::new(PingServiceImpl);
     let mut router = Router::default();
@@ -92,7 +93,7 @@ async fn test_upload_with_read_buffer_tcp() {
     let rsp = client.ping(&ctx, &"hello".to_string()).await.unwrap();
     assert_eq!(rsp, "pong");
 
-    // 2. Test with_read_buffer — client sends buffer for server to read.
+    // 2. Borrow a source buffer for the server to read.
     //    set_len marks the logical data length; the server reads exactly
     //    this many bytes.
     let test_data = b"Hello, WithReadBuffer!";
@@ -102,21 +103,18 @@ async fn test_upload_with_read_buffer_tcp() {
 
     let req = UploadReq {};
 
-    // Move the source into a wrapper that can reuse it across requests.
-    let mut source = client.with_read_buffer(buf).unwrap();
-    let rsp: UploadRsp = source.upload(&ctx, &req).await.unwrap();
-    assert_eq!(rsp.data, test_data);
-
-    // 3. Verify the same buffer can be reused (retry scenario).
-    let rsp2: UploadRsp = source.upload(&ctx, &req).await.unwrap();
-    assert_eq!(rsp2.data, test_data);
-    assert_eq!(&source.read_buffers()[0][..], test_data);
-    let recovered = source
-        .take_read_buffers()
-        .into_available()
-        .expect("completed reads release the source for reuse");
-    assert_eq!(&recovered[0][..], test_data);
-    assert!(source.read_buffers().is_empty());
+    // One scope reuses the same source reference across requests.
+    let Completed { result, buffers } = client
+        .with_buffers(slice::from_ref(&buf), vec![])
+        .run(async |source| {
+            let rsp: UploadRsp = source.upload(&ctx, &req).await?;
+            assert_eq!(rsp.data, test_data);
+            source.upload(&ctx, &req).await
+        })
+        .await;
+    assert_eq!(result.unwrap().data, test_data);
+    assert!(buffers.unwrap().is_empty());
+    assert_eq!(&buf[..], test_data);
 
     // 4. Verify upload without an attached buffer fails with a proper
     //    MissingBufferInfo error (not a server panic / timeout).
@@ -129,7 +127,7 @@ async fn test_upload_with_read_buffer_tcp() {
 }
 
 #[tokio::test]
-async fn test_upload_with_read_buffer_websocket() {
+async fn test_upload_with_source_reference_websocket() {
     let upload_svc = Arc::new(UploadServiceImpl);
     let mut router = Router::default();
     upload_svc.ruapc_export(&mut router);
@@ -155,10 +153,10 @@ async fn test_upload_with_read_buffer_websocket() {
     let req = UploadReq {};
 
     let rsp: UploadRsp = client
-        .with_read_buffer(buf)
-        .unwrap()
-        .upload(&ctx, &req)
+        .with_buffers(slice::from_ref(&buf), vec![])
+        .run(async |source| source.upload(&ctx, &req).await)
         .await
+        .result
         .unwrap();
     assert_eq!(rsp.data, test_data);
 
@@ -167,7 +165,7 @@ async fn test_upload_with_read_buffer_websocket() {
 }
 
 #[tokio::test]
-async fn test_upload_with_read_buffer_http() {
+async fn test_upload_with_source_reference_http() {
     let upload_svc = Arc::new(UploadServiceImpl);
     let mut router = Router::default();
     upload_svc.ruapc_export(&mut router);
@@ -193,10 +191,10 @@ async fn test_upload_with_read_buffer_http() {
     let req = UploadReq {};
 
     let rsp: UploadRsp = client
-        .with_read_buffer(buf)
-        .unwrap()
-        .upload(&ctx, &req)
+        .with_buffers(slice::from_ref(&buf), vec![])
+        .run(async |source| source.upload(&ctx, &req).await)
         .await
+        .result
         .unwrap();
     assert_eq!(rsp.data, test_data);
 

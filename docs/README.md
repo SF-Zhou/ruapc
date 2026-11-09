@@ -18,6 +18,7 @@ run `cargo doc -p ruapc --no-deps --open`.
 | Encode and decode RPC messages without the RPC runtime | [Wire crate](../ruapc-wire/README.md) |
 | Set up a development or test environment | [Contributing](../CONTRIBUTING.md) |
 | Measure and compare performance | [Benchmarks](benchmark.md) |
+| Use explicit unsafe buffer references | [Borrowing facade](../ruapc-unsafe/README.md) |
 | Upgrade between releases | [Changelog](../CHANGELOG.md) |
 
 ## Implementation contracts

@@ -1,0 +1,35 @@
+error: lifetime may not live long enough
+ --> tests/ui/scoped_handle_cannot_be_retained.rs:7:31
+  |
+4 |       let mut retained = None;
+  |           ------------ lifetime `'2` appears in the type of `retained`
+...
+7 |           .run(async |attached| {
+  |  _____________________--------__^
+  | |                     |
+  | |                     has type `&'1 ClientWithBuffers<'_>`
+8 | |             retained = Some(attached);
+9 | |         })
+  | |_________^ returning this value requires that `'1` must outlive `'2`
+  |
+  = note: requirement occurs because of a mutable reference to `Option<&ClientWithBuffers<'_>>`
+  = note: mutable references are invariant over their type parameter
+  = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance
+
+error: lifetime may not live long enough
+ --> tests/ui/scoped_handle_cannot_be_retained.rs:7:31
+  |
+4 |       let mut retained = None;
+  |           ------------ lifetime `'4` appears in the type of `retained`
+...
+7 |           .run(async |attached| {
+  |  _____________________--------__^
+  | |                     |
+  | |                     has type `&ClientWithBuffers<'3>`
+8 | |             retained = Some(attached);
+9 | |         })
+  | |_________^ returning this value requires that `'3` must outlive `'4`
+  |
+  = note: requirement occurs because of a mutable reference to `Option<&ClientWithBuffers<'_>>`
+  = note: mutable references are invariant over their type parameter
+  = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance

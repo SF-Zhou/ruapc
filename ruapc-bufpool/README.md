@@ -65,6 +65,21 @@ Partial failure drops completed registrations and restores the growth budget.
 Registrations are destroyed before backing memory, and the pool retains its
 registrars until all blocks have been released.
 
+`WriteBuffer` lets transport code handle owned destinations and explicitly unsafe
+borrowed destination metadata through the same interface. Safe
+`From<Buffer>` construction transfers ownership; `into_owned` returns that same
+buffer, or returns a borrowed view unchanged as `Err`. Ordinary `Buffer`
+allocation, access and release have no additional reference counts or access
+checks. Borrowed views do not retain the allocation or registration: their
+unsafe constructors require the caller to maintain the documented lifetime and
+access permissions until all work using them has settled. Read sources use
+ordinary references to `Buffer`, without unsafe source snapshots. The hidden
+`ReadSources` capability records whether the runtime must confirm source
+validity with the original future or may rely on an explicit unsafe caller's
+contract. It retains a real slice borrow and adds no per-buffer state. See the
+owning
+[safety contract](../docs/safe-boundaries.md) for the runtime completion rules.
+
 ## Implementation
 
 | Module | Responsibility |
@@ -72,6 +87,8 @@ registrars until all blocks have been released.
 | [`pool.rs`](src/pool.rs), [`pool/builder.rs`](src/pool/builder.rs) | Public API, allocation transitions and configuration |
 | [`pool/allocator.rs`](src/pool/allocator.rs), [`waiters.rs`](src/pool/allocator/waiters.rs) | Budget, merging, direct handoff and starvation reservations |
 | [`registration.rs`](src/registration.rs) | Audited memory registrar and owned registration handles |
+| [`buffer/capability.rs`](src/buffer/capability.rs) | Owned destinations and unsafe borrowed destination snapshots |
+| [`buffer/read_sources.rs`](src/buffer/read_sources.rs) | Borrowed sources and their established validation policy |
 | [`completion.rs`](src/completion.rs) | Safe runtime-independent single-value notification shared with RDMA |
 | [`pool/small.rs`](src/pool/small.rs), [`slab.rs`](src/slab.rs), [`thread_cache.rs`](src/thread_cache.rs) | Slab classes, chunk ownership, thread caches and reclamation |
 | [`buddy.rs`](src/buddy.rs), [`aligned.rs`](src/aligned.rs) | Backing regions, allocation metadata and initialized memory |

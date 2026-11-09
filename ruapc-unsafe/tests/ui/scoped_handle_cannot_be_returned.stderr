@@ -1,0 +1,17 @@
+error: lifetime may not live long enough
+ --> tests/ui/scoped_handle_cannot_be_returned.rs:6:31
+  |
+6 |         .run(async |attached| attached)
+  |                     --------- ^^^^^^^^ returning this value requires that `'1` must outlive `'2`
+  |                     |       |
+  |                     |       return type of async closure is &'2 ClientWithBuffers<'_>
+  |                     has type `&'1 ClientWithBuffers<'_>`
+
+error: lifetime may not live long enough
+ --> tests/ui/scoped_handle_cannot_be_returned.rs:6:31
+  |
+6 |         .run(async |attached| attached)
+  |                     --------- ^^^^^^^^ returning this value requires that `'3` must outlive `'4`
+  |                     |       |
+  |                     |       return type of async closure is &ClientWithBuffers<'4>
+  |                     has type `&ClientWithBuffers<'3>`

@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use ruapc::{
-    Buffer, BufferPool, Client, Context, CopyOp, Endpoint, ListenMode, ResultBufferReply, Router,
+    Buffer, BufferPool, Client, Completed, Context, CopyOp, Endpoint, ListenMode, Result, Router,
     Server, SocketPoolConfig, Transport, service,
 };
 use ruapc_bufpool::MemoryKey;
@@ -39,13 +39,13 @@ fn flatten(buffers: &[Buffer]) -> Vec<u8> {
 
 #[service]
 trait PackedCopy {
-    async fn exchange(&self, ctx: &Context, req: &()) -> ResultBufferReply<Vec<u8>>;
+    async fn exchange(&self, ctx: &Context, req: &()) -> Result<Vec<u8>>;
 }
 
 struct PackedCopyService;
 
 impl PackedCopy for PackedCopyService {
-    async fn exchange(&self, ctx: &Context, _: &()) -> ResultBufferReply<Vec<u8>> {
+    async fn exchange(&self, ctx: &Context, _: &()) -> Result<Vec<u8>> {
         #[cfg(feature = "rdma")]
         assert!(ctx.state.rdma_devices.is_empty());
         for (regions, lengths) in [
@@ -63,10 +63,15 @@ impl PackedCopy for PackedCopyService {
             );
         }
         let destination = buffers(&ctx.state.buffer_pool, b"............", &[3, 0, 4, 5]);
-        let read = ctx.remote_read(&OPS, destination).await?;
+        let Completed {
+            result,
+            buffers: destination,
+        } = ctx.own_buffers(destination).remote_read(&OPS).await;
+        let destination = destination.unwrap();
+        result?;
         let source = buffers(&ctx.state.buffer_pool, b"ABCDEFGH", &[1, 0, 4, 3]);
-        let sent = ctx.remote_write(&OPS, source).await?;
-        Ok(sent.into_reply(flatten(&read)))
+        ctx.remote_write(&OPS, &source).await?;
+        Ok(flatten(&destination))
     }
 }
 
@@ -101,18 +106,19 @@ async fn packed_copies_keep_operation_order_holes_and_empty_segments_on_stream_t
         let destination = buffers(&pool, b"............", &[0, 5, 2, 5]);
         let destination_pointers: Vec<_> =
             destination.iter().map(|buffer| buffer.as_ptr()).collect();
-        let mut attached = client
-            .with_read_buffers(source)
-            .unwrap()
-            .with_write_buffers(destination);
-        let (read, written) = attached.exchange(&ctx, &()).await.unwrap().into_parts();
-        let written = written.into_available().expect("destinations available");
+        let Completed { result, buffers } = client
+            .with_buffers(&source, destination)
+            .run(async |attached| attached.exchange(&ctx, &()).await)
+            .await;
+        let buffers = buffers.unwrap();
+        let read = result.unwrap();
+        let written = &buffers;
 
         // Operation order differs from destination order, the sources overlap,
         // and neither operation covers the holes in either destination.
         assert_eq!(read, b".abc...bcde.", "{transport:?} remote_read");
         assert_eq!(
-            flatten(&written),
+            flatten(written),
             b".ABC...BCDE.",
             "{transport:?} remote_write"
         );
@@ -131,9 +137,8 @@ async fn packed_copies_keep_operation_order_holes_and_empty_segments_on_stream_t
             destination_pointers,
         );
         assert_eq!(written[0].capacity(), 0);
-        let recovered = attached.take_read_buffers().into_available().unwrap();
-        assert_eq!(flatten(&recovered), b"abcdefgh");
-        assert_eq!(recovered[1].capacity(), 0);
+        assert_eq!(flatten(&source), b"abcdefgh");
+        assert_eq!(source[1].capacity(), 0);
     }
 
     server.stop();

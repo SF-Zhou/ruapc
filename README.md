@@ -76,7 +76,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The macro implements `EchoService` for `Client` and `ClientWithBuffers`.
+The macro implements `EchoService` for `Client` and `ClientWithBuffers`, which is
+available only through a buffered builder's `run` callback.
 Handlers and clients use the same trait and declared return types. When a service
 is defined in another module, import its service trait at the call site.
 
@@ -111,15 +112,27 @@ RuaPC's typed HTTP client uses an HTTP/2 stream that supports reverse RPC.
 
 ## Remote read/write
 
-Clients attach owned read sources and write destinations. Handlers address
-those buffers through logical `CopyOp` ranges, using RDMA READ or inline
-reverse RPC over the other transports. Handlers return `BufferReply<T>` from a
-completed `WriteReceipt`; clients receive the same `BufferReply<T>` type with
-explicit destination-buffer availability.
+Safe clients use `with_buffers(&sources, destinations).run(...)` and receive
+recovered original destinations alongside either application result. Sources
+stay borrowed in the calling future. Its optional
+buffer container is absent if cleanup grace expires; pending local DMA keeps
+ownership until background settlement. Handlers use
+`ctx.own_buffers(destinations).remote_read(...)` and
+`ctx.remote_write(ops, &sources)` with ordinary service responses. Source writes
+borrow safely and need no ownership recovery or unsafe facade.
+Buffered typed and raw calls use only the scoped client reference supplied to
+`run`; the builder itself cannot issue them.
 
-The [remote-memory guide](docs/remote-memory.md) shows a complete service and
-client call, buffer sizing and recovery. The [safety contract](docs/safe-boundaries.md)
-explains ownership, read-then-validate and behavior after cancellation or failure.
+Advanced callers use the separate [ruapc-unsafe](ruapc-unsafe/README.md) crate to
+skip the source future's validation reply with `with_buffers_unchecked`, or to
+borrow client or handler write destinations as `&mut Buffer`. These interfaces
+delegate source lifetime or exclusive destination access to the caller;
+borrowed destinations require completion, including error cleanup. They add no
+per-buffer reference counting, access locks or busy checks, and share the
+transport and CQE completion engine. Core continues to forbid unsafe code.
+
+See the [remote-memory guide](docs/remote-memory.md) for examples and
+[safety boundaries](docs/safe-boundaries.md) for cancellation and result validity.
 
 ## RDMA
 

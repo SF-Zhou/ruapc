@@ -132,10 +132,12 @@ and rechecks the budget before creating the QP. Failure to fit on one shard,
 or to create another shard, does not prevent admission on another fitting
 shard. Incoming and outgoing connections use the same path.
 
-`ReservedQueuePair` drops the QP before its reservation, including setup errors
-and handoff to the socket. Removing a connection from the poller's map does
-not release its reservation while another owner retains the QP. Posting and
-ordinary completion dispatch never acquire the CQ budget lock.
+`ReservedQueuePair` destroys the provider QP before retiring its reservation,
+including setup errors and handoff to the socket. Its posting gate permits
+explicit destruction while other owners retain the closed socket. Retaining an
+`Arc<RdmaSocket>` therefore does not delay normal QP destruction or reservation
+retirement. Posting and ordinary completion dispatch never acquire the CQ
+budget lock.
 
 ## Retirement and credit reuse
 
@@ -166,51 +168,71 @@ NIC semaphore used by other connections.
 before bandwidth admission and covers bandwidth, SQ/NIC permit waits and
 completion. The request's remaining budget independently limits the same
 stages; zero disables only the configured READ budget, not request deadlines.
-Normal server RPC contexts always carry a request deadline. An internal or
-low-level READ with neither deadline has no automatic expiry and must rely on
-completion or connection closure.
+Normal server RPC contexts always carry a request deadline. A live internal
+READ with neither deadline has no time-based expiry; abandonment or another
+recorded failure still starts cleanup.
 Permit waits use the earlier absolute deadline, including before the first WR
 is posted and between later WRs. Uncontended permit acquisition creates no
 timer; the posting path checks expiry before handing a WR to the provider.
 
-The poll thread checks posted READ deadlines during its 100 ms housekeeping
-sweep, skipping QPs with all READ permits available; completion waits do not
-create per-operation timers. The core socket owns the pending registry and
-both deadlines; the verbs crate provides weak observation/failure handles
-and retains exclusive completion authority. The registry prunes on a bounded
-registration cadence, including when idle sweeps are skipped. Temporary strong
-observations are dropped and failures notified outside the registry lock, so
-closing a result producer cannot invoke a waker under that lock.
-Only provider-accepted, unsettled WRs count: a
-batch is registered for the sweep after its first accepted post, so a suffix
-still waiting for admission neither arms the READ watchdog nor requests
-closure, while the caller's own deadline still bounds that wait. Request
-expiry in application remote-memory operations reports `Timeout` without
-itself closing the connection. Large-payload cancellation still closes its
-connection under the separate
+The poll thread checks posted READ deadlines and recorded failures during its
+100 ms housekeeping sweep, skipping QPs with all READ permits available.
+The core socket owns the pending registry and both deadlines; the verbs crate
+provides weak observation/failure handles and retains completion authority.
+The registry prunes on a bounded registration cadence, including when idle
+sweeps are skipped. Temporary strong observations are dropped outside the
+registry lock, so a final producer release cannot invoke a waker under it.
+Only provider-accepted, unsettled WRs count: a batch enters the registry after
+its first accepted post. A suffix waiting for admission does not itself prove
+a connection fault, while the caller's deadline still bounds that wait.
+
+`rdma.remote_memory.settle_grace_ms` defaults to 100. A deadline or the first
+observed failure, including a dropped completion receiver, starts this cleanup
+grace. On first observation, it uses the earliest already expired request/READ
+deadline, or the observation time when neither deadline has expired. Zero
+requests closure immediately on observation. If accepted work remains after the
+grace, the poller closes the connection and requests ERR. Large-payload failures can close their connection
+earlier under their separate
 [source-ownership protocol](safe-boundaries.md#large-payload-source-ownership).
-The independent READ watchdog remains armed after request expiry or receiver
-cancellation: when accepted work exceeds that budget, the sweep moves the QP
-to ERR. A waiting caller receives `RdmaReadTimeout` unless an earlier request
-deadline applies. Admission expiry alone does not prove a connection failure.
+Closing an attached write target also gives an outstanding transfer this grace
+before requesting connection teardown.
 
-Connection closure immediately fails READ waiters even with the watchdog
-disabled or missing flush completions. Expiry and closure never release
-posted DMA holds or return their permits. If no WR was posted, admission
-failure can restore the complete destination vector; after partial posting,
-the unposted suffix is cancelled and the QP retains the posted destinations.
+The first failure reason is preserved. Request expiry reports `Timeout`; the
+independent READ deadline reports `RdmaReadTimeout` when it expires first.
+Recording either error does not finish `ReadCompletion`: its `ReadOutcome`
+returns the same original vector only after all posted READs and the unposted
+suffix settle. A partial-posting failure cancels that suffix and waits for the
+posted work. Before any WR is posted, failure returns the complete vector
+without a DMA drain. No failure notification returns posted permits early.
 
-The [poller](qp-registry.md#closing-a-connection) owns normal removal and fatal
-shutdown. Shutdown closes all connection admission before releasing socket
-owners. A READ published after the shutdown sweep rechecks socket health
-before awaiting its batch and repeats failure notification; that notification
-leaves posted permits and memory held.
+Connection closure eagerly fails ordinary RPC waiters and records READ
+failure, closes admission, and wakes the poller. A READ published around the
+closure rechecks socket health before awaiting its batch. Normal teardown
+closes the posting gate, requests provider ERR, consumes the real READ and
+receive/ACK completion or flush CQEs, then explicitly destroys the QP.
+Successfully completed unsignaled SEND tails can remain owned until that
+destruction. The same drain runs during shutdown. A rejected ERR transition,
+failed CQ draining, teardown deadline expiry or poller panic aborts the process
+rather than fabricate completion evidence. See
+[connection closing](qp-registry.md#closing-a-connection) for the lifecycle.
 
-When the final socket owner drops, it captures the QP's actual outstanding
-READ count, destroys the QP, then returns those NIC permits. Unposted requests
-and already processed completions are excluded. External socket owners delay
-this recovery. A stopped CQ admits no new connections and cannot reuse its
-remaining reservations without an empty-poll proof.
+Owned RPC and remote-memory adapters may stop waiting at cleanup-grace expiry
+and return without buffers. The QP ledger or supervised target-restoration task
+continues holding posted allocations through settlement; abandoning the result
+does not return READ permits or allocations early. Borrowed calls and hidden
+storage bridges retain the strict recovery wait. See
+[call adapters](safe-boundaries.md#borrowed-and-owned-call-adapters) for the
+optional-buffer result and error semantics.
+
+The grace does not bound CQ draining, borrowed return latency, or a provider call
+or lock that itself never returns. An owned return with missing buffers also does
+not disable the fatal teardown policy. Moving to ERR, a timer firing, or an empty
+result channel cannot authorize memory reuse.
+Normal READ permits return through completion processing. The final socket-drop
+fallback still captures actual unpolled READs and returns their NIC permits
+only after provider destruction, excluding unposted work and previously
+processed completions. A stopped CQ admits no new connections and cannot reuse
+remaining reservations without the same retirement-snapshot/empty-poll proof.
 
 For destination ownership and the separate application source contract, see
 [safety boundaries](safe-boundaries.md#completion-and-destination-ownership)

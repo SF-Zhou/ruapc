@@ -6,7 +6,7 @@ use ruapc_bufpool::Buffer;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{MemoryError, MemoryErrorKind, MemoryResult, SpaceLayout};
+use crate::{BufferView, BufferViewMut, MemoryError, MemoryErrorKind, MemoryResult, SpaceLayout};
 
 /// Maximum number of operations in one copy batch.
 pub const MAX_COPY_OPS: usize = 1024;
@@ -130,7 +130,7 @@ impl<'a> CopyBatch<'a> {
     /// Destination offsets do not index the result. The actual source layout
     /// is constructed and checked before copying. For repeated copies from an
     /// owned buffer list, [`BufferSet::gather`] reuses its cached layout.
-    pub fn gather(&self, source: &[Buffer]) -> MemoryResult<Vec<u8>> {
+    pub fn gather<B: BufferView>(&self, source: &[B]) -> MemoryResult<Vec<u8>> {
         let layout = SpaceLayout::from_buffers(source)?;
         self.gather_from_layout(&layout, source)
     }
@@ -142,15 +142,23 @@ impl<'a> CopyBatch<'a> {
     /// all destination ranges and packed length are checked before any write.
     /// Destination gaps remain unchanged. [`BufferSet::scatter`] reuses a cached
     /// layout when the caller owns the buffers.
-    pub fn scatter(&self, packed: &[u8], destination: &mut [Buffer]) -> MemoryResult<()> {
+    pub fn scatter<B: BufferViewMut>(
+        &self,
+        packed: &[u8],
+        destination: &mut [B],
+    ) -> MemoryResult<()> {
         let layout = SpaceLayout::from_buffers(destination)?;
         self.scatter_into_layout(&layout, packed, destination)
     }
 
-    // Only layouts derived from these actual buffers, or owned beside them in
-    // BufferSet, reach these private helpers. No public API accepts a caller's
+    // Only layouts derived from these actual buffers, or held beside them in
+    // BufferSet / BorrowedSource, reach these helpers. No public API accepts a caller's
     // promise that a separate layout matches mutable buffers.
-    fn gather_from_layout(&self, layout: &SpaceLayout, source: &[Buffer]) -> MemoryResult<Vec<u8>> {
+    pub(crate) fn gather_from_layout<B: BufferView>(
+        &self,
+        layout: &SpaceLayout,
+        source: &[B],
+    ) -> MemoryResult<Vec<u8>> {
         self.check_source(layout.total())?;
         let mut packed = Vec::with_capacity(usize::try_from(self.byte_count)?);
         for op in self.ops {
@@ -160,7 +168,7 @@ impl<'a> CopyBatch<'a> {
                     op.len,
                     |segment, offset, len| {
                         let (offset, len) = (offset as usize, len as usize);
-                        packed.extend_from_slice(&source[segment][offset..offset + len]);
+                        packed.extend_from_slice(&source[segment].as_slice()[offset..offset + len]);
                         Ok(())
                     },
                 )
@@ -169,11 +177,11 @@ impl<'a> CopyBatch<'a> {
         Ok(packed)
     }
 
-    fn scatter_into_layout(
+    fn scatter_into_layout<B: BufferViewMut>(
         &self,
         layout: &SpaceLayout,
         packed: &[u8],
-        destination: &mut [Buffer],
+        destination: &mut [B],
     ) -> MemoryResult<()> {
         self.check_destination(layout.total())?;
         if packed.len() as u64 != self.byte_count {
@@ -196,7 +204,7 @@ impl<'a> CopyBatch<'a> {
                         // Both the destination and packed slice bounds were checked
                         // for the whole batch before the first write.
                         let (offset, len) = (offset as usize, len as usize);
-                        destination[segment][offset..offset + len]
+                        destination[segment].as_mut_slice()[offset..offset + len]
                             .copy_from_slice(&packed[cursor..cursor + len]);
                         cursor += len;
                         Ok(())
@@ -208,7 +216,7 @@ impl<'a> CopyBatch<'a> {
     }
 }
 
-/// Owned buffers with a logical layout derived and checked at construction.
+/// Owned buffers or transport views with a checked, cached logical layout.
 ///
 /// Shared access exposes immutable buffers. CPU writes go through checked batch
 /// operations, which cannot change buffer lengths. Recovering mutable buffer
@@ -221,14 +229,14 @@ impl<'a> CopyBatch<'a> {
 /// }
 /// ```
 #[derive(Debug)]
-pub struct BufferSet {
-    buffers: Vec<Buffer>,
+pub struct BufferSet<B = Buffer> {
+    buffers: Vec<B>,
     layout: SpaceLayout,
 }
 
-impl BufferSet {
+impl<B: BufferView> BufferSet<B> {
     /// Checks the buffers' logical layout, preserving all buffers on failure.
-    pub fn try_new(buffers: Vec<Buffer>) -> Result<Self, BufferSetError> {
+    pub fn try_new(buffers: Vec<B>) -> Result<Self, BufferSetError<B>> {
         match SpaceLayout::from_buffers(&buffers) {
             Ok(layout) => Ok(Self { buffers, layout }),
             Err(error) => Err(BufferSetError { error, buffers }),
@@ -243,13 +251,13 @@ impl BufferSet {
 
     /// Returns an immutable view of the owned buffers.
     #[must_use]
-    pub fn buffers(&self) -> &[Buffer] {
+    pub fn buffers(&self) -> &[B] {
         &self.buffers
     }
 
     /// Consumes the set and recovers ownership of all buffers.
     #[must_use]
-    pub fn into_buffers(self) -> Vec<Buffer> {
+    pub fn into_buffers(self) -> Vec<B> {
         self.buffers
     }
 
@@ -257,7 +265,9 @@ impl BufferSet {
     pub fn gather(&self, batch: &CopyBatch<'_>) -> MemoryResult<Vec<u8>> {
         batch.gather_from_layout(&self.layout, &self.buffers)
     }
+}
 
+impl<B: BufferViewMut> BufferSet<B> {
     /// Scatters a batch while reusing the checked layout.
     pub fn scatter(&mut self, batch: &CopyBatch<'_>, packed: &[u8]) -> MemoryResult<()> {
         batch.scatter_into_layout(&self.layout, packed, &mut self.buffers)
@@ -266,33 +276,33 @@ impl BufferSet {
 
 /// A buffer-set construction failure retaining the original owned buffers.
 #[derive(Debug)]
-pub struct BufferSetError {
+pub struct BufferSetError<B = Buffer> {
     /// The layout validation failure.
     pub error: MemoryError,
-    buffers: Vec<Buffer>,
+    buffers: Vec<B>,
 }
 
-impl BufferSetError {
+impl<B> BufferSetError<B> {
     /// Borrows the buffers that could not form a valid set.
     #[must_use]
-    pub fn buffers(&self) -> &[Buffer] {
+    pub fn buffers(&self) -> &[B] {
         &self.buffers
     }
 
     /// Returns the validation error and every original buffer in original order.
     #[must_use]
-    pub fn into_parts(self) -> (MemoryError, Vec<Buffer>) {
+    pub fn into_parts(self) -> (MemoryError, Vec<B>) {
         (self.error, self.buffers)
     }
 }
 
-impl std::fmt::Display for BufferSetError {
+impl<B> std::fmt::Display for BufferSetError<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.error.fmt(f)
     }
 }
 
-impl std::error::Error for BufferSetError {}
+impl<B: std::fmt::Debug> std::error::Error for BufferSetError<B> {}
 
 fn validate_structure(ops: &[CopyOp]) -> MemoryResult<(u64, u64, u64)> {
     if ops.len() > MAX_COPY_OPS {

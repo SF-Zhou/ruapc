@@ -1,3 +1,4 @@
+use std::slice;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,15 +32,15 @@ trait WriteTestService {
     /// Typed contract: the handler transfers `req.data` into the client's
     /// pinned write buffers via `remote_write_all` and replies with the
     /// number of bytes written; the client receives all its buffers back
-    /// through `BufferReply`.
-    async fn push_data(&self, ctx: &Context, req: &WriteReq) -> ResultBufferReply<u64>;
+    /// through the enclosing owned call.
+    async fn push_data(&self, ctx: &Context, req: &WriteReq) -> Result<u64>;
 
     /// Writes `req.data` in two vectored ops with the halves swapped in
     /// the destination space, from two server-local source buffers.
-    async fn push_swapped(&self, ctx: &Context, req: &WriteReq) -> ResultBufferReply<u64>;
+    async fn push_swapped(&self, ctx: &Context, req: &WriteReq) -> Result<u64>;
 
     /// Fulfills the buffer contract without transferring anything.
-    async fn push_empty(&self, ctx: &Context, req: &WriteReq) -> ResultBufferReply<u32>;
+    async fn push_empty(&self, ctx: &Context, req: &WriteReq) -> Result<u32>;
 
     /// Never touches buffers; used to simulate a mismatched peer.
     async fn push_nothing(&self, ctx: &Context, req: &WriteReq) -> Result<()>;
@@ -48,7 +49,7 @@ trait WriteTestService {
 struct WriteTestImpl;
 
 impl WriteTestService for WriteTestImpl {
-    async fn push_data(&self, ctx: &Context, req: &WriteReq) -> ResultBufferReply<u64> {
+    async fn push_data(&self, ctx: &Context, req: &WriteReq) -> Result<u64> {
         if req.delay_ms > 0 {
             tokio::time::sleep(Duration::from_millis(req.delay_ms)).await;
         }
@@ -56,11 +57,11 @@ impl WriteTestService for WriteTestImpl {
         local[..req.data.len()].copy_from_slice(&req.data);
         local.set_len(req.data.len());
         // Transfer first; the response is decided afterwards.
-        let sent = ctx.remote_write_all(vec![local]).await?;
-        Ok(sent.into_reply(req.data.len() as u64))
+        ctx.remote_write_all(slice::from_ref(&local)).await?;
+        Ok(req.data.len() as u64)
     }
 
-    async fn push_swapped(&self, ctx: &Context, req: &WriteReq) -> ResultBufferReply<u64> {
+    async fn push_swapped(&self, ctx: &Context, req: &WriteReq) -> Result<u64> {
         let total = req.data.len() as u64;
         let half = total / 2;
         // Source space: two server-local buffers split at an odd boundary.
@@ -82,14 +83,14 @@ impl WriteTestService for WriteTestImpl {
             CopyOp::new(0, total - half, half),
             CopyOp::new(half, 0, total - half),
         ];
-        let sent = ctx.remote_write(&ops, vec![a, b]).await?;
-        Ok(sent.into_reply(total))
+        let local = [a, b];
+        ctx.remote_write(&ops, &local).await?;
+        Ok(total)
     }
 
-    async fn push_empty(&self, ctx: &Context, _req: &WriteReq) -> ResultBufferReply<u32> {
-        // Nothing to transfer: the explicit no-op witness fulfills the
-        // contract without touching the network.
-        Ok(ctx.sent_nothing().into_reply(42))
+    async fn push_empty(&self, _ctx: &Context, _req: &WriteReq) -> Result<u32> {
+        // A normal response needs no transfer-specific witness.
+        Ok(42)
     }
 
     async fn push_nothing(&self, _ctx: &Context, _req: &WriteReq) -> Result<()> {
@@ -97,21 +98,8 @@ impl WriteTestService for WriteTestImpl {
     }
 }
 
-/// A client-side trait with the same wire identity ("WriteTestService") but
-/// declaring `push_nothing` as `ResultBufferReply`, simulating a mismatched
-/// peer whose handler never writes.
-mod mismatched {
-    use super::*;
-
-    #[service]
-    pub trait WriteTestService {
-        async fn push_nothing(&self, ctx: &Context, req: &WriteReq) -> ResultBufferReply<()>;
-    }
-}
-
 // --------------------------------------------------------------------------
-// Custom alias + custom error type: the buffer contract is recognized by
-// the type system, not by name, so user-defined aliases work.
+// Custom aliases and custom error types are unchanged by buffer attachments.
 // --------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -138,7 +126,7 @@ impl From<Error> for MyError {
 }
 
 /// A fully user-defined alias: custom name, custom error type.
-type MyFetchResult = std::result::Result<BufferReply<u64>, MyError>;
+type MyFetchResult = std::result::Result<u64, MyError>;
 
 #[service]
 trait AliasService {
@@ -157,11 +145,10 @@ impl AliasService for AliasImpl {
         buf[..req.data.len()].copy_from_slice(&req.data);
         buf.set_len(req.data.len());
         let pushed = buf.len() as u64;
-        let sent = ctx
-            .remote_write_all(vec![buf])
+        ctx.remote_write_all(slice::from_ref(&buf))
             .await
-            .map_err(|e| MyError::from(Error::from(e)))?;
-        Ok(sent.into_reply(pushed))
+            .map_err(MyError::from)?;
+        Ok(pushed)
     }
 }
 
@@ -226,8 +213,7 @@ async fn run_test(tc: TestCase) {
         delay_ms: tc.delay_ms,
     };
 
-    // Pre-provide the destination buffers; ownership moves into the call
-    // and every buffer comes back through the `BufferReply` result.
+    // Pre-provide owned destinations returned on both success and error.
     assert!(tc.write_splits.iter().sum::<usize>() >= tc.data.len());
     let mut write_bufs = Vec::new();
     for &split in tc.write_splits {
@@ -236,29 +222,31 @@ async fn run_test(tc: TestCase) {
         write_bufs.push(buf);
     }
 
-    let c = client.with_write_buffers(write_bufs);
-    let result: Result<BufferReply<u64>> = match tc.method {
-        Method::PushData => c.push_data(&ctx, &req).await,
-        Method::PushSwapped => c.push_swapped(&ctx, &req).await,
-    };
-
+    let Completed { result, buffers } = client
+        .with_buffers(&[], write_bufs)
+        .run(async |c| match tc.method {
+            Method::PushData => c.push_data(&ctx, &req).await,
+            Method::PushSwapped => c.push_swapped(&ctx, &req).await,
+        })
+        .await;
+    let write_bufs = buffers.unwrap();
     match tc.expect {
         Expected::Ok => {
-            let (written, buffers) = result.unwrap().into_parts();
-            let buffers = buffers.into_available().expect("destinations available");
+            let written = result.unwrap();
+            let buffers = &write_bufs;
             assert_eq!(written, tc.data.len() as u64);
             assert_eq!(buffers.len(), tc.write_splits.len());
-            let space = flatten(&buffers);
+            let space = flatten(buffers);
             assert_eq!(&space[..tc.data.len()], tc.data);
         }
         Expected::OkSwapped => {
-            let (written, buffers) = result.unwrap().into_parts();
-            let buffers = buffers.into_available().expect("destinations available");
+            let written = result.unwrap();
+            let buffers = &write_bufs;
             assert_eq!(written, tc.data.len() as u64);
             let half = tc.data.len() / 2;
             let mut swapped = tc.data[half..].to_vec();
             swapped.extend_from_slice(&tc.data[..half]);
-            let space = flatten(&buffers);
+            let space = flatten(buffers);
             assert_eq!(&space[..tc.data.len()], &swapped[..]);
         }
         Expected::Err(expected_kind) => {
@@ -416,8 +404,7 @@ async fn setup(scheme: &str) -> (Arc<Server>, Context) {
     (server, ctx)
 }
 
-/// A handler branch with no payload uses `sent_nothing()`: no transfer
-/// takes place, and the client's buffers come back untouched.
+/// A handler may return without a transfer, leaving destinations untouched.
 #[tokio::test]
 async fn test_tcp_reply_without_transfer() {
     run_empty_test("tcp").await;
@@ -441,30 +428,23 @@ async fn run_empty_test(scheme: &str) {
     let mut buf = ctx.state.buffer_pool.allocate(64 * 1024).unwrap();
     buf[..4].copy_from_slice(b"keep");
     buf.set_len(4);
-    let (rsp, buffers) = client
-        .with_write_buffers(vec![buf])
-        .push_empty(&ctx, &req)
-        .await
-        .unwrap()
-        .into_parts();
-    let buffers = buffers.into_available().expect("destinations available");
-    assert_eq!(rsp, 42);
-    assert_eq!(buffers.len(), 1);
-    assert_eq!(&buffers[0][..], b"keep");
+    let completed = client
+        .with_buffers(&[], vec![buf])
+        .run(async |c| c.push_empty(&ctx, &req).await)
+        .await;
+    assert_eq!(completed.result.unwrap(), 42);
+    assert_eq!(&completed.buffers.unwrap()[0][..], b"keep");
 
-    // Without write buffers: no attachment, distinct from an attached empty set.
-    let (rsp, buffers) = client.push_empty(&ctx, &req).await.unwrap().into_parts();
-    assert_eq!(rsp, 42);
-    assert!(matches!(buffers, BufferAvailability::NotAttached));
-
-    let (rsp, buffers) = client
-        .with_write_buffers(Vec::new())
-        .push_empty(&ctx, &req)
-        .await
-        .unwrap()
-        .into_parts();
-    assert_eq!(rsp, 42);
-    assert!(matches!(buffers, BufferAvailability::Available(ref buffers) if buffers.is_empty()));
+    assert_eq!(client.push_empty(&ctx, &req).await.unwrap(), 42);
+    assert_eq!(
+        client
+            .with_buffers(&[], vec![])
+            .run(async |c| c.push_empty(&ctx, &req).await)
+            .await
+            .result
+            .unwrap(),
+        42
+    );
 
     server.stop();
     server.join().await;
@@ -498,15 +478,16 @@ async fn test_tcp_write_space_too_small_fails() {
     };
     let mut buf = ctx.state.buffer_pool.allocate(64 * 1024).unwrap();
     buf.set_len(16); // space smaller than the payload
-    let wrapper = client.with_write_buffers(vec![buf]);
-    let err = wrapper.push_data(&ctx, &req).await.unwrap_err();
-    assert_eq!(err.kind, ErrorKind::InvalidCopyOp);
-    // The attached buffers are recoverable after the failed call.
-    let recovered = wrapper
-        .take_write_buffers()
-        .into_available()
-        .expect("buffers recoverable");
-    assert_eq!(recovered.len(), 1);
+    let pointer = buf.as_ptr();
+    let completed = client
+        .with_buffers(&[], vec![buf])
+        .run(async |c| c.push_data(&ctx, &req).await)
+        .await;
+    assert_eq!(completed.result.unwrap_err().kind, ErrorKind::InvalidCopyOp);
+    let buf = &completed.buffers.unwrap()[0];
+    assert_eq!(buf.as_ptr(), pointer);
+    assert_eq!(buf.len(), 16);
+    let _ = buf.as_slice();
     server.stop();
     server.join().await;
 }
@@ -524,20 +505,21 @@ async fn test_tcp_no_write_returns_buffers_untouched() {
 
     let mut buf = ctx.state.buffer_pool.allocate(64 * 1024).unwrap();
     buf.set_len(8);
-    let wrapper = client.with_write_buffers(vec![buf]);
-    let ((), buffers) = mismatched::WriteTestService::push_nothing(&wrapper, &ctx, &req)
-        .await
-        .unwrap()
-        .into_parts();
-    let buffers = buffers.into_available().expect("destinations available");
-    assert_eq!(buffers.len(), 1);
-
+    buf.copy_from_slice(b"retained");
+    let pointer = buf.as_ptr();
+    let completed = client
+        .with_buffers(&[], vec![buf])
+        .run(async |c| c.push_nothing(&ctx, &req).await)
+        .await;
+    completed.result.unwrap();
+    let buf = &completed.buffers.unwrap()[0];
+    assert_eq!(buf.as_ptr(), pointer);
+    assert_eq!(&buf[..], b"retained");
     server.stop();
     server.join().await;
 }
 
-/// The buffer contract works through user-defined aliases and custom error
-/// types: recognition is by type identity, not by name.
+/// Buffer attachments preserve user-defined aliases and custom error types.
 #[tokio::test]
 async fn test_custom_alias_and_error_type() {
     let (server, ctx) = setup("tcp").await;
@@ -549,15 +531,14 @@ async fn test_custom_alias_and_error_type() {
 
     let mut buf = ctx.state.buffer_pool.allocate(64 * 1024).unwrap();
     buf.set_len(req.data.len());
-    let (len, buffers) = client
-        .with_write_buffers(vec![buf])
-        .fetch(&ctx, &req)
-        .await
-        .unwrap()
-        .into_parts();
-    let buffers = buffers.into_available().expect("destinations available");
+    let completed = client
+        .with_buffers(&[], vec![buf])
+        .run(async |c| c.fetch(&ctx, &req).await)
+        .await;
+    let len = completed.result.unwrap();
+    let buf = &completed.buffers.unwrap()[0];
     assert_eq!(len, req.data.len() as u64);
-    assert_eq!(&flatten(&buffers)[..], &req.data[..]);
+    assert_eq!(&buf[..], &req.data[..]);
 
     server.stop();
     server.join().await;
@@ -583,14 +564,14 @@ struct EchoReq {}
 trait EchoBufService {
     /// Reads the client's read space and writes it back (reversed) into
     /// the client's write space.
-    async fn echo_reversed(&self, ctx: &Context, req: &EchoReq) -> ResultBufferReply<u64>;
+    async fn echo_reversed(&self, ctx: &Context, req: &EchoReq) -> Result<u64>;
 }
 
 struct EchoBufImpl;
 
 impl EchoBufService for EchoBufImpl {
-    async fn echo_reversed(&self, ctx: &Context, _req: &EchoReq) -> ResultBufferReply<u64> {
-        let local = ctx.remote_read_all().await?;
+    async fn echo_reversed(&self, ctx: &Context, _req: &EchoReq) -> Result<u64> {
+        let local = ctx.remote_read_allocated().await?;
         let mut data = flatten(&local);
         drop(local);
         data.reverse();
@@ -601,8 +582,8 @@ impl EchoBufService for EchoBufImpl {
             .map_err(|e| Error::new(ErrorKind::InvalidArgument, e.to_string()))?;
         out[..data.len()].copy_from_slice(&data);
         out.set_len(data.len());
-        let sent = ctx.remote_write_all(vec![out]).await?;
-        Ok(sent.into_reply(data.len() as u64))
+        ctx.remote_write_all(slice::from_ref(&out)).await?;
+        Ok(data.len() as u64)
     }
 }
 
@@ -628,19 +609,18 @@ async fn run_roundtrip_test(scheme: &str) {
     let mut dst = ctx.state.buffer_pool.allocate(64 * 1024).unwrap();
     dst.set_len(payload.len());
 
-    let (written, buffers) = client
-        .with_read_buffer(src)
-        .unwrap()
-        .with_write_buffers(vec![dst])
-        .echo_reversed(&ctx, &EchoReq {})
-        .await
-        .unwrap()
-        .into_parts();
-    let buffers = buffers.into_available().expect("destinations available");
+    let completed = client
+        .with_buffers(slice::from_ref(&src), vec![dst])
+        .run(async |c| c.echo_reversed(&ctx, &EchoReq {}).await)
+        .await;
+    let written = completed.result.unwrap();
+    let buffers = completed.buffers.unwrap();
+    let dst = &buffers[0];
     assert_eq!(written, payload.len() as u64);
     let mut expected = payload.to_vec();
     expected.reverse();
-    assert_eq!(&flatten(&buffers)[..], &expected[..]);
+    assert_eq!(&dst[..], &expected[..]);
+    assert_eq!(&src[..], payload);
 
     server.stop();
     server.join().await;

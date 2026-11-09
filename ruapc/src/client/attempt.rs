@@ -5,10 +5,11 @@
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use ruapc_bufpool::RemoteBufferInfo;
+use ruapc_memory::BufferView;
 use thin_vec::ThinVec;
 
 use crate::{
-    Buffer, Endpoint, Socket, State,
+    Endpoint, Socket, State,
     error::{Error, ErrorKind},
     remote_memory::WriteTarget,
     sockets::AcquireOptions,
@@ -204,9 +205,9 @@ pub(super) async fn acquire_for_attempt(
 
 /// Exports attachments for the selected transport. Invalid RDMA registrations
 /// are terminal for this call; stream transports need only logical lengths.
-pub(super) fn export_attached_regions(
+pub(super) fn export_attached_regions<B: BufferView>(
     socket: &Socket,
-    read_buffers: &[Buffer],
+    read_buffers: &[B],
     write_target: Option<&Arc<WriteTarget>>,
 ) -> std::result::Result<(ThinVec<RemoteBufferInfo>, ThinVec<RemoteBufferInfo>), AttemptFailure> {
     let read_regions = socket.export_regions(read_buffers)?;

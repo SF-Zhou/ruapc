@@ -9,7 +9,7 @@ use ruapc::{Client, ListenMode, SocketPoolConfig};
 
 const CLIENT_TIMEOUT: Duration = Duration::from_millis(200);
 
-// A wire-only test proxy: the built-in request-status operation is
+// A wire-only test proxy: the built-in source-validation operation is
 // not part of RuaPC's public Rust API.
 #[derive(Serialize, Deserialize, JsonSchema)]
 struct RequestStatusRequest {
@@ -84,14 +84,21 @@ async fn test_verify_message_id() {
             timeout: CLIENT_TIMEOUT,
             ..Default::default()
         };
+        let mut source = ctx.state.buffer_pool.allocate(8).unwrap();
+        source.set_len(8);
+        source.fill(0x5a);
         client
-            .hello(&ctx, &Duration::from_millis(10))
+            .with_buffers(std::slice::from_ref(&source), Vec::new())
+            .run(async |rpc| rpc.hello(&ctx, &Duration::from_millis(10)).await)
             .await
+            .result
             .unwrap();
 
         client
-            .hello(&ctx, &Duration::from_millis(250))
+            .with_buffers(std::slice::from_ref(&source), Vec::new())
+            .run(async |rpc| rpc.hello(&ctx, &Duration::from_millis(250)).await)
             .await
+            .result
             .unwrap_err();
 
         drop(server);

@@ -125,7 +125,8 @@ create one. With physical RDMA hardware, omit that environment variable.
 - Documentation changes belong in the [owning guide](docs/README.md#maintaining-the-docs).
   Keep examples, links and public API descriptions consistent with the code.
 
-Release tags publish bufpool, memory, macro, schema, RDMA, wire and core in
+Release tags publish bufpool, memory, macro, schema, RDMA, wire, core and the
+unsafe borrowing facade in
 dependency order through [the release workflow](.github/workflows/release.yml).
 The demo is not published.
 

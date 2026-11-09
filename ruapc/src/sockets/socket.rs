@@ -4,9 +4,9 @@ use ruapc_bufpool::RemoteBufferInfo;
 use serde::Serialize;
 use thin_vec::ThinVec;
 
-use crate::{Buffer, MsgMeta, Result, State, http::HttpSocket, tcp::TcpSocket, ws::WebSocket};
 #[cfg(feature = "rdma")]
 use crate::{Error, ErrorKind, rdma::RdmaSocket};
+use crate::{MsgMeta, Result, State, http::HttpSocket, tcp::TcpSocket, ws::WebSocket};
 
 /// Socket abstraction supporting multiple transport protocols.
 ///
@@ -72,7 +72,10 @@ impl Socket {
     /// Exports attachment lengths for streams, or registered addresses and keys
     /// for the RDMA connection's local NIC. Stream copies resolve owned buffers
     /// through the request waiter and never use addresses or registration keys.
-    pub(crate) fn export_regions(&self, buffers: &[Buffer]) -> Result<ThinVec<RemoteBufferInfo>> {
+    pub(crate) fn export_regions<B: ruapc_memory::BufferView>(
+        &self,
+        buffers: &[B],
+    ) -> Result<ThinVec<RemoteBufferInfo>> {
         match self {
             Socket::TCP(_) | Socket::WS(_) | Socket::HTTP(_) => Ok(buffers
                 .iter()

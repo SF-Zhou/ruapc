@@ -1,30 +1,21 @@
 //! Reverse-RPC requests, handlers and transport execution for remote memory.
 
-#[cfg(feature = "rdma")]
-use std::sync::Arc;
-
-#[cfg(feature = "rdma")]
-use ruapc_memory::ReadSource;
+use ruapc_bufpool::WriteBuffer;
 use ruapc_memory::{CopyBatch, RemoteSpace};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::{
-    BufferAvailability,
-    transfer::{PreparedRead, PreparedWrite},
-};
+use super::transfer::{PreparedRead, TransferCompletion};
 #[cfg(feature = "rdma")]
-use crate::Socket;
-use crate::{
-    Buffer, Client, Context, CopyOp, Error, ErrorKind, RemoteIoError, Result, core::ContextEndpoint,
-};
+use crate::{Buffer, Socket, client::ReadAttachment};
+use crate::{Client, Completed, Context, CopyOp, Error, ErrorKind, Result, core::ContextEndpoint};
 
 /// Request to read byte ranges of the client's read space (TCP/WS/HTTP
 /// fallback of `Context::remote_read`).
 ///
-/// The request ID selects this side's owned source buffers. The peer supplies
-/// logical offsets only; a local reader keeps the source alive through copying,
-/// even if the original request is cancelled at the same time.
+/// The request ID selects the original borrowing future's mailbox. The peer
+/// supplies logical offsets only; that future copies the bytes synchronously
+/// while its Rust source borrow is valid.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub(crate) struct ReadInlineRequest {
     /// The validated op batch; response bytes are the op payloads
@@ -99,8 +90,8 @@ pub(crate) struct RequestStatusRequest {
 /// source-request waiter probes.
 #[ruapc_macro::service]
 pub(crate) trait MemoryService {
-    /// Reads the original request's owned source (TCP/WS/HTTP fallback).
-    /// A local `Arc` retains the source throughout the CPU copy.
+    /// Asks the original borrowing future to copy source bytes (stream fallback).
+    /// The handler receives owned bytes and never obtains a source reference.
     async fn read_inline(
         &self,
         ctx: &Context,
@@ -117,10 +108,11 @@ pub(crate) trait MemoryService {
     /// this operation does not perform a `request_is_pending` postcheck.
     async fn read_into_target(&self, ctx: &Context, req: &ReadIntoTargetRequest) -> Result<()>;
 
-    /// Reports whether the original request remains in this peer's waiter table.
+    /// Confirms that the original source's waiter is still present.
     ///
-    /// This checks membership, not the deadline clock. [`Context::remote_read`]
-    /// defines how a positive post-READ reply validates the copied bytes.
+    /// Safe sources ask their borrowing future; caller-validated sources check
+    /// membership directly. A missing source returns false. Neither path checks
+    /// the original deadline clock; the probe's deadline bounds reply waiting.
     async fn request_is_pending(&self, ctx: &Context, req: &RequestStatusRequest) -> Result<bool>;
 }
 
@@ -140,8 +132,7 @@ impl MemoryService for () {
                     "read_inline: original request is gone or has no read buffers".into(),
                 )
             })?;
-        let batch = CopyBatch::new(&req.ops)?;
-        let bytes = source.gather(&batch)?;
+        let bytes = source.gather(&req.ops, ctx.deadline).await?;
         Ok(ReadInlineResponse { bytes })
     }
 
@@ -209,76 +200,66 @@ impl MemoryService for () {
     }
 
     async fn request_is_pending(&self, ctx: &Context, req: &RequestStatusRequest) -> Result<bool> {
-        Ok(ctx.state.waiter.contains_message_id(req.request_id))
+        let Some(source) = ctx.state.waiter.read_source(req.request_id) else {
+            return Ok(false);
+        };
+        source
+            .validate(&ctx.state.waiter, req.request_id, ctx.deadline)
+            .await
     }
 }
 
-/// Consumes a prepared stream read and recovers its local destinations.
-pub(crate) async fn read(
-    prepared: PreparedRead<'_, '_>,
-) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
-    let transfer = prepared.into_parts();
+/// Copies through the same owned-or-borrowed destination storage.
+pub(crate) async fn read(transfer: PreparedRead<'_, '_>) -> TransferCompletion<WriteBuffer> {
     let mut local = transfer.local;
     let request = ReadInlineRequest {
         ops: transfer.ops.ops().to_vec(),
         request_id: transfer.ctx.msg_meta.msgid,
     };
-    let client = Client::default();
-    let response = match client.read_inline(transfer.ctx, &request).await {
-        Ok(response) => response,
-        Err(error) => return Err(RemoteIoError::new(error, Some(local.into_buffers()))),
-    };
-    if let Err(error) = local.scatter(&transfer.ops, &response.bytes) {
-        return Err(RemoteIoError::new(error.into(), Some(local.into_buffers())));
+    let result = async {
+        let response = Client::default()
+            .read_inline(transfer.ctx, &request)
+            .await?;
+        Ok(local.scatter(&transfer.ops, &response.bytes)?)
     }
-    Ok(local.into_buffers())
+    .await;
+    Completed {
+        result,
+        buffers: Some(local.into_buffers()),
+    }
 }
 
-/// Consumes a prepared stream write; a successful reply follows its CPU copy.
-pub(crate) async fn write(
-    prepared: PreparedWrite<'_, '_>,
-) -> std::result::Result<BufferAvailability, RemoteIoError> {
-    let transfer = prepared.into_parts();
-    let local = transfer.local;
-    let bytes = match local.gather(&transfer.ops) {
-        Ok(bytes) => bytes,
-        Err(error) => return Err(RemoteIoError::new(error.into(), Some(local.into_buffers()))),
-    };
+pub(crate) async fn write(ctx: &Context, batch: CopyBatch<'_>, bytes: Vec<u8>) -> Result<()> {
     let request = WriteInlineRequest {
-        ops: transfer.ops.ops().to_vec(),
-        request_id: transfer.ctx.msg_meta.msgid,
+        ops: batch.ops().to_vec(),
+        request_id: ctx.msg_meta.msgid,
         bytes,
     };
-    let client = Client::default();
-    match client.write_inline(transfer.ctx, &request).await {
-        Ok(()) => Ok(BufferAvailability::Available(local.into_buffers())),
-        Err(error) => Err(RemoteIoError::new(error, Some(local.into_buffers()))),
-    }
+    Client::default().write_inline(ctx, &request).await
 }
 
-/// Asks the peer to READ the prepared source into its attached write target.
 #[cfg(feature = "rdma")]
 pub(crate) async fn write_via_read(
-    prepared: PreparedWrite<'_, '_>,
-) -> std::result::Result<BufferAvailability, RemoteIoError> {
-    let transfer = prepared.into_parts();
+    ctx: &Context,
+    batch: CopyBatch<'_>,
+    source: &[Buffer],
+) -> Result<()> {
     let request = ReadIntoTargetRequest {
-        request_id: transfer.ctx.msg_meta.msgid,
-        ops: transfer.ops.ops().to_vec(),
+        request_id: ctx.msg_meta.msgid,
+        ops: batch.ops().to_vec(),
     };
-    // Retain the source until the reverse RPC replies after the peer's READs.
-    // Error recovery proves local uniqueness, not remote completion; see
-    // Context::remote_write for the source reuse and result-validity contract.
-    let client = Client::default();
-    let mut source = client
-        .with_read_source(Arc::new(ReadSource::from(transfer.local)))
-        .with_read_charge_bytes(transfer.ops.byte_count());
-    let result = source.read_into_target(transfer.ctx, &request).await;
-    let buffers = source.take_read_buffers();
-    match result {
-        Ok(()) => Ok(buffers),
-        Err(error) => Err(RemoteIoError::new(error, buffers.into_available())),
-    }
+    // The request exports metadata while this future holds the real reference.
+    // Its waiter never receives a source that another local task could read.
+    // A normal successful response acknowledges the peer's completed READ.
+    Client::default()
+        .ruapc_request::<_, (), Error>(
+            ctx,
+            &request,
+            ReadAttachment::remote_source(source, batch.byte_count()),
+            None,
+            "MemoryService/read_into_target",
+        )
+        .await
 }
 
 #[cfg(test)]
@@ -369,10 +350,11 @@ mod tests {
         assert_eq!(err.kind, ErrorKind::Timeout);
 
         // Pin a 8-byte write target on a pending request.
-        let (msgid, _rx) = ctx.state.waiter.alloc(Duration::from_secs(5));
+        let (msgid, rx) = ctx.state.waiter.alloc(Duration::from_secs(5));
         let mut buf = ctx.state.buffer_pool.allocate(64 * 1024).unwrap();
         buf.set_len(8);
-        let target = WriteTarget::new(BufferSet::try_new(vec![buf]).unwrap());
+        let pointer = buf.as_ptr();
+        let target = WriteTarget::from_owned(BufferSet::try_new(vec![buf]).unwrap());
         ctx.state.waiter.bind_write_target(msgid, target);
 
         // Length mismatch between ops and data.
@@ -401,9 +383,23 @@ mod tests {
         };
         ().write_inline(&ctx, &req).await.unwrap();
         let target = ctx.state.waiter.write_target(msgid).unwrap();
-        // The waiter entry still holds a clone, so unwrapping fails here —
-        // which is exactly the pinning behavior we want.
-        assert!(WriteTarget::try_into_buffers(target).is_none());
+        drop(rx);
+        // Recovery revokes old handles instead of requiring Arc uniqueness.
+        let buffers = WriteTarget::try_into_buffers(target.clone()).unwrap();
+        assert_eq!(buffers[0].as_ptr(), pointer);
+        assert_eq!(&buffers[0][2..6], b"data");
+        assert_eq!(
+            target.copy_in(2, b"late").unwrap_err().kind,
+            ErrorKind::BuffersInUse
+        );
+        assert_eq!(&buffers[0][2..6], b"data");
+        let originals = buffers
+            .into_iter()
+            .map(|buffer| buffer.into_owned().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(originals[0].as_ptr(), pointer);
+        assert_eq!(originals[0].len(), 8);
+        assert_eq!(&originals[0][2..6], b"data");
     }
 
     #[tokio::test]
@@ -435,7 +431,7 @@ mod tests {
 
             let mut buffer = ctx.state.buffer_pool.allocate(4).unwrap();
             buffer.set_len(4);
-            let target = WriteTarget::new(BufferSet::try_new(vec![buffer]).unwrap());
+            let target = WriteTarget::from_owned(BufferSet::try_new(vec![buffer]).unwrap());
             ctx.state.waiter.bind_write_target(request_id, target);
             assert_eq!(
                 ().read_into_target(&ctx, &request).await.unwrap_err().kind,
@@ -464,8 +460,23 @@ mod tests {
         let missing = RequestStatusRequest { request_id: 9999 };
         assert!(!().request_is_pending(&ctx, &missing).await.unwrap());
 
-        let (request_id, _rx) = ctx.state.waiter.alloc(Duration::from_secs(1));
+        let (request_id, rx) = ctx.state.waiter.alloc(Duration::from_secs(1));
         let pending = RequestStatusRequest { request_id };
-        assert!(().request_is_pending(&ctx, &pending).await.unwrap());
+        assert!(!().request_is_pending(&ctx, &pending).await.unwrap());
+
+        let mut buffer = ctx.state.buffer_pool.allocate(4).unwrap();
+        buffer.set_len(4);
+        let buffers = [buffer];
+        let source = ruapc_memory::BorrowedSource::new(&buffers).unwrap();
+        let (sender, mut requests) = crate::remote_memory::SourceSender::channel();
+        ctx.state.waiter.bind_read_source(request_id, sender);
+        let mut validation = Box::pin(().request_is_pending(&ctx, &pending));
+        assert!(futures_util::poll!(validation.as_mut()).is_pending());
+        requests
+            .serve_next(&source, &ctx.state.waiter, request_id)
+            .await;
+        assert!(validation.await.unwrap());
+        drop(rx);
+        assert!(!().request_is_pending(&ctx, &pending).await.unwrap());
     }
 }

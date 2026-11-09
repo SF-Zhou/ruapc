@@ -270,11 +270,14 @@ impl RdmaService for () {
             .allocate(PROBE_BYTES)
             .map_err(|error| Error::new(ErrorKind::InvalidArgument, error.to_string()))?;
         destination.set_len(PROBE_BYTES);
-        let destinations = ctx
-            .remote_read(&[CopyOp::new(0, 0, PROBE_BYTES as u64)], vec![destination])
-            .await?;
+        let completed = ctx
+            .own_buffers(vec![destination])
+            .remote_read(&[CopyOp::new(0, 0, PROBE_BYTES as u64)])
+            .await;
+        completed.result?;
+        let destination = &completed.buffers.as_ref().unwrap()[0];
         let mut read_bytes = [0; PROBE_BYTES];
-        read_bytes.copy_from_slice(&destinations[0]);
+        read_bytes.copy_from_slice(destination);
         Ok(ProbeReply {
             rpc_nonce: *nonce,
             read_nonce: u64::from_le_bytes(read_bytes),
@@ -363,7 +366,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_rdma_bootstrap_discover_returns_connectable_devices() {
-        let config = SocketPoolConfig::default();
+        let config = SocketPoolConfig {
+            rdma: Some(Default::default()),
+            ..Default::default()
+        };
         let ctx = Context::create(&config).expect("failed to create RDMA context");
         let result = ().discover(&ctx, &()).await;
         assert!(result.is_ok());

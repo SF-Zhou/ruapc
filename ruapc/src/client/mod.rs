@@ -1,16 +1,15 @@
 mod attempt;
+mod buffers;
+#[doc(hidden)]
+pub use buffers::BufferScope;
+pub use buffers::{Completed, OwnedBuffers};
 mod call;
 pub use call::{RawCall, ResponseContract};
 mod with_buffers;
 
 pub use with_buffers::ClientWithBuffers;
 
-#[cfg(feature = "rdma")]
-use crate::remote_memory::ReadSource;
-use crate::{Buffer, RemoteIoError};
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "rdma")]
-use std::sync::Arc;
 use std::time::Duration;
 
 mod request;
@@ -66,71 +65,6 @@ impl Default for Client {
             use_msgpack: true,
             max_retries: 2,
         }
-    }
-}
-
-impl Client {
-    #[cfg(feature = "rdma")]
-    pub(crate) fn with_read_source(&self, source: Arc<ReadSource>) -> ClientWithBuffers<'_> {
-        ClientWithBuffers::from_read_source(self, source)
-    }
-
-    /// Creates a [`ClientWithBuffers`] wrapper attaching one *read* buffer
-    /// to requests; see [`with_read_buffers`](Self::with_read_buffers).
-    pub fn with_read_buffer(&self, buffer: Buffer) -> Result<ClientWithBuffers<'_>, RemoteIoError> {
-        ClientWithBuffers::new(self).with_read_buffer(buffer)
-    }
-
-    /// Creates a [`ClientWithBuffers`] wrapper attaching *read* buffers to
-    /// requests.
-    ///
-    /// Each request advertises the buffers' logical lengths as one concatenated
-    /// read space for [`Context::remote_read`](crate::Context::remote_read).
-    /// Call [`Buffer::set_len`] after filling to expose exactly the valid bytes.
-    ///
-    /// The reusable wrapper, pending requests and local inline readers share
-    /// the immutable source. [`ClientWithBuffers::take_read_buffers`] recovers
-    /// it when locally unique; this does not prove remote DMA completion.
-    /// See [`Context::remote_read`](crate::Context::remote_read) for RDMA
-    /// validation and recovery limits.
-    /// Invalid attachments return their original buffers in [`RemoteIoError`].
-    ///
-    /// # Examples
-    ///
-    /// ```rust,ignore
-    /// let rsp = client.with_read_buffers(bufs)?.upload(&ctx, &req).await?;
-    /// ```
-    pub fn with_read_buffers(
-        &self,
-        buffers: Vec<Buffer>,
-    ) -> Result<ClientWithBuffers<'_>, RemoteIoError> {
-        ClientWithBuffers::new(self).with_read_buffers(buffers)
-    }
-
-    /// Creates a [`ClientWithBuffers`] wrapper attaching *write* buffers
-    /// to requests.
-    ///
-    /// The buffers form a logical write space for
-    /// [`Context::remote_write`](crate::Context::remote_write). Set each
-    /// buffer's logical length to its receivable size before attaching.
-    /// The next call consumes the set; in-flight RDMA retains destination
-    /// ownership even if that call times out or is cancelled.
-    ///
-    /// A `Result<BufferReply<T>, E>` response returns the buffers when the
-    /// target is available and uniquely held. After failure, recover any
-    /// available set with [`ClientWithBuffers::take_write_buffers`].
-    ///
-    /// # Examples
-    ///
-    /// ```rust,ignore
-    /// let (rsp, bufs) = client
-    ///     .with_write_buffers(vec![buf_a, buf_b])
-    ///     .download(&ctx, &req)
-    ///     .await?
-    ///     .into_parts();
-    /// ```
-    pub fn with_write_buffers(&self, buffers: Vec<Buffer>) -> ClientWithBuffers<'_> {
-        ClientWithBuffers::new(self).with_write_buffers(buffers)
     }
 }
 

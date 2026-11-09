@@ -229,7 +229,7 @@ impl RdmaSocketPool {
     /// Constructs an endpoint from a QueuePair and selected local port/GID.
     pub(super) fn build_endpoint(
         &self,
-        qp: &QueuePair,
+        qp: &super::super::poller::ReservedQueuePair,
         device: &RdmaDevice,
         port_num: u8,
         gid_index: u8,
@@ -298,7 +298,7 @@ impl RdmaSocketPool {
 
     pub(super) fn bring_qp_to_rts(
         &self,
-        qp: &QueuePair,
+        qp: &super::super::poller::ReservedQueuePair,
         local: &RdmaQpEndpoint,
         remote: &RdmaQpEndpoint,
         pkey_index: u16,
@@ -403,9 +403,11 @@ impl RdmaSocketPool {
                 send_window,
                 path,
                 read_timeout,
+                settle_grace: Duration::from_millis(self.config.remote_memory.settle_grace_ms),
                 read_permits,
                 bandwidth_limiter,
                 sq_read_cap: (config.qp.max_send_wr / 2).max(1),
+                supervisor: state.socket_pool.task_supervisor_handle(),
             },
         ));
 

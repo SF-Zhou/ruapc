@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use ruapc::{BufferReply, Client, ClientWithBuffers, Context, Error};
+use ruapc::{Client, ClientWithBuffers, Context, Error};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -23,7 +23,7 @@ impl std::fmt::Display for CustomError {
 
 impl std::error::Error for CustomError {}
 
-type AliasedReply = ruapc::ResultBufferReply<u32, CustomError>;
+type AliasedReply = Result<u32, CustomError>;
 type PlainReply = Result<u32, CustomError>;
 
 #[ruapc::service]
@@ -35,8 +35,8 @@ trait Download {
 struct Handler;
 
 impl Download for Handler {
-    async fn download(&self, ctx: &Context, _req: &()) -> AliasedReply {
-        Ok(ctx.sent_nothing().into_reply(7))
+    async fn download(&self, _ctx: &Context, _req: &()) -> AliasedReply {
+        Ok(7)
     }
 
     async fn plain(&self, _ctx: &Context, _req: &()) -> PlainReply {
@@ -70,7 +70,7 @@ async fn shared_contract(client: &Client, attached: &ClientWithBuffers<'_>, ctx:
     let _: AliasedReply = download(attached, ctx).await;
 
     // Direct and qualified client calls also keep the exact declared type.
-    let _: Result<BufferReply<u32>, CustomError> = client.download(ctx, &()).await;
+    let _: Result<u32, CustomError> = client.download(ctx, &()).await;
     let _: AliasedReply = Download::download(attached, ctx, &()).await;
     let _: PlainReply = client.plain(ctx, &()).await;
     let _: PlainReply = attached.plain(ctx, &()).await;

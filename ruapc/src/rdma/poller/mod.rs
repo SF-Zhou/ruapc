@@ -37,12 +37,16 @@ mod budget;
 mod conn;
 mod dispatch;
 mod flow;
+mod queue_pair;
+
+pub(crate) use queue_pair::ReservedQueuePair;
 
 use std::{
     collections::{HashMap, hash_map::Entry},
     io::{Read as _, Write as _},
     os::unix::io::AsRawFd as _,
     os::unix::net::UnixStream,
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -60,18 +64,36 @@ use dispatch::{DispatchBatch, Dispatcher, MAX_DISPATCH_BATCH};
 use super::RdmaSocket;
 use crate::{Buffer, Error, ErrorKind, Result, State, task::TaskSupervisorGuard};
 
+/// Failure policy only: expiry never authorizes returning DMA buffers.
+const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn abort_on_panic(operation: impl FnOnce()) {
+    // Keep the poll-loop owner outside this boundary. Unwinding must not drop
+    // its connection registry before deciding that completion authority is lost.
+    if let Err(_payload) = catch_unwind(AssertUnwindSafe(operation)) {
+        // The panic hook already reported the cause. Do not run arbitrary panic
+        // payload destructors or continue with potentially poisoned state.
+        std::process::abort();
+    }
+}
+
 /// Only the poll thread may move a registered QP to ERR: receive posting and
 /// the provider flush must not race. Initial receive publication uses the
 /// inbox mutex; established receives are posted by this thread alone.
 fn set_qp_error(socket: &RdmaSocket) {
+    socket.queue_pair.stop_posting();
     let mut attr = ruapc_rdma::ibv_qp_attr {
         qp_state: ruapc_rdma::ibv_qp_state::IBV_QPS_ERR,
         ..Default::default()
     };
     let mask = ruapc_rdma::ibv_qp_attr_mask::IBV_QP_STATE;
     if let Err(err) = socket.queue_pair.modify(&mut attr, mask.0 as _) {
-        tracing::warn!(conn_id = socket.conn_id, local_qp = socket.queue_pair.qp_num(), %err,
+        tracing::error!(conn_id = socket.conn_id, local_qp = socket.queue_pair.qp_num(), %err,
             "failed to move RDMA queue pair to ERR");
+        // Without the provider flush, completion-based recovery cannot proceed.
+        // Match failed CQ polling / provider destruction: fail-stop rather than
+        // hang forever or treat the attempted transition as completion evidence.
+        std::process::abort();
     }
 }
 
@@ -180,27 +202,9 @@ pub(crate) struct ConnReservation {
     waker: PollerWaker,
 }
 
-/// This wrapper preserves destruction order even on setup errors and when
-/// moved between the handshake and the socket. Do not split its fields.
-#[derive(Debug)]
-pub(crate) struct ReservedQueuePair {
-    qp: ruapc_rdma::QueuePair,
-    reservation: ConnReservation,
-}
-
-impl std::ops::Deref for ReservedQueuePair {
-    type Target = ruapc_rdma::QueuePair;
-    fn deref(&self) -> &Self::Target {
-        &self.qp
-    }
-}
-
 impl ConnReservation {
     pub(crate) fn bind(self, qp: ruapc_rdma::QueuePair) -> ReservedQueuePair {
-        ReservedQueuePair {
-            qp,
-            reservation: self,
-        }
+        ReservedQueuePair::new(qp, self)
     }
 }
 
@@ -374,9 +378,7 @@ impl DevicePoller {
         post_receives: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
         let qp = &conn.socket.queue_pair;
-        if !Arc::ptr_eq(&conn.socket.queue_pair.reservation.shared, &self.shared)
-            || !Arc::ptr_eq(qp.cq(), &self.cq)
-        {
+        if !conn.socket.queue_pair.belongs_to(&self.shared) || !Arc::ptr_eq(qp.cq(), &self.cq) {
             return Err(Error::new(
                 ErrorKind::InvalidArgument,
                 "connection and reservation must belong to this RDMA poller's CQ".into(),
@@ -466,12 +468,14 @@ impl PollLoop {
     const HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(100);
 
     fn run(mut self) {
-        if let Err(error) = self.run_until_shutdown() {
-            tracing::error!(%error, "stopping RDMA poll thread");
-        }
-        // Every exit, including provider errors, closes registration and fails
-        // outstanding reads before connection ownership is released.
-        self.shutdown_cleanup();
+        abort_on_panic(|| {
+            if let Err(error) = self.run_until_shutdown() {
+                tracing::error!(%error, "stopping RDMA poll thread");
+            }
+            // Normal/provider-error exits drain; a panic in either phase aborts
+            // before this owner can drop connections or strand their waiters.
+            self.shutdown_cleanup(Instant::now());
+        });
     }
 
     fn run_until_shutdown(&mut self) -> ruapc_rdma::Result<()> {
@@ -654,10 +658,13 @@ impl PollLoop {
             tracing::error!("flow control update error: {e}");
         }
         if conn.ready_to_remove() {
-            // The QP keeps its identity leased even if another owner holds
-            // the socket after poller teardown.
+            // READs and receive/ACK flushes have CQ-issued completion evidence.
+            // Unsignaled transport SEND tails remain owned until this destroy.
+            // Cached Arc<RdmaSocket> handles retain only the closed shell.
+            conn.socket.queue_pair.destroy();
             return false;
         }
+        conn.check_teardown_deadline(now);
         conn.dirty = conn.recv_deficit > 0 && conn.socket.state.is_ok();
         true
     }
@@ -744,7 +751,7 @@ impl PollLoop {
 
     /// Marks shutdown, fails every connection and drains the inbox so no
     /// registration (with its budget and supervisor guards) is leaked.
-    fn shutdown_cleanup(&mut self) {
+    fn shutdown_cleanup(&mut self, started: Instant) {
         let drained = {
             let mut inner = self.shared.inner.lock().unwrap();
             // Under the same lock registrars check the flag, so after this
@@ -752,36 +759,50 @@ impl PollLoop {
             self.shared.shutdown.store(true, Ordering::Release);
             std::mem::take(&mut inner.incoming)
         };
-        for incoming in &drained {
-            incoming.socket.set_error();
-            set_qp_error(&incoming.socket);
-            incoming.socket.fail_read_batches();
-            // Inbox entries have not opened their metric registration yet,
-            // but a sender may already have bound a waiter to the socket.
-            incoming.state.connection_closed(
-                incoming.socket.conn_id,
-                &Error::new(
-                    ErrorKind::ConnectionClosed,
-                    "rdma poll thread stopped".into(),
-                ),
-            );
+        for incoming in drained {
+            let qp_num = incoming.socket.queue_pair.qp_num();
+            match self.conns.entry(qp_num) {
+                Entry::Vacant(entry) => {
+                    entry.insert(ConnState::new(incoming));
+                }
+                Entry::Occupied(_) => panic!("incoming QP {qp_num} already registered"),
+            }
         }
         for conn in self.conns.values_mut() {
             conn.socket.set_error();
             conn.start_error_flush();
-            // Nobody will poll the flush completions after this thread
-            // exits: resolve the waiting tasks now. The memory holds stay
-            // parked in the batches and are released when the socket (and
-            // its QP, first) is dropped.
             conn.socket.fail_read_batches();
         }
-        // Closing every connection must precede dropping any last socket
-        // owner. QP destruction can return unconsumed READ permits; no other
-        // connection on this stopped CQ may use them to replenish its CQEs.
-        drop(drained);
-        // RegisteredConnection guards notify ordinary waiters and close the
-        // connection gauges exactly once, including already-failing sockets.
-        self.conns.clear();
+        // The poller remains the completion authority during shutdown. A user
+        // waiting for original buffers must not receive an early failure while
+        // its READ is still outstanding, and retained socket Arcs must not keep
+        // a provider QP alive after this thread exits.
+        let cq = self.cq.clone();
+        let mut wcs = CompletionBatch::<64>::new();
+        let mut batch = Vec::new();
+        while !self.conns.is_empty() {
+            let progressed = match self.drain_completions(&cq, &mut wcs, &mut batch) {
+                Ok(progressed) => progressed,
+                Err(error) => {
+                    // A failed CQ cannot deliver the completion evidence this
+                    // API requires. Never report recovered destinations based
+                    // only on a timer or destroy them underneath a borrower.
+                    tracing::error!(%error, "CQ failed while draining RDMA shutdown");
+                    std::process::abort();
+                }
+            };
+            self.maintain_connections(Instant::now(), false, false);
+            if !self.conns.is_empty() && started.elapsed() >= TEARDOWN_TIMEOUT {
+                tracing::error!(
+                    connections = self.conns.len(),
+                    "RDMA shutdown did not receive required completions before its deadline"
+                );
+                std::process::abort();
+            }
+            if !progressed && !self.conns.is_empty() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
         self.dirty_qps.clear();
         if self.unack_cq_events > 0 {
             self.cq.ack_events(self.unack_cq_events);
@@ -936,7 +957,13 @@ mod tests {
     use super::*;
     use ruapc_memory::BufferSet;
 
-    use std::sync::{atomic::AtomicUsize, mpsc};
+    use std::{
+        future::Future,
+        os::unix::process::ExitStatusExt,
+        process::{Command, Stdio},
+        sync::{atomic::AtomicUsize, mpsc},
+        task::{Context as TaskContext, Wake, Waker},
+    };
 
     use ruapc_memory::CopyBatch;
     use ruapc_rdma::{QueuePair, ibv_qp_attr, ibv_qp_attr_mask, ibv_qp_state};
@@ -949,6 +976,228 @@ mod tests {
             test_utils::{make_rdma_devices, open_rdma_device},
         },
     };
+
+    const ABORT_CASE_ENV: &str = "RUAPC_POLLER_ABORT_TEST_CASE";
+
+    /// Execute fatal paths in a fresh test process. An ordinary panic (exit 101),
+    /// destructor sentinel (exit 91/92), or a hang is not an acceptable substitute
+    /// for the explicit SIGABRT policy.
+    fn assert_child_aborts(case: &str) {
+        if std::env::var(ABORT_CASE_ENV).as_deref() == Ok(case) {
+            eprintln!("entering fatal poller case: {case}");
+            if case == "panic_boundary_keeps_owner_and_panic_payload_alive" {
+                struct ExitOnDrop(i32);
+                impl Drop for ExitOnDrop {
+                    fn drop(&mut self) {
+                        std::process::exit(self.0);
+                    }
+                }
+                let owner = ExitOnDrop(91);
+                eprintln!("reached fatal poller boundary: {case}");
+                abort_on_panic(|| {
+                    std::hint::black_box(&owner);
+                    std::panic::panic_any(ExitOnDrop(92));
+                });
+            } else {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(fatal_poller_case(case));
+            }
+            panic!("fatal poller case returned normally: {case}");
+        }
+
+        let test = format!("rdma::poller::tests::{case}");
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("ulimit -c 0; exec \"$@\"")
+            .arg("ruapc-abort-test")
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--nocapture", "--test-threads=1"])
+            .env(ABORT_CASE_ENV, case)
+            .env("RUST_BACKTRACE", "0")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "fatal case {case} hung: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let output = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(&format!("entering fatal poller case: {case}")));
+        assert!(
+            stderr.contains(&format!("reached fatal poller boundary: {case}")),
+            "{case}: {stderr}"
+        );
+        assert_eq!(status.signal(), Some(libc::SIGABRT), "{case}: {stderr}");
+    }
+
+    struct ExitIfWaiterWakes;
+
+    impl Wake for ExitIfWaiterWakes {
+        fn wake(self: Arc<Self>) {
+            std::process::exit(91);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            std::process::exit(91);
+        }
+    }
+
+    async fn fatal_poller_case(case: &str) {
+        let devices = make_rdma_devices();
+        let device = &devices[0];
+        let pool = ruapc_bufpool::BufferPoolBuilder::new(
+            devices.iter().map(|device| device.registrar()).collect(),
+        )
+        .build();
+        let (poller, mut poll_loop) = manual_poller(device.context());
+        let (state, _stop) = State::create(
+            Router::default(),
+            &SocketPoolConfig {
+                rdma: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let socket = register_idle_socket(&poller, device, &pool, &state);
+        assert!(poll_loop.drain_incoming(false));
+
+        match case {
+            "failed_provider_error_transition_aborts" => {
+                // No WR is posted, so destroying this fixture is legitimate.
+                // Its revoked shell deterministically rejects modify(ERR),
+                // without relying on a provider-specific invalid transition.
+                socket.queue_pair.destroy();
+                assert!(socket.queue_pair.is_destroyed());
+                eprintln!("reached fatal poller boundary: {case}");
+                set_qp_error(&socket);
+            }
+            "poll_loop_panic_aborts_before_dropping_registered_connections" => {
+                let (msgid, receiver) = state.waiter.alloc(Duration::from_secs(60));
+                state.waiter.bind_connection(msgid, socket.conn_id);
+                let waker = Waker::from(Arc::new(ExitIfWaiterWakes));
+                let mut context = TaskContext::from_waker(&waker);
+                let mut receiving = Box::pin(receiver.recv());
+                assert!(receiving.as_mut().poll(&mut context).is_pending());
+
+                // ConnState destruction fails this waiter synchronously. Its
+                // custom waker exits 91, proving SIGABRT must precede registry
+                // destruction rather than result from a later double panic.
+                let poisoned = catch_unwind(AssertUnwindSafe(|| {
+                    let _locked = poll_loop.shared.inner.lock().unwrap();
+                    panic!("poison registration inbox for poll-loop regression");
+                }));
+                assert!(poisoned.is_err());
+                poll_loop.shared.has_incoming.store(true, Ordering::Release);
+                // Avoid the handle's poisoned-lock Drop masking a missing
+                // run() panic boundary with an unrelated double-panic abort.
+                std::mem::forget(poller);
+                eprintln!("reached fatal poller boundary: {case}");
+                poll_loop.run();
+            }
+            "normal_close_missing_read_cqe_aborts" | "shutdown_missing_read_cqe_aborts" => {
+                let peer = register_idle_socket(&poller, device, &pool, &state);
+                connect_read_pair(device, &socket.queue_pair, &peer.queue_pair);
+                assert!(poll_loop.drain_incoming(false));
+                let mut source = pool.allocate(64).unwrap();
+                source.set_len(64);
+                let region = source.remote_buffer_info(device.index()).unwrap();
+                let mut destination = pool.allocate(64).unwrap();
+                destination.set_len(64);
+                let (mut posting, mut completion) = socket
+                    .queue_pair
+                    .prepare_reads(
+                        vec![destination.into()],
+                        vec![ruapc_rdma::ReadRequest {
+                            remote_addr: region.addr,
+                            rkey: region.key.rkey,
+                            segments: vec![ruapc_rdma::ReadSegment {
+                                buffer: 0,
+                                offset: 0,
+                                len: 64,
+                            }],
+                        }],
+                    )
+                    .unwrap();
+                socket.queue_pair.post_read(&mut posting).unwrap();
+                drop(posting);
+                socket.set_error();
+                poll_loop.maintain_connections(Instant::now(), false, false);
+
+                // Consume a genuine CQ-issued token without dispatching it,
+                // modeling lost completion accounting. No completion is forged;
+                // the READ ledger must keep the destination held indefinitely.
+                let mut wcs = CompletionBatch::<64>::new();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let mut completions = poller.cq().poll_batch(&mut wcs).unwrap();
+                        if completions.len() != 0 {
+                            assert_eq!(completions.len(), 1);
+                            assert_eq!(
+                                completions.next().unwrap().qp_num(),
+                                socket.queue_pair.qp_num()
+                            );
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(completion.try_recv().is_none());
+                assert_eq!(socket.queue_pair.pending_read_count(), 1);
+                assert!(!socket.queue_pair.is_destroyed());
+                eprintln!("reached fatal poller boundary: {case}");
+                if case == "normal_close_missing_read_cqe_aborts" {
+                    // Repeated maintenance must retain the first close deadline.
+                    poll_loop.maintain_connections(Instant::now() + TEARDOWN_TIMEOUT, false, false);
+                } else {
+                    poll_loop.shutdown_cleanup(Instant::now() - TEARDOWN_TIMEOUT);
+                }
+            }
+            _ => panic!("unknown fatal poller case: {case}"),
+        }
+    }
+
+    #[test]
+    fn failed_provider_error_transition_aborts() {
+        assert_child_aborts("failed_provider_error_transition_aborts");
+    }
+
+    #[test]
+    fn normal_close_missing_read_cqe_aborts() {
+        assert_child_aborts("normal_close_missing_read_cqe_aborts");
+    }
+
+    #[test]
+    fn shutdown_missing_read_cqe_aborts() {
+        assert_child_aborts("shutdown_missing_read_cqe_aborts");
+    }
+
+    #[test]
+    fn poll_loop_panic_aborts_before_dropping_registered_connections() {
+        assert_child_aborts("poll_loop_panic_aborts_before_dropping_registered_connections");
+    }
+
+    #[test]
+    fn panic_boundary_keeps_owner_and_panic_payload_alive() {
+        assert_child_aborts("panic_boundary_keeps_owner_and_panic_payload_alive");
+    }
 
     /// The shared CQ length must be clamped to the device's `max_cqe`:
     /// drivers reject larger requests with EINVAL (e.g. the rxe soft-RoCE
@@ -1241,6 +1490,18 @@ mod tests {
             ..Default::default()
         };
         let qp = QueuePair::create(device.pd(), poller.cq(), &mut attrs, device.index()).unwrap();
+        // These fixtures may never connect. Initialize the QP so explicit
+        // teardown can request the same ERR transition as live connections.
+        let mut init = ibv_qp_attr {
+            qp_state: ibv_qp_state::IBV_QPS_INIT,
+            port_num: device.info().ports[0].port_num,
+            ..Default::default()
+        };
+        let init_mask = ibv_qp_attr_mask::IBV_QP_STATE
+            | ibv_qp_attr_mask::IBV_QP_PORT
+            | ibv_qp_attr_mask::IBV_QP_PKEY_INDEX
+            | ibv_qp_attr_mask::IBV_QP_ACCESS_FLAGS;
+        qp.modify(&mut init, init_mask.0 as _).unwrap();
         let nic = RdmaNicInfo {
             device: device.info().name.clone(),
             port_num: device.info().ports[0].port_num,
@@ -1254,6 +1515,7 @@ mod tests {
             pending_sender,
             poller.waker(),
             RdmaSocketConfig {
+                supervisor: state.socket_pool.task_supervisor_handle(),
                 max_msg_size: 1024,
                 max_large_msg_size: 0,
                 max_inflight_large_bytes: 128 << 20,
@@ -1264,6 +1526,7 @@ mod tests {
                     same_connectivity_domain: true,
                 },
                 read_timeout: pending.read_timeout,
+                settle_grace: Duration::from_millis(100),
                 read_permits,
                 bandwidth_limiter: Arc::new(RdmaBandwidthLimiter::new(
                     nic.device,
@@ -1298,7 +1561,34 @@ mod tests {
         socket
     }
 
-    fn connect_read_pair(device: &RdmaDevice, first: &QueuePair, second: &QueuePair) {
+    trait TestQueuePair {
+        fn qp_num(&self) -> u32;
+        fn connect(&self, config: &ruapc_rdma::QpConnectionConfig) -> ruapc_rdma::Result<()>;
+    }
+
+    impl TestQueuePair for QueuePair {
+        fn qp_num(&self) -> u32 {
+            self.qp_num()
+        }
+        fn connect(&self, config: &ruapc_rdma::QpConnectionConfig) -> ruapc_rdma::Result<()> {
+            self.connect(config)
+        }
+    }
+
+    impl TestQueuePair for ReservedQueuePair {
+        fn qp_num(&self) -> u32 {
+            self.qp_num()
+        }
+        fn connect(&self, config: &ruapc_rdma::QpConnectionConfig) -> ruapc_rdma::Result<()> {
+            self.connect(config)
+        }
+    }
+
+    fn connect_read_pair(
+        device: &RdmaDevice,
+        first: &impl TestQueuePair,
+        second: &impl TestQueuePair,
+    ) {
         let info = device.info();
         let port = info.ports.iter().find(|p| p.is_usable()).unwrap();
         let gid = port
@@ -1307,13 +1597,13 @@ mod tests {
             .find(|g| g.gid_type == ruapc_rdma::GidType::RoCEv2)
             .or_else(|| port.gids.first())
             .unwrap();
-        let config = |remote: &QueuePair| ruapc_rdma::QpConnectionConfig {
+        let config = |remote_qp_num| ruapc_rdma::QpConnectionConfig {
             local_port_num: port.port_num,
             local_gid_index: gid.index,
             pkey_index: 0,
             link_layer: port.port_attr.link_layer,
             path_mtu: port.port_attr.active_mtu,
-            remote_qp_num: remote.qp_num(),
+            remote_qp_num,
             remote_gid: gid.gid,
             remote_lid: port.port_attr.lid,
             local_psn: 7,
@@ -1322,8 +1612,8 @@ mod tests {
             max_dest_rd_atomic: 1,
             traffic_class: 0,
         };
-        first.connect(&config(second)).unwrap();
-        second.connect(&config(first)).unwrap();
+        first.connect(&config(second.qp_num())).unwrap();
+        second.connect(&config(first.qp_num())).unwrap();
     }
 
     #[tokio::test]
@@ -1405,22 +1695,37 @@ mod tests {
         }
     }
 
-    /// Consume exactly one authentic READ completion, leaving later CQEs untouched.
-    async fn complete_one_read(poller: &DevicePoller, poll_loop: &mut PollLoop) {
+    async fn wait_for_pending_reads(socket: &RdmaSocket, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                // read_into_target owns its transfer in a spawned task. Give
+                // that task a turn before inspecting posting/admission state.
+                tokio::task::yield_now().await;
+                if socket.queue_pair.pending_read_count() == expected {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("owned READ task must reach its expected posting state");
+    }
+
+    /// Consume one authentic READ CQE and report whether it succeeded.
+    async fn complete_one_read(poller: &DevicePoller, poll_loop: &mut PollLoop) -> bool {
         tokio::time::timeout(Duration::from_secs(5), async {
             let mut storage = CompletionBatch::<1>::new();
             loop {
                 if let Some(completion) = poller.cq().poll_batch(&mut storage).unwrap().next() {
-                    assert!(completion.info().succ());
+                    let succeeded = completion.info().succ();
                     assert!(completion.info().is_read());
                     poll_loop.dispatch(completion, &mut Vec::new());
-                    return;
+                    return succeeded;
                 }
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
-        .expect("READ must complete on the connected QP");
+        .expect("READ must complete on the connected QP")
     }
 
     #[tokio::test]
@@ -1499,7 +1804,7 @@ mod tests {
         assert!(conn.ready_to_remove());
         poll_loop.maintain_connections(Instant::now(), false, false);
         assert!(!poll_loop.conns.contains_key(&socket.queue_pair.qp_num()));
-        poll_loop.shutdown_cleanup();
+        poll_loop.shutdown_cleanup(Instant::now());
     }
 
     #[tokio::test]
@@ -1580,7 +1885,7 @@ mod tests {
         assert!(batch.is_empty());
         poll_loop.maintain_connections(Instant::now(), false, false);
         assert!(!poll_loop.conns.contains_key(&socket.queue_pair.qp_num()));
-        poll_loop.shutdown_cleanup();
+        poll_loop.shutdown_cleanup(Instant::now());
     }
 
     #[tokio::test]
@@ -1643,17 +1948,17 @@ mod tests {
             let mut other_destination = pool.allocate(64).unwrap();
             other_destination.set_len(64);
             let other_target =
-                WriteTarget::new(BufferSet::try_new(vec![other_destination]).unwrap());
+                WriteTarget::from_owned(BufferSet::try_new(vec![other_destination]).unwrap());
             let validated = CopyBatch::new(&ops).unwrap();
             let mut other_read =
                 Box::pin(peer.read_into_target(&remote, &validated, other_target, None));
             assert!(futures_util::poll!(&mut other_read).is_pending());
-            assert_eq!(peer.queue_pair.pending_read_count(), 1);
+            wait_for_pending_reads(&peer, 1).await;
 
             let mut destination = pool.allocate(64).unwrap();
             destination.set_len(64);
             destination.fill(0xa5);
-            let target = WriteTarget::new(BufferSet::try_new(vec![destination]).unwrap());
+            let target = WriteTarget::from_owned(BufferSet::try_new(vec![destination]).unwrap());
             let mut read = Box::pin(socket.read_into_target(
                 &remote,
                 &validated,
@@ -1661,7 +1966,7 @@ mod tests {
                 parent_remaining.map(|remaining| Instant::now() + remaining),
             ));
             assert!(futures_util::poll!(&mut read).is_pending());
-            assert_eq!(socket.queue_pair.pending_read_count(), 0);
+            wait_for_pending_reads(&socket, 0).await;
             assert_eq!(permits.available_permits(), 0);
 
             // No completion or housekeeping pass runs: a batch waiting for its
@@ -1682,9 +1987,11 @@ mod tests {
             assert_eq!(peer.queue_pair.pending_read_count(), 1);
 
             drop(other_read);
-            poll_loop.shutdown_cleanup();
+            poll_loop.shutdown_cleanup(Instant::now());
+            assert!(socket.queue_pair.is_destroyed());
+            assert!(peer.queue_pair.is_destroyed());
             drop(socket);
-            assert_eq!(permits.available_permits(), 0);
+            assert_eq!(permits.available_permits(), 1);
             drop(peer);
             assert_eq!(permits.available_permits(), 1);
             drop(source);
@@ -1760,7 +2067,8 @@ mod tests {
             let destination_lifetime = Arc::downgrade(&destination_pool);
             let mut destination = destination_pool.allocate(192).unwrap();
             destination.set_len(192);
-            let target = WriteTarget::new(BufferSet::try_new(vec![destination]).unwrap());
+            let destination_pointer = destination.as_ptr();
+            let target = WriteTarget::from_owned(BufferSet::try_new(vec![destination]).unwrap());
             drop(destination_pool);
             let validated = CopyBatch::new(&ops).unwrap();
             let mut read = Box::pin(socket.read_into_target(
@@ -1770,37 +2078,37 @@ mod tests {
                 parent_remaining.map(|remaining| Instant::now() + remaining),
             ));
             assert!(futures_util::poll!(&mut read).is_pending());
-            assert_eq!(socket.queue_pair.pending_read_count(), 2);
+            wait_for_pending_reads(&socket, 2).await;
 
             let mut other_destination = pool.allocate(64).unwrap();
             other_destination.set_len(64);
             let other_target =
-                WriteTarget::new(BufferSet::try_new(vec![other_destination]).unwrap());
+                WriteTarget::from_owned(BufferSet::try_new(vec![other_destination]).unwrap());
             let other_ops = [CopyOp::new(0, 0, 64)];
             let other_validated = CopyBatch::new(&other_ops).unwrap();
             let mut other_read =
                 Box::pin(peer.read_into_target(&remote, &other_validated, other_target, None));
             assert!(futures_util::poll!(&mut other_read).is_pending());
-            assert_eq!(peer.queue_pair.pending_read_count(), 0);
+            wait_for_pending_reads(&peer, 0).await;
 
             // The first completion gives SQ capacity back to this batch, but
             // its NIC permit goes to the other QP already waiting in the FIFO.
-            complete_one_read(&poller, &mut poll_loop).await;
+            assert!(complete_one_read(&poller, &mut poll_loop).await);
             assert!(futures_util::poll!(&mut other_read).is_pending());
-            assert_eq!(peer.queue_pair.pending_read_count(), 1);
+            wait_for_pending_reads(&peer, 1).await;
             assert!(futures_util::poll!(&mut read).is_pending());
             assert_eq!(socket.queue_pair.pending_read_count(), 1);
             assert_eq!(permits.available_permits(), 0);
 
-            let error = tokio::time::timeout(Duration::from_secs(2), read)
-                .await
-                .expect("partial posting must stop waiting for NIC capacity at its deadline")
-                .unwrap_err();
-            assert_eq!(error.kind, expected);
+            tokio::time::sleep(short + Duration::from_millis(10)).await;
+            assert!(
+                futures_util::poll!(&mut read).is_pending(),
+                "admission expiry records failure but cannot return posted destinations"
+            );
             assert!(socket.state.is_ok());
             assert_eq!(socket.queue_pair.pending_read_count(), 1);
             assert_eq!(permits.available_permits(), 0);
-            assert!(WriteTarget::try_into_buffers(target).is_none());
+            assert!(WriteTarget::try_into_buffers(target.clone()).is_none());
             assert!(destination_lifetime.upgrade().is_some());
 
             // Admission expiry alone does not prove this QP is faulty. Its
@@ -1811,15 +2119,216 @@ mod tests {
             assert_eq!(permits.available_permits(), 0);
 
             drop(other_read);
-            poll_loop.shutdown_cleanup();
+            poll_loop.shutdown_cleanup(Instant::now());
+            assert!(socket.queue_pair.is_destroyed());
+            assert!(peer.queue_pair.is_destroyed());
+            let error = tokio::time::timeout(Duration::from_secs(2), read)
+                .await
+                .expect("drained CQEs must settle the failed READ")
+                .unwrap_err();
+            assert_eq!(error.kind, expected);
+            let returned = target.close_and_take().await.unwrap().unwrap();
+            assert_eq!(returned[0].as_ptr(), destination_pointer);
+            assert_eq!(returned[0].len(), 192);
             assert!(destination_lifetime.upgrade().is_some());
-            assert_eq!(permits.available_permits(), 0);
+            assert_eq!(permits.available_permits(), 2);
             drop(socket);
-            assert!(destination_lifetime.upgrade().is_none());
-            assert_eq!(permits.available_permits(), 1);
+            assert!(destination_lifetime.upgrade().is_some());
             drop(peer);
             assert_eq!(permits.available_permits(), 2);
+            drop(returned);
+            assert!(destination_lifetime.upgrade().is_none());
             drop(source);
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_read_detaches_after_grace_and_real_cqes_reclaim_its_buffers() {
+        use crate::{Context, CopyOp, Socket};
+
+        let devices = make_rdma_devices();
+        let device = &devices[0];
+        let pool = ruapc_bufpool::BufferPoolBuilder::new(
+            devices.iter().map(|device| device.registrar()).collect(),
+        )
+        .build();
+        let (state, _stop) = State::create(
+            Router::default(),
+            &SocketPoolConfig {
+                rdma: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Cover both completion waits and a posting cursor blocked after its
+        // accepted prefix. No poller runs until the public owned call returns.
+        for (read_timeout, parent_timeout, close, operations, expected) in [
+            (None, Some(30), false, 1, ErrorKind::Timeout),
+            (Some(30), Some(1_000), false, 1, ErrorKind::RdmaReadTimeout),
+            (None, None, true, 1, ErrorKind::ConnectionClosed),
+            (None, Some(30), false, 3, ErrorKind::Timeout),
+        ] {
+            let (poller, mut poll_loop) = manual_poller(device.context());
+            let permits = Arc::new(tokio::sync::Semaphore::new(2));
+            let socket = register_socket_with_config(
+                &poller,
+                device,
+                &pool,
+                &state,
+                permits.clone(),
+                SocketTestConfig {
+                    read_timeout: read_timeout.map(Duration::from_millis),
+                    ..Default::default()
+                },
+            );
+            let peer = register_idle_socket(&poller, device, &pool, &state);
+            connect_read_pair(device, &socket.queue_pair, &peer.queue_pair);
+            assert!(poll_loop.drain_incoming(false));
+            let len = operations * 64;
+            let mut source = pool.allocate(len).unwrap();
+            source.set_len(len);
+            source.fill(0x5a);
+            let mut ctx = Context::server_ctx(
+                &state,
+                Socket::RDMA(socket.clone()),
+                MsgMeta {
+                    msgid: 17,
+                    read_regions: [source.remote_buffer_info(device.index()).unwrap()].into(),
+                    ..Default::default()
+                },
+            );
+            let destination_pool = ruapc_bufpool::BufferPoolBuilder::new(
+                devices.iter().map(|device| device.registrar()).collect(),
+            )
+            .build();
+            let destination_lifetime = Arc::downgrade(&destination_pool);
+            let mut destination = destination_pool.allocate(len).unwrap();
+            destination.set_len(len);
+            drop(destination_pool);
+            let ops = (0..operations)
+                .map(|index| CopyOp::new(index as u64 * 64, index as u64 * 64, 64))
+                .collect::<Vec<_>>();
+            ctx.deadline = parent_timeout.map(|ms| Instant::now() + Duration::from_millis(ms));
+            let mut read = Box::pin(ctx.own_buffers(vec![destination]).remote_read(&ops));
+            assert!(futures_util::poll!(&mut read).is_pending());
+            let posted = operations.min(2);
+            assert_eq!(socket.queue_pair.pending_read_count(), posted);
+            if close {
+                socket.set_error();
+            }
+            let completed = tokio::time::timeout(Duration::from_secs(2), read)
+                .await
+                .expect("owned failure must return after its settlement grace");
+            assert_eq!(completed.result.unwrap_err().kind, expected);
+            assert!(completed.buffers.is_none());
+            assert!(!socket.state.is_ok());
+            assert!(!socket.queue_pair.is_destroyed());
+            assert_eq!(socket.queue_pair.pending_read_count(), posted);
+            assert_eq!(permits.available_permits(), 2 - posted);
+            assert!(destination_lifetime.upgrade().is_some());
+
+            for outstanding in (0..posted).rev() {
+                assert!(complete_one_read(&poller, &mut poll_loop).await);
+                assert_eq!(socket.queue_pair.pending_read_count(), outstanding);
+                assert_eq!(permits.available_permits(), 2 - outstanding);
+                assert_eq!(destination_lifetime.upgrade().is_some(), outstanding != 0);
+            }
+            poll_loop.shutdown_cleanup(Instant::now());
+            assert!(socket.queue_pair.is_destroyed());
+            assert!(peer.queue_pair.is_destroyed());
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_read_returns_settled_buffers_while_strict_recovery_waits_for_destroy() {
+        use crate::{Context, CopyOp, Socket};
+        use ruapc_bufpool::WriteBuffer;
+
+        let devices = make_rdma_devices();
+        let device = &devices[0];
+        let pool = ruapc_bufpool::BufferPoolBuilder::new(
+            devices.iter().map(|device| device.registrar()).collect(),
+        )
+        .build();
+        let (state, _stop) = State::create(
+            Router::default(),
+            &SocketPoolConfig {
+                rdma: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for owned in [true, false] {
+            let (poller, mut poll_loop) = manual_poller(device.context());
+            let socket = register_idle_socket(&poller, device, &pool, &state);
+            let peer = register_idle_socket(&poller, device, &pool, &state);
+            connect_read_pair(device, &socket.queue_pair, &peer.queue_pair);
+            assert!(poll_loop.drain_incoming(false));
+            let mut source = pool.allocate(64).unwrap();
+            source.set_len(64);
+            source.fill(0x5a);
+            let ctx = Context::server_ctx(
+                &state,
+                Socket::RDMA(socket.clone()),
+                MsgMeta {
+                    msgid: 17,
+                    read_regions: [source.remote_buffer_info(device.index()).unwrap()].into(),
+                    timeout_ms: 5_000,
+                    ..Default::default()
+                },
+            );
+            let mut destination = pool.allocate(64).unwrap();
+            destination.set_len(64);
+            let pointer = destination.as_ptr() as usize;
+            let ops = [CopyOp::new(0, 0, 64)];
+            let read = async {
+                if owned {
+                    let completed = ctx.own_buffers(vec![destination]).remote_read(&ops).await;
+                    (
+                        completed.result,
+                        completed.buffers.unwrap()[0].as_ptr() as usize,
+                    )
+                } else {
+                    // The public storage bridge is strict even when its
+                    // capabilities happen to own allocations: borrowed users
+                    // reach this same executor without any runtime lease.
+                    let completed = ctx
+                        .read_buffer_storage(Some(&ops), vec![WriteBuffer::from(destination)])
+                        .await;
+                    (
+                        completed.result,
+                        completed.buffers.unwrap()[0].as_ptr() as usize,
+                    )
+                }
+            };
+            tokio::pin!(read);
+            assert!(futures_util::poll!(&mut read).is_pending());
+            assert_eq!(socket.queue_pair.pending_read_count(), 1);
+            socket.set_error();
+            assert!(futures_util::poll!(&mut read).is_pending());
+            if !owned {
+                tokio::time::sleep(socket.settle_grace() + Duration::from_millis(10)).await;
+                assert!(futures_util::poll!(&mut read).is_pending());
+            }
+            assert!(complete_one_read(&poller, &mut poll_loop).await);
+            assert!(!socket.queue_pair.is_destroyed());
+            if !owned {
+                assert!(
+                    futures_util::poll!(&mut read).is_pending(),
+                    "strict recovery still waits for provider destruction after closure"
+                );
+                poll_loop.shutdown_cleanup(Instant::now());
+            }
+            let (result, returned_pointer) =
+                tokio::time::timeout(Duration::from_secs(1), &mut read)
+                    .await
+                    .expect("real CQEs authorize returning the original allocation");
+            assert_eq!(result.unwrap_err().kind, ErrorKind::ConnectionClosed);
+            assert_eq!(returned_pointer, pointer);
+            if owned {
+                assert!(!socket.queue_pair.is_destroyed());
+                poll_loop.shutdown_cleanup(Instant::now());
+            }
         }
     }
 
@@ -1874,7 +2383,7 @@ mod tests {
         let remote = RemoteSpace::new(&regions).unwrap();
         let mut destination = pool.allocate(64).unwrap();
         destination.set_len(64);
-        let target = WriteTarget::new(BufferSet::try_new(vec![destination]).unwrap());
+        let target = WriteTarget::from_owned(BufferSet::try_new(vec![destination]).unwrap());
         let ops = [CopyOp::new(0, 0, 64)];
         let validated = CopyBatch::new(&ops).unwrap();
         // An expired absolute request deadline cannot post even when both
@@ -1886,29 +2395,28 @@ mod tests {
         assert_eq!(error.kind, ErrorKind::Timeout);
         assert_eq!(socket.queue_pair.pending_read_count(), 0);
         assert_eq!(permits.available_permits(), 1);
-        let mut read = Box::pin(socket.read_into_target(
+        let mut read = Some(Box::pin(socket.read_into_target(
             &remote,
             &validated,
             target.clone(),
             Some(Instant::now() + Duration::from_millis(50)),
-        ));
-        assert!(futures_util::poll!(&mut read).is_pending());
-        assert_eq!(socket.queue_pair.pending_read_count(), 1);
+        )));
+        assert!(futures_util::poll!(read.as_mut().unwrap()).is_pending());
+        wait_for_pending_reads(&socket, 1).await;
         let now = Instant::now();
         if cancel_receiver {
-            drop(read);
+            drop(read.take());
         } else {
             poll_loop.maintain_connections(now + Duration::from_millis(100), true, false);
-            let error = tokio::time::timeout(Duration::from_secs(1), read)
-                .await
-                .expect("the parent deadline must settle an already-posted batch")
-                .unwrap_err();
-            assert_eq!(error.kind, ErrorKind::Timeout);
+            assert!(
+                futures_util::poll!(read.as_mut().unwrap()).is_pending(),
+                "the parent deadline cannot return before the posted READ's CQE"
+            );
         }
         assert!(socket.state.is_ok());
         assert_eq!(socket.queue_pair.pending_read_count(), 1);
         assert_eq!(permits.available_permits(), 0);
-        assert!(WriteTarget::try_into_buffers(target).is_none());
+        assert!(WriteTarget::try_into_buffers(target.clone()).is_none());
 
         // Taking the receiver at the parent deadline must not disable the
         // independent watchdog for READs still owned by this QP.
@@ -1916,7 +2424,18 @@ mod tests {
         assert!(!socket.state.is_ok());
         assert_eq!(socket.queue_pair.pending_read_count(), 1);
         assert_eq!(permits.available_permits(), 0);
-        poll_loop.shutdown_cleanup();
+        poll_loop.shutdown_cleanup(Instant::now());
+        assert!(socket.queue_pair.is_destroyed());
+        if let Some(read) = read.take() {
+            let error = tokio::time::timeout(Duration::from_secs(1), read)
+                .await
+                .expect("CQ settlement must deliver the recorded parent timeout")
+                .unwrap_err();
+            assert_eq!(error.kind, ErrorKind::Timeout);
+        }
+        let returned = target.close_and_take().await.unwrap().unwrap();
+        assert_eq!(returned[0].len(), 64);
+        drop(read);
         drop(socket);
         assert_eq!(permits.available_permits(), 1);
         drop(peer);
@@ -1924,7 +2443,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closing_a_posted_read_without_a_watchdog_wakes_before_any_completion() {
+    async fn closing_a_posted_read_waits_for_cqe_then_destroys_a_retained_socket() {
         use crate::remote_memory::{CopyOp, WriteTarget};
         use ruapc_memory::RemoteSpace;
 
@@ -1961,29 +2480,60 @@ mod tests {
         let destination_lifetime = Arc::downgrade(&destination_pool);
         let mut destination = destination_pool.allocate(64).unwrap();
         destination.set_len(64);
-        let target = WriteTarget::new(BufferSet::try_new(vec![destination]).unwrap());
+        let destination_pointer = destination.as_ptr();
+        let target = WriteTarget::from_owned(BufferSet::try_new(vec![destination]).unwrap());
         drop(destination_pool);
         let ops = [CopyOp::new(0, 0, 64)];
         let validated = CopyBatch::new(&ops).unwrap();
         let mut read = Box::pin(socket.read_into_target(&remote, &validated, target.clone(), None));
         assert!(futures_util::poll!(&mut read).is_pending());
-        assert_eq!(socket.queue_pair.pending_read_count(), 1);
-        socket.set_error();
-        let error = tokio::time::timeout(Duration::from_secs(1), read)
-            .await
-            .expect("closing a QP must wake its READ even with read_timeout_ms = 0")
-            .unwrap_err();
-        assert_eq!(error.kind, ErrorKind::ConnectionClosed);
+        wait_for_pending_reads(&socket, 1).await;
+        state.socket_pool.stop();
+        let mut joined = Box::pin(state.socket_pool.join());
+        assert!(
+            futures_util::poll!(&mut joined).is_pending(),
+            "shutdown must retain the task restoring DMA-owned destinations"
+        );
+        let mut close = Box::pin(socket.close_and_wait());
+        assert!(futures_util::poll!(&mut close).is_pending());
+        assert!(futures_util::poll!(&mut read).is_pending());
         assert_eq!(socket.queue_pair.pending_read_count(), 1);
         assert_eq!(permits.available_permits(), 0);
-        assert!(WriteTarget::try_into_buffers(target).is_none());
+        assert!(WriteTarget::try_into_buffers(target.clone()).is_none());
         assert!(destination_lifetime.upgrade().is_some());
-        poll_loop.shutdown_cleanup();
+        poll_loop.maintain_connections(Instant::now(), true, false);
+        assert!(!socket.queue_pair.is_destroyed());
+        assert!(futures_util::poll!(&mut close).is_pending());
+        assert!(futures_util::poll!(&mut read).is_pending());
+
+        complete_one_read(&poller, &mut poll_loop).await;
+        assert_eq!(socket.queue_pair.pending_read_count(), 0);
+        poll_loop.maintain_connections(Instant::now(), false, false);
+        tokio::time::timeout(Duration::from_secs(1), close)
+            .await
+            .expect("all CQEs permit explicit destruction despite retained socket handles");
+        assert!(socket.queue_pair.is_destroyed());
+        let error = tokio::time::timeout(Duration::from_secs(1), read)
+            .await
+            .expect("a drained READ must receive its recorded connection failure")
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::ConnectionClosed);
+        let returned = target.close_and_take().await.unwrap().unwrap();
+        assert_eq!(returned[0].as_ptr(), destination_pointer);
+        assert_eq!(returned[0].len(), 64);
+        tokio::time::timeout(Duration::from_secs(1), joined)
+            .await
+            .expect("shutdown joins the recovery task after it restores the target");
+        assert_eq!(permits.available_permits(), 1);
+        assert!(destination_lifetime.upgrade().is_some());
+        poll_loop.shutdown_cleanup(Instant::now());
         assert!(destination_lifetime.upgrade().is_some());
         drop(socket);
-        assert!(destination_lifetime.upgrade().is_none());
+        assert!(destination_lifetime.upgrade().is_some());
         assert_eq!(permits.available_permits(), 1);
         drop(peer);
+        drop(returned);
+        assert!(destination_lifetime.upgrade().is_none());
         drop(source);
     }
 
@@ -2037,17 +2587,17 @@ mod tests {
             let remote = RemoteSpace::new(&regions).unwrap();
             let mut destination = pool.allocate(128).unwrap();
             destination.set_len(128);
-            let target = WriteTarget::new(BufferSet::try_new(vec![destination]).unwrap());
+            let target = WriteTarget::from_owned(BufferSet::try_new(vec![destination]).unwrap());
             let ops = [CopyOp::new(0, 0, 64), CopyOp::new(64, 64, 64)];
             let validated = CopyBatch::new(&ops).unwrap();
             let mut read =
                 Box::pin(socket.read_into_target(&remote, &validated, target.clone(), None));
             assert!(futures_util::poll!(&mut read).is_pending());
-            assert_eq!(socket.queue_pair.pending_read_count(), 1);
+            wait_for_pending_reads(&socket, 1).await;
             assert_eq!(permits.available_permits(), 0);
 
             for count in 0..completed {
-                complete_one_read(&poller, &mut poll_loop).await;
+                assert!(complete_one_read(&poller, &mut poll_loop).await);
                 assert_eq!(socket.queue_pair.pending_read_count(), 0);
                 if count == 0 {
                     // The second WR was waiting for the NIC credit returned by
@@ -2055,7 +2605,7 @@ mod tests {
                     // its waiter already, before the future is polled again.
                     assert_eq!(permits.available_permits(), 0);
                     assert!(futures_util::poll!(&mut read).is_pending());
-                    assert_eq!(socket.queue_pair.pending_read_count(), 1);
+                    wait_for_pending_reads(&socket, 1).await;
                     assert_eq!(permits.available_permits(), 0);
                 } else {
                     assert_eq!(permits.available_permits(), 1);
@@ -2070,20 +2620,23 @@ mod tests {
                 let buffers = buffers.into_buffers();
                 assert_eq!(&buffers[0][..], &source[..]);
             } else {
-                poll_loop.shutdown_cleanup();
+                poll_loop.shutdown_cleanup(Instant::now());
                 let error = tokio::time::timeout(Duration::from_secs(1), read)
                     .await
                     .expect("shutdown must settle the READ waiter")
                     .unwrap_err();
                 assert_eq!(error.kind, ErrorKind::ConnectionClosed);
-                assert_eq!(socket.queue_pair.pending_read_count(), 1);
+                assert_eq!(socket.queue_pair.pending_read_count(), 0);
+                assert!(socket.queue_pair.is_destroyed());
+                let returned = target.close_and_take().await.unwrap().unwrap();
+                assert_eq!(returned[0].len(), 128);
                 assert_eq!(
                     permits.available_permits(),
-                    0,
-                    "failing the waiter cannot end DMA"
+                    1,
+                    "shutdown drains CQEs before returning the settled failure"
                 );
             }
-            poll_loop.shutdown_cleanup();
+            poll_loop.shutdown_cleanup(Instant::now());
             assert!(socket.read_credits.is_closed());
             assert!(peer.read_credits.is_closed());
             drop(socket);
@@ -2150,14 +2703,15 @@ mod tests {
         let remote = RemoteSpace::new(&regions).unwrap();
         let mut destination = pool.allocate(64).unwrap();
         destination.set_len(64);
-        let target = WriteTarget::new(BufferSet::try_new(vec![destination]).unwrap());
+        let target = WriteTarget::from_owned(BufferSet::try_new(vec![destination]).unwrap());
         let ops = [CopyOp::new(0, 0, 64)];
         let validated = CopyBatch::new(&ops).unwrap();
         let mut read = Box::pin(incoming.read_into_target(&remote, &validated, target, None));
         assert!(futures_util::poll!(&mut read).is_pending());
+        wait_for_pending_reads(&incoming, 1).await;
         drop(read);
         assert_eq!(incoming.queue_pair.pending_read_count(), 1);
-        drop(incoming); // The inbox now owns the only socket reference.
+        drop(incoming); // The inbox and owned READ task retain the socket.
 
         let probe = Arc::new(RefundProbe {
             live,
@@ -2167,7 +2721,7 @@ mod tests {
         let mut context = Context::from_waker(&waker);
         let mut waiting = Box::pin(permits.acquire());
         assert!(std::future::Future::poll(waiting.as_mut(), &mut context).is_pending());
-        poll_loop.shutdown_cleanup();
+        poll_loop.shutdown_cleanup(Instant::now());
         assert!(
             probe.woke.load(Ordering::Acquire),
             "incoming QP destruction must wake the NIC waiter"
@@ -2180,7 +2734,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_read_posted_after_the_shutdown_scan_does_not_wait_for_a_stopped_poller() {
+    async fn a_paused_poster_cannot_submit_a_read_after_shutdown() {
         let devices = make_rdma_devices();
         let device = &devices[0];
         let pool = ruapc_bufpool::BufferPoolBuilder::new(
@@ -2210,7 +2764,7 @@ mod tests {
         let (mut posting, receiver) = socket
             .queue_pair
             .prepare_reads(
-                vec![destination],
+                vec![destination.into()],
                 vec![ruapc_rdma::ReadRequest {
                     remote_addr: remote.addr,
                     rkey: remote.key.rkey,
@@ -2225,36 +2779,21 @@ mod tests {
         let device_permit = permits.acquire().await.unwrap();
         assert!(socket.state.is_ok());
         // Pause after the final health check, before publishing to the QP. The
-        // cleanup's failure scan sees no batch and will never consume another CQE.
-        poll_loop.shutdown_cleanup();
+        // cleanup sees no posted batch, and destroys the QP with this handle retained.
+        poll_loop.shutdown_cleanup(Instant::now());
         assert_eq!(socket.queue_pair.pending_read_count(), 0);
-        // Providers such as RXE accept WRs on an ERR QP. Publish through the real
-        // ownership map, without repeating admission or consuming its CQEs.
-        match socket.queue_pair.post_read(&mut posting) {
-            Ok(()) => {
-                device_permit.forget();
-                assert_eq!(socket.queue_pair.pending_read_count(), 1);
-                socket.register_read_batch(&posting, None, None);
-                let error =
-                    tokio::time::timeout(Duration::from_secs(1), socket.await_read_batch(receiver))
-                        .await
-                        .expect("late posting must not strand its waiter after shutdown")
-                        .unwrap_err();
-                assert_eq!(error.kind, ErrorKind::ConnectionClosed);
-                drop(posting);
-                assert_eq!(socket.queue_pair.pending_read_count(), 1);
-                assert_eq!(permits.available_permits(), 0);
-            }
-            Err(_) => {
-                // A provider may instead reject the late WR. Ownership must roll
-                // back and the still-unposted permit must return through RAII.
-                assert_eq!(socket.queue_pair.pending_read_count(), 0);
-                assert_eq!(posting.remaining(), 1);
-                assert_eq!(posting.cancel().unwrap()[0].len(), 64);
-                drop(device_permit);
-                assert_eq!(permits.available_permits(), 1);
-            }
-        }
+        assert!(socket.queue_pair.is_destroyed());
+        // The software posting gate rejects the late WR before touching the
+        // provider, even on providers that would accept work on an ERR QP.
+        socket.queue_pair.post_read(&mut posting).unwrap_err();
+        assert_eq!(socket.queue_pair.pending_read_count(), 0);
+        assert_eq!(posting.remaining(), 1);
+        posting.cancel();
+        let outcome = receiver.await;
+        assert!(outcome.result.is_err());
+        assert_eq!(outcome.buffers[0].len(), 64);
+        drop(device_permit);
+        assert_eq!(permits.available_permits(), 1);
         drop(socket);
         assert_eq!(permits.available_permits(), 1);
         drop(peer);
@@ -2365,7 +2904,7 @@ mod tests {
         assert_eq!(socket.pending_sender.capacity(), 0);
         drop(slot);
         assert_eq!(socket.pending_sender.capacity(), 1);
-        poll_loop.shutdown_cleanup();
+        poll_loop.shutdown_cleanup(Instant::now());
     }
 
     #[tokio::test]
@@ -2400,7 +2939,7 @@ mod tests {
             assert!(futures_util::poll!(sending.as_mut()).is_pending());
 
             if shutdown {
-                poll_loop.shutdown_cleanup();
+                poll_loop.shutdown_cleanup(Instant::now());
                 assert!(socket.pending_sender.is_closed());
             } else {
                 socket.set_error();
@@ -2417,7 +2956,7 @@ mod tests {
             assert_eq!(error.kind, ErrorKind::ConnectionClosed);
             drop(sending);
             drop(response);
-            poll_loop.shutdown_cleanup();
+            poll_loop.shutdown_cleanup(Instant::now());
         }
     }
 
@@ -2520,7 +3059,7 @@ mod tests {
                 })
                 .collect();
             assert_eq!(received, expected);
-            poll_loop.shutdown_cleanup();
+            poll_loop.shutdown_cleanup(Instant::now());
         }
     }
 
@@ -2599,7 +3138,7 @@ mod tests {
         poll_loop.maintain_dirty_connections(Instant::now(), false);
         assert!(!poll_loop.conns[&replacement_qp].dirty);
         assert!(poll_loop.dirty_qps.is_empty());
-        poll_loop.shutdown_cleanup();
+        poll_loop.shutdown_cleanup(Instant::now());
     }
 
     #[tokio::test]
@@ -2691,7 +3230,7 @@ mod tests {
         poll_loop.maintain_dirty_connections(Instant::now(), false);
         assert!(poll_loop.conns.is_empty());
         assert!(poll_loop.dirty_qps.is_empty());
-        poll_loop.shutdown_cleanup();
+        poll_loop.shutdown_cleanup(Instant::now());
     }
 
     #[tokio::test]
@@ -2733,6 +3272,14 @@ mod tests {
             gid_index: 0,
             ip: None,
         };
+        let (state, _stop) = State::create(
+            Router::default(),
+            &SocketPoolConfig {
+                rdma: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let (pending_sender, pending_receiver) = tokio::sync::mpsc::channel(1);
         let socket = Arc::new(RdmaSocket::new(
             poller
@@ -2749,6 +3296,7 @@ mod tests {
             pending_sender,
             poller.waker(),
             RdmaSocketConfig {
+                supervisor: state.socket_pool.task_supervisor_handle(),
                 max_msg_size: 1024,
                 max_large_msg_size: 0,
                 max_inflight_large_bytes: 128 << 20,
@@ -2759,6 +3307,7 @@ mod tests {
                     same_connectivity_domain: true,
                 },
                 read_timeout: None,
+                settle_grace: Duration::from_millis(100),
                 read_permits: Arc::new(tokio::sync::Semaphore::new(1)),
                 bandwidth_limiter: Arc::new(RdmaBandwidthLimiter::new(
                     device.info().name.clone(),
@@ -2770,14 +3319,6 @@ mod tests {
                 sq_read_cap: 1,
             },
         ));
-        let (state, _stop) = State::create(
-            Router::default(),
-            &SocketPoolConfig {
-                rdma: None,
-                ..Default::default()
-            },
-        )
-        .unwrap();
         let supervisor = TaskSupervisor::create();
         let counts = Arc::new(vec![AtomicUsize::new(0)]);
         let ring_total = Arc::new(AtomicUsize::new(0));
@@ -2869,7 +3410,7 @@ mod tests {
             conn.ready_to_remove(),
             "the flush CQE must settle the receive ledger"
         );
-        poll_loop.shutdown_cleanup();
+        poll_loop.shutdown_cleanup(Instant::now());
         // Removing poller state cannot release CQ capacity while another socket
         // owner may still submit work. Destruction plus a later drain does.
         assert_eq!(poller.shared.budget.snapshot().1, 1);

@@ -1,8 +1,6 @@
 //! Logical space layouts and checked segment traversal.
 
-use ruapc_bufpool::Buffer;
-
-use crate::{MemoryError, MemoryErrorKind, MemoryResult};
+use crate::{BufferView, MemoryError, MemoryErrorKind, MemoryResult};
 
 /// Maximum number of segments in a logical memory space.
 pub const MAX_REGIONS: usize = 64;
@@ -40,7 +38,7 @@ impl SpaceLayout {
     }
 
     /// Builds a layout from the buffers' logical lengths, not their capacities.
-    pub fn from_buffers(buffers: &[Buffer]) -> MemoryResult<Self> {
+    pub fn from_buffers<B: BufferView>(buffers: &[B]) -> MemoryResult<Self> {
         Self::from_lens(buffers.iter().map(|buffer| buffer.len() as u64))
     }
 

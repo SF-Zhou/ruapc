@@ -7,6 +7,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 ## [Unreleased]
 
 ### Added
+
+- `Client::with_buffers(&sources, destinations).run(...)` borrows sources safely
+  and returns `Completed<R>` with optional original destinations outside the
+  unchanged closure result, on success or error. `Some` returns every original
+  destination; `None` abandons their recovery
+  after cleanup grace while pending local DMA retains its storage in the
+  background. An otherwise successful typed call reports `BufferRecoveryTimeout`
+  if its destination cannot be recovered; an existing application error is preserved.
+- Buffered client builders expose only consuming `run`. Typed and raw buffered
+  requests use the temporary `&ClientWithBuffers` inside its callback, with no
+  public handle construction or separate recovery path. The unsafe facade's
+  `BorrowedBuffers` builder follows the same scope boundary.
+- `Context::remote_write(ops, &buffers)` and `remote_write_all(&buffers)` safely
+  borrow local sources. Streams copy into owned request bytes; RDMA exports only
+  region metadata. No source snapshot is retained for background CPU access, and
+  cancelled source writes need no local DMA settlement or ownership recovery.
+- Separate `ruapc-unsafe` provides unsafe `ClientBuffersExt::borrow_buffers` and
+  `ContextBuffersExt::remote_read` for real references. The caller guarantees
+  memory lifetime, exclusion and complete polling; handles and lengths stay in
+  place. No per-buffer Arc, access lock or busy check is added. Core still forbids
+  unsafe code; RDMA configuration remains feature-gated.
+- `ClientBuffersExt::with_buffers_unchecked` borrows caller-validated sources
+  with owned destinations and returns the same `Completed<R>` as the safe
+  builder. It and `borrow_buffers` check source msgids directly, skipping the
+  original future's confirmation. CPU copies still run inside that future.
+  Started calls must not be forgotten; ordinary cancellation remains supported
+  with owned destinations. Borrowed destinations still require completion.
+- `WriteBuffer` destination capabilities share one READ engine between
+  owned buffers and explicitly unsafe metadata snapshots. `prepare_reads`
+  accepts `Vec<WriteBuffer>` and returns the same `ReadCompletion` / `ReadOutcome`
+  for both input modes. Owned callers convert with `WriteBuffer::from` and
+  recover their Buffers with `into_owned` after settlement.
+- `Context::own_buffers` returns optional original read destinations alongside
+  ordinary transfer results from the shared engine, with the same cleanup-grace
+  policy for owned destinations.
+- `rdma.remote_memory.settle_grace_ms` controls the grace before closing a
+  connection with failed or abandoned READ work, defaulting to 100 ms. Cleanup
+  still requires real completion evidence. Owned adapters can return without
+  buffers at grace expiry; borrowed calls continue waiting for recovery.
 - `ruapc-memory` provides logical spaces, copy validation and planning,
   synchronous CPU gather/scatter, and immutable read sources without the RPC
   runtime, an async executor or verbs. `CopyBatch` reuses structural validation;
@@ -30,37 +69,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   APIs.
 
 ### Changed
+
+- **BREAKING**: `ruapc-rdma::ReadCompletion` returns `ReadOutcome` with the
+  transfer result and every original `WriteBuffer` capability on both success and
+  failure. Failure records its first reason without an early public result.
+  `ReadPosting::cancel` now settles its unposted suffix and returns `()`;
+  recover buffers through the completion future.
+- Client read sources use a bounded command channel per request. Only the
+  original future accesses its source reference and confirms safe sources'
+  post-READ validity; a forgotten safe future cannot falsely validate reused
+  data. Explicit unsafe sources use the caller's contract for direct validation.
+  Source snapshots,
+  ownership recovery and reader locks are no longer needed.
+- Buffered calls close write targets before exposing success or error results;
+  borrowed calls settle their destinations before returning, while owned calls
+  may return without buffers after cleanup grace.
+  Target recovery does not depend on `Arc` uniqueness. Safe source references
+  preserve read-then-validate without waiting for remote READs. Forgotten owned
+  futures cannot prematurely release posted destinations.
+- RDMA teardown closes a synchronous posting gate, drains real completion/flush
+  CQEs and explicitly destroys the provider QP before retiring its reservation.
+  Retained socket handles cannot delay destruction. Shutdown performs the same
+  drain; an unrecoverable CQ polling failure aborts rather than inventing
+  completion evidence. CQ credit reuse still requires a retirement snapshot
+  followed by an empty poll.
+- RDMA teardown now aborts on a rejected provider ERR transition, a poller
+  panic, or missing completions at the fixed 30-second teardown deadline.
+  Ordinary close and shutdown preserve completion ownership until real CQEs
+  settle; a deadline never authorizes returning buffers. See the
+  [closing contract](docs/qp-registry.md#closing-a-connection), including the
+  limits of a deadline checked by the poll thread itself.
 - **BREAKING**: `MsgMeta::read_regions` and `write_regions` now use
   `thin_vec::ThinVec<RemoteBufferInfo>` instead of `Vec`, reducing inline
   metadata size. Use `.into()` or iterator `.collect()` when constructing
   these fields. Named-field MessagePack encoding and defaults are unchanged.
-- **BREAKING**: `SentBuffers`, `WithBuffers<T>` and `ResultWithBuffers<T>`
-  are replaced by `WriteReceipt`, `BufferReply<T>` and `ResultBufferReply<T>`.
-  `Context::remote_write`, `remote_write_all` and `sent_nothing` return receipts;
-  use `into_reply` instead of `reply`, and `source_buffers` / `take_sources`
-  instead of `buffers` / `take_buffers`. Replies expose `response()` instead
-  of `rsp()`. Handlers, `Client` and `ClientWithBuffers` share the declared
-  result type through static response dispatch, including aliases and custom
-  errors. Only the application response is serialized. See the
-  [remote-memory guide](docs/remote-memory.md).
-- **BREAKING**: `ClientWithBuffers::take_read_buffers` and `take_write_buffers`
-  return `BufferAvailability` instead of `Option<Vec<Buffer>>`.
-  `BufferReply::destinations()` reports this state, and `into_parts()` returns
-  `(T, BufferAvailability)`. `NotAttached`, `Available(Vec<Buffer>)` and
-  `Unavailable` distinguish missing attachments, recoverable sets (including
-  explicitly attached empty sets), and unavailable memory. Transfer success
-  is separate from local buffer availability.
-- **BREAKING**: `with_read_buffer` and `with_read_buffers` on `Client` and
-  `ClientWithBuffers` validate attachments immediately and return
-  `Result<_, RemoteIoError>`. Errors retain the supplied buffers; a failed
-  consuming replacement releases the wrapper's previous attachments.
-- **BREAKING**: `RemoteIoError::buffers` and `take_buffers` are renamed to
-  `recovered_buffers` and `take_recovered_buffers`; their return types remain
-  `Option`.
-- **BREAKING**: Empty and all-zero remote-memory transfers now validate the
-  connected context, attached spaces, layouts and operation limits before
-  skipping checkout and I/O. Use `ctx.sent_nothing().into_reply(value)` for an
-  intentional no-transfer reply that does not access remote memory.
+- **BREAKING**: Owned handler transfers use `ctx.own_buffers(local)` and return
+  `Completed<Result<()>, Vec<Buffer>>`. Unsafe borrowed transfers in the separate
+  facade return ordinary `Result<()>`; both provide `_all` variants.
+  `remote_read_allocated()` provides explicit destination allocation.
+  Handlers and generated clients share ordinary `Result<T, E>` types, including
+  aliases and custom errors, with no buffer-specific reply contract.
+- **BREAKING**: Empty and all-zero remote-memory transfers validate the context,
+  spaces, layouts and operation limits before skipping I/O. An intentional
+  no-transfer handler simply returns its application result.
 - `CopyOp`, `RemoteSpace` and the region/operation limits move to `ruapc-memory`
   and remain re-exported by `ruapc`. `CopyOp::schema_id()` now uses the
   `ruapc_memory` module prefix; its schema name and wire fields are unchanged.
@@ -68,6 +119,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   bandwidth charges are resolved once per request and reused across retries;
   RDMA write-target planning and checkout use one mutex guard, preserving
   the complete target when planning fails.
+- Buffered calls build each attachment layout once; runtime read sources cache
+  only their total length outside the checked memory collection. Explicit and
+  whole-space transfers share preparation without rebuilding the same layout.
+  Response waiters release attachment holds before sending only the response
+  message; the calling scope retains the target for recovery.
 - **BREAKING**: RDMA uses the shared `frame` format and `RdmaService/offer`
   and `RdmaService/finish` RPCs instead of private large-payload control frames.
   Connection bootstrap, payload transfer and health probes share `RdmaService`;
@@ -104,10 +160,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   [benchmark guide](docs/benchmark.md#allocator).
 
 ### Removed
-- **BREAKING**: `SentBuffers::merge` and `WithBuffers::into_buffers`. Use
-  `WriteReceipt::take_sources` to recover sources from each receipt and
-  `reply.into_parts().1.into_available()` to extract available
-  destinations.
+- **BREAKING**: Ownership-carrying attachment builders, `take_*_buffers`,
+  `ReadBuffers`, `BufferAvailability`, `WriteReceipt`, `BufferReply`,
+  `ResultBufferReply`, `RemoteIoError` and `sent_nothing`. Use borrowed inputs or
+  `Completed<R>` from an owning adapter; error handling no longer consumes buffers.
 - **BREAKING**: `SocketTrait::remote_read` and `SocketTrait::remote_write`.
   Execute transfers through the corresponding `Context` methods.
 - **BREAKING**: `ReflectionService`, its `_ruapc.meta/describe` and

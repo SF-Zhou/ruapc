@@ -38,9 +38,11 @@ Run from the workspace root:
 ```bash
 cargo bench -p ruapc --bench echo
 cargo bench -p ruapc --bench remote_memory
+cargo bench -p ruapc-unsafe --features rdma --bench buffer_modes
+cargo bench -p ruapc-unsafe --features rdma --bench source_validation
 ```
 
-Both harnesses run a UNIFIED server and client in one process, measuring
+These harnesses run a UNIFIED server and client in one process, measuring
 TCP, WebSocket, HTTP and RDMA with MessagePack payloads. They require the
 [libibverbs build prerequisites](../CONTRIBUTING.md) because `ruapc`'s self
 dev-dependency enables RDMA. RDMA measurements additionally need a usable device
@@ -51,11 +53,14 @@ and sufficient locked-memory allowance.
 | [`echo`](../ruapc/benches/echo.rs), serial | One request at a time, 16 B and 4 KiB payloads | 1,000 warmups and 5,000 measured requests per size |
 | `echo`, concurrent | 16 B payload, 64 or 1,024 tasks | 256,000 requests per case, split evenly across tasks |
 | [`remote_memory`](../ruapc/benches/remote_memory.rs) | Serial 64 KiB and 1 MiB reads/writes with full-pattern verification | 8 warmups; 512 measured requests for 64 KiB, 128 for 1 MiB |
+| [`buffer_modes`](../ruapc-unsafe/benches/buffer_modes.rs) | Serial 64 KiB and 1 MiB roundtrips through both owned and borrowed call adapters, with full-pattern verification | 100 warmups and 1,000 measured roundtrips per size and adapter |
+| [`source_validation`](../ruapc-unsafe/benches/source_validation.rs) | Repeated source probes and 64 KiB reads within one pending request; safe and caller-validated sources, idle and synthetic CPU load | 200 warmups and 10,000 measured samples per operation and case |
 
 Echo also runs concurrent RDMA cases with one endpoint containing two bootstrap
 addresses on the same server. Both addresses share one peer's stripe set.
 Its pool limit is 1 GiB per context and its Tokio worker count uses the runtime
-default. Remote memory uses 512 MiB per context and four runtime workers.
+default. Remote memory, buffer modes and source validation use 512 MiB per
+context and four runtime workers.
 Keep these settings fixed across compared versions.
 
 The harnesses read these controls before timing:
@@ -65,7 +70,10 @@ The harnesses read these controls before timing:
 | `RUAPC_BENCH_TRANSPORT` | Select `TCP`, `WS`, `HTTP` or `RDMA`; unset measures all. |
 | `RUAPC_BENCH_RDMA_DEVICE` | Set both peers' `rdma.path.device_filter` to one local device; unset uses automatic selection. |
 | `RUAPC_BENCH_SERIAL_ITERS` | Positive measured count for every serial case; does not change concurrent echo cases. |
-| `RUAPC_BENCH_WARMUP_ITERS` | Warmup count for serial cases; echo permits zero, remote memory requires a positive count. |
+| `RUAPC_BENCH_WARMUP_ITERS` | Warmup count for serial cases; echo permits zero, other RPC harnesses require a positive count. |
+| `RUAPC_BENCH_BUFFER_MODE` | For `buffer_modes` only, select `owned` or `borrowed`; unset measures both. |
+| `RUAPC_BENCH_SOURCE_MODE` | For `source_validation` only, select `safe` or `unchecked`; unset measures both in the same binary. |
+| `RUAPC_BENCH_SAMPLES_FILE` | For `source_validation` only, write every sample to a new CSV file; existing files are never overwritten. |
 
 For example:
 
@@ -76,19 +84,87 @@ RUAPC_BENCH_WARMUP_ITERS=1000 RUAPC_BENCH_SERIAL_ITERS=5000 \
   cargo bench -p ruapc --bench remote_memory
 ```
 
-Echo skips any transport whose probe fails. Remote memory skips failed RDMA
-probes and aborts on TCP/WS/HTTP probe failure. Retain every skip in results:
+Echo skips any transport whose probe fails. Remote memory and buffer modes skip
+failed RDMA probes and abort on TCP/WS/HTTP probe failure. Retain every skip in results:
 a successful process exit does not mean every transport was measured.
+Source validation requires each selected transport to be available and aborts
+on any probe failure.
 
 Echo consumes successful responses with `black_box` without comparing contents.
 Concurrent timing includes task creation; its `us/op` divides total wall time
 by requests per task, not individual latency samples. Remote-memory timing
 excludes setup, initial registration and warmup, and reuses sources and write
 destinations. It includes full-pattern verification and per-call
-`remote_read_all` destination allocation. Each transfer uses one full-span copy
+`remote_read_allocated` destination allocation. Each transfer uses one full-span copy
 operation with one source and destination buffer. Fragmented, multi-operation
 RPCs are not measured by this harness; the standalone memory benchmarks isolate
 those CPU and planning workloads.
+
+### Owned and borrowed buffer adapters
+
+`buffer_modes` measures one complete service roundtrip: the server calls
+`remote_read_allocated` on the client's source, verifies every byte, calls
+`remote_write_all` to copy the data into the client's destination, and replies.
+The client then verifies the complete returned pattern. Each operation includes
+both transfer directions, so its `us/op` is not directly comparable with a
+single-direction `remote_memory` case.
+
+The two modes run this same service with `with_buffers(&sources, destinations).run(...)` and
+unsafe `borrow_buffers(...).run(...)`. The latter runs from `ruapc-unsafe`;
+it uses direct source validation and borrowed destinations. Its futures always
+complete and never exercise cancellation. Client allocations are
+reused, and their identity is checked outside timing. Timing excludes setup,
+initial allocation/registration and warmup; it includes repeated attachment
+layout preparation, access settlement, server destination allocation and
+full-pattern verification. The output records amortized wall time in `us/op`,
+the iteration count and raw `elapsed_ns`, not a latency distribution. MessagePack,
+the four-worker runtime and the process allocator above are identical for both
+modes.
+
+For example:
+
+```bash
+RUAPC_BENCH_TRANSPORT=RDMA RUAPC_BENCH_RDMA_DEVICE=mlx5_0 \
+  RUAPC_BENCH_BUFFER_MODE=borrowed RUAPC_BENCH_WARMUP_ITERS=100 \
+  RUAPC_BENCH_SERIAL_ITERS=1000 cargo bench -p ruapc-unsafe --features rdma --bench buffer_modes
+```
+
+Use identical harness sources and timing scopes for version comparisons; an
+older owning API needs an equivalent adapter before it is a baseline for this
+roundtrip. Keep such comparison adapters and raw results outside `docs/` and
+follow [the comparison method](#comparing-results).
+
+### Source confirmation
+
+`source_validation` compares safe `with_buffers` with unsafe
+`with_buffers_unchecked` in the same release binary. Both use an empty owned
+destination vector and the same service. A pending original request holds a
+64 KiB source while the server measures repeated `request_is_pending` probes,
+then `remote_read_allocated` calls. Every probe must return true; every READ's
+complete payload is checked after timing. Original sources remain immutable
+and every started call is driven to completion in both modes.
+
+The reported mean, p50, p99 and maximum are individual operation latencies.
+Setup, source-scope creation, registration and warmup are outside the timed
+loops. READ timing includes allocation, transfer and source validation, but
+excludes payload verification. This does not measure per-request mailbox
+creation or a full application RPC. The CSV records transport, load,
+`source_mode`, operation, sample index and latency in nanoseconds.
+
+Each transport runs idle and `synthetic_cpu` cases. The latter adds four tasks
+that each perform about 50 microseconds of CPU work before yielding. The source
+request itself runs on a Tokio worker. This exposes scheduling sensitivity;
+it is not a production latency objective.
+
+For a repeated comparison, build once and run three pairs of separate processes
+with `RUAPC_BENCH_SOURCE_MODE=safe` and `unchecked`, alternating their order and
+keeping the same transport, CPU/NUMA placement and device settings. Retain all
+CSV samples and report variation across pairs. For example:
+
+```bash
+RUAPC_BENCH_SOURCE_MODE=unchecked RUAPC_BENCH_SAMPLES_FILE=/tmp/source-unchecked.csv \
+  cargo bench -p ruapc-unsafe --features rdma --bench source_validation
+```
 
 ## Wire codecs
 

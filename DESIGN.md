@@ -15,6 +15,7 @@ rustdoc.
 | `ruapc-schema` | Schema registry and OpenAPI projection | None |
 | `ruapc-wire` | Message codecs, framing and codec errors | Bufpool |
 | `ruapc` | RPC lifecycle, routing, transports and remote-memory execution | Bufpool, memory, macro, schema, wire; optional RDMA |
+| `ruapc-unsafe` | Explicit unsafe reference facade over the common storage executor | Core, bufpool |
 | `ruapc-demo` | Service host, typed caller and verified workloads | `ruapc` |
 
 Transport selection uses concrete enums (`Socket`, `SocketPool`, `HttpSocket`)
@@ -23,7 +24,10 @@ registrars are the trait-object extension boundaries.
 
 The core, memory and wire crates forbid unsafe code. Allocation, registration
 and verbs belong in bufpool and RDMA, whose APIs enforce local memory ownership
-and completion evidence. See [safety boundaries](docs/safe-boundaries.md) for these
+and completion evidence. The separate `ruapc-unsafe` leaf accepts caller lifetime
+and access promises only through unsafe methods; its destination snapshots and
+caller-validated source capabilities are created at bufpool's unsafe boundary.
+See [safety boundaries](docs/safe-boundaries.md) for these
 contracts and the separate application-source validation scheme.
 Bufpool allocation and RDMA completion futures are runtime independent.
 They share a safe single-value notification implementation in bufpool's hidden
@@ -35,11 +39,11 @@ the dependencies retain buffer ownership and completion authority.
 
 | Module | Responsibility |
 |---|---|
-| `client` | Settings, attachments, connection acquisition, retries and response decoding |
+| `client` | Settings, owned/borrowed call adapters, attachments, connection acquisition, retries and response decoding |
 | `core` | Contexts, listeners, method registration and handler admission |
 | `msg` | Owned messages and payloads, delegating codecs to `ruapc-wire` |
 | `sockets` | Concrete transports, connection queues, maps and closure |
-| `remote_memory` | Context transfer APIs, inline reverse RPCs, write targets and completion witnesses |
+| `remote_memory` | Context transfer APIs, source command channels, write targets and completion witnesses |
 | `rdma` | Path selection, bootstrap, READ execution and CQ polling |
 | `task` | Background-task supervision and response waiters |
 | `metrics` | Cached recorder handles and scoped request accounting |
@@ -53,16 +57,31 @@ wire names, HTTP discovery and handler prerequisites.
 
 The service macro implements each declared service trait for `Client` and
 `ClientWithBuffers`. Handlers and clients share the same method return types;
-the internal response contract selects decoding and buffer recovery without
+the internal response contract selects decoding without
 changing those types. See the [service macro](ruapc-macro/src/lib.rs) for the
 declaration rules.
+`ClientWithBuffers` executes owned or explicitly unsafe borrowed storage through
+one engine, and is available only by reference inside a builder's consuming
+`run` callback. `OwnedBuffers` and the unsafe facade's `BorrowedBuffers` expose
+no direct typed or raw calls; the execution handle cannot escape the callback.
+Client sources stay borrowed in the calling future. Owned adapters move destination
+Buffer vectors into that engine and return
+recovered originals as `Some` in `Completed<R>::buffers` outside the service
+result, or `None` when recovery exceeds cleanup grace. Direct source writes use
+safe `Context::remote_write(ops, &[Buffer])`, without moving source handles or
+publishing dereferenceable borrowed snapshots. The `ruapc-unsafe`
+extension traits accept destination references under an explicit lifetime and
+no-cancellation contract, and provide `with_buffers_unchecked` for direct source
+validation with owned destinations. Caller-validated sources skip the original
+future's validation reply; CPU copies still run in that future. No mode adds
+per-buffer shared owners or access checks.
+See the [remote-memory guide](docs/remote-memory.md#borrow-or-transfer-buffer-ownership).
 
 `ruapc-wire` owns `MsgMeta`, `MsgFlags`, direct serialization, shared transport
 frame codecs, and `CodecError`. It accepts payload byte slices and reports
 encoding, decoding, framing and argument failures without depending on the
 RPC runtime or verbs. The core owns `Message` / `Payload` storage and the
-`ErrorKind` / `Error` / `Result` API, including typed RDMA error conversion and
-`RemoteIoError` recovery. `Message::parse` and `Payload::deserialize` delegate to
+`ErrorKind` / `Error` / `Result` API, including typed RDMA error conversion. `Message::parse` and `Payload::deserialize` delegate to
 wire codecs and retain their `ruapc::Result` signatures, mapping failures to the
 original RPC error categories. Storage hooks and RDMA
 frame callbacks propagate caller errors through static generic dispatch. See
@@ -80,9 +99,8 @@ See [endpoint identity](docs/endpoints.md) for normalization and caller obligati
 
 ## Request lifecycle
 
-1. Generated methods enter `client/call.rs`. Plain and buffer-returning calls
-   use the same executor in `client/request.rs`; the result type selects the
-   response contract.
+1. Generated methods enter `client/call.rs`. Plain and attached-buffer calls
+   use the same executor in `client/request.rs` and preserve the service result.
 2. The client validates attachments and acquires a connection for its endpoint.
    The transport pool tries the group's equivalent addresses within the
    connection budget, independently of the request retry count.
@@ -104,9 +122,20 @@ See [endpoint identity](docs/endpoints.md) for normalization and caller obligati
    Running handlers are not cancelled by deadline expiry; they can poll
    `Context::is_expired()`.
 7. A response, connection failure, cancellation guard or expiry sweep removes
-   the waiter. Response expiry uses a shared 50 ms sweep, subject to scheduler
+   the waiter. Response delivery drops the waiter's attachment holds before
+   waking its receiver with the `Message`; the calling scope keeps its target
+   for recovery. Response expiry uses a shared 50 ms sweep, subject to scheduler
    delay. Unary HTTP allocates its response waiter after receiving the complete
    request body.
+8. Before returning a buffered result, the client seals its write target and
+   recovers the original destinations. Owned calls may abandon recovery after
+   cleanup grace and return without buffers while posted storage remains held
+   by completion machinery; borrowed calls wait for settlement. The outer `run`
+   adapter also recovers a target left by a cancelled inner method. Source
+   references stay in the calling future, which services copy and validation
+   commands while waiting for the response. Dropping it closes its command
+   receiver; forgetting it prevents further validation. Neither waits for remote
+   READ completion. See [ownership boundaries](docs/safe-boundaries.md).
 
 Connection closure is idempotent and eagerly fails its waiters. Eviction checks
 connection identity so an old connection cannot remove its replacement. RDMA
@@ -177,45 +206,52 @@ buffers, and the memory crate owns synchronous CPU gather/scatter operations.
 `CopyBatch` checks operation structure once and caches the required source and
 destination extents. Gather checks the actual source, scatter checks the actual
 destination and packed byte count, and planning checks both real layouts.
-`BufferSet` owns buffers with a cached layout; callers can change buffer lengths
+`BufferSet<B>` owns buffers or established access capabilities with a cached
+layout; callers can change buffer lengths
 only by consuming the set. Slice traversal validates its range before invoking
 callbacks. The crate also owns `RemoteSpace` and immutable `ReadSource` buffers,
 independently of the RPC runtime, async executors and verbs. `ruapc` re-exports
 the public copy-space types and converts memory errors into RPC errors.
-The RDMA dependency independently validates the owned destination plan before
+The RDMA dependency independently validates the exclusive destination plan before
 posting.
 
 | Component | Role |
 |---|---|
-| `ruapc-memory` | Space validation and planning, CPU gather/scatter and immutable sources shared by wrappers, pending requests and inline readers |
+| `ruapc-memory` | Space validation and planning, CPU gather/scatter and immutable source views |
+| `client/buffers.rs` | Owned result containers around the shared storage executor |
 | `context.rs` | Public transfer APIs |
-| `transfer.rs` | Owned preparation, convenience allocation and centralized enum dispatch |
+| `transfer.rs` | Storage preparation, allocation and centralized enum dispatch |
 | `rpc_transfer.rs` | Reverse-RPC protocol, handlers and TCP/WS/HTTP fallback |
-| `write_target.rs` | Exclusive destination checkout for CPU copies or owned RDMA READ plans |
-| `reply.rs` | Write receipts and shared reply types with local destination availability |
+| `read_source.rs` | Bounded source commands and safe or caller-validated source confirmation |
+| `write_target.rs` | Exclusive destination checkout, access closure and original storage restoration |
 | `rdma/rdma_socket/read.rs` | Concrete READ planning and execution |
 | `rdma/rdma_socket/read/credits.rs` | SQ/NIC admission, closure and completion credits |
-| `rdma/rdma_socket/read/pending.rs` | Weak READ tracking, deadline policy and failure notification |
+| `rdma/rdma_socket/read/pending.rs` | Weak READ tracking, first-failure recording and cleanup-grace policy |
 
 Public `Context` methods prepare each transfer once. Preparation binds the
-request context, remote space, checked batch and owned local buffers with their
+request context, remote space, checked batch and buffer capabilities with their
 layout through private read/write objects. The executor selects the transport through the
 `Socket` enum, which also dispatches message sends. Incoming reverse RPCs validate
 their own peer inputs. Empty batches follow the same preparation checks and then
 skip target checkout and I/O.
 
-Write-target checkout and `WriteReceipt` construction remain private to the
-core runtime. A receipt creates a `BufferReply<T>`, the return type shared by
-handlers and clients. It carries the application response and local destination
-availability; only the application response is serialized. Waiters retain source
-and target ownership through the request lifecycle. Inline writes hold a target's
-mutex for the complete batch and copy through its cached `BufferSet`. Read sources likewise
-cache their validated layouts. The memory crate supplies these synchronous
-operations without its own request registry or completion authority.
+Write-target checkout remains private to the core runtime. Public transfers
+use safe source references, owned read destinations, or unsafe destination
+references in the separate facade;
+services retain ordinary `Result<T, E>` declarations. Waiters retain source command
+senders and target access through the request lifecycle. Inline writes hold a
+target's mutex for the complete batch.
+Recovery closes the target against stale handles. Borrowed calls wait for the
+original storage; owned calls may return without buffers after cleanup grace,
+leaving posted storage held through background settlement. Source references
+never enter independent runtime tasks. Pure memory collections remain
+independent of request tracking and completion authority.
 
 RDMA transfers use READ in both directions: `remote_write` asks the client to
-read the server's source. Application reads validate the original waiter after
-READ completion; large serialized messages use a separate finish protocol.
+read the server's source. After READ completion, application reads obtain
+validation from the original source future, or check the msgid directly for
+explicit caller-validated sources. Large serialized messages use a separate
+finish protocol.
 See the [API guide](docs/remote-memory.md) for use and recovery, and
 [safety boundaries](docs/safe-boundaries.md) for success assumptions and failure behavior.
 
@@ -227,6 +263,10 @@ connection owns its NIC pair; peer identity is its bootstrap transport and
 complete normalized group of user-declared bootstrap addresses. Group addresses
 must share server state and lease records; different or overlapping groups
 remain independent.
+The core's `ReservedQueuePair` gates synchronous provider operations and permits
+explicit destruction while a socket handle remains cached. The poller closes
+posting, drains real READ and receive/ACK completions, destroys the QP and then
+retires CQ capacity; the later empty-poll retirement proof remains separate.
 
 | Contract | Reference |
 |---|---|
@@ -237,8 +277,11 @@ remain independent.
 
 ## Buffer-pool ownership
 
-The pool combines buddy allocation, slabs and thread caches. Public buffers
-retain the pool; internal backing tokens avoid ownership cycles. See the
+The pool combines buddy allocation, slabs and thread caches. Each public Buffer
+uniquely owns its allocation and retains the pool; internal backing tokens avoid
+ownership cycles. Ordinary Buffer layout, byte access and release do not carry
+shared-allocation counters or access checks. `WriteBuffer` capabilities wrap
+moved destinations or explicitly unsafe borrowed raw destination metadata. See the
 [bufpool guide](ruapc-bufpool/README.md) for allocation, lock order and internals.
 
 `BufferPool` holds an immutable `Vec<Arc<dyn MemoryRegistrar>>`. The runtime

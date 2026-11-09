@@ -64,10 +64,13 @@ leases. An occupied-QPN failure never removes the existing lease. This also
 handles the interval in which a provider reuses a destroyed QPN before its old
 Rust lease has retired.
 
-Final QP destruction precedes release of identity leases, SEND/RECV buffers
-and READ destinations. If provider destruction fails, the process aborts
-before releasing memory still accessible to DMA. Removing a core poller entry
-does not destroy a QP retained by another socket owner.
+Reclamation through QP destruction destroys the provider before releasing its
+identity lease or any remaining SEND/RECV buffers and READ destinations.
+If provider destruction fails, the process aborts before releasing memory still
+accessible to DMA. The core explicitly destroys the provider before removing
+a closed connection; retained socket handles cannot postpone that boundary.
+See [poller closing](qp-registry.md#closing-a-connection) for the posting gate
+and completion drain that precede it.
 
 Reclamation through completion processing requires all of the following:
 
@@ -131,8 +134,12 @@ protocol is implemented.
 
 ## READ ownership and source lifetime
 
-`QueuePair::prepare_reads` takes owned destination buffers and logical
-buffer-index/offset/length descriptors. It validates bounds, registration,
+`QueuePair::prepare_reads` takes a non-cloneable `WriteBuffer` vector and logical
+buffer-index/offset/length descriptors. `WriteBuffer::from(Buffer)` moves owned
+storage into this same engine without a per-buffer shared allocation or access
+counter. An unsafe borrowed capability supplies raw metadata instead; its constructor's
+caller must keep the real allocation and registration alive. The shared engine
+validates bounds, registration,
 scatter limits, overflow and destination overlap, then resolves local
 addresses and keys internally. Invalid plans return the input buffers without
 posting. Descriptors of all requests in a plan share one allocation. A
@@ -143,26 +150,39 @@ record back. A completion matches the full sequence, so it cannot settle a
 newer request that reused the same slot index, and a READ whose slot is still
 held by an older in-flight READ is recorded in the fallback map instead of
 being rejected. Dropping the cursor accounts for unposted requests without
-releasing posted memory. `ReadPosting::cancel` can recover buffers only before
-any request has posted.
+releasing posted memory. `ReadPosting::cancel` records cancellation and accounts
+for the unposted suffix; the completion future is the single return path for
+the original buffers, even when nothing was posted.
 
 After the unposted suffix is accounted for, destinations remain owned until
 every posted READ has a success/error/flush completion or the QP is destroyed.
-The waiting receiver gets buffers only if the entire batch succeeds. Failure
-notification can precede recovery; dropping, cancelling or forgetting the
-waiting future never authorizes early release. See
+The waiting receiver gets `ReadOutcome { result, buffers }`: every normal
+completion returns the original storage vector, in its original order, whether
+the batch succeeded or failed. Owned callers can extract their original Buffers
+from those capabilities with `into_owned`. The first failure is recorded while
+work remains pending; it does not produce an early public result. Dropping, cancelling or
+forgetting the waiting future never authorizes early release of owned buffers.
+Borrowed metadata cannot retain its allocation; preserving that allocation is
+an unsafe caller obligation. See
 [READ admission and failure](rdma-capacity.md#read-admission-and-failure) for
 permits, deadlines and teardown.
 
-`ReadCompletion` publishes the result through a runtime-independent future.
+`ReadCompletion` publishes through a runtime-independent future.
 Its lifetime is separate from the buffer-owning batch, so retaining the future
 cannot keep its own producer alive after QP destruction. Weak `ReadHandle`s
-allow observation and early failure notification; neither a handle nor its
-temporary strong `ReadObservation` can settle work or recover buffers.
+allow progress observation, failure recording and inspection of the first
+failure reason. Dropping an unfinished completion records `Cancelled`, allowing
+runtime cleanup even without a request or READ deadline. Neither a handle nor
+its temporary strong `ReadObservation` can settle work or recover buffers.
+Successful provider destruction settles the QP's retained READ ledger entries;
+an unposted suffix still requires its posting cursor's accounting.
 Deadline registration and failure policy belong to the core's
 [READ admission layer](rdma-capacity.md#read-admission-and-failure).
 `QueuePair::read_slot_spills` counts fallback-map use per QP for diagnosis; the
 fallback changes cost only, never ownership or ordering.
+Inserting a duplicate into an occupied fallback entry preserves its DMA hold
+and triggers a release-build assertion before provider posting. This defensive
+check does not replace the SQ sequence allocator's uniqueness guarantee.
 
 This is a local destination guarantee. Application sources follow the separate
 [read validation and recovery contract](safe-boundaries.md#application-read-source-validation-and-recovery),

@@ -178,8 +178,7 @@ mod tests {
             RdmaConnDirection, RdmaSocket, StripePhase, probe_connection,
             test_utils::small_rdma_config,
         },
-        remote_memory::ReadSource,
-        remote_memory::RequestStatusRequest,
+        remote_memory::{RequestStatusRequest, SourceSender},
         service,
     };
 
@@ -285,7 +284,7 @@ mod tests {
         fault: Fault,
         attempts: usize,
         dropped: usize,
-        source: Option<Weak<ReadSource>>,
+        source: Option<SourceSender>,
     }
 
     #[derive(Clone, Default)]
@@ -347,14 +346,11 @@ mod tests {
                             && matches!(observations.fault, Fault::DropReadValidation)
                         {
                             // This reverse RPC is sent only after the real READ
-                            // completed. Capture ownership without extending it.
+                            // completed. Retain only its source mailbox sender;
+                            // this cannot keep the borrowing request alive.
                             let request: RequestStatusRequest =
                                 payload.deserialize(&ctx.msg_meta)?;
-                            observations.source = ctx
-                                .state
-                                .waiter
-                                .read_source(request.request_id)
-                                .map(|source| Arc::downgrade(&source));
+                            observations.source = ctx.state.waiter.read_source(request.request_id);
                             observations.attempts += 1;
                             observations.dropped += 1;
                             true
@@ -679,13 +675,13 @@ mod tests {
             .unwrap()
             .source
             .clone()
-            .expect("post-READ validation must still own its original source");
-        assert!(source.upgrade().is_some());
+            .expect("post-READ validation must still have its source mailbox");
+        assert!(!source.is_closed());
         let client_state = Arc::downgrade(&fixture.context.state);
         let server_state = Arc::downgrade(fixture.server.state());
         fixture.shutdown().await;
         wait_until(|| {
-            source.upgrade().is_none()
+            source.is_closed()
                 && client_state.upgrade().is_none()
                 && server_state.upgrade().is_none()
         })

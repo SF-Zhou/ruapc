@@ -1,6 +1,6 @@
 use clap::Parser;
 use hdrhistogram::Histogram;
-use ruapc::{Buffer, Client, ClientWithBuffers, Context, Endpoint, Error, ErrorKind, Result};
+use ruapc::{Buffer, Client, Context, Endpoint, Error, ErrorKind, Result};
 use ruapc_demo::{
     EchoService, GreetService, MemBenchService, ReadCrcReq, Request, WriteCrcReq,
     app::{PoolOptions, RuntimeOptions, init_tracing},
@@ -107,21 +107,20 @@ enum Rpc {
 }
 
 // Each worker owns one operation; prepared buffers are reused across calls.
-// Read sources remain immutable, and failed writes recover buffers only
-// after RuaPC has released their ownership.
+// Sources stay local; recovered destinations are reused or replaced on the next call.
 struct Workload<'a> {
     client: &'a Client,
-    operation: Operation<'a>,
+    operation: Operation,
 }
 
-enum Operation<'a> {
+enum Operation {
     Echo(Request),
     Read {
-        source: ClientWithBuffers<'a>,
+        source: Vec<Buffer>,
         expected_crc: u32,
     },
     Write {
-        buffers: Option<Vec<Buffer>>,
+        buffers: Vec<Buffer>,
         len: usize,
     },
 }
@@ -142,12 +141,12 @@ impl<'a> Workload<'a> {
                 fill_pattern(&mut buffer, seed);
                 let expected_crc = crc32c_of([&buffer]);
                 Operation::Read {
-                    source: client.with_read_buffer(buffer)?,
+                    source: vec![buffer],
                     expected_crc,
                 }
             }
             Rpc::Write => Operation::Write {
-                buffers: Some(vec![allocate(ctx, buffer_size)?]),
+                buffers: vec![allocate(ctx, buffer_size)?],
                 len: buffer_size,
             },
         };
@@ -170,42 +169,32 @@ impl<'a> Workload<'a> {
                 source,
                 expected_crc,
             } => {
-                let crc = source.read_crc(ctx, &ReadCrcReq {}).await?;
-                verify_crc(crc, *expected_crc)
+                let completed = self
+                    .client
+                    .with_buffers(source, vec![])
+                    .run(async |attached| attached.read_crc(ctx, &ReadCrcReq {}).await)
+                    .await;
+                verify_crc(completed.result?, *expected_crc)
             }
             Operation::Write { buffers, len } => {
-                let destination = match buffers.take() {
-                    Some(buffers) => buffers,
-                    None => vec![allocate(ctx, *len)?],
-                };
-                let call = self.client.with_write_buffers(destination);
-                match call.write_crc(ctx, &WriteCrcReq { len: *len }).await {
-                    Ok(response) => {
-                        let (expected_crc, returned) = response.into_parts();
-                        let returned = returned.into_available().ok_or_else(|| {
-                            Error::new(
-                                ErrorKind::BuffersInUse,
-                                "completed write destinations unavailable".into(),
-                            )
-                        })?;
-                        let received_len: usize = returned.iter().map(|buffer| buffer.len()).sum();
-                        let crc = crc32c_of(&returned);
-                        *buffers = Some(returned);
-                        if received_len != *len {
-                            return Err(Error::new(
-                                ErrorKind::InvalidArgument,
-                                format!("write returned {received_len} bytes, expected {len}"),
-                            ));
-                        }
-                        verify_crc(crc, expected_crc)
-                    }
-                    Err(error) => {
-                        // A failed transfer may leave the target empty even
-                        // after DMA settles. Allocate replacements if needed.
-                        *buffers = call.take_write_buffers().into_available();
-                        Err(error)
-                    }
+                if buffers.is_empty() {
+                    buffers.push(allocate(ctx, *len)?);
                 }
+                let completed = self
+                    .client
+                    .with_buffers(&[], std::mem::take(buffers))
+                    .run(async |attached| attached.write_crc(ctx, &WriteCrcReq { len: *len }).await)
+                    .await;
+                *buffers = completed.buffers.unwrap_or_default();
+                let expected_crc = completed.result?;
+                let received_len: usize = buffers.iter().map(Buffer::len).sum();
+                if received_len != *len {
+                    return Err(Error::new(
+                        ErrorKind::InvalidArgument,
+                        format!("write returned {received_len} bytes, expected {len}"),
+                    ));
+                }
+                verify_crc(crc32c_of(&*buffers), expected_crc)
             }
         }
     }

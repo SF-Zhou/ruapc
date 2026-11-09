@@ -1,0 +1,13 @@
+error[E0599]: no method named `ping` found for struct `OwnedBuffers<'a>` in the current scope
+  --> tests/ui/owned_builder_cannot_call.rs:10:22
+   |
+10 |     let _ = attached.ping(ctx, &()).await;
+   |                      ^^^^ method not found in `OwnedBuffers<'_>`
+   |
+   = help: items from traits can only be used if the trait is implemented and in scope
+note: `ScopeRpc` defines an item `ping`, perhaps you need to implement it
+  --> tests/ui/owned_builder_cannot_call.rs:3:1
+   |
+ 3 | #[ruapc::service]
+   | ^^^^^^^^^^^^^^^^^
+   = note: this error originates in the attribute macro `ruapc::service` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -49,14 +49,14 @@ pub struct MsgMeta {
     pub msgid: u64,
     /// Regions of the sender's registered memory the receiver may *read*
     /// (RDMA READ or reverse-RPC copy). In order, they form one logical
-    /// contiguous space. Attached by `Client::with_read_buffers`; also
+    /// contiguous space. Attached by `Client::borrow_buffers` / `Client::own_buffers`; also
     /// used by the reverse `MemoryService/read_into_target` request to advertise the
     /// server's source buffers.
     #[serde(default, skip_serializing_if = "ThinVec::is_empty")]
     pub read_regions: ThinVec<RemoteBufferInfo>,
     /// Regions of the sender's registered memory the receiver may *write*
     /// (through the internal remote-memory protocol). In order, they form one logical
-    /// contiguous space. Attached by `Client::with_write_buffers`; active RDMA
+    /// contiguous space. Attached by `Client::borrow_buffers` / `Client::own_buffers`; active RDMA
     /// retains the destination even if the request has already resolved.
     #[serde(default, skip_serializing_if = "ThinVec::is_empty")]
     pub write_regions: ThinVec<RemoteBufferInfo>,

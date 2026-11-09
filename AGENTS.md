@@ -13,8 +13,10 @@ Use [DESIGN.md](DESIGN.md) for crate/module ownership and
   and device registration are explicit trait-object extension boundaries.
 - `ruapc`, `ruapc-memory` and `ruapc-wire` forbid unsafe code. Allocation,
   registration and verbs operations belong in `ruapc-bufpool` / `ruapc-rdma`.
-  Safe APIs must enforce memory ownership and completion evidence, not accept
-  caller-supplied lifetime promises.
+  Safe APIs accept owned buffers or already established access capabilities;
+  they do not accept arbitrary caller-supplied lifetime promises. The separate
+  `ruapc-unsafe` leaf crate is the explicit exception: its unsafe reference APIs
+  delegate lifetime and access obligations to the advanced caller.
 - `BufferPool` owns an immutable ordered list of `MemoryRegistrar` trait objects;
   registration indices are pool-local positions. The runtime builds its typed
   RDMA device list in the same order. Stream transports need no registration.
@@ -60,24 +62,67 @@ Use [DESIGN.md](DESIGN.md) for crate/module ownership and
   and transport execution in `ruapc`; convert memory errors at that boundary.
 - Read/write spaces concatenate buffer lengths. Validate bounds, overflow,
   region/op limits and destination overlap before transferring `CopyOp`s.
-- Read attachments own immutable buffers and replace the wrapper's source list.
-  Pending requests and inline readers share that ownership. Recovery requires
-  uniqueness; a failed recovery attempt preserves the source.
+- `Buffer` stays non-Clone with ordinary ownership, slice access and pool return;
+  do not add per-allocation reference counts, access leases or busy checks.
+  Bufpool's `WriteBuffer` holds either a moved Buffer or an unsafe
+  raw metadata snapshot. Borrowed snapshots neither move the original handle nor
+  keep its allocation or registration alive.
+- `Context::remote_write` safely borrows source `&[Buffer]`: streams synchronously
+  gather owned request bytes, and RDMA exports metadata without retaining a
+  dereferenceable source snapshot in the waiter. No local READ uses this source;
+  cancellation needs no source settlement. Normal successful completion keeps
+  the borrow valid through the peer's completed READ.
+- Only the explicit unsafe facade may borrow destination `&mut [Buffer]` without
+  runtime lifetime tracking. Its caller must retain the
+  originals, exclude conflicting access and drive started futures to completion;
+  dropping, forgetting, aborting or unwinding from them violates that contract.
+- Client sources are real `&[Buffer]` borrows held only by the calling future.
+  Each request has a separate bounded source-command channel; waiters retain
+  only its sender and validation mode. The calling future synchronously gathers
+  CPU bytes and confirms the original msgid for safe sources. Explicit unsafe
+  sources may skip that confirmation and directly check waiter membership under
+  their established `ReadSources` capability. No independent task retains source
+  references. Drop closes the channel; forget prevents positive validation for
+  safe sources. Caller-validated sources must not forget or leak started,
+  unfinished method or enclosing `run` futures. Owned destinations still permit
+  ordinary cancellation; borrowed destinations retain their strict contract.
+  Reverse-RPC deadlines bound command delivery and reply waiting. Response
+  delivery releases waiter holds before waking its receiver; the calling scope
+  retains its target and owns recovery. Never bypass a forgotten call's gate.
 - Preserve [read-then-validate](docs/safe-boundaries.md#application-read-source-validation-and-recovery):
-  success depends on the original waiter's immutable source and no request ID reuse.
-  The probe checks membership, not a strict deadline or remote DMA completion.
-  Failure can permit source reuse before remote completion; recovered error
-  bytes remain readable but are not valid transfer results.
+  success requires the original source future to confirm waiter membership while
+  holding its immutable borrow, or the explicit unsafe caller's source guarantee,
+  after the reader's READ completion. No request
+  ID reuse is allowed. The check is not a strict original-request deadline check.
+  Failure can permit source reuse before remote completion; error bytes remain
+  readable but are not valid transfer results.
 - RDMA transfers use READ, including client-side READ for `remote_write`.
-  A write target transfers its entire destination vector into the owned READ
-  plan and excludes CPU copies or competing READs until buffers are restored.
-  Cancellation or failure can leave the target empty after the QP recycles it.
-- `WriteReceipt` records a completed write or explicit `sent_nothing()`.
-  Keep transfer success separate from local source/destination availability;
-  successful calls return available destinations only when uniquely held.
+  A write target transfers its entire storage vector into the READ plan and
+  excludes CPU copies or competing READs until the original storage is restored.
+  Seal targets against new access before recovery. Borrowed calls return only
+  after their original destinations are locally available. Owned calls may stop
+  waiting after cleanup grace and return without buffers; posted allocations
+  remain held by completion machinery until settlement.
+- Public transfers use ordinary `Result`; service signatures do not carry
+  ownership-recovery wrappers. Owning call adapters return `Completed<R>` with
+  `Option` buffers outside either result branch, around the same storage executor.
+  Buffered client builders expose only consuming `run`; typed and raw buffered
+  requests use the `&ClientWithBuffers` supplied to its callback. The execution
+  handle cannot be constructed, cloned or retained outside that scope.
+  `Some` contains every original destination; `None` abandons recovery of the whole
+  container. An owned scope with abandoned attachments cannot issue another
+  call. A successful response cannot hide an unsettled destination:
+  recovery timeout becomes an error; an existing application error is preserved.
+  Owned cancellation retains posted allocations through settlement; unsafe
+  borrowed calls require the caller to prevent cancellation and premature reuse.
 - Dropping a posting cursor accounts for unposted work. Posted buffers and
   READ permits remain held until completions settle or QP destruction succeeds.
-  Timeout, ERR state and waiter failure do not authorize early recovery.
+  Use one `prepare_reads(Vec<WriteBuffer>)` path and one `ReadCompletion` /
+  `ReadOutcome` for both input modes; convert owned buffers at the boundary.
+  READ failures record a reason; settled completion returns the original storage
+  on both success and failure. Timeout, ERR state and waiter failure do not
+  authorize early recovery. Cleanup grace triggers ERR and real CQE draining,
+  then explicit provider destruction; retained socket handles cannot delay it.
 - Completion authority comes from non-cloneable CQ-issued tokens checked
   against CQ, QPN and immutable sequence identity. WR sequences never wrap.
   Provider QP destruction precedes release of identity leases or DMA holds.
@@ -100,7 +145,7 @@ feature/rustdoc checks and Soft-RoCE setup. Core tests and RPC benchmarks enable
 RDMA through a self dev-dependency even though downstream RDMA is opt-in.
 Always run formatting and Clippy before committing. PRs target `main`; all CI
 checks must pass before merging. Release order is bufpool, memory, macro,
-schema, RDMA, wire, core.
+schema, RDMA, wire, core, unsafe facade.
 
 Follow the [documentation ownership rules](docs/README.md#maintaining-the-docs):
 keep each contract in its owning guide, link to it from summaries, and keep

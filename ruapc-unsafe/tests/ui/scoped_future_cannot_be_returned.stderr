@@ -1,0 +1,17 @@
+error: lifetime may not live long enough
+  --> tests/ui/scoped_future_cannot_be_returned.rs:11:31
+   |
+11 |         .run(async |attached| attached.ping(ctx, &()))
+   |                     --------- ^^^^^^^^^^^^^^^^^^^^^^^ returning this value requires that `'1` must outlive `'2`
+   |                     |       |
+   |                     |       return type of async closure `impl Future<Output = Result<(), ruapc::Error>> + Send` contains a lifetime `'2`
+   |                     has type `&'1 ClientWithBuffers<'_>`
+
+error: lifetime may not live long enough
+  --> tests/ui/scoped_future_cannot_be_returned.rs:11:31
+   |
+11 |         .run(async |attached| attached.ping(ctx, &()))
+   |                     --------- ^^^^^^^^^^^^^^^^^^^^^^^ returning this value requires that `'3` must outlive `'4`
+   |                     |       |
+   |                     |       return type of async closure `impl Future<Output = Result<(), ruapc::Error>> + Send` contains a lifetime `'4`
+   |                     has type `&ClientWithBuffers<'3>`

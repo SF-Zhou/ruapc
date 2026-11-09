@@ -7,17 +7,12 @@ use tokio::sync::oneshot;
 
 use crate::{
     Error, Message, Receiver,
-    remote_memory::{ReadSource, WriteTarget},
+    remote_memory::{SourceSender, WriteTarget},
 };
-
-/// The response sent through the waiter channel: the RPC response message
-/// plus the request's pinned write target (when the client attached write
-/// buffers), delivered atomically.
-pub type WaiterResponse = (Message, Option<Arc<WriteTarget>>);
 
 /// The result delivered through the waiter channel: either a response, or an
 /// eager error (e.g. the connection carrying the request was closed).
-pub(crate) type WaiterResult = std::result::Result<WaiterResponse, Error>;
+pub(crate) type WaiterResult = std::result::Result<Message, Error>;
 
 /// Allocates a process-wide unique connection id.
 ///
@@ -31,14 +26,13 @@ pub(crate) fn next_conn_id() -> u64 {
 
 /// Entry stored in the waiter's id_map for each pending request.
 struct WaiterEntry {
-    /// Drop the source before waking the receiver, including expiry. A caller
-    /// receiving completion may immediately try to recover its owned buffers.
-    read_source: Option<Arc<ReadSource>>,
-    /// Destination target shared with reverse-RPC writers and returned with
-    /// the response. During RDMA, the QP owns its buffers and the target is empty.
+    /// A mailbox sender only: source bytes remain in the borrowing future.
+    /// Drop it before waking the response receiver on every terminal path.
+    read_source: Option<SourceSender>,
+    /// Destination target shared with the caller and reverse-RPC writers.
+    /// During RDMA, the QP owns its buffers and the target is empty.
     write_target: Option<Arc<WriteTarget>>,
-    /// Drop memory holds before waking a receiver on expiry or failure. On
-    /// successful post the destination instead moves into the response.
+    /// Drop memory holds before waking the receiver on every completion path.
     sender: oneshot::Sender<WaiterResult>,
     /// Id of the connection the request was sent on (see
     /// [`Waiter::bind_connection`]); used by [`Waiter::fail_connection`] to
@@ -57,8 +51,8 @@ struct WaiterEntry {
 /// Assigns message IDs and stores one response channel per pending request.
 ///
 /// A request's pinned write target (attached via `bind_write_target`) is
-/// stored alongside the channel sender and delivered together with the
-/// response message when `post` is called, ensuring atomicity.
+/// visible to reverse-RPC writers only while the request remains pending.
+/// The caller retains its own target for recovery after the waiter is removed.
 #[derive(Default)]
 pub struct Waiter {
     index: AtomicU64,
@@ -163,14 +157,14 @@ impl Waiter {
 
     /// Posts a response message to the waiting receiver.
     ///
-    /// Removes the entry from the map and sends the response message along
-    /// with the request's pinned write target, if any.
+    /// Removes the entry and its attachment holds before sending the response.
     ///
     /// If no waiter is found (e.g., because of timeout), a warning is logged.
     pub fn post(&self, msgid: u64, result: Message) {
         if let Some((_, entry)) = self.id_map.remove(&msgid) {
             drop(entry.read_source);
-            let _ = entry.sender.send(Ok((result, entry.write_target)));
+            drop(entry.write_target);
+            let _ = entry.sender.send(Ok(result));
         } else {
             tracing::warn!("Waiter post failed for msgid: {}", msgid);
         }
@@ -239,7 +233,7 @@ impl Waiter {
     }
 
     /// Attaches the pinned write target of a request sent with
-    /// `with_write_buffers`. Called right after the entry is allocated;
+    /// a buffer scope. Called right after the entry is allocated;
     /// a no-op when the entry no longer exists.
     pub(crate) fn bind_write_target(&self, msgid: u64, target: Arc<WriteTarget>) {
         if let Some(mut entry) = self.id_map.get_mut(&msgid) {
@@ -247,15 +241,15 @@ impl Waiter {
         }
     }
 
-    /// Keeps owned, immutable source buffers alive independently of the caller
-    /// future. A cancelled or forgotten future cannot invalidate a local read.
-    pub(crate) fn bind_read_source(&self, msgid: u64, source: Arc<ReadSource>) {
+    /// Publishes the request's source-command mailbox, never borrowed bytes.
+    /// Only the original request future can service its commands.
+    pub(crate) fn bind_read_source(&self, msgid: u64, source: SourceSender) {
         if let Some(mut entry) = self.id_map.get_mut(&msgid) {
             entry.read_source = Some(source);
         }
     }
 
-    pub(crate) fn read_source(&self, msgid: u64) -> Option<Arc<ReadSource>> {
+    pub(crate) fn read_source(&self, msgid: u64) -> Option<SourceSender> {
         self.id_map
             .get(&msgid)
             .and_then(|entry| entry.read_source.clone())
@@ -313,8 +307,8 @@ impl std::fmt::Debug for Waiter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CopyOp, ErrorKind};
-    use ruapc_memory::{BufferSet, CopyBatch};
+    use crate::ErrorKind;
+    use ruapc_memory::BufferSet;
     use std::sync::Arc;
 
     #[test]
@@ -326,9 +320,9 @@ mod tests {
         };
 
         struct ObserveHolds {
-            source: Weak<ReadSource>,
+            source: Arc<Mutex<crate::remote_memory::SourceRequests>>,
             target: Weak<WriteTarget>,
-            at_wake: Mutex<Vec<(usize, usize)>>,
+            at_wake: Mutex<Vec<(bool, usize)>>,
         }
 
         impl Wake for ObserveHolds {
@@ -336,10 +330,10 @@ mod tests {
                 // Observe synchronously inside oneshot's wake. Checking after
                 // post/expire returns would miss a receiver running before the
                 // waiter's last memory holds have been released.
-                self.at_wake
-                    .lock()
-                    .unwrap()
-                    .push((self.source.strong_count(), self.target.strong_count()));
+                self.at_wake.lock().unwrap().push((
+                    self.source.lock().unwrap().is_closed(),
+                    self.target.strong_count(),
+                ));
             }
         }
 
@@ -356,19 +350,20 @@ mod tests {
             Completion::ConnectionFailure,
             Completion::Expiry,
         ] {
-            // These two owners stand in for the caller's client wrapper.
-            let source = Arc::new(ReadSource::try_new(vec![pool.allocate(16).unwrap()]).unwrap());
-            let target =
-                WriteTarget::new(BufferSet::try_new(vec![pool.allocate(16).unwrap()]).unwrap());
+            let (source, requests) = SourceSender::channel();
+            let requests = Arc::new(Mutex::new(requests));
+            let target = WriteTarget::from_owned(
+                BufferSet::try_new(vec![pool.allocate(16).unwrap()]).unwrap(),
+            );
             let waiter = Waiter::default();
             let (msgid, receiver) = waiter.alloc(Duration::from_secs(1));
             let conn_id = next_conn_id();
             waiter.bind_connection(msgid, conn_id);
-            waiter.bind_read_source(msgid, source.clone());
+            waiter.bind_read_source(msgid, source);
             waiter.bind_write_target(msgid, target.clone());
 
             let observation = Arc::new(ObserveHolds {
-                source: Arc::downgrade(&source),
+                source: requests.clone(),
                 target: Arc::downgrade(&target),
                 at_wake: Mutex::new(Vec::new()),
             });
@@ -385,15 +380,11 @@ mod tests {
                 Completion::Expiry => waiter.expire(Instant::now() + Duration::from_secs(2)),
             }
 
-            // Success transfers the destination into the queued response.
-            // Both failure paths must release it before waking the caller.
-            let expected_target_holds = match completion {
-                Completion::Response => 2,
-                Completion::ConnectionFailure | Completion::Expiry => 1,
-            };
+            // Every terminal path releases the waiter's holds before waking
+            // the caller, which already owns the attachments to recover.
             assert_eq!(
                 *observation.at_wake.lock().unwrap(),
-                [(1, expected_target_holds)],
+                [(true, 1)],
                 "{completion:?} woke before releasing its memory holds"
             );
             let Poll::Ready(result) = receiving.as_mut().poll(&mut context) else {
@@ -401,8 +392,7 @@ mod tests {
             };
             match completion {
                 Completion::Response => {
-                    let (_, returned) = result.unwrap();
-                    assert!(Arc::ptr_eq(&returned.unwrap(), &target));
+                    result.unwrap();
                 }
                 Completion::ConnectionFailure => {
                     assert_eq!(result.unwrap_err().kind, ErrorKind::ConnectionClosed);
@@ -411,34 +401,29 @@ mod tests {
                     assert_eq!(result.unwrap_err().kind, ErrorKind::Timeout);
                 }
             }
-            assert_eq!(Arc::strong_count(&source), 1);
+            assert!(requests.lock().unwrap().is_closed());
             assert_eq!(Arc::strong_count(&target), 1);
         }
     }
 
-    #[test]
-    fn a_local_reader_keeps_owned_sources_alive_after_expiry() {
-        let pool = ruapc_bufpool::BufferPool::new(Vec::new());
-        let mut buffer = pool.allocate(16).unwrap();
-        buffer.set_len(4);
-        buffer.copy_from_slice(b"data");
-        let source = Arc::new(ReadSource::try_new(vec![buffer]).unwrap());
-        let weak = Arc::downgrade(&source);
+    #[tokio::test]
+    async fn a_retained_sender_has_no_source_access_after_the_request_drops() {
         let waiter = Waiter::default();
         let (msgid, receiver) = waiter.alloc(Duration::from_secs(1));
+        let (source, requests) = SourceSender::channel();
         waiter.bind_read_source(msgid, source);
-        let reading = waiter.read_source(msgid).unwrap();
-        waiter.expire(Instant::now() + Duration::from_secs(2));
+        let retained = waiter.read_source(msgid).unwrap();
+        drop(receiver);
+        drop(requests);
         assert!(waiter.read_source(msgid).is_none());
         assert_eq!(
-            reading
-                .gather(&CopyBatch::new(&[CopyOp::new(0, 0, 4)]).unwrap())
-                .unwrap(),
-            b"data"
+            retained
+                .validate(&waiter, msgid, None)
+                .await
+                .unwrap_err()
+                .kind,
+            ErrorKind::Timeout
         );
-        drop(receiver);
-        drop(reading);
-        assert!(weak.upgrade().is_none());
     }
 
     #[tokio::test]
@@ -458,9 +443,8 @@ mod tests {
             })
         };
 
-        let (msg, write_buf) = rx.recv().await.unwrap();
+        let msg = rx.recv().await.unwrap();
         assert_eq!(msg.meta.method, "dummy");
-        assert!(write_buf.is_none());
         handle.await.unwrap();
 
         let (msgid, rx) = msg_waiter.alloc(std::time::Duration::from_secs(30));
@@ -476,7 +460,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_waiter_write_target_delivery() {
+    async fn response_revokes_waiter_access_and_leaves_target_recovery_to_caller() {
         let pool = ruapc_bufpool::BufferPoolBuilder::new(Vec::new()).build();
 
         let waiter = Waiter::default();
@@ -485,19 +469,20 @@ mod tests {
         // Bind a write target while the request is pending.
         let mut buf = pool.allocate(1024 * 1024).unwrap();
         buf.set_len(5);
-        let target = WriteTarget::new(BufferSet::try_new(vec![buf]).unwrap());
-        waiter.bind_write_target(msgid, target);
+        let target = WriteTarget::from_owned(BufferSet::try_new(vec![buf]).unwrap());
+        waiter.bind_write_target(msgid, target.clone());
 
         // A handler-side clone writes into the target.
         let handler_clone = waiter.write_target(msgid).expect("target must be visible");
         handler_clone.copy_in(0, b"hello").unwrap();
         drop(handler_clone);
 
-        // Post the response; the target is delivered atomically with it.
+        // The caller keeps its target; the response only removes waiter access.
         waiter.post(msgid, Message::default());
-        let (_msg, target) = rx.recv().await.unwrap();
-        let buffers =
-            WriteTarget::try_into_buffers(target.expect("expected write target")).unwrap();
+        rx.recv().await.unwrap();
+        assert!(waiter.write_target(msgid).is_none());
+        assert_eq!(Arc::strong_count(&target), 1);
+        let buffers = WriteTarget::try_into_buffers(target).unwrap();
         assert_eq!(&buffers[0][..], b"hello");
     }
 
@@ -511,7 +496,7 @@ mod tests {
         buf.set_len(1);
         waiter.bind_write_target(
             msgid,
-            WriteTarget::new(BufferSet::try_new(vec![buf]).unwrap()),
+            WriteTarget::from_owned(BufferSet::try_new(vec![buf]).unwrap()),
         );
 
         // Drop receiver (simulates timeout cleanup).

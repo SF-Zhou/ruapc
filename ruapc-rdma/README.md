@@ -99,9 +99,11 @@ Context
 Ownership through `Arc` keeps parent resources alive until their children are
 dropped. A `QueuePair` posts SEND, RECV and READ work to one completion queue
 and accepts completions only from that CQ and QPN. `QueuePair::send` and
-`recv` take ownership of pool buffers, and `prepare_reads` takes ownership of
-READ destinations. The crate also supports gather-list sends and selective
-signaling; a signaled completion can reclaim preceding unsignaled SENDs.
+`recv` take ownership of pool buffers. READ plans own destination capabilities,
+from either unsafe borrowed construction or `WriteBuffer::from(Buffer)`.
+The crate also supports gather-list
+sends and selective signaling; a signaled completion can reclaim preceding
+unsignaled SENDs.
 
 Use `CompletionQueue::poll_batch` with reusable `CompletionBatch` storage and
 pass each CQ-issued `Completion` to `QueuePair::complete`. The borrowed proof
@@ -123,26 +125,43 @@ and retirement policy.
 
 ## READ lifetime
 
-`prepare_reads` validates destination buffer indices, bounds and overlap, then
+`prepare_reads` accepts `Vec<WriteBuffer>`. `WriteBuffer::from(Buffer)`
+owns the allocation. Unsafe borrowed construction keeps the caller's handle in
+place and records only its metadata; it adds no access lock or allocation hold.
+The caller must uphold the borrowed capability's lifetime and exclusive-access
+contract until all users and posted DMA have settled. Dropping or forgetting an
+unfinished borrowed operation does not satisfy that contract.
+
+Preparation validates destination buffer indices, bounds and overlap, then
 resolves local addresses and registration keys internally. Its non-cloneable
 `ReadPosting` cursor posts each request once, only to the preparing QP. Dropping
 the cursor accounts for its unposted suffix while the QP retains posted work.
-Explicit cancellation before any post can recover the destination vector.
+`ReadPosting::cancel` records cancellation and accounts for the unposted suffix;
+recover the original capability vector through its completion future.
 
-Preparation also returns a concrete, runtime-independent `ReadCompletion`
-future. It yields `Result<Vec<Buffer>, ReadFailure>`; `try_recv` checks for a
-ready result without waiting. This crate and its production dependencies do
-not require Tokio. `ReadPosting::handle` provides a weak `ReadHandle` for
-observing progress or notifying failure without granting completion authority.
+Preparation returns a runtime-independent `ReadCompletion`. Its
+`ReadOutcome` contains `result: Result<(), ReadFailure>` and
+`buffers: Vec<WriteBuffer>`; both success and error return every original
+capability in order.
+Owned callers can recover each `Buffer` with `WriteBuffer::into_owned` after
+completion. The same preparation and completion types handle both input modes.
+`try_recv` checks for a ready outcome without waiting. This crate and its
+production dependencies do not require Tokio. `ReadPosting::handle` provides a
+weak `ReadHandle` for
+observing progress, recording the first failure or inspecting it with `failure()`
+without granting completion authority.
 The application owns deadline and connection-failure policy; RuaPC implements
 it in its [READ admission and failure layer](../docs/rdma-capacity.md#read-admission-and-failure).
 
-Timeout or connection failure can notify a receiver before DMA has stopped.
-Posted destinations remain owned until all posted READs complete or the provider
-successfully destroys the QP. Dropping or forgetting a future cannot release
-them early; forgetting an owner can retain resources indefinitely. Destruction
-also releases remaining unsignaled SENDs. Failure to destroy a QP aborts the
-process before memory still accessible to DMA can be released.
+Timeout or connection failure records an error without completing the future
+early. Posted destination capabilities remain in the batch until all posted
+READs complete or the provider successfully destroys the QP, and unposted work
+is accounted for.
+Dropping an unfinished completion records cancellation but cannot release owned
+buffers early; forgetting an owner can retain resources indefinitely. Borrowed
+capabilities instead require the caller to keep their unsafe obligations.
+Destruction also releases remaining unsignaled SENDs. Failure to destroy a QP
+aborts the process before memory still accessible to DMA can be released.
 
 These guarantees cover local destinations; remote addresses and keys provide
 no source-side completion lease. RuaPC validates `remote_read` results after

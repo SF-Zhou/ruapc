@@ -2,7 +2,8 @@ use std::{os::raw::c_int, ptr, sync::Arc};
 
 mod read;
 pub use read::{
-    ReadCompletion, ReadFailure, ReadHandle, ReadObservation, ReadPosting, ReadRequest, ReadSegment,
+    ReadCompletion, ReadFailure, ReadHandle, ReadObservation, ReadOutcome, ReadPosting,
+    ReadRequest, ReadSegment,
 };
 
 #[cfg(feature = "bench-internals")]
@@ -663,6 +664,7 @@ impl Drop for QueuePair {
         // their PD/MR ownership. If the provider cannot destroy the QP, DMA may
         // still access them; unwinding would release those holds as well.
         destroy_provider_qp(self.ptr);
+        self.finish_destroyed_reads();
     }
 }
 impl std::fmt::Debug for QueuePair {
@@ -858,7 +860,7 @@ mod completion_tests {
         time::{Duration, Instant},
     };
 
-    use ruapc_bufpool::{AlignedMemory, BufferPoolBuilder};
+    use ruapc_bufpool::{AlignedMemory, BufferPoolBuilder, WriteBuffer};
 
     use super::*;
     use crate::{
@@ -868,7 +870,13 @@ mod completion_tests {
 
     #[test]
     fn read_completion_sweeps_unsignaled_send_and_settles_read_batch() {
-        for success in [true, false] {
+        for (success, destroy_before_poll, borrowed) in [
+            (true, false, false),
+            (false, false, false),
+            (true, true, false),
+            (true, false, true),
+            (false, false, true),
+        ] {
             let device = Arc::new(open_device());
             let pool = BufferPoolBuilder::new(vec![device.clone()]).build();
             // The remote source must outlive both provider QPs even on assertion
@@ -895,6 +903,14 @@ mod completion_tests {
                 .map_or((remote.addr, remote.key.rkey), |region| {
                     (region.addr() as u64, region.rkey())
                 });
+            // On assertion failure, provider QPs must be destroyed before a
+            // borrowed destination is released. Declare its owner first.
+            let mut destination = Some({
+                let mut buffer = pool.allocate(64).unwrap();
+                buffer.set_len(64);
+                buffer
+            });
+            let original_destination = destination.as_ref().unwrap().as_ptr();
             let cq = CompletionQueue::create(device.context(), 16, None).unwrap();
             let create = || {
                 QueuePair::create(
@@ -954,9 +970,17 @@ mod completion_tests {
             let mut sent = make_buffer();
             sent.as_mut_slice().fill(0x3c);
             let send_id = sender.send(sent, ibv_send_flags(0)).unwrap();
+            let destination_capability = if borrowed {
+                // SAFETY: the original Buffer remains alive and untouched until
+                // all posted READs finish and the returned capability is dropped.
+                // Unwinding destroys both QPs before dropping that original.
+                unsafe { WriteBuffer::borrowed(destination.as_mut().unwrap()) }
+            } else {
+                WriteBuffer::from(destination.take().unwrap())
+            };
             let (mut posting, mut result) = sender
                 .prepare_reads(
-                    vec![make_buffer()],
+                    vec![destination_capability],
                     vec![ReadRequest {
                         remote_addr,
                         // Error CQEs must dispatch ownership using WRID: their opcode
@@ -972,6 +996,15 @@ mod completion_tests {
                 .unwrap();
             sender.post_read(&mut posting).unwrap();
             assert_eq!(sender.pending_read_count(), 1);
+            if destroy_before_poll {
+                // Even with an external posting owner and unpolled CQEs, the
+                // successful provider destruction must return the same memory.
+                drop(sender);
+                let outcome = result.try_recv().unwrap();
+                assert_eq!(outcome.result, Err(ReadFailure::ConnectionClosed));
+                assert_eq!(outcome.buffers[0].as_ptr(), original_destination);
+                continue;
+            }
             let mut send_cursor = CompletionCursor::default();
             let mut recv_cursor = CompletionCursor::default();
             let mut batch = CompletionBatch::<8>::new();
@@ -1003,14 +1036,21 @@ mod completion_tests {
                 }
                 std::thread::yield_now();
             }
+            let outcome = result.try_recv().unwrap();
+            assert_eq!(outcome.buffers[0].as_ptr(), original_destination);
             if success {
-                let buffers = result.try_recv().unwrap().unwrap();
-                assert_eq!(buffers[0].as_slice(), &[0x5a; 64]);
+                outcome.result.unwrap();
+                assert_eq!(outcome.buffers[0].as_ref(), &[0x5a; 64]);
             } else {
-                assert_eq!(
-                    result.try_recv().unwrap().unwrap_err(),
-                    ReadFailure::Completion
-                );
+                assert_eq!(outcome.result, Err(ReadFailure::Completion));
+            }
+            drop(outcome);
+            if let Some(destination) = destination.as_ref() {
+                assert_eq!(destination.as_ptr(), original_destination);
+                assert_eq!(destination.len(), 64);
+                if success {
+                    assert_eq!(destination.as_slice(), &[0x5a; 64]);
+                }
             }
             // A single in-flight READ leaves its slot vacant, so this path must
             // never report fallback-map use.

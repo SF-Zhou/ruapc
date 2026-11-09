@@ -265,7 +265,7 @@ impl RdmaSocket {
             .try_spawn(async move {
                 let mut guard = guard;
                 let acknowledged = async {
-                    let (message, _) = response.recv().await?;
+                    let message = response.recv().await?;
                     message.payload.deserialize::<Result<()>>(&message.meta)?
                 }
                 .await;
@@ -473,7 +473,7 @@ impl RdmaSocket {
             return Err(protocol_error("payload finish RPC exceeds receive buffer"));
         }
         self.send_buffer(&mut meta, encoded, &request).await?;
-        let (message, _) = receiver.recv().await?;
+        let message = receiver.recv().await?;
         message.payload.deserialize(&message.meta)?
     }
 
@@ -1040,6 +1040,15 @@ mod lifecycle_tests {
                 gid_index: 0,
                 ip: None,
             };
+            let (state, stop) = State::create(
+                Router::default(),
+                &SocketPoolConfig {
+                    rdma: None,
+                    max_inflight_requests,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
             let (pending_sender, pending) = tokio::sync::mpsc::channel(4);
             let socket = Arc::new(RdmaSocket::new(
                 reservation.bind(qp),
@@ -1057,6 +1066,7 @@ mod lifecycle_tests {
                         same_connectivity_domain: true,
                     },
                     read_timeout: None,
+                    settle_grace: Duration::from_millis(100),
                     read_permits: Arc::new(Semaphore::new(2)),
                     bandwidth_limiter: Arc::new(RdmaBandwidthLimiter::new(
                         nic.device,
@@ -1066,17 +1076,9 @@ mod lifecycle_tests {
                         Duration::ZERO,
                     )),
                     sq_read_cap: 2,
+                    supervisor: state.socket_pool.task_supervisor_handle(),
                 },
             ));
-            let (state, stop) = State::create(
-                Router::default(),
-                &SocketPoolConfig {
-                    rdma: None,
-                    max_inflight_requests,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
             Self {
                 socket,
                 pending,
@@ -1250,7 +1252,7 @@ mod lifecycle_tests {
             let error = socket.send(&mut meta, &request, &state).await.unwrap_err();
             assert_eq!(error.kind, ErrorKind::InvalidArgument);
             let error = client
-                .ruapc_raw_call::<_, serde_json::Value, Error>(&context, &request, None, method)
+                .ruapc_raw_call::<_, serde_json::Value, Error>(&context, &request, method)
                 .await
                 .unwrap_err();
             assert_eq!(error.kind, ErrorKind::InvalidArgument);

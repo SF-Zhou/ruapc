@@ -1,8 +1,6 @@
-use ruapc_memory::{BufferSetError, MemoryError, MemoryErrorKind};
+use ruapc_memory::{MemoryError, MemoryErrorKind};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-
-use crate::Buffer;
 
 /// Request, serialization, and transport failure categories.
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
@@ -17,11 +15,14 @@ pub enum ErrorKind {
     /// Local buffer capacity is too small for the requested transfer.
     BufferTooSmall,
     /// An active reader prevents source recovery, or an in-flight DMA
-    /// operation owns a write target needed by another transfer.
+    /// operation owns a write target needed by another transfer. Also returned
+    /// when reusing an owning adapter whose buffer recovery was abandoned.
     BuffersInUse,
+    /// Owned destinations did not settle within the recovery grace. The call
+    /// returns without buffers while the runtime retains outstanding DMA holds.
+    BufferRecoveryTimeout,
     /// The request carries no memory regions for the attempted operation
-    /// (client did not attach buffers via `with_read_buffers` /
-    /// `with_write_buffers`).
+    /// (client did not attach a nonempty space via `borrow_buffers` / `own_buffers`).
     MissingBufferInfo,
     /// A `CopyOp` batch failed validation: out of bounds, arithmetic
     /// overflow, overlapping destination ranges, or too many ops/regions.
@@ -237,92 +238,6 @@ impl std::fmt::Display for Error {
     }
 }
 
-/// Error from a remote-memory attachment or read/write operation.
-///
-/// Remote reads and writes consume local buffers. This error returns them
-/// when ownership is recoverable. `None` can mean an active reader or DMA
-/// still owns them, or that a failed operation has already recycled them.
-/// Posted destinations remain owned until completion or QP destruction;
-/// error recovery cannot release them early.
-///
-/// Recovered buffers permit reuse but do not certify successful transfer
-/// contents. Their bytes remain readable and are not cleared; failed reads
-/// may contain data read after source reuse. See
-/// [`Context::remote_read`](crate::Context::remote_read) for source validation.
-///
-/// Converting into [`Error`] (e.g. via the `?` operator) drops any
-/// recovered buffers back to the pool.
-pub struct RemoteIoError {
-    /// The underlying error.
-    pub error: Error,
-    buffers: Option<Vec<Buffer>>,
-}
-
-impl RemoteIoError {
-    /// Creates a new remote I/O error, optionally carrying the local
-    /// buffers.
-    #[must_use]
-    pub(crate) fn new(error: Error, buffers: Option<Vec<Buffer>>) -> Self {
-        Self { error, buffers }
-    }
-
-    /// Returns the recovered local buffers, if any.
-    #[must_use]
-    pub fn recovered_buffers(&self) -> Option<&[Buffer]> {
-        self.buffers.as_deref()
-    }
-
-    /// Takes the recovered local buffers, if any.
-    pub fn take_recovered_buffers(&mut self) -> Option<Vec<Buffer>> {
-        self.buffers.take()
-    }
-
-    /// Decomposes into the underlying error and the recovered buffers.
-    #[must_use]
-    pub fn into_parts(self) -> (Error, Option<Vec<Buffer>>) {
-        (self.error, self.buffers)
-    }
-}
-
-impl From<RemoteIoError> for Error {
-    fn from(value: RemoteIoError) -> Self {
-        value.error
-    }
-}
-
-impl From<Error> for RemoteIoError {
-    fn from(error: Error) -> Self {
-        Self {
-            error,
-            buffers: None,
-        }
-    }
-}
-
-impl From<BufferSetError> for RemoteIoError {
-    fn from(error: BufferSetError) -> Self {
-        let (error, buffers) = error.into_parts();
-        Self::new(error.into(), Some(buffers))
-    }
-}
-
-impl std::fmt::Debug for RemoteIoError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RemoteIoError")
-            .field("error", &self.error)
-            .field("buffers_recovered", &self.buffers.is_some())
-            .finish()
-    }
-}
-
-impl std::fmt::Display for RemoteIoError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.error, f)
-    }
-}
-
-impl std::error::Error for RemoteIoError {}
-
 /// Result type alias using [`Error`] as the error type.
 ///
 /// This is a convenience type alias used throughout the RuaPC library.
@@ -477,22 +392,5 @@ mod tests {
         // kind is Unknown(io_kind_string)
         assert!(matches!(error.kind, ErrorKind::Unknown(_)));
         assert!(!error.msg.is_empty());
-    }
-
-    #[test]
-    fn converting_remote_io_error_returns_recovered_memory_to_the_pool() {
-        const CAPACITY: usize = 64 * 1024 * 1024;
-        let pool = ruapc_bufpool::BufferPoolBuilder::new(Vec::new())
-            .max_memory(CAPACITY)
-            .build();
-        let buffer = pool.allocate(CAPACITY).unwrap();
-        let expected = Error::new(ErrorKind::InvalidCopyOp, "invalid range".into());
-        let error = RemoteIoError::new(expected.clone(), Some(vec![buffer]));
-        assert!(pool.allocate(CAPACITY).is_err());
-
-        let plain: Error = error.into();
-
-        assert_eq!(plain, expected);
-        assert!(pool.allocate(CAPACITY).is_ok());
     }
 }

@@ -331,6 +331,12 @@ pub struct RdmaRemoteMemoryConfig {
     /// READ admission and completion budget in milliseconds. Zero disables
     /// this budget; the request deadline still applies.
     pub read_timeout_ms: u64,
+    /// Grace after a READ fails or reaches its deadline before closing the QP.
+    /// Zero requests ERR immediately. This is not a bound on CQE draining:
+    /// destination buffers remain unavailable until their posted READs settle.
+    /// Owned calls may return without buffers after this grace; borrowed calls
+    /// continue waiting for safe recovery.
+    pub settle_grace_ms: u64,
     /// Shared in-flight RDMA READ work-request limit per local NIC.
     pub max_inflight_read_wrs: u32,
     /// Fraction of nominal port bandwidth available to remote I/O.
@@ -345,6 +351,7 @@ impl Default for RdmaRemoteMemoryConfig {
     fn default() -> Self {
         Self {
             read_timeout_ms: 10_000,
+            settle_grace_ms: 100,
             max_inflight_read_wrs: 32,
             bandwidth_limit_ratio: 0.95,
             bandwidth_limit_burst_ms: 0,

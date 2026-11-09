@@ -50,23 +50,22 @@ async fn demo_services_round_trip_over_stream_transports() {
                         *byte = (i % 251) as u8;
                     }
                     let expected = crc32c_of([&data]);
-                    let source = client.with_read_buffer(data).unwrap();
+                    let sources = vec![data];
                     let mut destinations = vec![buffer(&ctx, len)];
                     for _ in 0..3 {
-                        assert_eq!(
-                            source.read_crc(&ctx, &ReadCrcReq {}).await.unwrap(),
-                            expected
-                        );
-                        let response = client
-                            .with_write_buffers(destinations)
-                            .write_crc(&ctx, &WriteCrcReq { len })
-                            .await
-                            .unwrap();
-                        let (expected, returned) = response.into_parts();
-                        let returned = returned.into_available().expect("destinations available");
-                        assert_eq!(returned.iter().map(|buf| buf.len()).sum::<usize>(), len);
-                        assert_eq!(crc32c_of(&returned), expected);
-                        destinations = returned;
+                        let completed = client
+                            .with_buffers(&sources, vec![])
+                            .run(async |source| source.read_crc(&ctx, &ReadCrcReq {}).await)
+                            .await;
+                        assert_eq!(completed.result.unwrap(), expected);
+                        assert!(completed.buffers.unwrap().is_empty());
+                        let completed = client
+                            .with_buffers(&[], destinations)
+                            .run(async |target| target.write_crc(&ctx, &WriteCrcReq { len }).await)
+                            .await;
+                        destinations = completed.buffers.unwrap();
+                        assert_eq!(destinations.iter().map(|buf| buf.len()).sum::<usize>(), len);
+                        assert_eq!(crc32c_of(&destinations), completed.result.unwrap());
                     }
                 }
             }

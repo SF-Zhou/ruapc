@@ -93,35 +93,75 @@ This reduces receive-pool pressure without moving parsing onto the poller.
 
 ## Closing a connection
 
-Closing a socket marks it failed, closes READ admission, fails posted READ
-waiters without releasing their DMA holds, and wakes the poller.
-The poll thread performs the provider QP transition to ERR, serialized with
-receive reposting. A repost already in progress therefore precedes the ERR
-flush. Posting a receive after that flush can leave it without a completion
-on providers such as Soft-RoCE, preventing teardown.
+Closing a socket marks it failed, closes READ admission, records failure on
+posted READ batches and wakes the poller. Ordinary RPC waiters are removed
+eagerly; a low-level READ completion still waits for its original buffers.
+An owning RPC adapter may abandon that completion and return without buffers
+after cleanup grace. The QP ledger and target-restoration tasks continue to hold
+the posted storage, independently of the business future; see
+[owned recovery](safe-boundaries.md#borrowed-and-owned-call-adapters).
+The poll thread closes the QP posting gate before requesting provider ERR.
+The gate waits for synchronous SEND, READ and receive posting already in
+progress and rejects later posts, even through retained socket handles. A
+repost already in progress therefore precedes the ERR flush. Posting a receive
+after that flush can otherwise leave it without a completion on providers such
+as Soft-RoCE, preventing teardown.
 
 Successful receive completions queued before closure still settle their
 receive counts, but do not dispatch messages or replenish the receive ring.
-Removal requires the provider ERR request, settled receive/ACK flow, empty
-pending sends, and closed, idle READ admission with no pending batches.
-Waiting for every SQ permit also covers a poster paused before registering
-its READ batch. See [READ admission and failure](rdma-capacity.md#read-admission-and-failure)
-for permit recovery.
+Removal requires a successful provider ERR transition, settled receive/ACK
+flow, empty pending sends, closed READ admission and no posted READs awaiting
+completion. A poster paused after acquiring permits cannot submit through the
+closed gate; it accounts for its unposted work when it resumes or is cancelled.
+The poller then explicitly destroys the provider QP and retires its reservation
+before removing the connection. Successfully completed unsignaled SEND tails
+are released by destruction, without inventing CQEs for them. Retained socket
+handles now refer to a closed shell and cannot delay destruction. See
+[READ admission and failure](rdma-capacity.md#read-admission-and-failure)
+for grace timing and permit recovery, and
+[credit retirement](rdma-capacity.md#retirement-and-credit-reuse) for the later
+empty-poll requirement.
 
-Fatal shutdown closes admission, requests ERR, and fails READ batches for all
-incoming and registered connections before releasing any socket owner. It
-notifies incoming ordinary waiters explicitly; registered-connection guards
-notify theirs when the connection map is cleared. External socket owners can
-delay QP destruction. ERR and failure notification do not themselves release
-DMA memory; see
+If the provider rejects the ERR transition, the process aborts immediately,
+matching failed CQ draining or QP destruction. An attempted transition is not a
+successful flush. Once teardown starts, each connection has a fixed internal
+30-second deadline for receiving the required completions. Repeated closure,
+CQE progress and entry into shutdown do not restart it. A connection whose
+completion accounting is already settled can still be destroyed; otherwise
+expiry aborts the process without releasing unsettled buffers or substituting
+destruction for the missing CQEs. This policy also applies when an owned call
+already returned with missing buffers; moving recovery into the background does
+not guarantee reclamation after permanent completion loss.
+
+An ordinary provider error leaving the main loop enters shutdown cleanup,
+which still requires every actual completion. Shutdown stops registration under
+the inbox mutex, installs any already
+published connections in the map, closes admission and requests ERR for all of
+them. The poller continues consuming real completion/flush CQEs and maintaining
+connections until each provider QP has been destroyed. It does not release the
+map and defer teardown to the last external socket owner. Shutdown also has a
+30-second total drain deadline and preserves earlier connection deadlines.
+If CQ polling fails or the drain deadline expires with connections still pending,
+the process aborts: a timeout or fabricated completion cannot satisfy the
+recovery contract. These deadlines are checked by the poller; they detect an
+empty CQ or missing CQEs, but cannot interrupt a provider call or lock that itself
+never returns. ERR and failure recording do not
+themselves release DMA memory; see
 [destination ownership](safe-boundaries.md#completion-and-destination-ownership).
+
+Both the poll loop and shutdown cleanup run inside a panic boundary. A panic
+aborts before the poll-loop owner releases its connection registry; cleanup is
+not retried against potentially poisoned state. This prevents a lost completion
+thread from leaving retained sockets waiting indefinitely for destruction.
 
 ## Implementation and regression coverage
 
 [Poller routing](../ruapc/src/rdma/poller/mod.rs),
 [per-connection maintenance](../ruapc/src/rdma/poller/conn.rs),
+[revocable QP ownership](../ruapc/src/rdma/poller/queue_pair.rs),
 [flow control](../ruapc/src/rdma/poller/flow.rs) and
 [dispatch](../ruapc/src/rdma/poller/dispatch.rs) own these paths.
 Adjacent tests cover early receive publication, stale routing, bounded drains,
-dirty-list maintenance, minimum-window ACK behavior, and shutdown. Verbs
+dirty-list maintenance, minimum-window ACK behavior, shutdown, and subprocess
+checks for fatal ERR/flush/panic failures. Verbs
 identity tests are indexed in [WRIDs](wrid.md).

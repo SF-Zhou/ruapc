@@ -1,8 +1,62 @@
-use ruapc_bufpool::{Buffer, BufferPool, RemoteBufferInfo};
+use ruapc_bufpool::{Buffer, BufferPool, RemoteBufferInfo, WriteBuffer};
 use ruapc_memory::{
     BufferSet, CopyBatch, CopyOp, MAX_COPY_OPS, MAX_REGIONS, MemoryError, MemoryErrorKind,
     ReadSource, RemoteSpace, SpaceLayout,
 };
+
+#[test]
+fn owned_transport_views_share_copy_validation_and_keep_original_allocations() {
+    let source = buffers(&[b"abc", b"def"]);
+    let destination = buffers(&[b"....", b"...."]);
+    let pointers: Vec<_> = destination.iter().map(|buffer| buffer.as_ptr()).collect();
+    let source = ReadSource::try_new(source).unwrap();
+    let mut target =
+        BufferSet::try_new(destination.into_iter().map(WriteBuffer::from).collect()).unwrap();
+    assert_eq!(target.layout().total(), 8);
+    let operations = [CopyOp::new(1, 2, 4)];
+    let batch = CopyBatch::new(&operations).unwrap();
+    assert!(target.scatter(&batch, b"bad").is_err());
+    assert_eq!(target.buffers()[0].as_ref(), b"....");
+    target
+        .scatter(&batch, &source.gather(&batch).unwrap())
+        .unwrap();
+    let destination: Vec<_> = target
+        .into_buffers()
+        .into_iter()
+        .map(|buffer| buffer.into_owned().unwrap())
+        .collect();
+    assert_eq!(flatten(&destination), b"..bcde..");
+    assert_eq!(
+        destination
+            .iter()
+            .map(|buffer| buffer.as_ptr())
+            .collect::<Vec<_>>(),
+        pointers
+    );
+}
+
+#[test]
+fn invalid_transport_view_collection_returns_every_original_buffer() {
+    let original = buffers(&vec![b"x".as_slice(); MAX_REGIONS + 1]);
+    let pointers: Vec<_> = original.iter().map(|buffer| buffer.as_ptr()).collect();
+    let views: Vec<_> = original.into_iter().map(WriteBuffer::from).collect();
+    let error = BufferSet::try_new(views).unwrap_err();
+    assert_eq!(error.error.kind, MemoryErrorKind::InvalidCopyOp);
+    assert_eq!(error.buffers().len(), pointers.len());
+    let (_, views) = error.into_parts();
+    let original: Vec<_> = views
+        .into_iter()
+        .map(|buffer| buffer.into_owned().unwrap())
+        .collect();
+    assert!(original.iter().all(|buffer| buffer.as_slice() == b"x"));
+    assert_eq!(
+        original
+            .iter()
+            .map(|buffer| buffer.as_ptr())
+            .collect::<Vec<_>>(),
+        pointers
+    );
+}
 
 fn buffers(parts: &[&[u8]]) -> Vec<Buffer> {
     let pool = BufferPool::new(Vec::new());

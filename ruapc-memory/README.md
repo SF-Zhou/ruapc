@@ -1,7 +1,8 @@
 # RuaPC memory spaces
 
 `ruapc-memory` provides logical memory spaces, copy validation and planning,
-synchronous CPU gather/scatter, and owned buffers with cached layouts. It depends
+synchronous CPU gather/scatter, and buffer-capability collections with cached
+layouts. It depends
 on `ruapc-bufpool`, serde and schemars, and works without the RPC runtime, an async
 executor or verbs.
 
@@ -60,8 +61,14 @@ operations' destination offsets. It checks the actual destination layout and
 requires exactly `byte_count` packed bytes before changing any destination.
 Source offsets do not index the packed input. Gaps remain unchanged.
 
-`BufferSet::try_new` takes owned buffers and caches their checked layout. Its
-`gather` and `scatter` methods reuse this layout. Buffer lengths cannot be changed
+`BufferSet<B>::try_new` takes a collection and caches its checked layout. The
+default element is `Buffer`; `WriteBuffer` uses the same implementation for
+owned destinations or borrowed destination snapshots established through
+bufpool's explicit unsafe boundary. The memory crate adds no lifetime tracking
+or access counters. Sealed `BufferView` / `BufferViewMut` traits expose fixed
+lengths, registration metadata and permitted byte access without runtime or
+verbs dependencies. Its `gather` and `scatter` methods reuse this layout.
+Buffer lengths cannot be changed
 through a set: `buffers()` exposes immutable buffers and `into_buffers()`
 consumes the set to return ownership. Public copy methods never accept a
 caller-supplied promise that a separate layout matches actual buffers.
@@ -106,13 +113,25 @@ transfer-completion evidence.
 `gather(&CopyBatch)` checks source bounds and reuses the cached layout;
 `buffers()` borrows the source and `into_buffers()` consumes it. Construction
 failure returns the same `BufferSetError` recovery contract. Sources can be
-shared through `Arc<ReadSource>`; recovering owned buffers requires uniqueness.
+shared through `Arc<ReadSource>`; consuming that pure collection requires
+ownership.
+
+`BorrowedSource::new(&buffers)` caches a checked layout while retaining a real
+immutable slice reference. It supports the same synchronous gather operation
+without moving buffers, creating raw snapshots or allocating a vector of
+per-buffer references. The RPC runtime keeps this view inside the caller's
+future; external source handles send copy requests to that future and cannot
+access its bytes themselves. Safe validation also asks that future to confirm;
+explicit caller-validated sources can instead use a direct msgid check.
 
 RuaPC keeps write-target checkout, RPC attachments and waiter registration,
 reverse RPCs, deadlines, READ execution and completion witnesses in `ruapc`.
 An inline write holds the target's mutex for the complete scatter batch. The
 runtime converts `MemoryError` into its RPC error categories. Posted RDMA
-buffers and completion authority remain in `ruapc-rdma`. See
+storage and completion authority remain in `ruapc-rdma`. Borrowed destination
+APIs live in the separate `ruapc-unsafe` facade; their caller contract is not
+implemented by these synchronous collection types. Safe source references are
+core APIs; the unsafe facade can opt into direct source validation. See
 [safety boundaries](https://github.com/SF-Zhou/ruapc/blob/main/docs/safe-boundaries.md)
 for ownership, recovery and source-validation contracts.
 

@@ -1,0 +1,21 @@
+error[E0277]: the trait bound `ruapc::BufferScope<'_>: ruapc::RawCall` is not satisfied
+ --> tests/ui/storage_builder_not_raw.rs:7:23
+  |
+7 |     requires_raw_call(attached);
+  |     ----------------- ^^^^^^^^ the trait `ruapc::RawCall` is not implemented for `ruapc::BufferScope<'_>`
+  |     |
+  |     required by a bound introduced by this call
+  |
+help: the following other types implement trait `ruapc::RawCall`
+ --> $WORKSPACE/ruapc/src/client/call.rs
+  |
+  | impl RawCall for Client {
+  | ^^^^^^^^^^^^^^^^^^^^^^^ `Client`
+...
+  | impl RawCall for ClientWithBuffers<'_> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `ClientWithBuffers<'_>`
+note: required by a bound in `requires_raw_call`
+ --> tests/ui/storage_builder_not_raw.rs:3:25
+  |
+3 | fn requires_raw_call<T: RawCall>(_: T) {}
+  |                         ^^^^^^^ required by this bound in `requires_raw_call`

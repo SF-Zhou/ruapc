@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 #![cfg(feature = "rdma")]
 
+use std::slice;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -8,8 +9,8 @@ use std::sync::{
 use std::time::Duration;
 
 use ruapc::{
-    Buffer, Client, Context, Endpoint, ErrorKind, ListenMode, Result, ResultBufferReply, Router,
-    Server, SocketPoolConfig, Transport,
+    Buffer, Client, Completed, Context, Endpoint, ErrorKind, ListenMode, Result, Router, Server,
+    SocketPoolConfig, Transport,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -73,7 +74,7 @@ trait LargePayloadService {
     async fn upload(&self, ctx: &Context, req: &Blob) -> Result<Digest>;
     async fn download(&self, ctx: &Context, req: &Download) -> Result<Blob>;
     async fn echo(&self, ctx: &Context, req: &Blob) -> Result<Blob>;
-    async fn exchange_attached(&self, ctx: &Context, req: &Blob) -> ResultBufferReply<Blob>;
+    async fn exchange_attached(&self, ctx: &Context, req: &Blob) -> Result<Blob>;
     async fn callback(&self, ctx: &Context, req: &Blob) -> Result<Blob>;
     async fn hold(&self, ctx: &Context, req: &Blob) -> Result<Blob>;
 }
@@ -102,19 +103,19 @@ impl LargePayloadService for LargePayloadServiceImpl {
         Ok(req.clone())
     }
 
-    async fn exchange_attached(&self, ctx: &Context, req: &Blob) -> ResultBufferReply<Blob> {
+    async fn exchange_attached(&self, ctx: &Context, req: &Blob) -> Result<Blob> {
         // Transport payload regions must never replace application regions.
         assert_eq!(ctx.msg_meta.read_regions.len(), 2);
         assert_eq!(ctx.msg_meta.write_regions.len(), 2);
-        let buffers = ctx.remote_read_all().await?;
+        let buffers = ctx.remote_read_allocated().await?;
         let mut data = flatten(&buffers);
         drop(buffers);
         data.reverse();
         let mut source = ctx.state.buffer_pool.allocate(data.len()).unwrap();
         source[..data.len()].copy_from_slice(&data);
         source.set_len(data.len());
-        let sent = ctx.remote_write_all(vec![source]).await?;
-        Ok(sent.into_reply(req.clone()))
+        ctx.remote_write_all(slice::from_ref(&source)).await?;
+        Ok(req.clone())
     }
 
     async fn callback(&self, ctx: &Context, req: &Blob) -> Result<Blob> {
@@ -238,7 +239,7 @@ async fn payload_with_attachments(use_msgpack: bool) {
     let attachment = blob(ATTACHMENT_SIZE, 61).data.into_bytes();
 
     let source_split = attachment.len() / 3;
-    let sources = [&attachment[..source_split], &attachment[source_split..]]
+    let sources: Vec<_> = [&attachment[..source_split], &attachment[source_split..]]
         .into_iter()
         .map(|bytes| {
             let mut buffer = ctx.state.buffer_pool.allocate(bytes.len()).unwrap();
@@ -248,7 +249,7 @@ async fn payload_with_attachments(use_msgpack: bool) {
         })
         .collect();
     let destination_split = attachment.len() / 2 + 17;
-    let destinations = [destination_split, attachment.len() - destination_split]
+    let destinations: Vec<_> = [destination_split, attachment.len() - destination_split]
         .into_iter()
         .map(|len| {
             let mut buffer = ctx.state.buffer_pool.allocate(len).unwrap();
@@ -256,30 +257,21 @@ async fn payload_with_attachments(use_msgpack: bool) {
             buffer
         })
         .collect();
-    let mut wrapper = client
-        .with_read_buffers(sources)
-        .unwrap()
-        .with_write_buffers(destinations);
-    let (response, buffers) = wrapper
-        .exchange_attached(&ctx, &request)
-        .await
-        .unwrap()
-        .into_parts();
-    let buffers = buffers.into_available().expect("destinations available");
+    let Completed { result, buffers } = client
+        .with_buffers(&sources, destinations)
+        .run(async |attached| attached.exchange_attached(&ctx, &request).await)
+        .await;
+    let destinations = buffers.unwrap();
+    let response = result.unwrap();
     assert_eq!(response, request);
-    assert_eq!(buffers.len(), 2);
+    assert_eq!(destinations.len(), 2);
     assert_eq!(
-        flatten(&buffers),
+        flatten(&destinations),
         attachment.iter().rev().copied().collect::<Vec<_>>()
     );
-    let recovered = wrapper
-        .take_read_buffers()
-        .into_available()
-        .expect("completed application READs release the attachment owner");
-    assert_eq!(flatten(&recovered), attachment);
-    drop(wrapper);
-    drop(buffers);
-    drop(recovered);
+    assert_eq!(flatten(&sources), attachment);
+    drop(destinations);
+    drop(sources);
     stop(server, ctx).await;
 }
 

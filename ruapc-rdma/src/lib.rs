@@ -10,9 +10,10 @@
 //! - **QueuePair**: High-level [`send`](QueuePair::send) / [`recv`](QueuePair::recv)
 //!   take ownership of a [`ruapc_bufpool::Buffer`]. Poll [`CompletionQueue`] and
 //!   pass CQ-issued [`Completion`] proofs to [`QueuePair::complete`] to recover
-//!   finished buffers. [`QueuePair::prepare_reads`] owns READ destinations
-//!   through completion or successful QP destruction; failures cannot release
-//!   destinations while the NIC may still access them.
+//!   finished buffers. [`QueuePair::prepare_reads`] accepts destination
+//!   capabilities. Owned buffers remain retained through completion or successful
+//!   QP destruction. Unsafely borrowed capabilities retain the caller's lifetime
+//!   and exclusive-access obligations.
 //! - **Type-safe bindings**: Generated FFI types have custom Rust wrappers
 //!   (`FwVer`, `Guid`, `WRID`, `LinkLayer`) substituted at build time.
 //!   Every verbs entry point is routed through a C shim compiled against the
@@ -64,7 +65,8 @@ pub use verbs::{
     ActiveDevice, CompChannel, CompletedWork, Completion, CompletionBatch, CompletionCursor,
     CompletionIdentity, CompletionQueue, Completions, Context, Device, DeviceList, MAX_GATHER_SGE,
     MemoryRegion, ProtectionDomain, QpConnectionConfig, QpRegistryStats, QueuePair, ReadCompletion,
-    ReadFailure, ReadHandle, ReadObservation, ReadPosting, ReadRequest, ReadSegment, WrBuffers,
+    ReadFailure, ReadHandle, ReadObservation, ReadOutcome, ReadPosting, ReadRequest, ReadSegment,
+    WrBuffers,
 };
 
 /// Internal ownership components used by the standalone benchmarks.

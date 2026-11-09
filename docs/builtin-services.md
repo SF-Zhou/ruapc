@@ -54,8 +54,8 @@ Their Rust trait and request types are crate-private.
 | `MemoryService/read_into_target` | Original request ID and `CopyOp` batch; source in `MsgMeta.read_regions` | `()` | Client RDMA-READs server buffers into its pinned target. |
 | `MemoryService/request_is_pending` | Original request ID | `bool` | Post-READ source-request waiter membership check. |
 
-Inline reads and writes require the original request's retained source or
-write target and valid copy ranges. `read_into_target` additionally requires an
+Inline reads and writes require the original request's source-command channel
+or write target and valid copy ranges. `read_into_target` additionally requires an
 established RDMA connection and advertised read regions. An ordinary HTTP POST
 cannot supply those RDMA prerequisites; the route reaches the handler, which
 returns an RPC error. Unary HTTP also lacks the reverse-RPC stream used by the

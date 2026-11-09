@@ -9,6 +9,11 @@ use crate::buddy::{BuddyBlock, LEVEL_SIZES, NODES_PER_LEVEL, NUM_LEVELS};
 use crate::slab::{NUM_SLAB_CLASSES, SLAB_BACKING_SIZE, SLAB_CLASS_SIZES};
 use crate::{BufferPool, MemoryKey, RemoteBufferInfo};
 
+mod capability;
+pub use capability::WriteBuffer;
+mod read_sources;
+pub use read_sources::ReadSources;
+
 /// A buffer allocated from the pool.
 ///
 /// When dropped, the buffer is automatically returned to the pool for reuse.
@@ -135,6 +140,18 @@ impl Buffer {
             level: Self::EMPTY_LEVEL,
             index: 0,
         }
+    }
+
+    /// Transfers this buffer's allocation into the returned value.
+    ///
+    /// Leaves an empty buffer with zero length and capacity in its place. The
+    /// returned buffer retains the original pointer, contents, length and
+    /// registration; no payload bytes are copied. Assign it back to restore
+    /// the original buffer after an operation has finished using it.
+    #[must_use]
+    pub fn take(&mut self) -> Self {
+        let empty = Self::empty(&self.pool);
+        std::mem::replace(self, empty)
     }
 
     /// Returns the logical length of the buffer in bytes.
@@ -418,5 +435,31 @@ mod tests {
         let debug_str = format!("{buffer:?}");
         assert!(debug_str.contains("Buffer"));
         assert!(debug_str.contains("len"));
+    }
+
+    #[test]
+    fn taking_a_buffer_preserves_the_allocation_and_leaves_an_empty_slot() {
+        let pool = test_pool();
+        let mut buffer = pool.allocate(16).unwrap();
+        buffer.set_len(4);
+        buffer.copy_from_slice(b"keep");
+        let pointer = buffer.as_ptr();
+        let capacity = buffer.capacity();
+
+        let taken = buffer.take();
+        assert!(buffer.is_empty());
+        assert_eq!(buffer.capacity(), 0);
+        assert_eq!(taken.as_ptr(), pointer);
+        assert_eq!(taken.capacity(), capacity);
+        assert_eq!(taken.as_slice(), b"keep");
+
+        // An empty slot can be taken again without acquiring the allocation
+        // still owned by the first result.
+        let empty = buffer.take();
+        assert_eq!(empty.capacity(), 0);
+        drop(empty);
+        buffer = taken;
+        assert_eq!(buffer.as_ptr(), pointer);
+        assert_eq!(buffer.as_slice(), b"keep");
     }
 }

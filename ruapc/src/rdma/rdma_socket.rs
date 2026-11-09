@@ -24,7 +24,7 @@ use crate::{
         rdma_service::is_payload_method,
     },
     sockets::{SendRequest, reserve_send},
-    task::next_conn_id,
+    task::{TaskSupervisorHandle, next_conn_id},
 };
 
 pub(crate) struct RdmaSocketConfig {
@@ -34,9 +34,11 @@ pub(crate) struct RdmaSocketConfig {
     pub(crate) send_window: u32,
     pub(crate) path: RdmaPathInfo,
     pub(crate) read_timeout: Option<Duration>,
+    pub(crate) settle_grace: Duration,
     pub(crate) read_permits: Arc<tokio::sync::Semaphore>,
     pub(crate) bandwidth_limiter: Arc<RdmaBandwidthLimiter>,
     pub(crate) sq_read_cap: u32,
+    pub(crate) supervisor: TaskSupervisorHandle,
 }
 
 pub(crate) use read::ReadCredits;
@@ -77,8 +79,11 @@ pub struct RdmaSocket {
     bandwidth_limiter: Arc<RdmaBandwidthLimiter>,
     /// Software budget for READ admission and completion. `None` disables
     /// this budget, but not request deadlines. Completion expiry uses the
-    /// poll thread's sweep; only contended admission creates a timer.
+    /// poll thread's sweep. Contended admission and owned completion waits also
+    /// use timers so callers can leave recovery to the runtime after the grace.
     read_timeout: Option<Duration>,
+    settle_grace: Duration,
+    supervisor: TaskSupervisorHandle,
 }
 
 impl RdmaSocket {
@@ -107,6 +112,8 @@ impl RdmaSocket {
             accept_lease_id: AtomicU64::new(0),
             bandwidth_limiter: config.bandwidth_limiter,
             read_timeout: config.read_timeout,
+            settle_grace: config.settle_grace,
+            supervisor: config.supervisor,
         }
     }
 
@@ -153,14 +160,27 @@ impl RdmaSocket {
             return;
         }
         self.read_credits.close();
-        // Notify callers even if the provider never produces flush CQEs.
-        // Failure notification preserves posted buffers and READ permits.
+        // Record the terminal reason. READ callers still await CQ-issued
+        // completion evidence and their original destination buffers.
         self.fail_read_batches();
         self.large.close();
         // The poll thread moves the QP to ERR, serialized with receive
         // reposting. A receive posted after the provider's ERR flush can
         // otherwise remain outstanding indefinitely (notably on RXE).
         self.poller_waker.wake();
+    }
+
+    /// Additional time allowed for an abandoned or failed READ to settle before
+    /// closing its QP. ERR draining itself is never bounded by a release timer.
+    pub(crate) fn settle_grace(&self) -> Duration {
+        self.settle_grace
+    }
+
+    /// Stops new work and waits for ERR draining and actual provider destruction.
+    /// Retained socket handles cannot delay destruction or post afterwards.
+    pub(crate) async fn close_and_wait(&self) {
+        self.set_error();
+        self.queue_pair.wait_destroyed().await;
     }
 
     /// Reserves SEND bandwidth before advertising local read buffers to the

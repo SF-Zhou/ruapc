@@ -75,7 +75,7 @@ impl RemoteReadService for RemoteReadServiceImpl {
         }
         // Allocates right-sized buffers (mirroring the client's regions)
         // and reads exactly the client's logical data.
-        let local = ctx.remote_read_all().await?;
+        let local = ctx.remote_read_allocated().await?;
         Ok(digest_bufs(&local))
     }
 
@@ -106,8 +106,10 @@ impl RemoteReadService for RemoteReadServiceImpl {
             CopyOp::new(half, 0, total - half),
             CopyOp::new(0, total - half, half),
         ];
-        let local = ctx.remote_read(&ops, vec![a, b]).await?;
-        Ok(digest_bufs(&local))
+        let Completed { result, buffers } = ctx.own_buffers(vec![a, b]).remote_read(&ops).await;
+        result?;
+        let buffers = buffers.unwrap();
+        Ok(digest_bufs(&buffers))
     }
 
     async fn read_out_of_bounds(&self, ctx: &Context, _req: &ReadReq) -> Result<ReadRsp> {
@@ -120,20 +122,17 @@ impl RemoteReadService for RemoteReadServiceImpl {
         buf.set_len(1);
         // One byte past the end of the remote space.
         let ops = [CopyOp::new(space.total_len(), 0, 1)];
-        match ctx.remote_read(&ops, vec![buf]).await {
-            Ok(local) => Ok(digest_bufs(&local)),
-            Err(mut e) => {
-                // The consumed buffers must be recoverable on this
-                // validation-failure path.
-                if e.take_recovered_buffers().is_none() {
-                    return Err(Error::new(
-                        ErrorKind::InvalidArgument,
-                        "buffers not recovered from RemoteIoError".into(),
-                    ));
-                }
-                Err(e.into())
-            }
-        }
+        let pointer = buf.as_ptr() as usize;
+        let Completed {
+            result,
+            buffers: local,
+        } = ctx.own_buffers(vec![buf]).remote_read(&ops).await;
+        let local = local.unwrap();
+        assert_eq!(local[0].as_ptr() as usize, pointer);
+        assert_eq!(local[0].len(), 1);
+        let _ = local[0].as_slice();
+        result?;
+        Ok(digest_bufs(&local))
     }
 }
 
@@ -209,12 +208,16 @@ async fn run_test(tc: TestCase) {
         delay_ms: tc.delay_ms,
     };
 
-    let c = client.with_read_buffers(bufs).unwrap();
-    let result: Result<ReadRsp> = match tc.method {
-        Method::All => c.read_all(&ctx, &req).await,
-        Method::Swapped => c.read_swapped(&ctx, &req).await,
-        Method::OutOfBounds => c.read_out_of_bounds(&ctx, &req).await,
-    };
+    let Completed { result, buffers } = client
+        .with_buffers(&bufs, vec![])
+        .run(async |c| match tc.method {
+            Method::All => c.read_all(&ctx, &req).await,
+            Method::Swapped => c.read_swapped(&ctx, &req).await,
+            Method::OutOfBounds => c.read_out_of_bounds(&ctx, &req).await,
+        })
+        .await;
+    assert!(buffers.unwrap().is_empty());
+    assert_eq!(digest_bufs(&bufs), digest(tc.data));
 
     match tc.expect {
         Expected::Ok => {

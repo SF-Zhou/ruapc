@@ -8,7 +8,7 @@ pub mod app;
 #[doc(hidden)]
 pub mod test_support;
 
-use ruapc::{BufferReply, Context, Result};
+use ruapc::{Context, Result};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -44,7 +44,7 @@ pub trait MemBenchService {
 
     /// Fills the client's pinned write buffers with `request.len` bytes of a
     /// varying pattern and returns the CRC32C of the written data.
-    async fn write_crc(&self, ctx: &Context, request: &WriteCrcReq) -> Result<BufferReply<u32>>;
+    async fn write_crc(&self, ctx: &Context, request: &WriteCrcReq) -> Result<u32>;
 }
 
 /// Computes the CRC32C (CRC-32/iSCSI) of a logical contiguous space made of

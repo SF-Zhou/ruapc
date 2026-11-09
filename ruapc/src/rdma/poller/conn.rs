@@ -32,37 +32,50 @@ const SMALL_MSG_COPY_MAX: usize = 1024;
 struct RegisteredConnection {
     state: Arc<State>,
     conn_id: u64,
+    waiters_closed: bool,
 }
 
 impl RegisteredConnection {
     fn new(state: Arc<State>, conn_id: u64) -> Self {
         state.metrics.connection_opened("RDMA");
-        Self { state, conn_id }
+        Self {
+            state,
+            conn_id,
+            waiters_closed: false,
+        }
+    }
+
+    fn close_waiters(&mut self) {
+        if !self.waiters_closed {
+            self.waiters_closed = true;
+            self.state.connection_closed(
+                self.conn_id,
+                &Error::new(ErrorKind::ConnectionClosed, "rdma connection closed".into()),
+            );
+        }
     }
 }
 
 impl Drop for RegisteredConnection {
     fn drop(&mut self) {
         self.state.metrics.connection_closed("RDMA");
-        self.state.connection_closed(
-            self.conn_id,
-            &Error::new(ErrorKind::ConnectionClosed, "rdma connection closed".into()),
-        );
+        self.close_waiters();
     }
 }
 
 /// Per-connection state owned by the poll thread.
 ///
-/// Field order matters for teardown: handlers holding buffers come before
-/// `socket` so buffers are released before the QP can be destroyed.
+/// The poller explicitly destroys the QP after ERR draining; cached socket
+/// handles may outlive this state but cannot perform provider operations.
 pub(super) struct ConnState {
     /// Listed once in the poller's active maintenance queue. Never shared
     /// with posting tasks and never used to authorize completion ownership.
     pub(super) dirty: bool,
     /// Only the poll thread requests provider ERR, after any receive repost
     /// already in progress. Software closure alone does not start that flush.
-    /// Records the transition attempt, never evidence of DMA completion.
-    qp_error_requested: bool,
+    /// First successful transition's start, never evidence of DMA completion.
+    /// Repeated maintenance and shutdown must not restart its failure deadline.
+    error_flush_started: Option<Instant>,
     /// CQ-assigned QP identity and sequence floor; stale completions are discarded
     /// before they can affect a replacement connection's flow control.
     pub(super) identity: CompletionIdentity,
@@ -97,7 +110,7 @@ impl ConnState {
         let registration = RegisteredConnection::new(reg.state, reg.socket.conn_id);
         Self {
             dirty: false,
-            qp_error_requested: false,
+            error_flush_started: None,
             identity: reg.socket.queue_pair.identity(),
             flow: FlowControl::new(reg.send_window, reg.recv_submitted, Instant::now()),
             pending_sends: VecDeque::new(),
@@ -588,8 +601,8 @@ impl ConnState {
         }
     }
 
-    /// Fails expired READ waiters and moves the QP to ERR. Posted memory and
-    /// permits stay held until completion processing or successful QP destruction.
+    /// Records READ deadlines and moves the QP to ERR after their cleanup
+    /// grace. Posted destinations and permits remain held through their CQEs.
     pub(super) fn sweep_read_timeouts(&self, now: Instant) {
         self.socket.sweep_large_transfers(now);
         // Skip the scan while every READ permit is available: no accepted WR
@@ -611,27 +624,44 @@ impl ConnState {
 
     /// Starts the provider flush on the thread that owns receive reposting.
     pub(super) fn start_error_flush(&mut self) {
-        if !self.qp_error_requested {
-            self.qp_error_requested = true;
+        self.registration.close_waiters();
+        if self.error_flush_started.is_none() {
+            let started = Instant::now();
             super::set_qp_error(&self.socket);
+            self.error_flush_started = Some(started);
+        }
+    }
+
+    /// A missing flush CQE must fail-stop instead of stranding every waiter.
+    /// This deadline never substitutes for completion or permits early destroy.
+    pub(super) fn check_teardown_deadline(&self, now: Instant) {
+        if self.error_flush_started.is_some_and(|started| {
+            now.saturating_duration_since(started) >= super::TEARDOWN_TIMEOUT
+        }) {
+            tracing::error!(
+                conn_id = self.socket.conn_id,
+                local_qp = self.socket.queue_pair.qp_num(),
+                flow = ?self.flow,
+                "RDMA teardown did not receive required completions before its deadline"
+            );
+            std::process::abort();
         }
     }
 
     /// Whether this connection can be torn down.
     ///
-    /// Requires a provider ERR request, settled ACK/receive counters, no
-    /// pending sends, and closed, idle READ admission with no pending batches.
-    /// Waiting for every SQ permit covers posters paused before registering their batch;
-    /// earlier removal would lose their completions and NIC permits.
+    /// Requires a successful provider ERR transition, settled ACK/receive
+    /// counters, no pending sends and no posted READs. The QP posting gate
+    /// excludes posters paused after acquiring credits: they can only fail
+    /// their unposted work after closure, even while retaining the socket.
     /// Successfully completed unsignaled SENDs may still own buffers until
     /// the QP is destroyed.
     pub(super) fn ready_to_remove(&mut self) -> bool {
         !self.socket.state.is_ok()
-            && self.qp_error_requested
+            && self.error_flush_started.is_some()
             && self.flow.flushed()
             && self.pending_sends.is_empty()
             && self.socket.read_credits.is_closed()
-            && self.socket.read_credits.is_idle()
             && !self.socket.queue_pair.has_pending_reads()
     }
 }

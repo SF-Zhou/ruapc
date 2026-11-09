@@ -154,8 +154,8 @@ fn finish_ledger(state: &Ledger, batch: Batch, mut receiver: ReadCompletion) {
     assert_eq!(batch.remaining(), 1);
     batch.abort_unposted(1);
     assert_eq!(
-        receiver.try_recv().unwrap().unwrap_err(),
-        ReadFailure::Completion
+        receiver.try_recv().unwrap().result,
+        Err(ReadFailure::Cancelled)
     );
 }
 
@@ -221,7 +221,17 @@ fn lifecycle_run(iterations: u64, pool: &Arc<BufferPool>, wrs: u64) -> Duration 
             for sequence in first..first + wrs {
                 assert!(state.complete(sequence));
             }
-            buffers = receiver.try_recv().unwrap().unwrap();
+            let outcome = receiver.try_recv().unwrap();
+            outcome.result.unwrap();
+            buffers = outcome
+                .buffers
+                .into_iter()
+                .map(|buffer| {
+                    buffer
+                        .into_owned()
+                        .expect("benchmark owns its destinations")
+                })
+                .collect();
         }
         elapsed += start.elapsed();
         remaining -= count;
@@ -339,7 +349,9 @@ fn finish_run(iterations: u64, pool: &Arc<BufferPool>, wrs: usize, armed: bool) 
         let start = Instant::now();
         for (batch, receiver) in &mut batches {
             batch.complete_one(true);
-            returned.push(receiver.try_recv().unwrap().unwrap());
+            let outcome = receiver.try_recv().unwrap();
+            outcome.result.unwrap();
+            returned.push(outcome.buffers);
         }
         elapsed += start.elapsed();
         black_box(&returned);

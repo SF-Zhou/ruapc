@@ -144,6 +144,16 @@ impl<T> SlotTable<T> {
             .filter(|slot| slot.tag.load(Ordering::Acquire) >= TAG_BASE)
             .count()
     }
+
+    /// Takes every entry with exclusive access to the ownership table.
+    /// The caller must establish that the provider can no longer access any
+    /// memory whose ownership is held by these entries.
+    pub fn drain(&mut self) -> impl Iterator<Item = T> + '_ {
+        self.slots.iter_mut().filter_map(|slot| {
+            *slot.tag.get_mut() = EMPTY;
+            slot.value.get_mut().take()
+        })
+    }
 }
 
 impl<T> std::fmt::Debug for SlotTable<T> {

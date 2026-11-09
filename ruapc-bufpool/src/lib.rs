@@ -41,7 +41,7 @@ mod slab;
 mod thread_cache;
 
 pub use aligned::AlignedMemory;
-pub use buffer::Buffer;
+pub use buffer::{Buffer, ReadSources, WriteBuffer};
 pub use pool::{BufferPool, BufferPoolBuilder, DEFAULT_BUFFER_POOL_MEMORY};
 
 mod key;
