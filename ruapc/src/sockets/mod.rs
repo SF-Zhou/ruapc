@@ -1,6 +1,6 @@
 /// Socket abstraction layer.
 mod socket;
-pub use socket::{Socket, SocketTrait};
+pub use socket::Socket;
 
 mod channel;
 mod send_queue;
@@ -20,7 +20,7 @@ pub use config::SocketPoolConfig;
 /// Socket pool management.
 mod socket_pool;
 pub(crate) use socket_pool::AcquireOptions;
-pub use socket_pool::{RawStream, SocketPool, SocketPoolTrait};
+pub use socket_pool::{RawStream, SocketPool};
 
 /// HTTP transport implementation.
 pub mod http;

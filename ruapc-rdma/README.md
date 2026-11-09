@@ -157,6 +157,9 @@ for the proof and `remote_write`'s separate reverse-RPC completion path.
 `ActiveDevice` implements `ruapc_bufpool::MemoryRegistrar` in
 [`buffer_registration.rs`](src/buffer_registration.rs). `MemoryRegion` retains
 memory and its protection domain, while queue operations enforce DMA lifetimes.
+Pass shared active devices directly to `BufferPoolBuilder::new`; a QP's
+`device_index` is the position of its device in that pool's registrar vector.
+The index is local to the pool and carries no cross-pool identity check.
 Registration itself grants no independent byte access; see the
 [registration contract](../docs/safe-boundaries.md#registration-and-byte-access).
 

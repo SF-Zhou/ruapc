@@ -191,7 +191,7 @@ impl RdmaSocket {
         request.refresh(meta)?;
         let mut region = encoded
             .buffer
-            .remote_buffer_info(&self.queue_pair.device_index)?;
+            .remote_buffer_info(self.queue_pair.device_index)?;
         region.addr = region
             .addr
             .checked_add(encoded.payload_offset as u64)
@@ -858,7 +858,7 @@ mod lifecycle_tests {
     use super::*;
     use crate::{
         Client, Context, Endpoint, MsgFlags, Payload, RawCall, Receiver, Router, Server,
-        SocketPoolConfig, SocketTrait, Transport,
+        SocketPoolConfig, Transport,
         core::ContextEndpoint,
         rdma::{
             DevicePollers, PollerConfig, RdmaBandwidthLimiter, RdmaConnectionConfig, RdmaNicInfo,
@@ -867,7 +867,6 @@ mod lifecycle_tests {
         },
         spawn_handler,
     };
-    use ruapc_bufpool::Device as _;
     use ruapc_rdma::{CompletionQueue, QueuePair};
     use std::sync::atomic::Ordering;
     use tokio::sync::Notify;
@@ -991,8 +990,11 @@ mod lifecycle_tests {
 
         fn with_handler_limit(max_inflight_requests: usize) -> Self {
             let devices = make_rdma_devices();
-            let device = &devices.devices()[0];
-            let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+            let device = &devices[0];
+            let pool = ruapc_bufpool::BufferPoolBuilder::new(
+                devices.iter().map(|device| device.registrar()).collect(),
+            )
+            .build();
             let connection = RdmaConnectionConfig {
                 qp: RdmaQueuePairConfig {
                     max_send_wr: 4,

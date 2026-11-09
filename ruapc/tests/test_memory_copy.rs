@@ -1,9 +1,10 @@
 use std::{sync::Arc, time::Duration};
 
 use ruapc::{
-    Buffer, Client, Context, CopyOp, Endpoint, ListenMode, ResultBufferReply, Router, Server,
-    SocketPoolConfig, Transport, service,
+    Buffer, BufferPool, Client, Context, CopyOp, Endpoint, ListenMode, ResultBufferReply, Router,
+    Server, SocketPoolConfig, Transport, service,
 };
+use ruapc_bufpool::MemoryKey;
 
 const OPS: [CopyOp; 3] = [
     CopyOp::new(1, 7, 4),
@@ -11,13 +12,16 @@ const OPS: [CopyOp; 3] = [
     CopyOp::new(0, 1, 3),
 ];
 
-fn buffers(ctx: &Context, bytes: &[u8], lengths: &[usize]) -> Vec<Buffer> {
+fn buffers(pool: &Arc<BufferPool>, bytes: &[u8], lengths: &[usize]) -> Vec<Buffer> {
     assert_eq!(lengths.iter().sum::<usize>(), bytes.len());
     let mut offset = 0;
     lengths
         .iter()
         .map(|&len| {
-            let mut buffer = ctx.state.buffer_pool.allocate(len.max(1)).unwrap();
+            if len == 0 {
+                return Buffer::empty(pool);
+            }
+            let mut buffer = pool.allocate(len).unwrap();
             buffer.set_len(len);
             buffer.copy_from_slice(&bytes[offset..offset + len]);
             offset += len;
@@ -42,9 +46,25 @@ struct PackedCopyService;
 
 impl PackedCopy for PackedCopyService {
     async fn exchange(&self, ctx: &Context, _: &()) -> ResultBufferReply<Vec<u8>> {
-        let destination = buffers(ctx, b"............", &[3, 0, 4, 5]);
+        #[cfg(feature = "rdma")]
+        assert!(ctx.state.rdma_devices.is_empty());
+        for (regions, lengths) in [
+            (&ctx.msg_meta.read_regions, [2, 0, 3, 3]),
+            (&ctx.msg_meta.write_regions, [0, 5, 2, 5]),
+        ] {
+            assert_eq!(
+                regions.iter().map(|region| region.len).collect::<Vec<_>>(),
+                lengths
+            );
+            assert!(
+                regions
+                    .iter()
+                    .all(|region| { region.addr == 0 && region.key == MemoryKey::default() })
+            );
+        }
+        let destination = buffers(&ctx.state.buffer_pool, b"............", &[3, 0, 4, 5]);
         let read = ctx.remote_read(&OPS, destination).await?;
-        let source = buffers(ctx, b"ABCDEFGH", &[1, 0, 4, 3]);
+        let source = buffers(&ctx.state.buffer_pool, b"ABCDEFGH", &[1, 0, 4, 3]);
         let sent = ctx.remote_write(&OPS, source).await?;
         Ok(sent.into_reply(flatten(&read)))
     }
@@ -63,17 +83,22 @@ async fn packed_copies_keep_operation_order_holes_and_empty_segments_on_stream_t
     Arc::new(PackedCopyService).ruapc_export(&mut router);
     let server = Server::create(router, &config).unwrap();
     let address = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    // Stream attachments need neither a registration nor allocation from the
+    // Context's own pool. Zero-length segments can have no backing allocation.
+    let pool = BufferPool::new(Vec::new());
 
     for transport in [Transport::TCP, Transport::WS, Transport::HTTP] {
         let ctx = Context::create(&config)
             .unwrap()
             .with_endpoint(Endpoint::new(transport, [address]).unwrap());
+        #[cfg(feature = "rdma")]
+        assert!(ctx.state.rdma_devices.is_empty());
         let client = Client {
             timeout: Duration::from_secs(5),
             ..Default::default()
         };
-        let source = buffers(&ctx, b"abcdefgh", &[2, 0, 3, 3]);
-        let destination = buffers(&ctx, b"............", &[0, 5, 2, 5]);
+        let source = buffers(&pool, b"abcdefgh", &[2, 0, 3, 3]);
+        let destination = buffers(&pool, b"............", &[0, 5, 2, 5]);
         let destination_pointers: Vec<_> =
             destination.iter().map(|buffer| buffer.as_ptr()).collect();
         let mut attached = client
@@ -105,10 +130,10 @@ async fn packed_copies_keep_operation_order_holes_and_empty_segments_on_stream_t
                 .collect::<Vec<_>>(),
             destination_pointers,
         );
-        assert_eq!(
-            flatten(&attached.take_read_buffers().into_available().unwrap()),
-            b"abcdefgh"
-        );
+        assert_eq!(written[0].capacity(), 0);
+        let recovered = attached.take_read_buffers().into_available().unwrap();
+        assert_eq!(flatten(&recovered), b"abcdefgh");
+        assert_eq!(recovered[1].capacity(), 0);
     }
 
     server.stop();

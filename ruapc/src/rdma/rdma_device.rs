@@ -4,7 +4,7 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use ruapc_bufpool::DeviceIndex;
+use ruapc_bufpool::MemoryRegistrar;
 use ruapc_rdma::{ActiveDevice, Context, DeviceInfo, ProtectionDomain};
 
 use super::RdmaBandwidthLimiter;
@@ -18,24 +18,34 @@ struct BandwidthLimitConfig {
     max_wait: Duration,
 }
 
+/// One configured RDMA device and its shared runtime resources.
 pub struct RdmaDevice {
-    index: DeviceIndex,
-    inner: ActiveDevice,
+    index: usize,
+    inner: Arc<ActiveDevice>,
     info: ArcSwap<DeviceInfo>,
     bandwidth_config: OnceLock<BandwidthLimitConfig>,
     bandwidth_limiters: dashmap::DashMap<u8, Arc<RdmaBandwidthLimiter>>,
 }
 
 impl RdmaDevice {
-    pub fn new(inner: ActiveDevice) -> Self {
+    pub(crate) fn new(index: usize, inner: ActiveDevice) -> Self {
         let info = Arc::new(inner.info().clone());
         Self {
-            index: DeviceIndex::default(),
-            inner,
+            index,
+            inner: Arc::new(inner),
             info: ArcSwap::from(info),
             bandwidth_config: OnceLock::new(),
             bandwidth_limiters: dashmap::DashMap::new(),
         }
+    }
+
+    /// Position in the State's device list and buffer-pool registration list.
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    pub(crate) fn registrar(&self) -> Arc<dyn MemoryRegistrar> {
+        self.inner.clone()
     }
 
     pub fn context(&self) -> &Arc<Context> {
@@ -130,22 +140,6 @@ impl RdmaDevice {
     }
 }
 
-impl ruapc_bufpool::Device for RdmaDevice {
-    fn index(&self) -> DeviceIndex {
-        self.index
-    }
-
-    fn set_index(&mut self, idx: DeviceIndex) {
-        self.index = idx;
-    }
-
-    type Registrar = ActiveDevice;
-
-    fn registrar(&self) -> &Self::Registrar {
-        &self.inner
-    }
-}
-
 impl std::fmt::Debug for RdmaDevice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RdmaDevice")
@@ -158,24 +152,18 @@ impl std::fmt::Debug for RdmaDevice {
 mod tests {
     use super::*;
     use crate::rdma::test_utils::open_rdma_device;
-    use ruapc_bufpool::Device as _;
 
     #[test]
     fn test_rdma_device_debug_format() {
-        let mut rdma = RdmaDevice::new(open_rdma_device());
-        rdma.set_index(DeviceIndex { magic: 0, index: 3 });
+        let rdma = RdmaDevice::new(3, open_rdma_device());
         let debug = format!("{rdma:?}");
         assert!(debug.contains("RdmaDevice"));
     }
 
     #[test]
     fn test_rdma_device_index_and_inner() {
-        let mut rdma = RdmaDevice::new(open_rdma_device());
-        rdma.set_index(DeviceIndex {
-            magic: 0,
-            index: 42,
-        });
-        assert_eq!(rdma.index().index, 42);
+        let rdma = RdmaDevice::new(42, open_rdma_device());
+        assert_eq!(rdma.index(), 42);
         // context() and pd() should not panic.
         let _ = rdma.context();
         let _ = rdma.pd();
@@ -183,7 +171,7 @@ mod tests {
 
     #[test]
     fn test_bandwidth_limiter_is_shared_per_port() {
-        let rdma = RdmaDevice::new(open_rdma_device());
+        let rdma = RdmaDevice::new(0, open_rdma_device());
         let config = RdmaSocketPoolConfig::default();
         rdma.configure_bandwidth_limit(&config).unwrap();
         let port_num = rdma.info().ports[0].port_num;

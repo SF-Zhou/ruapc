@@ -938,12 +938,11 @@ mod tests {
 
     use std::sync::{atomic::AtomicUsize, mpsc};
 
-    use ruapc_bufpool::Device as _;
     use ruapc_memory::CopyBatch;
     use ruapc_rdma::{QueuePair, ibv_qp_attr, ibv_qp_attr_mask, ibv_qp_state};
 
     use crate::{
-        BufferPool, MsgFlags, MsgMeta, Router, SocketPoolConfig, SocketTrait, TaskSupervisor,
+        BufferPool, MsgFlags, MsgMeta, Router, SocketPoolConfig, TaskSupervisor,
         rdma::{
             ConnCountGuard, RdmaBandwidthLimiter, RdmaConnectionConfig, RdmaDevice, RdmaNicInfo,
             RdmaPathInfo, RdmaQueuePairConfig, RdmaSocketConfig, SendPermit,
@@ -1084,7 +1083,7 @@ mod tests {
     #[tokio::test]
     async fn failed_new_shard_does_not_hide_existing_capacity() {
         let devices = make_rdma_devices();
-        let device = &devices.devices()[0];
+        let device = &devices[0];
         let pollers = DevicePollers::default();
         let config = PollerConfig {
             cq_len: 63,
@@ -1327,6 +1326,85 @@ mod tests {
         second.connect(&config(first)).unwrap();
     }
 
+    #[tokio::test]
+    async fn registrar_slots_match_each_devices_protection_domain() {
+        // Two opens of one NIC give independent PDs without requiring two NICs.
+        // A swapped registrar order or a hard-coded zero slot fails in hardware.
+        let devices = [
+            RdmaDevice::new(0, open_rdma_device()),
+            RdmaDevice::new(1, open_rdma_device()),
+        ];
+        assert!(!Arc::ptr_eq(devices[0].pd(), devices[1].pd()));
+        let pool = BufferPool::new(devices.iter().map(|device| device.registrar()).collect());
+
+        for (index, device) in devices.iter().enumerate() {
+            assert_eq!(device.index(), index);
+            let cq = ruapc_rdma::CompletionQueue::create(device.context(), 16, None).unwrap();
+            let create_qp = || {
+                QueuePair::create(
+                    device.pd(),
+                    &cq,
+                    &mut ruapc_rdma::ibv_qp_init_attr {
+                        qp_type: ruapc_rdma::ibv_qp_type::IBV_QPT_RC,
+                        cap: ruapc_rdma::ibv_qp_cap {
+                            max_send_wr: 4,
+                            max_recv_wr: 4,
+                            max_send_sge: 1,
+                            max_recv_sge: 1,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    device.index(),
+                )
+                .unwrap()
+            };
+            let sender = create_qp();
+            let receiver = create_qp();
+            connect_read_pair(device, &sender, &receiver);
+
+            let mut sent = pool.allocate(64).unwrap();
+            sent.set_len(64);
+            sent.fill(0x5a + index as u8);
+            assert!(sent.memory_key(devices.len()).is_err());
+            receiver.recv(pool.allocate(64).unwrap()).unwrap();
+            sender
+                .send_signaled(sent, ruapc_rdma::ibv_send_flags::IBV_SEND_SIGNALED)
+                .unwrap();
+
+            let mut send_cursor = ruapc_rdma::CompletionCursor::default();
+            let mut recv_cursor = ruapc_rdma::CompletionCursor::default();
+            let mut batch = CompletionBatch::<2>::new();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut received = false;
+                let mut sent = false;
+                while !received || !sent {
+                    for completion in cq.poll_batch(&mut batch).unwrap() {
+                        assert!(completion.info().succ(), "registration slot {index}");
+                        if completion.qp_num() == receiver.qp_num() {
+                            let completed =
+                                receiver.complete(completion, &mut recv_cursor).unwrap();
+                            assert_eq!(completed.wc.byte_len, 64);
+                            let mut buffer = completed.buffer.unwrap().into_single().unwrap();
+                            buffer.set_len(completed.wc.byte_len as usize);
+                            assert_eq!(&buffer[..], &[0x5a + index as u8; 64]);
+                            received = true;
+                        } else {
+                            assert_eq!(completion.qp_num(), sender.qp_num());
+                            sender.complete(completion, &mut send_cursor).unwrap();
+                            sent = true;
+                        }
+                    }
+                    if !received || !sent {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                }
+            })
+            .await
+            .expect("both PDs must accept their pool registration keys");
+        }
+    }
+
     /// Consume exactly one authentic READ completion, leaving later CQEs untouched.
     async fn complete_one_read(poller: &DevicePoller, poll_loop: &mut PollLoop) {
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -1348,8 +1426,11 @@ mod tests {
     #[tokio::test]
     async fn successful_receive_queued_before_close_is_not_reposted() {
         let devices = make_rdma_devices();
-        let device = &devices.devices()[0];
-        let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+        let device = &devices[0];
+        let pool = ruapc_bufpool::BufferPoolBuilder::new(
+            devices.iter().map(|device| device.registrar()).collect(),
+        )
+        .build();
         let (poller, mut poll_loop) = manual_poller(device.context());
         let (state, _stop) = State::create(
             Router::default(),
@@ -1424,8 +1505,11 @@ mod tests {
     #[tokio::test]
     async fn close_between_receive_health_check_and_post_is_flushed_by_poller() {
         let devices = make_rdma_devices();
-        let device = &devices.devices()[0];
-        let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+        let device = &devices[0];
+        let pool = ruapc_bufpool::BufferPoolBuilder::new(
+            devices.iter().map(|device| device.registrar()).collect(),
+        )
+        .build();
         let (poller, mut poll_loop) = manual_poller(device.context());
         let (state, _stop) = State::create(
             Router::default(),
@@ -1505,8 +1589,11 @@ mod tests {
         use ruapc_memory::RemoteSpace;
 
         let devices = make_rdma_devices();
-        let device = &devices.devices()[0];
-        let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+        let device = &devices[0];
+        let pool = ruapc_bufpool::BufferPoolBuilder::new(
+            devices.iter().map(|device| device.registrar()).collect(),
+        )
+        .build();
         let (state, _stop) = State::create(
             Router::default(),
             &SocketPoolConfig {
@@ -1550,7 +1637,7 @@ mod tests {
             let mut source = pool.allocate(64).unwrap();
             source.set_len(64);
             source.fill(0x5a);
-            let regions = [source.remote_buffer_info(&device.index()).unwrap()];
+            let regions = [source.remote_buffer_info(device.index()).unwrap()];
             let remote = RemoteSpace::new(&regions).unwrap();
             let ops = [CopyOp::new(0, 0, 64)];
             let mut other_destination = pool.allocate(64).unwrap();
@@ -1610,8 +1697,11 @@ mod tests {
         use ruapc_memory::RemoteSpace;
 
         let devices = make_rdma_devices();
-        let device = &devices.devices()[0];
-        let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+        let device = &devices[0];
+        let pool = ruapc_bufpool::BufferPoolBuilder::new(
+            devices.iter().map(|device| device.registrar()).collect(),
+        )
+        .build();
         let (state, _stop) = State::create(
             Router::default(),
             &SocketPoolConfig {
@@ -1654,7 +1744,7 @@ mod tests {
             let mut source = pool.allocate(192).unwrap();
             source.set_len(192);
             source.fill(0x5a);
-            let regions = [source.remote_buffer_info(&device.index()).unwrap()];
+            let regions = [source.remote_buffer_info(device.index()).unwrap()];
             let remote = RemoteSpace::new(&regions).unwrap();
             let ops = [
                 CopyOp::new(0, 0, 64),
@@ -1663,7 +1753,10 @@ mod tests {
             ];
             // A separate destination pool lets the test observe DMA ownership
             // independently of the socket's pool and the remote source.
-            let destination_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+            let destination_pool = ruapc_bufpool::BufferPoolBuilder::new(
+                devices.iter().map(|device| device.registrar()).collect(),
+            )
+            .build();
             let destination_lifetime = Arc::downgrade(&destination_pool);
             let mut destination = destination_pool.allocate(192).unwrap();
             destination.set_len(192);
@@ -1745,8 +1838,11 @@ mod tests {
         use ruapc_memory::RemoteSpace;
 
         let devices = make_rdma_devices();
-        let device = &devices.devices()[0];
-        let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+        let device = &devices[0];
+        let pool = ruapc_bufpool::BufferPoolBuilder::new(
+            devices.iter().map(|device| device.registrar()).collect(),
+        )
+        .build();
         let (poller, mut poll_loop) = manual_poller(device.context());
         let (state, _stop) = State::create(
             Router::default(),
@@ -1774,7 +1870,7 @@ mod tests {
         assert!(poll_loop.drain_incoming(false));
         let mut source = pool.allocate(64).unwrap();
         source.set_len(64);
-        let regions = [source.remote_buffer_info(&device.index()).unwrap()];
+        let regions = [source.remote_buffer_info(device.index()).unwrap()];
         let remote = RemoteSpace::new(&regions).unwrap();
         let mut destination = pool.allocate(64).unwrap();
         destination.set_len(64);
@@ -1833,8 +1929,11 @@ mod tests {
         use ruapc_memory::RemoteSpace;
 
         let devices = make_rdma_devices();
-        let device = &devices.devices()[0];
-        let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+        let device = &devices[0];
+        let pool = ruapc_bufpool::BufferPoolBuilder::new(
+            devices.iter().map(|device| device.registrar()).collect(),
+        )
+        .build();
         let (poller, mut poll_loop) = manual_poller(device.context());
         let (state, _stop) = State::create(
             Router::default(),
@@ -1853,9 +1952,12 @@ mod tests {
         assert!(poll_loop.drain_incoming(false));
         let mut source = pool.allocate(64).unwrap();
         source.set_len(64);
-        let regions = [source.remote_buffer_info(&device.index()).unwrap()];
+        let regions = [source.remote_buffer_info(device.index()).unwrap()];
         let remote = RemoteSpace::new(&regions).unwrap();
-        let destination_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+        let destination_pool = ruapc_bufpool::BufferPoolBuilder::new(
+            devices.iter().map(|device| device.registrar()).collect(),
+        )
+        .build();
         let destination_lifetime = Arc::downgrade(&destination_pool);
         let mut destination = destination_pool.allocate(64).unwrap();
         destination.set_len(64);
@@ -1891,8 +1993,11 @@ mod tests {
         use ruapc_memory::RemoteSpace;
 
         let devices = make_rdma_devices();
-        let device = &devices.devices()[0];
-        let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+        let device = &devices[0];
+        let pool = ruapc_bufpool::BufferPoolBuilder::new(
+            devices.iter().map(|device| device.registrar()).collect(),
+        )
+        .build();
         let (state, _stop) = State::create(
             Router::default(),
             &SocketPoolConfig {
@@ -1928,7 +2033,7 @@ mod tests {
             let mut source = pool.allocate(128).unwrap();
             source.set_len(128);
             source.fill(0x5a);
-            let regions = [source.remote_buffer_info(&device.index()).unwrap()];
+            let regions = [source.remote_buffer_info(device.index()).unwrap()];
             let remote = RemoteSpace::new(&regions).unwrap();
             let mut destination = pool.allocate(128).unwrap();
             destination.set_len(128);
@@ -2018,8 +2123,11 @@ mod tests {
         }
 
         let devices = make_rdma_devices();
-        let device = &devices.devices()[0];
-        let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+        let device = &devices[0];
+        let pool = ruapc_bufpool::BufferPoolBuilder::new(
+            devices.iter().map(|device| device.registrar()).collect(),
+        )
+        .build();
         let (poller, mut poll_loop) = manual_poller(device.context());
         let (state, _stop) = State::create(
             Router::default(),
@@ -2038,7 +2146,7 @@ mod tests {
         connect_read_pair(device, &incoming.queue_pair, &live.queue_pair);
         let mut source = pool.allocate(64).unwrap();
         source.set_len(64);
-        let regions = [source.remote_buffer_info(&device.index()).unwrap()];
+        let regions = [source.remote_buffer_info(device.index()).unwrap()];
         let remote = RemoteSpace::new(&regions).unwrap();
         let mut destination = pool.allocate(64).unwrap();
         destination.set_len(64);
@@ -2074,8 +2182,11 @@ mod tests {
     #[tokio::test]
     async fn a_read_posted_after_the_shutdown_scan_does_not_wait_for_a_stopped_poller() {
         let devices = make_rdma_devices();
-        let device = &devices.devices()[0];
-        let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+        let device = &devices[0];
+        let pool = ruapc_bufpool::BufferPoolBuilder::new(
+            devices.iter().map(|device| device.registrar()).collect(),
+        )
+        .build();
         let (poller, mut poll_loop) = manual_poller(device.context());
         let (state, _stop) = State::create(
             Router::default(),
@@ -2093,7 +2204,7 @@ mod tests {
         connect_read_pair(device, &socket.queue_pair, &peer.queue_pair);
         let mut source = pool.allocate(64).unwrap();
         source.set_len(64);
-        let remote = source.remote_buffer_info(&device.index()).unwrap();
+        let remote = source.remote_buffer_info(device.index()).unwrap();
         let mut destination = pool.allocate(64).unwrap();
         destination.set_len(64);
         let (mut posting, receiver) = socket
@@ -2196,9 +2307,12 @@ mod tests {
     #[tokio::test]
     async fn pending_send_backlog_stays_bounded_and_cancellation_preserves_capacity() {
         let devices = make_rdma_devices();
-        let device = &devices.devices()[0];
+        let device = &devices[0];
         let (poller, mut poll_loop) = manual_poller(device.context());
-        let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+        let pool = ruapc_bufpool::BufferPoolBuilder::new(
+            devices.iter().map(|device| device.registrar()).collect(),
+        )
+        .build();
         let (state, _stop) = State::create(
             Router::default(),
             &SocketPoolConfig {
@@ -2258,9 +2372,12 @@ mod tests {
     async fn full_pending_send_backlog_wakes_on_close_and_poller_shutdown() {
         for shutdown in [false, true] {
             let devices = make_rdma_devices();
-            let device = &devices.devices()[0];
+            let device = &devices[0];
             let (poller, mut poll_loop) = manual_poller(device.context());
-            let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+            let pool = ruapc_bufpool::BufferPoolBuilder::new(
+                devices.iter().map(|device| device.registrar()).collect(),
+            )
+            .build();
             let (state, _stop) = State::create(
                 Router::default(),
                 &SocketPoolConfig {
@@ -2308,9 +2425,12 @@ mod tests {
     async fn pending_send_refill_spends_remaining_window_in_one_maintenance_pass() {
         for aggregate in [false, true] {
             let devices = make_rdma_devices();
-            let device = &devices.devices()[0];
+            let device = &devices[0];
             let (poller, mut poll_loop) = manual_poller(device.context());
-            let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+            let pool = ruapc_bufpool::BufferPoolBuilder::new(
+                devices.iter().map(|device| device.registrar()).collect(),
+            )
+            .build();
             let (state, _stop) = State::create(
                 Router::default(),
                 &SocketPoolConfig {
@@ -2407,9 +2527,12 @@ mod tests {
     #[tokio::test]
     async fn dirty_maintenance_is_bounded_and_survives_replacement() {
         let devices = make_rdma_devices();
-        let device = &devices.devices()[0];
+        let device = &devices[0];
         let (poller, mut poll_loop) = manual_poller(device.context());
-        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(
+            devices.iter().map(|device| device.registrar()).collect(),
+        )
+        .build();
         let (state, _stop) = State::create(
             Router::default(),
             &SocketPoolConfig {
@@ -2482,9 +2605,12 @@ mod tests {
     #[tokio::test]
     async fn identical_wrids_are_routed_by_their_provider_qp_numbers() {
         let devices = make_rdma_devices();
-        let device = &devices.devices()[0];
+        let device = &devices[0];
         let (poller, mut poll_loop) = manual_poller(device.context());
-        let pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+        let pool = ruapc_bufpool::BufferPoolBuilder::new(
+            devices.iter().map(|device| device.registrar()).collect(),
+        )
+        .build();
         let (state, _stop) = State::create(
             Router::default(),
             &SocketPoolConfig {
@@ -2571,9 +2697,12 @@ mod tests {
     #[tokio::test]
     async fn early_flush_completion_waits_for_registration_and_settles_receive() {
         let devices = make_rdma_devices();
-        let device = &devices.devices()[0];
+        let device = &devices[0];
         let (poller, mut poll_loop) = manual_poller(device.context());
-        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(
+            devices.iter().map(|device| device.registrar()).collect(),
+        )
+        .build();
         let mut attrs = ruapc_rdma::ibv_qp_init_attr {
             qp_type: ruapc_rdma::ibv_qp_type::IBV_QPT_RC,
             cap: ruapc_rdma::ibv_qp_cap {

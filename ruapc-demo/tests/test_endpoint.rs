@@ -99,7 +99,14 @@ fn assert_rdma_unavailable(error: Error) {
 async fn cached_rdma_endpoint_reports_backend_unavailable_when_used() {
     let config = stream_config();
     let base = Context::create(&config).unwrap();
-    let pool = SocketPool::create(&config, &base.state.devices, &base.state.buffer_pool).unwrap();
+    let pool = SocketPool::create(
+        &config,
+        #[cfg(feature = "rdma")]
+        &base.state.rdma_devices,
+        #[cfg(feature = "rdma")]
+        &base.state.buffer_pool,
+    )
+    .unwrap();
     let app = ApplicationConfig {
         endpoint: "http+rdma://127.0.0.1:0,[::1]:0".parse().unwrap(),
     };

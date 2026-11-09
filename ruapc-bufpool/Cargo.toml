@@ -12,7 +12,6 @@ license.workspace = true
 
 [dependencies]
 aliasable.workspace = true
-dashmap.workspace = true
 foldhash.workspace = true
 libc.workspace = true
 schemars.workspace = true

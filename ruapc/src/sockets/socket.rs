@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
-use ruapc_bufpool::DeviceIndex;
+use ruapc_bufpool::RemoteBufferInfo;
 use serde::Serialize;
+use thin_vec::ThinVec;
 
+use crate::{Buffer, MsgMeta, Result, State, http::HttpSocket, tcp::TcpSocket, ws::WebSocket};
 #[cfg(feature = "rdma")]
-use crate::rdma::RdmaSocket;
-use crate::{MsgMeta, Result, State, http::HttpSocket, tcp::TcpSocket, ws::WebSocket};
+use crate::{Error, ErrorKind, rdma::RdmaSocket};
 
 /// Socket abstraction supporting multiple transport protocols.
 ///
@@ -67,32 +68,33 @@ impl Socket {
     }
 }
 
-/// Trait defining the interface for sending messages through different socket types.
-pub trait SocketTrait {
-    /// Sends a message through this socket.
-    async fn send<P: Serialize>(
-        &self,
-        meta: &mut MsgMeta,
-        payload: &P,
-        state: &Arc<State>,
-    ) -> Result<()>;
-}
-
 impl Socket {
-    /// Returns the device index associated with this socket.
-    pub fn device_index(&self, state: &State) -> DeviceIndex {
+    /// Exports attachment lengths for streams, or registered addresses and keys
+    /// for the RDMA connection's local NIC. Stream copies resolve owned buffers
+    /// through the request waiter and never use addresses or registration keys.
+    pub(crate) fn export_regions(&self, buffers: &[Buffer]) -> Result<ThinVec<RemoteBufferInfo>> {
         match self {
-            Socket::TCP(_) | Socket::WS(_) | Socket::HTTP(_) => {
-                ruapc_bufpool::Device::index(state.devices.tcp_device())
-            }
+            Socket::TCP(_) | Socket::WS(_) | Socket::HTTP(_) => Ok(buffers
+                .iter()
+                .map(|buffer| RemoteBufferInfo {
+                    len: buffer.len() as u64,
+                    ..Default::default()
+                })
+                .collect()),
             #[cfg(feature = "rdma")]
-            Socket::RDMA(rdma_socket) => rdma_socket.queue_pair.device_index,
+            Socket::RDMA(socket) => buffers
+                .iter()
+                .map(|buffer| {
+                    buffer
+                        .remote_buffer_info(socket.queue_pair.device_index)
+                        .map_err(|error| Error::new(ErrorKind::InvalidArgument, error.to_string()))
+                })
+                .collect(),
         }
     }
-}
 
-impl SocketTrait for Socket {
-    async fn send<P: Serialize>(
+    /// Sends a message through this socket.
+    pub async fn send<P: Serialize>(
         &self,
         meta: &mut MsgMeta,
         payload: &P,

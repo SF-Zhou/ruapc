@@ -5,7 +5,7 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::{
-    SocketTrait, State,
+    State,
     error::Result,
     msg::{MsgMeta, frame::encode},
     sockets::{ChannelConnection, PoolConnection},
@@ -54,8 +54,8 @@ impl PoolConnection for WebSocket {
     }
 }
 
-impl SocketTrait for WebSocket {
-    async fn send<P: Serialize>(
+impl WebSocket {
+    pub(crate) async fn send<P: Serialize>(
         &self,
         meta: &mut MsgMeta,
         payload: &P,

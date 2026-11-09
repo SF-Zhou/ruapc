@@ -5,7 +5,7 @@ use http_body_util::{BodyExt, Either, Full};
 use hyper::{Request, Response, body::Incoming};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
-use tokio::sync::mpsc;
+use tokio::{net::TcpStream, sync::mpsc};
 use tokio_util::sync::DropGuard;
 
 use super::{
@@ -13,8 +13,8 @@ use super::{
     service::HttpService,
 };
 use crate::{
-    BufferPool, ConnectionMap, Devices, Endpoint, Error, ErrorKind, Message, RawStream, Result,
-    Socket, SocketPoolConfig, SocketPoolTrait, State, TaskSupervisor, TaskSupervisorHandle,
+    ConnectionMap, Endpoint, Error, ErrorKind, Message, Result, Socket, SocketPoolConfig, State,
+    TaskSupervisor, TaskSupervisorHandle,
     msg::frame::FrameDecoder,
     sockets::{connect::ConnectGroups, tcp},
 };
@@ -29,12 +29,8 @@ pub struct HttpSocketPool {
     task_supervisor: TaskSupervisor,
 }
 
-impl SocketPoolTrait for HttpSocketPool {
-    fn create(
-        config: &SocketPoolConfig,
-        _devices: &std::sync::Arc<Devices>,
-        _buffer_pool: &std::sync::Arc<BufferPool>,
-    ) -> Result<Self> {
+impl HttpSocketPool {
+    pub(crate) fn create(config: &SocketPoolConfig) -> Result<Self> {
         let mut http = Builder::new(TokioExecutor::new());
         http.http1().keep_alive(true);
         Ok(Self {
@@ -49,33 +45,14 @@ impl SocketPoolTrait for HttpSocketPool {
         })
     }
 
-    async fn handle_new_stream(
-        &self,
-        state: &Arc<State>,
-        stream: RawStream,
-        addr: SocketAddr,
-    ) -> Result<()> {
-        self.handle_new_stream(state, stream, addr)
-    }
-
-    fn stop(&self) {
-        self.task_supervisor.stop();
-    }
-
-    fn drop_guard(&self) -> DropGuard {
+    pub(crate) fn drop_guard(&self) -> DropGuard {
         self.task_supervisor.drop_guard()
     }
 
-    async fn join(&self) {
+    pub(crate) async fn join(&self) {
         self.task_supervisor.all_stopped().await;
     }
 
-    async fn acquire(&self, endpoint: &Endpoint, state: &Arc<State>) -> Result<Socket> {
-        self.acquire_with_deadline(endpoint, None, state).await
-    }
-}
-
-impl HttpSocketPool {
     pub(crate) async fn acquire_with_deadline(
         &self,
         endpoint: &Endpoint,
@@ -115,19 +92,12 @@ impl HttpSocketPool {
         self.socket_map.get_live(endpoint).await.map(Into::into)
     }
 
-    fn handle_new_stream(
+    pub(crate) fn handle_new_stream(
         &self,
         state: &Arc<State>,
-        stream: RawStream,
+        stream: TcpStream,
         addr: SocketAddr,
     ) -> Result<()> {
-        let RawStream::TCP(tcp_stream) = stream else {
-            return Err(Error::new(
-                ErrorKind::InvalidArgument,
-                "invalid socket type".into(),
-            ));
-        };
-
         let state = state.clone();
         let http = self.http.clone();
         let service = self.service.clone();
@@ -139,7 +109,7 @@ impl HttpSocketPool {
             .ok_or_else(|| Error::new(ErrorKind::ConnectionClosed, "HTTP pool stopped".into()))?;
         tokio::spawn(async move {
             let connection = http.serve_connection_with_upgrades(
-                TokioIo::new(tcp_stream),
+                TokioIo::new(stream),
                 hyper::service::service_fn(move |req: Request<Incoming>| {
                     service
                         .clone()

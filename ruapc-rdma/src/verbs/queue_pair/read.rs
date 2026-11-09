@@ -660,10 +660,10 @@ impl QueuePair {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ruapc_bufpool::{BufferPool, BufferPoolBuilder, EmptyDevices};
+    use ruapc_bufpool::{BufferPool, BufferPoolBuilder};
 
     fn buffers() -> (Vec<Buffer>, std::sync::Weak<BufferPool>) {
-        let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices)).build();
+        let pool = BufferPoolBuilder::new(Vec::new()).build();
         let mut buffer = pool.allocate(1024 * 1024).unwrap();
         buffer.set_len(16);
         (vec![buffer], Arc::downgrade(&pool))

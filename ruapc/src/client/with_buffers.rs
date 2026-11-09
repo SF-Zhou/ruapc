@@ -11,7 +11,7 @@ use crate::{
 
 use super::{Client, ReadAttachment};
 
-/// A client wrapper that attaches registered buffers to RPC calls.
+/// A client wrapper that attaches owned buffers to RPC calls.
 ///
 /// Created via [`Client::with_read_buffers`] /
 /// [`Client::with_write_buffers`]. Implements the same service traits as

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::{Devices, Endpoint, ListenMode, SocketPoolConfig, Transport, rdma::RdmaDevice};
+use crate::{Endpoint, ListenMode, SocketPoolConfig, Transport, rdma::RdmaDevice};
 
 /// Opens the first available RDMA device, honoring the `RUAPC_PREFER_RXE`
 /// env var (used in CI to select the `rxe_0` virtual device).
@@ -49,21 +49,21 @@ pub(crate) fn small_rdma_config() -> SocketPoolConfig {
     config
 }
 
-/// Builds a [`crate::Devices`] populated with all available RDMA devices,
+/// Opens all available RDMA devices and assigns registration indices,
 /// honoring the `RUAPC_PREFER_RXE` env var.
-pub(crate) fn make_rdma_devices() -> Arc<Devices> {
+pub(crate) fn make_rdma_devices() -> Arc<[RdmaDevice]> {
     let active_devices =
         ruapc_rdma::ActiveDevice::available().expect("RDMA devices should be available");
     let prefer_rxe = std::env::var("RUAPC_PREFER_RXE").is_ok();
-    let mut devices = Devices::default();
+    let mut devices = Vec::new();
     for dev in active_devices {
         if prefer_rxe && !dev.info().name.starts_with("rxe") {
             continue;
         }
-        devices.push(RdmaDevice::new(dev));
+        devices.push(RdmaDevice::new(devices.len(), dev));
     }
-    assert!(!devices.devices().is_empty(), "no RDMA device found");
-    Arc::new(devices)
+    assert!(!devices.is_empty(), "no RDMA device found");
+    devices.into()
 }
 
 /// Builds an endpoint for a transport loop, using TCP as the RDMA bootstrap.

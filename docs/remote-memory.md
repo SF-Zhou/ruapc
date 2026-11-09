@@ -24,6 +24,11 @@ buffer boundaries may differ.
 
 Set each buffer's logical length before attaching or transferring it: allocations
 initially expose their full size class, and reused bytes are not cleared.
+Stream transports accept unregistered buffers, including buffers from a separate
+pool created with `BufferPool::new(Vec::new())`. Their metadata preserves each
+buffer's length with zero addresses and keys. RDMA requires registration on the
+selected connection's device; allocating from the context's pool supplies those
+registrations.
 Transfers require a connected context and the corresponding advertised remote
 space. They validate operation structure, overflow, region/op limits, destination
 overlap and bounds against the actual spaces. Empty or all-zero batches follow

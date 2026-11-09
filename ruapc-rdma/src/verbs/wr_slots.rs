@@ -158,12 +158,12 @@ impl<T> std::fmt::Debug for SlotTable<T> {
 mod tests {
     use std::sync::Arc;
 
-    use ruapc_bufpool::{BufferPoolBuilder, EmptyDevices};
+    use ruapc_bufpool::BufferPoolBuilder;
 
     use super::*;
 
     fn pool() -> Arc<ruapc_bufpool::BufferPool> {
-        BufferPoolBuilder::new(Arc::new(EmptyDevices)).build()
+        BufferPoolBuilder::new(Vec::new()).build()
     }
 
     #[test]

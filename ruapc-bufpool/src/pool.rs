@@ -15,7 +15,7 @@ use crate::AlignedMemory;
 use crate::buddy::{BuddyBlock, LEVEL_SIZES, NUM_LEVELS, SIZE_64MIB, size_to_level};
 use crate::buffer::Buffer;
 use crate::completion as oneshot;
-use crate::devices::Devices;
+use crate::registration::MemoryRegistrar;
 use crate::slab::{NUM_SLAB_CLASSES, SLAB_CLASS_SIZES, SlabClass, size_to_class};
 use crate::thread_cache::CacheShard;
 
@@ -38,7 +38,6 @@ enum AllocationStep {
 /// and 256 KiB slabs; larger allocations use 1 MiB, 4 MiB, 16 MiB, and 64 MiB
 /// buddy nodes. Freed buffers are reused without clearing their contents.
 pub struct BufferPool {
-    devices: Arc<dyn Devices>,
     max_memory: usize,
     starvation_timeout: Duration,
     slab_empty_watermark: usize,
@@ -64,13 +63,17 @@ pub struct BufferPool {
     /// a slab class lock or `inner` while holding them.
     thread_shards: Mutex<Vec<Arc<CacheShard>>>,
     inner: Mutex<BuddyAllocator>,
+    /// Immutable registration order; dropped after all registered blocks.
+    registrars: Vec<Arc<dyn MemoryRegistrar>>,
 }
 
 impl BufferPool {
-    /// Creates a new buffer pool with the given devices and default settings.
+    /// Creates a pool with the given registrars and default settings.
+    ///
+    /// Registrars are indexed in vector order. An empty vector disables registration.
     #[must_use]
-    pub fn new(devices: Arc<dyn Devices>) -> Arc<Self> {
-        BufferPoolBuilder::new(devices).build()
+    pub fn new(registrars: Vec<Arc<dyn MemoryRegistrar>>) -> Arc<Self> {
+        BufferPoolBuilder::new(registrars).build()
     }
 
     /// Returns the capacity of a buffer allocated for `size` bytes.
@@ -287,8 +290,11 @@ impl BufferPool {
     fn create_block_or_release(&self) -> Result<AliasableBox<BuddyBlock>> {
         let create = || -> Result<AliasableBox<BuddyBlock>> {
             let aligned = Arc::new(AlignedMemory::new(SIZE_64MIB)?);
-            let regs = self.devices.register(&aligned)?;
-            Ok(BuddyBlock::new(aligned, regs))
+            let mut registrations = Vec::with_capacity(self.registrars.len());
+            for registrar in &self.registrars {
+                registrations.push(registrar.register(&aligned)?);
+            }
+            Ok(BuddyBlock::new(aligned, registrations))
         };
         create().inspect_err(|_| {
             self.inner
@@ -341,11 +347,6 @@ impl BufferPool {
                 .free_chunks()
         })
     }
-
-    /// Returns the devices associated with this pool.
-    pub fn devices(&self) -> &Arc<dyn Devices> {
-        &self.devices
-    }
 }
 
 impl std::fmt::Debug for BufferPool {
@@ -374,17 +375,14 @@ fn invalid_size_error(size: usize) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::EmptyDevices;
     use crate::buddy::{LEVEL_SIZES, SIZE_1MIB};
 
     fn test_pool() -> Arc<BufferPool> {
-        BufferPoolBuilder::new(Arc::new(EmptyDevices)).build()
+        BufferPoolBuilder::new(Vec::new()).build()
     }
 
     fn test_pool_with_max(max: usize) -> Arc<BufferPool> {
-        BufferPoolBuilder::new(Arc::new(EmptyDevices))
-            .max_memory(max)
-            .build()
+        BufferPoolBuilder::new(Vec::new()).max_memory(max).build()
     }
 
     #[test]
@@ -620,7 +618,7 @@ mod tests {
     #[test]
     fn test_lazy_merge_keeps_nodes_below_watermark() {
         // High watermarks: merging on free is always deferred.
-        let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
+        let pool = BufferPoolBuilder::new(Vec::new())
             .max_memory(SIZE_64MIB)
             .merge_watermarks([64, 16, 4, 0])
             .build();
@@ -645,7 +643,7 @@ mod tests {
 
     #[test]
     fn test_zero_watermarks_restore_eager_merge() {
-        let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
+        let pool = BufferPoolBuilder::new(Vec::new())
             .max_memory(SIZE_64MIB)
             .merge_watermarks([0, 0, 0, 0])
             .build();
@@ -662,7 +660,7 @@ mod tests {
     fn test_demand_driven_coalescing_on_alloc() {
         // Max memory allows two blocks, so this also verifies that deferred
         // quads are coalesced and reused instead of growing the pool.
-        let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
+        let pool = BufferPoolBuilder::new(Vec::new())
             .max_memory(SIZE_64MIB * 2)
             .merge_watermarks([64, 16, 4, 0])
             .build();
@@ -685,7 +683,7 @@ mod tests {
 
     #[test]
     fn test_coalescing_is_minimal_and_on_demand() {
-        let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
+        let pool = BufferPoolBuilder::new(Vec::new())
             .max_memory(SIZE_64MIB)
             .merge_watermarks([64, 16, 4, 0])
             .build();
@@ -725,7 +723,7 @@ mod tests {
         use std::time::Duration;
         use tokio::time::timeout;
 
-        let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
+        let pool = BufferPoolBuilder::new(Vec::new())
             .max_memory(SIZE_64MIB)
             .merge_watermarks([64, 16, 4, 0])
             .build();
@@ -752,7 +750,7 @@ mod tests {
         // Random alloc/free mix across all levels; debug_asserts in
         // try_merge/coalesce_pending/demote_pending_parent verify the
         // pending-list invariant on every transition.
-        let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
+        let pool = BufferPoolBuilder::new(Vec::new())
             .max_memory(SIZE_64MIB * 4)
             .merge_watermarks([4, 2, 1, 0])
             .build();
@@ -950,7 +948,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::task::{Context, Waker};
 
-        let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
+        let pool = BufferPoolBuilder::new(Vec::new())
             .max_memory(SIZE_64MIB)
             .starvation_timeout(Duration::ZERO)
             .build();
@@ -1191,7 +1189,7 @@ mod tests {
         use std::time::Duration;
         use tokio::time::timeout;
 
-        let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
+        let pool = BufferPoolBuilder::new(Vec::new())
             .max_memory(SIZE_64MIB)
             .starvation_timeout(Duration::from_millis(10))
             .build();
@@ -1227,7 +1225,7 @@ mod tests {
         use std::time::Duration;
         use tokio::time::timeout;
 
-        let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
+        let pool = BufferPoolBuilder::new(Vec::new())
             .max_memory(SIZE_64MIB)
             .starvation_timeout(Duration::from_millis(10))
             .build();
@@ -1277,7 +1275,7 @@ mod tests {
     async fn test_cancelled_reserved_waiter_releases_absorbed_capacity() {
         use std::time::Duration;
 
-        let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
+        let pool = BufferPoolBuilder::new(Vec::new())
             .max_memory(SIZE_64MIB)
             .starvation_timeout(Duration::from_millis(10))
             .build();
@@ -1322,7 +1320,7 @@ mod tests {
         // exercises reservation activation, drain, priority completion and
         // cancellation-release concurrently. The debug_asserts in the merge,
         // pending and reservation paths check the invariants throughout.
-        let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
+        let pool = BufferPoolBuilder::new(Vec::new())
             .max_memory(SIZE_64MIB * 2)
             .starvation_timeout(Duration::from_millis(5))
             .build();
@@ -1384,7 +1382,7 @@ mod tests {
     fn test_chunks_share_slab() {
         const KIB64: usize = 64 * 1024;
         // Exact slab accounting: keep chunks out of the per-thread cache.
-        let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
+        let pool = BufferPoolBuilder::new(Vec::new())
             .max_memory(SIZE_64MIB)
             .thread_cache(false)
             .build();
@@ -1412,7 +1410,7 @@ mod tests {
 
     #[test]
     fn test_slab_release_beyond_watermark() {
-        let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
+        let pool = BufferPoolBuilder::new(Vec::new())
             .max_memory(SIZE_64MIB)
             .slab_empty_watermark(0)
             .thread_cache(false)
@@ -1430,7 +1428,7 @@ mod tests {
 
     #[test]
     fn test_slab_watermark_caches_empty_slab() {
-        let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
+        let pool = BufferPoolBuilder::new(Vec::new())
             .max_memory(SIZE_64MIB)
             .slab_empty_watermark(1)
             .thread_cache(false)
@@ -1453,7 +1451,7 @@ mod tests {
 
     #[test]
     fn test_buddy_miss_reclaims_cached_slabs() {
-        let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
+        let pool = BufferPoolBuilder::new(Vec::new())
             .max_memory(SIZE_64MIB)
             .slab_empty_watermark(8)
             .thread_cache(false)
@@ -1475,7 +1473,7 @@ mod tests {
         use std::time::Duration;
         use tokio::time::timeout;
 
-        let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
+        let pool = BufferPoolBuilder::new(Vec::new())
             .max_memory(SIZE_64MIB)
             .slab_empty_watermark(8)
             .build();
@@ -1684,7 +1682,7 @@ mod tests {
     #[test]
     fn cached_slabs_and_magazines_do_not_keep_pool_alive() {
         for thread_cache in [false, true] {
-            let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
+            let pool = BufferPoolBuilder::new(Vec::new())
                 .thread_cache(thread_cache)
                 .build();
             let weak = Arc::downgrade(&pool);
@@ -1711,7 +1709,90 @@ mod tests {
     }
 
     #[test]
-    fn registrations_drop_before_their_backing_memory() {
+    fn empty_registrar_list_allocates_without_registration() {
+        let pool = BufferPool::new(Vec::new());
+        let mut buffer = pool.allocate(4).unwrap();
+        buffer.set_len(4);
+        buffer.copy_from_slice(b"data");
+        assert_eq!(buffer.as_slice(), b"data");
+        assert_eq!(
+            buffer.memory_key(0).unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
+        assert!(buffer.remote_buffer_info(0).is_err());
+    }
+
+    #[test]
+    fn registrar_order_is_stable_across_blocks() {
+        use crate::{MemoryKey, Registration};
+
+        #[derive(Debug)]
+        struct KeyedRegistration(u32);
+        impl Registration for KeyedRegistration {
+            fn memory_key(&self) -> MemoryKey {
+                MemoryKey {
+                    lkey: self.0,
+                    rkey: self.0,
+                }
+            }
+        }
+        #[derive(Debug)]
+        struct KeyedRegistrar {
+            key: u32,
+            calls: Arc<Mutex<Vec<u32>>>,
+        }
+        // SAFETY: registrations contain only constant keys and never access memory.
+        unsafe impl MemoryRegistrar for KeyedRegistrar {
+            fn register(&self, _: &Arc<AlignedMemory>) -> Result<Box<dyn Registration>> {
+                self.calls.lock().unwrap().push(self.key);
+                Ok(Box::new(KeyedRegistration(self.key)))
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let pool = BufferPool::new(vec![
+            Arc::new(KeyedRegistrar {
+                key: 41,
+                calls: Arc::clone(&calls),
+            }),
+            Arc::new(KeyedRegistrar {
+                key: 73,
+                calls: Arc::clone(&calls),
+            }),
+        ]);
+        let first = pool.allocate(SIZE_64MIB).unwrap();
+        let mut second = pool.allocate(SIZE_1MIB).unwrap();
+        second.set_len(17);
+        assert_eq!(*calls.lock().unwrap(), [41, 73, 41, 73]);
+        for buffer in [&first, &second] {
+            for (index, key) in [41, 73].into_iter().enumerate() {
+                assert_eq!(
+                    buffer.memory_key(index).unwrap(),
+                    MemoryKey {
+                        lkey: key,
+                        rkey: key
+                    }
+                );
+            }
+            for index in [2, usize::MAX] {
+                assert_eq!(
+                    buffer.memory_key(index).unwrap_err().kind(),
+                    ErrorKind::InvalidInput
+                );
+                assert!(buffer.remote_buffer_info(index).is_err());
+            }
+        }
+        let remote = second.remote_buffer_info(1).unwrap();
+        assert_eq!(remote.addr, second.as_ptr() as u64);
+        assert_eq!(remote.len, 17);
+        assert_eq!(remote.key, second.memory_key(1).unwrap());
+        let empty = Buffer::empty(&pool);
+        assert!(empty.memory_key(0).is_err());
+        assert!(empty.remote_buffer_info(0).is_err());
+    }
+
+    #[test]
+    fn registrations_drop_before_backing_memory_and_registrars() {
         use crate::{MemoryKey, Registration};
         use std::sync::Weak;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1719,6 +1800,7 @@ mod tests {
         #[derive(Debug)]
         struct TrackedRegistration {
             memory: Weak<AlignedMemory>,
+            registrar_alive: Arc<AtomicBool>,
             drops: Arc<AtomicUsize>,
         }
         impl Registration for TrackedRegistration {
@@ -1728,6 +1810,7 @@ mod tests {
         }
         impl Drop for TrackedRegistration {
             fn drop(&mut self) {
+                assert!(self.registrar_alive.load(Ordering::Relaxed));
                 assert!(
                     self.memory.upgrade().is_some(),
                     "deregistered after freeing memory"
@@ -1736,58 +1819,116 @@ mod tests {
             }
         }
         #[derive(Debug)]
-        struct TrackedDevices(Arc<AtomicUsize>);
-        // SAFETY: registrations retain only weak references and never access bytes.
-        unsafe impl Devices for TrackedDevices {
-            fn len(&self) -> usize {
-                1
+        struct TrackedRegistrar {
+            alive: Arc<AtomicBool>,
+            drops: Arc<AtomicUsize>,
+        }
+        impl Drop for TrackedRegistrar {
+            fn drop(&mut self) {
+                self.alive.store(false, Ordering::Relaxed);
             }
-            fn register(&self, memory: &Arc<AlignedMemory>) -> Result<Vec<Box<dyn Registration>>> {
-                Ok(vec![Box::new(TrackedRegistration {
+        }
+        // SAFETY: registrations retain only weak references and never access bytes.
+        unsafe impl MemoryRegistrar for TrackedRegistrar {
+            fn register(&self, memory: &Arc<AlignedMemory>) -> Result<Box<dyn Registration>> {
+                Ok(Box::new(TrackedRegistration {
                     memory: Arc::downgrade(memory),
-                    drops: Arc::clone(&self.0),
-                })])
+                    registrar_alive: Arc::clone(&self.alive),
+                    drops: Arc::clone(&self.drops),
+                }))
             }
         }
 
         let drops = Arc::new(AtomicUsize::new(0));
-        let pool = BufferPoolBuilder::new(Arc::new(TrackedDevices(Arc::clone(&drops)))).build();
-        drop(pool.allocate(16 * 1024).unwrap());
-        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        let alive = Arc::new(AtomicBool::new(true));
+        let pool = BufferPool::new(vec![Arc::new(TrackedRegistrar {
+            alive: Arc::clone(&alive),
+            drops: Arc::clone(&drops),
+        })]);
+        let buffer = pool.allocate(16 * 1024).unwrap();
         drop(pool);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        assert!(alive.load(Ordering::Relaxed));
+        drop(buffer);
         assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert!(!alive.load(Ordering::Relaxed));
     }
 
     #[test]
-    fn failed_registration_returns_reserved_budget() {
-        use crate::Registration;
+    fn failed_registration_releases_handles_memory_and_reserved_budget() {
+        use crate::{MemoryKey, Registration};
+        use std::sync::Weak;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         #[derive(Debug)]
-        struct FailingDevices;
-        // SAFETY: registration always fails without retaining or accessing memory.
-        unsafe impl Devices for FailingDevices {
-            fn len(&self) -> usize {
-                1
-            }
-            fn register(&self, _: &Arc<AlignedMemory>) -> Result<Vec<Box<dyn Registration>>> {
-                Err(Error::other("registration failed"))
+        struct HeldRegistration {
+            _memory: Arc<AlignedMemory>,
+            drops: Arc<AtomicUsize>,
+        }
+        impl Registration for HeldRegistration {
+            fn memory_key(&self) -> MemoryKey {
+                MemoryKey::default()
             }
         }
-        let pool = BufferPoolBuilder::new(Arc::new(FailingDevices))
+        impl Drop for HeldRegistration {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        #[derive(Debug)]
+        struct FallibleRegistrar {
+            index: usize,
+            calls: Arc<Mutex<Vec<usize>>>,
+            memory: Arc<Mutex<Weak<AlignedMemory>>>,
+            drops: Arc<AtomicUsize>,
+        }
+        // SAFETY: successful handles only retain memory; no bytes are accessed
+        // or exposed, including on registration failure and handle destruction.
+        unsafe impl MemoryRegistrar for FallibleRegistrar {
+            fn register(&self, memory: &Arc<AlignedMemory>) -> Result<Box<dyn Registration>> {
+                self.calls.lock().unwrap().push(self.index);
+                *self.memory.lock().unwrap() = Arc::downgrade(memory);
+                if self.index == 1 {
+                    return Err(Error::other("registration failed"));
+                }
+                Ok(Box::new(HeldRegistration {
+                    _memory: Arc::clone(memory),
+                    drops: Arc::clone(&self.drops),
+                }))
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let memory = Arc::new(Mutex::new(Weak::new()));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let registrars = (0..3)
+            .map(|index| {
+                Arc::new(FallibleRegistrar {
+                    index,
+                    calls: Arc::clone(&calls),
+                    memory: Arc::clone(&memory),
+                    drops: Arc::clone(&drops),
+                }) as Arc<dyn MemoryRegistrar>
+            })
+            .collect();
+        let pool = BufferPoolBuilder::new(registrars)
             .max_memory(SIZE_64MIB)
             .build();
-        for _ in 0..2 {
+        for attempt in 1..=2 {
             assert_eq!(
                 pool.allocate(SIZE_1MIB).unwrap_err().to_string(),
                 "registration failed"
             );
             assert_eq!(pool.allocated_memory(), 0);
+            assert_eq!(drops.load(Ordering::Relaxed), attempt);
+            assert!(memory.lock().unwrap().upgrade().is_none());
         }
+        assert_eq!(*calls.lock().unwrap(), [0, 1, 0, 1]);
     }
 
     #[test]
     fn registration_keys_remain_readable_during_allocator_mutation() {
-        use crate::{DeviceIndex, MemoryKey, Registration};
+        use crate::{MemoryKey, Registration};
 
         #[derive(Debug)]
         struct FixedRegistration;
@@ -1797,18 +1938,15 @@ mod tests {
             }
         }
         #[derive(Debug)]
-        struct RegisteredDevices;
+        struct FixedRegistrar;
         // SAFETY: registrations contain only constant keys and never access memory.
-        unsafe impl Devices for RegisteredDevices {
-            fn len(&self) -> usize {
-                1
-            }
-            fn register(&self, _: &Arc<AlignedMemory>) -> Result<Vec<Box<dyn Registration>>> {
-                Ok(vec![Box::new(FixedRegistration)])
+        unsafe impl MemoryRegistrar for FixedRegistrar {
+            fn register(&self, _: &Arc<AlignedMemory>) -> Result<Box<dyn Registration>> {
+                Ok(Box::new(FixedRegistration))
             }
         }
 
-        let pool = BufferPoolBuilder::new(Arc::new(RegisteredDevices))
+        let pool = BufferPoolBuilder::new(vec![Arc::new(FixedRegistrar)])
             .max_memory(SIZE_64MIB)
             .build();
         let held = pool.allocate(SIZE_1MIB).unwrap();
@@ -1819,7 +1957,7 @@ mod tests {
                 }
             });
             for _ in 0..10_000 {
-                let key = held.memory_key(&DeviceIndex::default()).unwrap();
+                let key = held.memory_key(0).unwrap();
                 assert_eq!((key.lkey, key.rkey), (7, 11));
             }
         });
@@ -1872,7 +2010,7 @@ mod tests {
         }
 
         for thread_cache in [false, true] {
-            let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
+            let pool = BufferPoolBuilder::new(Vec::new())
                 .max_memory(SIZE_64MIB)
                 .slab_empty_watermark(8)
                 .thread_cache(thread_cache)
@@ -1903,7 +2041,7 @@ mod tests {
     #[test]
     fn slab_reclaim_remains_enabled_after_whole_pool_reuse() {
         for thread_cache in [false, true] {
-            let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
+            let pool = BufferPoolBuilder::new(Vec::new())
                 .max_memory(SIZE_64MIB)
                 .slab_empty_watermark(8)
                 .thread_cache(thread_cache)

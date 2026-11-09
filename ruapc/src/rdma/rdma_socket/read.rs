@@ -633,8 +633,9 @@ mod timeout_tests {
                     .as_ref()
                     .and_then(Weak::upgrade);
                 if let Some(target) = target
+                    && let Some(held) = blocked.lock().unwrap().as_ref()
                     && target
-                        .export_regions(fixture.context.state.devices.tcp_device())
+                        .export_regions(&Socket::RDMA(held.socket.clone()))
                         .is_err_and(|e| e.kind == ErrorKind::BuffersInUse)
                 {
                     break;

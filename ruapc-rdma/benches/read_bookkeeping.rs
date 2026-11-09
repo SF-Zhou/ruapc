@@ -28,7 +28,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ruapc_bufpool::{Buffer, BufferPool, BufferPoolBuilder, EmptyDevices};
+use ruapc_bufpool::{Buffer, BufferPool, BufferPoolBuilder};
 
 use ruapc_rdma::{
     ReadCompletion, ReadFailure, ReadRequest, ReadSegment, WRID,
@@ -48,7 +48,7 @@ const SEGMENT_LEN: usize = 64;
 const LEDGER_WINDOW: u64 = 64;
 
 fn pool() -> Arc<BufferPool> {
-    BufferPoolBuilder::new(Arc::new(EmptyDevices)).build()
+    BufferPoolBuilder::new(Vec::new()).build()
 }
 
 fn destination(pool: &Arc<BufferPool>, len: usize) -> Buffer {

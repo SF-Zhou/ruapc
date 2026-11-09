@@ -2,7 +2,6 @@
 
 use std::{sync::Arc, sync::atomic::Ordering, time::Duration};
 
-use ruapc_bufpool::Device as _;
 use ruapc_rdma::{
     DeviceInfo, Port, QpConnectionConfig, QueuePair, ibv_mtu, ibv_qp_cap, ibv_qp_init_attr,
     ibv_qp_type,
@@ -77,7 +76,7 @@ impl RdmaSocketPool {
         peer_limits: RdmaConnectionLimits,
         traffic_class: u8,
     ) -> Result<Box<LocalConnection>> {
-        let device = self.devices.devices().get(device_index).ok_or_else(|| {
+        let device = self.devices.get(device_index).ok_or_else(|| {
             Error::new(
                 ErrorKind::InvalidArgument,
                 format!("local RDMA device index {device_index} is unavailable"),
@@ -125,7 +124,6 @@ impl RdmaSocketPool {
         selection: &DeviceSelection,
     ) -> Result<(usize, &RdmaDevice)> {
         self.devices
-            .devices()
             .iter()
             .enumerate()
             .find(|(_, device)| device.info().name.as_str() == selection.device_name)
@@ -385,7 +383,6 @@ impl RdmaSocketPool {
             });
         let bandwidth_limiter = self
             .devices
-            .devices()
             .get(device_index)
             .ok_or_else(|| {
                 Error::new(

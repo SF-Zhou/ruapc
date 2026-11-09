@@ -13,7 +13,7 @@ use std::{
     time::Instant,
 };
 
-use ruapc_bufpool::{Buffer, BufferPool, BufferPoolBuilder, EmptyDevices};
+use ruapc_bufpool::{Buffer, BufferPool, BufferPoolBuilder};
 use ruapc_memory::{BufferSet, CopyBatch, CopyOp, SpaceLayout};
 
 #[global_allocator]
@@ -278,7 +278,7 @@ fn run_case(config: &Config, name: &str, kind: &str, mut fixture: Fixture) {
 
 fn main() {
     let config = Config::from_env();
-    let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
+    let pool = BufferPoolBuilder::new(Vec::new())
         .max_memory(64 * 1024 * 1024)
         .build();
     println!(

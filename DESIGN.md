@@ -200,7 +200,7 @@ posting.
 Public `Context` methods prepare each transfer once. Preparation binds the
 request context, remote space, checked batch and owned local buffers with their
 layout through private read/write objects. The executor selects the transport through the
-`Socket` enum; `SocketTrait` only sends messages. Incoming reverse RPCs validate
+`Socket` enum, which also dispatches message sends. Incoming reverse RPCs validate
 their own peer inputs. Empty batches follow the same preparation checks and then
 skip target checkout and I/O.
 
@@ -241,11 +241,14 @@ The pool combines buddy allocation, slabs and thread caches. Public buffers
 retain the pool; internal backing tokens avoid ownership cycles. See the
 [bufpool guide](ruapc-bufpool/README.md) for allocation, lock order and internals.
 
-`ruapc::Devices` aliases `DeviceSet<RdmaDevice>` with RDMA enabled and
-`DeviceSet` otherwise. TCP occupies index zero. RDMA registration delegates to
-`ActiveDevice` in `ruapc-rdma/src/buffer_registration.rs`; TCP registration stays
-in `ruapc-bufpool/src/tcp_device.rs`. The unsafe registrar and collection contracts
-are documented in [registration and byte access](docs/safe-boundaries.md#registration-and-byte-access).
+`BufferPool` holds an immutable `Vec<Arc<dyn MemoryRegistrar>>`. The runtime
+retains a separate `Arc<[RdmaDevice]>` for RDMA configuration and connection
+setup, with indices matching the pool's registrar order. RDMA registration
+delegates directly to the shared `ActiveDevice` in
+`ruapc-rdma/src/buffer_registration.rs`. Stream transports advertise logical
+buffer lengths without memory registration; `Socket` exports attachment metadata
+for the selected transport. The unsafe registrar contract is
+documented in [registration and byte access](docs/safe-boundaries.md#registration-and-byte-access).
 
 ## Generated services and examples
 

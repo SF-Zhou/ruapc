@@ -13,7 +13,7 @@ use std::{
     time::Instant,
 };
 
-use ruapc_bufpool::{BufferPool, BufferPoolBuilder, EmptyDevices};
+use ruapc_bufpool::{BufferPool, BufferPoolBuilder};
 
 use ruapc_rdma::{
     CompletionCursor, WrBuffers,
@@ -30,7 +30,7 @@ const BATCH: usize = 32;
 const PIPELINE: usize = 2;
 
 fn pool() -> Arc<BufferPool> {
-    BufferPoolBuilder::new(Arc::new(EmptyDevices)).build()
+    BufferPoolBuilder::new(Vec::new()).build()
 }
 
 fn buffers(pool: &Arc<BufferPool>, gather: Option<usize>) -> WrBuffers {

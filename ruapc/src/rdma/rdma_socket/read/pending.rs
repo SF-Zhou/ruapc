@@ -170,7 +170,6 @@ mod tests {
         time::Duration,
     };
 
-    use ruapc_bufpool::Device as _;
     use ruapc_rdma::{ReadCompletion, ReadPosting, ReadRequest, ReadSegment};
 
     use crate::{BufferPool, rdma::test_utils::make_rdma_devices};
@@ -183,7 +182,7 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let devices = make_rdma_devices();
-            let device = &devices.devices()[0];
+            let device = &devices[0];
             let cq = ruapc_rdma::CompletionQueue::create(device.context(), 16, None).unwrap();
             let qp = ruapc_rdma::QueuePair::create(
                 device.pd(),
@@ -204,7 +203,10 @@ mod tests {
             .unwrap();
             Self {
                 qp,
-                pool: ruapc_bufpool::BufferPoolBuilder::new(devices).build(),
+                pool: ruapc_bufpool::BufferPoolBuilder::new(
+                    devices.iter().map(|device| device.registrar()).collect(),
+                )
+                .build(),
             }
         }
 

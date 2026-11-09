@@ -16,7 +16,7 @@ use tokio::sync::mpsc::Sender;
 
 use super::{RdmaBandwidthLimiter, RdmaPathInfo, RdmaState, SendPermit};
 use crate::{
-    Buffer, BufferPool, Error, SocketTrait, State,
+    Buffer, BufferPool, Error, State,
     error::{ErrorKind, Result},
     msg::MsgMeta,
     rdma::{
@@ -186,9 +186,9 @@ impl Drop for RdmaSocket {
     }
 }
 
-impl SocketTrait for Arc<RdmaSocket> {
-    async fn send<P: Serialize>(
-        &self,
+impl RdmaSocket {
+    pub(crate) async fn send<P: Serialize>(
+        self: &Arc<Self>,
         meta: &mut MsgMeta,
         payload: &P,
         state: &Arc<State>,

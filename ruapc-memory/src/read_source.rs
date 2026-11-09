@@ -58,11 +58,10 @@ impl ReadSource {
 mod tests {
     use super::*;
     use crate::{CopyOp, MemoryErrorKind};
-    use std::sync::Arc;
 
     #[test]
     fn reads_cross_buffer_boundaries_and_rejects_out_of_bounds() {
-        let pool = ruapc_bufpool::BufferPool::new(Arc::new(ruapc_bufpool::EmptyDevices));
+        let pool = ruapc_bufpool::BufferPool::new(Vec::new());
         let buffers = [b"abcd", b"efgh"]
             .into_iter()
             .map(|bytes| {

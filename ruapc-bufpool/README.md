@@ -36,11 +36,10 @@ otherwise; Linux 64-bit builds use demand-paged anonymous mappings.
 ## Usage
 
 ```rust
-use std::sync::Arc;
-use ruapc_bufpool::{BufferPoolBuilder, EmptyDevices};
+use ruapc_bufpool::BufferPoolBuilder;
 
 fn main() -> std::io::Result<()> {
-    let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
+    let pool = BufferPoolBuilder::new(Vec::new())
         .max_memory(256 * 1024 * 1024)
         .build();
 
@@ -54,14 +53,17 @@ fn main() -> std::io::Result<()> {
 
 ## Registration and ownership
 
-`DeviceSet<D>` combines a TCP device at index zero with additional devices.
-`EmptyDevices` disables registration. A safe `Device` wrapper supplies identity
-and an audited `MemoryRegistrar`; it never receives pool backing memory itself.
-Custom `MemoryRegistrar` and `Devices` implementations must uphold the
+`BufferPool` and its builder accept `Vec<Arc<dyn MemoryRegistrar>>`. Every new
+block is registered in vector order, which defines the pool-local indices used
+by `Buffer::memory_key` and `Buffer::remote_buffer_info`. Use an empty vector for
+stream transports and other CPU-only uses. Indices do not identify devices
+across pools; a transport must use the position of its registrar in that pool.
+
+Custom `MemoryRegistrar` implementations must uphold the
 [registration and byte-access contracts](../docs/safe-boundaries.md#registration-and-byte-access).
-Device registrations are destroyed before backing memory.
-`TcpDevice::read_memory` is unsafe: the caller must keep the requested allocation
-alive and prevent concurrent writes throughout the copy.
+Partial failure drops completed registrations and restores the growth budget.
+Registrations are destroyed before backing memory, and the pool retains its
+registrars until all blocks have been released.
 
 ## Implementation
 
@@ -69,6 +71,7 @@ alive and prevent concurrent writes throughout the copy.
 | --- | --- |
 | [`pool.rs`](src/pool.rs), [`pool/builder.rs`](src/pool/builder.rs) | Public API, allocation transitions and configuration |
 | [`pool/allocator.rs`](src/pool/allocator.rs), [`waiters.rs`](src/pool/allocator/waiters.rs) | Budget, merging, direct handoff and starvation reservations |
+| [`registration.rs`](src/registration.rs) | Audited memory registrar and owned registration handles |
 | [`completion.rs`](src/completion.rs) | Safe runtime-independent single-value notification shared with RDMA |
 | [`pool/small.rs`](src/pool/small.rs), [`slab.rs`](src/slab.rs), [`thread_cache.rs`](src/thread_cache.rs) | Slab classes, chunk ownership, thread caches and reclamation |
 | [`buddy.rs`](src/buddy.rs), [`aligned.rs`](src/aligned.rs) | Backing regions, allocation metadata and initialized memory |

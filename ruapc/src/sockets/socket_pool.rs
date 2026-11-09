@@ -7,16 +7,16 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_util::sync::DropGuard;
 
 #[cfg(feature = "rdma")]
-use crate::TaskSupervisorHandle;
-#[cfg(feature = "rdma")]
 use crate::rdma::{
-    ConnectionLease, PrepareConnectionRequest, PrepareConnectionResponse, RdmaPeerAdvertisement,
-    RdmaSocket, RdmaSocketPool,
+    ConnectionLease, PrepareConnectionRequest, PrepareConnectionResponse, RdmaDevice,
+    RdmaPeerAdvertisement, RdmaSocket, RdmaSocketPool,
 };
+#[cfg(feature = "rdma")]
+use crate::{BufferPool, TaskSupervisorHandle};
 use crate::{
-    BufferPool, Devices, Endpoint as RpcEndpoint, Error, ErrorKind, ListenMode, Result, Socket,
-    SocketPoolConfig, State, TaskSupervisor, Transport, http::HttpSocketPool,
-    msg::frame::MAGIC_NUM, tcp::TcpSocketPool, ws::WebSocketPool,
+    Endpoint as RpcEndpoint, Error, ErrorKind, ListenMode, Result, Socket, SocketPoolConfig, State,
+    TaskSupervisor, Transport, http::HttpSocketPool, msg::frame::MAGIC_NUM, tcp::TcpSocketPool,
+    ws::WebSocketPool,
 };
 
 /// Constraints and budget applied when acquiring a connection.
@@ -68,51 +68,24 @@ pub enum RawStream {
     WS(Box<WebSocketStream<TokioIo<Upgraded>>>),
 }
 
-/// Trait defining the interface for individual socket pool implementations.
-///
-/// Used by `TcpSocketPool`, `WebSocketPool`, `HttpSocketPool`, etc.
-/// The composite `SocketPool` dispatches to these through the transport enum.
-pub trait SocketPoolTrait: Sized {
-    fn create(
-        config: &SocketPoolConfig,
-        devices: &Arc<Devices>,
-        buffer_pool: &Arc<BufferPool>,
-    ) -> Result<Self>;
-
-    async fn acquire(&self, endpoint: &RpcEndpoint, state: &Arc<State>) -> Result<Socket>;
-
-    async fn handle_new_stream(
-        &self,
-        state: &Arc<State>,
-        stream: RawStream,
-        addr: SocketAddr,
-    ) -> Result<()>;
-
-    fn stop(&self);
-
-    fn drop_guard(&self) -> DropGuard;
-
-    async fn join(&self);
-}
-
 impl SocketPool {
     /// Creates all lightweight stream pools and, when explicitly enabled,
     /// the RDMA pool.
     pub fn create(
         config: &SocketPoolConfig,
-        devices: &Arc<Devices>,
-        buffer_pool: &Arc<BufferPool>,
+        #[cfg(feature = "rdma")] devices: &Arc<[RdmaDevice]>,
+        #[cfg(feature = "rdma")] buffer_pool: &Arc<BufferPool>,
     ) -> Result<Self> {
         config.validate()?;
         let task_supervisor = TaskSupervisor::create();
-        let tcp = TcpSocketPool::create(config, devices, buffer_pool)?;
-        let ws = WebSocketPool::create(config, devices, buffer_pool)?;
-        let http = HttpSocketPool::create(config, devices, buffer_pool)?;
+        let tcp = TcpSocketPool::new();
+        let ws = WebSocketPool::new();
+        let http = HttpSocketPool::create(config)?;
         #[cfg(feature = "rdma")]
         let rdma = config
             .rdma
             .as_ref()
-            .map(|_| RdmaSocketPool::create(config, devices, buffer_pool))
+            .map(|rdma| RdmaSocketPool::new(devices.clone(), buffer_pool.clone(), rdma.clone()))
             .transpose()?;
 
         let task = task_supervisor.start_async_task();
@@ -120,7 +93,7 @@ impl SocketPool {
         let ws_guard = ws.drop_guard();
         let http_guard = http.drop_guard();
         #[cfg(feature = "rdma")]
-        let rdma_guard = rdma.as_ref().map(SocketPoolTrait::drop_guard);
+        let rdma_guard = rdma.as_ref().map(RdmaSocketPool::drop_guard);
         tokio::spawn(async move {
             task.stopped().await;
             drop(http_guard);
@@ -278,9 +251,7 @@ impl SocketPool {
             || (self.listen_mode.contains(ListenMode::TCP)
                 && Self::peek_is_tcp_magic(&stream).await?)
         {
-            self.tcp
-                .handle_new_stream(state, RawStream::TCP(stream), addr)
-                .await
+            self.tcp.add_socket(None, addr, stream, state).map(|_| ())
         } else if !self.listen_mode.contains(ListenMode::HTTP) {
             // Without HTTP routes, preserve the dedicated WebSocket handshake.
             self.ws
@@ -288,9 +259,7 @@ impl SocketPool {
                 .await
         } else {
             // The HTTP service independently gates WebSocket upgrades.
-            self.http
-                .handle_new_stream(state, RawStream::TCP(stream), addr)
-                .await
+            self.http.handle_new_stream(state, stream, addr)
         }
     }
 
@@ -442,9 +411,14 @@ mod tests {
     #[tokio::test]
     async fn composite_pool_lifecycle() {
         let config = SocketPoolConfig::default();
-        let devices = std::sync::Arc::new(Devices::default());
-        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
-        let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
+        let pool = SocketPool::create(
+            &config,
+            #[cfg(feature = "rdma")]
+            &Arc::from([]),
+            #[cfg(feature = "rdma")]
+            &BufferPool::new(Vec::new()),
+        )
+        .unwrap();
         pool.stop();
         drop(pool.drop_guard());
         pool.join().await;
@@ -455,7 +429,10 @@ mod tests {
     async fn rdma_is_enabled_by_default_and_can_be_disabled() {
         let devices = make_rdma_devices();
         let config = SocketPoolConfig::default();
-        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(
+            devices.iter().map(|device| device.registrar()).collect(),
+        )
+        .build();
         let pool = SocketPool::create(&config, &devices, &buffer_pool).unwrap();
         let info = pool.rdma_peer_advertisement().unwrap();
         assert!(!info.devices.is_empty());
@@ -463,9 +440,8 @@ mod tests {
             rdma: None,
             ..Default::default()
         };
-        let disabled_devices = std::sync::Arc::new(Devices::default());
-        let disabled_buffers =
-            ruapc_bufpool::BufferPoolBuilder::new(disabled_devices.clone()).build();
+        let disabled_devices = Arc::from([]);
+        let disabled_buffers = ruapc_bufpool::BufferPoolBuilder::new(Vec::new()).build();
         let disabled_pool =
             SocketPool::create(&disabled, &disabled_devices, &disabled_buffers).unwrap();
         assert!(disabled_pool.rdma_peer_advertisement().is_err());

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::{
-    Buffer, BufferAvailability, Context, Receiver, SocketTrait,
+    Buffer, BufferAvailability, Context, Receiver,
     core::ContextEndpoint,
     error::{Error, ErrorKind},
     msg::{MsgFlags, MsgMeta},
@@ -234,7 +234,7 @@ impl Client {
         }
 
         let (read_regions, write_regions) =
-            export_attached_regions(&socket, &ctx.state, read_attachment.buffers(), write_target)?;
+            export_attached_regions(&socket, read_attachment.buffers(), write_target)?;
         let read_bytes = read_attachment.charge_bytes;
         if let Err(err) = socket
             .reserve_rdma_send_bandwidth(read_bytes, Some(response_deadline))
@@ -300,7 +300,7 @@ mod tests {
     use super::*;
     use crate::{Socket, SocketPoolConfig, tcp::TcpSocket};
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-    use ruapc_bufpool::{BufferPool, EmptyDevices};
+    use ruapc_bufpool::BufferPool;
     use std::{
         future::Future,
         task::{Context as TaskContext, Poll, Waker},
@@ -309,7 +309,7 @@ mod tests {
 
     #[test]
     fn read_bandwidth_charge_uses_logical_lengths_unless_overridden() {
-        let pool = BufferPool::new(Arc::new(EmptyDevices));
+        let pool = BufferPool::new(Vec::new());
         let buffers = [4, 0, 7]
             .into_iter()
             .map(|len| {

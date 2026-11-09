@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::buddy::{BuddyBlock, LEVEL_SIZES, NODES_PER_LEVEL, NUM_LEVELS};
 use crate::slab::{NUM_SLAB_CLASSES, SLAB_BACKING_SIZE, SLAB_CLASS_SIZES};
-use crate::{AsDeviceIndex, BufferPool, MemoryKey, RemoteBufferInfo};
+use crate::{BufferPool, MemoryKey, RemoteBufferInfo};
 
 /// A buffer allocated from the pool.
 ///
@@ -236,29 +236,31 @@ impl Buffer {
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 
-    /// Returns the memory key for this buffer's underlying block on the given device.
+    /// Returns the memory key for this buffer's underlying block.
+    ///
+    /// `registrar_index` is the zero-based position supplied when constructing
+    /// this buffer's pool. Indices carry no identity across different pools.
     ///
     /// # Errors
     ///
-    /// Returns an error if the device index is not registered, or if this
+    /// Returns an error if the registrar index is not registered, or if this
     /// is an empty buffer created by [`empty`](Self::empty).
-    pub fn memory_key(&self, device_index: &impl AsDeviceIndex) -> Result<MemoryKey> {
+    pub fn memory_key(&self, registrar_index: usize) -> Result<MemoryKey> {
         if self.level == Self::EMPTY_LEVEL {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "memory not registered: empty buffer has no backing memory",
             ));
         }
-        let idx = device_index.as_device_index();
         // SAFETY: this buffer retains the block; registrations remain immutable.
         // Borrow only that field while other threads change allocation metadata.
         unsafe { &(*self.block.as_ptr()).registrations }
-            .get(idx.index as usize)
+            .get(registrar_index)
             .map(|r| r.memory_key())
             .ok_or_else(|| {
                 Error::new(
                     ErrorKind::InvalidInput,
-                    format!("memory not registered on device index {}", idx.index),
+                    format!("memory not registered at registrar index {registrar_index}"),
                 )
             })
     }
@@ -295,12 +297,9 @@ impl Buffer {
     ///
     /// # Errors
     ///
-    /// Returns an error for an unregistered device index or an empty sentinel.
-    pub fn remote_buffer_info(
-        &self,
-        device_index: &impl AsDeviceIndex,
-    ) -> Result<RemoteBufferInfo> {
-        let key = self.memory_key(device_index)?;
+    /// Returns an error for an unregistered pool-local registrar index or an empty sentinel.
+    pub fn remote_buffer_info(&self, registrar_index: usize) -> Result<RemoteBufferInfo> {
+        let key = self.memory_key(registrar_index)?;
         Ok(RemoteBufferInfo {
             key,
             addr: self.as_ptr() as u64,
@@ -371,10 +370,10 @@ impl std::fmt::Debug for Buffer {
 mod tests {
     use std::sync::Arc;
 
-    use crate::{BufferPool, BufferPoolBuilder, EmptyDevices};
+    use crate::{BufferPool, BufferPoolBuilder};
 
     fn test_pool() -> Arc<BufferPool> {
-        BufferPoolBuilder::new(Arc::new(EmptyDevices)).build()
+        BufferPoolBuilder::new(Vec::new()).build()
     }
 
     #[test]

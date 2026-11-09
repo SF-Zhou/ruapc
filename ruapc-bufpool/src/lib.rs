@@ -12,12 +12,11 @@
 //! ## Example
 //!
 //! ```rust
-//! use std::sync::Arc;
-//! use ruapc_bufpool::{BufferPoolBuilder, EmptyDevices};
+//! use ruapc_bufpool::BufferPoolBuilder;
 //!
 //! # fn main() -> std::io::Result<()> {
 //! // Create a buffer pool with 256MiB max memory
-//! let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
+//! let pool = BufferPoolBuilder::new(Vec::new())
 //!     .max_memory(256 * 1024 * 1024)
 //!     .build();
 //!
@@ -48,11 +47,5 @@ pub use pool::{BufferPool, BufferPoolBuilder, DEFAULT_BUFFER_POOL_MEMORY};
 mod key;
 pub use key::{MemoryKey, RemoteBufferInfo};
 
-mod device;
-pub use device::{AsDeviceIndex, Device, DeviceIndex, MemoryRegistrar, Registration};
-
-mod tcp_device;
-pub use tcp_device::{TcpDevice, TcpMemoryRegistration};
-
-mod devices;
-pub use devices::{DeviceSet, Devices, EmptyDevices};
+mod registration;
+pub use registration::{MemoryRegistrar, Registration};

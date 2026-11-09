@@ -141,9 +141,7 @@ fn bytesmut_reuse_replaces_successful_and_failed_messages_without_reallocating()
 
 #[test]
 fn pooled_buffer_reuse_replaces_successful_and_failed_messages_without_reallocating() {
-    let pool =
-        ruapc_bufpool::BufferPoolBuilder::new(std::sync::Arc::new(ruapc_bufpool::EmptyDevices))
-            .build();
+    let pool = ruapc_bufpool::BufferPoolBuilder::new(Vec::new()).build();
     let mut storage = pool.allocate(16 * 1024).unwrap();
     let capacity = storage.capacity();
     assert_storage_reuse(&mut storage);

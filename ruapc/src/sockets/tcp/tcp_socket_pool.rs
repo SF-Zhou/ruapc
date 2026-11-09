@@ -13,8 +13,7 @@ use tokio_util::sync::DropGuard;
 
 use super::TcpSocket;
 use crate::{
-    BufferPool, ConnectionMap, Devices, Endpoint, Message, RawStream, Socket, SocketPoolConfig,
-    SocketPoolTrait, State, TaskSupervisor,
+    ConnectionMap, Endpoint, Message, Socket, State, TaskSupervisor,
     error::{Error, ErrorKind, Result},
     msg::frame,
     sockets::connect::ConnectGroups,
@@ -26,50 +25,15 @@ pub struct TcpSocketPool {
     task_supervisor: TaskSupervisor,
 }
 
-impl SocketPoolTrait for TcpSocketPool {
-    fn create(
-        _config: &SocketPoolConfig,
-        _devices: &Arc<Devices>,
-        _buffer_pool: &Arc<BufferPool>,
-    ) -> Result<Self> {
-        Ok(Self::new())
-    }
-
-    async fn handle_new_stream(
-        &self,
-        state: &Arc<State>,
-        stream: RawStream,
-        addr: SocketAddr,
-    ) -> Result<()> {
-        let RawStream::TCP(tcp_stream) = stream else {
-            return Err(Error::new(
-                ErrorKind::InvalidArgument,
-                "invalid socket type".into(),
-            ));
-        };
-
-        let _ = self.add_socket(None, addr, tcp_stream, state)?;
-        Ok(())
-    }
-
-    fn stop(&self) {
-        self.task_supervisor.stop();
-    }
-
-    fn drop_guard(&self) -> DropGuard {
+impl TcpSocketPool {
+    pub(crate) fn drop_guard(&self) -> DropGuard {
         self.task_supervisor.drop_guard()
     }
 
-    async fn join(&self) {
+    pub(crate) async fn join(&self) {
         self.task_supervisor.all_stopped().await;
     }
 
-    async fn acquire(&self, endpoint: &Endpoint, state: &Arc<State>) -> Result<Socket> {
-        self.acquire_with_deadline(endpoint, None, state).await
-    }
-}
-
-impl TcpSocketPool {
     pub(crate) async fn acquire_with_deadline(
         &self,
         endpoint: &Endpoint,

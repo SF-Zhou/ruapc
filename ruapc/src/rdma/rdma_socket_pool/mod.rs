@@ -1,6 +1,5 @@
 use std::{
     collections::HashSet,
-    net::SocketAddr,
     sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     sync::{Arc, OnceLock, Weak},
     time::{Duration, Instant},
@@ -10,10 +9,12 @@ use foldhash::fast::RandomState;
 use tokio_util::sync::DropGuard;
 
 use super::path::RdmaPathInfo;
-use super::{DevicePollers, PollerConfig, RdmaDeviceRefresher, RdmaSocket, RdmaSocketPoolConfig};
+use super::{
+    DevicePollers, PollerConfig, RdmaDevice, RdmaSocket, RdmaSocketPoolConfig,
+    start_device_refresher,
+};
 use crate::{
-    BufferPool, Client, Devices, Endpoint, Error, ErrorKind, RawStream, Result, Socket,
-    SocketPoolConfig, SocketPoolTrait, State, TaskSupervisor,
+    BufferPool, Client, Endpoint, Error, ErrorKind, Result, Socket, State, TaskSupervisor,
 };
 
 mod peer;
@@ -80,7 +81,11 @@ impl Drop for ConnCountGuard {
 ///   2. Destroy QPs (`peers`) — the shared CQs are destroyed via their
 ///      `Arc` chain once the last QP referencing them is gone
 ///   3. Deregister MRs (`buffer_pool`)
-///   4. Destroy PD / close device context (`devices`)
+///   4. Release the runtime device handles (`devices`)
+///
+/// Buffer-pool registrars also hold the active devices. Registrations retain
+/// their backing memory and PD, so surviving buffers keep those resources alive
+/// even after this pool releases its handles.
 ///
 /// Rust drops struct fields in **declaration order**, so the fields below
 /// are intentionally ordered to satisfy the ibverbs requirement.
@@ -94,18 +99,16 @@ pub struct RdmaSocketPool {
     /// Per-device completion poll threads. Dropped before `peers` so
     /// the threads are joined and release their `Arc<RdmaSocket>` clones.
     pollers: DevicePollers,
-    /// Background port/GID cache refresher. Dropped before RDMA devices.
-    _port_refresher: RdmaDeviceRefresher,
     /// Per-peer connection state. Dropped after tasks stop, before memory
     /// registration and device resources.
     peers: PeerMap,
     /// Live connection count per local RDMA device (outbound + inbound),
-    /// indexed like `devices.devices()`. Drives least-connections
+    /// indexed like `devices`. Drives least-connections
     /// placement and is advertised to peers via `RdmaPeerAdvertisement`.
     conn_counts: Arc<Vec<AtomicUsize>>,
     /// Per local RDMA device budget of in-flight RDMA READ work requests
     /// (`rdma.remote_memory.max_inflight_read_wrs`), indexed like
-    /// `devices.devices()` and shared by every connection on the
+    /// `devices` and shared by every connection on the
     /// device — the congestion control for read traffic (server-side
     /// `remote_read` and client-side `read_into_target` alike).
     read_permits: Vec<Arc<tokio::sync::Semaphore>>,
@@ -120,9 +123,9 @@ pub struct RdmaSocketPool {
     /// Shared buffer pool (owned by State, kept alive via Arc).
     /// Dropped after QPs → deregisters MRs.
     pub buffer_pool: Arc<BufferPool>,
-    /// Global device collection (owned by State, kept alive via Arc).
-    /// Dropped last → destroys PD and closes device context.
-    pub devices: Arc<Devices>,
+    /// Configured runtime devices, shared with State. Each active device is
+    /// also retained by its buffer-pool registrar.
+    pub devices: Arc<[RdmaDevice]>,
     /// RDMA Queue Pair and connection settings.
     pub config: RdmaSocketPoolConfig,
     /// Counter for round-robin stripe selection in `acquire`.
@@ -141,71 +144,32 @@ pub struct RdmaSocketPool {
     pool_capacity_warned: std::sync::atomic::AtomicBool,
 }
 
-impl SocketPoolTrait for RdmaSocketPool {
-    fn create(
-        config: &SocketPoolConfig,
-        devices: &Arc<Devices>,
-        buffer_pool: &Arc<BufferPool>,
-    ) -> Result<Self> {
-        let rdma = config.rdma.clone().ok_or_else(|| {
-            Error::new(
-                ErrorKind::InvalidArgument,
-                "RDMA socket pool requires RDMA configuration".into(),
-            )
-        })?;
-        Self::new(devices.clone(), buffer_pool.clone(), rdma)
-    }
-
-    /// Stops all tasks managed by the socket pool.
-    fn stop(&self) {
-        self.task_supervisor.stop();
-    }
-
+impl RdmaSocketPool {
     /// Returns a guard that will stop all tasks when dropped.
-    fn drop_guard(&self) -> DropGuard {
+    pub(crate) fn drop_guard(&self) -> DropGuard {
         self.task_supervisor.drop_guard()
     }
 
     /// Waits for all tasks to complete.
-    async fn join(&self) {
+    pub(crate) async fn join(&self) {
         self.task_supervisor.all_stopped().await;
     }
 
-    /// Acquires or creates an RDMA socket for the complete bootstrap address group.
-    async fn acquire(&self, endpoint: &Endpoint, state: &Arc<State>) -> Result<Socket> {
-        self.acquire_with_options(endpoint, &HashSet::new(), None, state)
-            .await
-    }
-
-    async fn handle_new_stream(
-        &self,
-        _state: &Arc<State>,
-        _stream: RawStream,
-        _addr: SocketAddr,
-    ) -> Result<()> {
-        Err(Error::new(
-            ErrorKind::InvalidArgument,
-            "invalid socket type".into(),
-        ))
-    }
-}
-
-impl RdmaSocketPool {
     /// How long a NIC pair stays penalized after its QP setup failed.
     const PATH_BLACKLIST_TTL: Duration = Duration::from_secs(30);
 
     /// Creates a new pool using the shared devices and buffer pool.
     pub fn new(
-        devices: Arc<Devices>,
+        devices: Arc<[RdmaDevice]>,
         buffer_pool: Arc<BufferPool>,
         config: RdmaSocketPoolConfig,
     ) -> Result<Self> {
         config.validate()?;
-        for device in devices.devices() {
+        for device in devices.iter() {
             device.configure_bandwidth_limit(&config)?;
         }
         let task_supervisor = TaskSupervisor::create();
-        let port_refresher = RdmaDeviceRefresher::start(devices.clone(), &task_supervisor);
+        start_device_refresher(devices.clone(), &task_supervisor);
         Ok(Self {
             bootstrap_client: Client {
                 timeout: std::time::Duration::from_secs(5),
@@ -215,14 +179,9 @@ impl RdmaSocketPool {
             },
             task_supervisor,
             pollers: DevicePollers::default(),
-            _port_refresher: port_refresher,
             peers: PeerMap::default(),
-            conn_counts: Arc::new(
-                (0..devices.devices().len())
-                    .map(|_| AtomicUsize::new(0))
-                    .collect(),
-            ),
-            read_permits: (0..devices.devices().len())
+            conn_counts: Arc::new((0..devices.len()).map(|_| AtomicUsize::new(0)).collect()),
+            read_permits: (0..devices.len())
                 .map(|_| {
                     Arc::new(tokio::sync::Semaphore::new(
                         config.remote_memory.max_inflight_read_wrs as usize,
@@ -436,11 +395,13 @@ mod group_tests {
     use crate::core::ContextEndpoint;
     use crate::http::HttpSocket;
     use crate::rdma::{RdmaService as _, rdma_service::RDMA_BOOTSTRAP_PROTOCOL_VERSION};
-    use crate::{Context, Endpoint, ListenMode, Listener, Router, Server, Transport};
+    use crate::{
+        Context, Endpoint, ListenMode, Listener, Router, Server, SocketPoolConfig, Transport,
+    };
 
     fn pool_without_rdma_devices() -> RdmaSocketPool {
-        let devices = Arc::new(Devices::default());
-        let buffers = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+        let devices = Arc::from([]);
+        let buffers = ruapc_bufpool::BufferPoolBuilder::new(Vec::new()).build();
         RdmaSocketPool::new(devices, buffers, RdmaSocketPoolConfig::default()).unwrap()
     }
 
@@ -561,7 +522,7 @@ mod group_tests {
         for bootstrap_transport in [Transport::TCP, Transport::WS, Transport::HTTP] {
             let config = bootstrap_config();
             let server = Server::create(Router::default(), &config).unwrap();
-            assert!(server.state().devices.devices().is_empty());
+            assert!(server.state().rdma_devices.is_empty());
             let first = Listener::new();
             let second = Listener::new();
             let first_addr = first

@@ -143,9 +143,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "sequence out of range")]
     fn insert_rejects_sequences_that_alias_reserved_tags() {
-        let pool =
-            ruapc_bufpool::BufferPoolBuilder::new(std::sync::Arc::new(ruapc_bufpool::EmptyDevices))
-                .build();
+        let pool = ruapc_bufpool::BufferPoolBuilder::new(Vec::new()).build();
         WrSlots::new(1)
             .insert(u64::MAX - 1, pool.allocate(64).unwrap().into())
             .unwrap();

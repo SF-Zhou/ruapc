@@ -11,7 +11,7 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ruapc_bufpool::{Buffer, BufferPool, BufferPoolBuilder, EmptyDevices};
+use ruapc_bufpool::{Buffer, BufferPool, BufferPoolBuilder};
 
 // Measurements pin jemalloc as the process allocator so samples are comparable
 // across hosts; see docs/benchmark.md#allocator.
@@ -25,7 +25,7 @@ const EAGER: [usize; 4] = [0, 0, 0, 0];
 const LAZY: [usize; 4] = [16, 8, 2, 0];
 
 fn new_pool(watermarks: [usize; 4]) -> Arc<BufferPool> {
-    BufferPoolBuilder::new(Arc::new(EmptyDevices))
+    BufferPoolBuilder::new(Vec::new())
         .max_memory(256 * MIB)
         .merge_watermarks(watermarks)
         .build()

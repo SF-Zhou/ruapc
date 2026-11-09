@@ -67,12 +67,11 @@ consumes the set to return ownership. Public copy methods never accept a
 caller-supplied promise that a separate layout matches actual buffers.
 
 ```rust
-use std::sync::Arc;
-use ruapc_bufpool::{BufferPool, EmptyDevices};
+use ruapc_bufpool::BufferPool;
 use ruapc_memory::{BufferSet, CopyBatch, CopyOp};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let pool = BufferPool::new(Arc::new(EmptyDevices));
+    let pool = BufferPool::new(Vec::new());
     let mut source = pool.allocate(4)?;
     source.set_len(4);
     source.copy_from_slice(b"Rua!");
