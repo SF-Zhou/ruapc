@@ -12,12 +12,15 @@ pub struct MemoryKey {
     pub rkey: u32,
 }
 
-/// Information about a remote buffer, used for RDMA-style remote read/write.
+/// One advertised region in a logical remote-memory space.
+///
+/// RDMA uses its registered address and keys. Stream transports use only the
+/// logical length and leave the address and keys zero.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RemoteBufferInfo {
-    /// The memory key for the buffer.
+    /// The memory key for the buffer, or zero for stream transfers.
     pub key: MemoryKey,
-    /// The address of the buffer.
+    /// The registered address of the buffer, or zero for stream transfers.
     pub addr: u64,
     /// Advertised logical length, not allocation capacity. Operations may
     /// select any validated subrange within it.

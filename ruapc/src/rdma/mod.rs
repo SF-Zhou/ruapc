@@ -21,10 +21,10 @@ mod rate_limiter;
 pub(crate) use rate_limiter::RdmaBandwidthLimiter;
 
 mod rdma_device;
-pub(crate) use rdma_device::RdmaDevice;
+pub use rdma_device::RdmaDevice;
 
 mod rdma_device_refresher;
-pub(crate) use rdma_device_refresher::RdmaDeviceRefresher;
+pub(crate) use rdma_device_refresher::start_device_refresher;
 
 mod rdma_service;
 pub(crate) use rdma_service::{RdmaPeerAdvertisement, RdmaService};

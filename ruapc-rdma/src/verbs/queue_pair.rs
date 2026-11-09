@@ -8,7 +8,7 @@ pub use read::{
 #[cfg(feature = "bench-internals")]
 pub use read::bench_support as read_bench_support;
 
-use ruapc_bufpool::{Buffer, DeviceIndex};
+use ruapc_bufpool::Buffer;
 
 use super::{
     completion_queue::{Completion, CompletionIdentity, CompletionQueue, IdentityLease},
@@ -78,18 +78,15 @@ pub struct CompletedWork<'a> {
     pub swept_sends: usize,
 }
 
-/// One local scatter segment of an RDMA READ posted via
-/// [`QueuePair::read_sges`]: a raw (address, length, lkey) triple. The
-/// caller owns the memory and must keep it alive until the read's
-/// completion is observed.
+/// One local scatter segment resolved from an owned READ plan.
 #[derive(Debug, Clone, Copy)]
-pub struct ReadSge {
+struct ReadSge {
     /// Local destination address.
-    pub addr: u64,
+    addr: u64,
     /// Segment length in bytes.
-    pub len: u32,
+    len: u32,
     /// Local memory key covering the segment on this QP's device.
-    pub lkey: u32,
+    lkey: u32,
 }
 
 /// Signaling is explicit at each entry point: window-tail and backlog sends
@@ -141,7 +138,9 @@ pub struct QueuePair {
     /// Negotiated gather-list capability (`init_attr.cap.max_send_sge`
     /// after creation).
     max_send_sge: usize,
-    pub device_index: DeviceIndex,
+    /// Position of this QP's registrar in the buffers' pool. This is not a pool
+    /// identity or a protection-domain compatibility check.
+    pub device_index: usize,
 }
 
 /// Setup leases the QPN after the provider assigns it. Drop must destroy the
@@ -176,11 +175,14 @@ fn destroy_provider_qp(ptr: *mut ibv_qp) {
 impl QueuePair {
     /// Creates a queue pair that posts SEND, RECV and READ work to `cq` and
     /// receives every completion from it.
+    ///
+    /// `device_index` selects the registration associated with `pd` in each
+    /// submitted buffer's pool. Pools used with this QP must preserve that order.
     pub fn create(
         pd: &Arc<ProtectionDomain>,
         cq: &Arc<CompletionQueue>,
         init_attr: &mut ibv_qp_init_attr,
-        device_index: DeviceIndex,
+        device_index: usize,
     ) -> Result<Self> {
         // Completion of a later SQ request only authorizes the selective
         // SEND sweep for reliable-connected queue pairs.
@@ -253,7 +255,7 @@ impl QueuePair {
 
     fn lkey(&self, buffer: &Buffer) -> Result<u32> {
         buffer
-            .memory_key(&self.device_index)
+            .memory_key(self.device_index)
             .map(|k| k.lkey)
             .map_err(|e| Error::new(ErrorKind::IBRegMemoryRegionFail, e.to_string()))
     }
@@ -444,7 +446,7 @@ impl QueuePair {
     /// Every SGE must describe writable registered memory on this QP's device.
     /// Keep that memory alive and exclusively available for DMA until the WR's
     /// success, error, or flush completion is observed (or the QP is destroyed).
-    pub unsafe fn read_sges(
+    unsafe fn read_sges(
         &self,
         sges: &[ReadSge],
         remote_addr: u64,
@@ -710,8 +712,7 @@ mod tests {
     fn qp_identity_is_registered_after_creation_and_retires_after_destruction() {
         let device = open_device();
         let cq = CompletionQueue::create(device.context(), 16, None).unwrap();
-        let qp =
-            QueuePair::create(device.pd(), &cq, &mut init_attr(), DeviceIndex::default()).unwrap();
+        let qp = QueuePair::create(device.pd(), &cq, &mut init_attr(), 0).unwrap();
         let identity = qp.identity();
         assert_eq!(identity.qp_num(), qp.qp_num());
         assert!(Arc::ptr_eq(qp.cq(), &cq));
@@ -723,8 +724,7 @@ mod tests {
         drop(qp);
         assert_eq!(cq.qp_registry_stats().active, 0);
         assert_eq!(cq.qp_registry_stats().next_sequence_floor, 300);
-        let replacement =
-            QueuePair::create(device.pd(), &cq, &mut init_attr(), DeviceIndex::default()).unwrap();
+        let replacement = QueuePair::create(device.pd(), &cq, &mut init_attr(), 0).unwrap();
         assert_eq!(replacement.identity().first_sequence(), 300);
         assert_eq!(replacement.identity.lock_send().unwrap().sequence(), 300);
         assert_eq!(replacement.identity.alloc_recv().unwrap(), 300);
@@ -735,10 +735,7 @@ mod tests {
         let device = open_device();
         let cq = CompletionQueue::create(device.context(), 1, None).unwrap();
         let qps: Vec<_> = (0..cq.capacity() + 2)
-            .map(|_| {
-                QueuePair::create(device.pd(), &cq, &mut init_attr(), DeviceIndex::default())
-                    .unwrap()
-            })
+            .map(|_| QueuePair::create(device.pd(), &cq, &mut init_attr(), 0).unwrap())
             .collect();
         assert!(qps.len() > cq.capacity() as usize);
         assert_eq!(cq.qp_registry_stats().active, qps.len());
@@ -784,25 +781,20 @@ mod tests {
         let mut attrs = init_attr();
         attrs.srq = ptr::dangling_mut();
         assert_eq!(
-            QueuePair::create(device.pd(), &cq, &mut attrs, DeviceIndex::default())
+            QueuePair::create(device.pd(), &cq, &mut attrs, 0)
                 .unwrap_err()
                 .kind,
             ErrorKind::InvalidQueuePairConfig
         );
         attrs.srq = ptr::null_mut();
         attrs.qp_context = ptr::dangling_mut();
-        assert!(QueuePair::create(device.pd(), &cq, &mut attrs, DeviceIndex::default()).is_err());
+        assert!(QueuePair::create(device.pd(), &cq, &mut attrs, 0).is_err());
         let foreign = open_device();
         let foreign_cq = CompletionQueue::create(foreign.context(), 16, None).unwrap();
         assert_eq!(
-            QueuePair::create(
-                device.pd(),
-                &foreign_cq,
-                &mut init_attr(),
-                DeviceIndex::default()
-            )
-            .unwrap_err()
-            .kind,
+            QueuePair::create(device.pd(), &foreign_cq, &mut init_attr(), 0)
+                .unwrap_err()
+                .kind,
             ErrorKind::InvalidQueuePairConfig
         );
     }
@@ -866,53 +858,25 @@ mod completion_tests {
         time::{Duration, Instant},
     };
 
-    use ruapc_bufpool::{
-        AlignedMemory, BufferPoolBuilder, Device as PoolDevice, DeviceIndex, DeviceSet,
-    };
+    use ruapc_bufpool::{AlignedMemory, BufferPoolBuilder};
 
     use super::*;
     use crate::{
-        ActiveDevice, CompletionBatch, GidType, MemoryRegion, ibv_access_flags, ibv_qp_cap,
-        ibv_qp_init_attr, ibv_qp_type, ibv_send_flags, test_utils::open_device,
+        CompletionBatch, GidType, MemoryRegion, ibv_access_flags, ibv_qp_cap, ibv_qp_init_attr,
+        ibv_qp_type, ibv_send_flags, test_utils::open_device,
     };
-
-    #[derive(Debug)]
-    struct RegisteredDevice {
-        active: ActiveDevice,
-        index: DeviceIndex,
-    }
-
-    impl PoolDevice for RegisteredDevice {
-        type Registrar = ActiveDevice;
-
-        fn registrar(&self) -> &ActiveDevice {
-            &self.active
-        }
-        fn index(&self) -> DeviceIndex {
-            self.index
-        }
-        fn set_index(&mut self, index: DeviceIndex) {
-            self.index = index;
-        }
-    }
 
     #[test]
     fn read_completion_sweeps_unsignaled_send_and_settles_read_batch() {
         for success in [true, false] {
-            let mut devices = DeviceSet::default();
-            devices.push(RegisteredDevice {
-                active: open_device(),
-                index: DeviceIndex::default(),
-            });
-            let devices = Arc::new(devices);
-            let device = &devices.devices()[0];
-            let pool = BufferPoolBuilder::new(devices.clone()).build();
+            let device = Arc::new(open_device());
+            let pool = BufferPoolBuilder::new(vec![device.clone()]).build();
             // The remote source must outlive both provider QPs even on assertion
             // failure. Its declaration precedes the QPs for unwinding drop order.
             let mut source = pool.allocate(64).unwrap();
             source.set_len(64);
             source.as_mut_slice().fill(0x5a);
-            let remote = source.remote_buffer_info(&device.index).unwrap();
+            let remote = source.remote_buffer_info(0).unwrap();
             // Use an actual MR without remote READ permission for the error case;
             // no numeric rkey value is assumed to be universally invalid. Declare
             // both the MR and its backing before the QPs so panic cleanup destroys
@@ -920,7 +884,7 @@ mod completion_tests {
             let denied_source = (!success).then(|| Arc::new(AlignedMemory::new(64).unwrap()));
             let denied_region = denied_source.as_ref().map(|memory| {
                 MemoryRegion::register(
-                    device.active.pd(),
+                    device.pd(),
                     memory,
                     ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0 as _,
                 )
@@ -931,10 +895,10 @@ mod completion_tests {
                 .map_or((remote.addr, remote.key.rkey), |region| {
                     (region.addr() as u64, region.rkey())
                 });
-            let cq = CompletionQueue::create(device.active.context(), 16, None).unwrap();
+            let cq = CompletionQueue::create(device.context(), 16, None).unwrap();
             let create = || {
                 QueuePair::create(
-                    device.active.pd(),
+                    device.pd(),
                     &cq,
                     &mut ibv_qp_init_attr {
                         qp_type: ibv_qp_type::IBV_QPT_RC,
@@ -947,19 +911,13 @@ mod completion_tests {
                         },
                         ..Default::default()
                     },
-                    device.index,
+                    0,
                 )
                 .unwrap()
             };
             let mut sender = create();
             let receiver = create();
-            let port = device
-                .active
-                .info()
-                .ports
-                .iter()
-                .find(|p| p.is_usable())
-                .unwrap();
+            let port = device.info().ports.iter().find(|p| p.is_usable()).unwrap();
             let gid = port
                 .gids
                 .iter()

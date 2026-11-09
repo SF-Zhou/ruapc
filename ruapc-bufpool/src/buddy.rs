@@ -13,8 +13,8 @@ use std::sync::Arc;
 use aliasable::boxed::AliasableBox;
 
 use crate::AlignedMemory;
-use crate::device::Registration;
 use crate::intrusive_list::IntrusiveNode;
+use crate::registration::Registration;
 
 /// Size constants for each level.
 pub const SIZE_1MIB: usize = 1024 * 1024;

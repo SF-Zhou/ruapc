@@ -350,7 +350,7 @@ mod tests {
             Expiry,
         }
 
-        let pool = ruapc_bufpool::BufferPool::new(Arc::new(ruapc_bufpool::EmptyDevices));
+        let pool = ruapc_bufpool::BufferPool::new(Vec::new());
         for completion in [
             Completion::Response,
             Completion::ConnectionFailure,
@@ -418,7 +418,7 @@ mod tests {
 
     #[test]
     fn a_local_reader_keeps_owned_sources_alive_after_expiry() {
-        let pool = ruapc_bufpool::BufferPool::new(Arc::new(ruapc_bufpool::EmptyDevices));
+        let pool = ruapc_bufpool::BufferPool::new(Vec::new());
         let mut buffer = pool.allocate(16).unwrap();
         buffer.set_len(4);
         buffer.copy_from_slice(b"data");
@@ -477,10 +477,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_waiter_write_target_delivery() {
-        use crate::Devices;
-
-        let devices = Arc::new(Devices::default());
-        let pool = ruapc_bufpool::BufferPoolBuilder::new(devices).build();
+        let pool = ruapc_bufpool::BufferPoolBuilder::new(Vec::new()).build();
 
         let waiter = Waiter::default();
         let (msgid, rx) = waiter.alloc(std::time::Duration::from_secs(30));
@@ -506,10 +503,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_waiter_write_target_after_timeout() {
-        use crate::Devices;
-
-        let devices = Arc::new(Devices::default());
-        let pool = ruapc_bufpool::BufferPoolBuilder::new(devices).build();
+        let pool = ruapc_bufpool::BufferPoolBuilder::new(Vec::new()).build();
 
         let waiter = Waiter::default();
         let (msgid, rx) = waiter.alloc(std::time::Duration::from_secs(30));

@@ -162,7 +162,11 @@ pub(super) async fn acquire_for_attempt(
         AttemptEndpoint::Connected(socket) => return Ok(socket),
         AttemptEndpoint::Endpoint(endpoint) => endpoint,
     };
-    if let Some(result) = try_acquire_direct(state, &endpoint, avoided_remote_nics) {
+    let mut options = AcquireOptions {
+        avoided_remote_nics,
+        deadline: None,
+    };
+    if let Some(result) = state.socket_pool.try_acquire(&endpoint, options) {
         return result.map_err(AttemptFailure::acquire);
     }
     if let Some(acquire_deadline) = split_connection_deadline(
@@ -170,13 +174,12 @@ pub(super) async fn acquire_for_attempt(
         connect_deadline,
         remaining_acquire_attempts,
     ) {
-        let options = AcquireOptions {
-            avoided_remote_nics,
-            deadline: Some(acquire_deadline),
-        };
+        options.deadline = Some(acquire_deadline);
         match tokio::time::timeout_at(
             tokio::time::Instant::from_std(acquire_deadline),
-            acquire_direct(state, &endpoint, options),
+            state
+                .socket_pool
+                .acquire_with_options(&endpoint, options, state),
         )
         .await
         {
@@ -190,38 +193,27 @@ pub(super) async fn acquire_for_attempt(
     } else {
         // No time left to connect: an existing connection can still serve
         // this attempt without consuming a fresh connection budget.
-        acquire_existing_direct(state, &endpoint, avoided_remote_nics)
+        state
+            .socket_pool
+            .acquire_existing(&endpoint, options)
             .await
             .ok_or_else(AttemptFailure::acquire_deadline)?
             .map_err(AttemptFailure::acquire)
     }
 }
 
-/// Exports the attached buffers as regions for the device the connection
-/// actually runs on (TCP device, or the specific RDMA NIC of this
-/// connection). Invalid registrations are terminal for this call.
+/// Exports attachments for the selected transport. Invalid RDMA registrations
+/// are terminal for this call; stream transports need only logical lengths.
 pub(super) fn export_attached_regions(
     socket: &Socket,
-    state: &State,
     read_buffers: &[Buffer],
     write_target: Option<&Arc<WriteTarget>>,
 ) -> std::result::Result<(ThinVec<RemoteBufferInfo>, ThinVec<RemoteBufferInfo>), AttemptFailure> {
-    let mut read_regions = ThinVec::new();
+    let read_regions = socket.export_regions(read_buffers)?;
     let mut write_regions = ThinVec::new();
-    if read_buffers.is_empty() && write_target.is_none() {
-        return Ok((read_regions, write_regions));
-    }
-    let device_index = socket.device_index(state);
-    for buf in read_buffers {
-        read_regions.push(
-            buf.remote_buffer_info(&device_index)
-                .map_err(|e| Error::new(ErrorKind::InvalidArgument, e.to_string()))
-                .map_err(AttemptFailure::from)?,
-        );
-    }
     if let Some(target) = write_target {
         write_regions = target
-            .export_regions(&device_index)
+            .export_regions(socket)
             .map_err(AttemptFailure::from)?;
     }
     Ok((read_regions, write_regions))
@@ -260,48 +252,6 @@ fn split_connection_deadline(
 pub(super) fn wire_timeout_ms(timeout: Duration) -> u32 {
     let millis = timeout.as_nanos().div_ceil(1_000_000);
     u32::try_from(millis).unwrap_or(u32::MAX)
-}
-
-async fn acquire_direct(
-    state: &Arc<State>,
-    endpoint: &Endpoint,
-    options: AcquireOptions<'_>,
-) -> std::result::Result<Socket, Error> {
-    state
-        .socket_pool
-        .acquire_with_options(endpoint, options, state)
-        .await
-}
-
-fn try_acquire_direct(
-    state: &Arc<State>,
-    endpoint: &Endpoint,
-    avoided_remote_nics: Option<&HashSet<String>>,
-) -> Option<std::result::Result<Socket, Error>> {
-    state.socket_pool.try_acquire(
-        endpoint,
-        AcquireOptions {
-            avoided_remote_nics,
-            deadline: None,
-        },
-    )
-}
-
-async fn acquire_existing_direct(
-    state: &Arc<State>,
-    endpoint: &Endpoint,
-    avoided_remote_nics: Option<&HashSet<String>>,
-) -> Option<std::result::Result<Socket, Error>> {
-    state
-        .socket_pool
-        .acquire_existing(
-            endpoint,
-            AcquireOptions {
-                avoided_remote_nics,
-                deadline: None,
-            },
-        )
-        .await
 }
 
 /// Connection-level errors eligible for pre-acceptance retries.

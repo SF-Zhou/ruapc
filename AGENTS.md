@@ -15,9 +15,10 @@ Use [DESIGN.md](DESIGN.md) for crate/module ownership and
   registration and verbs operations belong in `ruapc-bufpool` / `ruapc-rdma`.
   Safe APIs must enforce memory ownership and completion evidence, not accept
   caller-supplied lifetime promises.
-- `DeviceSet` owns TCP at index zero and assigns additional device indices.
-  Safe `Device` wrappers expose an associated `MemoryRegistrar`; custom
-  registrars and `Devices` collections must uphold their unsafe contracts.
+- `BufferPool` owns an immutable ordered list of `MemoryRegistrar` trait objects;
+  registration indices are pool-local positions. The runtime builds its typed
+  RDMA device list in the same order. Stream transports need no registration.
+  Custom registrars must uphold their unsafe registration contract.
 - Keep metadata in named-field MessagePack. Add compatible fields with
   `#[serde(default)]` and `skip_serializing_if`. `UseMessagePack` selects the
   payload decoder only; default clients use MessagePack, otherwise JSON.

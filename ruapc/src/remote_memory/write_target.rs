@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use ruapc_bufpool::{AsDeviceIndex, RemoteBufferInfo};
+use ruapc_bufpool::RemoteBufferInfo;
 #[cfg(feature = "rdma")]
 use ruapc_memory::SpaceLayout;
 use ruapc_memory::{BufferSet, CopyBatch};
@@ -10,7 +10,7 @@ use thin_vec::ThinVec;
 
 #[cfg(test)]
 use crate::CopyOp;
-use crate::{Buffer, Error, ErrorKind, Result};
+use crate::{Buffer, Error, ErrorKind, Result, Socket};
 
 /// The owned destination shared by the original waiter and reverse-RPC handlers.
 ///
@@ -40,23 +40,10 @@ impl WriteTarget {
         self.total_len
     }
 
-    /// Exports actual available buffers for metadata on the selected device.
-    pub fn export_regions(
-        &self,
-        device_index: &impl AsDeviceIndex,
-    ) -> Result<ThinVec<RemoteBufferInfo>> {
+    /// Exports available destinations for the selected transport while locked.
+    pub fn export_regions(&self, socket: &Socket) -> Result<ThinVec<RemoteBufferInfo>> {
         let buffers = self.buffers.lock().unwrap();
-        buffers
-            .as_ref()
-            .ok_or_else(Self::busy)?
-            .buffers()
-            .iter()
-            .map(|buffer| {
-                buffer
-                    .remote_buffer_info(device_index)
-                    .map_err(|error| Error::new(ErrorKind::InvalidArgument, error.to_string()))
-            })
-            .collect()
+        socket.export_regions(buffers.as_ref().ok_or_else(Self::busy)?.buffers())
     }
 
     /// Plans against the available set's layout, then removes the whole set
@@ -137,11 +124,10 @@ impl WriteTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BufferPool, Devices};
+    use crate::BufferPool;
 
     fn pool() -> Arc<BufferPool> {
-        let devices = Arc::new(Devices::default());
-        ruapc_bufpool::BufferPoolBuilder::new(devices).build()
+        ruapc_bufpool::BufferPoolBuilder::new(Vec::new()).build()
     }
 
     #[test]

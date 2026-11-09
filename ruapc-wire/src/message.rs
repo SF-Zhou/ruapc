@@ -51,6 +51,7 @@ mod tests {
     use crate::{MsgFlags, SendMsg, deserialize_payload};
     use bytes::Bytes;
     use bytes::BytesMut;
+    use ruapc_bufpool::BufferPoolBuilder;
     use serde::Serialize;
 
     fn make_meta(method: &str, use_msgpack: bool) -> MsgMeta {
@@ -299,10 +300,7 @@ mod tests {
 
     #[test]
     fn test_buffer_sendmsg_serialize() {
-        use ruapc_bufpool::DeviceSet;
-        use std::sync::Arc;
-        let devices = Arc::new(DeviceSet::<ruapc_bufpool::TcpDevice>::default());
-        let pool = ruapc_bufpool::BufferPoolBuilder::new(devices).build();
+        let pool = BufferPoolBuilder::new(Vec::new()).build();
         let mut buf = pool.allocate(1024 * 1024).unwrap();
 
         let meta = make_meta("SomeService/rpc", false);
@@ -314,11 +312,8 @@ mod tests {
 
     #[test]
     fn test_buffer_sendmsg_writer_write_and_flush() {
-        use ruapc_bufpool::DeviceSet;
         use std::io::Write as _;
-        use std::sync::Arc;
-        let devices = Arc::new(DeviceSet::<ruapc_bufpool::TcpDevice>::default());
-        let pool = ruapc_bufpool::BufferPoolBuilder::new(devices).build();
+        let pool = BufferPoolBuilder::new(Vec::new()).build();
         let mut buf = pool.allocate(1024 * 1024).unwrap();
         buf.set_len(0);
         {
@@ -371,9 +366,7 @@ mod tests {
         let mut bytes = BytesMut::from(&[42; 16][..]);
         assert_finish_rejects_invalid_offsets(&mut bytes);
 
-        let devices =
-            std::sync::Arc::new(ruapc_bufpool::DeviceSet::<ruapc_bufpool::TcpDevice>::default());
-        let pool = ruapc_bufpool::BufferPoolBuilder::new(devices).build();
+        let pool = BufferPoolBuilder::new(Vec::new()).build();
         let mut buffer = pool.allocate(16).unwrap();
         buffer.set_len(0);
         buffer.extend_from_slice(&[42; 16]).unwrap();

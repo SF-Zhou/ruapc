@@ -482,10 +482,9 @@ mod tests {
     #[test]
     fn converting_remote_io_error_returns_recovered_memory_to_the_pool() {
         const CAPACITY: usize = 64 * 1024 * 1024;
-        let pool =
-            ruapc_bufpool::BufferPoolBuilder::new(std::sync::Arc::new(ruapc_bufpool::EmptyDevices))
-                .max_memory(CAPACITY)
-                .build();
+        let pool = ruapc_bufpool::BufferPoolBuilder::new(Vec::new())
+            .max_memory(CAPACITY)
+            .build();
         let buffer = pool.allocate(CAPACITY).unwrap();
         let expected = Error::new(ErrorKind::InvalidCopyOp, "invalid range".into());
         let error = RemoteIoError::new(expected.clone(), Some(vec![buffer]));

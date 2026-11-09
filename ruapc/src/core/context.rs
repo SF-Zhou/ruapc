@@ -4,7 +4,7 @@ use serde::Serialize;
 use tokio_util::sync::DropGuard;
 
 use crate::{
-    Endpoint, Error, Result, Router, Socket, SocketPoolConfig, SocketTrait, State,
+    Endpoint, Error, Result, Router, Socket, SocketPoolConfig, State,
     msg::{MsgFlags, MsgMeta},
 };
 

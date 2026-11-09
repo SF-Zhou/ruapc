@@ -161,10 +161,9 @@ fn rpc_error_envelope_and_schema_identity_keep_the_original_contract() {
 #[test]
 fn registered_payload_parsing_retains_the_buffer_until_drop() {
     const CAPACITY: usize = 64 * 1024 * 1024;
-    let pool =
-        ruapc_bufpool::BufferPoolBuilder::new(std::sync::Arc::new(ruapc_bufpool::EmptyDevices))
-            .max_memory(CAPACITY)
-            .build();
+    let pool = ruapc_bufpool::BufferPoolBuilder::new(Vec::new())
+        .max_memory(CAPACITY)
+        .build();
     let mut buffer = pool.allocate(CAPACITY).unwrap();
     let meta = MsgMeta::default();
     meta.serialize_to(&"registered payload", &mut buffer)

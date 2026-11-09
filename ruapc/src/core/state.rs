@@ -3,8 +3,8 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio_util::sync::DropGuard;
 
 use crate::{
-    BufferPool, Context, Devices, Error, Message, Metrics, RawStream, Result, Router, Socket,
-    SocketPool, SocketPoolConfig, Waiter,
+    BufferPool, Context, Error, Message, Metrics, RawStream, Result, Router, Socket, SocketPool,
+    SocketPoolConfig, Waiter,
 };
 
 #[cfg(feature = "rdma")]
@@ -33,10 +33,11 @@ pub struct State {
     pub(crate) waiter: Arc<Waiter>,
     /// Socket pool for managing connections.
     pub(crate) socket_pool: SocketPool,
-    /// Devices used to register buffer-pool memory; TCP occupies index zero.
-    pub devices: Arc<Devices>,
     /// Shared buffer pool for transports and application memory attachments.
     pub buffer_pool: Arc<BufferPool>,
+    /// Configured RDMA devices, in buffer-pool registration order.
+    #[cfg(feature = "rdma")]
+    pub rdma_devices: Arc<[RdmaDevice]>,
     /// Metric emission helpers (see [`crate::metrics`]); the actual
     /// storage/export belongs to the user-installed [`metrics::Recorder`].
     pub(crate) metrics: Arc<Metrics>,
@@ -60,11 +61,16 @@ impl State {
         config: &SocketPoolConfig,
     ) -> Result<(Arc<Self>, DropGuard)> {
         config.validate()?;
-        // Build the Devices collection based on configuration.
-        let devices = Arc::new(Self::discover_devices(config));
-
-        // Create a shared buffer pool backed by all discovered devices.
-        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone())
+        #[cfg(feature = "rdma")]
+        let rdma_devices = Self::discover_rdma_devices(config);
+        #[cfg(feature = "rdma")]
+        let registrars = rdma_devices
+            .iter()
+            .map(|device| device.registrar())
+            .collect();
+        #[cfg(not(feature = "rdma"))]
+        let registrars = Vec::new();
+        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(registrars)
             .max_memory(config.buffer_pool_memory)
             .build();
 
@@ -76,7 +82,13 @@ impl State {
                 ..Default::default()
             });
         }
-        let socket_pool = SocketPool::create(config, &devices, &buffer_pool)?;
+        let socket_pool = SocketPool::create(
+            config,
+            #[cfg(feature = "rdma")]
+            &rdma_devices,
+            #[cfg(feature = "rdma")]
+            &buffer_pool,
+        )?;
 
         let waiter: Arc<Waiter> = Arc::default();
         // Coarse request-timeout sweeping (no per-request timers).
@@ -86,8 +98,9 @@ impl State {
             router,
             waiter,
             socket_pool,
-            devices,
             buffer_pool,
+            #[cfg(feature = "rdma")]
+            rdma_devices,
             metrics: Arc::default(),
             max_inflight_requests: config.max_inflight_requests,
         };
@@ -98,31 +111,27 @@ impl State {
 
     /// Discovers and creates devices based on the socket pool configuration.
     ///
-    /// Always adds a TCP device. When the `rdma` feature and
-    /// `SocketPoolConfig::rdma` is `Some`, discovers available RDMA devices
+    /// When the `rdma` feature is enabled and `SocketPoolConfig::rdma` is
+    /// `Some`, discovers available RDMA devices
     /// before constructing the shared buffer pool. Devices with a DOWN port
     /// are retained when `rdma.path.allow_down_ports` is enabled so the
     /// periodic refresher can observe a later transition to ACTIVE.
-    fn discover_devices(_config: &SocketPoolConfig) -> Devices {
-        let devices = Devices::default();
-        #[cfg(feature = "rdma")]
-        let devices = {
-            let mut devices = devices;
-            if let Some(rdma) = &_config.rdma
-                && let Ok(mut active_devices) = ruapc_rdma::ActiveDevice::available()
-            {
-                sort_rdma_devices(&mut active_devices);
-                let prefer_rxe = std::env::var("RUAPC_PREFER_RXE").is_ok();
-                for dev in active_devices {
-                    if !rdma_device_allowed(dev.info(), prefer_rxe, &rdma.path) {
-                        continue;
-                    }
-                    devices.push(RdmaDevice::new(dev));
+    #[cfg(feature = "rdma")]
+    fn discover_rdma_devices(config: &SocketPoolConfig) -> Arc<[RdmaDevice]> {
+        let mut devices = Vec::new();
+        if let Some(rdma) = &config.rdma
+            && let Ok(mut active_devices) = ruapc_rdma::ActiveDevice::available()
+        {
+            sort_rdma_devices(&mut active_devices);
+            let prefer_rxe = std::env::var("RUAPC_PREFER_RXE").is_ok();
+            for dev in active_devices {
+                if !rdma_device_allowed(dev.info(), prefer_rxe, &rdma.path) {
+                    continue;
                 }
+                devices.push(RdmaDevice::new(devices.len(), dev));
             }
-            devices
-        };
-        devices
+        }
+        devices.into()
     }
 
     /// Dispatches requests with an incoming deadline, or delivers responses to

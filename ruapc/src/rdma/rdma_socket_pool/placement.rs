@@ -284,7 +284,7 @@ impl RdmaSocketPool {
         &self,
         remote_info: &RdmaPeerAdvertisement,
     ) -> Result<Vec<PathCandidate>> {
-        let local_devices = self.devices.devices();
+        let local_devices = &self.devices;
         if local_devices.is_empty() {
             return Err(Error::new(
                 ErrorKind::InvalidArgument,
@@ -549,7 +549,7 @@ pub(super) struct PathPreference<'a> {
 /// One compatible (local NIC, remote NIC) pair a new connection could use.
 #[derive(Clone, Debug)]
 pub(super) struct PathCandidate {
-    /// Index of the local device in `devices.devices()`.
+    /// Index of the local device in `devices`.
     pub(super) local_device_index: usize,
     /// Remote device/port/GID to request in `prepare_connection`.
     pub(super) remote: DeviceSelection,
@@ -999,7 +999,10 @@ mod path_selection_tests {
 
     fn make_pool() -> RdmaSocketPool {
         let devices = make_rdma_devices();
-        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(
+            devices.iter().map(|device| device.registrar()).collect(),
+        )
+        .build();
         RdmaSocketPool::new(devices, buffer_pool, RdmaSocketPoolConfig::default()).unwrap()
     }
 
@@ -1140,7 +1143,10 @@ mod path_selection_tests {
     #[tokio::test]
     async fn test_rejects_too_short_connect_lease() {
         let devices = make_rdma_devices();
-        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(
+            devices.iter().map(|device| device.registrar()).collect(),
+        )
+        .build();
         let mut config = RdmaSocketPoolConfig::default();
         config.peers.connect_lease_ms = 14_999;
         let err = RdmaSocketPool::new(devices, buffer_pool, config).unwrap_err();
@@ -1209,11 +1215,14 @@ mod path_selection_tests {
     #[tokio::test]
     async fn test_traffic_class_client_decides_server_obeys() {
         let devices = make_rdma_devices();
-        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(
+            devices.iter().map(|device| device.registrar()).collect(),
+        )
+        .build();
         let mut config = RdmaSocketPoolConfig::default();
         config.connection.traffic_class = 96;
         let pool = RdmaSocketPool::new(devices, buffer_pool, config).unwrap();
-        let rdma_devices = pool.devices.devices();
+        let rdma_devices = &pool.devices;
         let device = &rdma_devices[0];
 
         // Client path: local config wins over the remote advertisement.

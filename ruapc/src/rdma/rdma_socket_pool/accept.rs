@@ -123,7 +123,7 @@ impl AcceptLease {
 impl RdmaSocketPool {
     pub(crate) fn rdma_peer_advertisement(&self) -> Result<RdmaPeerAdvertisement> {
         Ok(RdmaPeerAdvertisement::from_devices(
-            self.devices.devices(),
+            &self.devices,
             &self.config,
             &self.conn_counts,
         ))
@@ -433,7 +433,6 @@ impl RdmaSocketPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Devices;
 
     const LEASE_DURATION: Duration = Duration::from_secs(30);
 
@@ -448,8 +447,8 @@ mod tests {
 
     fn make_pool() -> RdmaSocketPool {
         // Lease bookkeeping has no hardware dependency.
-        let devices = Arc::new(Devices::default());
-        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
+        let devices = Arc::from([]);
+        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(Vec::new()).build();
         RdmaSocketPool::new(
             devices,
             buffer_pool,

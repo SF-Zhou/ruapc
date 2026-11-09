@@ -1,4 +1,4 @@
-//! Audited registration capability used by buffer-pool device collections.
+//! Audited registration capability used by buffer pools.
 
 use std::sync::Arc;
 

@@ -25,7 +25,7 @@ use std::hint::black_box;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-use ruapc_bufpool::{Buffer, BufferPool, BufferPoolBuilder, EmptyDevices};
+use ruapc_bufpool::{Buffer, BufferPool, BufferPoolBuilder};
 
 // Measurements pin jemalloc as the process allocator so samples are comparable
 // across hosts; see docs/benchmark.md#allocator.
@@ -289,7 +289,7 @@ fn main() {
                     {
                         continue;
                     }
-                    let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
+                    let pool = BufferPoolBuilder::new(Vec::new())
                         .max_memory(512 * MIB)
                         .thread_cache(cache)
                         .build();

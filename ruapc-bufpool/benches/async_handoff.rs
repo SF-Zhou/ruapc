@@ -25,7 +25,7 @@ use std::{
     time::Instant,
 };
 
-use ruapc_bufpool::{Buffer, BufferPool, BufferPoolBuilder, EmptyDevices};
+use ruapc_bufpool::{Buffer, BufferPool, BufferPoolBuilder};
 
 // Measurements pin jemalloc as the process allocator so samples are comparable
 // across hosts; see docs/benchmark.md#allocator.
@@ -102,7 +102,7 @@ fn main() {
     for cancel in [false, true] {
         let name = if cancel { "cancel" } else { "handoff" };
         for sample in 0..repeats {
-            let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
+            let pool = BufferPoolBuilder::new(Vec::new())
                 .max_memory(SIZE)
                 .thread_cache(false)
                 .build();

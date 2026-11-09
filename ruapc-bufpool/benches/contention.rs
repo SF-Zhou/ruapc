@@ -17,7 +17,7 @@ use std::hint::black_box;
 use std::sync::{Arc, Barrier};
 use std::time::Instant;
 
-use ruapc_bufpool::{BufferPool, BufferPoolBuilder, EmptyDevices};
+use ruapc_bufpool::{BufferPool, BufferPoolBuilder};
 
 // Measurements pin jemalloc as the process allocator so samples are comparable
 // across hosts; see docs/benchmark.md#allocator.
@@ -27,7 +27,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 const MIB: usize = 1024 * 1024;
 
 fn new_pool() -> Arc<BufferPool> {
-    BufferPoolBuilder::new(Arc::new(EmptyDevices))
+    BufferPoolBuilder::new(Vec::new())
         .max_memory(1024 * MIB)
         .build()
 }

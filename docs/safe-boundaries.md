@@ -9,12 +9,24 @@ below. See [remote-memory usage](remote-memory.md) for the public API.
 
 ## Registration and byte access
 
-`DeviceSet<D>` assigns stable indices, with TCP at index zero. A safe `Device`
-provides an associated `MemoryRegistrar`; only the registrar receives backing
-memory. Custom `MemoryRegistrar` and `Devices` implementations have unsafe
-contracts: registration grants no independent access to bytes owned by pool
-buffers, and deregistration must finish before backing memory is released.
-Partial registration failure drops registrations already created.
+`BufferPool` owns an immutable ordered list of `Arc<dyn MemoryRegistrar>` and
+registers each new backing block in that order, outside the allocator lock.
+Buffer key lookups and QPs use zero-based positions in this list. These positions
+do not identify a pool or validate that a buffer belongs to a QP's protection
+domain; the runtime constructs its RDMA device list and registrar list together
+to keep their order aligned.
+
+Custom `MemoryRegistrar` implementations have an unsafe contract: registration
+grants no independent access to bytes owned by pool buffers, and deregistration
+must finish before backing memory is released. The pool drops registrations
+already created on partial failure and restores the allocation budget. It keeps
+registrars alive until all backing blocks have been released; each block drops
+its registrations before its memory.
+
+TCP, WebSocket and HTTP/2 need no memory registration. Their attachment metadata
+contains logical buffer lengths with zero addresses and keys; reverse RPCs
+resolve the owned buffers through the original request's waiter. RDMA exports
+registered addresses and keys for the connection's actual NIC.
 
 New backing memory is initialized before safe slices are exposed. Reused
 buffers are not cleared. Mutable slices require exclusive access, and logical

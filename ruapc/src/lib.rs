@@ -73,16 +73,6 @@ pub use sockets::*;
 pub use ruapc_bufpool::Buffer;
 pub use ruapc_bufpool::BufferPool;
 pub use ruapc_bufpool::DEFAULT_BUFFER_POOL_MEMORY;
-pub use ruapc_bufpool::Device as _;
-pub use ruapc_bufpool::Devices as _;
 
 #[cfg(feature = "rdma")]
 pub mod rdma;
-
-/// The TCP registration device and the configured RDMA devices.
-#[cfg(feature = "rdma")]
-pub type Devices = ruapc_bufpool::DeviceSet<rdma::RdmaDevice>;
-
-/// The TCP registration device for stream transports.
-#[cfg(not(feature = "rdma"))]
-pub type Devices = ruapc_bufpool::DeviceSet;

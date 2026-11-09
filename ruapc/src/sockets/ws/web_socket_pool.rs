@@ -16,8 +16,7 @@ use tokio_util::sync::DropGuard;
 
 use super::WebSocket;
 use crate::{
-    BufferPool, ConnectionMap, Devices, Endpoint, Message, RawStream, Socket, SocketPoolConfig,
-    SocketPoolTrait, State, TaskSupervisor,
+    ConnectionMap, Endpoint, Message, RawStream, Socket, State, TaskSupervisor,
     error::{Error, ErrorKind, Result},
     msg::frame::{FrameDecoder, MAX_MSG_SIZE},
     sockets::{connect::ConnectGroups, tcp},
@@ -38,20 +37,16 @@ pub struct WebSocketPool {
     task_supervisor: TaskSupervisor,
 }
 
-impl SocketPoolTrait for WebSocketPool {
-    fn create(
-        _config: &SocketPoolConfig,
-        _devices: &Arc<Devices>,
-        _buffer_pool: &Arc<BufferPool>,
-    ) -> Result<Self> {
-        Ok(Self {
+impl WebSocketPool {
+    pub(crate) fn new() -> Self {
+        Self {
             socket_map: ConnectionMap::default(),
             connect_groups: Default::default(),
             task_supervisor: TaskSupervisor::create(),
-        })
+        }
     }
 
-    async fn handle_new_stream(
+    pub(crate) async fn handle_new_stream(
         &self,
         state: &Arc<State>,
         stream: RawStream,
@@ -71,24 +66,14 @@ impl SocketPoolTrait for WebSocketPool {
         Ok(())
     }
 
-    fn stop(&self) {
-        self.task_supervisor.stop();
-    }
-
-    fn drop_guard(&self) -> DropGuard {
+    pub(crate) fn drop_guard(&self) -> DropGuard {
         self.task_supervisor.drop_guard()
     }
 
-    async fn join(&self) {
+    pub(crate) async fn join(&self) {
         self.task_supervisor.all_stopped().await;
     }
 
-    async fn acquire(&self, endpoint: &Endpoint, state: &Arc<State>) -> Result<Socket> {
-        self.acquire_with_deadline(endpoint, None, state).await
-    }
-}
-
-impl WebSocketPool {
     pub(crate) async fn acquire_with_deadline(
         &self,
         endpoint: &Endpoint,
@@ -320,14 +305,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_web_socket_pool_debug_format() {
-        let config = SocketPoolConfig::default();
-        let devices = Arc::new(Devices::default());
-        let buffer_pool = ruapc_bufpool::BufferPoolBuilder::new(devices.clone()).build();
-        let pool = WebSocketPool::create(&config, &devices, &buffer_pool).unwrap();
+        let pool = WebSocketPool::new();
         let debug = format!("{pool:?}");
         assert!(debug.contains("WebSocketPool"));
-        // Exercise stop / drop_guard / join.
-        pool.stop();
+        // Exercise shutdown through the guard used by the composite pool.
         drop(pool.drop_guard());
         pool.join().await;
     }

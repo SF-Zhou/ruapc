@@ -1,13 +1,11 @@
-use std::sync::Arc;
-
-use ruapc_bufpool::{Buffer, BufferPool, EmptyDevices, RemoteBufferInfo};
+use ruapc_bufpool::{Buffer, BufferPool, RemoteBufferInfo};
 use ruapc_memory::{
     BufferSet, CopyBatch, CopyOp, MAX_COPY_OPS, MAX_REGIONS, MemoryError, MemoryErrorKind,
     ReadSource, RemoteSpace, SpaceLayout,
 };
 
 fn buffers(parts: &[&[u8]]) -> Vec<Buffer> {
-    let pool = BufferPool::new(Arc::new(EmptyDevices));
+    let pool = BufferPool::new(Vec::new());
     parts
         .iter()
         .map(|part| {

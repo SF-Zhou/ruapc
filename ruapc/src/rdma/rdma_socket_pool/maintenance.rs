@@ -85,12 +85,7 @@ impl RdmaSocketPool {
     /// Whether the local NIC of `nic` can no longer carry traffic
     /// (device gone or port not usable, per the refresher's snapshot).
     fn local_nic_dead(&self, nic: &RdmaNicInfo) -> bool {
-        let Some(device) = self
-            .devices
-            .devices()
-            .iter()
-            .find(|d| d.info().name == nic.device)
-        else {
+        let Some(device) = self.devices.iter().find(|d| d.info().name == nic.device) else {
             return true;
         };
         !device
@@ -211,7 +206,6 @@ impl RdmaSocketPool {
         };
         let local_count = |name: &str| -> u64 {
             self.devices
-                .devices()
                 .iter()
                 .enumerate()
                 .find(|(_, device)| device.info().name == name)

@@ -10,7 +10,7 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::{
-    Error, ErrorKind, Message, MsgMeta, Result, SocketTrait, State,
+    Error, ErrorKind, Message, MsgMeta, Result, State,
     msg::{SendMsg, frame::encode},
     sockets::{ChannelConnection, PoolConnection},
 };
@@ -106,8 +106,8 @@ impl hyper::body::Body for ChannelBody {
     }
 }
 
-impl SocketTrait for HttpSocket {
-    async fn send<P: Serialize>(
+impl HttpSocket {
+    pub(crate) async fn send<P: Serialize>(
         &self,
         meta: &mut MsgMeta,
         payload: &P,

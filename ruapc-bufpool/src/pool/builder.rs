@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::buddy::NUM_LEVELS;
-use crate::devices::Devices;
+use crate::registration::MemoryRegistrar;
 use crate::slab::SlabClass;
 
 use super::{BuddyAllocator, BufferPool};
@@ -43,16 +43,15 @@ const DEFAULT_SLAB_EMPTY_WATERMARK: usize = 1;
 /// # Example
 ///
 /// ```rust
-/// use std::sync::Arc;
-/// use ruapc_bufpool::{BufferPoolBuilder, EmptyDevices};
+/// use ruapc_bufpool::BufferPoolBuilder;
 ///
-/// let pool = BufferPoolBuilder::new(Arc::new(EmptyDevices))
+/// let pool = BufferPoolBuilder::new(Vec::new())
 ///     .max_memory(512 * 1024 * 1024)
 ///     .build();
 /// ```
 pub struct BufferPoolBuilder {
     max_memory: usize,
-    devices: Arc<dyn Devices>,
+    registrars: Vec<Arc<dyn MemoryRegistrar>>,
     merge_watermarks: [usize; NUM_LEVELS],
     starvation_timeout: Duration,
     slab_empty_watermark: usize,
@@ -60,14 +59,17 @@ pub struct BufferPoolBuilder {
 }
 
 impl BufferPoolBuilder {
-    /// Creates a new builder with the given devices.
+    /// Creates a builder with the given memory registrars.
     ///
-    /// Each new 64 MiB block will be registered with all devices.
+    /// Each new 64 MiB block is registered in vector order. That position is
+    /// the pool-local index passed to [`crate::Buffer::memory_key`]. An empty
+    /// vector disables registration. Registrars stay alive until all blocks
+    /// have been released.
     #[must_use]
-    pub fn new(devices: Arc<dyn Devices>) -> Self {
+    pub fn new(registrars: Vec<Arc<dyn MemoryRegistrar>>) -> Self {
         Self {
             max_memory: DEFAULT_BUFFER_POOL_MEMORY,
-            devices,
+            registrars,
             merge_watermarks: DEFAULT_MERGE_WATERMARKS,
             starvation_timeout: DEFAULT_STARVATION_TIMEOUT,
             slab_empty_watermark: DEFAULT_SLAB_EMPTY_WATERMARK,
@@ -155,7 +157,6 @@ impl BufferPoolBuilder {
         let inner = BuddyAllocator::new(self.merge_watermarks);
 
         Arc::new(BufferPool {
-            devices: self.devices,
             max_memory: self.max_memory,
             starvation_timeout: self.starvation_timeout,
             slab_empty_watermark: self.slab_empty_watermark,
@@ -165,6 +166,7 @@ impl BufferPoolBuilder {
             slab_classes: std::array::from_fn(|class| Mutex::new(SlabClass::new(class))),
             thread_shards: Mutex::new(Vec::new()),
             inner: Mutex::new(inner),
+            registrars: self.registrars,
         })
     }
 }

@@ -207,12 +207,12 @@ mod tests {
     use ruapc_wire::frame;
     use serde::{Serializer, ser::SerializeSeq};
 
-    use crate::{Devices, Message, MsgFlags};
+    use crate::{Message, MsgFlags};
 
     const INLINE: usize = 16 * 1024;
 
     fn pool() -> Arc<BufferPool> {
-        ruapc_bufpool::BufferPoolBuilder::new(Arc::new(Devices::default())).build()
+        ruapc_bufpool::BufferPoolBuilder::new(Vec::new()).build()
     }
 
     fn message<'a>(
