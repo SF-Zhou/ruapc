@@ -1,9 +1,6 @@
 //! Reverse-RPC requests, handlers and transport execution for remote memory.
 
 #[cfg(feature = "rdma")]
-use std::sync::Arc;
-
-#[cfg(feature = "rdma")]
 use ruapc_memory::ReadSource;
 use ruapc_memory::{CopyBatch, RemoteSpace};
 use schemars::JsonSchema;
@@ -16,15 +13,15 @@ use super::{
 #[cfg(feature = "rdma")]
 use crate::Socket;
 use crate::{
-    Buffer, Client, Context, CopyOp, Error, ErrorKind, RemoteIoError, Result, core::ContextEndpoint,
+    Buffer, Client, Context, CopyOp, Error, ErrorKind, MAX_COPY_OPS, RemoteIoError, Result,
+    core::ContextEndpoint,
 };
 
 /// Request to read byte ranges of the client's read space (TCP/WS/HTTP
 /// fallback of `Context::remote_read`).
 ///
-/// The request ID selects this side's owned source buffers. The peer supplies
-/// logical offsets only; a local reader keeps the source alive through copying,
-/// even if the original request is cancelled at the same time.
+/// The request ID routes logical operations to the original borrowing future,
+/// which copies the bytes synchronously while its source reference is valid.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub(crate) struct ReadInlineRequest {
     /// The validated op batch; response bytes are the op payloads
@@ -88,7 +85,7 @@ pub(crate) struct ReadIntoTargetRequest {
     pub(crate) ops: Vec<CopyOp>,
 }
 
-/// Identifies the original request for post-READ waiter membership validation.
+/// Identifies the original borrowing future for post-READ source validation.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub(crate) struct RequestStatusRequest {
     /// Message ID of the original request.
@@ -99,8 +96,7 @@ pub(crate) struct RequestStatusRequest {
 /// source-request waiter probes.
 #[ruapc_macro::service]
 pub(crate) trait MemoryService {
-    /// Reads the original request's owned source (TCP/WS/HTTP fallback).
-    /// A local `Arc` retains the source throughout the CPU copy.
+    /// Asks the original request future to copy its borrowed source.
     async fn read_inline(
         &self,
         ctx: &Context,
@@ -117,10 +113,9 @@ pub(crate) trait MemoryService {
     /// this operation does not perform a `request_is_pending` postcheck.
     async fn read_into_target(&self, ctx: &Context, req: &ReadIntoTargetRequest) -> Result<()>;
 
-    /// Reports whether the original request remains in this peer's waiter table.
-    ///
-    /// This checks membership, not the deadline clock. [`Context::remote_read`]
-    /// defines how a positive post-READ reply validates the copied bytes.
+    /// Asks the original request future to confirm its source after this READ.
+    /// Waiter membership alone cannot validate a borrowed source: a forgotten
+    /// future leaves its mailbox behind but cannot answer another probe.
     async fn request_is_pending(&self, ctx: &Context, req: &RequestStatusRequest) -> Result<bool>;
 }
 
@@ -130,7 +125,7 @@ impl MemoryService for () {
         ctx: &Context,
         req: &ReadInlineRequest,
     ) -> Result<ReadInlineResponse> {
-        let source = ctx
+        let (source, deadline) = ctx
             .state
             .waiter
             .read_source(req.request_id)
@@ -140,8 +135,16 @@ impl MemoryService for () {
                     "read_inline: original request is gone or has no read buffers".into(),
                 )
             })?;
-        let batch = CopyBatch::new(&req.ops)?;
-        let bytes = source.gather(&batch)?;
+        let deadline = ctx.deadline.map_or(deadline, |parent| parent.min(deadline));
+        // Bound each queued control message before cloning peer-supplied ops.
+        // Full validation and byte access remain in the borrowing future.
+        if req.ops.len() > MAX_COPY_OPS {
+            return Err(Error::new(
+                ErrorKind::InvalidCopyOp,
+                "too many inline read operations".into(),
+            ));
+        }
+        let bytes = source.gather(req.ops.clone(), deadline).await?;
         Ok(ReadInlineResponse { bytes })
     }
 
@@ -209,7 +212,12 @@ impl MemoryService for () {
     }
 
     async fn request_is_pending(&self, ctx: &Context, req: &RequestStatusRequest) -> Result<bool> {
-        Ok(ctx.state.waiter.contains_message_id(req.request_id))
+        let Some((source, deadline)) = ctx.state.waiter.read_source(req.request_id) else {
+            return Ok(false);
+        };
+        let deadline = ctx.deadline.map_or(deadline, |parent| parent.min(deadline));
+        source.validate(deadline).await?;
+        Ok(true)
     }
 }
 
@@ -266,18 +274,18 @@ pub(crate) async fn write_via_read(
         request_id: transfer.ctx.msg_meta.msgid,
         ops: transfer.ops.ops().to_vec(),
     };
-    // Retain the source until the reverse RPC replies after the peer's READs.
-    // Error recovery proves local uniqueness, not remote completion; see
+    // Own the source locally and lend it to the reverse RPC until its reply.
+    // Error recovery does not prove remote completion; see
     // Context::remote_write for the source reuse and result-validity contract.
     let client = Client::default();
-    let mut source = client
-        .with_read_source(Arc::new(ReadSource::from(transfer.local)))
+    let source = client
+        .with_read_source(ReadSource::from(&transfer.local))
         .with_read_charge_bytes(transfer.ops.byte_count());
     let result = source.read_into_target(transfer.ctx, &request).await;
-    let buffers = source.take_read_buffers();
+    let buffers = transfer.local.into_buffers();
     match result {
-        Ok(()) => Ok(buffers),
-        Err(error) => Err(RemoteIoError::new(error, buffers.into_available())),
+        Ok(()) => Ok(BufferAvailability::Available(buffers)),
+        Err(error) => Err(RemoteIoError::new(error, Some(buffers))),
     }
 }
 
@@ -459,13 +467,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_request_is_pending() {
+    async fn oversized_inline_reads_are_rejected_without_polling_the_source() {
+        use crate::remote_memory::read_source_channel;
+
+        let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
+        let (request_id, _response) = ctx.state.waiter.alloc(Duration::from_secs(30));
+        let (sender, _requests) = read_source_channel();
+        ctx.state.waiter.bind_read_source(request_id, sender);
+        let request = ReadInlineRequest {
+            request_id,
+            ops: vec![CopyOp::new(0, 0, 0); MAX_COPY_OPS + 1],
+        };
+        let result = tokio::time::timeout(Duration::from_secs(1), ().read_inline(&ctx, &request))
+            .await
+            .expect("oversized work must fail before entering the source mailbox");
+        assert_eq!(result.unwrap_err().kind, ErrorKind::InvalidCopyOp);
+    }
+
+    #[tokio::test]
+    async fn source_validation_requires_the_original_future_not_just_a_waiter() {
+        use crate::remote_memory::read_source_channel;
+        use ruapc_memory::ReadSource;
+
         let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
         let missing = RequestStatusRequest { request_id: 9999 };
         assert!(!().request_is_pending(&ctx, &missing).await.unwrap());
 
         let (request_id, _rx) = ctx.state.waiter.alloc(Duration::from_secs(1));
         let pending = RequestStatusRequest { request_id };
-        assert!(().request_is_pending(&ctx, &pending).await.unwrap());
+        assert!(!().request_is_pending(&ctx, &pending).await.unwrap());
+
+        let buffer = ctx.state.buffer_pool.allocate(4).unwrap();
+        let source = ReadSource::try_new(std::slice::from_ref(&buffer)).unwrap();
+        let (sender, mut requests) = read_source_channel();
+        ctx.state.waiter.bind_read_source(request_id, sender);
+        assert!(
+            requests
+                .drive(&source, ().request_is_pending(&ctx, &pending))
+                .await
+                .unwrap()
+        );
+        drop(requests);
+        assert_eq!(
+            ().request_is_pending(&ctx, &pending)
+                .await
+                .unwrap_err()
+                .kind,
+            ErrorKind::Timeout
+        );
     }
 }

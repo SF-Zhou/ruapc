@@ -1,6 +1,6 @@
 use clap::Parser;
 use hdrhistogram::Histogram;
-use ruapc::{Buffer, Client, ClientWithBuffers, Context, Endpoint, Error, ErrorKind, Result};
+use ruapc::{Buffer, Client, Context, Endpoint, Error, ErrorKind, Result};
 use ruapc_demo::{
     EchoService, GreetService, MemBenchService, ReadCrcReq, Request, WriteCrcReq,
     app::{PoolOptions, RuntimeOptions, init_tracing},
@@ -111,13 +111,13 @@ enum Rpc {
 // after RuaPC has released their ownership.
 struct Workload<'a> {
     client: &'a Client,
-    operation: Operation<'a>,
+    operation: Operation,
 }
 
-enum Operation<'a> {
+enum Operation {
     Echo(Request),
     Read {
-        source: ClientWithBuffers<'a>,
+        source: Buffer,
         expected_crc: u32,
     },
     Write {
@@ -142,7 +142,7 @@ impl<'a> Workload<'a> {
                 fill_pattern(&mut buffer, seed);
                 let expected_crc = crc32c_of([&buffer]);
                 Operation::Read {
-                    source: client.with_read_buffer(buffer)?,
+                    source: buffer,
                     expected_crc,
                 }
             }
@@ -170,7 +170,11 @@ impl<'a> Workload<'a> {
                 source,
                 expected_crc,
             } => {
-                let crc = source.read_crc(ctx, &ReadCrcReq {}).await?;
+                let crc = self
+                    .client
+                    .with_read_buffer(source)?
+                    .read_crc(ctx, &ReadCrcReq {})
+                    .await?;
                 verify_crc(crc, *expected_crc)
             }
             Operation::Write { buffers, len } => {

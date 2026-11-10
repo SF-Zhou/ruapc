@@ -70,8 +70,8 @@ impl Socket {
 
 impl Socket {
     /// Exports attachment lengths for streams, or registered addresses and keys
-    /// for the RDMA connection's local NIC. Stream copies resolve owned buffers
-    /// through the request waiter and never use addresses or registration keys.
+    /// for the RDMA connection's local NIC. Stream copies use the request's
+    /// source mailbox or owned write target, never addresses or registration keys.
     pub(crate) fn export_regions(&self, buffers: &[Buffer]) -> Result<ThinVec<RemoteBufferInfo>> {
         match self {
             Socket::TCP(_) | Socket::WS(_) | Socket::HTTP(_) => Ok(buffers

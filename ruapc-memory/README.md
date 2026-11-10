@@ -102,11 +102,12 @@ transfer-completion evidence.
 
 ## Immutable sources and runtime integration
 
-`ReadSource::try_new` wraps a checked buffer set with an immutable interface.
-`gather(&CopyBatch)` checks source bounds and reuses the cached layout;
-`buffers()` borrows the source and `into_buffers()` consumes it. Construction
-failure returns the same `BufferSetError` recovery contract. Sources can be
-shared through `Arc<ReadSource>`; recovering owned buffers requires uniqueness.
+`ReadSource::try_new(&[Buffer])` borrows an immutable source slice and caches its
+checked layout. `gather(&CopyBatch)` checks source bounds and reuses that layout;
+`buffers()` returns the borrowed slice. Construction failure returns
+`MemoryError` without taking ownership. `ReadSource::from(&BufferSet)` borrows
+an already checked set and copies its cached layout. Buffer ownership remains
+with the caller, and the borrow prevents mutation while the source is used.
 
 RuaPC keeps write-target checkout, RPC attachments and waiter registration,
 reverse RPCs, deadlines, READ execution and completion witnesses in `ruapc`.

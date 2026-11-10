@@ -52,10 +52,16 @@ Their Rust trait and request types are crate-private.
 | `MemoryService/read_inline` | Original request ID and `CopyOp` batch | `ReadInlineResponse { bytes }` in operation order | TCP/WS/HTTP read; data in response. |
 | `MemoryService/write_inline` | Original request ID, `CopyOp` batch, bytes | `()` | TCP/WS/HTTP write; data in request. |
 | `MemoryService/read_into_target` | Original request ID and `CopyOp` batch; source in `MsgMeta.read_regions` | `()` | Client RDMA-READs server buffers into its pinned target. |
-| `MemoryService/request_is_pending` | Original request ID | `bool` | Post-READ source-request waiter membership check. |
+| `MemoryService/request_is_pending` | Original request ID | `bool` | Post-READ validation serviced by the original borrowing future. |
 
-Inline reads and writes require the original request's retained source or
-write target and valid copy ranges. `read_into_target` additionally requires an
+`request_is_pending` returns `false` when the original request has no source
+route. A routed probe must receive a fresh answer from the borrowing future;
+an expired or unresponsive source returns an RPC error. It is not a general
+waiter-membership query.
+
+Inline reads route to the original request future, which gathers its borrowed
+source during a poll. Inline writes require the original request's retained
+write target. Both validate copy ranges. `read_into_target` additionally requires an
 established RDMA connection and advertised read regions. An ordinary HTTP POST
 cannot supply those RDMA prerequisites; the route reaches the handler, which
 returns an RPC error. Unary HTTP also lacks the reverse-RPC stream used by the
@@ -63,7 +69,7 @@ remote-memory API.
 
 Inline byte fields use MessagePack `bin` encoding. The request layouts and
 validation handlers are in [rpc_transfer.rs](../ruapc/src/remote_memory/rpc_transfer.rs).
-For the meaning of a successful READ, waiter membership, error-buffer contents,
+For the meaning of a successful READ, future-driven validation, error-buffer contents,
 and source recovery, see
 [read validation and recovery](safe-boundaries.md#application-read-source-validation-and-recovery).
 
@@ -144,7 +150,7 @@ method to check that specific connection. It rejects other transports.
 The read-space nonce is a little-endian `u64` and differs from the RPC nonce.
 The caller requires both
 returned values to match; the receiver uses `Context::remote_read`, including
-its post-READ waiter membership check. The method appears in OpenAPI, but a
+its post-READ validation by the original borrowing future. The method appears in OpenAPI, but a
 unary HTTP call returns an RPC error because it has no established RDMA
 connection. The handler and `ProbeReply` are defined in
 [rdma_service.rs](../ruapc/src/rdma/rdma_service.rs);

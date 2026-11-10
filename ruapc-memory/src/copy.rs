@@ -147,10 +147,14 @@ impl<'a> CopyBatch<'a> {
         self.scatter_into_layout(&layout, packed, destination)
     }
 
-    // Only layouts derived from these actual buffers, or owned beside them in
-    // BufferSet, reach these private helpers. No public API accepts a caller's
-    // promise that a separate layout matches mutable buffers.
-    fn gather_from_layout(&self, layout: &SpaceLayout, source: &[Buffer]) -> MemoryResult<Vec<u8>> {
+    // Only layouts derived from these actual buffers, owned in BufferSet, or
+    // held beside an immutable borrow in ReadSource reach these helpers.
+    // No public API accepts a promise that a separate layout matches buffers.
+    pub(crate) fn gather_from_layout(
+        &self,
+        layout: &SpaceLayout,
+        source: &[Buffer],
+    ) -> MemoryResult<Vec<u8>> {
         self.check_source(layout.total())?;
         let mut packed = Vec::with_capacity(usize::try_from(self.byte_count)?);
         for op in self.ops {

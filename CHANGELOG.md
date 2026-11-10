@@ -30,6 +30,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   APIs.
 
 ### Changed
+- **BREAKING**: `with_read_buffer` and `with_read_buffers` on `Client` and
+  `ClientWithBuffers` now borrow `&Buffer` / `&[Buffer]`, validate layouts
+  immediately, and return `Result<_, Error>` using the core RPC error type.
+  Callers retain ownership of read buffers on both success and failure;
+  `ClientWithBuffers::take_read_buffers` is removed. Replacing an attachment
+  consumes the wrapper; validation failure drops it and its previous attachments.
+  The original request future services inline reads and post-READ validation
+  while polled, so forgetting that future cannot authorize new source access or a
+  new positive validation. See the [source contract](docs/safe-boundaries.md#application-read-source-validation-and-recovery).
+- **BREAKING**: `ruapc-memory::ReadSource<'a>` borrows its source buffers.
+  `ReadSource::try_new` takes `&[Buffer]` instead of `Vec<Buffer>` and returns
+  `MemoryError` instead of `BufferSetError` on failure. `ReadSource::into_buffers`
+  is removed, and `From<&BufferSet>` replaces `From<BufferSet>`; callers retain
+  ownership of the borrowed buffers or buffer set.
 - **BREAKING**: `MsgMeta::read_regions` and `write_regions` now use
   `thin_vec::ThinVec<RemoteBufferInfo>` instead of `Vec`, reducing inline
   metadata size. Use `.into()` or iterator `.collect()` when constructing
@@ -43,17 +57,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   result type through static response dispatch, including aliases and custom
   errors. Only the application response is serialized. See the
   [remote-memory guide](docs/remote-memory.md).
-- **BREAKING**: `ClientWithBuffers::take_read_buffers` and `take_write_buffers`
-  return `BufferAvailability` instead of `Option<Vec<Buffer>>`.
+- **BREAKING**: `ClientWithBuffers::take_write_buffers` returns
+  `BufferAvailability` instead of `Option<Vec<Buffer>>`.
   `BufferReply::destinations()` reports this state, and `into_parts()` returns
   `(T, BufferAvailability)`. `NotAttached`, `Available(Vec<Buffer>)` and
   `Unavailable` distinguish missing attachments, recoverable sets (including
   explicitly attached empty sets), and unavailable memory. Transfer success
   is separate from local buffer availability.
-- **BREAKING**: `with_read_buffer` and `with_read_buffers` on `Client` and
-  `ClientWithBuffers` validate attachments immediately and return
-  `Result<_, RemoteIoError>`. Errors retain the supplied buffers; a failed
-  consuming replacement releases the wrapper's previous attachments.
 - **BREAKING**: `RemoteIoError::buffers` and `take_buffers` are renamed to
   `recovered_buffers` and `take_recovered_buffers`; their return types remain
   `Option`.
