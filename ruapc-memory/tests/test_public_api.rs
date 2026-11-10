@@ -189,7 +189,7 @@ fn packed_copy_order_overlap_gaps_and_segmentation_match_for_cached_and_raw_buff
         CopyOp::new(2, 8, 2),
     ];
     let batch = CopyBatch::new(&operations).unwrap();
-    let source = BufferSet::try_new(buffers(&[b"ab", b"", b"cde", b"fgh", b""])).unwrap();
+    let source = BufferSet::new(buffers(&[b"ab", b"", b"cde", b"fgh", b""]));
     let single_source = buffers(&[b"abcdefghMORE"]);
     assert_eq!(source.layout().total(), 8);
     let packed = source.gather(&batch).unwrap();
@@ -198,7 +198,7 @@ fn packed_copy_order_overlap_gaps_and_segmentation_match_for_cached_and_raw_buff
     let source = ReadSource::from(&source);
     assert_eq!(source.gather(&batch).unwrap(), packed);
 
-    let mut destination = BufferSet::try_new(buffers(&[b".", b"", b"...", b"......"])).unwrap();
+    let mut destination = BufferSet::new(buffers(&[b".", b"", b"...", b"......"]));
     destination.scatter(&batch, &packed).unwrap();
     assert_eq!(flatten(destination.buffers()), b"bcde.fghcd");
     let mut single_destination = buffers(&[b"..........++"]);
@@ -211,7 +211,7 @@ fn scatter_rejects_invalid_packed_data_or_bounds_before_any_modification() {
     let operations = [CopyOp::new(0, 0, 2), CopyOp::new(2, 4, 2)];
     let batch = CopyBatch::new(&operations).unwrap();
     for packed in [b"ab".as_slice(), b"abcde"] {
-        let mut destination = BufferSet::try_new(buffers(&[b"111", b"222"])).unwrap();
+        let mut destination = BufferSet::new(buffers(&[b"111", b"222"]));
         assert_eq!(
             destination.scatter(&batch, packed).unwrap_err().kind,
             MemoryErrorKind::InvalidCopyOp
@@ -224,7 +224,7 @@ fn scatter_rejects_invalid_packed_data_or_bounds_before_any_modification() {
         MemoryErrorKind::InvalidCopyOp
     );
     assert_eq!(flatten(&too_small), b"11122");
-    let mut too_small = BufferSet::try_new(too_small).unwrap();
+    let mut too_small = BufferSet::new(too_small);
     assert!(too_small.scatter(&batch, b"abcd").is_err());
     assert_eq!(flatten(too_small.buffers()), b"11122");
 }
@@ -234,7 +234,7 @@ fn empty_copy_batches_still_check_actual_layout_and_packed_length() {
     for operations in [vec![], vec![CopyOp::new(u64::MAX, u64::MAX, 0)]] {
         let batch = CopyBatch::new(&operations).unwrap();
         batch.check_bounds(0, 0).unwrap();
-        let mut empty = BufferSet::try_new(buffers(&[b"", b"", b""])).unwrap();
+        let mut empty = BufferSet::new(buffers(&[b"", b"", b""]));
         assert!(empty.gather(&batch).unwrap().is_empty());
         empty.scatter(&batch, &[]).unwrap();
         assert_eq!(
@@ -248,29 +248,89 @@ fn empty_copy_batches_still_check_actual_layout_and_packed_length() {
 }
 
 #[test]
-fn invalid_owned_layouts_return_every_original_buffer_in_order() {
+fn oversized_local_layouts_are_rejected_on_use_without_access_or_lost_ownership() {
     let original = buffers(&vec![b"data".as_slice(); MAX_REGIONS + 1]);
     let addresses: Vec<_> = original.iter().map(|buffer| buffer.as_ptr()).collect();
-    let failure = ReadSource::try_new(&original).unwrap_err();
-    assert_eq!(failure.kind, MemoryErrorKind::InvalidCopyOp);
-    let failure = BufferSet::try_new(original).unwrap_err();
-    assert_eq!(failure.error.kind, MemoryErrorKind::InvalidCopyOp);
-    assert_eq!(failure.buffers().len(), MAX_REGIONS + 1);
-    let (_, recovered) = failure.into_parts();
+    let total = 4 * (MAX_REGIONS + 1) as u64;
+    let layout = SpaceLayout::from_buffers(&original);
+    let source = ReadSource::new(&original);
+    assert_eq!(layout.total(), total);
+    assert_eq!(source.layout().total(), total);
     assert_eq!(
-        recovered
-            .iter()
-            .map(|buffer| buffer.as_ptr())
-            .collect::<Vec<_>>(),
-        addresses
+        layout.check_region_limit().unwrap_err().kind,
+        MemoryErrorKind::InvalidCopyOp
     );
-    assert!(recovered.iter().all(|buffer| buffer.as_slice() == b"data"));
+    let valid = SpaceLayout::from_lens([total]).unwrap();
+
+    for operations in [
+        vec![],
+        vec![CopyOp::new(u64::MAX, u64::MAX, 0)],
+        vec![CopyOp::new(0, 0, 4)],
+    ] {
+        let batch = CopyBatch::new(&operations).unwrap();
+        for error in [
+            batch.gather(&original).unwrap_err(),
+            source.gather(&batch).unwrap_err(),
+            batch.plan_chunks(&layout, &valid, 1).unwrap_err(),
+            batch.plan_chunks(&valid, &layout, 1).unwrap_err(),
+        ] {
+            assert_eq!(error.kind, MemoryErrorKind::InvalidCopyOp);
+        }
+    }
+    for len in [0, 4] {
+        let mut called = false;
+        let error = layout
+            .for_each_slice::<MemoryError>(0, len, |_, _, _| {
+                called = true;
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(error.kind, MemoryErrorKind::InvalidCopyOp);
+        assert!(!called, "region-limit failure must precede every callback");
+    }
+
+    let mut owned = BufferSet::new(original);
+    assert_eq!(owned.layout().total(), total);
+    for operations in [
+        vec![],
+        vec![CopyOp::new(u64::MAX, u64::MAX, 0)],
+        vec![CopyOp::new(0, 0, 4)],
+    ] {
+        let batch = CopyBatch::new(&operations).unwrap();
+        let packed = vec![b'x'; batch.byte_count() as usize];
+        assert_eq!(
+            owned.gather(&batch).unwrap_err().kind,
+            MemoryErrorKind::InvalidCopyOp
+        );
+        assert_eq!(
+            ReadSource::from(&owned).gather(&batch).unwrap_err().kind,
+            MemoryErrorKind::InvalidCopyOp
+        );
+        assert_eq!(
+            owned.scatter(&batch, &packed).unwrap_err().kind,
+            MemoryErrorKind::InvalidCopyOp
+        );
+        let mut recovered = owned.into_buffers();
+        assert_eq!(
+            batch.scatter(&packed, &mut recovered).unwrap_err().kind,
+            MemoryErrorKind::InvalidCopyOp
+        );
+        assert_eq!(
+            recovered
+                .iter()
+                .map(|buffer| buffer.as_ptr())
+                .collect::<Vec<_>>(),
+            addresses
+        );
+        assert!(recovered.iter().all(|buffer| buffer.as_slice() == b"data"));
+        owned = BufferSet::new(recovered);
+    }
 }
 
 #[test]
 fn read_source_bound_failure_preserves_borrowed_buffers_for_retry() {
     let buffers = buffers(&[b"abcd", b"efgh"]);
-    let source = ReadSource::try_new(&buffers).unwrap();
+    let source = ReadSource::new(&buffers);
     let invalid = [CopyOp::new(7, 0, 2)];
     assert_eq!(
         source

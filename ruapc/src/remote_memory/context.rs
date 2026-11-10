@@ -272,6 +272,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_local_spaces_fail_before_io_and_preserve_all_buffers() {
+        let (ctx, mut queue) = connected_context(MsgMeta {
+            read_regions: [region(4)].into(),
+            write_regions: [region(4)].into(),
+            ..Default::default()
+        });
+        for ops in [
+            vec![],
+            vec![CopyOp::new(u64::MAX, u64::MAX, 0)],
+            vec![CopyOp::new(0, 0, 4)],
+        ] {
+            for write in [false, true] {
+                let buffers: Vec<_> = (0..=crate::MAX_REGIONS)
+                    .map(|_| {
+                        if ops.is_empty() {
+                            return Buffer::empty(&ctx.state.buffer_pool);
+                        }
+                        let mut buffer = ctx.state.buffer_pool.allocate(4).unwrap();
+                        buffer.set_len(4);
+                        buffer.copy_from_slice(b"keep");
+                        buffer
+                    })
+                    .collect();
+                let pointers: Vec<_> = buffers.iter().map(Buffer::as_ptr).collect();
+                let error = if write {
+                    ctx.remote_write(&ops, buffers).await.unwrap_err()
+                } else {
+                    ctx.remote_read(&ops, buffers).await.unwrap_err()
+                };
+                let (error, recovered) = error.into_parts();
+                assert_eq!(error.kind, ErrorKind::InvalidCopyOp);
+                let recovered = recovered.unwrap();
+                assert_eq!(
+                    recovered.iter().map(Buffer::as_ptr).collect::<Vec<_>>(),
+                    pointers
+                );
+                let expected = if ops.is_empty() {
+                    &b""[..]
+                } else {
+                    &b"keep"[..]
+                };
+                assert!(recovered.iter().all(|buffer| buffer.as_slice() == expected));
+            }
+        }
+        assert!(
+            queue.try_recv().is_err(),
+            "invalid spaces must not send RPCs"
+        );
+    }
+
+    #[tokio::test]
     async fn zero_byte_transfers_validate_context_and_batch_without_sending() {
         let disconnected = Context::create(&SocketPoolConfig::default()).unwrap();
         let (missing, mut missing_queue) = connected_context(MsgMeta::default());
@@ -459,7 +510,7 @@ mod tests {
         let mut buffer = ctx.state.buffer_pool.allocate(4).unwrap();
         buffer.set_len(4);
         buffer.copy_from_slice(b"keep");
-        let target = WriteTarget::new(BufferSet::try_new(vec![buffer]).unwrap());
+        let target = WriteTarget::new(BufferSet::new(vec![buffer]));
         let (request_id, _receiver) = ctx.state.waiter.alloc(Duration::from_secs(5));
         ctx.state
             .waiter
@@ -673,7 +724,7 @@ mod timeout_tests {
             };
             let source = buffer(&self.client.state);
             let attached = match operation {
-                Operation::Read => client.with_read_buffer(&source).unwrap(),
+                Operation::Read => client.with_read_buffer(&source),
                 Operation::Write => client.with_write_buffers(vec![buffer(&self.client.state)]),
             };
             // Keep the read source wrapper alive until both observations settle.

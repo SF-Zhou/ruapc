@@ -94,7 +94,6 @@ async fn test_verify_message_id() {
         assert!(
             client
                 .with_read_buffer(&source)
-                .unwrap()
                 .hello(&ctx, &false)
                 .await
                 .unwrap(),
@@ -129,7 +128,7 @@ async fn test_verify_message_id() {
                 max_retries: 0,
                 ..Default::default()
             };
-            let attached = client.with_read_buffer(&source).unwrap();
+            let attached = client.with_read_buffer(&source);
             let mut call = Box::pin(attached.hello(&ctx, &true));
             tokio::time::timeout(TEST_TIMEOUT, async {
                 tokio::select! {

@@ -172,7 +172,7 @@ impl<'a> Workload<'a> {
             } => {
                 let crc = self
                     .client
-                    .with_read_buffer(source)?
+                    .with_read_buffer(source)
                     .read_crc(ctx, &ReadCrcReq {})
                     .await?;
                 verify_crc(crc, *expected_crc)

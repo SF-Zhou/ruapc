@@ -1,7 +1,5 @@
 //! Reverse-RPC requests, handlers and transport execution for remote memory.
 
-#[cfg(feature = "rdma")]
-use ruapc_memory::ReadSource;
 use ruapc_memory::{CopyBatch, RemoteSpace};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -278,10 +276,11 @@ pub(crate) async fn write_via_read(
     // Error recovery does not prove remote completion; see
     // Context::remote_write for the source reuse and result-validity contract.
     let client = Client::default();
-    let source = client
-        .with_read_source(ReadSource::from(&transfer.local))
-        .with_read_charge_bytes(transfer.ops.byte_count());
-    let result = source.read_into_target(transfer.ctx, &request).await;
+    let result = client
+        .with_read_buffers(transfer.local.buffers())
+        .with_read_charge_bytes(transfer.ops.byte_count())
+        .read_into_target(transfer.ctx, &request)
+        .await;
     let buffers = transfer.local.into_buffers();
     match result {
         Ok(()) => Ok(BufferAvailability::Available(buffers)),
@@ -380,7 +379,7 @@ mod tests {
         let (msgid, _rx) = ctx.state.waiter.alloc(Duration::from_secs(5));
         let mut buf = ctx.state.buffer_pool.allocate(64 * 1024).unwrap();
         buf.set_len(8);
-        let target = WriteTarget::new(BufferSet::try_new(vec![buf]).unwrap());
+        let target = WriteTarget::new(BufferSet::new(vec![buf]));
         ctx.state.waiter.bind_write_target(msgid, target);
 
         // Length mismatch between ops and data.
@@ -443,7 +442,7 @@ mod tests {
 
             let mut buffer = ctx.state.buffer_pool.allocate(4).unwrap();
             buffer.set_len(4);
-            let target = WriteTarget::new(BufferSet::try_new(vec![buffer]).unwrap());
+            let target = WriteTarget::new(BufferSet::new(vec![buffer]));
             ctx.state.waiter.bind_write_target(request_id, target);
             assert_eq!(
                 ().read_into_target(&ctx, &request).await.unwrap_err().kind,
@@ -498,7 +497,7 @@ mod tests {
         assert!(!().request_is_pending(&ctx, &pending).await.unwrap());
 
         let buffer = ctx.state.buffer_pool.allocate(4).unwrap();
-        let source = ReadSource::try_new(std::slice::from_ref(&buffer)).unwrap();
+        let source = ReadSource::new(std::slice::from_ref(&buffer));
         let (sender, mut requests) = read_source_channel();
         ctx.state.waiter.bind_read_source(request_id, sender);
         assert!(

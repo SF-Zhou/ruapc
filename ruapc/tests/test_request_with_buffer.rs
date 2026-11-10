@@ -103,7 +103,7 @@ async fn test_upload_with_read_buffer_tcp() {
     let req = UploadReq {};
 
     // Borrow the source in a wrapper that can reuse it across requests.
-    let source = client.with_read_buffer(&buf).unwrap();
+    let source = client.with_read_buffer(&buf);
     let rsp: UploadRsp = source.upload(&ctx, &req).await.unwrap();
     assert_eq!(rsp.data, test_data);
 
@@ -157,7 +157,6 @@ async fn test_upload_with_read_buffer_websocket() {
 
     let rsp: UploadRsp = client
         .with_read_buffer(&buf)
-        .unwrap()
         .upload(&ctx, &req)
         .await
         .unwrap();
@@ -195,7 +194,6 @@ async fn test_upload_with_read_buffer_http() {
 
     let rsp: UploadRsp = client
         .with_read_buffer(&buf)
-        .unwrap()
         .upload(&ctx, &req)
         .await
         .unwrap();

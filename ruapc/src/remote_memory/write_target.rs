@@ -1,4 +1,4 @@
-//! RPC-owned destination checkout around a checked buffer set.
+//! RPC-owned destination checkout around a buffer set with a cached layout.
 
 use std::sync::{Arc, Mutex};
 
@@ -27,7 +27,7 @@ pub(crate) struct WriteTarget {
 }
 
 impl WriteTarget {
-    /// Installs an already checked destination set.
+    /// Installs a destination set; the request validates it before publication.
     pub fn new(buffers: BufferSet) -> Arc<Self> {
         let total_len = buffers.layout().total();
         Arc::new(Self {
@@ -38,6 +38,16 @@ impl WriteTarget {
 
     pub fn total_len(&self) -> u64 {
         self.total_len
+    }
+
+    /// Checks the attached destination space before the request publishes it.
+    pub fn check_region_limit(&self) -> Result<()> {
+        let buffers = self.buffers.lock().unwrap();
+        Ok(buffers
+            .as_ref()
+            .ok_or_else(Self::busy)?
+            .layout()
+            .check_region_limit()?)
     }
 
     /// Exports available destinations for the selected transport while locked.
@@ -137,7 +147,7 @@ mod tests {
         let mut b = pool.allocate(64 * 1024).unwrap();
         a.set_len(4);
         b.set_len(4);
-        let target = WriteTarget::new(BufferSet::try_new(vec![a, b]).unwrap());
+        let target = WriteTarget::new(BufferSet::new(vec![a, b]));
         assert_eq!(target.total_len(), 8);
         target.copy_in(2, b"wxyz").unwrap();
         let buffers = WriteTarget::try_into_buffers(target).unwrap();
@@ -150,7 +160,7 @@ mod tests {
         let pool = pool();
         let mut a = pool.allocate(64 * 1024).unwrap();
         a.set_len(1);
-        let target = WriteTarget::new(BufferSet::try_new(vec![a]).unwrap());
+        let target = WriteTarget::new(BufferSet::new(vec![a]));
         let clone = target.clone();
         assert!(WriteTarget::try_into_buffers(target).is_none());
         assert!(WriteTarget::try_into_buffers(clone).is_some());
@@ -167,7 +177,7 @@ mod tests {
         a.copy_from_slice(b"keep");
         b.copy_from_slice(b"both");
         let pointers = [a.as_ptr(), b.as_ptr()];
-        let target = WriteTarget::new(BufferSet::try_new(vec![a, b]).unwrap());
+        let target = WriteTarget::new(BufferSet::new(vec![a, b]));
         let error = target
             .checkout::<()>(|layout| {
                 assert_eq!(layout.total(), 8);
@@ -189,7 +199,7 @@ mod tests {
         let pool = pool();
         let mut buffer = pool.allocate(64 * 1024).unwrap();
         buffer.set_len(4);
-        let target = WriteTarget::new(BufferSet::try_new(vec![buffer]).unwrap());
+        let target = WriteTarget::new(BufferSet::new(vec![buffer]));
         let (planned_len, buffers) = target.checkout(|layout| Ok(layout.total())).unwrap();
         assert_eq!(planned_len, 4);
         assert_eq!(

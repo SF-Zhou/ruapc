@@ -76,7 +76,6 @@ dst.set_len(4);
 let client = ruapc::Client::default();
 let transfer = client
     .with_read_buffer(&src)
-    .expect("valid source layout")
     .with_write_buffers(vec![dst]);
 let reply: BufferReply<u64> = transfer.copy(&ctx, &()).await?;
 let (total, destinations) = reply.into_parts();
@@ -107,14 +106,21 @@ sources can be recovered; `take_sources()` returns their `BufferAvailability`
 and leaves the receipt usable for `into_reply`. It does not claim that every
 destination byte was filled or bind the write to a particular response value.
 
-Read attachments validate their layout before being installed.
-`with_read_buffer(&Buffer)` and `with_read_buffers(&[Buffer])` return the core
-`Error` on invalid input. They borrow the buffers without taking ownership, so
-there is no read-source recovery method. Replacing a read attachment consumes
-the wrapper and replaces the borrowed list; on validation failure, the wrapper
-and its previous attachments are dropped. The standalone memory crate's
-`ReadSource::try_new` returns `MemoryError`; owned `BufferSet` construction
-continues to return `BufferSetError` with its supplied buffers.
+`with_read_buffer(&Buffer)` and `with_read_buffers(&[Buffer])` return a
+`ClientWithBuffers` directly. They borrow the buffers and cache their logical
+layout; replacing an attachment consumes the wrapper and replaces its borrowed
+source list. The RPC call checks attachment region limits before acquiring a
+connection and reports `InvalidCopyOp` through the method's existing error
+result. The caller still owns its read sources. Attachment-validation failures
+leave owned write attachments recoverable through `take_write_buffers()`.
+
+The standalone memory crate likewise constructs `ReadSource::new(&[Buffer])`,
+`BufferSet::new(Vec<Buffer>)` and `SpaceLayout::from_buffers(&[Buffer])` without
+a construction error. Copying, planning and slice traversal check region limits
+and ranges before accessing bytes, including empty batches. Remote-memory
+transfer preparation performs these checks before I/O and returns supplied
+local buffers in `RemoteIoError` on failure. See the
+[memory crate guide](../ruapc-memory/README.md) for the standalone APIs.
 
 ## Timeouts
 

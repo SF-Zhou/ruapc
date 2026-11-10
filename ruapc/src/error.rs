@@ -1,4 +1,4 @@
-use ruapc_memory::{BufferSetError, MemoryError, MemoryErrorKind};
+use ruapc_memory::{MemoryError, MemoryErrorKind};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -296,13 +296,6 @@ impl From<Error> for RemoteIoError {
             error,
             buffers: None,
         }
-    }
-}
-
-impl From<BufferSetError> for RemoteIoError {
-    fn from(error: BufferSetError) -> Self {
-        let (error, buffers) = error.into_parts();
-        Self::new(error.into(), Some(buffers))
     }
 }
 

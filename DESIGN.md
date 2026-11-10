@@ -83,7 +83,8 @@ See [endpoint identity](docs/endpoints.md) for normalization and caller obligati
 1. Generated methods enter `client/call.rs`. Plain and buffer-returning calls
    use the same executor in `client/request.rs`; the result type selects the
    response contract.
-2. The client validates attachments and acquires a connection for its endpoint.
+2. The call checks attachment region limits before acquiring a connection for
+   its endpoint.
    The transport pool tries the group's equivalent addresses within the
    connection budget, independently of the request retry count.
 3. The response budget starts after connection acquisition and includes
@@ -173,14 +174,19 @@ Client attachments and local buffer lists form logical spaces by concatenating
 buffer lengths. `CopyOp` addresses those spaces independently of segmentation.
 [`ruapc-memory`](ruapc-memory/README.md) validates bounds, overflow, region/op
 limits and destination overlap, then fragments operations at buffer boundaries.
-`SpaceLayout::from_buffers` supplies the common layout constructor for local
-buffers, and the memory crate owns synchronous CPU gather/scatter operations.
+`SpaceLayout::from_buffers`, `BufferSet::new` and `ReadSource::new` construct
+local buffer layouts without returning errors. RPC calls check attachment
+region limits before connection acquisition; copying, planning and slice
+traversal check layouts at their operation boundaries. `RemoteSpace::new` checks
+advertised regions, and `SpaceLayout::from_lens` validates arbitrary segment
+lengths at construction.
+The memory crate owns synchronous CPU gather/scatter operations.
 `CopyBatch` checks operation structure once and caches the required source and
 destination extents. Gather checks the actual source, scatter checks the actual
 destination and packed byte count, and planning checks both real layouts.
 `BufferSet` owns buffers with a cached layout; callers can change buffer lengths
-only by consuming the set. Slice traversal validates its range before invoking
-callbacks. The crate also defines `RemoteSpace` and borrowed `ReadSource` views,
+only by consuming the set. Slice traversal validates the layout and range before
+invoking callbacks. The crate also defines `RemoteSpace` and borrowed `ReadSource` views,
 independently of the RPC runtime, async executors and verbs. `ruapc` re-exports
 the public copy-space types and converts memory errors into RPC errors.
 The RDMA dependency independently validates the owned destination plan before
@@ -211,9 +217,10 @@ handlers and clients. It carries the application response and local destination
 availability; only the application response is serialized. Waiters retain write
 targets and route read operations to the original borrowing request futures.
 Inline writes hold a target's mutex for the complete batch and copy through its
-cached `BufferSet`. Read sources likewise
-cache their validated layouts. The memory crate supplies these synchronous
-operations without its own request registry or completion authority.
+cached `BufferSet`. Read sources likewise cache their logical layouts, whose
+region limits are checked before publication or copying. The memory crate
+supplies these synchronous operations without its own request registry or
+completion authority.
 
 RDMA transfers use READ in both directions: `remote_write` asks the client to
 read the server's source. Application reads ask the original borrowing future to validate after

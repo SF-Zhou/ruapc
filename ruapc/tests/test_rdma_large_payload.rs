@@ -258,7 +258,6 @@ async fn payload_with_attachments(use_msgpack: bool) {
         .collect();
     let wrapper = client
         .with_read_buffers(&sources)
-        .unwrap()
         .with_write_buffers(destinations);
     let (response, buffers) = wrapper
         .exchange_attached(&ctx, &request)

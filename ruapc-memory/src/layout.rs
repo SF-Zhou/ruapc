@@ -39,9 +39,31 @@ impl SpaceLayout {
         Ok(Self { starts })
     }
 
-    /// Builds a layout from the buffers' logical lengths, not their capacities.
-    pub fn from_buffers(buffers: &[Buffer]) -> MemoryResult<Self> {
-        Self::from_lens(buffers.iter().map(|buffer| buffer.len() as u64))
+    /// Builds a layout from actual buffer lengths without imposing a region limit.
+    /// Copy and transfer operations check that limit before using the layout.
+    pub fn from_buffers(buffers: &[Buffer]) -> Self {
+        let mut starts = Vec::with_capacity(buffers.len() + 1);
+        let mut total = 0u64;
+        starts.push(total);
+        for buffer in buffers {
+            // Buffer values exclusively own non-overlapping allocations, and
+            // their lengths cannot exceed those allocations. Their combined
+            // lengths fit the address space, hence u64 on supported targets.
+            total += buffer.len() as u64;
+            starts.push(total);
+        }
+        Self { starts }
+    }
+
+    /// Checks the region-count limit before copying, planning or exporting memory.
+    pub fn check_region_limit(&self) -> MemoryResult<()> {
+        if self.starts.len() > MAX_REGIONS + 1 {
+            return Err(MemoryError::new(
+                MemoryErrorKind::InvalidCopyOp,
+                format!("logical space exceeds {MAX_REGIONS} segments"),
+            ));
+        }
+        Ok(())
     }
 
     /// Total length of the space in bytes.
@@ -68,8 +90,9 @@ impl SpaceLayout {
     /// Invokes `f(segment, offset_in_segment, slice_len)` for every
     /// segment-contiguous slice of `[offset, offset + len)`, in order.
     ///
-    /// Validates the complete range before calling `f`. Empty ranges perform
-    /// no access and permit any offset, matching zero-length [`crate::CopyOp`]s.
+    /// Validates the region limit and complete range before calling `f`. Empty
+    /// ranges still check the region limit, but perform no access and permit
+    /// any offset, matching zero-length [`crate::CopyOp`]s.
     /// Errors from `f` stop iteration immediately and are returned unchanged.
     pub fn for_each_slice<E: From<MemoryError>>(
         &self,
@@ -77,6 +100,7 @@ impl SpaceLayout {
         len: u64,
         f: impl FnMut(usize, u64, u64) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), E> {
+        self.check_region_limit()?;
         if len != 0 && offset.checked_add(len).is_none_or(|end| end > self.total()) {
             return Err(MemoryError::new(
                 MemoryErrorKind::InvalidCopyOp,

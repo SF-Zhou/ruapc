@@ -24,8 +24,12 @@ returns the sum of operation lengths, which can differ from either logical
 space's length. Callers preparing transport work check both spaces before
 submitting it; each receiving peer independently validates incoming operations.
 
-`SpaceLayout::from_buffers` constructs a layout from buffers' logical lengths;
-`from_lens` accepts lengths directly. `CopyBatch::plan_chunks` checks the supplied
+`SpaceLayout::from_buffers` constructs a layout from actual buffers' logical
+lengths without returning an error. Actual buffers own disjoint allocations, so
+their total logical length fits the address space. `from_lens` accepts arbitrary
+`u64` lengths and rejects overflow or too many segments immediately.
+`check_region_limit` checks the limit for a layout built from buffers before it
+is used for a copy or transfer. `CopyBatch::plan_chunks` checks the supplied
 layouts and splits the batch into source-contiguous chunks with a bounded list
 of destination slices. Planning performs no I/O; it allocates only plan metadata.
 
@@ -46,8 +50,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`SpaceLayout::for_each_slice` checks a complete range before invoking its
-callback. `RemoteSpace` validates advertised region counts, address arithmetic
+`SpaceLayout::for_each_slice` checks the region limit and a complete range before
+invoking its callback. `RemoteSpace` validates advertised region counts, address arithmetic
 and logical lengths. It borrows the region descriptions; it does not own remote
 memory or establish access permission, request validity or DMA completion.
 
@@ -60,9 +64,10 @@ operations' destination offsets. It checks the actual destination layout and
 requires exactly `byte_count` packed bytes before changing any destination.
 Source offsets do not index the packed input. Gaps remain unchanged.
 
-`BufferSet::try_new` takes owned buffers and caches their checked layout. Its
-`gather` and `scatter` methods reuse this layout. Buffer lengths cannot be changed
-through a set: `buffers()` exposes immutable buffers and `into_buffers()`
+`BufferSet::new` takes owned buffers and caches their layout without returning an
+error. Its `gather` and `scatter` methods check the region limit and reuse this
+layout. Buffer lengths cannot be changed through a set: `buffers()` exposes
+immutable buffers and `into_buffers()`
 consumes the set to return ownership. Public copy methods never accept a
 caller-supplied promise that a separate layout matches actual buffers.
 
@@ -78,8 +83,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut destination = pool.allocate(4)?;
     destination.set_len(4);
     destination.fill(0);
-    let source = BufferSet::try_new(vec![source])?;
-    let mut destination = BufferSet::try_new(vec![destination])?;
+    let source = BufferSet::new(vec![source]);
+    let mut destination = BufferSet::new(vec![destination]);
 
     let operations = [CopyOp::new(1, 0, 3)];
     let batch = CopyBatch::new(&operations)?;
@@ -95,19 +100,21 @@ A batch can be reused with different buffer segmentations and space lengths as
 long as its ranges fit the actual accessed space. Even an empty batch checks
 actual buffer layouts; scatter still requires an empty packed payload.
 
-If `BufferSet::try_new` fails, `BufferSetError::into_parts()` returns its
-`MemoryError` and every original buffer in original order. Dropping that error
-releases its buffers normally. These are local ownership operations, not
-transfer-completion evidence.
+Constructing a set with more than `MAX_REGIONS` buffers succeeds; copying,
+planning and public slice traversal reject that layout before accessing memory,
+even for an empty batch. A failed scatter leaves every destination unchanged.
+`BufferSet::into_buffers()` returns every original buffer in original order
+regardless of an earlier operation's failure. Local ownership and recovery are
+not transfer-completion evidence.
 
 ## Immutable sources and runtime integration
 
-`ReadSource::try_new(&[Buffer])` borrows an immutable source slice and caches its
-checked layout. `gather(&CopyBatch)` checks source bounds and reuses that layout;
-`buffers()` returns the borrowed slice. Construction failure returns
-`MemoryError` without taking ownership. `ReadSource::from(&BufferSet)` borrows
-an already checked set and copies its cached layout. Buffer ownership remains
-with the caller, and the borrow prevents mutation while the source is used.
+`ReadSource::new(&[Buffer])` borrows an immutable source slice and caches its
+layout without returning an error. `gather(&CopyBatch)` checks the region limit
+and source bounds, then reuses that layout; `buffers()` returns the borrowed
+slice. `ReadSource::from(&BufferSet)` borrows an existing set and copies its
+cached layout. Buffer ownership remains with the caller, and the borrow prevents
+mutation while the source is used.
 
 RuaPC keeps write-target checkout, RPC attachments and waiter registration,
 reverse RPCs, deadlines, READ execution and completion witnesses in `ruapc`.
@@ -124,7 +131,7 @@ cargo test -p ruapc-memory
 ```
 
 Tests cover structural and actual-space checks, overflow, overlap, planning,
-packed copies, immutable layouts and construction-failure recovery without RDMA
+packed copies, immutable layouts and operation-failure recovery without RDMA
 libraries or a device. See
 [Contributing](https://github.com/SF-Zhou/ruapc/blob/main/CONTRIBUTING.md) for
 workspace checks and transport tests.

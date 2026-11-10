@@ -630,7 +630,6 @@ async fn run_roundtrip_test(scheme: &str) {
 
     let (written, buffers) = client
         .with_read_buffer(&src)
-        .unwrap()
         .with_write_buffers(vec![dst])
         .echo_reversed(&ctx, &EchoReq {})
         .await
