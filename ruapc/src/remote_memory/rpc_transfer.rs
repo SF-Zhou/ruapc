@@ -408,9 +408,7 @@ mod tests {
         };
         ().write_inline(&ctx, &req).await.unwrap();
         let target = ctx.state.waiter.write_target(msgid).unwrap();
-        // The waiter entry still holds a clone, so unwrapping fails here —
-        // which is exactly the pinning behavior we want.
-        assert!(WriteTarget::try_into_buffers(target).is_none());
+        assert_eq!(&target.seal(None).await.unwrap()[0][2..6], b"data");
     }
 
     #[tokio::test]

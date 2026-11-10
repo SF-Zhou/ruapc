@@ -153,7 +153,7 @@ below.
 | Resource | Lifetime and recovery |
 |---|---|
 | Read attachments | Borrowed and immutable; reusable across calls. Attaching a new list replaces the old one. `read_buffers()` exposes the borrowed list. The caller retains ownership and can mutate or release sources once their borrow ends. |
-| Write attachments | Consumed by the next call. `BufferReply::destinations()` reports the set's availability; `into_parts()` recovers the response and that state. Plain results do not return destinations. After failure, `take_write_buffers()` reports any recoverable set. |
+| Write attachments | Consumed by the next call. A successful `BufferReply` reports the set's availability through `destinations()`, and `into_parts()` recovers the response and that state. After an error or a successful plain result, `take_write_buffers()` reports it instead; an available set left in the wrapper is attached again by that wrapper's next call. |
 | Handler buffers | `remote_read` returns its destinations; `remote_write` returns a `WriteReceipt` with separate source availability. `RemoteIoError::recovered_buffers()` and `take_recovered_buffers()` expose any recoverable buffers on failure; converting the error with `?` to `Error` drops them. |
 
 `BufferAvailability` distinguishes `NotAttached`, `Available(Vec<Buffer>)` and
@@ -164,10 +164,63 @@ unavailable response, write-attachment state or receipt is not a handle that
 can later recover buffers. Read sources are borrowed separately and never enter
 this recovery state machine.
 
-Posted READ destinations remain owned until completion or successful QP
-destruction. Cancellation or failure can make recovery unavailable even after
-the QP eventually recycles the memory. Recovered error buffers are reusable,
-but their readable contents must not be treated as a successful transfer result.
+When a call ends, with any result, the client seals its write target: a
+reverse handler that still holds the target can no longer write, and a set
+that no READ owns is returned as `Available`. Posted READ destinations remain
+owned until completion or successful QP destruction. If a READ still owns the
+set at that point, the call reports `Unavailable` and the QP later recycles
+the memory into the pool. Recovered error buffers are reusable, but their
+readable contents must not be treated as a successful transfer result.
+
+### Wait for write destinations
+
+Enable `ClientWithBuffers::wait_for_write_buffers(grace)` when a call must
+also wait for a READ that still owns its write destinations:
+
+```rust,ignore
+let transfer = client
+    .with_write_buffers(destinations)
+    .wait_for_write_buffers(std::time::Duration::from_millis(100));
+match transfer.copy(&ctx, &()).await {
+    Ok(reply) => {
+        let (response, destinations) = reply.into_parts();
+        let buffers = destinations.into_available().expect("attached destinations returned");
+        // Use the response and completed destination buffers.
+    }
+    Err(error) => {
+        let buffers = transfer.take_write_buffers().into_available()
+            .expect("attached destinations returned even on error");
+        // Reuse these buffers; their contents are not a successful transfer result.
+    }
+}
+```
+
+This option only adds waiting; sealing and the return paths are those of every
+call. It covers every RPC result, including success, application errors,
+timeouts and connection failures. The READ returns the complete destination
+set once it settles, whether it succeeded or failed. If the set remains
+unavailable after `grace`, the client closes the connection (and its QP) that
+is executing that READ and continues waiting without a time limit. Zero grace
+requests closure immediately when buffers remain unavailable. Closing a shared
+connection also fails its other pending requests. Existing connection failures
+and the READ watchdog may close it sooner.
+
+The original RPC result is preserved, and an attached set, including an empty
+one, is always `Available` when the call returns. Without an attachment,
+availability remains `NotAttached`.
+
+The grace period starts during recovery after the RPC ends; it does not extend
+the request's execution or source-validation deadline. Recovery can therefore
+make the call outlive its RPC deadline indefinitely. QP closure alone does not
+release buffers: all posted READs must settle through CQ-issued completions,
+or provider QP destruction must succeed. Dropping or forgetting the request
+future does not promise buffers back to the wrapper, and still cannot release
+posted memory early.
+
+This option applies to owned write destinations. Borrowed read attachments
+retain their separate source-validation contract below.
+
+### Read-source validation
 
 Application RDMA reads validate the source request after READ completion. The
 original borrowing future must be polled to answer the probe or service an

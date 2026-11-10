@@ -202,6 +202,63 @@ impl Future for ReadCompletion {
     }
 }
 
+/// Runtime-independent status of a recoverable READ plan.
+///
+/// A failure can be reported before DMA settles. Destination ownership is
+/// returned separately through [`ReadRecovery`], even if this future is dropped.
+#[derive(Debug)]
+pub struct ReadStatus(ReadCompletion);
+
+impl ReadStatus {
+    /// Takes a ready status without waiting. `None` means it is still pending.
+    pub fn try_recv(&mut self) -> Option<std::result::Result<(), ReadFailure>> {
+        self.0.try_recv().map(|result| result.map(drop))
+    }
+}
+
+impl Future for ReadStatus {
+    type Output = std::result::Result<(), ReadFailure>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.0)
+            .poll(cx)
+            .map(|result| result.map(drop))
+    }
+}
+
+/// Exclusive destination recovery for a recoverable READ plan.
+///
+/// This future returns the complete original vector only after every posted
+/// READ has CQ-issued completion evidence or provider QP destruction succeeds,
+/// and the posting cursor has accounted for its unposted suffix. Failure,
+/// timeout, ERR state and dropping [`ReadStatus`] cannot complete this future.
+/// Recovery permits buffer reuse, not acceptance as a valid transfer result.
+/// Waiting has no time limit; leaking a posting cursor or observation can retain
+/// the batch indefinitely. Dropping this future preserves all DMA holds.
+#[derive(Debug)]
+pub struct ReadRecovery {
+    receiver: oneshot::Receiver<Vec<Buffer>>,
+}
+
+impl ReadRecovery {
+    /// Takes settled buffers without waiting. `None` means they remain held.
+    pub fn try_recv(&mut self) -> Option<Vec<Buffer>> {
+        self.receiver
+            .try_recv()
+            .expect("READ recovery producer always returns its buffers")
+    }
+}
+
+impl Future for ReadRecovery {
+    type Output = Vec<Buffer>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.receiver)
+            .poll(cx)
+            .map(|result| result.expect("READ recovery producer always returns its buffers"))
+    }
+}
+
 /// A weak observer and failure notifier for one READ plan.
 ///
 /// The handle neither owns destination buffers nor grants completion authority.
@@ -299,6 +356,8 @@ impl ReadPosting {
 
     /// Recovers buffers only if no request reached the NIC. Otherwise the QP
     /// retains them through completion or destruction, even without a receiver.
+    /// Recoverable plans always return their buffers through [`ReadRecovery`],
+    /// including cancellation before posting; this method returns `None` then.
     pub fn cancel(mut self) -> Option<Vec<Buffer>> {
         if self.next == 0 {
             self.next = self.reads.len();
@@ -329,23 +388,53 @@ impl Drop for ReadPosting {
 pub(super) struct ReadBatch {
     /// WRs not yet settled by completion or unposted cancellation.
     remaining: AtomicUsize,
-    total: usize,
     failed: AtomicBool,
     inner: Mutex<ReadBatchInner>,
     /// WRs the provider accepted. Written only by the posting cursor.
     accepted: AtomicUsize,
     /// Unposted suffix settled by the cursor, never concurrently with acceptance.
     aborted: AtomicUsize,
+    total: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct ReadBatchInner {
     buffers: Option<Vec<Buffer>>,
+    /// Publishes the result once; a failure can take it before settlement.
     tx: Option<oneshot::Sender<std::result::Result<Vec<Buffer>, ReadFailure>>>,
+    /// Recoverable plans return their settled buffers here on every outcome,
+    /// so their successful result carries none.
+    recovery: Option<oneshot::Sender<Vec<Buffer>>>,
+}
+
+impl ReadBatchInner {
+    /// Hands out the buffers and the result of a batch that DMA can no longer
+    /// reach. The caller takes the state first and calls this without the lock.
+    fn settle(self, status: std::result::Result<(), ReadFailure>) {
+        let Self {
+            mut buffers,
+            tx,
+            recovery,
+        } = self;
+        if let (Some(recovery), Some(buffers)) = (recovery, buffers.as_mut()) {
+            // Recovery precedes the result: a successful status implies that
+            // the buffers can already be received. A dropped receiver frees them.
+            let _ = recovery.send(std::mem::take(buffers));
+        }
+        // An unsuccessful plan releases buffers nobody recovers before notifying.
+        let result = status.and_then(|()| buffers.ok_or(ReadFailure::Cancelled));
+        if let Some(tx) = tx {
+            let _ = tx.send(result);
+        }
+    }
 }
 
 impl ReadBatch {
-    fn new(count: usize, buffers: Vec<Buffer>) -> (Arc<Self>, ReadCompletion) {
+    fn new(
+        count: usize,
+        buffers: Vec<Buffer>,
+        recovery: Option<oneshot::Sender<Vec<Buffer>>>,
+    ) -> (Arc<Self>, ReadCompletion) {
         let (tx, receiver) = oneshot::channel();
         let batch = Arc::new(Self {
             total: count,
@@ -356,6 +445,7 @@ impl ReadBatch {
             inner: Mutex::new(ReadBatchInner {
                 buffers: Some(buffers),
                 tx: Some(tx),
+                recovery,
             }),
         });
         if count == 0 {
@@ -415,19 +505,13 @@ impl ReadBatch {
     }
 
     fn finish(&self) {
-        let (buffers, tx) = {
-            let mut inner = self.inner.lock().unwrap();
-            (inner.buffers.take(), inner.tx.take())
-        };
-        let result = if self.failed.load(Ordering::Acquire) {
-            drop(buffers);
+        let status = if self.failed.load(Ordering::Acquire) {
             Err(ReadFailure::Completion)
         } else {
-            buffers.ok_or(ReadFailure::Cancelled)
+            Ok(())
         };
-        if let Some(tx) = tx {
-            let _ = tx.send(result);
-        }
+        let inner = std::mem::take(&mut *self.inner.lock().unwrap());
+        inner.settle(status);
     }
 
     fn fail(&self, reason: ReadFailure) -> bool {
@@ -444,12 +528,31 @@ impl ReadBatch {
         // The cursor proves no WR reached the provider, so no completion can
         // race this settlement. Existing observers must also see cancellation.
         self.remaining.store(0, Ordering::Release);
-        let (buffers, tx) = {
-            let mut inner = self.inner.lock().unwrap();
-            (inner.buffers.take(), inner.tx.take())
-        };
-        drop(tx);
-        buffers
+        let mut inner = std::mem::take(&mut *self.inner.lock().unwrap());
+        if inner.recovery.is_some() {
+            inner.settle(Err(ReadFailure::Cancelled));
+            None
+        } else {
+            // Dropping the sender reports the cancellation.
+            inner.buffers.take()
+        }
+    }
+}
+
+impl Drop for ReadBatch {
+    fn drop(&mut self) {
+        // Every posted WR owns a ledger reference until its authentic CQE or
+        // provider QP destruction. Final-owner drop therefore also proves that
+        // the NIC can no longer access these destinations, even if no flush
+        // CQE arrived. A live posting cursor or observation delays this path.
+        let inner = self
+            .inner
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A batch that already finished has handed out its buffers.
+        if inner.buffers.is_some() {
+            std::mem::take(inner).settle(Err(ReadFailure::Cancelled));
+        }
     }
 }
 
@@ -562,13 +665,40 @@ impl QueuePair {
         buffers: Vec<Buffer>,
         requests: Vec<ReadRequest>,
     ) -> std::result::Result<(ReadPosting, ReadCompletion), (Error, Vec<Buffer>)> {
+        self.prepare_plan(buffers, requests, None)
+    }
+
+    /// Prepares an owned READ plan with separate status and buffer recovery.
+    ///
+    /// Validation errors return the complete vector without posting. For a
+    /// prepared plan, [`ReadStatus`] reports success or early failure, while
+    /// [`ReadRecovery`] always returns the original buffers after DMA settles,
+    /// including failed and cancelled plans. Dropping either receiver never
+    /// releases posted memory early. The higher layer owns timeout and
+    /// connection-closing policy; recovery itself has no deadline.
+    pub fn prepare_recoverable_reads(
+        &self,
+        buffers: Vec<Buffer>,
+        requests: Vec<ReadRequest>,
+    ) -> std::result::Result<(ReadPosting, ReadStatus, ReadRecovery), (Error, Vec<Buffer>)> {
+        let (recovery, receiver) = oneshot::channel();
+        let (posting, completion) = self.prepare_plan(buffers, requests, Some(recovery))?;
+        Ok((posting, ReadStatus(completion), ReadRecovery { receiver }))
+    }
+
+    fn prepare_plan(
+        &self,
+        buffers: Vec<Buffer>,
+        requests: Vec<ReadRequest>,
+        recovery: Option<oneshot::Sender<Vec<Buffer>>>,
+    ) -> std::result::Result<(ReadPosting, ReadCompletion), (Error, Vec<Buffer>)> {
         let (reads, sges) = match prepare(&buffers, requests, self.gather_limit(), |buffer| {
             self.lkey(buffer)
         }) {
             Ok(prepared) => prepared,
             Err(error) => return Err((error, buffers)),
         };
-        let (batch, receiver) = ReadBatch::new(reads.len(), buffers);
+        let (batch, completion) = ReadBatch::new(reads.len(), buffers, recovery);
         Ok((
             ReadPosting {
                 owner: self.read_state.owner,
@@ -577,7 +707,7 @@ impl QueuePair {
                 next: 0,
                 batch,
             },
-            receiver,
+            completion,
         ))
     }
 
@@ -669,6 +799,15 @@ mod tests {
         (vec![buffer], Arc::downgrade(&pool))
     }
 
+    fn recoverable(
+        count: usize,
+        buffers: Vec<Buffer>,
+    ) -> (Arc<ReadBatch>, ReadStatus, ReadRecovery) {
+        let (recovery, receiver) = oneshot::channel();
+        let (batch, completion) = ReadBatch::new(count, buffers, Some(recovery));
+        (batch, ReadStatus(completion), ReadRecovery { receiver })
+    }
+
     fn request(buffer: usize, offset: usize, len: usize) -> ReadRequest {
         ReadRequest {
             remote_addr: 1024,
@@ -730,7 +869,7 @@ mod tests {
     #[test]
     fn only_last_completion_returns_owned_memory() {
         let (buffers, lifetime) = buffers();
-        let (batch, mut rx) = ReadBatch::new(2, buffers);
+        let (batch, mut rx) = ReadBatch::new(2, buffers, None);
         batch.complete_one(true);
         assert!(rx.try_recv().is_none());
         assert!(lifetime.upgrade().is_some());
@@ -744,7 +883,7 @@ mod tests {
     #[test]
     fn failure_notifies_once_and_holds_memory_through_flush() {
         let (buffers, lifetime) = buffers();
-        let (batch, mut rx) = ReadBatch::new(2, buffers);
+        let (batch, mut rx) = ReadBatch::new(2, buffers, None);
         let handle = ReadHandle(Arc::downgrade(&batch));
         assert!(handle.fail(ReadFailure::Timeout));
         assert!(!handle.fail(ReadFailure::ConnectionClosed));
@@ -759,7 +898,7 @@ mod tests {
     #[test]
     fn cancelled_poster_accounts_the_unposted_suffix() {
         let (buffers, lifetime) = buffers();
-        let (batch, mut rx) = ReadBatch::new(3, buffers);
+        let (batch, mut rx) = ReadBatch::new(3, buffers, None);
         let reads = (0..3)
             .map(|_| PreparedRead {
                 remote_addr: 0,
@@ -791,7 +930,7 @@ mod tests {
     #[test]
     fn partial_failure_after_early_completions_settles_once() {
         let (buffers, lifetime) = buffers();
-        let (batch, mut rx) = ReadBatch::new(3, buffers);
+        let (batch, mut rx) = ReadBatch::new(3, buffers, None);
         batch.complete_one(true);
         batch.complete_one(true);
         assert!(rx.try_recv().is_none());
@@ -803,7 +942,7 @@ mod tests {
     #[test]
     fn dropped_receiver_cannot_release_inflight_memory() {
         let (buffers, lifetime) = buffers();
-        let (batch, rx) = ReadBatch::new(1, buffers);
+        let (batch, rx) = ReadBatch::new(1, buffers, None);
         drop(rx);
         assert!(lifetime.upgrade().is_some());
         batch.complete_one(true);
@@ -811,11 +950,164 @@ mod tests {
     }
 
     #[test]
+    fn recoverable_success_returns_buffers_only_through_recovery() {
+        let (buffers, lifetime) = buffers();
+        let address = buffers[0].as_ptr();
+        let (batch, mut status, mut recovery) = recoverable(2, buffers);
+        batch.complete_one(true);
+        assert!(status.try_recv().is_none());
+        assert!(recovery.try_recv().is_none());
+        batch.complete_one(true);
+        assert_eq!(status.try_recv(), Some(Ok(())));
+        let returned = recovery.try_recv().unwrap();
+        assert_eq!(returned[0].as_ptr(), address);
+        drop(batch);
+        assert!(lifetime.upgrade().is_some());
+        drop(returned);
+        assert!(lifetime.upgrade().is_none());
+    }
+
+    #[test]
+    fn recoverable_failure_preserves_buffers_until_all_flushes_settle() {
+        for reason in [
+            ReadFailure::Timeout,
+            ReadFailure::RequestTimeout,
+            ReadFailure::ConnectionClosed,
+        ] {
+            let (buffers, lifetime) = buffers();
+            let address = buffers[0].as_ptr();
+            let (batch, mut status, mut recovery) = recoverable(2, buffers);
+            assert!(batch.fail(reason));
+            assert_eq!(status.try_recv(), Some(Err(reason)));
+            assert!(recovery.try_recv().is_none());
+            batch.complete_one(false);
+            assert!(recovery.try_recv().is_none());
+            assert!(lifetime.upgrade().is_some());
+            batch.complete_one(false);
+            let returned = recovery.try_recv().unwrap();
+            assert_eq!(returned[0].as_ptr(), address);
+            drop(returned);
+            assert!(lifetime.upgrade().is_none());
+        }
+    }
+
+    #[test]
+    fn recoverable_completion_error_and_dropped_status_keep_destinations() {
+        for discard_status in [false, true] {
+            let (buffers, lifetime) = buffers();
+            let (batch, mut status, mut recovery) = recoverable(1, buffers);
+            if discard_status {
+                status.0.receiver.close();
+            }
+            batch.complete_one(false);
+            if !discard_status {
+                assert_eq!(status.try_recv(), Some(Err(ReadFailure::Completion)));
+            }
+            let returned = recovery.try_recv().unwrap();
+            assert_eq!(returned[0].len(), 16);
+            drop(returned);
+            assert!(lifetime.upgrade().is_none());
+        }
+    }
+
+    #[test]
+    fn recoverable_cancel_before_posting_uses_the_recovery_receiver() {
+        let (buffers, lifetime) = buffers();
+        let (batch, mut status, mut recovery) = recoverable(1, buffers);
+        let posting = ReadPosting {
+            owner: 1,
+            reads: vec![PreparedRead {
+                remote_addr: 0,
+                rkey: 0,
+                sge_start: 0,
+                sge_end: 0,
+            }],
+            sges: Vec::new(),
+            next: 0,
+            batch,
+        };
+        assert!(posting.cancel().is_none());
+        assert_eq!(status.try_recv(), Some(Err(ReadFailure::Cancelled)));
+        let returned = recovery.try_recv().unwrap();
+        assert_eq!(returned[0].len(), 16);
+        drop(returned);
+        assert!(lifetime.upgrade().is_none());
+    }
+
+    #[test]
+    fn recoverable_partial_post_waits_for_posted_work_after_suffix_cancellation() {
+        let (buffers, lifetime) = buffers();
+        let (batch, status, mut recovery) = recoverable(3, buffers);
+        let posting = ReadPosting {
+            owner: 1,
+            reads: (0..3)
+                .map(|_| PreparedRead {
+                    remote_addr: 0,
+                    rkey: 0,
+                    sge_start: 0,
+                    sge_end: 0,
+                })
+                .collect(),
+            sges: Vec::new(),
+            next: 1,
+            batch: batch.clone(),
+        };
+        batch.mark_accepted(1);
+        drop(status);
+        drop(posting);
+        assert!(recovery.try_recv().is_none());
+        assert!(lifetime.upgrade().is_some());
+        batch.complete_one(true);
+        assert_eq!(recovery.try_recv().unwrap()[0].len(), 16);
+        assert!(lifetime.upgrade().is_none());
+    }
+
+    #[test]
+    fn recoverable_final_owner_drop_returns_buffers_without_flush_completions() {
+        let (buffers, lifetime) = buffers();
+        let (batch, mut status, mut recovery) = recoverable(1, buffers);
+        // A real QP releases its ledger only after provider destruction. Keep
+        // an observation alive to exercise delayed final ownership release.
+        let ledger = ReadState::new(4);
+        ledger.insert(0, batch.clone());
+        let observation = ReadHandle(Arc::downgrade(&batch)).observe().unwrap();
+        drop(batch);
+        assert!(recovery.try_recv().is_none());
+        drop(ledger);
+        assert!(recovery.try_recv().is_none());
+        drop(observation);
+        assert_eq!(status.try_recv(), Some(Err(ReadFailure::Cancelled)));
+        let returned = recovery.try_recv().unwrap();
+        assert_eq!(returned[0].len(), 16);
+        drop(returned);
+        assert!(lifetime.upgrade().is_none());
+    }
+
+    #[test]
+    fn dropping_both_recoverable_receivers_preserves_inflight_memory() {
+        let (buffers, lifetime) = buffers();
+        let (batch, status, recovery) = recoverable(1, buffers);
+        drop(status);
+        drop(recovery);
+        assert!(lifetime.upgrade().is_some());
+        batch.complete_one(false);
+        assert!(lifetime.upgrade().is_none());
+    }
+
+    #[test]
+    fn empty_recoverable_plan_returns_the_complete_destination_vector() {
+        let (buffers, _) = buffers();
+        let (_batch, mut status, mut recovery) = recoverable(0, buffers);
+        assert_eq!(status.try_recv(), Some(Ok(())));
+        assert_eq!(recovery.try_recv().unwrap()[0].len(), 16);
+    }
+
+    #[test]
     fn ledger_spills_colliding_sequences_without_losing_ownership() {
         let (buffers_a, lifetime_a) = buffers();
         let (buffers_b, lifetime_b) = buffers();
-        let (batch_a, _rx_a) = ReadBatch::new(1, buffers_a);
-        let (batch_b, _rx_b) = ReadBatch::new(1, buffers_b);
+        let (batch_a, _rx_a) = ReadBatch::new(1, buffers_a, None);
+        let (batch_b, _rx_b) = ReadBatch::new(1, buffers_b, None);
         let state = ReadState::new(64);
         let capacity = SlotTable::<Arc<ReadBatch>>::new(64).capacity() as u64;
         assert!(state.insert(0, batch_a.clone()));
@@ -838,7 +1130,7 @@ mod tests {
     #[test]
     fn handle_observes_only_provider_accepted_work_as_in_flight() {
         let (buffers, _) = buffers();
-        let (batch, _rx) = ReadBatch::new(2, buffers);
+        let (batch, _rx) = ReadBatch::new(2, buffers, None);
         let handle = ReadHandle(Arc::downgrade(&batch));
         assert!(handle.is_pending());
         assert!(!handle.has_in_flight());
@@ -865,7 +1157,7 @@ mod tests {
             }
         }
         let (buffers, lifetime) = buffers();
-        let (batch, mut rx) = ReadBatch::new(1, buffers);
+        let (batch, mut rx) = ReadBatch::new(1, buffers, None);
         let handle = ReadHandle(Arc::downgrade(&batch));
         let counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
         let waker = Waker::from(counter.clone());
@@ -901,7 +1193,7 @@ mod tests {
     #[test]
     fn unposted_cancel_recovers_memory_and_closes_receiver() {
         let (buffers, lifetime) = buffers();
-        let (batch, mut rx) = ReadBatch::new(1, buffers);
+        let (batch, mut rx) = ReadBatch::new(1, buffers, None);
         let posting = ReadPosting {
             owner: 1,
             reads: vec![PreparedRead {

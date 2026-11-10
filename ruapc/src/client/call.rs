@@ -27,7 +27,8 @@ impl RawCall for Client {
         &self,
         ctx: &Context,
         req: &Req,
-        slot: Option<&mut BufferAvailability>,
+        // Without attached write buffers the slot stays `NotAttached`.
+        _slot: Option<&mut BufferAvailability>,
         method_name: &str,
     ) -> Result<Rsp, E>
     where
@@ -35,15 +36,8 @@ impl RawCall for Client {
         Rsp: for<'c> Deserialize<'c> + JsonSchema,
         E: std::error::Error + From<Error> + for<'c> Deserialize<'c>,
     {
-        self.ruapc_request(
-            ctx,
-            req,
-            ReadAttachment::new(None, None),
-            &mut None,
-            slot,
-            method_name,
-        )
-        .await
+        self.ruapc_request(ctx, req, ReadAttachment::new(None, None), None, method_name)
+            .await
     }
 }
 

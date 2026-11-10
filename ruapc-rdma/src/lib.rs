@@ -64,7 +64,8 @@ pub use verbs::{
     ActiveDevice, CompChannel, CompletedWork, Completion, CompletionBatch, CompletionCursor,
     CompletionIdentity, CompletionQueue, Completions, Context, Device, DeviceList, MAX_GATHER_SGE,
     MemoryRegion, ProtectionDomain, QpConnectionConfig, QpRegistryStats, QueuePair, ReadCompletion,
-    ReadFailure, ReadHandle, ReadObservation, ReadPosting, ReadRequest, ReadSegment, WrBuffers,
+    ReadFailure, ReadHandle, ReadObservation, ReadPosting, ReadRecovery, ReadRequest, ReadSegment,
+    ReadStatus, WrBuffers,
 };
 
 /// Internal ownership components used by the standalone benchmarks.

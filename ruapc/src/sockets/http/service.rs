@@ -164,7 +164,7 @@ impl HttpService {
         let socket = Socket::HTTP(HttpSocket::ForResponse(msgid));
         state.handle_recv(&socket, msg)?;
 
-        let (msg, _write_buffer) = rx
+        let msg = rx
             .recv()
             .await
             .map_err(|e| Error::new(ErrorKind::HttpWaitRspFailed, e.to_string()))?;

@@ -515,7 +515,8 @@ mod tests {
         ctx.state
             .waiter
             .bind_write_target(request_id, target.clone());
-        let ((), checked_out) = target.checkout(|_| Ok(())).unwrap();
+        // Sealing makes the buffers as unavailable as a READ that owns them.
+        let taken = target.seal(None).await.unwrap();
 
         let empty = CopyBatch::new(&[]).unwrap();
         target.copy_inline(&empty, &[]).unwrap();
@@ -546,9 +547,7 @@ mod tests {
                 expected
             );
         }
-        assert_eq!(checked_out.buffers()[0].as_slice(), b"keep");
-        target.restore(checked_out);
-        target.copy_inline(&zeros, &[]).unwrap();
+        assert_eq!(taken[0].as_slice(), b"keep");
     }
 }
 

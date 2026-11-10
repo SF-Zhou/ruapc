@@ -2,7 +2,8 @@ use std::{os::raw::c_int, ptr, sync::Arc};
 
 mod read;
 pub use read::{
-    ReadCompletion, ReadFailure, ReadHandle, ReadObservation, ReadPosting, ReadRequest, ReadSegment,
+    ReadCompletion, ReadFailure, ReadHandle, ReadObservation, ReadPosting, ReadRecovery,
+    ReadRequest, ReadSegment, ReadStatus,
 };
 
 #[cfg(feature = "bench-internals")]
@@ -863,8 +864,124 @@ mod completion_tests {
     use super::*;
     use crate::{
         CompletionBatch, GidType, MemoryRegion, ibv_access_flags, ibv_qp_cap, ibv_qp_init_attr,
-        ibv_qp_type, ibv_send_flags, test_utils::open_device,
+        ibv_qp_state, ibv_qp_type, ibv_send_flags, test_utils::open_device,
     };
+
+    #[test]
+    fn recoverable_read_requires_real_completion_or_provider_destruction_after_error() {
+        for poll_completion in [true, false] {
+            let device = Arc::new(open_device());
+            let pool = BufferPoolBuilder::new(vec![device.clone()]).build();
+            // Sources outlive both QPs on success and assertion unwinding.
+            let mut source = pool.allocate(64).unwrap();
+            source.set_len(64);
+            source.fill(0x5a);
+            let remote = source.remote_buffer_info(0).unwrap();
+            let cq = CompletionQueue::create(device.context(), 16, None).unwrap();
+            let create = || {
+                QueuePair::create(
+                    device.pd(),
+                    &cq,
+                    &mut ibv_qp_init_attr {
+                        qp_type: ibv_qp_type::IBV_QPT_RC,
+                        cap: ibv_qp_cap {
+                            max_send_wr: 4,
+                            max_recv_wr: 4,
+                            max_send_sge: 1,
+                            max_recv_sge: 1,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    0,
+                )
+                .unwrap()
+            };
+            let reader = create();
+            let peer = create();
+            let port = device.info().ports.iter().find(|p| p.is_usable()).unwrap();
+            let gid = port
+                .gids
+                .iter()
+                .find(|g| g.gid_type == GidType::RoCEv2)
+                .or_else(|| port.gids.first())
+                .unwrap();
+            let config = |remote: &QueuePair| QpConnectionConfig {
+                local_port_num: port.port_num,
+                local_gid_index: gid.index,
+                pkey_index: 0,
+                link_layer: port.port_attr.link_layer,
+                path_mtu: port.port_attr.active_mtu,
+                remote_qp_num: remote.qp_num(),
+                remote_gid: gid.gid,
+                remote_lid: port.port_attr.lid,
+                local_psn: 7,
+                remote_psn: 7,
+                max_rd_atomic: 1,
+                max_dest_rd_atomic: 1,
+                traffic_class: 0,
+            };
+            reader.connect(&config(&peer)).unwrap();
+            peer.connect(&config(&reader)).unwrap();
+            let mut destination = pool.allocate(64).unwrap();
+            destination.set_len(64);
+            let address = destination.as_ptr();
+            let (mut posting, mut status, mut recovery) = reader
+                .prepare_recoverable_reads(
+                    vec![destination],
+                    vec![ReadRequest {
+                        remote_addr: remote.addr,
+                        rkey: remote.key.rkey,
+                        segments: vec![ReadSegment {
+                            buffer: 0,
+                            offset: 0,
+                            len: 64,
+                        }],
+                    }],
+                )
+                .unwrap();
+            reader.post_read(&mut posting).unwrap();
+            posting.handle().fail(ReadFailure::RequestTimeout);
+            assert_eq!(status.try_recv(), Some(Err(ReadFailure::RequestTimeout)));
+            reader
+                .modify(
+                    &mut ibv_qp_attr {
+                        qp_state: ibv_qp_state::IBV_QPS_ERR,
+                        ..Default::default()
+                    },
+                    ibv_qp_attr_mask::IBV_QP_STATE.0 as _,
+                )
+                .unwrap();
+            assert!(
+                recovery.try_recv().is_none(),
+                "ERR is not completion evidence"
+            );
+            drop(posting);
+            assert!(recovery.try_recv().is_none());
+
+            if poll_completion {
+                let mut cursor = CompletionCursor::default();
+                let mut completions = CompletionBatch::<8>::new();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while reader.pending_read_count() != 0 {
+                    assert!(Instant::now() < deadline, "closed QP must settle its READ");
+                    for completion in cq.poll_batch(&mut completions).unwrap() {
+                        assert_eq!(completion.qp_num(), reader.qp_num());
+                        let completed = reader.complete(completion, &mut cursor).unwrap();
+                        assert_eq!(completed.wc.wr_id.get_type(), WRType::Read);
+                    }
+                    std::thread::yield_now();
+                }
+            } else {
+                // No CQE is consumed in this branch: only successful provider
+                // destruction can release the ledger's ownership reference.
+                drop(reader);
+            }
+            let returned = recovery.try_recv().expect("settled destinations recover");
+            assert_eq!(returned[0].as_ptr(), address);
+            assert_eq!(returned[0].len(), 64);
+        }
+    }
 
     #[test]
     fn read_completion_sweeps_unsignaled_send_and_settles_read_batch() {

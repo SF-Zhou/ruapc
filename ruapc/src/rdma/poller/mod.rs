@@ -1675,7 +1675,7 @@ mod tests {
                 "unposted expiry must not close the QP"
             );
             assert_eq!(socket.queue_pair.pending_read_count(), 0);
-            let returned = WriteTarget::try_into_buffers(target).unwrap();
+            let returned = target.seal(None).await.unwrap();
             assert_eq!(returned[0].as_slice(), &[0xa5; 64]);
             assert_eq!(permits.available_permits(), 0);
             assert_eq!(peer.queue_pair.pending_read_count(), 1);
@@ -1798,7 +1798,7 @@ mod tests {
             assert!(socket.state.is_ok());
             assert_eq!(socket.queue_pair.pending_read_count(), 1);
             assert_eq!(permits.available_permits(), 0);
-            assert!(WriteTarget::try_into_buffers(target).is_none());
+            assert!(target.seal(None).await.is_none());
             assert!(destination_lifetime.upgrade().is_some());
 
             // Admission expiry alone does not prove this QP is faulty. Its
@@ -1906,7 +1906,7 @@ mod tests {
         assert!(socket.state.is_ok());
         assert_eq!(socket.queue_pair.pending_read_count(), 1);
         assert_eq!(permits.available_permits(), 0);
-        assert!(WriteTarget::try_into_buffers(target).is_none());
+        assert!(target.seal(None).await.is_none());
 
         // Taking the receiver at the parent deadline must not disable the
         // independent watchdog for READs still owned by this QP.
@@ -1974,7 +1974,7 @@ mod tests {
         assert_eq!(error.kind, ErrorKind::ConnectionClosed);
         assert_eq!(socket.queue_pair.pending_read_count(), 1);
         assert_eq!(permits.available_permits(), 0);
-        assert!(WriteTarget::try_into_buffers(target).is_none());
+        assert!(target.seal(None).await.is_none());
         assert!(destination_lifetime.upgrade().is_some());
         poll_loop.shutdown_cleanup();
         assert!(destination_lifetime.upgrade().is_some());
@@ -2064,8 +2064,7 @@ mod tests {
                     .await
                     .expect("processed READ completions must settle their waiter")
                     .unwrap();
-                let ((), buffers) = target.checkout(|_| Ok(())).unwrap();
-                let buffers = buffers.into_buffers();
+                let buffers = target.seal(None).await.unwrap();
                 assert_eq!(&buffers[0][..], &source[..]);
             } else {
                 poll_loop.shutdown_cleanup();

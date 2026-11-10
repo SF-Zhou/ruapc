@@ -127,7 +127,8 @@ and retirement policy.
 resolves local addresses and registration keys internally. Its non-cloneable
 `ReadPosting` cursor posts each request once, only to the preparing QP. Dropping
 the cursor accounts for its unposted suffix while the QP retains posted work.
-Explicit cancellation before any post can recover the destination vector.
+For `prepare_reads`, explicit cancellation before any post can recover the
+destination vector.
 
 Preparation also returns a concrete, runtime-independent `ReadCompletion`
 future. It yields `Result<Vec<Buffer>, ReadFailure>`; `try_recv` checks for a
@@ -136,6 +137,15 @@ not require Tokio. `ReadPosting::handle` provides a weak `ReadHandle` for
 observing progress or notifying failure without granting completion authority.
 The application owns deadline and connection-failure policy; RuaPC implements
 it in its [READ admission and failure layer](../docs/rdma-capacity.md#read-admission-and-failure).
+
+Use `prepare_recoverable_reads` to keep destination recovery separate from
+the transfer result. It returns the same posting cursor plus `ReadStatus`
+(`Result<(), ReadFailure>`) and `ReadRecovery` (`Vec<Buffer>`) futures. Status
+can report failure immediately; recovery waits for all posted work to settle
+or successful QP destruction, then returns the full vector even after failure.
+Cancellation before posting also returns buffers through `ReadRecovery`.
+Neither future keeps the batch or QP alive. Recovered failed-transfer bytes
+remain readable but are not valid transfer results.
 
 Timeout or connection failure can notify a receiver before DMA has stopped.
 Posted destinations remain owned until all posted READs complete or the provider

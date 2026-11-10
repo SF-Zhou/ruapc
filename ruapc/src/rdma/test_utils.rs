@@ -1,6 +1,12 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
-use crate::{Endpoint, ListenMode, SocketPoolConfig, Transport, rdma::RdmaDevice};
+use ruapc_rdma::{ReadPosting, ReadRequest, ReadSegment};
+
+use crate::{
+    Context, Endpoint, ListenMode, Router, Server, Socket, SocketPoolConfig, Transport,
+    rdma::{RdmaDevice, RdmaSocket},
+    remote_memory::WriteTarget,
+};
 
 /// Opens the first available RDMA device, honoring the `RUAPC_PREFER_RXE`
 /// env var (used in CI to select the `rxe_0` virtual device).
@@ -72,5 +78,74 @@ pub(crate) fn transport_endpoint(transport: Transport, address: std::net::Socket
         Endpoint::rdma(Transport::TCP, [address]).unwrap()
     } else {
         Endpoint::new(transport, [address]).unwrap()
+    }
+}
+
+/// A served RDMA connection for tests that need destinations owned by a real
+/// READ plan. Allocate those destinations from `context`'s buffer pool.
+pub(crate) struct RdmaConnection {
+    pub server: Server,
+    pub context: Context,
+    pub socket: Arc<RdmaSocket>,
+}
+
+impl RdmaConnection {
+    pub(crate) async fn establish() -> Self {
+        let config = small_rdma_config();
+        let server = Server::create(Router::default(), &config).unwrap();
+        let address = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let context = Context::create(&config).unwrap();
+        let endpoint = Endpoint::rdma(Transport::TCP, [address]).unwrap();
+        let Socket::RDMA(socket) = context
+            .state
+            .socket_pool
+            .acquire(&endpoint, &context.state)
+            .await
+            .unwrap()
+        else {
+            panic!("an RDMA endpoint must provide an RDMA connection");
+        };
+        Self {
+            server,
+            context,
+            socket,
+        }
+    }
+
+    /// Moves `target`'s nonempty destinations into a READ plan that is never
+    /// posted. The plan owns them until the returned cursor is dropped.
+    pub(crate) fn hold(&self, target: &WriteTarget) -> ReadPosting {
+        target
+            .start_read(Arc::downgrade(&self.socket), |destinations| {
+                let read = ReadRequest {
+                    remote_addr: 0,
+                    rkey: 0,
+                    segments: vec![ReadSegment {
+                        buffer: 0,
+                        offset: 0,
+                        len: 1,
+                    }],
+                };
+                match self
+                    .socket
+                    .queue_pair
+                    .prepare_recoverable_reads(destinations.into_buffers(), vec![read])
+                {
+                    Ok((posting, _status, recovery)) => Ok((posting, recovery)),
+                    Err((error, buffers)) => Err((error.into(), buffers)),
+                }
+            })
+            .expect("available destinations registered with this connection's device")
+    }
+
+    pub(crate) async fn shutdown(self) {
+        drop(self.socket);
+        self.context.state.socket_pool.stop();
+        self.server.stop();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(self.context.state.socket_pool.join(), self.server.join());
+        })
+        .await
+        .expect("both RDMA pools must stop");
     }
 }
