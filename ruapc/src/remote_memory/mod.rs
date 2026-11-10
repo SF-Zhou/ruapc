@@ -6,11 +6,13 @@
 //! and local buffer availability as separate facts.
 
 mod context;
+mod read_source;
 mod reply;
 mod rpc_transfer;
 pub(crate) mod transfer;
 mod write_target;
 
+pub(crate) use read_source::{ReadSourceReceiver, ReadSourceSender, read_source_channel};
 pub use reply::{BufferAvailability, BufferReply, ResultBufferReply, WriteReceipt};
 pub(crate) use rpc_transfer::MemoryService;
 #[cfg(all(test, feature = "rdma"))]

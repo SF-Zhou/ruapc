@@ -60,12 +60,16 @@ Use [DESIGN.md](DESIGN.md) for crate/module ownership and
   and transport execution in `ruapc`; convert memory errors at that boundary.
 - Read/write spaces concatenate buffer lengths. Validate bounds, overflow,
   region/op limits and destination overlap before transferring `CopyOp`s.
-- Read attachments own immutable buffers and replace the wrapper's source list.
-  Pending requests and inline readers share that ownership. Recovery requires
-  uniqueness; a failed recovery attempt preserves the source.
+- Read attachments borrow immutable buffers and replace the wrapper's source list.
+  The original request future services inline copies and validation while polled;
+  waiters only route control messages and never retain borrowed source pointers.
+  Forgetting a future must not allow background source access or new validation.
 - Preserve [read-then-validate](docs/safe-boundaries.md#application-read-source-validation-and-recovery):
-  success depends on the original waiter's immutable source and no request ID reuse.
-  The probe checks membership, not a strict deadline or remote DMA completion.
+  success depends on the original borrowing future answering after READ completion
+  and the documented assumption that request IDs are not reused within the
+  validation window. Source operations reject the earlier original-call or
+  probe deadline. Waiter membership alone is insufficient, and validation is
+  not a remote DMA completion lease.
   Failure can permit source reuse before remote completion; recovered error
   bytes remain readable but are not valid transfer results.
 - RDMA transfers use READ, including client-side READ for `remote_write`.

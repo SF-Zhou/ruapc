@@ -101,8 +101,8 @@ async fn packed_copies_keep_operation_order_holes_and_empty_segments_on_stream_t
         let destination = buffers(&pool, b"............", &[0, 5, 2, 5]);
         let destination_pointers: Vec<_> =
             destination.iter().map(|buffer| buffer.as_ptr()).collect();
-        let mut attached = client
-            .with_read_buffers(source)
+        let attached = client
+            .with_read_buffers(&source)
             .unwrap()
             .with_write_buffers(destination);
         let (read, written) = attached.exchange(&ctx, &()).await.unwrap().into_parts();
@@ -131,9 +131,9 @@ async fn packed_copies_keep_operation_order_holes_and_empty_segments_on_stream_t
             destination_pointers,
         );
         assert_eq!(written[0].capacity(), 0);
-        let recovered = attached.take_read_buffers().into_available().unwrap();
-        assert_eq!(flatten(&recovered), b"abcdefgh");
-        assert_eq!(recovered[1].capacity(), 0);
+        drop(attached);
+        assert_eq!(flatten(&source), b"abcdefgh");
+        assert_eq!(source[1].capacity(), 0);
     }
 
     server.stop();

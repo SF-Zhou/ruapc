@@ -102,21 +102,22 @@ async fn test_upload_with_read_buffer_tcp() {
 
     let req = UploadReq {};
 
-    // Move the source into a wrapper that can reuse it across requests.
-    let mut source = client.with_read_buffer(buf).unwrap();
+    // Borrow the source in a wrapper that can reuse it across requests.
+    let source = client.with_read_buffer(&buf).unwrap();
     let rsp: UploadRsp = source.upload(&ctx, &req).await.unwrap();
     assert_eq!(rsp.data, test_data);
 
     // 3. Verify the same buffer can be reused (retry scenario).
     let rsp2: UploadRsp = source.upload(&ctx, &req).await.unwrap();
     assert_eq!(rsp2.data, test_data);
+    let (first, second) = tokio::join!(source.upload(&ctx, &req), source.upload(&ctx, &req));
+    assert_eq!(first.unwrap().data, test_data);
+    assert_eq!(second.unwrap().data, test_data);
     assert_eq!(&source.read_buffers()[0][..], test_data);
-    let recovered = source
-        .take_read_buffers()
-        .into_available()
-        .expect("completed reads release the source for reuse");
-    assert_eq!(&recovered[0][..], test_data);
-    assert!(source.read_buffers().is_empty());
+    drop(source);
+    assert_eq!(&buf[..], test_data);
+    buf[0] = b'h';
+    assert_eq!(buf[0], b'h');
 
     // 4. Verify upload without an attached buffer fails with a proper
     //    MissingBufferInfo error (not a server panic / timeout).
@@ -155,7 +156,7 @@ async fn test_upload_with_read_buffer_websocket() {
     let req = UploadReq {};
 
     let rsp: UploadRsp = client
-        .with_read_buffer(buf)
+        .with_read_buffer(&buf)
         .unwrap()
         .upload(&ctx, &req)
         .await
@@ -193,7 +194,7 @@ async fn test_upload_with_read_buffer_http() {
     let req = UploadReq {};
 
     let rsp: UploadRsp = client
-        .with_read_buffer(buf)
+        .with_read_buffer(&buf)
         .unwrap()
         .upload(&ctx, &req)
         .await

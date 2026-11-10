@@ -9,7 +9,7 @@ use crate::{
     core::ContextEndpoint,
     error::{Error, ErrorKind},
     msg::{MsgFlags, MsgMeta},
-    remote_memory::{ReadSource, WriteTarget},
+    remote_memory::{ReadSource, ReadSourceReceiver, WriteTarget, read_source_channel},
 };
 
 use super::attempt::{
@@ -21,12 +21,12 @@ use super::Client;
 
 #[derive(Clone, Copy)]
 pub(crate) struct ReadAttachment<'a> {
-    source: Option<&'a Arc<ReadSource>>,
+    source: Option<&'a ReadSource<'a>>,
     charge_bytes: u64,
 }
 
 impl<'a> ReadAttachment<'a> {
-    pub(crate) fn new(source: Option<&'a Arc<ReadSource>>, charge_bytes: Option<u64>) -> Self {
+    pub(crate) fn new(source: Option<&'a ReadSource<'a>>, charge_bytes: Option<u64>) -> Self {
         Self {
             source,
             charge_bytes: charge_bytes
@@ -96,7 +96,7 @@ impl Client {
             .into());
         }
 
-        let sent = self
+        let mut sent = self
             .send_with_retries(
                 ctx,
                 req,
@@ -107,7 +107,12 @@ impl Client {
             .await?;
         // Never retry after send: a missing response cannot tell us whether
         // the peer executed the request.
-        let (response, returned_target) = sent.receiver.recv().await?;
+        let receiving = sent.receiver.recv();
+        let (response, returned_target) = match (&mut sent.source_requests, read_attachment.source)
+        {
+            (Some(requests), Some(source)) => requests.drive(source, receiving).await,
+            _ => receiving.await,
+        }?;
         // Drop our clone before trying to recover the target. A handler still
         // holding it, or DMA still owning its buffers, prevents recovery.
         let had_attachment = write_target.take().is_some();
@@ -253,9 +258,11 @@ impl Client {
         // Response waiting uses the periodic sweep. A full transport queue
         // separately bounds admission by this same absolute deadline.
         let (msgid, receiver) = ctx.state.waiter.alloc_until(response_deadline);
-        if let Some(source) = read_attachment.source {
-            ctx.state.waiter.bind_read_source(msgid, source.clone());
-        }
+        let mut source_requests = read_attachment.source.map(|_| {
+            let (sender, requests) = read_source_channel();
+            ctx.state.waiter.bind_read_source(msgid, sender);
+            requests
+        });
         if let Some(target) = write_target {
             // Pin the write buffers to the pending request so remote-memory
             // handlers can reach (and keep alive) the destination memory.
@@ -275,7 +282,14 @@ impl Client {
             // tree inherits the shrunk deadline.
             timeout_ms: wire_timeout_ms(timeout),
         };
-        if let Err(err) = socket.send(&mut meta, req, &ctx.state).await {
+        // Publication can precede send completion. Serve reverse requests while
+        // sending as well as while waiting for the business response.
+        let sending = socket.send(&mut meta, req, &ctx.state);
+        let result = match (&mut source_requests, read_attachment.source) {
+            (Some(requests), Some(source)) => requests.drive(source, sending).await,
+            _ => sending.await,
+        };
+        if let Err(err) = result {
             // Closure and expiry can race while waiting for capacity. An
             // exhausted response budget must not start another send attempt.
             if std::time::Instant::now() >= response_deadline {
@@ -286,13 +300,17 @@ impl Client {
                 socket.rdma_remote_device().map(str::to_owned),
             ));
         }
-        Ok(SentRequest { receiver })
+        Ok(SentRequest {
+            receiver,
+            source_requests,
+        })
     }
 }
 
 /// A successfully sent request attempt, waiting for its response.
 struct SentRequest<'a> {
     receiver: Receiver<'a>,
+    source_requests: Option<ReadSourceReceiver>,
 }
 
 #[cfg(test)]
@@ -317,9 +335,9 @@ mod tests {
                 buffer.set_len(len);
                 buffer
             })
-            .collect();
-        let source = Arc::new(ReadSource::try_new(buffers).unwrap());
-        let empty = Arc::new(ReadSource::try_new(Vec::new()).unwrap());
+            .collect::<Vec<_>>();
+        let source = ReadSource::try_new(&buffers).unwrap();
+        let empty = ReadSource::try_new(&[]).unwrap();
 
         for (source, charge_bytes, expected) in [
             (None, None, 0),
@@ -354,6 +372,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forgotten_request_cannot_confirm_or_copy_a_reused_source() {
+        let (sender, _queue) = tokio::sync::mpsc::channel(1);
+        let ctx = connected_context(sender);
+        let client = Client::default();
+        let mut buffer = ctx.state.buffer_pool.allocate(4).unwrap();
+        buffer.set_len(4);
+        buffer.copy_from_slice(b"read");
+        let route = {
+            let source = ReadSource::try_new(std::slice::from_ref(&buffer)).unwrap();
+            let mut target = None;
+            let mut request = Box::pin(client.ruapc_request::<(), (), Error>(
+                &ctx,
+                &(),
+                ReadAttachment::new(Some(&source), None),
+                &mut target,
+                None,
+                "Test/forgotten",
+            ));
+            assert!(futures_util::poll!(request.as_mut()).is_pending());
+            let (route, _) = ctx.state.waiter.read_source(0).unwrap();
+            std::mem::forget(request);
+            route
+        };
+        // The forgotten future leaves its waiter and mailbox alive, but no
+        // borrow prevents reuse and no background task may access these bytes.
+        buffer.copy_from_slice(b"next");
+        assert!(ctx.state.waiter.contains_message_id(0));
+        assert!(!route.is_closed());
+        assert_eq!(
+            route
+                .validate(std::time::Instant::now() + Duration::from_millis(10))
+                .await
+                .unwrap_err()
+                .kind,
+            ErrorKind::Timeout
+        );
+        assert_eq!(
+            route
+                .gather(
+                    vec![crate::CopyOp::new(0, 0, 4)],
+                    std::time::Instant::now() + Duration::from_millis(10)
+                )
+                .await
+                .unwrap_err()
+                .kind,
+            ErrorKind::Timeout
+        );
+        assert_eq!(buffer.as_slice(), b"next");
+        ctx.state
+            .waiter
+            .expire(std::time::Instant::now() + Duration::from_secs(60));
+        assert_eq!(ctx.state.waiter.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn source_requests_progress_during_send_and_response_then_stop_on_cancel() {
+        let (sender, mut queue) = tokio::sync::mpsc::channel(1);
+        sender
+            .send(bytes::Bytes::from_static(b"occupied"))
+            .await
+            .unwrap();
+        let ctx = connected_context(sender);
+        let client = Client::default();
+        let mut buffer = ctx.state.buffer_pool.allocate(4).unwrap();
+        buffer.set_len(4);
+        buffer.copy_from_slice(b"read");
+        {
+            let source = ReadSource::try_new(std::slice::from_ref(&buffer)).unwrap();
+            let mut target = None;
+            let mut request = Box::pin(client.ruapc_request::<(), (), Error>(
+                &ctx,
+                &(),
+                ReadAttachment::new(Some(&source), None),
+                &mut target,
+                None,
+                "Test/blocked_send",
+            ));
+            assert!(futures_util::poll!(request.as_mut()).is_pending());
+            let (route, deadline) = ctx.state.waiter.read_source(0).unwrap();
+            let mut copying = Box::pin(route.gather(vec![crate::CopyOp::new(1, 0, 2)], deadline));
+            assert!(futures_util::poll!(copying.as_mut()).is_pending());
+            assert!(futures_util::poll!(request.as_mut()).is_pending());
+            assert_eq!(copying.await.unwrap(), b"ea");
+
+            assert_eq!(queue.recv().await.unwrap(), b"occupied"[..]);
+            assert!(futures_util::poll!(request.as_mut()).is_pending());
+            assert!(queue.try_recv().is_ok());
+            let mut validating = Box::pin(route.validate(deadline));
+            assert!(futures_util::poll!(validating.as_mut()).is_pending());
+            assert!(futures_util::poll!(request.as_mut()).is_pending());
+            validating.await.unwrap();
+
+            drop(request);
+            assert!(route.is_closed());
+            assert_eq!(ctx.state.waiter.pending_count(), 0);
+            assert_eq!(
+                route.validate(deadline).await.unwrap_err().kind,
+                ErrorKind::Timeout
+            );
+        }
+        buffer.fill(0);
+        assert_eq!(buffer.as_slice(), [0; 4]);
+    }
+
+    #[tokio::test]
     async fn rejected_send_retries_are_bounded_and_release_read_sources() {
         let (sender, queue) = tokio::sync::mpsc::channel(1);
         drop(queue);
@@ -361,7 +484,8 @@ mod tests {
         let mut buffer = ctx.state.buffer_pool.allocate(4).unwrap();
         buffer.set_len(4);
         buffer.copy_from_slice(b"read");
-        let source = Arc::new(ReadSource::try_new(vec![buffer]).unwrap());
+        let buffers = [buffer];
+        let source = ReadSource::try_new(&buffers).unwrap();
         let client = Client {
             max_retries: 2,
             ..Default::default()
@@ -383,7 +507,6 @@ mod tests {
         assert_eq!(ctx.state.waiter.pending_count(), 0);
         let (next_id, _receiver) = ctx.state.waiter.alloc(Duration::from_secs(1));
         assert_eq!(next_id, 3, "two retries permit exactly three send attempts");
-        let source = Arc::try_unwrap(source).expect("failed attempts must release their source");
         assert_eq!(&source.buffers()[0][..], b"read");
     }
 

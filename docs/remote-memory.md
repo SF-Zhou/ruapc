@@ -1,6 +1,6 @@
 # Remote memory
 
-Clients attach owned buffers to a request; handlers access them through
+Clients borrow read sources and attach owned write destinations; handlers access them through
 `Context::remote_read` and `remote_write`. TCP, WebSocket and HTTP/2 use reverse
 RPCs to copy bytes. RDMA uses READ, including a client-side READ for
 `remote_write`. Ordinary unary HTTP calls do not support these reverse RPCs.
@@ -74,8 +74,8 @@ let mut dst = ctx.state.buffer_pool.allocate(4)?;
 dst.set_len(4);
 
 let client = ruapc::Client::default();
-let mut transfer = client
-    .with_read_buffer(src)
+let transfer = client
+    .with_read_buffer(&src)
     .expect("valid source layout")
     .with_write_buffers(vec![dst]);
 let reply: BufferReply<u64> = transfer.copy(&ctx, &()).await?;
@@ -85,7 +85,8 @@ let ruapc::BufferAvailability::Available(buffers) = destinations else {
     panic!("copy completed but destinations are unavailable");
 };
 assert_eq!(&*buffers[0], b"Rua!");
-let reusable_sources = transfer.take_read_buffers();
+drop(transfer);
+src.copy_from_slice(b"next"); // The caller still owns the source.
 ```
 
 Import `BlobService` wherever the client call is made. The handler, `Client` and
@@ -106,14 +107,14 @@ sources can be recovered; `take_sources()` returns their `BufferAvailability`
 and leaves the receipt usable for `into_reply`. It does not claim that every
 destination byte was filled or bind the write to a particular response value.
 
-Read attachments validate their layout before being installed. The fallible
-`with_read_buffer(s)` methods return `RemoteIoError` on invalid input, retaining
-the supplied buffers. `into_parts()` returns the RPC error and an optional
-recovered buffer vector. Handle the error explicitly when those buffers must be
-reused: converting it with `?` to the core `Error` drops them. The standalone
-memory crate's constructors keep their own `BufferSetError` type. Replacing read
-attachments consumes the wrapper: on failure, the error retains only the newly
-supplied buffers, and the wrapper releases its previous attachments.
+Read attachments validate their layout before being installed.
+`with_read_buffer(&Buffer)` and `with_read_buffers(&[Buffer])` return the core
+`Error` on invalid input. They borrow the buffers without taking ownership, so
+there is no read-source recovery method. Replacing a read attachment consumes
+the wrapper and replaces the borrowed list; on validation failure, the wrapper
+and its previous attachments are dropped. The standalone memory crate's
+`ReadSource::try_new` returns `MemoryError`; owned `BufferSet` construction
+continues to return `BufferSetError` with its supplied buffers.
 
 ## Timeouts
 
@@ -145,7 +146,7 @@ below.
 
 | Resource | Lifetime and recovery |
 |---|---|
-| Read attachments | Immutable and reusable across calls. Attaching a new list replaces the old one. `read_buffers()` borrows it; `take_read_buffers()` returns `Available` only when no pending request or local reader shares ownership. `Unavailable` preserves the source for another attempt; `NotAttached` means no source remains. |
+| Read attachments | Borrowed and immutable; reusable across calls. Attaching a new list replaces the old one. `read_buffers()` exposes the borrowed list. The caller retains ownership and can mutate or release sources once their borrow ends. |
 | Write attachments | Consumed by the next call. `BufferReply::destinations()` reports the set's availability; `into_parts()` recovers the response and that state. Plain results do not return destinations. After failure, `take_write_buffers()` reports any recoverable set. |
 | Handler buffers | `remote_read` returns its destinations; `remote_write` returns a `WriteReceipt` with separate source availability. `RemoteIoError::recovered_buffers()` and `take_recovered_buffers()` expose any recoverable buffers on failure; converting the error with `?` to `Error` drops them. |
 
@@ -154,17 +155,18 @@ below.
 `Unavailable` describes local recovery only: it does not prove that DMA is
 still running, since the pool may already have recycled the buffers. An
 unavailable response, write-attachment state or receipt is not a handle that
-can later recover buffers. Only the read-attachment wrapper retains a shared
-source after an unsuccessful `take_read_buffers()` attempt, allowing that
-specific recovery attempt to be repeated.
+can later recover buffers. Read sources are borrowed separately and never enter
+this recovery state machine.
 
 Posted READ destinations remain owned until completion or successful QP
 destruction. Cancellation or failure can make recovery unavailable even after
 the QP eventually recycles the memory. Recovered error buffers are reusable,
 but their readable contents must not be treated as a successful transfer result.
 
-Application RDMA reads validate the source request after READ completion.
-Source recovery after failure still does not prove remote DMA has stopped.
+Application RDMA reads validate the source request after READ completion. The
+original borrowing future must be polled to answer the probe or service an
+inline read; a forgotten future cannot authorize a new source operation.
+Source reuse after failure still does not prove remote DMA has stopped.
 The [safety contract](safe-boundaries.md#application-read-source-validation-and-recovery)
 explains successful-result validation, its assumptions and the failed-read
 boundary.

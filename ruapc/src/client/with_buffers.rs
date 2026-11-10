@@ -1,17 +1,17 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use ruapc_memory::BufferSet;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Buffer, BufferAvailability, Context, Error, RemoteIoError,
+    Buffer, BufferAvailability, Context, Error,
     remote_memory::{ReadSource, WriteTarget},
 };
 
 use super::{Client, ReadAttachment};
 
-/// A client wrapper that attaches owned buffers to RPC calls.
+/// A client wrapper that borrows read sources and owns write destinations.
 ///
 /// Created via [`Client::with_read_buffers`] /
 /// [`Client::with_write_buffers`]. Implements the same service traits as
@@ -20,8 +20,9 @@ use super::{Client, ReadAttachment};
 /// # Read buffers
 ///
 /// Read attachments are reusable immutable sources for [`Context::remote_read`].
-/// Pending requests and local readers share them with this wrapper. Recover
-/// local ownership through [`take_read_buffers`](Self::take_read_buffers).
+/// This wrapper borrows them; each request future performs inline copies and
+/// post-READ validation while holding that borrow. The caller retains ownership
+/// and can reuse the sources once the borrow ends.
 ///
 /// # Write buffers
 ///
@@ -36,7 +37,7 @@ use super::{Client, ReadAttachment};
 /// ```rust,ignore
 /// // Upload and download in a single call:
 /// let (rsp, out) = client
-///     .with_read_buffers(src_bufs)?
+///     .with_read_buffers(&src_bufs)?
 ///     .with_write_buffers(dst_bufs)
 ///     .transform(&ctx, &req)
 ///     .await?
@@ -44,7 +45,7 @@ use super::{Client, ReadAttachment};
 /// ```
 pub struct ClientWithBuffers<'a> {
     client: &'a Client,
-    read_source: Option<Arc<ReadSource>>,
+    read_source: Option<ReadSource<'a>>,
     read_charge_bytes: Option<u64>,
     write_buffers: Mutex<BufferAvailability>,
 }
@@ -62,26 +63,24 @@ impl<'a> ClientWithBuffers<'a> {
     }
 
     #[cfg(feature = "rdma")]
-    pub(super) fn from_read_source(client: &'a Client, source: Arc<ReadSource>) -> Self {
+    pub(super) fn from_read_source(client: &'a Client, source: ReadSource<'a>) -> Self {
         Self {
             read_source: Some(source),
             ..Self::new(client)
         }
     }
 
-    /// Replaces the request's read space with one owned buffer.
-    pub fn with_read_buffer(self, buffer: Buffer) -> Result<Self, RemoteIoError> {
-        self.with_read_buffers(vec![buffer])
+    /// Replaces the request's read space with one borrowed buffer.
+    pub fn with_read_buffer(self, buffer: &'a Buffer) -> Result<Self, Error> {
+        self.with_read_buffers(std::slice::from_ref(buffer))
     }
 
-    /// Replaces the request's read space with owned buffers.
+    /// Replaces the request's read space with borrowed buffers.
     ///
-    /// On failure, the error retains the supplied buffers. This consuming
-    /// builder drops the previous wrapper and its existing attachments.
-    /// Invalid attachments return their original buffers in [`RemoteIoError`].
-    pub fn with_read_buffers(mut self, buffers: Vec<Buffer>) -> Result<Self, RemoteIoError> {
-        let source = ReadSource::try_new(buffers)?;
-        self.read_source = Some(Arc::new(source));
+    /// Invalid layouts return an error without taking buffer ownership. This
+    /// consuming builder drops the previous wrapper and its attachments on error.
+    pub fn with_read_buffers(mut self, buffers: &'a [Buffer]) -> Result<Self, Error> {
+        self.read_source = Some(ReadSource::try_new(buffers)?);
         Ok(self)
     }
 
@@ -90,23 +89,6 @@ impl<'a> ClientWithBuffers<'a> {
         self.read_source
             .as_ref()
             .map_or(&[], |source| source.buffers())
-    }
-
-    /// Recovers the source buffers when no pending request or local reader
-    /// still holds them. On `Unavailable`, the wrapper retains its source for a later
-    /// attempt. Local uniqueness does not prove remote DMA completion; see
-    /// [`Context::remote_read`] for validation and source-recovery limits.
-    pub fn take_read_buffers(&mut self) -> BufferAvailability {
-        let Some(source) = self.read_source.take() else {
-            return BufferAvailability::NotAttached;
-        };
-        match Arc::try_unwrap(source) {
-            Ok(source) => BufferAvailability::Available(source.into_buffers()),
-            Err(source) => {
-                self.read_source = Some(source);
-                BufferAvailability::Unavailable
-            }
-        }
     }
 
     /// Overrides the SEND bandwidth charge for an internal request whose
@@ -216,67 +198,11 @@ mod tests {
     use super::*;
     use crate::client::tests::TestService;
     use crate::{
-        BufferReply, CopyOp, ErrorKind, Message, MsgFlags, MsgMeta, Payload, Socket,
-        SocketPoolConfig, msg::frame, tcp::TcpSocket,
+        BufferReply, ErrorKind, Message, MsgFlags, MsgMeta, Payload, Socket, SocketPoolConfig,
+        msg::frame, tcp::TcpSocket,
     };
     use bytes::{Bytes, BytesMut};
-    use ruapc_memory::{CopyBatch, MAX_REGIONS};
-    use std::{
-        future::Future,
-        task::{Context as TaskContext, Poll, Waker},
-    };
-
-    #[tokio::test]
-    async fn forgotten_request_cannot_release_an_active_read_source() {
-        let base = Context::create(&SocketPoolConfig::default()).unwrap();
-        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
-        let ctx = Context::server_ctx(
-            &base.state,
-            Socket::TCP(TcpSocket::new(sender)),
-            MsgMeta {
-                timeout_ms: 30_000,
-                ..Default::default()
-            },
-        );
-        let mut buffer = ctx.state.buffer_pool.allocate(16).unwrap();
-        buffer.set_len(4);
-        buffer.copy_from_slice(b"data");
-        let client = Client::default();
-        let mut wrapper = client.with_read_buffer(buffer).unwrap();
-        let mut request = Box::pin(wrapper.test_call(&ctx, &()));
-        assert!(matches!(
-            request
-                .as_mut()
-                .poll(&mut TaskContext::from_waker(Waker::noop())),
-            Poll::Pending
-        ));
-        // Forgetting a future is safe Rust: source ownership must not depend on
-        // the request's Drop running before the wrapper can be reused/dropped.
-        std::mem::forget(request);
-        assert!(matches!(
-            wrapper.take_read_buffers(),
-            BufferAvailability::Unavailable
-        ));
-        let source = ctx.state.waiter.read_source(0).unwrap();
-        ctx.state
-            .waiter
-            .expire(std::time::Instant::now() + std::time::Duration::from_secs(60));
-        assert!(matches!(
-            wrapper.take_read_buffers(),
-            BufferAvailability::Unavailable
-        ));
-        assert_eq!(
-            source
-                .gather(&CopyBatch::new(&[CopyOp::new(0, 0, 4)]).unwrap())
-                .unwrap(),
-            b"data"
-        );
-        drop(source);
-        assert_eq!(
-            &wrapper.take_read_buffers().into_available().unwrap()[0][..],
-            b"data"
-        );
-    }
+    use ruapc_memory::MAX_REGIONS;
 
     #[tokio::test]
     async fn test_write_buffers_recoverable_after_failed_call() {
@@ -382,12 +308,10 @@ mod tests {
             .collect();
         let pointer = buffers[0].as_ptr();
         let error = client
-            .with_read_buffers(buffers)
+            .with_read_buffers(&buffers)
             .err()
             .expect("too many regions");
-        assert_eq!(error.error.kind, ErrorKind::InvalidCopyOp);
-        let (_, buffers) = error.into_parts();
-        let buffers = buffers.expect("attachment validation returns the original input");
+        assert_eq!(error.kind, ErrorKind::InvalidCopyOp);
         assert_eq!(buffers.len(), MAX_REGIONS + 1);
         assert_eq!(buffers[0].as_ptr(), pointer);
 

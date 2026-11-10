@@ -1,47 +1,58 @@
-//! Immutable, owned source buffers shared by a client and its pending reads.
+//! Immutable borrowed source buffers with a checked, cached layout.
 
 use ruapc_bufpool::Buffer;
 
-use crate::{BufferSet, BufferSetError, CopyBatch, MemoryResult, SpaceLayout};
+use crate::{BufferSet, CopyBatch, MemoryResult, SpaceLayout};
 
-/// Owned immutable source buffers, shareable through an `Arc`.
+/// An immutable borrow of source buffers and their checked logical layout.
 ///
-/// Local shared ownership protects CPU readers. It is not evidence that a
-/// remote DMA operation has completed or that a request remains valid.
+/// The borrow prevents changes to the buffers and their lengths while this
+/// source is used. It is not remote DMA completion or request-validity evidence.
+///
+/// ```compile_fail
+/// use ruapc_bufpool::Buffer;
+/// use ruapc_memory::ReadSource;
+/// fn change_length(buffers: &mut [Buffer]) {
+///     let source = ReadSource::try_new(buffers).unwrap();
+///     buffers[0].set_len(0);
+///     assert!(!source.buffers().is_empty());
+/// }
+/// ```
 #[derive(Debug)]
-pub struct ReadSource {
-    buffers: BufferSet,
+pub struct ReadSource<'a> {
+    buffers: &'a [Buffer],
+    layout: SpaceLayout,
 }
 
-impl From<BufferSet> for ReadSource {
-    /// Makes an already checked buffer set immutable without rebuilding its layout.
-    fn from(buffers: BufferSet) -> Self {
-        Self { buffers }
+impl<'a> From<&'a BufferSet> for ReadSource<'a> {
+    /// Borrows an already checked set without rebuilding its layout.
+    fn from(buffers: &'a BufferSet) -> Self {
+        Self {
+            buffers: buffers.buffers(),
+            layout: buffers.layout().clone(),
+        }
     }
 }
 
-impl ReadSource {
-    /// Checks and caches the source layout, retaining all buffers on failure.
-    pub fn try_new(buffers: Vec<Buffer>) -> Result<Self, BufferSetError> {
-        BufferSet::try_new(buffers).map(Self::from)
+impl<'a> ReadSource<'a> {
+    /// Checks and caches the borrowed source layout.
+    pub fn try_new(buffers: &'a [Buffer]) -> MemoryResult<Self> {
+        Ok(Self {
+            buffers,
+            layout: SpaceLayout::from_buffers(buffers)?,
+        })
     }
 
     /// Returns an immutable view of the source buffers.
     #[must_use]
-    pub fn buffers(&self) -> &[Buffer] {
-        self.buffers.buffers()
+    pub fn buffers(&self) -> &'a [Buffer] {
+        self.buffers
     }
 
     /// Returns the immutable cached source layout.
     #[must_use]
     pub fn layout(&self) -> &SpaceLayout {
-        self.buffers.layout()
-    }
-
-    /// Recovers local ownership of all source buffers.
-    #[must_use]
-    pub fn into_buffers(self) -> Vec<Buffer> {
-        self.buffers.into_buffers()
+        &self.layout
     }
 
     /// Gathers source ranges into bytes, concatenated in operation order.
@@ -50,7 +61,7 @@ impl ReadSource {
     /// offsets do not determine output order. No peer-provided address or
     /// registration key can select a different allocation.
     pub fn gather(&self, batch: &CopyBatch<'_>) -> MemoryResult<Vec<u8>> {
-        self.buffers.gather(batch)
+        batch.gather_from_layout(&self.layout, self.buffers)
     }
 }
 
@@ -70,8 +81,8 @@ mod tests {
                 buffer.copy_from_slice(bytes);
                 buffer
             })
-            .collect();
-        let source = ReadSource::try_new(buffers).unwrap();
+            .collect::<Vec<_>>();
+        let source = ReadSource::try_new(&buffers).unwrap();
         let operations = [CopyOp::new(2, 0, 4), CopyOp::new(0, 4, 2)];
         assert_eq!(
             source

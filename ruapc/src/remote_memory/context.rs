@@ -65,9 +65,11 @@ impl Context {
     /// drops any returned buffers.
     ///
     /// For transfers that copy bytes, RDMA validates the completed READs with
-    /// an original-request waiter membership probe. With the original immutable
-    /// source still held and no request-ID reuse, a positive probe validates
-    /// the copy. It is not a precise deadline check.
+    /// a probe handled by the original request future while it still borrows
+    /// the immutable source. A positive reply validates that completed copy;
+    /// a cancelled or forgotten future cannot confirm new probes. This assumes
+    /// no request-ID reuse during the operation; probes are bounded by both
+    /// requests' deadlines.
     ///
     /// Source recovery after cancellation does not wait for remote DMA.
     /// Failed validation can return readable destinations in [`RemoteIoError`];
@@ -669,8 +671,9 @@ mod timeout_tests {
                 max_retries: 0,
                 ..Default::default()
             };
-            let mut attached = match operation {
-                Operation::Read => client.with_read_buffer(buffer(&self.client.state)).unwrap(),
+            let source = buffer(&self.client.state);
+            let attached = match operation {
+                Operation::Read => client.with_read_buffer(&source).unwrap(),
                 Operation::Write => client.with_write_buffers(vec![buffer(&self.client.state)]),
             };
             // Keep the read source wrapper alive until both observations settle.
@@ -710,7 +713,10 @@ mod timeout_tests {
             assert_eq!(self.server.state().waiter.pending_count(), 0);
             assert_eq!(self.client.state.waiter.pending_count(), 0);
             let recovered = match operation {
-                Operation::Read => attached.take_read_buffers().into_available(),
+                Operation::Read => {
+                    drop(attached);
+                    Some(vec![source])
+                }
                 Operation::Write => attached.take_write_buffers().into_available(),
             }
             .expect("no DMA or inline copy remains after the injected reverse-RPC fault");

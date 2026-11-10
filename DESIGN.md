@@ -89,15 +89,16 @@ See [endpoint identity](docs/endpoints.md) for normalization and caller obligati
 3. The response budget starts after connection acquisition and includes
    bandwidth and send-queue admission. Nested calls cap both budgets at the
    parent's remaining time. The client allocates its waiter after bandwidth
-   admission and attaches the read source and write target.
+   admission and binds a source-operation route and the owned write target.
 4. Before queueing, the transport binds the waiter to its connection ID and
    checks closure. A full queue waits for capacity, deadline or closure;
    submission rechecks state and advertises the remaining admission budget.
    TCP/WS/HTTP share this logic in `sockets/channel.rs`; RDMA uses the same
    admission helper. Accepted messages stay queued even if their requests expire.
 5. Only failures before transport acceptance can retry. After acceptance the
-   client waits for one result; ambiguous timeouts and connection loss do not
-   trigger automatic retries.
+   client waits for one result while its request future services borrowed-source
+   copies and validation; ambiguous timeouts and connection loss do not trigger
+   automatic retries.
 6. Server dispatch reserves capacity atomically from the shared
    `max_inflight_requests` cap for built-in and application methods, and drops
    expired requests before execution. Generated handlers contain panics.
@@ -179,7 +180,7 @@ destination extents. Gather checks the actual source, scatter checks the actual
 destination and packed byte count, and planning checks both real layouts.
 `BufferSet` owns buffers with a cached layout; callers can change buffer lengths
 only by consuming the set. Slice traversal validates its range before invoking
-callbacks. The crate also owns `RemoteSpace` and immutable `ReadSource` buffers,
+callbacks. The crate also defines `RemoteSpace` and borrowed `ReadSource` views,
 independently of the RPC runtime, async executors and verbs. `ruapc` re-exports
 the public copy-space types and converts memory errors into RPC errors.
 The RDMA dependency independently validates the owned destination plan before
@@ -187,7 +188,7 @@ posting.
 
 | Component | Role |
 |---|---|
-| `ruapc-memory` | Space validation and planning, CPU gather/scatter and immutable sources shared by wrappers, pending requests and inline readers |
+| `ruapc-memory` | Space validation and planning, CPU gather/scatter and immutable borrowed sources with cached layouts |
 | `context.rs` | Public transfer APIs |
 | `transfer.rs` | Owned preparation, convenience allocation and centralized enum dispatch |
 | `rpc_transfer.rs` | Reverse-RPC protocol, handlers and TCP/WS/HTTP fallback |
@@ -207,14 +208,15 @@ skip target checkout and I/O.
 Write-target checkout and `WriteReceipt` construction remain private to the
 core runtime. A receipt creates a `BufferReply<T>`, the return type shared by
 handlers and clients. It carries the application response and local destination
-availability; only the application response is serialized. Waiters retain source
-and target ownership through the request lifecycle. Inline writes hold a target's
-mutex for the complete batch and copy through its cached `BufferSet`. Read sources likewise
+availability; only the application response is serialized. Waiters retain write
+targets and route read operations to the original borrowing request futures.
+Inline writes hold a target's mutex for the complete batch and copy through its
+cached `BufferSet`. Read sources likewise
 cache their validated layouts. The memory crate supplies these synchronous
 operations without its own request registry or completion authority.
 
 RDMA transfers use READ in both directions: `remote_write` asks the client to
-read the server's source. Application reads validate the original waiter after
+read the server's source. Application reads ask the original borrowing future to validate after
 READ completion; large serialized messages use a separate finish protocol.
 See the [API guide](docs/remote-memory.md) for use and recovery, and
 [safety boundaries](docs/safe-boundaries.md) for success assumptions and failure behavior.

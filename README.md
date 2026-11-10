@@ -111,7 +111,7 @@ RuaPC's typed HTTP client uses an HTTP/2 stream that supports reverse RPC.
 
 ## Remote read/write
 
-Clients attach owned read sources and write destinations. Handlers address
+Clients borrow read sources and attach owned write destinations. Handlers address
 those buffers through logical `CopyOp` ranges, using RDMA READ or inline
 reverse RPC over the other transports. Handlers return `BufferReply<T>` from a
 completed `WriteReceipt`; clients receive the same `BufferReply<T>` type with

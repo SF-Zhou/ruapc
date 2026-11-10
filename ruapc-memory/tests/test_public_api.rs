@@ -195,7 +195,7 @@ fn packed_copy_order_overlap_gaps_and_segmentation_match_for_cached_and_raw_buff
     let packed = source.gather(&batch).unwrap();
     assert_eq!(packed, b"fghbcdecd");
     assert_eq!(batch.gather(&single_source).unwrap(), packed);
-    let source = ReadSource::try_new(source.into_buffers()).unwrap();
+    let source = ReadSource::from(&source);
     assert_eq!(source.gather(&batch).unwrap(), packed);
 
     let mut destination = BufferSet::try_new(buffers(&[b".", b"", b"...", b"......"])).unwrap();
@@ -249,31 +249,28 @@ fn empty_copy_batches_still_check_actual_layout_and_packed_length() {
 
 #[test]
 fn invalid_owned_layouts_return_every_original_buffer_in_order() {
-    for read_source in [false, true] {
-        let original = buffers(&vec![b"data".as_slice(); MAX_REGIONS + 1]);
-        let addresses: Vec<_> = original.iter().map(|buffer| buffer.as_ptr()).collect();
-        let failure = if read_source {
-            ReadSource::try_new(original).map(drop).unwrap_err()
-        } else {
-            BufferSet::try_new(original).map(drop).unwrap_err()
-        };
-        assert_eq!(failure.error.kind, MemoryErrorKind::InvalidCopyOp);
-        assert_eq!(failure.buffers().len(), MAX_REGIONS + 1);
-        let (_, recovered) = failure.into_parts();
-        assert_eq!(
-            recovered
-                .iter()
-                .map(|buffer| buffer.as_ptr())
-                .collect::<Vec<_>>(),
-            addresses
-        );
-        assert!(recovered.iter().all(|buffer| buffer.as_slice() == b"data"));
-    }
+    let original = buffers(&vec![b"data".as_slice(); MAX_REGIONS + 1]);
+    let addresses: Vec<_> = original.iter().map(|buffer| buffer.as_ptr()).collect();
+    let failure = ReadSource::try_new(&original).unwrap_err();
+    assert_eq!(failure.kind, MemoryErrorKind::InvalidCopyOp);
+    let failure = BufferSet::try_new(original).unwrap_err();
+    assert_eq!(failure.error.kind, MemoryErrorKind::InvalidCopyOp);
+    assert_eq!(failure.buffers().len(), MAX_REGIONS + 1);
+    let (_, recovered) = failure.into_parts();
+    assert_eq!(
+        recovered
+            .iter()
+            .map(|buffer| buffer.as_ptr())
+            .collect::<Vec<_>>(),
+        addresses
+    );
+    assert!(recovered.iter().all(|buffer| buffer.as_slice() == b"data"));
 }
 
 #[test]
-fn read_source_bound_failure_preserves_buffers_for_retry_and_recovery() {
-    let source = ReadSource::try_new(buffers(&[b"abcd", b"efgh"])).unwrap();
+fn read_source_bound_failure_preserves_borrowed_buffers_for_retry() {
+    let buffers = buffers(&[b"abcd", b"efgh"]);
+    let source = ReadSource::try_new(&buffers).unwrap();
     let invalid = [CopyOp::new(7, 0, 2)];
     assert_eq!(
         source
@@ -287,7 +284,6 @@ fn read_source_bound_failure_preserves_buffers_for_retry_and_recovery() {
         source.gather(&CopyBatch::new(&valid).unwrap()).unwrap(),
         b"cdef"
     );
-    let recovered = source.into_buffers();
-    assert_eq!(recovered.len(), 2);
-    assert_eq!(flatten(&recovered), b"abcdefgh");
+    assert_eq!(buffers.len(), 2);
+    assert_eq!(flatten(&buffers), b"abcdefgh");
 }

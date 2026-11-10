@@ -238,7 +238,7 @@ async fn payload_with_attachments(use_msgpack: bool) {
     let attachment = blob(ATTACHMENT_SIZE, 61).data.into_bytes();
 
     let source_split = attachment.len() / 3;
-    let sources = [&attachment[..source_split], &attachment[source_split..]]
+    let sources: Vec<_> = [&attachment[..source_split], &attachment[source_split..]]
         .into_iter()
         .map(|bytes| {
             let mut buffer = ctx.state.buffer_pool.allocate(bytes.len()).unwrap();
@@ -256,8 +256,8 @@ async fn payload_with_attachments(use_msgpack: bool) {
             buffer
         })
         .collect();
-    let mut wrapper = client
-        .with_read_buffers(sources)
+    let wrapper = client
+        .with_read_buffers(&sources)
         .unwrap()
         .with_write_buffers(destinations);
     let (response, buffers) = wrapper
@@ -272,14 +272,10 @@ async fn payload_with_attachments(use_msgpack: bool) {
         flatten(&buffers),
         attachment.iter().rev().copied().collect::<Vec<_>>()
     );
-    let recovered = wrapper
-        .take_read_buffers()
-        .into_available()
-        .expect("completed application READs release the attachment owner");
-    assert_eq!(flatten(&recovered), attachment);
     drop(wrapper);
+    assert_eq!(flatten(&sources), attachment);
     drop(buffers);
-    drop(recovered);
+    drop(sources);
     stop(server, ctx).await;
 }
 

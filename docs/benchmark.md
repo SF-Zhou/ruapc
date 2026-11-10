@@ -57,6 +57,11 @@ addresses on the same server. Both addresses share one peer's stripe set.
 Its pool limit is 1 GiB per context and its Tokio worker count uses the runtime
 default. Remote memory uses 512 MiB per context and four runtime workers.
 Keep these settings fixed across compared versions.
+The remote-memory client loop runs in `Runtime::block_on` on the calling
+thread. Borrowed read sources are serviced by that loop's request future, so
+the measurement includes waking the calling thread for inline copies and RDMA
+validation. Running the loop in a spawned worker task changes these scheduling
+costs; record that as a separate workload when comparing results.
 
 The harnesses read these controls before timing:
 
@@ -385,6 +390,9 @@ latency includes server CRC calculation, write-pattern generation, client
 verification and per-call server allocation; MiB/s counts successful logical
 payload bytes, not network traffic. These costs differ from the reusable write
 sources in the `remote_memory` harness.
+The demo also constructs its borrowed read attachment on each call. The
+`remote_memory` harness reuses that wrapper and its checked layout, so it
+excludes attachment construction from the timed read loop.
 
 Concurrent echo and demo loads are closed-loop: each worker waits for a response
 before sending another request. They measure fixed-concurrency behavior, not

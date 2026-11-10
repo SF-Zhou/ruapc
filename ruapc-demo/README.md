@@ -124,14 +124,15 @@ typed HTTP and RDMA.
 
 [`client.rs`](src/bin/client.rs) shows how to allocate buffers, set their logical
 lengths and reuse them across calls; see the [remote-memory API guide](../docs/remote-memory.md)
-for attachments and logical copy spaces. Read attachments own immutable sources.
+for attachments and logical copy spaces. Read attachments borrow immutable sources.
 `BufferReply` reports destination availability explicitly; destinations are
 recoverable only when uniquely held. Failed or cancelled DMA can leave them
 unavailable.
-RDMA validates successful reads after READ completion, but source recovery does
+The borrowing request future validates successful reads after READ completion,
+but source reuse does
 not wait for remote DMA. Readable destinations from a failed transfer are not
 valid results. See [read validation and recovery](../docs/safe-boundaries.md#application-read-source-validation-and-recovery)
-for the immutable-source/request-ID conditions and the separate `remote_write`
+for the borrowing-future/request-ID conditions and the separate `remote_write`
 completion path.
 
 ## Load testing

@@ -558,7 +558,7 @@ mod timeout_tests {
             source.set_len(64);
             source.fill(0x5a);
             client
-                .with_read_buffers(vec![source])
+                .with_read_buffer(&source)
                 .unwrap()
                 .read(&context, &())
                 .await
@@ -672,5 +672,180 @@ mod timeout_tests {
         drop(completed);
         drop(blocked.lock().unwrap().take());
         fixture.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod borrowed_source_tests {
+    use std::{sync::Arc, time::Duration};
+
+    use tokio::sync::{Notify, mpsc};
+
+    use crate::{
+        Buffer, Client, Context, CopyOp, Endpoint, ErrorKind, RemoteIoError, Result, Router,
+        Server, Socket, Transport, core::ContextEndpoint, rdma::test_utils::small_rdma_config,
+        remote_memory::RequestStatusRequest,
+    };
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+    const CONTENTS: &[u8] = b"borrowed RDMA source";
+
+    #[crate::service]
+    trait BorrowedReadRpc {
+        async fn ping(&self, ctx: &Context, req: &()) -> Result<()>;
+        async fn read_and_report(&self, ctx: &Context, req: &()) -> Result<()>;
+    }
+
+    struct CompletedRead {
+        destination: usize,
+        result: std::result::Result<Vec<Buffer>, RemoteIoError>,
+    }
+
+    struct ReadService {
+        completed: mpsc::UnboundedSender<CompletedRead>,
+    }
+
+    impl BorrowedReadRpc for ReadService {
+        async fn ping(&self, _ctx: &Context, _req: &()) -> Result<()> {
+            Ok(())
+        }
+
+        async fn read_and_report(&self, ctx: &Context, _req: &()) -> Result<()> {
+            assert!(matches!(
+                ctx.endpoint,
+                ContextEndpoint::Connected(Socket::RDMA(_))
+            ));
+            let mut destination = ctx.state.buffer_pool.allocate(CONTENTS.len()).unwrap();
+            destination.set_len(CONTENTS.len());
+            let pointer = destination.as_ptr() as usize;
+            let result = ctx
+                .remote_read(
+                    &[CopyOp::new(0, 0, CONTENTS.len() as u64)],
+                    vec![destination],
+                )
+                .await;
+            self.completed
+                .send(CompletedRead {
+                    destination: pointer,
+                    result,
+                })
+                .unwrap_or_else(|_| panic!("test must observe the remote READ result"));
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forgotten_borrowed_call_cannot_validate_a_completed_rdma_read() {
+        let mut config = small_rdma_config();
+        let rdma = config.rdma.as_mut().unwrap();
+        rdma.remote_memory.bandwidth_limit_ratio = 0.0;
+        rdma.peers.connections_per_peer = 1;
+        rdma.peers.preconnect_max_per_peer = 1;
+        let (completed, mut completion) = mpsc::unbounded_channel();
+        let mut router = Router::default();
+        Arc::new(ReadService { completed }).ruapc_export(&mut router);
+        let server = Server::create(router, &config).unwrap();
+        let address = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+
+        let (arrived, mut arrival) = mpsc::unbounded_channel();
+        let (released, mut release) = mpsc::unbounded_channel();
+        let resume = Arc::new(Notify::new());
+        let gate = resume.clone();
+        let mut router = Router::default();
+        router.wrap_method("MemoryService/request_is_pending", move |original| {
+            let original = Arc::new(original);
+            Box::new(move |ctx, payload| {
+                let request: RequestStatusRequest = payload.deserialize(&ctx.msg_meta)?;
+                let ContextEndpoint::Connected(Socket::RDMA(socket)) = &ctx.endpoint else {
+                    panic!("validation must follow a real RDMA READ");
+                };
+                let conn_id = socket.conn_id;
+                arrived.send(request.request_id).unwrap();
+                let original = original.clone();
+                let gate = gate.clone();
+                let released = released.clone();
+                tokio::spawn(async move {
+                    gate.notified().await;
+                    // Prove this exercises a live stale waiter, rather than a
+                    // request that was already removed or expired before dispatch.
+                    let pending = ctx
+                        .state
+                        .waiter
+                        .pending_on_connection(request.request_id, conn_id);
+                    let probe_has_time = ctx
+                        .remaining_time()
+                        .is_some_and(|remaining| remaining > Duration::from_millis(100));
+                    released.send((pending, probe_has_time)).unwrap();
+                    original(ctx, payload).expect("validation handler dispatch succeeds");
+                });
+                Ok(())
+            })
+        });
+        let context = Context::create_with_router(router, &config)
+            .unwrap()
+            .with_endpoint(Endpoint::rdma(Transport::TCP, [address]).unwrap());
+        Client::default().ping(&context, &()).await.unwrap();
+        let client = Client {
+            timeout: Duration::from_secs(3),
+            max_retries: 0,
+            ..Default::default()
+        };
+        let mut source = context.state.buffer_pool.allocate(CONTENTS.len()).unwrap();
+        source.set_len(CONTENTS.len());
+        source.copy_from_slice(CONTENTS);
+        let attached = client.with_read_buffer(&source).unwrap();
+        let mut call = Box::pin(attached.read_and_report(&context, &()));
+        let request_id = tokio::time::timeout(TEST_TIMEOUT, async {
+            tokio::select! {
+                result = &mut call => panic!("call finished before validation was gated: {result:?}"),
+                request_id = arrival.recv() => request_id.expect("READ must reach post-validation"),
+            }
+        })
+        .await
+        .expect("real READ must complete and send its validation request");
+
+        // Forget the owning allocation, not a Pin<&mut _> handle. Safe Rust can
+        // now end both borrows, mutate the original bytes, and release the buffer.
+        std::mem::forget(call);
+        drop(attached);
+        source.fill(0xa5);
+        drop(source);
+        assert!(context.state.waiter.contains_message_id(request_id));
+        resume.notify_one();
+        let (pending, probe_has_time) = tokio::time::timeout(TEST_TIMEOUT, release.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            pending,
+            "original waiter must remain live at probe dispatch"
+        );
+        assert!(probe_has_time, "probe must be released before its deadline");
+
+        let completed = tokio::time::timeout(TEST_TIMEOUT, completion.recv())
+            .await
+            .expect("unpolled source validation must terminate at its deadline")
+            .expect("server must report the READ outcome independently of its caller");
+        let mut error = completed
+            .result
+            .expect_err("waiter membership cannot validate a forgotten source borrow");
+        assert_eq!(error.error.kind, ErrorKind::Timeout);
+        let mut destinations = error
+            .take_recovered_buffers()
+            .expect("completed READ destinations must remain recoverable");
+        assert_eq!(destinations.len(), 1);
+        assert_eq!(destinations[0].as_ptr() as usize, completed.destination);
+        assert_eq!(destinations[0].as_slice(), CONTENTS);
+        destinations[0].fill(0x5a);
+        drop(destinations);
+
+        // Explicit shutdown also covers the deliberately leaked caller future.
+        context.state.socket_pool.stop();
+        server.stop();
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            tokio::join!(context.state.socket_pool.join(), server.join());
+        })
+        .await
+        .expect("both RDMA pools must stop after validation failure");
     }
 }

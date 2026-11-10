@@ -56,7 +56,7 @@ pub(crate) async fn probe_connection(
             max_retries: 0,
             ..Default::default()
         };
-        let attached = client.with_read_buffers(vec![source])?;
+        let attached = client.with_read_buffer(&source)?;
         let reply = Box::pin(attached.probe(&ctx, &rpc_nonce)).await?;
         if reply.rpc_nonce != rpc_nonce || reply.read_nonce != read_nonce {
             return Err(Error::new(
@@ -161,7 +161,7 @@ mod tests {
             let mut buffer = context.state.buffer_pool.allocate(len).unwrap();
             buffer.set_len(len);
             let error = client
-                .with_read_buffers(vec![buffer])
+                .with_read_buffer(&buffer)
                 .unwrap()
                 .probe(&context, &23)
                 .await

@@ -7,10 +7,8 @@ pub use with_buffers::ClientWithBuffers;
 
 #[cfg(feature = "rdma")]
 use crate::remote_memory::ReadSource;
-use crate::{Buffer, RemoteIoError};
+use crate::{Buffer, Error};
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "rdma")]
-use std::sync::Arc;
 use std::time::Duration;
 
 mod request;
@@ -71,13 +69,16 @@ impl Default for Client {
 
 impl Client {
     #[cfg(feature = "rdma")]
-    pub(crate) fn with_read_source(&self, source: Arc<ReadSource>) -> ClientWithBuffers<'_> {
+    pub(crate) fn with_read_source<'a>(&'a self, source: ReadSource<'a>) -> ClientWithBuffers<'a> {
         ClientWithBuffers::from_read_source(self, source)
     }
 
     /// Creates a [`ClientWithBuffers`] wrapper attaching one *read* buffer
     /// to requests; see [`with_read_buffers`](Self::with_read_buffers).
-    pub fn with_read_buffer(&self, buffer: Buffer) -> Result<ClientWithBuffers<'_>, RemoteIoError> {
+    pub fn with_read_buffer<'a>(
+        &'a self,
+        buffer: &'a Buffer,
+    ) -> Result<ClientWithBuffers<'a>, Error> {
         ClientWithBuffers::new(self).with_read_buffer(buffer)
     }
 
@@ -88,22 +89,22 @@ impl Client {
     /// read space for [`Context::remote_read`](crate::Context::remote_read).
     /// Call [`Buffer::set_len`] after filling to expose exactly the valid bytes.
     ///
-    /// The reusable wrapper, pending requests and local inline readers share
-    /// the immutable source. [`ClientWithBuffers::take_read_buffers`] recovers
-    /// it when locally unique; this does not prove remote DMA completion.
-    /// See [`Context::remote_read`](crate::Context::remote_read) for RDMA
-    /// validation and recovery limits.
-    /// Invalid attachments return their original buffers in [`RemoteIoError`].
+    /// The reusable wrapper borrows the sources. Its request future services
+    /// inline copies and post-READ validation while holding that borrow. Sources
+    /// remain owned by the caller and can be reused once the borrow ends.
+    /// This does not prove remote DMA completion after cancellation or failure;
+    /// see [`Context::remote_read`](crate::Context::remote_read).
+    /// Invalid attachments return an [`Error`] without taking buffer ownership.
     ///
     /// # Examples
     ///
     /// ```rust,ignore
-    /// let rsp = client.with_read_buffers(bufs)?.upload(&ctx, &req).await?;
+    /// let rsp = client.with_read_buffers(&bufs)?.upload(&ctx, &req).await?;
     /// ```
-    pub fn with_read_buffers(
-        &self,
-        buffers: Vec<Buffer>,
-    ) -> Result<ClientWithBuffers<'_>, RemoteIoError> {
+    pub fn with_read_buffers<'a>(
+        &'a self,
+        buffers: &'a [Buffer],
+    ) -> Result<ClientWithBuffers<'a>, Error> {
         ClientWithBuffers::new(self).with_read_buffers(buffers)
     }
 

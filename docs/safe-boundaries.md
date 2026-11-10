@@ -25,7 +25,8 @@ its registrations before its memory.
 
 TCP, WebSocket and HTTP/2 need no memory registration. Their attachment metadata
 contains logical buffer lengths with zero addresses and keys; reverse RPCs
-resolve the owned buffers through the original request's waiter. RDMA exports
+route source-copy requests to the original borrowing future and resolve write
+targets through its waiter. RDMA exports
 registered addresses and keys for the connection's actual NIC.
 
 New backing memory is initialized before safe slices are exposed. Reused
@@ -112,10 +113,16 @@ protocol.
 
 ## Application read-source validation and recovery
 
-An immutable `ReadSource` is shared by the client wrapper, pending requests and
-inline reverse-RPC readers. This keeps memory alive during local CPU copies.
+`ReadSource<'a>` borrows an immutable `&'a [Buffer]` and caches its checked
+layout. The client wrapper borrows these buffers; ownership remains with the
+caller. The original request future handles source operations while it is
+polled. The waiter stores only a control-message route, never a source reference
+or address that a background CPU reader can dereference.
+
 `read_inline` accepts a request ID and logical operations, not peer-provided
-addresses.
+addresses. It sends that operation to the original request future, which
+synchronously gathers the bytes during its poll and replies with an owned byte
+vector. No borrowed source escapes that poll into an independent task.
 
 ### Read first, then validate
 
@@ -123,39 +130,74 @@ For an RDMA `remote_read` that transfers bytes, the reader waits for all READ
 completions, then calls `MemoryService/request_is_pending` on the source peer.
 It returns `Ok(buffers)` only if that check succeeds with `true`. Empty or
 all-zero-length batches validate the connected request, advertised space and
-copy ranges, then return the local buffers without I/O or a source-membership
+copy ranges, then return the local buffers without I/O or a source-validation
 probe.
 
-Success depends on the original waiter retaining the immutable source and
-its request ID not being reused during the operation. A positive check after
-READ completion then proves that the source remained held throughout the
-READ. Later source recovery cannot change the completed copy.
+The validation handler routes the probe to the original request future. A
+positive answer is produced only while that future is polled with its immutable
+source borrow. Background waiter membership alone cannot answer positively.
+Assuming no request-ID reuse during the READ and validation window, a positive
+answer after READ completion proves that the original source remained immutable
+through that READ. Later source reuse cannot change the completed copy. Each
+completed READ batch needs its own subsequent probe; a previous answer cannot
+validate later READs.
 
-The probe checks waiter-table membership, not the deadline clock. An entry
-can retain its source past its nominal deadline until the expiry sweep removes
-it. Request IDs come from a `u64` counter; the proof assumes no ID reuse,
-unlike the enforced [non-wrapping WRID sequence](wrid.md#why-the-sequence-does-not-wrap).
+Source operations honor the earlier of the original request's deadline and the
+reverse RPC's deadline, and reject expiry before accessing the source or
+validating it. Connection failure and waiter removal prevent new route lookups;
+already-routed operations still require the original future to be polled.
+The validity proof still depends on the live source borrow, not the clock or
+waiter membership alone. A positive probe is not a local CQ-issued completion
+token or a remote DMA completion lease.
 
-### Failure and buffer recovery
+Request IDs use a wrapping `u64` counter local to each `State`'s waiter. The
+protocol assumes that an ID is not reused while an earlier request or probe
+with that ID can still affect the result. At one million ID allocations per
+second, a full counter cycle takes about 585,000 years. Wraparound is therefore
+treated as unreachable in practice, without a runtime exhaustion guard.
+Deadlines further limit stale probes in normal operation, but do not themselves
+prevent ID reuse. This is an engineering assumption, not an enforced
+non-wrapping guarantee.
 
-Read-source ownership is **not a remote DMA completion lease**. Timeout,
-cancellation or failure can remove the source waiter before an already posted
-remote READ finishes. Local owners can then release or recover the source
-without waiting for that READ. For example, while the backing storage remains
-registered:
+Planned follow-up: once Rust stabilizes `!Forget` with the required destruction
+guarantees, make borrowing request futures non-forgettable and simplify
+post-READ `msgid` validation to a direct check of the original source's waiter,
+avoiding the extra handoff to the source future. The constraint must survive
+public future wrappers and cover safe ways to skip cleanup. Every completion,
+cancellation and error path must
+synchronously revoke validation eligibility before releasing the source borrow,
+with validation ordered against revocation. READ completion must still precede
+the probe, and the same request-ID non-reuse assumption applies. This plan
+concerns `msgid` validation; inline copies still require protected source access.
+Until then, the future-driven protocol above remains required.
+
+### Cancellation, forgetting and source reuse
+
+The source borrow is **not a remote DMA completion lease**. Timeout,
+cancellation or failure can end the original request before an already posted
+remote READ finishes. Once no wrapper or future borrows the source, the caller
+can mutate or release its buffers without waiting for that READ. For example,
+while the backing storage remains registered:
 
 | Step | Source peer | Reader |
 |---|---|---|
-| 1 | Original waiter holds the immutable source. | Posts a READ. |
-| 2 | Cancels the request and reuses the released source storage. | READ may still be in flight. |
-| 3 | Original waiter is absent. | READ completes, possibly with bytes from the reused storage. |
-| 4 | Pending probe returns `false`. | Returns an error instead of a successful read result. |
+| 1 | Original request future borrows the immutable source. | Posts a READ. |
+| 2 | Cancels the request and reuses the source storage after its borrow ends. | READ may still be in flight. |
+| 3 | Original future can no longer service a probe. | READ completes, possibly with bytes from reused storage. |
+| 4 | Probe cannot return a new positive answer. | Returns an error instead of a successful read result. |
+
+Forgetting a future with safe `mem::forget` can also end the caller's borrow
+without running its cleanup. A stale waiter or control route does not grant
+source access: the forgotten future is no longer polled, so it cannot perform
+an inline copy or produce a new positive validation answer. Probe requests may
+instead wait until their deadlines, and forgotten resources can remain leaked.
+An answer produced before forgetting remains valid only for the READ batch that
+had already completed before that probe.
 
 An unsuccessful probe, including a probe RPC error, can return completed
 destinations in `RemoteIoError`. Its `recovered_buffers()`,
 `take_recovered_buffers()` and `into_parts()` expose their bytes without clearing
-them. Recovery permits
-reuse, **not acceptance as a valid transfer result**.
+them. Recovery permits reuse, **not acceptance as a valid transfer result**.
 
 This protocol assumes cooperating peers. It rejects invalid read results but
 does not prevent a failed READ from fetching bytes written after source reuse
@@ -167,7 +209,8 @@ applies on failure.
 
 RDMA `remote_write` publishes an immutable server source in a reverse
 `read_into_target` RPC. Its successful response follows the client's READ
-completions; the server retains the source while awaiting that response.
+completions; the server owns the source and borrows it into the reverse request while awaiting
+that response.
 This path does not use the `remote_read` pending probe. After reverse-RPC
 failure or cancellation, source recovery still does not prove that remote
 DMA has stopped. Recovered write destinations likewise carry no successful
