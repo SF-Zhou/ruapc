@@ -37,7 +37,7 @@ use super::{Client, ReadAttachment};
 /// ```rust,ignore
 /// // Upload and download in a single call:
 /// let (rsp, out) = client
-///     .with_read_buffers(&src_bufs)?
+///     .with_read_buffers(&src_bufs)
 ///     .with_write_buffers(dst_bufs)
 ///     .transform(&ctx, &req)
 ///     .await?
@@ -62,26 +62,20 @@ impl<'a> ClientWithBuffers<'a> {
         }
     }
 
-    #[cfg(feature = "rdma")]
-    pub(super) fn from_read_source(client: &'a Client, source: ReadSource<'a>) -> Self {
-        Self {
-            read_source: Some(source),
-            ..Self::new(client)
-        }
-    }
-
     /// Replaces the request's read space with one borrowed buffer.
-    pub fn with_read_buffer(self, buffer: &'a Buffer) -> Result<Self, Error> {
+    #[must_use]
+    pub fn with_read_buffer(self, buffer: &'a Buffer) -> Self {
         self.with_read_buffers(std::slice::from_ref(buffer))
     }
 
     /// Replaces the request's read space with borrowed buffers.
     ///
-    /// Invalid layouts return an error without taking buffer ownership. This
-    /// consuming builder drops the previous wrapper and its attachments on error.
-    pub fn with_read_buffers(mut self, buffers: &'a [Buffer]) -> Result<Self, Error> {
-        self.read_source = Some(ReadSource::try_new(buffers)?);
-        Ok(self)
+    /// Construction is infallible; requests check the region limit before
+    /// acquiring a connection or publishing the buffers.
+    #[must_use]
+    pub fn with_read_buffers(mut self, buffers: &'a [Buffer]) -> Self {
+        self.read_source = Some(ReadSource::new(buffers));
+        self
     }
 
     /// Returns an immutable view of the attached source buffers.
@@ -144,17 +138,7 @@ impl<'a> ClientWithBuffers<'a> {
             }
         };
         let had_attachment = buffers.is_some();
-        let mut target = match buffers {
-            Some(buffers) => match BufferSet::try_new(buffers) {
-                Ok(buffers) => Some(WriteTarget::new(buffers)),
-                Err(error) => {
-                    let (error, buffers) = error.into_parts();
-                    *self.write_buffers.lock().unwrap() = BufferAvailability::Available(buffers);
-                    return Err(Error::from(error).into());
-                }
-            },
-            None => None,
-        };
+        let mut target = buffers.map(BufferSet::new).map(WriteTarget::new);
         let mut returned = BufferAvailability::NotAttached;
         let result = self
             .client
@@ -304,16 +288,34 @@ mod tests {
         let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
         let client = Client::default();
         let buffers: Vec<_> = (0..=MAX_REGIONS)
-            .map(|_| ctx.state.buffer_pool.allocate(1).unwrap())
+            .map(|_| Buffer::empty(&ctx.state.buffer_pool))
             .collect();
         let pointer = buffers[0].as_ptr();
-        let error = client
+        let mut destination = ctx.state.buffer_pool.allocate(4).unwrap();
+        destination.set_len(4);
+        destination.copy_from_slice(b"keep");
+        let destination_pointer = destination.as_ptr();
+        let wrapper = client
             .with_read_buffers(&buffers)
-            .err()
-            .expect("too many regions");
+            .with_write_buffers(vec![destination]);
+        assert_eq!(wrapper.read_buffers().len(), MAX_REGIONS + 1);
+        // The context has no endpoint: attachment validation must precede
+        // connection acquisition, and preserve both borrowed and owned memory.
+        let error = wrapper.test_call(&ctx, &()).await.unwrap_err();
         assert_eq!(error.kind, ErrorKind::InvalidCopyOp);
         assert_eq!(buffers.len(), MAX_REGIONS + 1);
         assert_eq!(buffers[0].as_ptr(), pointer);
+        let recovered = wrapper.take_write_buffers().into_available().unwrap();
+        assert_eq!(recovered[0].as_ptr(), destination_pointer);
+        assert_eq!(recovered[0].as_slice(), b"keep");
+
+        // The next call must validate only the replacement attachment.
+        let wrapper = wrapper.with_read_buffer(&buffers[0]);
+        assert_eq!(wrapper.read_buffers().len(), 1);
+        assert_eq!(
+            wrapper.test_call(&ctx, &()).await.unwrap_err().kind,
+            ErrorKind::InvalidArgument
+        );
 
         let wrapper = client.with_write_buffers(buffers);
         let error = wrapper.test_call(&ctx, &()).await.unwrap_err();

@@ -1642,8 +1642,7 @@ mod tests {
             let ops = [CopyOp::new(0, 0, 64)];
             let mut other_destination = pool.allocate(64).unwrap();
             other_destination.set_len(64);
-            let other_target =
-                WriteTarget::new(BufferSet::try_new(vec![other_destination]).unwrap());
+            let other_target = WriteTarget::new(BufferSet::new(vec![other_destination]));
             let validated = CopyBatch::new(&ops).unwrap();
             let mut other_read =
                 Box::pin(peer.read_into_target(&remote, &validated, other_target, None));
@@ -1653,7 +1652,7 @@ mod tests {
             let mut destination = pool.allocate(64).unwrap();
             destination.set_len(64);
             destination.fill(0xa5);
-            let target = WriteTarget::new(BufferSet::try_new(vec![destination]).unwrap());
+            let target = WriteTarget::new(BufferSet::new(vec![destination]));
             let mut read = Box::pin(socket.read_into_target(
                 &remote,
                 &validated,
@@ -1760,7 +1759,7 @@ mod tests {
             let destination_lifetime = Arc::downgrade(&destination_pool);
             let mut destination = destination_pool.allocate(192).unwrap();
             destination.set_len(192);
-            let target = WriteTarget::new(BufferSet::try_new(vec![destination]).unwrap());
+            let target = WriteTarget::new(BufferSet::new(vec![destination]));
             drop(destination_pool);
             let validated = CopyBatch::new(&ops).unwrap();
             let mut read = Box::pin(socket.read_into_target(
@@ -1774,8 +1773,7 @@ mod tests {
 
             let mut other_destination = pool.allocate(64).unwrap();
             other_destination.set_len(64);
-            let other_target =
-                WriteTarget::new(BufferSet::try_new(vec![other_destination]).unwrap());
+            let other_target = WriteTarget::new(BufferSet::new(vec![other_destination]));
             let other_ops = [CopyOp::new(0, 0, 64)];
             let other_validated = CopyBatch::new(&other_ops).unwrap();
             let mut other_read =
@@ -1874,7 +1872,7 @@ mod tests {
         let remote = RemoteSpace::new(&regions).unwrap();
         let mut destination = pool.allocate(64).unwrap();
         destination.set_len(64);
-        let target = WriteTarget::new(BufferSet::try_new(vec![destination]).unwrap());
+        let target = WriteTarget::new(BufferSet::new(vec![destination]));
         let ops = [CopyOp::new(0, 0, 64)];
         let validated = CopyBatch::new(&ops).unwrap();
         // An expired absolute request deadline cannot post even when both
@@ -1961,7 +1959,7 @@ mod tests {
         let destination_lifetime = Arc::downgrade(&destination_pool);
         let mut destination = destination_pool.allocate(64).unwrap();
         destination.set_len(64);
-        let target = WriteTarget::new(BufferSet::try_new(vec![destination]).unwrap());
+        let target = WriteTarget::new(BufferSet::new(vec![destination]));
         drop(destination_pool);
         let ops = [CopyOp::new(0, 0, 64)];
         let validated = CopyBatch::new(&ops).unwrap();
@@ -2037,7 +2035,7 @@ mod tests {
             let remote = RemoteSpace::new(&regions).unwrap();
             let mut destination = pool.allocate(128).unwrap();
             destination.set_len(128);
-            let target = WriteTarget::new(BufferSet::try_new(vec![destination]).unwrap());
+            let target = WriteTarget::new(BufferSet::new(vec![destination]));
             let ops = [CopyOp::new(0, 0, 64), CopyOp::new(64, 64, 64)];
             let validated = CopyBatch::new(&ops).unwrap();
             let mut read =
@@ -2150,7 +2148,7 @@ mod tests {
         let remote = RemoteSpace::new(&regions).unwrap();
         let mut destination = pool.allocate(64).unwrap();
         destination.set_len(64);
-        let target = WriteTarget::new(BufferSet::try_new(vec![destination]).unwrap());
+        let target = WriteTarget::new(BufferSet::new(vec![destination]));
         let ops = [CopyOp::new(0, 0, 64)];
         let validated = CopyBatch::new(&ops).unwrap();
         let mut read = Box::pin(incoming.read_into_target(&remote, &validated, target, None));

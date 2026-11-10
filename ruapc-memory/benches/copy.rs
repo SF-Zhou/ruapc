@@ -164,12 +164,9 @@ impl Fixture {
             &segment_lengths(total, destination_regions, true),
             &vec![SENTINEL; total],
         );
+        assert_eq!(SpaceLayout::from_buffers(&source).total(), total as u64);
         assert_eq!(
-            SpaceLayout::from_buffers(&source).unwrap().total(),
-            total as u64
-        );
-        assert_eq!(
-            SpaceLayout::from_buffers(&destination).unwrap().total(),
+            SpaceLayout::from_buffers(&destination).total(),
             total as u64,
         );
         Self {
@@ -192,7 +189,7 @@ struct ReceiverTarget {
 impl ReceiverTarget {
     fn new(buffers: Vec<Buffer>) -> Self {
         Self {
-            buffers: Mutex::new(BufferSet::try_new(buffers).unwrap()),
+            buffers: Mutex::new(BufferSet::new(buffers)),
         }
     }
 
@@ -217,7 +214,7 @@ fn run_case(config: &Config, name: &str, kind: &str, mut fixture: Fixture) {
     };
     if kind.starts_with("gather") {
         if kind.contains("cached") {
-            let source = BufferSet::try_new(fixture.source).unwrap();
+            let source = BufferSet::new(fixture.source);
             assert_eq!(source.gather(&prepared).unwrap(), fixture.packed);
             config.measure(name, || {
                 drop(black_box(black_box(&source).gather(&batch()).unwrap()));
@@ -233,7 +230,7 @@ fn run_case(config: &Config, name: &str, kind: &str, mut fixture: Fixture) {
         }
     } else if kind.starts_with("scatter") {
         if kind.contains("cached") {
-            let mut destination = BufferSet::try_new(fixture.destination).unwrap();
+            let mut destination = BufferSet::new(fixture.destination);
             destination.scatter(&prepared, &fixture.packed).unwrap();
             verify_bytes(destination.buffers(), &fixture.expected_destination);
             config.measure(name, || {

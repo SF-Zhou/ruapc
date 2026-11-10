@@ -113,10 +113,14 @@ protocol.
 
 ## Application read-source validation and recovery
 
-`ReadSource<'a>` borrows an immutable `&'a [Buffer]` and caches its checked
-layout. The client wrapper borrows these buffers; ownership remains with the
-caller. The original request future handles source operations while it is
-polled. The waiter stores only a control-message route, never a source reference
+`ReadSource<'a>` borrows an immutable `&'a [Buffer]` and caches its logical
+layout. Constructing a source or attachment is infallible; the RPC checks read
+and write attachment region limits before connection acquisition and source
+publication. Local copy operations and transfer preparation validate their
+layouts before accessing bytes, including empty batches. The client wrapper
+borrows these buffers; ownership remains with the caller. The original request
+future handles source operations while it is polled. The waiter stores only a
+control-message route, never a source reference
 or address that a background CPU reader can dereference.
 
 `read_inline` accepts a request ID and logical operations, not peer-provided

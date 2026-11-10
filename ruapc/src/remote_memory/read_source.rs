@@ -200,7 +200,7 @@ mod tests {
         let (sender, mut receiver) = read_source_channel();
         let completed_read = buffers[0].to_vec();
         let completed_probe = {
-            let source = ReadSource::try_new(&buffers).unwrap();
+            let source = ReadSource::new(&buffers);
             let mut driver = Box::pin(receiver.drive(&source, pending::<()>()));
 
             // Model a completed READ followed by its own fresh probe.
@@ -228,7 +228,7 @@ mod tests {
     #[tokio::test]
     async fn inline_gather_returns_owned_bytes_and_checks_ranges() {
         let buffers = buffers();
-        let source = ReadSource::try_new(&buffers).unwrap();
+        let source = ReadSource::new(&buffers);
         let (sender, mut receiver) = read_source_channel();
         let work = async {
             assert_eq!(
@@ -250,7 +250,7 @@ mod tests {
     #[tokio::test]
     async fn business_completion_stops_confirmation_until_the_next_phase() {
         let buffers = buffers();
-        let source = ReadSource::try_new(&buffers).unwrap();
+        let source = ReadSource::new(&buffers);
         let (sender, mut receiver) = read_source_channel();
         let mut probe = Box::pin(sender.validate(deadline()));
         assert!(futures_util::poll!(probe.as_mut()).is_pending());
@@ -307,7 +307,7 @@ mod tests {
     #[tokio::test]
     async fn expired_queued_work_cannot_be_answered_when_polling_resumes() {
         let buffers = buffers();
-        let source = ReadSource::try_new(&buffers).unwrap();
+        let source = ReadSource::new(&buffers);
         let (sender, mut receiver) = read_source_channel();
         let expired = Instant::now();
         let (validate_reply, validate_response) = oneshot::channel();
@@ -345,7 +345,7 @@ mod tests {
         }
 
         let buffers = buffers();
-        let source = ReadSource::try_new(&buffers).unwrap();
+        let source = ReadSource::new(&buffers);
         for closed in [false, true] {
             let (sender, mut receiver) = read_source_channel();
             let sender = (!closed).then_some(sender);

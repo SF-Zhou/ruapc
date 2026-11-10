@@ -50,7 +50,7 @@ async fn demo_services_round_trip_over_stream_transports() {
                         *byte = (i % 251) as u8;
                     }
                     let expected = crc32c_of([&data]);
-                    let source = client.with_read_buffer(&data).unwrap();
+                    let source = client.with_read_buffer(&data);
                     let mut destinations = vec![buffer(&ctx, len)];
                     for _ in 0..3 {
                         assert_eq!(

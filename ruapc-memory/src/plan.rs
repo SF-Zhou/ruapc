@@ -27,8 +27,8 @@ pub struct SrcChunk {
 
 impl CopyBatch<'_> {
     /// Splits the batch into source-contiguous chunks with at most `max_sge`
-    /// destination slices each. Checks both actual layout bounds without
-    /// repeating structural validation. `max_sge` must be nonzero even for an
+    /// destination slices each. Checks both region limits and layout bounds
+    /// without repeating structural validation. `max_sge` must be nonzero even for an
     /// empty batch. Planning performs no transfer and conveys no DMA authority.
     pub fn plan_chunks(
         &self,
@@ -42,6 +42,8 @@ impl CopyBatch<'_> {
                 "maximum destination segments per chunk must be nonzero".into(),
             ));
         }
+        src.check_region_limit()?;
+        dst.check_region_limit()?;
         self.check_bounds(src.total(), dst.total())?;
         let mut chunks: Vec<SrcChunk> = Vec::new();
         for op in self.ops() {

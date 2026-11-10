@@ -1,10 +1,10 @@
-//! Immutable borrowed source buffers with a checked, cached layout.
+//! Immutable borrowed source buffers with a cached layout.
 
 use ruapc_bufpool::Buffer;
 
 use crate::{BufferSet, CopyBatch, MemoryResult, SpaceLayout};
 
-/// An immutable borrow of source buffers and their checked logical layout.
+/// An immutable borrow of source buffers and their cached logical layout.
 ///
 /// The borrow prevents changes to the buffers and their lengths while this
 /// source is used. It is not remote DMA completion or request-validity evidence.
@@ -13,7 +13,7 @@ use crate::{BufferSet, CopyBatch, MemoryResult, SpaceLayout};
 /// use ruapc_bufpool::Buffer;
 /// use ruapc_memory::ReadSource;
 /// fn change_length(buffers: &mut [Buffer]) {
-///     let source = ReadSource::try_new(buffers).unwrap();
+///     let source = ReadSource::new(buffers);
 ///     buffers[0].set_len(0);
 ///     assert!(!source.buffers().is_empty());
 /// }
@@ -25,7 +25,7 @@ pub struct ReadSource<'a> {
 }
 
 impl<'a> From<&'a BufferSet> for ReadSource<'a> {
-    /// Borrows an already checked set without rebuilding its layout.
+    /// Borrows a buffer set without rebuilding its layout.
     fn from(buffers: &'a BufferSet) -> Self {
         Self {
             buffers: buffers.buffers(),
@@ -35,12 +35,12 @@ impl<'a> From<&'a BufferSet> for ReadSource<'a> {
 }
 
 impl<'a> ReadSource<'a> {
-    /// Checks and caches the borrowed source layout.
-    pub fn try_new(buffers: &'a [Buffer]) -> MemoryResult<Self> {
-        Ok(Self {
+    /// Borrows sources and caches their layout. Operations check the region limit.
+    pub fn new(buffers: &'a [Buffer]) -> Self {
+        Self {
             buffers,
-            layout: SpaceLayout::from_buffers(buffers)?,
-        })
+            layout: SpaceLayout::from_buffers(buffers),
+        }
     }
 
     /// Returns an immutable view of the source buffers.
@@ -49,7 +49,7 @@ impl<'a> ReadSource<'a> {
         self.buffers
     }
 
-    /// Returns the immutable cached source layout.
+    /// Returns the immutable cached source layout; its region limit is unchecked.
     #[must_use]
     pub fn layout(&self) -> &SpaceLayout {
         &self.layout
@@ -82,7 +82,7 @@ mod tests {
                 buffer
             })
             .collect::<Vec<_>>();
-        let source = ReadSource::try_new(&buffers).unwrap();
+        let source = ReadSource::new(&buffers);
         let operations = [CopyOp::new(2, 0, 4), CopyOp::new(0, 4, 2)];
         assert_eq!(
             source

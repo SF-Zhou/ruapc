@@ -391,7 +391,7 @@ verification and per-call server allocation; MiB/s counts successful logical
 payload bytes, not network traffic. These costs differ from the reusable write
 sources in the `remote_memory` harness.
 The demo also constructs its borrowed read attachment on each call. The
-`remote_memory` harness reuses that wrapper and its checked layout, so it
+`remote_memory` harness reuses that wrapper and its cached layout, so it
 excludes attachment construction from the timed read loop.
 
 Concurrent echo and demo loads are closed-loop: each worker waits for a response

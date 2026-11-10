@@ -10,7 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - `ruapc-memory` provides logical spaces, copy validation and planning,
   synchronous CPU gather/scatter, and immutable read sources without the RPC
   runtime, an async executor or verbs. `CopyBatch` reuses structural validation;
-  `BufferSet` caches checked buffer layouts. Memory errors are converted to RPC
+  `BufferSet` caches logical buffer layouts. Memory errors are converted to RPC
   errors by `ruapc`, which retains transfer execution and completion witnesses.
   See the [memory crate guide](ruapc-memory/README.md).
 - Standalone memory planning and CPU-copy benchmarks cover fragmented spaces,
@@ -31,19 +31,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Changed
 - **BREAKING**: `with_read_buffer` and `with_read_buffers` on `Client` and
-  `ClientWithBuffers` now borrow `&Buffer` / `&[Buffer]`, validate layouts
-  immediately, and return `Result<_, Error>` using the core RPC error type.
-  Callers retain ownership of read buffers on both success and failure;
-  `ClientWithBuffers::take_read_buffers` is removed. Replacing an attachment
-  consumes the wrapper; validation failure drops it and its previous attachments.
+  `ClientWithBuffers` now borrow `&Buffer` / `&[Buffer]` and return the wrapper
+  directly. RPC calls check attachment region limits before connection
+  acquisition and report `InvalidCopyOp` through the method's existing error result.
+  Callers retain ownership of read buffers; `ClientWithBuffers::take_read_buffers`
+  is removed. Replacing an attachment consumes the wrapper and replaces the
+  borrowed source list.
   The original request future services inline reads and post-READ validation
   while polled, so forgetting that future cannot authorize new source access or a
   new positive validation. See the [source contract](docs/safe-boundaries.md#application-read-source-validation-and-recovery).
 - **BREAKING**: `ruapc-memory::ReadSource<'a>` borrows its source buffers.
-  `ReadSource::try_new` takes `&[Buffer]` instead of `Vec<Buffer>` and returns
-  `MemoryError` instead of `BufferSetError` on failure. `ReadSource::into_buffers`
-  is removed, and `From<&BufferSet>` replaces `From<BufferSet>`; callers retain
-  ownership of the borrowed buffers or buffer set.
+  `ReadSource::new(&[Buffer])` and `BufferSet::new(Vec<Buffer>)` replace their
+  fallible `try_new` constructors; `SpaceLayout::from_buffers` is also infallible.
+  Copying, planning, traversal and RPC transfer preparation enforce region
+  limits when used, including empty batches. `BufferSetError` and
+  `ReadSource::into_buffers` are removed, and `From<&BufferSet>` replaces
+  `From<BufferSet>`; callers retain ownership of borrowed sources.
 - **BREAKING**: `MsgMeta::read_regions` and `write_regions` now use
   `thin_vec::ThinVec<RemoteBufferInfo>` instead of `Vec`, reducing inline
   metadata size. Use `.into()` or iterator `.collect()` when constructing

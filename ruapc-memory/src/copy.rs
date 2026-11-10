@@ -1,4 +1,4 @@
-//! Validated copy batches and buffer sets with cached logical layouts.
+//! Copy batches with validated operations and buffer sets with cached layouts.
 
 use std::convert::Infallible;
 
@@ -131,7 +131,7 @@ impl<'a> CopyBatch<'a> {
     /// is constructed and checked before copying. For repeated copies from an
     /// owned buffer list, [`BufferSet::gather`] reuses its cached layout.
     pub fn gather(&self, source: &[Buffer]) -> MemoryResult<Vec<u8>> {
-        let layout = SpaceLayout::from_buffers(source)?;
+        let layout = SpaceLayout::from_buffers(source);
         self.gather_from_layout(&layout, source)
     }
 
@@ -143,7 +143,7 @@ impl<'a> CopyBatch<'a> {
     /// Destination gaps remain unchanged. [`BufferSet::scatter`] reuses a cached
     /// layout when the caller owns the buffers.
     pub fn scatter(&self, packed: &[u8], destination: &mut [Buffer]) -> MemoryResult<()> {
-        let layout = SpaceLayout::from_buffers(destination)?;
+        let layout = SpaceLayout::from_buffers(destination);
         self.scatter_into_layout(&layout, packed, destination)
     }
 
@@ -155,6 +155,7 @@ impl<'a> CopyBatch<'a> {
         layout: &SpaceLayout,
         source: &[Buffer],
     ) -> MemoryResult<Vec<u8>> {
+        layout.check_region_limit()?;
         self.check_source(layout.total())?;
         let mut packed = Vec::with_capacity(usize::try_from(self.byte_count)?);
         for op in self.ops {
@@ -179,6 +180,7 @@ impl<'a> CopyBatch<'a> {
         packed: &[u8],
         destination: &mut [Buffer],
     ) -> MemoryResult<()> {
+        layout.check_region_limit()?;
         self.check_destination(layout.total())?;
         if packed.len() as u64 != self.byte_count {
             return Err(MemoryError::new(
@@ -212,7 +214,7 @@ impl<'a> CopyBatch<'a> {
     }
 }
 
-/// Owned buffers with a logical layout derived and checked at construction.
+/// Owned buffers with a cached logical layout derived at construction.
 ///
 /// Shared access exposes immutable buffers. CPU writes go through checked batch
 /// operations, which cannot change buffer lengths. Recovering mutable buffer
@@ -231,15 +233,13 @@ pub struct BufferSet {
 }
 
 impl BufferSet {
-    /// Checks the buffers' logical layout, preserving all buffers on failure.
-    pub fn try_new(buffers: Vec<Buffer>) -> Result<Self, BufferSetError> {
-        match SpaceLayout::from_buffers(&buffers) {
-            Ok(layout) => Ok(Self { buffers, layout }),
-            Err(error) => Err(BufferSetError { error, buffers }),
-        }
+    /// Takes ownership and caches the layout. Operations check the region limit.
+    pub fn new(buffers: Vec<Buffer>) -> Self {
+        let layout = SpaceLayout::from_buffers(&buffers);
+        Self { buffers, layout }
     }
 
-    /// Returns the immutable cached logical layout.
+    /// Returns the immutable cached logical layout; its region limit is unchecked.
     #[must_use]
     pub fn layout(&self) -> &SpaceLayout {
         &self.layout
@@ -257,46 +257,16 @@ impl BufferSet {
         self.buffers
     }
 
-    /// Gathers a batch while reusing the checked layout.
+    /// Checks the region limit and gathers a batch using the cached layout.
     pub fn gather(&self, batch: &CopyBatch<'_>) -> MemoryResult<Vec<u8>> {
         batch.gather_from_layout(&self.layout, &self.buffers)
     }
 
-    /// Scatters a batch while reusing the checked layout.
+    /// Checks the region limit and scatters a batch using the cached layout.
     pub fn scatter(&mut self, batch: &CopyBatch<'_>, packed: &[u8]) -> MemoryResult<()> {
         batch.scatter_into_layout(&self.layout, packed, &mut self.buffers)
     }
 }
-
-/// A buffer-set construction failure retaining the original owned buffers.
-#[derive(Debug)]
-pub struct BufferSetError {
-    /// The layout validation failure.
-    pub error: MemoryError,
-    buffers: Vec<Buffer>,
-}
-
-impl BufferSetError {
-    /// Borrows the buffers that could not form a valid set.
-    #[must_use]
-    pub fn buffers(&self) -> &[Buffer] {
-        &self.buffers
-    }
-
-    /// Returns the validation error and every original buffer in original order.
-    #[must_use]
-    pub fn into_parts(self) -> (MemoryError, Vec<Buffer>) {
-        (self.error, self.buffers)
-    }
-}
-
-impl std::fmt::Display for BufferSetError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.error.fmt(f)
-    }
-}
-
-impl std::error::Error for BufferSetError {}
 
 fn validate_structure(ops: &[CopyOp]) -> MemoryResult<(u64, u64, u64)> {
     if ops.len() > MAX_COPY_OPS {

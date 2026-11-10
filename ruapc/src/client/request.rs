@@ -96,6 +96,15 @@ impl Client {
             .into());
         }
 
+        // Builders only attach buffers. Validate both spaces before connection
+        // acquisition, bandwidth admission, or waiter/source publication.
+        if let Some(source) = read_attachment.source {
+            source.layout().check_region_limit().map_err(Error::from)?;
+        }
+        if let Some(target) = write_target.as_ref() {
+            target.check_region_limit()?;
+        }
+
         let mut sent = self
             .send_with_retries(
                 ctx,
@@ -336,8 +345,8 @@ mod tests {
                 buffer
             })
             .collect::<Vec<_>>();
-        let source = ReadSource::try_new(&buffers).unwrap();
-        let empty = ReadSource::try_new(&[]).unwrap();
+        let source = ReadSource::new(&buffers);
+        let empty = ReadSource::new(&[]);
 
         for (source, charge_bytes, expected) in [
             (None, None, 0),
@@ -380,7 +389,7 @@ mod tests {
         buffer.set_len(4);
         buffer.copy_from_slice(b"read");
         let route = {
-            let source = ReadSource::try_new(std::slice::from_ref(&buffer)).unwrap();
+            let source = ReadSource::new(std::slice::from_ref(&buffer));
             let mut target = None;
             let mut request = Box::pin(client.ruapc_request::<(), (), Error>(
                 &ctx,
@@ -439,7 +448,7 @@ mod tests {
         buffer.set_len(4);
         buffer.copy_from_slice(b"read");
         {
-            let source = ReadSource::try_new(std::slice::from_ref(&buffer)).unwrap();
+            let source = ReadSource::new(std::slice::from_ref(&buffer));
             let mut target = None;
             let mut request = Box::pin(client.ruapc_request::<(), (), Error>(
                 &ctx,
@@ -485,7 +494,7 @@ mod tests {
         buffer.set_len(4);
         buffer.copy_from_slice(b"read");
         let buffers = [buffer];
-        let source = ReadSource::try_new(&buffers).unwrap();
+        let source = ReadSource::new(&buffers);
         let client = Client {
             max_retries: 2,
             ..Default::default()

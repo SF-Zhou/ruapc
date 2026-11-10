@@ -5,9 +5,7 @@ mod with_buffers;
 
 pub use with_buffers::ClientWithBuffers;
 
-#[cfg(feature = "rdma")]
-use crate::remote_memory::ReadSource;
-use crate::{Buffer, Error};
+use crate::Buffer;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -68,17 +66,10 @@ impl Default for Client {
 }
 
 impl Client {
-    #[cfg(feature = "rdma")]
-    pub(crate) fn with_read_source<'a>(&'a self, source: ReadSource<'a>) -> ClientWithBuffers<'a> {
-        ClientWithBuffers::from_read_source(self, source)
-    }
-
     /// Creates a [`ClientWithBuffers`] wrapper attaching one *read* buffer
     /// to requests; see [`with_read_buffers`](Self::with_read_buffers).
-    pub fn with_read_buffer<'a>(
-        &'a self,
-        buffer: &'a Buffer,
-    ) -> Result<ClientWithBuffers<'a>, Error> {
+    #[must_use]
+    pub fn with_read_buffer<'a>(&'a self, buffer: &'a Buffer) -> ClientWithBuffers<'a> {
         ClientWithBuffers::new(self).with_read_buffer(buffer)
     }
 
@@ -94,17 +85,16 @@ impl Client {
     /// remain owned by the caller and can be reused once the borrow ends.
     /// This does not prove remote DMA completion after cancellation or failure;
     /// see [`Context::remote_read`](crate::Context::remote_read).
-    /// Invalid attachments return an [`Error`] without taking buffer ownership.
+    /// Attachment construction is infallible. Requests validate the region
+    /// limit before acquiring a connection or publishing the buffers.
     ///
     /// # Examples
     ///
     /// ```rust,ignore
-    /// let rsp = client.with_read_buffers(&bufs)?.upload(&ctx, &req).await?;
+    /// let rsp = client.with_read_buffers(&bufs).upload(&ctx, &req).await?;
     /// ```
-    pub fn with_read_buffers<'a>(
-        &'a self,
-        buffers: &'a [Buffer],
-    ) -> Result<ClientWithBuffers<'a>, Error> {
+    #[must_use]
+    pub fn with_read_buffers<'a>(&'a self, buffers: &'a [Buffer]) -> ClientWithBuffers<'a> {
         ClientWithBuffers::new(self).with_read_buffers(buffers)
     }
 

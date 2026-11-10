@@ -103,7 +103,6 @@ async fn packed_copies_keep_operation_order_holes_and_empty_segments_on_stream_t
             destination.iter().map(|buffer| buffer.as_ptr()).collect();
         let attached = client
             .with_read_buffers(&source)
-            .unwrap()
             .with_write_buffers(destination);
         let (read, written) = attached.exchange(&ctx, &()).await.unwrap().into_parts();
         let written = written.into_available().expect("destinations available");

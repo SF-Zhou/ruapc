@@ -182,7 +182,7 @@ async fn bench_read(
 ) {
     let buffers = make_buffers(&ctx.state.buffer_pool, expected);
     let client = Client::default();
-    let source = client.with_read_buffers(&buffers).unwrap();
+    let source = client.with_read_buffers(&buffers);
     for _ in 0..warmup {
         assert_eq!(source.read_all(ctx, req).await.unwrap(), expected.len());
     }

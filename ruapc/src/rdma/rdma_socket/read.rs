@@ -283,14 +283,12 @@ impl RdmaSocket {
             .await
         {
             Ok(buffers) => {
-                target.restore(BufferSet::try_new(buffers).expect("READ preserves buffer layout"));
+                target.restore(BufferSet::new(buffers));
                 Ok(())
             }
             Err(mut error) => {
                 if let Some(buffers) = error.take_recovered_buffers() {
-                    target.restore(
-                        BufferSet::try_new(buffers).expect("READ preserves buffer layout"),
-                    );
+                    target.restore(BufferSet::new(buffers));
                 }
                 Err(error.into())
             }
@@ -557,11 +555,7 @@ mod timeout_tests {
             let mut source = context.state.buffer_pool.allocate(64).unwrap();
             source.set_len(64);
             source.fill(0x5a);
-            client
-                .with_read_buffer(&source)
-                .unwrap()
-                .read(&context, &())
-                .await
+            client.with_read_buffer(&source).read(&context, &()).await
         });
 
         // The outer client's own Timeout is not evidence that its handler exited.
@@ -793,7 +787,7 @@ mod borrowed_source_tests {
         let mut source = context.state.buffer_pool.allocate(CONTENTS.len()).unwrap();
         source.set_len(CONTENTS.len());
         source.copy_from_slice(CONTENTS);
-        let attached = client.with_read_buffer(&source).unwrap();
+        let attached = client.with_read_buffer(&source);
         let mut call = Box::pin(attached.read_and_report(&context, &()));
         let request_id = tokio::time::timeout(TEST_TIMEOUT, async {
             tokio::select! {

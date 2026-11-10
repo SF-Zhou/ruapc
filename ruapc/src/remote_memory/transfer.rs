@@ -24,13 +24,6 @@ pub(crate) struct Transfer<'ctx, 'ops> {
     pub(crate) local: BufferSet,
 }
 
-fn buffer_set(local: Vec<Buffer>) -> std::result::Result<BufferSet, RemoteIoError> {
-    BufferSet::try_new(local).map_err(|error| {
-        let (error, buffers) = error.into_parts();
-        RemoteIoError::new(error.into(), Some(buffers))
-    })
-}
-
 fn connection(ctx: &Context) -> Result<&Socket> {
     match &ctx.endpoint {
         ContextEndpoint::Connected(socket) => Ok(socket),
@@ -50,6 +43,7 @@ impl<'ctx, 'ops> Transfer<'ctx, 'ops> {
         direction: Direction,
     ) -> std::result::Result<Self, RemoteIoError> {
         let validation = (|| {
+            local.layout().check_region_limit()?;
             let socket = connection(ctx)?;
             let remote = remote?;
             let ops = CopyBatch::new(ops)?;
@@ -124,7 +118,7 @@ pub(super) async fn read(
         ctx,
         ctx.remote_read_space(),
         ops,
-        buffer_set(local)?,
+        BufferSet::new(local),
         Direction::Read,
     )?)
     .execute()
@@ -140,7 +134,7 @@ pub(super) async fn write(
         ctx,
         ctx.remote_write_space(),
         ops,
-        buffer_set(local)?,
+        BufferSet::new(local),
         Direction::Write,
     )?)
     .execute()
@@ -168,7 +162,7 @@ pub(super) async fn read_all(ctx: &Context) -> Result<Vec<Buffer>> {
         ctx,
         Ok(remote),
         &ops,
-        buffer_set(local)?,
+        BufferSet::new(local),
         Direction::Read,
     )?)
     .execute()
@@ -179,7 +173,7 @@ pub(super) async fn write_all(
     ctx: &Context,
     local: Vec<Buffer>,
 ) -> std::result::Result<WriteReceipt, RemoteIoError> {
-    let local = buffer_set(local)?;
+    let local = BufferSet::new(local);
     let ops = [CopyOp::new(0, 0, local.layout().total())];
     PreparedWrite(Transfer::prepare(
         ctx,

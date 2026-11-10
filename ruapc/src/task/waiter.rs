@@ -362,8 +362,7 @@ mod tests {
             Completion::Expiry,
         ] {
             // This owner stands in for the caller's client wrapper.
-            let target =
-                WriteTarget::new(BufferSet::try_new(vec![pool.allocate(16).unwrap()]).unwrap());
+            let target = WriteTarget::new(BufferSet::new(vec![pool.allocate(16).unwrap()]));
             let waiter = Waiter::default();
             let (msgid, receiver) = waiter.alloc(Duration::from_secs(1));
             let conn_id = next_conn_id();
@@ -461,7 +460,7 @@ mod tests {
         // Bind a write target while the request is pending.
         let mut buf = pool.allocate(1024 * 1024).unwrap();
         buf.set_len(5);
-        let target = WriteTarget::new(BufferSet::try_new(vec![buf]).unwrap());
+        let target = WriteTarget::new(BufferSet::new(vec![buf]));
         waiter.bind_write_target(msgid, target);
 
         // A handler-side clone writes into the target.
@@ -485,10 +484,7 @@ mod tests {
         let (msgid, rx) = waiter.alloc(std::time::Duration::from_secs(30));
         let mut buf = pool.allocate(1024 * 1024).unwrap();
         buf.set_len(1);
-        waiter.bind_write_target(
-            msgid,
-            WriteTarget::new(BufferSet::try_new(vec![buf]).unwrap()),
-        );
+        waiter.bind_write_target(msgid, WriteTarget::new(BufferSet::new(vec![buf])));
 
         // Drop receiver (simulates timeout cleanup).
         drop(rx);
