@@ -7,6 +7,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 ## [Unreleased]
 
 ### Added
+- `ClientWithBuffers::wait_for_write_buffers(grace)` optionally waits for a
+  READ that still owns the attached write destinations when a call ends. If
+  they remain unavailable after the grace period, it closes the shared
+  connection (and its QP) and waits without a time limit for safe buffer
+  recovery, preserving the RPC result. The guarantee requires polling the call
+  to completion; see
+  [waiting for write destinations](docs/remote-memory.md#wait-for-write-destinations).
+- `ruapc-rdma::QueuePair::prepare_recoverable_reads` provides separate
+  `ReadStatus` and `ReadRecovery` futures. Early failure notification is
+  independent of destination recovery, which waits for CQ-issued completion
+  evidence or successful provider QP destruction, including failed transfers.
 - `ruapc-memory` provides logical spaces, copy validation and planning,
   synchronous CPU gather/scatter, and immutable read sources without the RPC
   runtime, an async executor or verbs. `CopyBatch` reuses structural validation;
@@ -30,6 +41,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   APIs.
 
 ### Changed
+- **BREAKING**: Write destinations follow one recovery rule on every call. When
+  a call ends, with any result, its write target is sealed against reverse
+  handlers that still hold it, and the set is returned unless an RDMA READ
+  still owns it. A set no longer becomes unavailable because a stale handler
+  shares the target, and a READ that failed or was cancelled returns its
+  settled destinations to the target. Successful plain `Result<T, E>` calls no
+  longer drop the set: like errors, they leave it in the wrapper for
+  `take_write_buffers()`, where a later call on the same wrapper reattaches it.
+  Every READ into client write destinations uses
+  `prepare_recoverable_reads`. `Waiter` responses no longer carry the write
+  target.
 - **BREAKING**: `with_read_buffer` and `with_read_buffers` on `Client` and
   `ClientWithBuffers` now borrow `&Buffer` / `&[Buffer]` and return the wrapper
   directly. RPC calls check attachment region limits before connection

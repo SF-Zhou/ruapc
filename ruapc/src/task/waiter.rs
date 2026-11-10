@@ -10,14 +10,9 @@ use crate::{
     remote_memory::{ReadSourceSender, WriteTarget},
 };
 
-/// The response sent through the waiter channel: the RPC response message
-/// plus the request's pinned write target (when the client attached write
-/// buffers), delivered atomically.
-pub type WaiterResponse = (Message, Option<Arc<WriteTarget>>);
-
 /// The result delivered through the waiter channel: either a response, or an
 /// eager error (e.g. the connection carrying the request was closed).
-pub(crate) type WaiterResult = std::result::Result<WaiterResponse, Error>;
+pub(crate) type WaiterResult = std::result::Result<Message, Error>;
 
 /// Allocates a process-wide unique connection id.
 ///
@@ -34,11 +29,10 @@ struct WaiterEntry {
     /// Routes source operations to the borrowing request future. This carries
     /// no buffer references and cannot itself confirm source validity.
     read_source: Option<ReadSourceSender>,
-    /// Destination target shared with reverse-RPC writers and returned with
-    /// the response. During RDMA, the QP owns its buffers and the target is empty.
+    /// Destination target shared with reverse-RPC writers; the original call
+    /// keeps its own reference. During a READ, the QP owns the target's buffers.
     write_target: Option<Arc<WriteTarget>>,
-    /// Drop memory holds before waking a receiver on expiry or failure. On
-    /// successful post the destination instead moves into the response.
+    /// Drop memory holds before waking the receiver on every completion path.
     sender: oneshot::Sender<WaiterResult>,
     /// Id of the connection the request was sent on (see
     /// [`Waiter::bind_connection`]); used by [`Waiter::fail_connection`] to
@@ -57,8 +51,8 @@ struct WaiterEntry {
 /// Assigns message IDs and stores one response channel per pending request.
 ///
 /// A request's pinned write target (attached via `bind_write_target`) is
-/// stored alongside the channel sender and delivered together with the
-/// response message when `post` is called, ensuring atomicity.
+/// stored alongside the channel sender, so reverse-RPC handlers can reach it
+/// exactly as long as the request is pending.
 #[derive(Default)]
 pub struct Waiter {
     index: AtomicU64,
@@ -165,14 +159,15 @@ impl Waiter {
 
     /// Posts a response message to the waiting receiver.
     ///
-    /// Removes the entry from the map and sends the response message along
-    /// with the request's pinned write target, if any.
+    /// Removes the entry from the map, releasing its memory holds, and sends
+    /// the response message.
     ///
     /// If no waiter is found (e.g., because of timeout), a warning is logged.
     pub fn post(&self, msgid: u64, result: Message) {
         if let Some((_, entry)) = self.id_map.remove(&msgid) {
             drop(entry.read_source);
-            let _ = entry.sender.send(Ok((result, entry.write_target)));
+            drop(entry.write_target);
+            let _ = entry.sender.send(Ok(result));
         } else {
             tracing::warn!("Waiter post failed for msgid: {}", msgid);
         }
@@ -386,15 +381,10 @@ mod tests {
                 Completion::Expiry => waiter.expire(Instant::now() + Duration::from_secs(2)),
             }
 
-            // Success transfers the destination into the queued response.
-            // Both failure paths must release it before waking the caller.
-            let expected_target_holds = match completion {
-                Completion::Response => 2,
-                Completion::ConnectionFailure | Completion::Expiry => 1,
-            };
+            // Every path must release the waiter's hold before waking the caller.
             assert_eq!(
                 *observation.at_wake.lock().unwrap(),
-                [expected_target_holds],
+                [1],
                 "{completion:?} woke before releasing its memory holds"
             );
             let Poll::Ready(result) = receiving.as_mut().poll(&mut context) else {
@@ -402,8 +392,7 @@ mod tests {
             };
             match completion {
                 Completion::Response => {
-                    let (_, returned) = result.unwrap();
-                    assert!(Arc::ptr_eq(&returned.unwrap(), &target));
+                    result.unwrap();
                 }
                 Completion::ConnectionFailure => {
                     assert_eq!(result.unwrap_err().kind, ErrorKind::ConnectionClosed);
@@ -433,9 +422,8 @@ mod tests {
             })
         };
 
-        let (msg, write_buf) = rx.recv().await.unwrap();
+        let msg = rx.recv().await.unwrap();
         assert_eq!(msg.meta.method, "dummy");
-        assert!(write_buf.is_none());
         handle.await.unwrap();
 
         let (msgid, rx) = msg_waiter.alloc(std::time::Duration::from_secs(30));
@@ -451,7 +439,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_waiter_write_target_delivery() {
+    async fn test_waiter_write_target_is_reachable_while_pending() {
         let pool = ruapc_bufpool::BufferPoolBuilder::new(Vec::new()).build();
 
         let waiter = Waiter::default();
@@ -461,18 +449,19 @@ mod tests {
         let mut buf = pool.allocate(1024 * 1024).unwrap();
         buf.set_len(5);
         let target = WriteTarget::new(BufferSet::new(vec![buf]));
-        waiter.bind_write_target(msgid, target);
+        waiter.bind_write_target(msgid, target.clone());
 
         // A handler-side clone writes into the target.
         let handler_clone = waiter.write_target(msgid).expect("target must be visible");
         handler_clone.copy_in(0, b"hello").unwrap();
         drop(handler_clone);
 
-        // Post the response; the target is delivered atomically with it.
+        // Posting the response removes the entry and its hold on the target.
         waiter.post(msgid, Message::default());
-        let (_msg, target) = rx.recv().await.unwrap();
-        let buffers =
-            WriteTarget::try_into_buffers(target.expect("expected write target")).unwrap();
+        rx.recv().await.unwrap();
+        assert!(waiter.write_target(msgid).is_none());
+        assert_eq!(Arc::strong_count(&target), 1);
+        let buffers = target.seal(None).await.unwrap();
         assert_eq!(&buffers[0][..], b"hello");
     }
 

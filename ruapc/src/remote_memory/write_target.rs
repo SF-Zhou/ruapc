@@ -1,38 +1,78 @@
-//! RPC-owned destination checkout around a buffer set with a cached layout.
+//! RPC-owned write destinations shared by a call and its reverse-RPC handlers.
 
-use std::sync::{Arc, Mutex};
+#[cfg(feature = "rdma")]
+use std::sync::Weak;
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use ruapc_bufpool::RemoteBufferInfo;
 #[cfg(feature = "rdma")]
 use ruapc_memory::SpaceLayout;
 use ruapc_memory::{BufferSet, CopyBatch};
+#[cfg(feature = "rdma")]
+use ruapc_rdma::ReadRecovery;
 use thin_vec::ThinVec;
 
 #[cfg(test)]
 use crate::CopyOp;
+#[cfg(feature = "rdma")]
+use crate::rdma::RdmaSocket;
 use crate::{Buffer, Error, ErrorKind, Result, Socket};
 
-/// The owned destination shared by the original waiter and reverse-RPC handlers.
+/// The owned destination shared by the original call and reverse-RPC handlers.
 ///
-/// CPU copies borrow the complete set under one mutex. RDMA checkout removes
-/// the set and leaves the target unavailable until settled buffers return from
-/// the dependency. Request expiry, cancellation and ERR state do not authorize
-/// restoring buffers still owned by DMA. Failed transfers may leave no set to
-/// recover, even after the QP eventually recycles its buffers.
+/// CPU copies borrow the complete set under one mutex. An RDMA READ moves the
+/// set into its plan and leaves the receiver that returns it once DMA has
+/// settled, whatever the transfer's result. Request expiry, cancellation and
+/// ERR state never return buffers. The original call finally seals the target,
+/// which revokes every handler still holding a reference.
 #[derive(Debug)]
 pub(crate) struct WriteTarget {
-    buffers: Mutex<Option<BufferSet>>,
-    /// The advertised logical length remains available during DMA checkout.
+    destinations: Mutex<Destinations>,
+    /// The advertised logical length remains available during a READ.
     total_len: u64,
+}
+
+#[derive(Debug)]
+enum Destinations {
+    Available(BufferSet),
+    /// A READ plan on `socket` owns the set until `recovery` returns it.
+    #[cfg(feature = "rdma")]
+    Reading {
+        recovery: ReadRecovery,
+        socket: Weak<RdmaSocket>,
+    },
+    /// The original call took the set or its recovery; writers are revoked.
+    Sealed,
+}
+
+impl Destinations {
+    /// Borrows the set, first restoring one whose READ has settled.
+    fn available(&mut self) -> Result<&mut BufferSet> {
+        #[cfg(feature = "rdma")]
+        if let Self::Reading { recovery, .. } = self
+            && let Some(buffers) = recovery.try_recv()
+        {
+            *self = Self::Available(BufferSet::new(buffers));
+        }
+        match self {
+            Self::Available(buffers) => Ok(buffers),
+            _ => Err(Error::new(
+                ErrorKind::BuffersInUse,
+                "write target buffers are unavailable".into(),
+            )),
+        }
+    }
 }
 
 impl WriteTarget {
     /// Installs a destination set; the request validates it before publication.
     pub fn new(buffers: BufferSet) -> Arc<Self> {
-        let total_len = buffers.layout().total();
         Arc::new(Self {
-            buffers: Mutex::new(Some(buffers)),
-            total_len,
+            total_len: buffers.layout().total(),
+            destinations: Mutex::new(Destinations::Available(buffers)),
         })
     }
 
@@ -42,55 +82,14 @@ impl WriteTarget {
 
     /// Checks the attached destination space before the request publishes it.
     pub fn check_region_limit(&self) -> Result<()> {
-        let buffers = self.buffers.lock().unwrap();
-        Ok(buffers
-            .as_ref()
-            .ok_or_else(Self::busy)?
-            .layout()
-            .check_region_limit()?)
+        let mut destinations = self.destinations.lock().unwrap();
+        Ok(destinations.available()?.layout().check_region_limit()?)
     }
 
     /// Exports available destinations for the selected transport while locked.
     pub fn export_regions(&self, socket: &Socket) -> Result<ThinVec<RemoteBufferInfo>> {
-        let buffers = self.buffers.lock().unwrap();
-        socket.export_regions(buffers.as_ref().ok_or_else(Self::busy)?.buffers())
-    }
-
-    /// Plans against the available set's layout, then removes the whole set
-    /// under the same lock, excluding CPU copies and competing DMA. Planning
-    /// is synchronous; an error leaves the original buffers available.
-    #[cfg(feature = "rdma")]
-    pub fn checkout<R>(
-        &self,
-        plan: impl FnOnce(&SpaceLayout) -> Result<R>,
-    ) -> Result<(R, BufferSet)> {
-        let mut slot = self.buffers.lock().unwrap();
-        let buffers = slot.as_ref().ok_or_else(Self::busy)?;
-        let planned = plan(buffers.layout())?;
-        let buffers = slot
-            .take()
-            .expect("write target remains available while locked");
-        Ok((planned, buffers))
-    }
-
-    /// Restores owned buffers returned by a settled transfer or a pre-post error.
-    #[cfg(feature = "rdma")]
-    pub fn restore(&self, buffers: BufferSet) {
-        assert_eq!(
-            buffers.layout().total(),
-            self.total_len,
-            "restored write target length changed"
-        );
-        let mut slot = self.buffers.lock().unwrap();
-        assert!(slot.is_none(), "write target already contains buffers");
-        *slot = Some(buffers);
-    }
-
-    fn busy() -> Error {
-        Error::new(
-            ErrorKind::BuffersInUse,
-            "write target buffers are unavailable".into(),
-        )
+        let mut destinations = self.destinations.lock().unwrap();
+        socket.export_regions(destinations.available()?.buffers())
     }
 
     /// Validates destination bounds and packed length before any target access.
@@ -111,9 +110,8 @@ impl WriteTarget {
         if batch.byte_count() == 0 {
             return Ok(());
         }
-        let mut buffers = self.buffers.lock().unwrap();
-        let buffers = buffers.as_mut().ok_or_else(Self::busy)?;
-        Ok(buffers.scatter(batch, bytes)?)
+        let mut destinations = self.destinations.lock().unwrap();
+        Ok(destinations.available()?.scatter(batch, bytes)?)
     }
 
     #[cfg(test)]
@@ -122,12 +120,87 @@ impl WriteTarget {
         self.copy_inline(&CopyBatch::new(&operations)?, data)
     }
 
-    /// Returns available destinations only when no waiter or handler shares them.
-    pub fn try_into_buffers(this: Arc<Self>) -> Option<Vec<Buffer>> {
-        Arc::try_unwrap(this)
-            .ok()
-            .and_then(|target| target.buffers.into_inner().unwrap())
-            .map(BufferSet::into_buffers)
+    /// Plans a READ against the available set's layout without taking it.
+    ///
+    /// The layout never changes: a READ always returns the original vector.
+    /// A plan therefore stays valid until [`Self::start_read`] takes the set,
+    /// which fails if a competing READ or the sealing call got there first.
+    #[cfg(feature = "rdma")]
+    pub fn plan_read<T>(&self, plan: impl FnOnce(&SpaceLayout) -> Result<T>) -> Result<T> {
+        let mut destinations = self.destinations.lock().unwrap();
+        plan(destinations.available()?.layout())
+    }
+
+    /// Moves the whole set into a READ plan under one lock, excluding CPU
+    /// copies and competing READs until its recovery returns the set.
+    ///
+    /// `prepare` is synchronous. Its error returns every buffer, which leaves
+    /// the target available. A prepared plan leaves `recovery` here, so the
+    /// set comes back after settlement even if the reading handler is gone.
+    /// `socket` is the connection to close when the original call stops
+    /// waiting for that READ.
+    #[cfg(feature = "rdma")]
+    pub fn start_read<T>(
+        &self,
+        socket: Weak<RdmaSocket>,
+        prepare: impl FnOnce(BufferSet) -> std::result::Result<(T, ReadRecovery), (Error, Vec<Buffer>)>,
+    ) -> Result<T> {
+        let mut destinations = self.destinations.lock().unwrap();
+        destinations.available()?;
+        let Destinations::Available(buffers) =
+            std::mem::replace(&mut *destinations, Destinations::Sealed)
+        else {
+            unreachable!("the set was available under this lock");
+        };
+        match prepare(buffers) {
+            Ok((prepared, recovery)) => {
+                *destinations = Destinations::Reading { recovery, socket };
+                Ok(prepared)
+            }
+            Err((error, buffers)) => {
+                *destinations = Destinations::Available(BufferSet::new(buffers));
+                Err(error)
+            }
+        }
+    }
+
+    /// Revokes every writer for good and returns the complete original set.
+    ///
+    /// A set held by a READ is unavailable without a grace period. With one,
+    /// this waits for the READ to settle, closes its connection if the grace
+    /// expires first, and then keeps waiting without a deadline: neither the
+    /// timer nor ERR state proves that DMA has stopped. Waiting holds only a
+    /// weak connection reference, so it cannot delay QP destruction.
+    /// Cancellation leaves the set with the READ, which then releases it.
+    #[cfg_attr(not(feature = "rdma"), allow(unused_variables))]
+    pub async fn seal(&self, grace: Option<Duration>) -> Option<Vec<Buffer>> {
+        let taken = std::mem::replace(
+            &mut *self.destinations.lock().unwrap(),
+            Destinations::Sealed,
+        );
+        match taken {
+            Destinations::Available(buffers) => Some(buffers.into_buffers()),
+            #[cfg(feature = "rdma")]
+            Destinations::Reading {
+                mut recovery,
+                socket,
+            } => {
+                // The recovery is checked only here, after the target is
+                // sealed: a READ that has settled by now returns the set with
+                // or without a grace period, and no other access can race it.
+                let Some(grace) = grace else {
+                    return recovery.try_recv();
+                };
+                if let Ok(buffers) = tokio::time::timeout(grace, &mut recovery).await {
+                    return Some(buffers);
+                }
+                if let Some(socket) = socket.upgrade() {
+                    socket.set_error();
+                }
+                Some(recovery.await)
+            }
+            Destinations::Sealed => None,
+        }
     }
 }
 
@@ -136,86 +209,163 @@ mod tests {
     use super::*;
     use crate::BufferPool;
 
+    fn new_target(pool: &Arc<BufferPool>, contents: &[&[u8]]) -> Arc<WriteTarget> {
+        let buffers = contents
+            .iter()
+            .map(|bytes| {
+                let mut buffer = pool.allocate(bytes.len()).unwrap();
+                buffer.set_len(bytes.len());
+                buffer.copy_from_slice(bytes);
+                buffer
+            })
+            .collect();
+        WriteTarget::new(BufferSet::new(buffers))
+    }
+
     fn pool() -> Arc<BufferPool> {
         ruapc_bufpool::BufferPoolBuilder::new(Vec::new()).build()
     }
 
-    #[test]
-    fn test_copy_in_spans_buffers() {
-        let pool = pool();
-        let mut a = pool.allocate(64 * 1024).unwrap();
-        let mut b = pool.allocate(64 * 1024).unwrap();
-        a.set_len(4);
-        b.set_len(4);
-        let target = WriteTarget::new(BufferSet::new(vec![a, b]));
+    #[tokio::test]
+    async fn copy_in_spans_buffers() {
+        let target = new_target(&pool(), &[b"....", b"...."]);
         assert_eq!(target.total_len(), 8);
         target.copy_in(2, b"wxyz").unwrap();
-        let buffers = WriteTarget::try_into_buffers(target).unwrap();
-        assert_eq!(&buffers[0][2..4], b"wx");
-        assert_eq!(&buffers[1][..2], b"yz");
+        let buffers = target.seal(None).await.unwrap();
+        assert_eq!(buffers[0].as_slice(), b"..wx");
+        assert_eq!(buffers[1].as_slice(), b"yz..");
     }
 
-    #[test]
-    fn test_try_into_buffers_requires_uniqueness() {
-        let pool = pool();
-        let mut a = pool.allocate(64 * 1024).unwrap();
-        a.set_len(1);
-        let target = WriteTarget::new(BufferSet::new(vec![a]));
-        let clone = target.clone();
-        assert!(WriteTarget::try_into_buffers(target).is_none());
-        assert!(WriteTarget::try_into_buffers(clone).is_some());
+    #[tokio::test]
+    async fn sealing_returns_the_set_and_revokes_stale_handlers() {
+        let target = new_target(&pool(), &[b"keep"]);
+        let stale_handler = target.clone();
+        let buffers = target.seal(Some(Duration::ZERO)).await.unwrap();
+        assert_eq!(
+            stale_handler.copy_in(0, b"late").unwrap_err().kind,
+            ErrorKind::BuffersInUse
+        );
+        #[cfg(feature = "rdma")]
+        {
+            // A READ planned before the seal cannot take the set afterwards.
+            assert_eq!(
+                stale_handler
+                    .plan_read::<()>(|_| panic!("sealed targets plan no READ"))
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::BuffersInUse
+            );
+            assert_eq!(
+                stale_handler
+                    .start_read::<()>(Weak::new(), |_| panic!("sealed targets start no READ"))
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::BuffersInUse
+            );
+        }
+        assert_eq!(buffers[0].as_slice(), b"keep");
+        assert!(stale_handler.seal(None).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn sealing_preserves_an_attached_empty_set() {
+        for grace in [None, Some(Duration::ZERO)] {
+            let target = WriteTarget::new(BufferSet::new(Vec::new()));
+            assert!(target.seal(grace).await.unwrap().is_empty());
+        }
     }
 
     #[cfg(feature = "rdma")]
-    #[test]
-    fn failed_planning_preserves_the_complete_target() {
-        let pool = pool();
-        let mut a = pool.allocate(4).unwrap();
-        let mut b = pool.allocate(4).unwrap();
-        a.set_len(4);
-        b.set_len(4);
-        a.copy_from_slice(b"keep");
-        b.copy_from_slice(b"both");
-        let pointers = [a.as_ptr(), b.as_ptr()];
-        let target = WriteTarget::new(BufferSet::new(vec![a, b]));
+    #[tokio::test]
+    async fn failed_planning_or_preparation_preserves_the_complete_target() {
+        let target = new_target(&pool(), &[b"keep", b"both"]);
         let error = target
-            .checkout::<()>(|layout| {
+            .plan_read::<()>(|layout| {
                 assert_eq!(layout.total(), 8);
                 Err(Error::kind(ErrorKind::InvalidCopyOp))
             })
             .unwrap_err();
         assert_eq!(error.kind, ErrorKind::InvalidCopyOp);
-        let buffers = WriteTarget::try_into_buffers(target).unwrap();
-        assert_eq!(buffers.len(), 2);
-        assert_eq!(buffers[0].as_ptr(), pointers[0]);
-        assert_eq!(buffers[1].as_ptr(), pointers[1]);
-        assert_eq!(buffers[0].as_slice(), b"keep");
+        let error = target
+            .start_read::<()>(Weak::new(), |destinations| {
+                assert_eq!(destinations.layout().total(), 8);
+                Err((
+                    Error::kind(ErrorKind::InvalidCopyOp),
+                    destinations.into_buffers(),
+                ))
+            })
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::InvalidCopyOp);
+        target.copy_in(0, b"kept").unwrap();
+        let buffers = target.seal(None).await.unwrap();
+        assert_eq!(buffers[0].as_slice(), b"kept");
         assert_eq!(buffers[1].as_slice(), b"both");
     }
 
     #[cfg(feature = "rdma")]
-    #[test]
-    fn dma_ownership_excludes_cpu_and_competing_writers() {
-        let pool = pool();
-        let mut buffer = pool.allocate(64 * 1024).unwrap();
-        buffer.set_len(4);
-        let target = WriteTarget::new(BufferSet::new(vec![buffer]));
-        let (planned_len, buffers) = target.checkout(|layout| Ok(layout.total())).unwrap();
-        assert_eq!(planned_len, 4);
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_read_owns_the_set_until_it_settles() {
+        use crate::rdma::test_utils::RdmaConnection;
+
+        let connection = RdmaConnection::establish().await;
+        let pool = &connection.context.state.buffer_pool;
+
+        // The plan excludes CPU copies and competing READs, then returns the
+        // set to the target without help from the handler that started it.
+        let target = new_target(pool, &[b"keep"]);
+        let posting = connection.hold(&target);
         assert_eq!(
-            target.copy_in(0, b"data").unwrap_err().kind,
+            target.copy_in(0, b"busy").unwrap_err().kind,
             ErrorKind::BuffersInUse
         );
         assert_eq!(
             target
-                .checkout::<()>(|_| panic!("busy targets must not invoke the planner"))
+                .plan_read::<()>(|_| panic!("busy targets plan no READ"))
                 .unwrap_err()
                 .kind,
             ErrorKind::BuffersInUse
         );
-        target.restore(buffers);
-        target.copy_in(0, b"data").unwrap();
-        let buffers = WriteTarget::try_into_buffers(target).unwrap();
-        assert_eq!(buffers[0].as_slice(), b"data");
+        assert_eq!(
+            target
+                .start_read::<()>(Weak::new(), |_| panic!("busy targets start no READ"))
+                .unwrap_err()
+                .kind,
+            ErrorKind::BuffersInUse
+        );
+        drop(posting);
+        target.copy_in(0, b"next").unwrap();
+        assert_eq!(target.seal(None).await.unwrap()[0].as_slice(), b"next");
+
+        // Without a grace period, sealing does not wait for the READ, but
+        // still returns a set whose READ has already settled.
+        let target = new_target(pool, &[b"keep"]);
+        let posting = connection.hold(&target);
+        assert!(target.seal(None).await.is_none());
+        drop(posting);
+        let target = new_target(pool, &[b"keep"]);
+        drop(connection.hold(&target));
+        assert_eq!(target.seal(None).await.unwrap()[0].as_slice(), b"keep");
+
+        // Settlement within the grace period leaves the connection usable.
+        let target = new_target(pool, &[b"keep"]);
+        let posting = connection.hold(&target);
+        let mut sealing = Box::pin(target.seal(Some(Duration::from_secs(30))));
+        assert!(futures_util::poll!(&mut sealing).is_pending());
+        drop(posting);
+        assert_eq!(sealing.await.unwrap()[0].as_slice(), b"keep");
+        assert!(connection.socket.state.is_ok());
+
+        // Expiry closes the connection, but only settlement returns the set.
+        let target = new_target(pool, &[b"keep"]);
+        let posting = connection.hold(&target);
+        let mut sealing = Box::pin(target.seal(Some(Duration::ZERO)));
+        assert!(futures_util::poll!(&mut sealing).is_pending());
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        assert!(futures_util::poll!(&mut sealing).is_pending());
+        assert!(!connection.socket.state.is_ok());
+        drop(posting);
+        assert_eq!(sealing.await.unwrap()[0].as_slice(), b"keep");
+
+        connection.shutdown().await;
     }
 }

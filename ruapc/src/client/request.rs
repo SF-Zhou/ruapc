@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::{
-    Buffer, BufferAvailability, Context, Receiver,
+    Buffer, Context, Receiver,
     core::ContextEndpoint,
     error::{Error, ErrorKind},
     msg::{MsgFlags, MsgMeta},
@@ -41,15 +41,13 @@ impl<'a> ReadAttachment<'a> {
 
 impl Client {
     /// Executes one logical call, including pre-wire retries and metrics.
-    /// `write_buffers_slot` receives the target only if it is available and
-    /// uniquely held when the response arrives.
+    /// The caller keeps `write_target` and recovers its buffers afterwards.
     pub(crate) async fn ruapc_request<Req, Rsp, E>(
         &self,
         ctx: &Context,
         req: &Req,
         read_attachment: ReadAttachment<'_>,
-        write_target: &mut Option<Arc<WriteTarget>>,
-        write_buffers_slot: Option<&mut BufferAvailability>,
+        write_target: Option<&Arc<WriteTarget>>,
         method_name: &str,
     ) -> std::result::Result<Rsp, E>
     where
@@ -59,14 +57,7 @@ impl Client {
     {
         let metrics = ctx.state.metrics.client_method(method_name).start();
         let result = self
-            .request_inner(
-                ctx,
-                req,
-                read_attachment,
-                write_target,
-                write_buffers_slot,
-                method_name,
-            )
+            .request_inner(ctx, req, read_attachment, write_target, method_name)
             .await;
         if result.is_err() {
             metrics.failed();
@@ -79,8 +70,7 @@ impl Client {
         ctx: &Context,
         req: &Req,
         read_attachment: ReadAttachment<'_>,
-        write_target: &mut Option<Arc<WriteTarget>>,
-        write_buffers_slot: Option<&mut BufferAvailability>,
+        write_target: Option<&Arc<WriteTarget>>,
         method_name: &str,
     ) -> std::result::Result<Rsp, E>
     where
@@ -101,37 +91,20 @@ impl Client {
         if let Some(source) = read_attachment.source {
             source.layout().check_region_limit().map_err(Error::from)?;
         }
-        if let Some(target) = write_target.as_ref() {
+        if let Some(target) = write_target {
             target.check_region_limit()?;
         }
 
         let mut sent = self
-            .send_with_retries(
-                ctx,
-                req,
-                read_attachment,
-                write_target.as_ref(),
-                method_name,
-            )
+            .send_with_retries(ctx, req, read_attachment, write_target, method_name)
             .await?;
         // Never retry after send: a missing response cannot tell us whether
         // the peer executed the request.
         let receiving = sent.receiver.recv();
-        let (response, returned_target) = match (&mut sent.source_requests, read_attachment.source)
-        {
+        let response = match (&mut sent.source_requests, read_attachment.source) {
             (Some(requests), Some(source)) => requests.drive(source, receiving).await,
             _ => receiving.await,
         }?;
-        // Drop our clone before trying to recover the target. A handler still
-        // holding it, or DMA still owning its buffers, prevents recovery.
-        let had_attachment = write_target.take().is_some();
-        if let Some(slot) = write_buffers_slot {
-            *slot = match returned_target.and_then(WriteTarget::try_into_buffers) {
-                Some(buffers) => BufferAvailability::Available(buffers),
-                None if had_attachment => BufferAvailability::Unavailable,
-                None => BufferAvailability::NotAttached,
-            };
-        }
         if response.meta.flags.contains(MsgFlags::IsFrameworkError) {
             // Framework failures use Error regardless of the service's E.
             // Keep the Result envelope shared with application responses.
@@ -390,12 +363,10 @@ mod tests {
         buffer.copy_from_slice(b"read");
         let route = {
             let source = ReadSource::new(std::slice::from_ref(&buffer));
-            let mut target = None;
             let mut request = Box::pin(client.ruapc_request::<(), (), Error>(
                 &ctx,
                 &(),
                 ReadAttachment::new(Some(&source), None),
-                &mut target,
                 None,
                 "Test/forgotten",
             ));
@@ -449,12 +420,10 @@ mod tests {
         buffer.copy_from_slice(b"read");
         {
             let source = ReadSource::new(std::slice::from_ref(&buffer));
-            let mut target = None;
             let mut request = Box::pin(client.ruapc_request::<(), (), Error>(
                 &ctx,
                 &(),
                 ReadAttachment::new(Some(&source), None),
-                &mut target,
                 None,
                 "Test/blocked_send",
             ));
@@ -499,13 +468,11 @@ mod tests {
             max_retries: 2,
             ..Default::default()
         };
-        let mut target = None;
         let error = client
             .ruapc_request::<(), (), Error>(
                 &ctx,
                 &(),
                 ReadAttachment::new(Some(&source), None),
-                &mut target,
                 None,
                 "Test/rejected",
             )
@@ -533,14 +500,12 @@ mod tests {
             max_retries: 10,
             ..Default::default()
         };
-        let mut target = None;
         let result = tokio::time::timeout(
             Duration::from_secs(2),
             client.ruapc_request::<(), (), Error>(
                 &ctx,
                 &(),
                 ReadAttachment::new(None, None),
-                &mut target,
                 None,
                 "Test/queue_timeout",
             ),
@@ -603,13 +568,11 @@ mod tests {
             max_retries: 10,
             ..Default::default()
         };
-        let mut target = None;
         let error = client
             .ruapc_request::<_, (), Error>(
                 &ctx,
                 &payload,
                 ReadAttachment::new(None, None),
-                &mut target,
                 None,
                 "Test/close_at_deadline",
             )
@@ -638,12 +601,10 @@ mod tests {
             max_retries: 10,
             ..Default::default()
         };
-        let mut target = None;
         let mut request = Box::pin(client.ruapc_request::<(), (), Error>(
             &ctx,
             &(),
             ReadAttachment::new(None, None),
-            &mut target,
             None,
             "Test/accepted",
         ));
@@ -684,12 +645,10 @@ mod tests {
             .unwrap();
         let ctx = connected_context(sender);
         let client = Client::default();
-        let mut target = None;
         let mut request = Box::pin(client.ruapc_request::<(), (), Error>(
             &ctx,
             &(),
             ReadAttachment::new(None, None),
-            &mut target,
             None,
             "Test/cancel_admission",
         ));
@@ -722,12 +681,10 @@ mod tests {
         let recorder = DebuggingRecorder::new();
         let snapshot = recorder.snapshotter();
         let client = Client::default();
-        let mut target = None;
         let mut request = Box::pin(client.ruapc_request::<(), (), Error>(
             &ctx,
             &(),
             ReadAttachment::new(None, None),
-            &mut target,
             None,
             "Test/pending",
         ));

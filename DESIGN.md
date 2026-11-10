@@ -198,7 +198,7 @@ posting.
 | `context.rs` | Public transfer APIs |
 | `transfer.rs` | Owned preparation, convenience allocation and centralized enum dispatch |
 | `rpc_transfer.rs` | Reverse-RPC protocol, handlers and TCP/WS/HTTP fallback |
-| `write_target.rs` | Exclusive destination checkout for CPU copies or owned RDMA READ plans |
+| `write_target.rs` | Exclusive destination checkout for CPU copies or owned RDMA READ plans, their recovery, and final sealing |
 | `reply.rs` | Write receipts and shared reply types with local destination availability |
 | `rdma/rdma_socket/read.rs` | Concrete READ planning and execution |
 | `rdma/rdma_socket/read/credits.rs` | SQ/NIC admission, closure and completion credits |

@@ -4,8 +4,8 @@
 use std::{sync::Arc, time::Instant};
 
 use ruapc_bufpool::RemoteBufferInfo;
-use ruapc_memory::{BufferSet, CopyBatch, SpaceLayout};
-use ruapc_rdma::{ReadCompletion, ReadFailure, ReadPosting, ReadRequest, ReadSegment};
+use ruapc_memory::{CopyBatch, SpaceLayout};
+use ruapc_rdma::{ReadFailure, ReadPosting, ReadRequest, ReadSegment};
 
 mod credits;
 mod pending;
@@ -163,8 +163,37 @@ impl RdmaSocket {
         local: Vec<Buffer>,
         request_deadline: Option<Instant>,
     ) -> std::result::Result<Vec<Buffer>, RemoteIoError> {
+        let (read_deadline, deadline) = match self.admit_reads(&reads, request_deadline).await {
+            Ok(deadlines) => deadlines,
+            Err(error) => return Err(RemoteIoError::new(error, Some(local))),
+        };
+        let (mut posting, receiver) = self
+            .queue_pair
+            .prepare_reads(local, reads)
+            .map_err(|(error, buffers)| RemoteIoError::new(plan_error(error), Some(buffers)))?;
+        if let Err(error) = self
+            .post_reads(&mut posting, read_deadline, request_deadline, deadline)
+            .await
+        {
+            // The cursor returns buffers only before the first post;
+            // otherwise it accounts the suffix and preserves posted DMA.
+            return Err(RemoteIoError::new(error, posting.cancel()));
+        }
+        let result = self.await_read_batch(receiver).await;
+        // Retain the posting owner's Arc until notification so the runtime
+        // task, rather than the CQ poller, normally destroys the batch.
+        drop(posting);
+        result.map_err(Into::into)
+    }
+
+    /// Reserves receive bandwidth for a plan before any buffer changes hands.
+    async fn admit_reads(
+        &self,
+        reads: &[ReadRequest],
+        request_deadline: Option<Instant>,
+    ) -> Result<(Option<Instant>, Option<ReadDeadline>)> {
         if !self.state.is_ok() {
-            return Err(RemoteIoError::new(read_closed_error(), Some(local)));
+            return Err(read_closed_error());
         }
         // Admission consumes the same absolute budgets as completion. Keep
         // both: request expiry must not disable the connection's READ watchdog.
@@ -188,48 +217,48 @@ impl RdmaSocket {
             } else {
                 error
             };
-            return Err(RemoteIoError::new(error, Some(local)));
+            return Err(error);
         }
-        if let Err(error) = ReadDeadline::check(deadline) {
-            return Err(RemoteIoError::new(error, Some(local)));
-        }
-        let (mut posting, receiver) = self
-            .queue_pair
-            .prepare_reads(local, reads)
-            .map_err(|(error, buffers)| RemoteIoError::new(plan_error(error), Some(buffers)))?;
+        ReadDeadline::check(deadline)?;
+        Ok((read_deadline, deadline))
+    }
+
+    async fn post_reads(
+        &self,
+        posting: &mut ReadPosting,
+        read_deadline: Option<Instant>,
+        request_deadline: Option<Instant>,
+        deadline: Option<ReadDeadline>,
+    ) -> Result<()> {
         let mut registered = false;
         while posting.remaining() != 0 {
-            if let Err(error) = self.post_read(&mut posting, deadline).await {
-                // The cursor returns buffers only before the first post;
-                // otherwise it accounts the suffix and preserves posted DMA.
-                let buffers = posting.cancel();
+            if let Err(error) = self.post_read(posting, deadline).await {
                 // Waiting for admission does not prove a QP failure. The
                 // poller still applies the independent READ watchdog to any
                 // outstanding work after this caller's deadline has expired.
-                if buffers.is_none()
+                if registered
                     && !matches!(error.kind, ErrorKind::Timeout | ErrorKind::RdmaReadTimeout)
                 {
                     self.set_error();
                 }
-                return Err(RemoteIoError::new(error, buffers));
+                return Err(error);
             }
             if !registered {
                 // Publish after the first provider-accepted WR and before the
                 // next await, including admission for a later WR. Cancellation
                 // cannot skip registration while leaving posted DMA behind.
-                self.register_read_batch(&posting, read_deadline, request_deadline);
+                self.register_read_batch(posting, read_deadline, request_deadline);
                 registered = true;
             }
         }
-        let result = self.await_read_batch(receiver).await;
-        // Retain the posting owner's Arc until notification so the runtime
-        // task, rather than the CQ poller, normally destroys the batch.
-        drop(posting);
-        result.map_err(Into::into)
+        Ok(())
     }
 
     /// Waits after posting finishes or its unposted suffix has been cancelled.
-    pub(crate) async fn await_read_batch(&self, receiver: ReadCompletion) -> Result<Vec<Buffer>> {
+    pub(crate) async fn await_read_batch<T>(
+        &self,
+        receiver: impl Future<Output = std::result::Result<T, ReadFailure>>,
+    ) -> Result<T> {
         // A task may pass its final health check, then record its READ only
         // after shutdown has scanned the pending list. Recheck only once per
         // batch, after posting, so that late work receives a failure even when
@@ -264,8 +293,13 @@ impl RdmaSocket {
         Ok(())
     }
 
+    /// READs `source` into the attached destinations of an original call.
+    ///
+    /// The whole destination set moves into the plan, and its recovery stays
+    /// with the target: the set returns there once DMA has settled, whether
+    /// this transfer succeeds, fails or its handler is cancelled.
     pub(crate) async fn read_into_target(
-        &self,
+        self: &Arc<Self>,
         source: &RemoteSpace<'_>,
         ops: &CopyBatch<'_>,
         target: Arc<WriteTarget>,
@@ -275,24 +309,29 @@ impl RdmaSocket {
         if ops.byte_count() == 0 {
             return Ok(());
         }
-        let (planned, buffers) = target.checkout(|layout| {
+        // Planning only borrows the layout, so an invalid plan or a busy or
+        // sealed target fails before admission. The destinations change hands
+        // afterwards: no await separates their checkout from the plan that
+        // owns their way back.
+        let reads = target.plan_read(|layout| {
             build_planned_reads(source, layout, ops, self.queue_pair.gather_limit())
         })?;
-        match self
-            .execute_reads(planned, buffers.into_buffers(), request_deadline)
-            .await
-        {
-            Ok(buffers) => {
-                target.restore(BufferSet::new(buffers));
-                Ok(())
+        let (read_deadline, deadline) = self.admit_reads(&reads, request_deadline).await?;
+        let (mut posting, status) = target.start_read(Arc::downgrade(self), |destinations| {
+            match self
+                .queue_pair
+                .prepare_recoverable_reads(destinations.into_buffers(), reads)
+            {
+                Ok((posting, status, recovery)) => Ok(((posting, status), recovery)),
+                Err((error, buffers)) => Err((plan_error(error), buffers)),
             }
-            Err(mut error) => {
-                if let Some(buffers) = error.take_recovered_buffers() {
-                    target.restore(BufferSet::new(buffers));
-                }
-                Err(error.into())
-            }
-        }
+        })?;
+        // A failed post drops the cursor, which accounts the unposted suffix.
+        self.post_reads(&mut posting, read_deadline, request_deadline, deadline)
+            .await?;
+        let result = self.await_read_batch(status).await;
+        drop(posting);
+        result
     }
 
     pub(crate) async fn read_remote(
@@ -582,6 +621,15 @@ mod timeout_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn server_remote_write_and_client_read_handler_return_at_parent_deadline() {
+        check_remote_write_admission_timeout(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn waiting_client_recovers_destinations_after_read_admission_timeout() {
+        check_remote_write_admission_timeout(true).await;
+    }
+
+    async fn check_remote_write_admission_timeout(wait_for_buffers: bool) {
         let blocked = AdmissionBlock::default();
         let observed_target: Arc<Mutex<Option<Weak<WriteTarget>>>> = Arc::default();
         let mut router = Router::default();
@@ -611,10 +659,24 @@ mod timeout_tests {
             };
             let mut destination = context.state.buffer_pool.allocate(64).unwrap();
             destination.set_len(64);
-            client
-                .with_write_buffers(vec![destination])
-                .write(&context, &())
-                .await
+            destination.fill(0xa5);
+            let pointer = destination.as_ptr() as usize;
+            let wrapper = client.with_write_buffers(vec![destination]);
+            let wrapper = if wait_for_buffers {
+                wrapper.wait_for_write_buffers(Duration::from_secs(1))
+            } else {
+                wrapper
+            };
+            let result = wrapper.write(&context, &()).await;
+            if wait_for_buffers {
+                let recovered = wrapper
+                    .take_write_buffers()
+                    .into_available()
+                    .expect("strict recovery must preserve a cancelled, never-posted plan");
+                assert_eq!(recovered[0].as_ptr() as usize, pointer);
+                assert_eq!(recovered[0].as_slice(), &[0xa5; 64]);
+            }
+            result
         });
 
         // Prove that the actual reverse handler checked out its destination,
@@ -841,5 +903,134 @@ mod borrowed_source_tests {
         })
         .await
         .expect("both RDMA pools must stop after validation failure");
+    }
+}
+
+#[cfg(test)]
+mod recoverable_write_tests {
+    use std::{sync::Arc, time::Duration};
+
+    use crate::{
+        Buffer, Client, Context, CopyOp, Endpoint, Result, ResultBufferReply, Router, Server,
+        Socket, Transport, core::ContextEndpoint, rdma::test_utils::small_rdma_config,
+    };
+
+    const CONTENTS: &[u8] = b"whole-vector";
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[crate::service]
+    trait RecoverableWriteRpc {
+        async fn ping(&self, ctx: &Context, req: &()) -> Result<u64>;
+        async fn write_twice(&self, ctx: &Context, req: &()) -> ResultBufferReply<u64>;
+    }
+
+    struct Writer;
+
+    fn connection(ctx: &Context) -> u64 {
+        let ContextEndpoint::Connected(Socket::RDMA(socket)) = &ctx.endpoint else {
+            panic!("this test must exercise RDMA READ completion and recovery");
+        };
+        socket.conn_id
+    }
+
+    impl RecoverableWriteRpc for Writer {
+        async fn ping(&self, ctx: &Context, _: &()) -> Result<u64> {
+            Ok(connection(ctx))
+        }
+
+        async fn write_twice(&self, ctx: &Context, _: &()) -> ResultBufferReply<u64> {
+            // Different source/destination boundaries force several READ WRs.
+            // A second transfer proves successful replies restore the target
+            // before a following reverse RPC can check it out again.
+            let mut first = ctx.state.buffer_pool.allocate(CONTENTS.len()).unwrap();
+            first.set_len(CONTENTS.len());
+            first.fill(0xa5);
+            ctx.remote_write_all(vec![first]).await?;
+
+            let source = [&CONTENTS[..5], &CONTENTS[5..]]
+                .into_iter()
+                .map(|bytes| {
+                    let mut buffer = ctx.state.buffer_pool.allocate(bytes.len()).unwrap();
+                    buffer.set_len(bytes.len());
+                    buffer.copy_from_slice(bytes);
+                    buffer
+                })
+                .collect();
+            let receipt = ctx
+                .remote_write(&[CopyOp::new(0, 0, CONTENTS.len() as u64)], source)
+                .await?;
+            Ok(receipt.into_reply(connection(ctx)))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strict_remote_writes_return_the_original_segmented_destinations() {
+        let mut config = small_rdma_config();
+        let rdma = config.rdma.as_mut().unwrap();
+        rdma.remote_memory.bandwidth_limit_ratio = 0.0;
+        rdma.peers.connections_per_peer = 1;
+        rdma.peers.preconnect_max_per_peer = 1;
+        let mut router = Router::default();
+        Arc::new(Writer).ruapc_export(&mut router);
+        let server = Server::create(router, &config).unwrap();
+        let address = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let context = Context::create(&config)
+            .unwrap()
+            .with_endpoint(Endpoint::rdma(Transport::TCP, [address]).unwrap());
+        let client = Client::default();
+        let connection = client.ping(&context, &()).await.unwrap();
+        let mut destinations = [3, 5, 4]
+            .into_iter()
+            .map(|len| {
+                let mut buffer = context.state.buffer_pool.allocate(len).unwrap();
+                buffer.set_len(len);
+                buffer.fill(0);
+                buffer
+            })
+            .collect::<Vec<Buffer>>();
+        let addresses = destinations
+            .iter()
+            .map(|buffer| buffer.as_ptr() as usize)
+            .collect::<Vec<_>>();
+
+        for _ in 0..3 {
+            let attached = client
+                .with_write_buffers(destinations)
+                .wait_for_write_buffers(Duration::ZERO);
+            let (reply, availability) =
+                tokio::time::timeout(TEST_TIMEOUT, attached.write_twice(&context, &()))
+                    .await
+                    .expect("strict recovery must complete after successful READ CQEs")
+                    .unwrap()
+                    .into_parts();
+            assert_eq!(reply, connection);
+            destinations = availability
+                .into_available()
+                .expect("strict success always returns the attached destinations");
+            assert_eq!(
+                destinations
+                    .iter()
+                    .map(|buffer| buffer.as_ptr() as usize)
+                    .collect::<Vec<_>>(),
+                addresses,
+            );
+            assert_eq!(
+                destinations
+                    .iter()
+                    .flat_map(|buffer| buffer.as_slice())
+                    .copied()
+                    .collect::<Vec<_>>(),
+                CONTENTS,
+            );
+        }
+        assert_eq!(client.ping(&context, &()).await.unwrap(), connection);
+        drop(destinations);
+        context.state.socket_pool.stop();
+        server.stop();
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            tokio::join!(context.state.socket_pool.join(), server.join());
+        })
+        .await
+        .expect("both RDMA pools must stop after buffer recovery");
     }
 }

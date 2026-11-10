@@ -74,11 +74,13 @@ Use [DESIGN.md](DESIGN.md) for crate/module ownership and
   bytes remain readable but are not valid transfer results.
 - RDMA transfers use READ, including client-side READ for `remote_write`.
   A write target transfers its entire destination vector into the owned READ
-  plan and excludes CPU copies or competing READs until buffers are restored.
-  Cancellation or failure can leave the target empty after the QP recycles it.
+  plan and excludes CPU copies or competing READs until the plan's recovery
+  receiver returns it after settlement, whatever the transfer's result.
+  The original call seals the target when it ends, revoking stale handlers.
 - `WriteReceipt` records a completed write or explicit `sent_nothing()`.
   Keep transfer success separate from local source/destination availability;
-  successful calls return available destinations only when uniquely held.
+  calls return destinations unless a READ still owns them, and only
+  `wait_for_write_buffers` waits for that READ.
 - Dropping a posting cursor accounts for unposted work. Posted buffers and
   READ permits remain held until completions settle or QP destruction succeeds.
   Timeout, ERR state and waiter failure do not authorize early recovery.

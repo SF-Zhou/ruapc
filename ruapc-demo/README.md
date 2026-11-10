@@ -126,8 +126,7 @@ typed HTTP and RDMA.
 lengths and reuse them across calls; see the [remote-memory API guide](../docs/remote-memory.md)
 for attachments and logical copy spaces. Read attachments borrow immutable sources.
 `BufferReply` reports destination availability explicitly; destinations are
-recoverable only when uniquely held. Failed or cancelled DMA can leave them
-unavailable.
+unavailable only while an RDMA READ still owns them when the call ends.
 The borrowing request future validates successful reads after READ completion,
 but source reuse does
 not wait for remote DMA. Readable destinations from a failed transfer are not

@@ -53,13 +53,36 @@ cursors and reclamation, and [capacity](rdma-capacity.md) for permits and CQ
 retirement.
 
 Inline CPU writes hold the `WriteTarget` mutex for the entire validated batch.
-`WriteTarget` removes its entire destination vector before handing it to an
-owned READ plan. CPU copies and competing transfers that access bytes fail
-with `BuffersInUse` while the target is empty. Empty and all-zero batches still
-validate the request, spaces and operations, then succeed without checkout.
-Only buffers returned by the dependency can be restored; failed or cancelled
-transfers can leave the target empty even after
-the QP eventually recycles those buffers.
+Under that same mutex, `WriteTarget` moves its entire destination vector into
+an owned READ plan and keeps the plan's recovery receiver in its place; no
+await separates the two. CPU copies and competing transfers that access bytes
+fail with `BuffersInUse` while the READ owns the vector. Empty and all-zero
+batches still validate the request, spaces and operations, then succeed
+without checkout.
+
+Only that recovery receiver returns the vector. It resolves after all posted
+work settles or provider QP destruction succeeds, including when the transfer
+failed or its handler was cancelled, and for a plan that never posted. Early
+READ failure notification does not resolve it. The next access to the target
+restores a settled vector.
+
+The original RPC seals the target when it ends, with any result, and takes
+whatever the target holds. A reverse handler holding an older target reference
+cannot start another READ or CPU write afterwards, so the final destination
+set can be returned even if such references still exist. A vector that a READ
+still owns is not returned: by default the call drops the recovery receiver
+and reports the set unavailable, and the QP releases the memory once the READ
+settles.
+
+With [`wait_for_write_buffers`](remote-memory.md#wait-for-write-destinations),
+the call awaits that receiver instead. If destinations remain unavailable
+after the configured grace period, it closes the connection (and its QP)
+executing the READ and waits without a further deadline. Waiting uses only a
+weak connection reference, so it does not itself prevent QP destruction. This
+guarantees local availability on a normally awaited return, not successful
+transfer contents or a remote completion lease for borrowed read sources. See
+the [API guide](remote-memory.md#wait-for-write-destinations) for return paths
+and cancellation behavior.
 
 ## Large-payload source ownership
 

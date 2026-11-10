@@ -107,9 +107,9 @@ impl Client {
     /// The next call consumes the set; in-flight RDMA retains destination
     /// ownership even if that call times out or is cancelled.
     ///
-    /// A `Result<BufferReply<T>, E>` response returns the buffers when the
-    /// target is available and uniquely held. After failure, recover any
-    /// available set with [`ClientWithBuffers::take_write_buffers`].
+    /// A `Result<BufferReply<T>, E>` response returns the buffers unless a
+    /// READ still owns them. After an error or a plain result, recover the
+    /// set with [`ClientWithBuffers::take_write_buffers`].
     ///
     /// # Examples
     ///

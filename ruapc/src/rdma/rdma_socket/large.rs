@@ -265,7 +265,7 @@ impl RdmaSocket {
             .try_spawn(async move {
                 let mut guard = guard;
                 let acknowledged = async {
-                    let (message, _) = response.recv().await?;
+                    let message = response.recv().await?;
                     message.payload.deserialize::<Result<()>>(&message.meta)?
                 }
                 .await;
@@ -473,7 +473,7 @@ impl RdmaSocket {
             return Err(protocol_error("payload finish RPC exceeds receive buffer"));
         }
         self.send_buffer(&mut meta, encoded, &request).await?;
-        let (message, _) = receiver.recv().await?;
+        let message = receiver.recv().await?;
         message.payload.deserialize(&message.meta)?
     }
 

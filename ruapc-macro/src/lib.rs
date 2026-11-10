@@ -64,7 +64,7 @@
 //!     .into_parts();
 //! ```
 //!
-//! Recovery requires an available, uniquely held target. See
+//! The buffers are unavailable only while a READ still owns them. See
 //! `ruapc::ClientWithBuffers` for cancellation and in-flight DMA behavior.
 
 mod args;

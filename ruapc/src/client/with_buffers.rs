@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use std::{sync::Mutex, time::Duration};
 
 use ruapc_memory::BufferSet;
 use schemars::JsonSchema;
@@ -27,10 +27,15 @@ use super::{Client, ReadAttachment};
 /// # Write buffers
 ///
 /// The next call consumes the attached write space, which the server fills
-/// via [`Context::remote_write`]. In-flight RDMA retains destination ownership
-/// through completion or QP destruction, even after the call ends. Methods
-/// returning `Result<BufferReply<T>, E>` return available, uniquely held
-/// buffers; after failure, use [`take_write_buffers`](Self::take_write_buffers).
+/// via [`Context::remote_write`]. When the call ends, the server can no longer
+/// write, and the set is returned unless an RDMA READ still owns it: in-flight
+/// RDMA retains destination ownership through completion or QP destruction.
+/// A successful `Result<BufferReply<T>, E>` carries the set; after an error or
+/// a plain result, use [`take_write_buffers`](Self::take_write_buffers). An
+/// available set left in the wrapper is attached again by its next call.
+/// Enable [`wait_for_write_buffers`](Self::wait_for_write_buffers) to also
+/// wait for such a READ, which guarantees destination recovery when the call
+/// is polled to completion.
 ///
 /// # Examples
 ///
@@ -48,6 +53,7 @@ pub struct ClientWithBuffers<'a> {
     read_source: Option<ReadSource<'a>>,
     read_charge_bytes: Option<u64>,
     write_buffers: Mutex<BufferAvailability>,
+    write_buffer_grace: Option<Duration>,
 }
 
 impl<'a> ClientWithBuffers<'a> {
@@ -59,6 +65,7 @@ impl<'a> ClientWithBuffers<'a> {
             read_source: None,
             read_charge_bytes: None,
             write_buffers: Mutex::new(BufferAvailability::NotAttached),
+            write_buffer_grace: None,
         }
     }
 
@@ -100,15 +107,39 @@ impl<'a> ClientWithBuffers<'a> {
         self
     }
 
-    /// Takes an unused write-buffer set or one recovered after a failed call.
+    /// Waits for the complete attached write-buffer set before returning a call.
+    ///
+    /// Without this option, a set that an RDMA READ still owns when the RPC
+    /// ends is reported unavailable. With it, such a READ gets `grace` to
+    /// return the buffers. If it remains outstanding, its RDMA connection is
+    /// closed and recovery waits without a deadline for completion or
+    /// successful QP destruction. Zero grace requests immediate closure.
+    /// Closing a shared connection also fails other requests using it;
+    /// existing connection watchdogs still apply.
+    ///
+    /// Recovery can exceed the RPC deadline and does not change its result or
+    /// where the set is returned. Recovered bytes after an error are not valid
+    /// transfer results.
+    ///
+    /// This applies only to owned write destinations, not borrowed read sources.
+    /// It requires polling the call to completion: dropping or forgetting its
+    /// future cannot guarantee recovery, and never releases in-flight DMA early.
+    #[must_use]
+    pub fn wait_for_write_buffers(mut self, grace: Duration) -> Self {
+        self.write_buffer_grace = Some(grace);
+        self
+    }
+
+    /// Takes an unused write-buffer set or one returned by a finished call.
     ///
     /// Distinguishes no attachment, an available set (including an empty set),
-    /// and an unavailable set. Cancellation or a failed DMA
-    /// transfer can leave no recoverable set even after the QP eventually
-    /// returns its buffers to the pool. Successful plain `Result<T, E>` calls
-    /// also consume the set; use a `BufferReply<T>` service result to receive it in the result.
-    /// Recovery permits reuse; after failure it does not establish valid
-    /// transfer contents or promise that the buffers have been zeroed.
+    /// and an unavailable set. A call returns its set here after an error or a
+    /// successful plain `Result<T, E>`; a successful `BufferReply<T>` carries
+    /// it instead. The set is unavailable if the call was dropped, or if an
+    /// RDMA READ still owned it when the call ended without
+    /// [`Self::wait_for_write_buffers`]; the QP then returns those buffers to
+    /// the pool. Recovery permits reuse; after failure it does not establish
+    /// valid transfer contents or promise that the buffers have been zeroed.
     pub fn take_write_buffers(&self) -> BufferAvailability {
         self.write_buffers.lock().unwrap().take()
     }
@@ -126,53 +157,46 @@ impl<'a> ClientWithBuffers<'a> {
         Rsp: for<'c> Deserialize<'c> + JsonSchema,
         E: std::error::Error + From<Error> + for<'c> Deserialize<'c>,
     {
-        let buffers = {
-            let mut slot = self.write_buffers.lock().unwrap();
-            if matches!(*slot, BufferAvailability::Available(_)) {
-                match std::mem::replace(&mut *slot, BufferAvailability::Unavailable) {
-                    BufferAvailability::Available(buffers) => Some(buffers),
-                    _ => unreachable!(),
+        let target = {
+            let mut attached = self.write_buffers.lock().unwrap();
+            match &mut *attached {
+                BufferAvailability::Available(buffers) => {
+                    let buffers = std::mem::take(buffers);
+                    // A call dropped before it returns leaves the set unavailable.
+                    *attached = BufferAvailability::Unavailable;
+                    Some(WriteTarget::new(BufferSet::new(buffers)))
                 }
-            } else {
-                None
+                _ => None,
             }
         };
-        let had_attachment = buffers.is_some();
-        let mut target = buffers.map(BufferSet::new).map(WriteTarget::new);
-        let mut returned = BufferAvailability::NotAttached;
         let result = self
             .client
             .ruapc_request(
                 ctx,
                 req,
                 ReadAttachment::new(self.read_source.as_ref(), self.read_charge_bytes),
-                &mut target,
-                Some(&mut returned),
+                target.as_ref(),
                 method_name,
             )
             .await;
-        if result.is_ok() {
-            if had_attachment {
-                *self.write_buffers.lock().unwrap() = match &returned {
-                    BufferAvailability::Unavailable => BufferAvailability::Unavailable,
-                    _ => BufferAvailability::NotAttached,
-                };
+        let Some(target) = target else {
+            return result;
+        };
+        // Every result path seals the target, so a reverse handler that still
+        // holds it can no longer write. The set is then either back, or owned
+        // by a READ that only `wait_for_write_buffers` waits for.
+        let recovered = match target.seal(self.write_buffer_grace).await {
+            Some(buffers) => BufferAvailability::Available(buffers),
+            None => BufferAvailability::Unavailable,
+        };
+        // A successful buffer reply carries the set; otherwise it stays here.
+        *self.write_buffers.lock().unwrap() = match write_buffers_slot {
+            Some(slot) if result.is_ok() => {
+                *slot = recovered;
+                BufferAvailability::NotAttached
             }
-            if let Some(slot) = write_buffers_slot {
-                *slot = returned;
-            }
-        } else if had_attachment {
-            // Before a response arrives, the caller still holds the target.
-            // Afterwards, request_inner has already tried to recover it.
-            let recovered = match target.take() {
-                Some(target) => match WriteTarget::try_into_buffers(target) {
-                    Some(buffers) => BufferAvailability::Available(buffers),
-                    None => BufferAvailability::Unavailable,
-                },
-                None => returned,
-            };
-            *self.write_buffers.lock().unwrap() = recovered;
-        }
+            _ => recovered,
+        };
         result
     }
 }
@@ -212,7 +236,174 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_response_preserves_unavailable_destinations() {
+    async fn calls_recover_destinations_and_revoke_stale_writers_on_every_result_path() {
+        // Exercise both result contracts, application/framework errors,
+        // decoding failure, and expiry with an already-routed writer alive,
+        // with and without waiting for the destinations.
+        for (outcome, buffered, grace) in (0..5).flat_map(|outcome| {
+            [false, true].into_iter().flat_map(move |buffered| {
+                [None, Some(Duration::ZERO)].map(|grace| (outcome, buffered, grace))
+            })
+        }) {
+            let config = SocketPoolConfig {
+                #[cfg(feature = "rdma")]
+                rdma: None,
+                ..Default::default()
+            };
+            let base = Context::create(&config).unwrap();
+            let (sender, mut queue) = tokio::sync::mpsc::channel(1);
+            let ctx = Context::server_ctx(
+                &base.state,
+                Socket::TCP(TcpSocket::new(sender)),
+                MsgMeta {
+                    timeout_ms: 5_000,
+                    ..Default::default()
+                },
+            );
+            let client = Client::default();
+            let mut buffer = ctx.state.buffer_pool.allocate(4).unwrap();
+            buffer.set_len(4);
+            buffer.copy_from_slice(b"keep");
+            let pointer = buffer.as_ptr();
+            let mut wrapper = client.with_write_buffers(vec![buffer]);
+            if let Some(grace) = grace {
+                wrapper = wrapper.wait_for_write_buffers(grace);
+            }
+            let peer = async {
+                let encoded = queue.recv().await.unwrap();
+                let mut encoded = BytesMut::from(encoded.as_ref());
+                let request =
+                    Message::parse(frame::parse_message(&mut encoded).unwrap().unwrap()).unwrap();
+                let retained = ctx.state.waiter.write_target(request.meta.msgid).unwrap();
+                if outcome == 4 {
+                    ctx.state
+                        .waiter
+                        .expire(std::time::Instant::now() + Duration::from_secs(60));
+                } else {
+                    let response: Result<u32, Error> = if outcome == 0 {
+                        Ok(7)
+                    } else {
+                        Err(Error::kind(ErrorKind::InvalidArgument))
+                    };
+                    let bytes = if outcome == 3 {
+                        vec![0xc1]
+                    } else {
+                        rmp_serde::to_vec_named(&response).unwrap()
+                    };
+                    let mut flags = MsgFlags::UseMessagePack | MsgFlags::IsRsp;
+                    if outcome == 2 {
+                        flags |= MsgFlags::IsFrameworkError;
+                    }
+                    ctx.state.waiter.post(
+                        request.meta.msgid,
+                        Message::new(
+                            MsgMeta {
+                                msgid: request.meta.msgid,
+                                flags,
+                                ..Default::default()
+                            },
+                            Payload::from(Bytes::from(bytes)),
+                        ),
+                    );
+                }
+                retained
+            };
+            let mut destinations = BufferAvailability::NotAttached;
+            let call = wrapper.ruapc_request::<(), u32, Error>(
+                &ctx,
+                &(),
+                buffered.then_some(&mut destinations),
+                "Test/recover",
+            );
+            let (result, retained) = tokio::join!(call, peer);
+            assert_eq!(result.is_ok(), outcome == 0);
+            if outcome == 4 {
+                assert_eq!(result.unwrap_err().kind, ErrorKind::Timeout);
+            }
+            // A successful buffer reply carries the set; every other result
+            // leaves it in the wrapper.
+            let recovered = if outcome == 0 && buffered {
+                assert!(matches!(
+                    wrapper.take_write_buffers(),
+                    BufferAvailability::NotAttached
+                ));
+                destinations
+            } else {
+                wrapper.take_write_buffers()
+            }
+            .into_available()
+            .expect("a set no READ owns is always recovered");
+            assert_eq!(recovered[0].as_ptr(), pointer);
+            assert!(retained.copy_in(0, b"late").is_err());
+            assert_eq!(recovered[0].as_slice(), b"keep");
+        }
+    }
+
+    #[cfg(feature = "rdma")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_waiting_calls_outlast_a_read_and_none_keeps_validating_sources() {
+        use crate::rdma::test_utils::RdmaConnection;
+
+        let connection = RdmaConnection::establish().await;
+        for wait in [false, true] {
+            let (sender, mut queue) = tokio::sync::mpsc::channel(1);
+            let ctx = Context::server_ctx(
+                &connection.context.state,
+                Socket::TCP(TcpSocket::new(sender)),
+                MsgMeta {
+                    timeout_ms: 5_000,
+                    ..Default::default()
+                },
+            );
+            let source = ctx.state.buffer_pool.allocate(4).unwrap();
+            let mut destination = ctx.state.buffer_pool.allocate(4).unwrap();
+            destination.set_len(4);
+            let pointer = destination.as_ptr();
+            let client = Client::default();
+            let mut wrapper = client
+                .with_read_buffer(&source)
+                .with_write_buffers(vec![destination]);
+            if wait {
+                wrapper = wrapper.wait_for_write_buffers(Duration::from_secs(30));
+            }
+            let mut call = Box::pin(wrapper.buffered(&ctx, &()));
+            assert!(futures_util::poll!(call.as_mut()).is_pending());
+            let encoded = queue.recv().await.unwrap();
+            let mut encoded = BytesMut::from(encoded.as_ref());
+            let request =
+                Message::parse(frame::parse_message(&mut encoded).unwrap().unwrap()).unwrap();
+            let (route, deadline) = ctx.state.waiter.read_source(request.meta.msgid).unwrap();
+            let target = ctx.state.waiter.write_target(request.meta.msgid).unwrap();
+            let posting = connection.hold(&target);
+            ctx.state.waiter.expire(deadline);
+            if wait {
+                assert!(
+                    futures_util::poll!(call.as_mut()).is_pending(),
+                    "recovery still owns the pending call"
+                );
+                assert!(
+                    route.is_closed(),
+                    "recovery must not continue source validation"
+                );
+                assert_eq!(
+                    route.validate(deadline).await.unwrap_err().kind,
+                    ErrorKind::Timeout
+                );
+                drop(posting);
+            }
+            assert_eq!(call.await.unwrap_err().kind, ErrorKind::Timeout);
+            let recovered = wrapper.take_write_buffers();
+            if wait {
+                assert_eq!(recovered.into_available().unwrap()[0].as_ptr(), pointer);
+            } else {
+                assert!(matches!(recovered, BufferAvailability::Unavailable));
+            }
+        }
+        connection.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_set_left_in_the_wrapper_is_attached_again_by_its_next_call() {
         let config = SocketPoolConfig {
             #[cfg(feature = "rdma")]
             rdma: None,
@@ -231,15 +422,20 @@ mod tests {
         let client = Client::default();
         let mut buffer = ctx.state.buffer_pool.allocate(4).unwrap();
         buffer.set_len(4);
-        buffer.copy_from_slice(b"keep");
+        let pointer = buffer.as_ptr();
         let wrapper = client.with_write_buffers(vec![buffer]);
-        let peer = async {
+        // Writes into the destinations attached to one request, then answers it.
+        let mut serve = async |data: &[u8], response: Vec<u8>| {
             let encoded = queue.recv().await.unwrap();
             let mut encoded = BytesMut::from(encoded.as_ref());
             let request =
                 Message::parse(frame::parse_message(&mut encoded).unwrap().unwrap()).unwrap();
-            let retained = ctx.state.waiter.write_target(request.meta.msgid).unwrap();
-            let response: Result<u32, Error> = Ok(7);
+            ctx.state
+                .waiter
+                .write_target(request.meta.msgid)
+                .expect("the call attached the set held by its wrapper")
+                .copy_in(0, data)
+                .unwrap();
             ctx.state.waiter.post(
                 request.meta.msgid,
                 Message::new(
@@ -248,24 +444,64 @@ mod tests {
                         flags: MsgFlags::UseMessagePack | MsgFlags::IsRsp,
                         ..Default::default()
                     },
-                    Payload::from(Bytes::from(rmp_serde::to_vec_named(&response).unwrap())),
+                    Payload::from(Bytes::from(response)),
                 ),
             );
-            retained
         };
-        let (response, retained) = tokio::join!(wrapper.buffered(&ctx, &()), peer);
-        let response = response.expect("completion and destination recovery are distinct");
-        assert_eq!(*response.response(), 7);
-        assert!(matches!(
-            response.destinations(),
-            BufferAvailability::Unavailable
-        ));
+
+        // Neither a successful plain result nor an error consumes the set:
+        // without `take_write_buffers`, the following call writes into it.
+        let plain: Result<(), Error> = Ok(());
+        let (result, ()) = tokio::join!(
+            wrapper.test_call(&ctx, &()),
+            serve(b"one.", rmp_serde::to_vec_named(&plain).unwrap())
+        );
+        result.unwrap();
+        let failed: Result<(), Error> = Err(Error::kind(ErrorKind::InvalidArgument));
+        let (result, ()) = tokio::join!(
+            wrapper.test_call(&ctx, &()),
+            serve(b"two.", rmp_serde::to_vec_named(&failed).unwrap())
+        );
+        assert_eq!(result.unwrap_err().kind, ErrorKind::InvalidArgument);
+
+        // A successful buffer reply finally takes the set out of the wrapper.
+        let buffered: Result<u32, Error> = Ok(7);
+        let (reply, ()) = tokio::join!(
+            wrapper.buffered(&ctx, &()),
+            serve(b"last", rmp_serde::to_vec_named(&buffered).unwrap())
+        );
+        let (response, destinations) = reply.unwrap().into_parts();
+        assert_eq!(response, 7);
+        let buffers = destinations.into_available().unwrap();
+        assert_eq!(buffers[0].as_ptr(), pointer);
+        assert_eq!(buffers[0].as_slice(), b"last");
         assert!(matches!(
             wrapper.take_write_buffers(),
-            BufferAvailability::Unavailable
+            BufferAvailability::NotAttached
         ));
-        let buffers = WriteTarget::try_into_buffers(retained).unwrap();
-        assert_eq!(buffers[0].as_slice(), b"keep");
+    }
+
+    #[tokio::test]
+    async fn unsent_calls_preserve_empty_and_invalid_attachments() {
+        let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
+        let client = Client::default();
+        for (count, grace) in [0, MAX_REGIONS + 1]
+            .into_iter()
+            .flat_map(|count| [None, Some(Duration::ZERO)].map(|grace| (count, grace)))
+        {
+            let buffers = (0..count)
+                .map(|_| Buffer::empty(&ctx.state.buffer_pool))
+                .collect();
+            let mut wrapper = client.with_write_buffers(buffers);
+            if let Some(grace) = grace {
+                wrapper = wrapper.wait_for_write_buffers(grace);
+            }
+            assert!(wrapper.test_call(&ctx, &()).await.is_err());
+            assert_eq!(
+                wrapper.take_write_buffers().into_available().unwrap().len(),
+                count
+            );
+        }
     }
 
     #[tokio::test]

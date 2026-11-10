@@ -1,9 +1,6 @@
 use tokio::sync::oneshot;
 
-use crate::{
-    Error, ErrorKind, Result, WaiterCleaner,
-    task::waiter::{WaiterResponse, WaiterResult},
-};
+use crate::{Error, ErrorKind, Message, Result, WaiterCleaner, task::waiter::WaiterResult};
 
 /// Internal receiver for RPC response messages.
 ///
@@ -22,18 +19,12 @@ impl<'a> Receiver<'a> {
         Self { response, cleanup }
     }
 
-    /// Receives a response message along with any write buffer.
+    /// Receives the response message.
     ///
     /// This method waits for a response to arrive through the channel.
     /// Once notified, the cleanup guard releases its waiter owner without
     /// removing the entry again; the posting or failure path already removed it.
-    ///
-    /// # Returns
-    ///
-    /// A tuple of (Message, Option<Arc<WriteTarget>>). The target is
-    /// present if the request attached write buffers; the server may have
-    /// written into it during the request.
-    pub(crate) async fn recv(self) -> Result<WaiterResponse> {
+    pub(crate) async fn recv(self) -> Result<Message> {
         let Self { response, cleanup } = self;
         // The entry has already been removed by post, eager failure or the
         // expiry sweep. Cancellation before this await resolves instead
@@ -70,7 +61,7 @@ mod tests {
             w.post(msgid, msg);
         });
 
-        let (msg, _write_buf) = rx.recv().await.unwrap();
+        let msg = rx.recv().await.unwrap();
         assert_eq!(msg.meta.method, "ping");
     }
 

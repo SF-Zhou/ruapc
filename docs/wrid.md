@@ -143,13 +143,13 @@ record back. A completion matches the full sequence, so it cannot settle a
 newer request that reused the same slot index, and a READ whose slot is still
 held by an older in-flight READ is recorded in the fallback map instead of
 being rejected. Dropping the cursor accounts for unposted requests without
-releasing posted memory. `ReadPosting::cancel` can recover buffers only before
-any request has posted.
+releasing posted memory. For a plan created with `prepare_reads`,
+`ReadPosting::cancel` can recover buffers only before any request has posted.
 
 After the unposted suffix is accounted for, destinations remain owned until
 every posted READ has a success/error/flush completion or the QP is destroyed.
-The waiting receiver gets buffers only if the entire batch succeeds. Failure
-notification can precede recovery; dropping, cancelling or forgetting the
+The default waiting receiver gets buffers only if the entire batch succeeds.
+Failure notification can precede recovery; dropping, cancelling or forgetting the
 waiting future never authorizes early release. See
 [READ admission and failure](rdma-capacity.md#read-admission-and-failure) for
 permits, deadlines and teardown.
@@ -161,6 +161,17 @@ allow observation and early failure notification; neither a handle nor its
 temporary strong `ReadObservation` can settle work or recover buffers.
 Deadline registration and failure policy belong to the core's
 [READ admission layer](rdma-capacity.md#read-admission-and-failure).
+
+`QueuePair::prepare_recoverable_reads` separates result notification from
+destination recovery. Its `ReadStatus` future reports success or failure;
+its independent `ReadRecovery` future returns the complete destination vector
+after settlement, including on failure. All buffers use the recovery path,
+including cancellation before posting. Neither receiver retains the batch or
+QP. Dropping the status receiver does not discard the recovery path, and
+receiving an early failure does not authorize it to release memory. The core
+uses this form for every READ into a client's write destinations; see
+[destination ownership](safe-boundaries.md#completion-and-destination-ownership).
+
 `QueuePair::read_slot_spills` counts fallback-map use per QP for diagnosis; the
 fallback changes cost only, never ownership or ordering.
 
