@@ -54,6 +54,8 @@ README and the checker, then uploads it as the Pages artifact.
   (including their copy text and accessible labels), and structured data.
   Update them together when the crate version changes. Keep the OG artwork
   free of release version numbers.
+- The hero headline, social card, title/description and structured data carry
+  the current positioning. Update them together when the core story changes.
 - The canonical URL, Open Graph metadata, sitemap and `robots.txt` use
   `https://sf-zhou.github.io/ruapc/`. Update all of them (and the root README
   link) together if the site moves to a custom domain.

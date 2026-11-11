@@ -10,6 +10,10 @@ For standalone logical-space validation, copy planning and immutable buffer
 sources, see the [memory crate](../ruapc-memory/README.md). RPC applications keep
 using the `ruapc` types and `Context` methods shown here.
 
+The [project example](../README.md#example) is a complete runnable service with
+lent write destinations. The snippets below focus on whole-space helpers,
+owned destinations and recovery.
+
 ## Spaces and copy operations
 
 A buffer list forms a logical space by concatenating its buffers' `len()` values.
@@ -23,8 +27,9 @@ buffer boundaries may differ.
 | `remote_read_all()` | Entire client read space | Newly allocated handler buffers |
 | `remote_write_all(local)` | Entire `local` space | Beginning of client write space |
 
-Set each buffer's logical length before attaching or transferring it: allocations
-initially expose their full size class, and reused bytes are not cleared.
+Set each buffer's logical length with `Buffer::set_len` before attaching or
+transferring it: allocations initially expose their full size class
+(`len() == capacity()`), and reused bytes are not cleared.
 Stream transports accept unregistered buffers, including buffers from a separate
 pool created with `BufferPool::new(Vec::new())`. Their metadata preserves each
 buffer's length with zero addresses and keys. RDMA requires registration on the
@@ -64,7 +69,7 @@ impl BlobService for Blob {
 }
 ```
 
-Register `Blob` and create a client context as in the [quick start](../README.md#example).
+Register `Blob` and create a client context as in the [quick start](../ruapc/README.md#quick-start).
 Allocate source and destination buffers from that context's pool:
 
 ```rust,ignore

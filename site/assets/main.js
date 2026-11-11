@@ -22,7 +22,7 @@
   /* Header state and scrollspy -------------------------------------------- */
 
   const navLinks = Array.from(document.querySelectorAll('.site-nav a[href^="#"]'));
-  const spyTargets = ["top", "why", "code", "transports", "memory", "kit", "quickstart"]
+  const spyTargets = ["top", "why", "code", "memory", "transports", "kit", "quickstart"]
     .map((id) => document.getElementById(id))
     .filter(Boolean);
 
@@ -200,13 +200,13 @@
   const codeMeta = {
     define: {
       file: "src/service.rs",
-      status: "typed client + dispatch + schema",
+      status: "typed client + dispatch + BufferReply",
       copyLabel: "Copy the define example",
     },
-    serve: {
-      file: "src/main.rs",
-      status: "UNIFIED listener + dispatch",
-      copyLabel: "Copy the serve example",
+    handle: {
+      file: "src/service.rs",
+      status: "READ → transform → WRITE",
+      copyLabel: "Copy the handler example",
     },
     call: {
       file: "src/client.rs",

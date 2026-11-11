@@ -1,13 +1,14 @@
 # Documentation
 
-Start with the [project quick start](../README.md#example). For public API details,
+Start with the [crate quick start](../ruapc/README.md#quick-start). For public API details,
 run `cargo doc -p ruapc --no-deps --open`.
 
 ## Use and operate RuaPC
 
 | Task | Guide |
 |---|---|
-| Define a service and make a typed call | [Quick start](../README.md#example) |
+| Understand the service and remote-memory design through a complete example | [Project README](../README.md#example) |
+| Define a service and make a typed call | [Quick start](../ruapc/README.md#quick-start) |
 | Address one server through multiple equivalent addresses | [Server endpoints](endpoints.md) |
 | Run examples, HTTP calls or verified load tests | [Demo](../ruapc-demo/README.md) |
 | Attach buffers, copy logical ranges and recover memory | [Remote memory](remote-memory.md) |
@@ -40,10 +41,14 @@ Each guide owns a distinct part of the design. Start at
 ## Maintaining the docs
 
 Update the guide that owns a contract; other pages should summarize it and
-link there. Keep README focused on first use, DESIGN on module responsibilities,
-crate READMEs on their APIs, and rustdoc on each caller's obligations. Avoid
-copying configuration tables, protocol proofs or validation commands between
-these layers.
+link there. Keep the root [README](../README.md) focused on the project's core
+design, illustrated by a complete service and remote-memory example. Crate
+READMEs cover installation, first use and their APIs; DESIGN covers module
+responsibilities, and rustdoc covers each caller's obligations.
+The [core crate README](../ruapc/README.md) owns the minimal service quick start
+and is published on crates.io; use absolute links there. Cross-reference the
+two introductions and keep their examples complementary. Avoid copying
+configuration tables, protocol proofs or validation commands between these layers.
 
 Document current behavior in English, matching code names and units. Keep
 historical changes in the changelog and raw benchmark samples, build logs and

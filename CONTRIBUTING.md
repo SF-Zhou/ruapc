@@ -60,8 +60,8 @@ the all-feature workspace checks exercise the libibverbs backend.
 
 Run formatting and Clippy before committing. PRs target `main`, and all CI
 checks must pass before merging. [CI](.github/workflows/rust.yml) runs formatting,
-release Clippy and coverage on Linux x86-64 and ARM64 with Soft-RoCE, plus
-standalone memory tests, Clippy and rustdoc without RDMA setup.
+release Clippy, README doctests and coverage on Linux x86-64 and ARM64 with
+Soft-RoCE, plus standalone memory tests, Clippy and rustdoc without RDMA setup.
 
 Use two-component `x.y` version requirements for dependencies by default
 (for example, `"0.2"`). Use a patch-level minimum or an exact requirement only
