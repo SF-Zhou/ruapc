@@ -64,8 +64,10 @@
 //!     .into_parts();
 //! ```
 //!
-//! The buffers are unavailable only while a READ still owns them. See
-//! `ruapc::ClientWithBuffers` for cancellation and in-flight DMA behavior.
+//! The buffers are unavailable only while a READ still owns them.
+//! `with_write_buffers_mut` instead lends `&mut` buffers, which every returned
+//! call leaves filled in place. See `ruapc::ClientWithBuffers` for cancellation
+//! and in-flight DMA behavior.
 
 mod args;
 mod expand;

@@ -80,7 +80,11 @@ Use [DESIGN.md](DESIGN.md) for crate/module ownership and
 - `WriteReceipt` records a completed write or explicit `sent_nothing()`.
   Keep transfer success separate from local source/destination availability;
   calls return destinations unless a READ still owns them, and only
-  `wait_for_write_buffers` waits for that READ.
+  `wait_for_write_buffers` and lent destinations wait for that READ.
+- Lent write destinations (`with_write_buffers_mut`) move out of the caller's
+  slots into the owned target; the slots hold empty buffers meanwhile and never
+  alias DMA memory. A returned call has restored them, waiting without a
+  deadline for any READ. Only a dropped or forgotten call may leave them empty.
 - Dropping a posting cursor accounts for unposted work. Posted buffers and
   READ permits remain held until completions settle or QP destruction succeeds.
   Timeout, ERR state and waiter failure do not authorize early recovery.

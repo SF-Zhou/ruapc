@@ -174,23 +174,18 @@ impl WriteTarget {
     /// Cancellation leaves the set with the READ, which then releases it.
     #[cfg_attr(not(feature = "rdma"), allow(unused_variables))]
     pub async fn seal(&self, grace: Option<Duration>) -> Option<Vec<Buffer>> {
-        let taken = std::mem::replace(
-            &mut *self.destinations.lock().unwrap(),
-            Destinations::Sealed,
-        );
-        match taken {
+        // A READ that has settled by now returns the set with or without a
+        // grace period; once sealed, no other access can race its recovery.
+        let Some(grace) = grace else {
+            return self.seal_now();
+        };
+        match self.take() {
             Destinations::Available(buffers) => Some(buffers.into_buffers()),
             #[cfg(feature = "rdma")]
             Destinations::Reading {
                 mut recovery,
                 socket,
             } => {
-                // The recovery is checked only here, after the target is
-                // sealed: a READ that has settled by now returns the set with
-                // or without a grace period, and no other access can race it.
-                let Some(grace) = grace else {
-                    return recovery.try_recv();
-                };
                 if let Ok(buffers) = tokio::time::timeout(grace, &mut recovery).await {
                     return Some(buffers);
                 }
@@ -201,6 +196,23 @@ impl WriteTarget {
             }
             Destinations::Sealed => None,
         }
+    }
+
+    /// Seals without waiting, as [`Self::seal`] does without a grace period.
+    pub fn seal_now(&self) -> Option<Vec<Buffer>> {
+        match self.take() {
+            Destinations::Available(buffers) => Some(buffers.into_buffers()),
+            #[cfg(feature = "rdma")]
+            Destinations::Reading { mut recovery, .. } => recovery.try_recv(),
+            Destinations::Sealed => None,
+        }
+    }
+
+    fn take(&self) -> Destinations {
+        std::mem::replace(
+            &mut *self.destinations.lock().unwrap(),
+            Destinations::Sealed,
+        )
     }
 }
 

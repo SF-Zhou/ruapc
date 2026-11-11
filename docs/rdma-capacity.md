@@ -187,7 +187,8 @@ still waiting for admission neither arms the READ watchdog nor requests
 closure, while the caller's own deadline still bounds that wait. Request
 expiry in application remote-memory operations reports `Timeout` without
 itself closing the connection. An original client call using
-[`wait_for_write_buffers`](remote-memory.md#wait-for-write-destinations)
+[`wait_for_write_buffers`](remote-memory.md#wait-for-write-destinations) or
+[lent write buffers](remote-memory.md#lend-write-destinations)
 can additionally close the connection (and its QP) executing the READ that
 owns its destinations after its recovery grace period; this neither extends
 READ admission deadlines nor releases posted permits.
