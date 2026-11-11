@@ -84,6 +84,15 @@ transfer contents or a remote completion lease for borrowed read sources. See
 the [API guide](remote-memory.md#wait-for-write-destinations) for return paths
 and cancellation behavior.
 
+[Lent write destinations](remote-memory.md#lend-write-destinations) use the
+same owned target. A call moves the buffers out of the caller's `&mut` slots
+and leaves empty buffers that own no memory, so the caller's borrow never
+covers bytes that a READ can write. Only buffers returned by the target or its
+recovery receiver are moved back. A call polled to completion always awaits
+that receiver, as above. A dropped call restores the slots only when that
+needs no wait, and a forgotten call leaves them empty while retaining the
+original buffers indefinitely.
+
 ## Large-payload source ownership
 
 Large RDMA requests and responses use transport-owned serialized source

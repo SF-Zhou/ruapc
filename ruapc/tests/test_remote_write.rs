@@ -536,6 +536,61 @@ async fn test_tcp_no_write_returns_buffers_untouched() {
     server.join().await;
 }
 
+/// Lent write buffers stay in the caller's slots: every returned call has
+/// moved the originals back, on success and on error.
+#[tokio::test]
+async fn test_tcp_lent_write_buffers() {
+    run_lent_test("tcp").await;
+}
+
+#[cfg(feature = "rdma")]
+#[tokio::test]
+async fn test_rdma_lent_write_buffers() {
+    run_lent_test("tcp+rdma").await;
+}
+
+async fn run_lent_test(scheme: &str) {
+    fn assert_send<T: Send>(_: &T) {}
+
+    let (server, ctx) = setup(scheme).await;
+    let client = Client::default();
+    let mut slots = [(); 2].map(|()| {
+        let mut buffer = ctx.state.buffer_pool.allocate(64 * 1024).unwrap();
+        buffer.set_len(16);
+        buffer
+    });
+    let pointers = slots.each_ref().map(Buffer::as_ptr);
+    {
+        let wrapper = client.with_write_buffers_mut(&mut slots);
+        // The same slots serve consecutive calls.
+        for fill in [1, 2] {
+            let req = WriteReq {
+                data: vec![fill; 24],
+                delay_ms: 0,
+            };
+            let call = wrapper.push_data(&ctx, &req);
+            assert_send(&call);
+            let (written, destinations) = call.await.unwrap().into_parts();
+            assert_eq!(written, 24);
+            assert!(matches!(destinations, BufferAvailability::NotAttached));
+        }
+        // A payload larger than the lent space fails without writing.
+        let req = WriteReq {
+            data: vec![3; 64],
+            delay_ms: 0,
+        };
+        let err = wrapper.push_data(&ctx, &req).await.unwrap_err();
+        assert_eq!(err.kind, ErrorKind::InvalidCopyOp);
+    }
+    assert_eq!(slots.each_ref().map(Buffer::as_ptr), pointers);
+    assert_eq!(slots.each_ref().map(Buffer::len), [16, 16]);
+    // The failed call left the second call's bytes in place.
+    assert_eq!(flatten(&slots)[..24], [2; 24]);
+
+    server.stop();
+    server.join().await;
+}
+
 /// The buffer contract works through user-defined aliases and custom error
 /// types: recognition is by type identity, not by name.
 #[tokio::test]

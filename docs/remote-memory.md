@@ -1,6 +1,7 @@
 # Remote memory
 
-Clients borrow read sources and attach owned write destinations; handlers access them through
+Clients borrow read sources and attach write destinations, either owned or
+[lent from caller-owned slots](#lend-write-destinations); handlers access them through
 `Context::remote_read` and `remote_write`. TCP, WebSocket and HTTP/2 use reverse
 RPCs to copy bytes. RDMA uses READ, including a client-side READ for
 `remote_write`. Ordinary unary HTTP calls do not support these reverse RPCs.
@@ -112,7 +113,8 @@ layout; replacing an attachment consumes the wrapper and replaces its borrowed
 source list. The RPC call checks attachment region limits before acquiring a
 connection and reports `InvalidCopyOp` through the method's existing error
 result. The caller still owns its read sources. Attachment-validation failures
-leave owned write attachments recoverable through `take_write_buffers()`.
+leave owned write attachments recoverable through `take_write_buffers()` and
+lent ones in their slots.
 
 The standalone memory crate likewise constructs `ReadSource::new(&[Buffer])`,
 `BufferSet::new(Vec<Buffer>)` and `SpaceLayout::from_buffers(&[Buffer])` without
@@ -153,7 +155,8 @@ below.
 | Resource | Lifetime and recovery |
 |---|---|
 | Read attachments | Borrowed and immutable; reusable across calls. Attaching a new list replaces the old one. `read_buffers()` exposes the borrowed list. The caller retains ownership and can mutate or release sources once their borrow ends. |
-| Write attachments | Consumed by the next call. A successful `BufferReply` reports the set's availability through `destinations()`, and `into_parts()` recovers the response and that state. After an error or a successful plain result, `take_write_buffers()` reports it instead; an available set left in the wrapper is attached again by that wrapper's next call. |
+| Owned write attachments | Consumed by the next call. A successful `BufferReply` reports the set's availability through `destinations()`, and `into_parts()` recovers the response and that state. After an error or a successful plain result, `take_write_buffers()` reports it instead; an available set left in the wrapper is attached again by that wrapper's next call. |
+| Lent write attachments | Moved out of the caller's slots by each call and moved back before it returns, so the same slots serve the wrapper's next call. Only a call that is not polled to completion can leave them empty; see [lending](#lend-write-destinations). |
 | Handler buffers | `remote_read` returns its destinations; `remote_write` returns a `WriteReceipt` with separate source availability. `RemoteIoError::recovered_buffers()` and `take_recovered_buffers()` expose any recoverable buffers on failure; converting the error with `?` to `Error` drops them. |
 
 `BufferAvailability` distinguishes `NotAttached`, `Available(Vec<Buffer>)` and
@@ -169,7 +172,8 @@ reverse handler that still holds the target can no longer write, and a set
 that no READ owns is returned as `Available`. Posted READ destinations remain
 owned until completion or successful QP destruction. If a READ still owns the
 set at that point, the call reports `Unavailable` and the QP later recycles
-the memory into the pool. Recovered error buffers are reusable, but their
+the memory into the pool. A call with [lent destinations](#lend-write-destinations)
+waits for that READ instead. Recovered error buffers are reusable, but their
 readable contents must not be treated as a successful transfer result.
 
 ### Wait for write destinations
@@ -214,11 +218,62 @@ the request's execution or source-validation deadline. Recovery can therefore
 make the call outlive its RPC deadline indefinitely. QP closure alone does not
 release buffers: all posted READs must settle through CQ-issued completions,
 or provider QP destruction must succeed. Dropping or forgetting the request
-future does not promise buffers back to the wrapper, and still cannot release
-posted memory early.
+future does not promise buffers back to the wrapper or to lent slots, and still
+cannot release posted memory early.
 
-This option applies to owned write destinations. Borrowed read attachments
-retain their separate source-validation contract below.
+This option applies to write destinations: it is opt-in for owned sets and
+only sets the grace period for lent ones, which always wait. Borrowed read
+attachments retain their separate source-validation contract below.
+
+### Lend write destinations
+
+`with_write_buffer_mut(&mut Buffer)` and `with_write_buffers_mut(&mut [Buffer])`
+lend caller-owned slots instead of transferring a `Vec<Buffer>`. The call fills
+the buffers in place:
+
+```rust,ignore
+let reply = client
+    .with_read_buffer(&src)
+    .with_write_buffer_mut(&mut dst)
+    .copy(&ctx, &())
+    .await?;
+assert_eq!(*reply.response(), 4);
+assert_eq!(&*dst, b"Rua!"); // The original buffer, back in its slot.
+```
+
+The slots form the same write space as an owned set. Each call moves the
+buffers out of their slots into its write target, leaving empty buffers behind,
+and moves the originals back before it returns. The slots are then attached to
+the wrapper's next call. They are the only return path:
+`BufferReply::destinations()` and `take_write_buffers()` report `NotAttached`.
+While one call holds the slots, concurrent calls on the same wrapper carry no
+write attachment.
+
+| How the call ends | Slots afterwards |
+|---|---|
+| Returns, with any result | The original buffers in their original positions and with their lengths. A READ that still owns them is awaited first, without a time limit. |
+| Dropped, including cancellation by `select!` or a timeout wrapper | The original buffers if restoring them needs no waiting; otherwise empty buffers. |
+| Forgotten with `mem::forget` | Empty buffers. |
+
+A call takes the buffers at its first poll; one that is dropped or forgotten
+before that leaves the slots untouched.
+
+A returned call waits as described under
+[wait for write destinations](#wait-for-write-destinations). Its grace period
+is `Client::timeout` unless `wait_for_write_buffers(grace)` sets one. The call
+can therefore outlive its RPC deadline, and closes the connection executing the
+READ when the grace period expires. After an error, the restored contents are
+not a successful transfer result.
+
+A dropped call cannot wait. It leaves the slots empty if a READ owns the
+buffers at that moment, or if the call was already waiting for one; that READ
+later returns the buffers to the pool. TCP, WebSocket and HTTP/2 use no READ,
+so there a dropped call always restores the slots. A forgotten call restores
+nothing, and its buffers never return to the pool.
+
+Slots that were not restored hold empty buffers, whose `capacity()` is 0, and
+are not attached to later calls on that wrapper. In every case the slots never
+expose memory that a READ can still write.
 
 ### Read-source validation
 

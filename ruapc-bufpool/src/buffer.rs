@@ -137,6 +137,14 @@ impl Buffer {
         }
     }
 
+    /// Moves this buffer out, leaving an [`empty`](Self::empty) buffer of the
+    /// same pool in its place.
+    #[must_use]
+    pub fn take(&mut self) -> Self {
+        let empty = Self::empty(&self.pool);
+        std::mem::replace(self, empty)
+    }
+
     /// Returns the logical length of the buffer in bytes.
     ///
     /// Initially set to the full capacity. Use `set_len` to adjust.
@@ -408,6 +416,16 @@ mod tests {
         for i in 0..100 {
             assert_eq!(buffer[i], i as u8);
         }
+    }
+
+    #[test]
+    fn take_leaves_an_empty_buffer_behind() {
+        let pool = test_pool();
+        let mut slot = pool.allocate(1024).unwrap();
+        let pointer = slot.as_ptr();
+        let taken = slot.take();
+        assert_eq!(taken.as_ptr(), pointer);
+        assert_eq!((slot.len(), slot.capacity()), (0, 0));
     }
 
     #[test]

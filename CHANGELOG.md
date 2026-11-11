@@ -7,6 +7,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 ## [Unreleased]
 
 ### Added
+- `with_write_buffer_mut(&mut Buffer)` and `with_write_buffers_mut(&mut [Buffer])`
+  on `Client` and `ClientWithBuffers` lend caller-owned write destinations.
+  Every call that returns, with any result, has moved the original buffers back
+  into their slots, waiting without a time limit for a READ that still owns
+  them; the same slots then serve the wrapper's next call. Only a dropped or
+  forgotten call can leave empty buffers in the slots. See
+  [lending write destinations](docs/remote-memory.md#lend-write-destinations).
+- `ruapc_bufpool::Buffer::take` moves a buffer out of a `&mut Buffer`, leaving
+  an empty buffer of the same pool.
 - `ClientWithBuffers::wait_for_write_buffers(grace)` optionally waits for a
   READ that still owns the attached write destinations when a call ends. If
   they remain unavailable after the grace period, it closes the shared
@@ -41,6 +50,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   APIs.
 
 ### Changed
+- `ClientWithBuffers<'a>` is now invariant in `'a` because it can hold
+  `&'a mut [Buffer]`. Code that relied on coercing a wrapper to a shorter
+  lifetime no longer compiles.
 - **BREAKING**: Write destinations follow one recovery rule on every call. When
   a call ends, with any result, its write target is sealed against reverse
   handlers that still hold it, and the set is returned unless an RDMA READ

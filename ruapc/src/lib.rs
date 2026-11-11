@@ -20,7 +20,8 @@
 //!
 //! ## Remote memory
 //!
-//! [`ClientWithBuffers`] borrows read sources and owns write destinations.
+//! [`ClientWithBuffers`] borrows read sources and takes write destinations by
+//! value or from caller-owned slots.
 //! Handlers use [`Context::remote_read`] and [`Context::remote_write`] with
 //! logical [`CopyOp`] ranges. Handlers and clients share the declared service
 //! trait and [`BufferReply`] result type, with explicit local destination availability.

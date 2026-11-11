@@ -123,6 +123,38 @@ impl Client {
     pub fn with_write_buffers(&self, buffers: Vec<Buffer>) -> ClientWithBuffers<'_> {
         ClientWithBuffers::new(self).with_write_buffers(buffers)
     }
+
+    /// Creates a [`ClientWithBuffers`] wrapper lending one *write* buffer;
+    /// see [`with_write_buffers_mut`](Self::with_write_buffers_mut).
+    #[must_use]
+    pub fn with_write_buffer_mut<'a>(&'a self, buffer: &'a mut Buffer) -> ClientWithBuffers<'a> {
+        ClientWithBuffers::new(self).with_write_buffer_mut(buffer)
+    }
+
+    /// Creates a [`ClientWithBuffers`] wrapper lending caller-owned *write*
+    /// buffers to requests.
+    ///
+    /// The buffers form the same write space as with
+    /// [`with_write_buffers`](Self::with_write_buffers), but stay in the
+    /// caller's slots: a returned call has always moved the original buffers
+    /// back, waiting for any READ that still owns them. A dropped or forgotten
+    /// call can leave empty buffers in the slots instead; see
+    /// [`ClientWithBuffers::with_write_buffers_mut`].
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let mut bufs = [buf_a, buf_b];
+    /// let rsp = client.with_write_buffers_mut(&mut bufs).download(&ctx, &req).await?;
+    /// // `bufs` holds the downloaded bytes.
+    /// ```
+    #[must_use]
+    pub fn with_write_buffers_mut<'a>(
+        &'a self,
+        buffers: &'a mut [Buffer],
+    ) -> ClientWithBuffers<'a> {
+        ClientWithBuffers::new(self).with_write_buffers_mut(buffers)
+    }
 }
 
 #[cfg(test)]
