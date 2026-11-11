@@ -5,9 +5,9 @@ authors.workspace = true
 edition.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description.workspace = true
-keywords.workspace = true
-categories.workspace = true
+description = "Reusable buffer pool with buddy allocation, slab caches and optional device registration"
+keywords = ["buffer-pool", "memory", "allocation", "buddy-allocator"]
+categories = ["memory-management"]
 license.workspace = true
 
 [dependencies]

@@ -139,13 +139,19 @@ fn registration(method: &Method, krate: &TokenStream) -> TokenStream {
 /// Resolve a renamed dependency as well as invocations inside RuaPC itself.
 /// Missing dependencies are a macro diagnostic, not a misleading `crate::...`
 /// lookup in the caller's unrelated crate.
+///
+/// `Itself` also spells the crate as `::ruapc` instead of `crate`: doctests
+/// compile the snippet as a separate crate, where `crate::...` names the
+/// doctest harness. In-crate expansion resolves `::ruapc` through the crate
+/// root's `extern crate self as ruapc;`; doctest snippets resolve it through
+/// the `--extern ruapc` that rustdoc passes.
 fn crate_path() -> syn::Result<TokenStream> {
     match proc_macro_crate::crate_name("ruapc") {
         Ok(proc_macro_crate::FoundCrate::Name(name)) => {
             let ident = Ident::new(&name, proc_macro2::Span::call_site());
             Ok(quote!(::#ident))
         }
-        Ok(proc_macro_crate::FoundCrate::Itself) => Ok(quote!(crate)),
+        Ok(proc_macro_crate::FoundCrate::Itself) => Ok(quote!(::ruapc)),
         Err(error) => Err(syn::Error::new(proc_macro2::Span::call_site(), error)),
     }
 }

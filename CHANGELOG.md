@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.2.0-alpha.8] - 2026-11-11
+
 ### Added
 - `with_write_buffer_mut(&mut Buffer)` and `with_write_buffers_mut(&mut [Buffer])`
   on `Client` and `ClientWithBuffers` lend caller-owned write destinations.
@@ -50,6 +52,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   APIs.
 
 ### Changed
+- **BREAKING**: `ListenMode` is now a composable flag set. Combine `TCP`, `HTTP`
+  and `WS` with `|`; `UNIFIED` remains their union. HTTP RPC/documentation routes
+  and WebSocket upgrades are enabled independently. Parsing accepts
+  case-insensitive combinations; serialization emits the canonical flag names.
+  Empty or unknown modes are rejected. See [listener modes](docs/endpoints.md#listener-modes).
+- **BREAKING**: `BufferPool::new` and `BufferPoolBuilder::new` now accept an
+  ordered `Vec<Arc<dyn MemoryRegistrar>>`. Registration indices are pool-local
+  `usize` positions, including `QueuePair::create`'s device index. Stream-only
+  pools use `Vec::new()` and need no registration. This replaces the `Device`,
+  `Devices`, `DeviceSet`, `EmptyDevices`, `DeviceIndex` and TCP registration
+  wrappers, including `ruapc::Devices`. See
+  [registration and byte access](docs/safe-boundaries.md#registration-and-byte-access).
 - `ClientWithBuffers<'a>` is now invariant in `'a` because it can hold
   `&'a mut [Buffer]`. Code that relied on coercing a wrapper to a shorter
   lifetime no longer compiles.
@@ -149,14 +163,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   The `initialization` harness reports its raw controls as `std alloc` because
   they now use jemalloc as well. See the
   [benchmark guide](docs/benchmark.md#allocator).
+- HTTP/2 decodes complete frames directly from incoming byte chunks; only
+  frames spanning chunks require an assembly buffer. RapiDoc HTML is cached.
+- The project README explains the service and remote-memory design through a
+  complete multi-transport example. A standalone `ruapc` crate README provides
+  installation and API first use on crates.io.
+
+### Fixed
+- Framework-generated errors now carry `MsgFlags::IsFrameworkError`. Clients
+  decode these as `ruapc::Error` and convert them through the declared error
+  type's `From<ruapc::Error>` implementation, while handler-returned errors keep
+  their application type. This fixes decoding of overload, panic and request
+  errors for services with custom errors; both peers must support the flag.
+- Cyclic development dependencies from `ruapc` to itself and `ruapc-macro` to
+  `ruapc` remain path-only, so publishing does not resolve the new core release
+  from crates.io before it has been uploaded.
 
 ### Removed
 - **BREAKING**: `SentBuffers::merge` and `WithBuffers::into_buffers`. Use
   `WriteReceipt::take_sources` to recover sources from each receipt and
   `reply.into_parts().1.into_available()` to extract available
   destinations.
-- **BREAKING**: `SocketTrait::remote_read` and `SocketTrait::remote_write`.
-  Execute transfers through the corresponding `Context` methods.
+- **BREAKING**: `SocketTrait` and `SocketPoolTrait`. Transport operations use
+  concrete types and enum dispatch; execute remote transfers through the
+  corresponding `Context` methods.
+- **BREAKING**: The public raw-SGE READ API (`ReadSge` and
+  `QueuePair::read_sges`). Use owned READ plans through `QueuePair::prepare_reads`
+  or `prepare_recoverable_reads` so the runtime retains destination ownership.
 - **BREAKING**: `ReflectionService`, its `_ruapc.meta/describe` and
   `_ruapc.meta/openapi` RPCs, reflection data types and the `ruapc_info` binary.
   Query `/openapi.json` through an HTTP or unified listener for service schemas.

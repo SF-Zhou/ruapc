@@ -83,9 +83,10 @@ jobs:
         cargo fmt -- --check
         # --all-features selects the libibverbs GID backend; check the
         # default ioctl/sysfs backend separately.
-        cargo clippy --release -p ruapc-rdma --all-targets --no-default-features -- -D warnings
-        cargo test --release -p ruapc-rdma --no-default-features
-        cargo clippy --release --all-features -- -D warnings
+        cargo clippy -p ruapc-rdma --all-targets --no-default-features -- -D warnings
+        cargo test -p ruapc-rdma --no-default-features
+        cargo clippy --all-features -- -D warnings
+        cargo test --doc -p ruapc -p ruapc-memory
         cargo llvm-cov --all-features --ignore-filename-regex "ruapc-demo/*|ruapc-macro/*|ruapc/src/bin/*|ruapc-rdma/src/bin/*" --cobertura --output-path cobertura.xml
 
     - name: Upload coverage reports to Codecov

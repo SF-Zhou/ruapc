@@ -27,15 +27,23 @@
 //! trait and [`BufferReply`] result type, with explicit local destination availability.
 //! [`RemoteIoError`] describes recovery after a failed transfer.
 //!
-//! See the [quick start](https://github.com/SF-Zhou/ruapc#example) for a complete
-//! service and the [documentation index](https://github.com/SF-Zhou/ruapc/blob/main/docs/README.md)
+//! See the [quick start] for a complete service and the [documentation index]
 //! for architecture, ownership contracts and runnable workloads.
+//!
+//! [quick start]: https://github.com/SF-Zhou/ruapc/blob/main/ruapc/README.md#quick-start
+//! [documentation index]: https://github.com/SF-Zhou/ruapc/blob/main/docs/README.md
 
 #![forbid(unsafe_code)]
 // Transport enums and client call glue use statically dispatched futures.
 // Their concrete implementations determine Send; user service traits instead
 // receive an explicit `impl Future + Send` contract from `#[service]`.
 #![allow(async_fn_in_trait)]
+
+// Generated code spells the crate as `::ruapc`; this alias makes that path
+// resolve during in-crate expansion (unit tests and built-in services).
+// Doctest snippets are separate crates that receive `ruapc` via `--extern`,
+// so they resolve the same path without this alias.
+extern crate self as ruapc;
 
 pub use ruapc_macro::service;
 
@@ -77,3 +85,11 @@ pub use ruapc_bufpool::DEFAULT_BUFFER_POOL_MEMORY;
 
 #[cfg(feature = "rdma")]
 pub mod rdma;
+
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
+#[cfg(doctest)]
+#[doc = include_str!("../../README.md")]
+struct RootReadmeDoctests;
