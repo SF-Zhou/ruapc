@@ -5,6 +5,7 @@ description = "Low-level FFI bindings to libibverbs with type-safe device manage
 readme = "README.md"
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 homepage.workspace = true
 repository.workspace = true
 license.workspace = true

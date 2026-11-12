@@ -3,6 +3,7 @@ name = "ruapc-schema"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 homepage.workspace = true
 repository.workspace = true
 description = "Service schemas and OpenAPI projection for RuaPC"

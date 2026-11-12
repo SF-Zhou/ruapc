@@ -3,6 +3,7 @@ name = "ruapc-macro"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 homepage.workspace = true
 repository.workspace = true
 description = "macro for ruapc service"
