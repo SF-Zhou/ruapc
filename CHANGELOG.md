@@ -6,7 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+### Security
+- Remote-memory reverse RPCs (`MemoryService/read_inline`, `write_inline`,
+  `read_into_target` and `validate_read_source`) now reach a request's read
+  source or write destinations only when they arrive on the connection that
+  carries the request. Request IDs are sequential, so a peer on any other
+  connection of the same process could previously guess one and read the
+  attached source bytes or write into the attached destinations of a pending
+  call. Such calls, and unary HTTP calls that have no such connection, now
+  return the same `Timeout` error as a request that is gone. See
+  [route binding](docs/safe-boundaries.md#routes-belong-to-the-requests-connection).
+- `MemoryService/read_inline` rejects a batch whose reply would reach the
+  64 MiB message limit before queueing it. Source ranges may overlap, so a
+  peer could previously make the borrowing request future allocate and copy up
+  to 1024 times its attached source for a reply that no frame can carry.
+  A stream `remote_read` of that size now fails with `InvalidCopyOp` instead
+  of waiting for its deadline.
+
 ### Changed
+- **BREAKING** (wire): `MemoryService/request_is_pending` is renamed to
+  `MemoryService/validate_read_source` and returns `()` instead of `bool`. A
+  request without a source route now fails with `Timeout` like an
+  unresponsive one. Peers must run the same version to complete an RDMA
+  `remote_read`.
 - Declare Rust 1.95 as the minimum supported version and check the library
   targets at that toolchain in CI.
 - The `ruapc` documentation on docs.rs now enables the `rdma` feature, so RDMA

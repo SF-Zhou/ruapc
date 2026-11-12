@@ -52,16 +52,22 @@ Their Rust trait and request types are crate-private.
 | `MemoryService/read_inline` | Original request ID and `CopyOp` batch | `ReadInlineResponse { bytes }` in operation order | TCP/WS/HTTP read; data in response. |
 | `MemoryService/write_inline` | Original request ID, `CopyOp` batch, bytes | `()` | TCP/WS/HTTP write; data in request. |
 | `MemoryService/read_into_target` | Original request ID and `CopyOp` batch; source in `MsgMeta.read_regions` | `()` | Client RDMA-READs server buffers into its pinned target. |
-| `MemoryService/request_is_pending` | Original request ID | `bool` | Post-READ validation serviced by the original borrowing future. |
+| `MemoryService/validate_read_source` | Original request ID | `()` | Post-READ validation serviced by the original borrowing future. |
 
-`request_is_pending` returns `false` when the original request has no source
-route. A routed probe must receive a fresh answer from the borrowing future;
-an expired or unresponsive source returns an RPC error. It is not a general
+Every method reaches the original request's memory only when it arrives on the
+connection that request was sent on. A request that is gone, has no such
+attachment, or belongs to another connection returns the same `Timeout` error;
+a unary HTTP call therefore always fails that way. See
+[route binding](safe-boundaries.md#routes-belong-to-the-requests-connection).
+
+`validate_read_source` succeeds only with a fresh answer from the borrowing
+future; an expired or unresponsive source returns an RPC error. It is not a
 waiter-membership query.
 
 Inline reads route to the original request future, which gathers its borrowed
-source during a poll. Inline writes require the original request's retained
-write target. Both validate copy ranges. `read_into_target` additionally requires an
+source during a poll. A batch whose reply would reach the 64 MiB message limit
+is rejected before it is queued. Inline writes require the original request's
+retained write target. Both validate copy ranges. `read_into_target` additionally requires an
 established RDMA connection and advertised read regions. An ordinary HTTP POST
 cannot supply those RDMA prerequisites; the route reaches the handler, which
 returns an RPC error. Unary HTTP also lacks the reverse-RPC stream used by the

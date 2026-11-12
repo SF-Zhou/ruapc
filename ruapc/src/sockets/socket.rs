@@ -31,7 +31,8 @@ pub enum Socket {
 }
 
 impl Socket {
-    #[cfg(test)]
+    /// Process-unique identity of this connection. A unary HTTP exchange has
+    /// none: it cannot carry requests of its own, nor their reverse RPCs.
     pub(crate) fn conn_id(&self) -> Option<u64> {
         match self {
             Self::TCP(socket) => Some(socket.conn_id()),

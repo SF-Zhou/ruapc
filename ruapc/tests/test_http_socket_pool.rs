@@ -67,7 +67,7 @@ async fn test_http_openapi_includes_builtin_methods() {
         "/MemoryService/read_inline",
         "/MemoryService/write_inline",
         "/MemoryService/read_into_target",
-        "/MemoryService/request_is_pending",
+        "/MemoryService/validate_read_source",
         #[cfg(feature = "rdma")]
         "/RdmaService/discover",
         #[cfg(feature = "rdma")]
@@ -104,24 +104,14 @@ async fn test_http_builtin_methods_dispatch_and_validate_context() {
     let addr = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let client = http_client();
 
-    let response = client
-        .post(format!("http://{addr}/MemoryService/request_is_pending"))
-        .json(&serde_json::json!({ "request_id": u64::MAX }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 200);
-    assert!(
-        !response
-            .json::<ruapc::Result<bool>>()
-            .await
-            .unwrap()
-            .unwrap()
-    );
-
     // Routing succeeds for built-ins; handler-specific prerequisites still
     // reject absent source requests, missing attachments and non-RDMA sockets.
     for (path, payload, expected_error) in [
+        (
+            "/MemoryService/validate_read_source",
+            serde_json::json!({ "request_id": u64::MAX }),
+            ErrorKind::Timeout,
+        ),
         (
             "/MemoryService/read_inline",
             serde_json::json!({ "request_id": u64::MAX, "ops": [] }),

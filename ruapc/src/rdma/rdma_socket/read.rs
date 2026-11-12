@@ -15,7 +15,7 @@ pub(super) use pending::PendingReads;
 use super::RdmaSocket;
 use crate::{
     Buffer, Client, CopyOp, Error, ErrorKind, RemoteIoError, RemoteSpace, Result,
-    remote_memory::{MemoryService, RequestStatusRequest, WriteTarget, transfer::PreparedRead},
+    remote_memory::{MemoryService, ValidateSourceRequest, WriteTarget, transfer::PreparedRead},
 };
 
 fn build_planned_reads(
@@ -361,24 +361,13 @@ impl RdmaSocket {
         // Validate after READ completion; see Context::remote_read for the
         // immutable-source and request-identity assumptions. Error destinations
         // below are recoverable memory, not validated transfer results.
-        let request = RequestStatusRequest {
+        let request = ValidateSourceRequest {
             request_id: ctx.msg_meta.msgid,
         };
-        let client = Client::default();
-        let pending = match client.request_is_pending(ctx, &request).await {
-            Ok(pending) => pending,
-            Err(error) => return Err(RemoteIoError::new(error, Some(local))),
-        };
-        if !pending {
-            return Err(RemoteIoError::new(
-                Error::new(
-                    ErrorKind::Timeout,
-                    "RDMA read completed but client request has already timed out".into(),
-                ),
-                Some(local),
-            ));
+        match Client::default().validate_read_source(ctx, &request).await {
+            Ok(()) => Ok(local),
+            Err(error) => Err(RemoteIoError::new(error, Some(local))),
         }
-        Ok(local)
     }
 }
 
@@ -641,7 +630,7 @@ mod timeout_tests {
                 let target = ctx
                     .state
                     .waiter
-                    .write_target(request.request_id)
+                    .write_target(request.request_id, ctx.conn_id().unwrap())
                     .expect("the reverse READ arrives while its original request is live");
                 *target_observer.lock().unwrap() = Some(Arc::downgrade(&target));
                 drop(target);
@@ -740,7 +729,7 @@ mod borrowed_source_tests {
     use crate::{
         Buffer, Client, Context, CopyOp, Endpoint, ErrorKind, RemoteIoError, Result, Router,
         Server, Socket, Transport, core::ContextEndpoint, rdma::test_utils::small_rdma_config,
-        remote_memory::RequestStatusRequest,
+        remote_memory::ValidateSourceRequest,
     };
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -808,10 +797,10 @@ mod borrowed_source_tests {
         let resume = Arc::new(Notify::new());
         let gate = resume.clone();
         let mut router = Router::default();
-        router.wrap_method("MemoryService/request_is_pending", move |original| {
+        router.wrap_method("MemoryService/validate_read_source", move |original| {
             let original = Arc::new(original);
             Box::new(move |ctx, payload| {
-                let request: RequestStatusRequest = payload.deserialize(&ctx.msg_meta)?;
+                let request: ValidateSourceRequest = payload.deserialize(&ctx.msg_meta)?;
                 let ContextEndpoint::Connected(Socket::RDMA(socket)) = &ctx.endpoint else {
                     panic!("validation must follow a real RDMA READ");
                 };

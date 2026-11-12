@@ -170,11 +170,14 @@ mod tests {
     use ruapc_bufpool::RemoteBufferInfo;
     use serde::Serialize;
 
-    #[cfg(feature = "rdma")]
-    use crate::remote_memory::{MemoryService, WriteTarget, rpc_transfer::WriteInlineRequest};
     use crate::{
         BufferReply, Error, ErrorKind, MAX_COPY_OPS, Message, MsgFlags, MsgMeta, Payload, Socket,
         SocketPoolConfig, msg::frame, tcp::TcpSocket,
+    };
+    #[cfg(feature = "rdma")]
+    use crate::{
+        remote_memory::{MemoryService, WriteTarget, rpc_transfer::WriteInlineRequest},
+        task::MemoryRoutes,
     };
 
     #[derive(Serialize)]
@@ -506,15 +509,21 @@ mod tests {
     #[cfg(feature = "rdma")]
     #[tokio::test]
     async fn inline_write_checks_request_before_busy_and_keeps_empty_batch_semantics() {
-        let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
+        let (ctx, _queue) = connected_context(MsgMeta::default());
         let mut buffer = ctx.state.buffer_pool.allocate(4).unwrap();
         buffer.set_len(4);
         buffer.copy_from_slice(b"keep");
         let target = WriteTarget::new(BufferSet::new(vec![buffer]));
-        let (request_id, _receiver) = ctx.state.waiter.alloc(Duration::from_secs(5));
+        let (request_id, _receiver) = ctx.state.waiter.alloc_until(
+            std::time::Instant::now() + Duration::from_secs(5),
+            MemoryRoutes {
+                write_target: Some(target.clone()),
+                ..Default::default()
+            },
+        );
         ctx.state
             .waiter
-            .bind_write_target(request_id, target.clone());
+            .bind_connection(request_id, ctx.conn_id().unwrap());
         // Sealing makes the buffers as unavailable as a READ that owns them.
         let taken = target.seal(None).await.unwrap();
 
@@ -574,7 +583,7 @@ mod timeout_tests {
     const METHODS: [&str; 4] = [
         "MemoryService/read_inline",
         "MemoryService/write_inline",
-        "MemoryService/request_is_pending",
+        "MemoryService/validate_read_source",
         "MemoryService/read_into_target",
     ];
 

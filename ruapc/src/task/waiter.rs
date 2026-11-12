@@ -24,6 +24,16 @@ pub(crate) fn next_conn_id() -> u64 {
     NEXT_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Remote-memory routes of one request, published together with its waiter
+/// entry and reachable only from the connection that carries the request.
+#[derive(Default)]
+pub(crate) struct MemoryRoutes {
+    /// Mailbox of the future that borrows the request's read source.
+    pub(crate) read_source: Option<ReadSourceSender>,
+    /// Write destinations shared with reverse-RPC writers.
+    pub(crate) write_target: Option<Arc<WriteTarget>>,
+}
+
 /// Entry stored in the waiter's id_map for each pending request.
 struct WaiterEntry {
     /// Routes source operations to the borrowing request future. This carries
@@ -50,9 +60,10 @@ struct WaiterEntry {
 ///
 /// Assigns message IDs and stores one response channel per pending request.
 ///
-/// A request's pinned write target (attached via `bind_write_target`) is
-/// stored alongside the channel sender, so reverse-RPC handlers can reach it
-/// exactly as long as the request is pending.
+/// A request's remote-memory routes (its read-source mailbox and pinned write
+/// target) are stored alongside the channel sender from the moment its ID
+/// exists. Reverse-RPC handlers can reach them exactly as long as the request
+/// is pending, and only through the request's connection.
 #[derive(Default)]
 pub struct Waiter {
     index: AtomicU64,
@@ -101,12 +112,17 @@ impl Waiter {
     /// The deadline is `timeout` after allocation; the periodic sweep observes
     /// expiry at [`Self::SWEEP_INTERVAL`], subject to scheduler delay.
     pub(crate) fn alloc(&self, timeout: Duration) -> (u64, Receiver<'_>) {
-        self.alloc_until(Instant::now() + timeout)
+        self.alloc_until(Instant::now() + timeout, MemoryRoutes::default())
     }
 
     /// Preserves a caller's existing absolute budget across admission work.
-    pub(crate) fn alloc_until(&self, deadline: Instant) -> (u64, Receiver<'_>) {
-        let (msgid, response) = self.alloc_entry(deadline);
+    /// The entry holds `routes` before its ID can reach a peer.
+    pub(crate) fn alloc_until(
+        &self,
+        deadline: Instant,
+        routes: MemoryRoutes,
+    ) -> (u64, Receiver<'_>) {
+        let (msgid, response) = self.alloc_entry(deadline, routes);
         (
             msgid,
             Receiver::new(
@@ -126,7 +142,7 @@ impl Waiter {
         self: &Arc<Self>,
         deadline: Instant,
     ) -> (u64, Receiver<'static>) {
-        let (msgid, response) = self.alloc_entry(deadline);
+        let (msgid, response) = self.alloc_entry(deadline, MemoryRoutes::default());
         (
             msgid,
             Receiver::new(
@@ -139,7 +155,11 @@ impl Waiter {
         )
     }
 
-    fn alloc_entry(&self, deadline: Instant) -> (u64, oneshot::Receiver<WaiterResult>) {
+    fn alloc_entry(
+        &self,
+        deadline: Instant,
+        routes: MemoryRoutes,
+    ) -> (u64, oneshot::Receiver<WaiterResult>) {
         // The source-validation protocol assumes no reuse while earlier
         // requests or probes can still matter; see docs/safe-boundaries.md.
         let msgid = self.index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -147,9 +167,9 @@ impl Waiter {
         self.id_map.insert(
             msgid,
             WaiterEntry {
-                read_source: None,
+                read_source: routes.read_source,
                 sender: tx,
-                write_target: None,
+                write_target: routes.write_target,
                 conn_id: None,
                 deadline,
             },
@@ -224,10 +244,21 @@ impl Waiter {
     }
 
     pub(crate) fn deadline_on_connection(&self, msgid: u64, conn_id: u64) -> Option<Instant> {
+        self.on_connection(msgid, conn_id)
+            .map(|entry| entry.deadline)
+    }
+
+    /// The pending entry, if its request was sent on exactly this connection.
+    /// Message IDs are sequential, so an ID alone must not select an entry
+    /// for a peer: every lookup made on a peer's behalf goes through here.
+    fn on_connection(
+        &self,
+        msgid: u64,
+        conn_id: u64,
+    ) -> Option<dashmap::mapref::one::Ref<'_, u64, WaiterEntry>> {
         self.id_map
             .get(&msgid)
             .filter(|entry| entry.conn_id.is_some_and(|id| id.get() == conn_id))
-            .map(|entry| entry.deadline)
     }
 
     /// Number of requests currently waiting for a response.
@@ -235,40 +266,25 @@ impl Waiter {
         self.id_map.len()
     }
 
-    /// Attaches the pinned write target of a request sent with
-    /// `with_write_buffers`. Called right after the entry is allocated;
-    /// a no-op when the entry no longer exists.
-    pub(crate) fn bind_write_target(&self, msgid: u64, target: Arc<WriteTarget>) {
-        if let Some(mut entry) = self.id_map.get_mut(&msgid) {
-            entry.write_target = Some(target);
-        }
-    }
-
-    /// Installs the request's mailbox before publishing its source regions.
-    pub(crate) fn bind_read_source(&self, msgid: u64, source: ReadSourceSender) {
-        if let Some(mut entry) = self.id_map.get_mut(&msgid) {
-            entry.read_source = Some(source);
-        }
-    }
-
     /// Copies routing information only; the original future must handle every
-    /// operation while its source borrow is still valid.
-    pub(crate) fn read_source(&self, msgid: u64) -> Option<(ReadSourceSender, Instant)> {
-        self.id_map.get(&msgid).and_then(|entry| {
-            entry
-                .read_source
-                .clone()
-                .map(|source| (source, entry.deadline))
-        })
+    /// operation while its source borrow is still valid. `conn_id` identifies
+    /// the connection that delivered the reverse RPC.
+    pub(crate) fn read_source(
+        &self,
+        msgid: u64,
+        conn_id: u64,
+    ) -> Option<(ReadSourceSender, Instant)> {
+        let entry = self.on_connection(msgid, conn_id)?;
+        let source = entry.read_source.clone()?;
+        Some((source, entry.deadline))
     }
 
     /// Returns a clone of the pending request's pinned write target, or
-    /// `None` when the entry was removed or no buffers were attached. Writers
-    /// share this target; RDMA moves its buffers into QP ownership.
-    pub(crate) fn write_target(&self, msgid: u64) -> Option<Arc<WriteTarget>> {
-        self.id_map
-            .get(&msgid)
-            .and_then(|entry| entry.write_target.clone())
+    /// `None` when the entry was removed, no buffers were attached, or the
+    /// request uses another connection than `conn_id`. Writers share this
+    /// target; RDMA moves its buffers into QP ownership.
+    pub(crate) fn write_target(&self, msgid: u64, conn_id: u64) -> Option<Arc<WriteTarget>> {
+        self.on_connection(msgid, conn_id)?.write_target.clone()
     }
 
     fn remove(&self, msgid: u64) {
@@ -315,8 +331,20 @@ impl std::fmt::Debug for Waiter {
 mod tests {
     use super::*;
     use crate::ErrorKind;
-    use ruapc_memory::BufferSet;
+    use crate::remote_memory::serve_read_source;
+    use ruapc_memory::{BufferSet, ReadSource};
     use std::sync::Arc;
+
+    fn writes(target: &Arc<WriteTarget>) -> MemoryRoutes {
+        MemoryRoutes {
+            write_target: Some(target.clone()),
+            ..Default::default()
+        }
+    }
+
+    fn later() -> Instant {
+        Instant::now() + Duration::from_secs(30)
+    }
 
     #[test]
     fn completion_releases_memory_holds_before_waking_the_receiver() {
@@ -359,10 +387,10 @@ mod tests {
             // This owner stands in for the caller's client wrapper.
             let target = WriteTarget::new(BufferSet::new(vec![pool.allocate(16).unwrap()]));
             let waiter = Waiter::default();
-            let (msgid, receiver) = waiter.alloc(Duration::from_secs(1));
+            let (msgid, receiver) =
+                waiter.alloc_until(Instant::now() + Duration::from_secs(1), writes(&target));
             let conn_id = next_conn_id();
             waiter.bind_connection(msgid, conn_id);
-            waiter.bind_write_target(msgid, target.clone());
 
             let observation = Arc::new(ObserveHolds {
                 target: Arc::downgrade(&target),
@@ -443,23 +471,26 @@ mod tests {
         let pool = ruapc_bufpool::BufferPoolBuilder::new(Vec::new()).build();
 
         let waiter = Waiter::default();
-        let (msgid, rx) = waiter.alloc(std::time::Duration::from_secs(30));
 
-        // Bind a write target while the request is pending.
+        // The target is attached for as long as the request is pending.
         let mut buf = pool.allocate(1024 * 1024).unwrap();
         buf.set_len(5);
         let target = WriteTarget::new(BufferSet::new(vec![buf]));
-        waiter.bind_write_target(msgid, target.clone());
+        let (msgid, rx) = waiter.alloc_until(later(), writes(&target));
+        let conn_id = next_conn_id();
+        waiter.bind_connection(msgid, conn_id);
 
         // A handler-side clone writes into the target.
-        let handler_clone = waiter.write_target(msgid).expect("target must be visible");
+        let handler_clone = waiter
+            .write_target(msgid, conn_id)
+            .expect("target must be visible");
         handler_clone.copy_in(0, b"hello").unwrap();
         drop(handler_clone);
 
         // Posting the response removes the entry and its hold on the target.
         waiter.post(msgid, Message::default());
         rx.recv().await.unwrap();
-        assert!(waiter.write_target(msgid).is_none());
+        assert!(waiter.write_target(msgid, conn_id).is_none());
         assert_eq!(Arc::strong_count(&target), 1);
         let buffers = target.seal(None).await.unwrap();
         assert_eq!(&buffers[0][..], b"hello");
@@ -470,16 +501,48 @@ mod tests {
         let pool = ruapc_bufpool::BufferPoolBuilder::new(Vec::new()).build();
 
         let waiter = Waiter::default();
-        let (msgid, rx) = waiter.alloc(std::time::Duration::from_secs(30));
         let mut buf = pool.allocate(1024 * 1024).unwrap();
         buf.set_len(1);
-        waiter.bind_write_target(msgid, WriteTarget::new(BufferSet::new(vec![buf])));
+        let target = WriteTarget::new(BufferSet::new(vec![buf]));
+        let (msgid, rx) = waiter.alloc_until(later(), writes(&target));
+        let conn_id = next_conn_id();
+        waiter.bind_connection(msgid, conn_id);
+        assert!(waiter.write_target(msgid, conn_id).is_some());
 
         // Drop receiver (simulates timeout cleanup).
         drop(rx);
 
         // The target is gone together with the entry.
-        assert!(waiter.write_target(msgid).is_none());
+        assert!(waiter.write_target(msgid, conn_id).is_none());
+    }
+
+    #[test]
+    fn memory_routes_are_reachable_only_from_the_requests_connection() {
+        let pool = ruapc_bufpool::BufferPool::new(Vec::new());
+        let buffers = [pool.allocate(4).unwrap()];
+        let source = ReadSource::new(&buffers);
+        let (route, _service) = serve_read_source(&source);
+        let target = WriteTarget::new(BufferSet::new(vec![pool.allocate(4).unwrap()]));
+        let waiter = Waiter::default();
+        let (msgid, _response) = waiter.alloc_until(
+            later(),
+            MemoryRoutes {
+                read_source: Some(route),
+                write_target: Some(target),
+            },
+        );
+        let (conn_id, other) = (next_conn_id(), next_conn_id());
+
+        // Before the request is bound to a connection, no peer has its ID.
+        assert!(waiter.read_source(msgid, conn_id).is_none());
+        assert!(waiter.write_target(msgid, conn_id).is_none());
+
+        waiter.bind_connection(msgid, conn_id);
+        assert!(waiter.read_source(msgid, conn_id).is_some());
+        assert!(waiter.write_target(msgid, conn_id).is_some());
+        // Another connection of the same process cannot guess its way in.
+        assert!(waiter.read_source(msgid, other).is_none());
+        assert!(waiter.write_target(msgid, other).is_none());
     }
 
     #[tokio::test]

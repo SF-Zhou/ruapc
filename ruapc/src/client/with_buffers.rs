@@ -433,7 +433,11 @@ mod tests {
                 let mut encoded = BytesMut::from(encoded.as_ref());
                 let request =
                     Message::parse(frame::parse_message(&mut encoded).unwrap().unwrap()).unwrap();
-                let retained = ctx.state.waiter.write_target(request.meta.msgid).unwrap();
+                let retained = ctx
+                    .state
+                    .waiter
+                    .write_target(request.meta.msgid, ctx.conn_id().unwrap())
+                    .unwrap();
                 if outcome == 4 {
                     ctx.state
                         .waiter
@@ -531,8 +535,16 @@ mod tests {
             let mut encoded = BytesMut::from(encoded.as_ref());
             let request =
                 Message::parse(frame::parse_message(&mut encoded).unwrap().unwrap()).unwrap();
-            let (route, deadline) = ctx.state.waiter.read_source(request.meta.msgid).unwrap();
-            let target = ctx.state.waiter.write_target(request.meta.msgid).unwrap();
+            let (route, deadline) = ctx
+                .state
+                .waiter
+                .read_source(request.meta.msgid, ctx.conn_id().unwrap())
+                .unwrap();
+            let target = ctx
+                .state
+                .waiter
+                .write_target(request.meta.msgid, ctx.conn_id().unwrap())
+                .unwrap();
             let posting = connection.hold(&target);
             ctx.state.waiter.expire(deadline);
             if wait {
@@ -591,7 +603,7 @@ mod tests {
                 Message::parse(frame::parse_message(&mut encoded).unwrap().unwrap()).unwrap();
             ctx.state
                 .waiter
-                .write_target(request.meta.msgid)
+                .write_target(request.meta.msgid, ctx.conn_id().unwrap())
                 .expect("the call attached the set held by its wrapper")
                 .copy_in(0, data)
                 .unwrap();
@@ -785,7 +797,11 @@ mod tests {
             ] {
                 let serve = async {
                     let msgid = next_request(&mut queue).await;
-                    let target = ctx.state.waiter.write_target(msgid).unwrap();
+                    let target = ctx
+                        .state
+                        .waiter
+                        .write_target(msgid, ctx.conn_id().unwrap())
+                        .unwrap();
                     target.copy_in(0, data).unwrap();
                     respond(&ctx, msgid, &response);
                     target
@@ -821,7 +837,11 @@ mod tests {
             let mut call = Box::pin(wrapper.test_call(&ctx, &()));
             assert!(futures_util::poll!(call.as_mut()).is_pending());
             let msgid = next_request(&mut queue).await;
-            let stale = ctx.state.waiter.write_target(msgid).unwrap();
+            let stale = ctx
+                .state
+                .waiter
+                .write_target(msgid, ctx.conn_id().unwrap())
+                .unwrap();
             drop(call);
             assert!(stale.copy_in(0, b"late").is_err());
 
@@ -834,7 +854,10 @@ mod tests {
             assert!(futures_util::poll!(call.as_mut()).is_pending());
             let msgid = next_request(&mut queue).await;
             assert!(
-                ctx.state.waiter.write_target(msgid).is_none(),
+                ctx.state
+                    .waiter
+                    .write_target(msgid, ctx.conn_id().unwrap())
+                    .is_none(),
                 "no slots remain to attach"
             );
         }
@@ -882,7 +905,11 @@ mod tests {
                 let mut call = Box::pin(wrapper.test_call(&ctx, &()));
                 assert!(futures_util::poll!(call.as_mut()).is_pending());
                 let msgid = next_request(&mut queue).await;
-                let target = ctx.state.waiter.write_target(msgid).unwrap();
+                let target = ctx
+                    .state
+                    .waiter
+                    .write_target(msgid, ctx.conn_id().unwrap())
+                    .unwrap();
                 let posting = connection.hold(&target);
                 respond(&ctx, msgid, &Ok(()));
                 assert!(futures_util::poll!(call.as_mut()).is_pending());

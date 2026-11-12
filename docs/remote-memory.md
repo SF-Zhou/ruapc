@@ -43,6 +43,11 @@ these same checks, then return without destination checkout or I/O. Use
 memory. Only the requested destination ranges are filled; separate calls require
 caller coordination.
 
+On TCP, WebSocket and HTTP/2 the bytes of one batch travel inline in a single
+message, which is limited to 64 MiB including framing. A `remote_read` batch
+whose bytes reach that limit fails with `InvalidCopyOp`; split larger transfers
+across calls. RDMA READs have no such limit.
+
 ## Copy a client's read space into its write space
 
 The handler returns a `BufferReply<T>` by completing a write and pairing its

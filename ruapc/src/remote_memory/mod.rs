@@ -12,13 +12,13 @@ mod rpc_transfer;
 pub(crate) mod transfer;
 mod write_target;
 
-pub(crate) use read_source::{ReadSourceReceiver, ReadSourceSender, read_source_channel};
+pub(crate) use read_source::{ReadSourceSender, ReadSourceService, serve_read_source};
 pub use reply::{BufferAvailability, BufferReply, ResultBufferReply, WriteReceipt};
 pub(crate) use rpc_transfer::MemoryService;
 #[cfg(all(test, feature = "rdma"))]
 pub(crate) use rpc_transfer::ReadIntoTargetRequest;
 #[cfg(feature = "rdma")]
-pub(crate) use rpc_transfer::RequestStatusRequest;
+pub(crate) use rpc_transfer::ValidateSourceRequest;
 pub(crate) use ruapc_memory::ReadSource;
 pub use ruapc_memory::{CopyOp, MAX_COPY_OPS, MAX_REGIONS, RemoteSpace};
 pub(crate) use write_target::WriteTarget;

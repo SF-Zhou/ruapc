@@ -64,6 +64,10 @@ trait RemoteReadService {
 
     /// Issues an out-of-bounds op batch to exercise `InvalidCopyOp`.
     async fn read_out_of_bounds(&self, ctx: &Context, req: &ReadReq) -> Result<ReadRsp>;
+
+    /// Reads the whole read space `MAX_COPY_OPS` times into distinct local
+    /// ranges: overlapping source ranges multiply the bytes of one batch.
+    async fn read_amplified(&self, ctx: &Context, req: &ReadReq) -> Result<ReadRsp>;
 }
 
 struct RemoteReadServiceImpl;
@@ -135,6 +139,26 @@ impl RemoteReadService for RemoteReadServiceImpl {
             }
         }
     }
+
+    async fn read_amplified(&self, ctx: &Context, _req: &ReadReq) -> Result<ReadRsp> {
+        let len = ctx.remote_read_space()?.total_len();
+        let ops: Vec<_> = (0..MAX_COPY_OPS as u64)
+            .map(|index| CopyOp::new(0, index * len, len))
+            .collect();
+        let per_buffer = usize::try_from(len).unwrap() * MAX_COPY_OPS / MAX_REGIONS;
+        let local = (0..MAX_REGIONS)
+            .map(|_| {
+                let mut buffer = ctx
+                    .state
+                    .buffer_pool
+                    .allocate(per_buffer)
+                    .map_err(|e| Error::new(ErrorKind::InvalidArgument, e.to_string()))?;
+                buffer.set_len(per_buffer);
+                Ok(buffer)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(digest_bufs(&ctx.remote_read(&ops, local).await?))
+    }
 }
 
 // ==========================================================================
@@ -162,6 +186,7 @@ enum Method {
     All,
     Swapped,
     OutOfBounds,
+    Amplified,
 }
 
 enum Expected {
@@ -214,6 +239,7 @@ async fn run_test(tc: TestCase) {
         Method::All => c.read_all(&ctx, &req).await,
         Method::Swapped => c.read_swapped(&ctx, &req).await,
         Method::OutOfBounds => c.read_out_of_bounds(&ctx, &req).await,
+        Method::Amplified => c.read_amplified(&ctx, &req).await,
     };
 
     match tc.expect {
@@ -289,6 +315,26 @@ async fn test_tcp_read_vectored_ops() {
         expect: Expected::OkSwapped,
     })
     .await;
+}
+
+/// A stream batch travels in one message. The source peer refuses one whose
+/// reply could not be framed before allocating or copying it, so the reader
+/// gets the error instead of waiting for a reply that cannot arrive.
+#[tokio::test]
+async fn test_stream_read_rejects_batches_beyond_the_message_limit() {
+    for scheme in ["tcp", "ws", "http"] {
+        run_test(TestCase {
+            // 1024 overlapping reads of 64 KiB total exactly 64 MiB.
+            data: &[0x5a; 64 * 1024],
+            splits: &[64 * 1024],
+            delay_ms: 0,
+            client_timeout: Duration::from_secs(5),
+            scheme,
+            method: Method::Amplified,
+            expect: Expected::Err(ErrorKind::InvalidCopyOp),
+        })
+        .await;
+    }
 }
 
 #[tokio::test]
