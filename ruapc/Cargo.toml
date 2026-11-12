@@ -10,6 +10,12 @@ keywords.workspace = true
 categories.workspace = true
 license.workspace = true
 
+# docs.rs builds without default features, which would omit every RDMA item.
+# Build the optional RDMA API there as well.
+[package.metadata.docs.rs]
+all-features = true
+apt_packages = ["libibverbs-dev", "libclang-dev", "clang", "pkg-config"]
+
 [features]
 rdma = ["ruapc-rdma"]
 # Forward ruapc-rdma's optional libibverbs GID query backend through the core
