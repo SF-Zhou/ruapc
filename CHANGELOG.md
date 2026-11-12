@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+### Changed
+- Declare Rust 1.95 as the minimum supported version and check the library
+  targets at that toolchain in CI.
+- The `ruapc` documentation on docs.rs now enables the `rdma` feature, so RDMA
+  items appear in the published API reference.
+
 ## [0.2.0-alpha.8] - 2026-11-11
 
 ### Added

@@ -3,12 +3,19 @@ name = "ruapc"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 homepage.workspace = true
 repository.workspace = true
 description.workspace = true
 keywords.workspace = true
 categories.workspace = true
 license.workspace = true
+
+# docs.rs builds without default features, which would omit every RDMA item.
+# Build the optional RDMA API there as well.
+[package.metadata.docs.rs]
+all-features = true
+apt_packages = ["libibverbs-dev", "libclang-dev", "clang", "pkg-config"]
 
 [features]
 rdma = ["ruapc-rdma"]

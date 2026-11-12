@@ -31,6 +31,23 @@ jobs:
         cargo clippy -p ruapc-memory --all-targets -- -D warnings
         RUSTDOCFLAGS='-D warnings' cargo doc -p ruapc-memory --no-deps
 
+  msrv:
+    name: MSRV (1.95)
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - uses: dtolnay/rust-toolchain@1.95.0
+
+    - name: Install RDMA build prerequisites
+      run: sudo apt-get update && sudo apt-get install -y clang pkg-config libibverbs-dev libclang-dev
+
+    - name: Check library targets at the MSRV
+      run: |
+        cargo check --workspace --all-features --lib
+        cargo check -p ruapc --no-default-features --lib
+
   build:
     name: Build and test (${{ matrix.runner }})
     strategy:
