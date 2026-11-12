@@ -5,11 +5,12 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::{
-    Buffer, Context, Receiver,
+    Buffer, Context, Message, Receiver,
     core::ContextEndpoint,
     error::{Error, ErrorKind},
     msg::{MsgFlags, MsgMeta},
-    remote_memory::{ReadSource, ReadSourceReceiver, WriteTarget, read_source_channel},
+    remote_memory::{ReadSource, ReadSourceService, WriteTarget, serve_read_source},
+    task::MemoryRoutes,
 };
 
 use super::attempt::{
@@ -95,16 +96,12 @@ impl Client {
             target.check_region_limit()?;
         }
 
-        let mut sent = self
+        let sent = self
             .send_with_retries(ctx, req, read_attachment, write_target, method_name)
             .await?;
         // Never retry after send: a missing response cannot tell us whether
         // the peer executed the request.
-        let receiving = sent.receiver.recv();
-        let response = match (&mut sent.source_requests, read_attachment.source) {
-            (Some(requests), Some(source)) => requests.drive(source, receiving).await,
-            _ => receiving.await,
-        }?;
+        let response = sent.recv().await?;
         if response.meta.flags.contains(MsgFlags::IsFrameworkError) {
             // Framework failures use Error regardless of the service's E.
             // Keep the Result envelope shared with application responses.
@@ -119,14 +116,14 @@ impl Client {
 
     /// Acquires a socket and sends the request, retrying only failures that
     /// provably occur before the request reaches the wire.
-    async fn send_with_retries<'a, Req>(
+    async fn send_with_retries<'a, 's, Req>(
         &self,
         ctx: &'a Context,
         req: &Req,
-        read_attachment: ReadAttachment<'_>,
+        read_attachment: ReadAttachment<'s>,
         write_target: Option<&Arc<WriteTarget>>,
         method_name: &str,
-    ) -> Result<SentRequest<'a>, Error>
+    ) -> Result<SentRequest<'a, 's>, Error>
     where
         Req: Serialize + JsonSchema,
     {
@@ -186,15 +183,15 @@ impl Client {
     /// connection setup does not eat into the response budget; it is
     /// returned as a [`Receiver`](crate::Receiver) whose drop (on send
     /// failure) removes the entry again.
-    async fn try_send<'a, Req>(
+    async fn try_send<'a, 's, Req>(
         &self,
         ctx: &'a Context,
         req: &Req,
-        read_attachment: ReadAttachment<'_>,
+        read_attachment: ReadAttachment<'s>,
         write_target: Option<&Arc<WriteTarget>>,
         method_name: &str,
         attempt: AttemptOptions<'_>,
-    ) -> std::result::Result<SentRequest<'a>, AttemptFailure>
+    ) -> std::result::Result<SentRequest<'a, 's>, AttemptFailure>
     where
         Req: Serialize + JsonSchema,
     {
@@ -237,19 +234,20 @@ impl Client {
             return Err(AttemptFailure::deadline());
         }
 
+        // Each attempt serves its source through its own route, so a stale
+        // attempt can never be answered. The waiter entry is created holding
+        // both memory routes: reverse handlers can reach the source mailbox
+        // and the pinned destinations as soon as the request ID exists.
+        let (read_source, mut source) = read_attachment.source.map(serve_read_source).unzip();
         // Response waiting uses the periodic sweep. A full transport queue
         // separately bounds admission by this same absolute deadline.
-        let (msgid, receiver) = ctx.state.waiter.alloc_until(response_deadline);
-        let mut source_requests = read_attachment.source.map(|_| {
-            let (sender, requests) = read_source_channel();
-            ctx.state.waiter.bind_read_source(msgid, sender);
-            requests
-        });
-        if let Some(target) = write_target {
-            // Pin the write buffers to the pending request so remote-memory
-            // handlers can reach (and keep alive) the destination memory.
-            ctx.state.waiter.bind_write_target(msgid, target.clone());
-        }
+        let (msgid, receiver) = ctx.state.waiter.alloc_until(
+            response_deadline,
+            MemoryRoutes {
+                read_source,
+                write_target: write_target.cloned(),
+            },
+        );
         let mut flags = MsgFlags::IsReq;
         if self.use_msgpack {
             flags |= MsgFlags::UseMessagePack;
@@ -267,11 +265,7 @@ impl Client {
         // Publication can precede send completion. Serve reverse requests while
         // sending as well as while waiting for the business response.
         let sending = socket.send(&mut meta, req, &ctx.state);
-        let result = match (&mut source_requests, read_attachment.source) {
-            (Some(requests), Some(source)) => requests.drive(source, sending).await,
-            _ => sending.await,
-        };
-        if let Err(err) = result {
+        if let Err(err) = ReadSourceService::drive_optional(source.as_mut(), sending).await {
             // Closure and expiry can race while waiting for capacity. An
             // exhausted response budget must not start another send attempt.
             if std::time::Instant::now() >= response_deadline {
@@ -282,17 +276,26 @@ impl Client {
                 socket.rdma_remote_device().map(str::to_owned),
             ));
         }
-        Ok(SentRequest {
-            receiver,
-            source_requests,
-        })
+        Ok(SentRequest { receiver, source })
     }
 }
 
 /// A successfully sent request attempt, waiting for its response.
-struct SentRequest<'a> {
+struct SentRequest<'a, 's> {
     receiver: Receiver<'a>,
-    source_requests: Option<ReadSourceReceiver>,
+    /// The attempt's borrowed read source, if it attached one.
+    source: Option<ReadSourceService<'s>>,
+}
+
+impl SentRequest<'_, '_> {
+    /// Waits for the response while still answering source requests.
+    async fn recv(self) -> Result<Message, Error> {
+        let Self {
+            receiver,
+            mut source,
+        } = self;
+        ReadSourceService::drive_optional(source.as_mut(), receiver.recv()).await
+    }
 }
 
 #[cfg(test)]
@@ -371,7 +374,11 @@ mod tests {
                 "Test/forgotten",
             ));
             assert!(futures_util::poll!(request.as_mut()).is_pending());
-            let (route, _) = ctx.state.waiter.read_source(0).unwrap();
+            let (route, _) = ctx
+                .state
+                .waiter
+                .read_source(0, ctx.conn_id().unwrap())
+                .unwrap();
             std::mem::forget(request);
             route
         };
@@ -391,7 +398,7 @@ mod tests {
         assert_eq!(
             route
                 .gather(
-                    vec![crate::CopyOp::new(0, 0, 4)],
+                    &[crate::CopyOp::new(0, 0, 4)],
                     std::time::Instant::now() + Duration::from_millis(10)
                 )
                 .await
@@ -428,8 +435,13 @@ mod tests {
                 "Test/blocked_send",
             ));
             assert!(futures_util::poll!(request.as_mut()).is_pending());
-            let (route, deadline) = ctx.state.waiter.read_source(0).unwrap();
-            let mut copying = Box::pin(route.gather(vec![crate::CopyOp::new(1, 0, 2)], deadline));
+            let (route, deadline) = ctx
+                .state
+                .waiter
+                .read_source(0, ctx.conn_id().unwrap())
+                .unwrap();
+            let ops = [crate::CopyOp::new(1, 0, 2)];
+            let mut copying = Box::pin(route.gather(&ops, deadline));
             assert!(futures_util::poll!(copying.as_mut()).is_pending());
             assert!(futures_util::poll!(request.as_mut()).is_pending());
             assert_eq!(copying.await.unwrap(), b"ea");

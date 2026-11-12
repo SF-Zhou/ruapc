@@ -159,12 +159,28 @@ or address that a background CPU reader can dereference.
 addresses. It sends that operation to the original request future, which
 synchronously gathers the bytes during its poll and replies with an owned byte
 vector. No borrowed source escapes that poll into an independent task.
+Source ranges may overlap, so the handler rejects a batch before queueing it
+when it has too many operations or its reply would reach the 64 MiB message
+limit: a peer cannot make the borrowing future allocate and copy more than one
+message can carry.
+
+### Routes belong to the request's connection
+
+The waiter entry holds a request's source route and write target from the
+moment its ID exists. `read_inline`, `write_inline`, `read_into_target` and
+`validate_read_source` name the original request by that ID, and reach its
+memory only when they arrive on the connection the request was sent on. Request
+IDs are sequential and easy to guess, and a process usually has several peers;
+an ID alone therefore selects nothing. A reverse RPC from another connection,
+or from a unary HTTP exchange that has none, gets the same `Timeout` error as
+one for a request that is gone. This binds a route to its connection; it does
+not authenticate the peer on that connection.
 
 ### Read first, then validate
 
 For an RDMA `remote_read` that transfers bytes, the reader waits for all READ
-completions, then calls `MemoryService/request_is_pending` on the source peer.
-It returns `Ok(buffers)` only if that check succeeds with `true`. Empty or
+completions, then calls `MemoryService/validate_read_source` on the source peer.
+It returns `Ok(buffers)` only if that call succeeds. Empty or
 all-zero-length batches validate the connected request, advertised space and
 copy ranges, then return the local buffers without I/O or a source-validation
 probe.

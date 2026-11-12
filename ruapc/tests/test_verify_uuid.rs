@@ -11,16 +11,16 @@ use ruapc::{Client, Context, ErrorKind, ListenMode, Result, Router, Server, Sock
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_TIMEOUT: Duration = Duration::from_millis(200);
 
-// A wire-only test proxy: the built-in request-status operation is
+// A wire-only test proxy: the built-in source-validation operation is
 // not part of RuaPC's public Rust API.
 #[derive(Serialize, Deserialize, JsonSchema)]
-struct RequestStatusRequest {
+struct ValidateSourceRequest {
     request_id: u64,
 }
 
 #[ruapc::service(name = "MemoryService")]
-trait RequestStatusClient {
-    async fn request_is_pending(&self, ctx: &Context, req: &RequestStatusRequest) -> Result<bool>;
+trait ValidateSourceClient {
+    async fn validate_read_source(&self, ctx: &Context, req: &ValidateSourceRequest) -> Result<()>;
 }
 
 #[ruapc::service]
@@ -31,7 +31,7 @@ trait Foo {
 struct FooImpl {
     arrived: mpsc::UnboundedSender<()>,
     resume: Notify,
-    completed: mpsc::UnboundedSender<Result<bool>>,
+    completed: mpsc::UnboundedSender<Result<()>>,
 }
 
 impl Foo for FooImpl {
@@ -41,9 +41,9 @@ impl Foo for FooImpl {
             self.resume.notified().await;
         }
         let outcome = Client::default()
-            .request_is_pending(
+            .validate_read_source(
                 ctx,
-                &RequestStatusRequest {
+                &ValidateSourceRequest {
                     request_id: ctx.msg_meta.msgid,
                 },
             )
@@ -51,7 +51,7 @@ impl Foo for FooImpl {
         // Observe the handler even when its original caller timed out or was
         // cancelled: the call's own timeout alone cannot test this probe.
         self.completed.send(outcome.clone()).unwrap();
-        outcome
+        Ok(outcome.is_ok())
     }
 }
 
@@ -99,23 +99,24 @@ async fn test_verify_message_id() {
                 .unwrap(),
             "{scheme}: the actively polled borrowing future must answer"
         );
-        assert!(
-            tokio::time::timeout(TEST_TIMEOUT, completion.recv())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap()
-        );
+        tokio::time::timeout(TEST_TIMEOUT, completion.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         assert!(
             !client.hello(&ctx, &false).await.unwrap(),
             "{scheme}: a waiter without a read attachment cannot validate a source"
         );
-        assert!(
-            !tokio::time::timeout(TEST_TIMEOUT, completion.recv())
+        assert_eq!(
+            tokio::time::timeout(TEST_TIMEOUT, completion.recv())
                 .await
                 .unwrap()
                 .unwrap()
-                .unwrap()
+                .unwrap_err()
+                .kind,
+            ErrorKind::Timeout,
+            "{scheme}"
         );
 
         for expires in [false, true] {
@@ -154,11 +155,8 @@ async fn test_verify_message_id() {
                 .await
                 .expect("the handler's validation attempt must finish independently")
                 .expect("the handler must report its validation outcome");
-            match outcome {
-                Ok(false) => {}
-                Err(error) if expires => assert_eq!(error.kind, ErrorKind::Timeout, "{scheme}"),
-                other => panic!("{scheme}: ended source borrow was accepted: {other:?}"),
-            }
+            let error = outcome.expect_err("an ended source borrow must not be accepted");
+            assert_eq!(error.kind, ErrorKind::Timeout, "{scheme}");
         }
 
         drop(source);

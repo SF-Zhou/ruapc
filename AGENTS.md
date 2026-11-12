@@ -64,6 +64,9 @@ Use [DESIGN.md](DESIGN.md) for crate/module ownership and
   The original request future services inline copies and validation while polled;
   waiters only route control messages and never retain borrowed source pointers.
   Forgetting a future must not allow background source access or new validation.
+- Reverse memory RPCs reach a request's source route or write target only on
+  the connection carrying that request; a request ID alone selects nothing.
+  Bound peer-supplied inline read work before queueing it to the source future.
 - Preserve [read-then-validate](docs/safe-boundaries.md#application-read-source-validation-and-recovery):
   success depends on the original borrowing future answering after READ completion
   and the documented assumption that request IDs are not reused within the

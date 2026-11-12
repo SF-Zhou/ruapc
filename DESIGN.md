@@ -90,7 +90,8 @@ See [endpoint identity](docs/endpoints.md) for normalization and caller obligati
 3. The response budget starts after connection acquisition and includes
    bandwidth and send-queue admission. Nested calls cap both budgets at the
    parent's remaining time. The client allocates its waiter after bandwidth
-   admission and binds a source-operation route and the owned write target.
+   admission, already holding the source-operation route and the owned write
+   target. Reverse RPCs reach them only on the request's connection.
 4. Before queueing, the transport binds the waiter to its connection ID and
    checks closure. A full queue waits for capacity, deadline or closure;
    submission rechecks state and advertises the remaining admission budget.

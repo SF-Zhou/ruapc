@@ -130,6 +130,15 @@ impl Context {
         self.remaining_time() == Some(std::time::Duration::ZERO)
     }
 
+    /// Identity of the connection that delivered the request being handled.
+    /// `None` for client-created contexts and unary HTTP exchanges.
+    pub(crate) fn conn_id(&self) -> Option<u64> {
+        match &self.endpoint {
+            ContextEndpoint::Connected(socket) => socket.conn_id(),
+            _ => None,
+        }
+    }
+
     /// Creates a server-side context with an established socket connection.
     ///
     /// Derives the request deadline from the client-provided `timeout_ms`

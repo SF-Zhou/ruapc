@@ -179,7 +179,7 @@ mod tests {
             test_utils::small_rdma_config,
         },
         remote_memory::ReadSourceSender,
-        remote_memory::RequestStatusRequest,
+        remote_memory::ValidateSourceRequest,
         service,
     };
 
@@ -337,7 +337,7 @@ mod tests {
                 })
             });
             let observer = self.clone();
-            router.wrap_method("MemoryService/request_is_pending", move |original| {
+            router.wrap_method("MemoryService/validate_read_source", move |original| {
                 Box::new(move |ctx, payload| {
                     let qp = socket(&ctx).queue_pair.qp_num();
                     let drop_response = {
@@ -348,12 +348,12 @@ mod tests {
                         {
                             // This reverse RPC is sent only after the real READ
                             // completed. Observe the mailbox without borrowing bytes.
-                            let request: RequestStatusRequest =
+                            let request: ValidateSourceRequest =
                                 payload.deserialize(&ctx.msg_meta)?;
                             observations.source = ctx
                                 .state
                                 .waiter
-                                .read_source(request.request_id)
+                                .read_source(request.request_id, ctx.conn_id().unwrap())
                                 .map(|(source, _)| source);
                             observations.attempts += 1;
                             observations.dropped += 1;

@@ -6,7 +6,7 @@ pub use supervisor::{TaskSupervisor, TaskSupervisorHandle};
 pub use supervisor::TaskSupervisorGuard;
 
 pub(crate) mod waiter;
-pub(crate) use waiter::next_conn_id;
+pub(crate) use waiter::{MemoryRoutes, next_conn_id};
 pub use waiter::{Waiter, WaiterCleaner};
 
 mod receiver;

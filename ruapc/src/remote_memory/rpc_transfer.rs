@@ -1,18 +1,19 @@
 //! Reverse-RPC requests, handlers and transport execution for remote memory.
 
+use std::{sync::Arc, time::Instant};
+
 use ruapc_memory::{CopyBatch, RemoteSpace};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    BufferAvailability,
+    BufferAvailability, ReadSourceSender, WriteTarget,
     transfer::{PreparedRead, PreparedWrite},
 };
 #[cfg(feature = "rdma")]
 use crate::Socket;
 use crate::{
-    Buffer, Client, Context, CopyOp, Error, ErrorKind, MAX_COPY_OPS, RemoteIoError, Result,
-    core::ContextEndpoint,
+    Buffer, Client, Context, CopyOp, Error, ErrorKind, RemoteIoError, Result, core::ContextEndpoint,
 };
 
 /// Request to read byte ranges of the client's read space (TCP/WS/HTTP
@@ -85,13 +86,18 @@ pub(crate) struct ReadIntoTargetRequest {
 
 /// Identifies the original borrowing future for post-READ source validation.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub(crate) struct RequestStatusRequest {
+pub(crate) struct ValidateSourceRequest {
     /// Message ID of the original request.
     pub(crate) request_id: u64,
 }
 
-/// Reverse RPCs for inline copies, client-side RDMA READs, and
-/// source-request waiter probes.
+/// Reverse RPCs for inline copies, client-side RDMA READs, and post-READ
+/// source validation.
+///
+/// Every method names an original request by its ID, and reaches that
+/// request's memory only when called on the connection carrying it. Request
+/// IDs are sequential: an ID alone must not let another peer of this process
+/// read a source or write a destination.
 #[ruapc_macro::service]
 pub(crate) trait MemoryService {
     /// Asks the original request future to copy its borrowed source.
@@ -108,13 +114,51 @@ pub(crate) trait MemoryService {
     /// Executes RDMA READs from the server's advertised regions
     /// (`read_regions` of this request's metadata) into the pinned write
     /// target (RDMA path). A successful response follows completed READs;
-    /// this operation does not perform a `request_is_pending` postcheck.
+    /// this operation does not perform a `validate_read_source` postcheck.
     async fn read_into_target(&self, ctx: &Context, req: &ReadIntoTargetRequest) -> Result<()>;
 
-    /// Asks the original request future to confirm its source after this READ.
-    /// Waiter membership alone cannot validate a borrowed source: a forgotten
-    /// future leaves its mailbox behind but cannot answer another probe.
-    async fn request_is_pending(&self, ctx: &Context, req: &RequestStatusRequest) -> Result<bool>;
+    /// Asks the original request future to confirm its source after a READ.
+    /// Success is that future's fresh answer. Waiter membership alone cannot
+    /// validate a borrowed source: a forgotten future leaves its mailbox
+    /// behind but cannot answer another probe.
+    async fn validate_read_source(&self, ctx: &Context, req: &ValidateSourceRequest) -> Result<()>;
+}
+
+/// The original request named by a reverse RPC is not pending on the
+/// connection that delivered it, or attached no such memory. The cases are
+/// deliberately indistinguishable to the caller.
+fn request_gone(method: &str, attachment: &str) -> Error {
+    Error::new(
+        ErrorKind::Timeout,
+        format!(
+            "{method}: original request is gone (timed out, completed, on another \
+             connection, or attached no {attachment} buffers)"
+        ),
+    )
+}
+
+/// Routes to the read source of the original request on this connection, with
+/// the earlier of that request's deadline and this reverse RPC's.
+fn read_source(
+    ctx: &Context,
+    request_id: u64,
+    method: &str,
+) -> Result<(ReadSourceSender, Instant)> {
+    let (source, deadline) = ctx
+        .conn_id()
+        .and_then(|conn_id| ctx.state.waiter.read_source(request_id, conn_id))
+        .ok_or_else(|| request_gone(method, "read"))?;
+    Ok((
+        source,
+        ctx.deadline.map_or(deadline, |parent| parent.min(deadline)),
+    ))
+}
+
+/// The pinned write target of the original request on this connection.
+fn write_target(ctx: &Context, request_id: u64, method: &str) -> Result<Arc<WriteTarget>> {
+    ctx.conn_id()
+        .and_then(|conn_id| ctx.state.waiter.write_target(request_id, conn_id))
+        .ok_or_else(|| request_gone(method, "write"))
 }
 
 impl MemoryService for () {
@@ -123,26 +167,8 @@ impl MemoryService for () {
         ctx: &Context,
         req: &ReadInlineRequest,
     ) -> Result<ReadInlineResponse> {
-        let (source, deadline) = ctx
-            .state
-            .waiter
-            .read_source(req.request_id)
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::Timeout,
-                    "read_inline: original request is gone or has no read buffers".into(),
-                )
-            })?;
-        let deadline = ctx.deadline.map_or(deadline, |parent| parent.min(deadline));
-        // Bound each queued control message before cloning peer-supplied ops.
-        // Full validation and byte access remain in the borrowing future.
-        if req.ops.len() > MAX_COPY_OPS {
-            return Err(Error::new(
-                ErrorKind::InvalidCopyOp,
-                "too many inline read operations".into(),
-            ));
-        }
-        let bytes = source.gather(req.ops.clone(), deadline).await?;
+        let (source, deadline) = read_source(ctx, req.request_id, "read_inline")?;
+        let bytes = source.gather(&req.ops, deadline).await?;
         Ok(ReadInlineResponse { bytes })
     }
 
@@ -150,14 +176,7 @@ impl MemoryService for () {
         // The write target pins the destination buffers; if the original
         // request already resolved or expired, there is nothing to write
         // into.
-        let Some(target) = ctx.state.waiter.write_target(req.request_id) else {
-            return Err(Error::new(
-                ErrorKind::Timeout,
-                "write_inline: original request is gone (timed out, completed, or \
-                 attached no write buffers)"
-                    .into(),
-            ));
-        };
+        let target = write_target(ctx, req.request_id, "write_inline")?;
         // The source space is server-local and opaque here; validate the
         // destination side against the pinned write space.
         let batch = CopyBatch::new(&req.ops)?;
@@ -174,14 +193,7 @@ impl MemoryService for () {
                 "read_into_target: request metadata carries no read regions".into(),
             ));
         }
-        let Some(target) = ctx.state.waiter.write_target(req.request_id) else {
-            return Err(Error::new(
-                ErrorKind::Timeout,
-                "read_into_target: original request is gone (timed out, completed, or \
-                 attached no write buffers)"
-                    .into(),
-            ));
-        };
+        let target = write_target(ctx, req.request_id, "read_into_target")?;
         let source = RemoteSpace::new(regions)?;
         let batch = CopyBatch::new(&req.ops)?;
         batch.check_bounds(source.total_len(), target.total_len())?;
@@ -209,13 +221,9 @@ impl MemoryService for () {
         }
     }
 
-    async fn request_is_pending(&self, ctx: &Context, req: &RequestStatusRequest) -> Result<bool> {
-        let Some((source, deadline)) = ctx.state.waiter.read_source(req.request_id) else {
-            return Ok(false);
-        };
-        let deadline = ctx.deadline.map_or(deadline, |parent| parent.min(deadline));
-        source.validate(deadline).await?;
-        Ok(true)
+    async fn validate_read_source(&self, ctx: &Context, req: &ValidateSourceRequest) -> Result<()> {
+        let (source, deadline) = read_source(ctx, req.request_id, "validate_read_source")?;
+        source.validate(deadline).await
     }
 }
 
@@ -293,11 +301,14 @@ mod tests {
     use std::time::Duration;
 
     use ruapc_bufpool::RemoteBufferInfo;
-    use ruapc_memory::BufferSet;
+    use ruapc_memory::{BufferSet, ReadSource};
 
     use super::*;
 
-    use crate::{Socket, SocketPoolConfig, remote_memory::WriteTarget, tcp::TcpSocket};
+    use crate::{
+        MAX_COPY_OPS, MsgMeta, Socket, SocketPoolConfig, remote_memory::serve_read_source,
+        task::MemoryRoutes, tcp::TcpSocket,
+    };
 
     /// The bulk fields must go through serde's byte-string channel:
     /// MessagePack `bin` (length header + memcpy), not a per-element
@@ -360,11 +371,47 @@ mod tests {
         assert_eq!(decoded.bytes, vec![42, 255]);
     }
 
+    fn later() -> Instant {
+        Instant::now() + Duration::from_secs(30)
+    }
+
+    /// A reverse-RPC context as delivered by one stream connection of `state`.
+    fn arrival(state: &Arc<crate::State>) -> (Context, u64) {
+        let (sender, _queue) = tokio::sync::mpsc::channel(1);
+        let socket = TcpSocket::new(sender);
+        let conn_id = socket.conn_id();
+        let ctx = Context::server_ctx(
+            state,
+            Socket::TCP(socket),
+            MsgMeta {
+                timeout_ms: 30_000,
+                ..Default::default()
+            },
+        );
+        (ctx, conn_id)
+    }
+
+    fn connected() -> (Context, u64) {
+        let config = SocketPoolConfig {
+            #[cfg(feature = "rdma")]
+            rdma: None,
+            ..Default::default()
+        };
+        arrival(&Context::create(&config).unwrap().state)
+    }
+
+    fn filled(ctx: &Context, bytes: &[u8]) -> Buffer {
+        let mut buffer = ctx.state.buffer_pool.allocate(bytes.len()).unwrap();
+        buffer.set_len(bytes.len());
+        buffer.copy_from_slice(bytes);
+        buffer
+    }
+
     /// `write_inline` must reject batches whose inline data length disagrees with
     /// the ops, and requests without a pinned write target.
     #[tokio::test]
     async fn test_write_inline_validation() {
-        let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
+        let (ctx, conn_id) = connected();
 
         // No pending request with a write target.
         let req = WriteInlineRequest {
@@ -375,12 +422,18 @@ mod tests {
         let err = ().write_inline(&ctx, &req).await.unwrap_err();
         assert_eq!(err.kind, ErrorKind::Timeout);
 
-        // Pin a 8-byte write target on a pending request.
-        let (msgid, _rx) = ctx.state.waiter.alloc(Duration::from_secs(5));
+        // Pin a 8-byte write target on a request pending on this connection.
         let mut buf = ctx.state.buffer_pool.allocate(64 * 1024).unwrap();
         buf.set_len(8);
         let target = WriteTarget::new(BufferSet::new(vec![buf]));
-        ctx.state.waiter.bind_write_target(msgid, target);
+        let (msgid, _rx) = ctx.state.waiter.alloc_until(
+            later(),
+            MemoryRoutes {
+                write_target: Some(target.clone()),
+                ..Default::default()
+            },
+        );
+        ctx.state.waiter.bind_connection(msgid, conn_id);
 
         // Length mismatch between ops and data.
         let req = WriteInlineRequest {
@@ -407,20 +460,24 @@ mod tests {
             bytes: b"data".to_vec(),
         };
         ().write_inline(&ctx, &req).await.unwrap();
-        let target = ctx.state.waiter.write_target(msgid).unwrap();
         assert_eq!(&target.seal(None).await.unwrap()[0][2..6], b"data");
     }
 
     #[tokio::test]
     async fn zero_byte_read_into_target_validates_attachments_and_connection() {
         for ops in [Vec::new(), vec![CopyOp::new(u64::MAX, u64::MAX, 0)]] {
-            let config = SocketPoolConfig {
-                #[cfg(feature = "rdma")]
-                rdma: None,
-                ..Default::default()
-            };
-            let mut ctx = Context::create(&config).unwrap();
-            let (request_id, _rx) = ctx.state.waiter.alloc(Duration::from_secs(5));
+            let (mut ctx, conn_id) = connected();
+            let connection = ctx.endpoint.clone();
+            let mut buffer = ctx.state.buffer_pool.allocate(4).unwrap();
+            buffer.set_len(4);
+            let (request_id, _rx) = ctx.state.waiter.alloc_until(
+                later(),
+                MemoryRoutes {
+                    write_target: Some(WriteTarget::new(BufferSet::new(vec![buffer]))),
+                    ..Default::default()
+                },
+            );
+            ctx.state.waiter.bind_connection(request_id, conn_id);
             let request = ReadIntoTargetRequest { request_id, ops };
 
             assert_eq!(
@@ -433,84 +490,207 @@ mod tests {
                 ..Default::default()
             }]
             .into();
+
+            // Without the request's connection, its target cannot be named.
+            for endpoint in [
+                ContextEndpoint::Invalid,
+                ContextEndpoint::Endpoint("tcp://127.0.0.1:8000".parse().unwrap()),
+                arrival(&ctx.state).0.endpoint,
+            ] {
+                ctx.endpoint = endpoint;
+                assert_eq!(
+                    ().read_into_target(&ctx, &request).await.unwrap_err().kind,
+                    ErrorKind::Timeout,
+                );
+            }
+
+            ctx.endpoint = connection;
+            let (unattached_id, _unattached) = ctx.state.waiter.alloc(Duration::from_secs(5));
+            ctx.state.waiter.bind_connection(unattached_id, conn_id);
+            let unattached = ReadIntoTargetRequest {
+                request_id: unattached_id,
+                ops: request.ops.clone(),
+            };
             assert_eq!(
-                ().read_into_target(&ctx, &request).await.unwrap_err().kind,
+                ().read_into_target(&ctx, &unattached)
+                    .await
+                    .unwrap_err()
+                    .kind,
                 ErrorKind::Timeout,
             );
-
-            let mut buffer = ctx.state.buffer_pool.allocate(4).unwrap();
-            buffer.set_len(4);
-            let target = WriteTarget::new(BufferSet::new(vec![buffer]));
-            ctx.state.waiter.bind_write_target(request_id, target);
-            assert_eq!(
-                ().read_into_target(&ctx, &request).await.unwrap_err().kind,
-                ErrorKind::NotConnected,
-            );
-
-            ctx.endpoint = ContextEndpoint::Endpoint("tcp://127.0.0.1:8000".parse().unwrap());
-            assert_eq!(
-                ().read_into_target(&ctx, &request).await.unwrap_err().kind,
-                ErrorKind::NotConnected,
-            );
-
-            let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
-            ctx.endpoint = ContextEndpoint::Connected(Socket::TCP(TcpSocket::new(sender)));
             assert_eq!(
                 ().read_into_target(&ctx, &request).await.unwrap_err().kind,
                 ErrorKind::InvalidArgument,
             );
-            assert!(receiver.try_recv().is_err());
         }
     }
 
     #[tokio::test]
     async fn oversized_inline_reads_are_rejected_without_polling_the_source() {
-        use crate::remote_memory::read_source_channel;
-
-        let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
-        let (request_id, _response) = ctx.state.waiter.alloc(Duration::from_secs(30));
-        let (sender, _requests) = read_source_channel();
-        ctx.state.waiter.bind_read_source(request_id, sender);
-        let request = ReadInlineRequest {
-            request_id,
-            ops: vec![CopyOp::new(0, 0, 0); MAX_COPY_OPS + 1],
-        };
-        let result = tokio::time::timeout(Duration::from_secs(1), ().read_inline(&ctx, &request))
-            .await
-            .expect("oversized work must fail before entering the source mailbox");
-        assert_eq!(result.unwrap_err().kind, ErrorKind::InvalidCopyOp);
+        let (ctx, conn_id) = connected();
+        let buffer = filled(&ctx, b"data");
+        let source = ReadSource::new(std::slice::from_ref(&buffer));
+        let (route, _service) = serve_read_source(&source);
+        let (request_id, _response) = ctx.state.waiter.alloc_until(
+            later(),
+            MemoryRoutes {
+                read_source: Some(route),
+                ..Default::default()
+            },
+        );
+        ctx.state.waiter.bind_connection(request_id, conn_id);
+        for ops in [
+            vec![CopyOp::new(0, 0, 0); MAX_COPY_OPS + 1],
+            // Overlapping source ranges would amplify four bytes into a reply
+            // that no frame can carry.
+            (0..MAX_COPY_OPS as u64)
+                .map(|index| CopyOp::new(0, index << 16, 1 << 16))
+                .collect(),
+        ] {
+            let request = ReadInlineRequest { request_id, ops };
+            let result =
+                tokio::time::timeout(Duration::from_secs(1), ().read_inline(&ctx, &request))
+                    .await
+                    .expect("oversized work must fail before entering the source mailbox");
+            assert_eq!(result.unwrap_err().kind, ErrorKind::InvalidCopyOp);
+        }
     }
 
     #[tokio::test]
     async fn source_validation_requires_the_original_future_not_just_a_waiter() {
-        use crate::remote_memory::read_source_channel;
-        use ruapc_memory::ReadSource;
-
-        let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
-        let missing = RequestStatusRequest { request_id: 9999 };
-        assert!(!().request_is_pending(&ctx, &missing).await.unwrap());
-
-        let (request_id, _rx) = ctx.state.waiter.alloc(Duration::from_secs(1));
-        let pending = RequestStatusRequest { request_id };
-        assert!(!().request_is_pending(&ctx, &pending).await.unwrap());
-
-        let buffer = ctx.state.buffer_pool.allocate(4).unwrap();
-        let source = ReadSource::new(std::slice::from_ref(&buffer));
-        let (sender, mut requests) = read_source_channel();
-        ctx.state.waiter.bind_read_source(request_id, sender);
-        assert!(
-            requests
-                .drive(&source, ().request_is_pending(&ctx, &pending))
-                .await
-                .unwrap()
-        );
-        drop(requests);
+        let (ctx, conn_id) = connected();
+        let missing = ValidateSourceRequest { request_id: 9999 };
         assert_eq!(
-            ().request_is_pending(&ctx, &pending)
+            ().validate_read_source(&ctx, &missing)
                 .await
                 .unwrap_err()
                 .kind,
             ErrorKind::Timeout
         );
+
+        // A pending request without a read attachment has no source to validate.
+        let (request_id, _rx) = ctx.state.waiter.alloc(Duration::from_secs(1));
+        ctx.state.waiter.bind_connection(request_id, conn_id);
+        let unattached = ValidateSourceRequest { request_id };
+        assert_eq!(
+            ().validate_read_source(&ctx, &unattached)
+                .await
+                .unwrap_err()
+                .kind,
+            ErrorKind::Timeout
+        );
+
+        let buffer = ctx.state.buffer_pool.allocate(4).unwrap();
+        let source = ReadSource::new(std::slice::from_ref(&buffer));
+        let (route, mut service) = serve_read_source(&source);
+        let (request_id, _rx) = ctx.state.waiter.alloc_until(
+            later(),
+            MemoryRoutes {
+                read_source: Some(route),
+                ..Default::default()
+            },
+        );
+        ctx.state.waiter.bind_connection(request_id, conn_id);
+        let pending = ValidateSourceRequest { request_id };
+        service
+            .drive(().validate_read_source(&ctx, &pending))
+            .await
+            .unwrap();
+        drop(service);
+        assert_eq!(
+            ().validate_read_source(&ctx, &pending)
+                .await
+                .unwrap_err()
+                .kind,
+            ErrorKind::Timeout
+        );
+    }
+
+    /// Request IDs are sequential. Guessing one must not give another
+    /// connection of this process, or a caller without one, access to memory
+    /// attached to a request sent elsewhere.
+    #[tokio::test]
+    async fn memory_routes_reject_reverse_rpcs_from_other_connections() {
+        let (ctx, conn_id) = connected();
+        let (other, _) = arrival(&ctx.state);
+        let mut unconnected = ctx.clone();
+        unconnected.endpoint = ContextEndpoint::Invalid;
+
+        let buffer = filled(&ctx, b"read");
+        let source = ReadSource::new(std::slice::from_ref(&buffer));
+        let (route, mut service) = serve_read_source(&source);
+        let target = WriteTarget::new(BufferSet::new(vec![filled(&ctx, b"keep")]));
+        let (request_id, _response) = ctx.state.waiter.alloc_until(
+            later(),
+            MemoryRoutes {
+                read_source: Some(route),
+                write_target: Some(target.clone()),
+            },
+        );
+        ctx.state.waiter.bind_connection(request_id, conn_id);
+
+        let read = ReadInlineRequest {
+            request_id,
+            ops: vec![CopyOp::new(0, 0, 4)],
+        };
+        let write = WriteInlineRequest {
+            request_id,
+            ops: vec![CopyOp::new(0, 0, 4)],
+            bytes: b"evil".to_vec(),
+        };
+        let validate = ValidateSourceRequest { request_id };
+        let mut into_target = other.clone();
+        into_target.msg_meta.read_regions = [RemoteBufferInfo {
+            addr: 0x1000,
+            len: 4,
+            ..Default::default()
+        }]
+        .into();
+        let read_into = ReadIntoTargetRequest {
+            request_id,
+            ops: vec![CopyOp::new(0, 0, 4)],
+        };
+
+        // The owner is polled throughout, so only the connection check can
+        // refuse these callers.
+        service
+            .drive(async {
+                for foreign in [&other, &unconnected] {
+                    assert_eq!(
+                        ().read_inline(foreign, &read).await.unwrap_err().kind,
+                        ErrorKind::Timeout
+                    );
+                    assert_eq!(
+                        ().write_inline(foreign, &write).await.unwrap_err().kind,
+                        ErrorKind::Timeout
+                    );
+                    assert_eq!(
+                        ().validate_read_source(foreign, &validate)
+                            .await
+                            .unwrap_err()
+                            .kind,
+                        ErrorKind::Timeout
+                    );
+                }
+                assert_eq!(
+                    ().read_into_target(&into_target, &read_into)
+                        .await
+                        .unwrap_err()
+                        .kind,
+                    ErrorKind::Timeout
+                );
+
+                // The request's own connection reaches both attachments.
+                assert_eq!(().read_inline(&ctx, &read).await.unwrap().bytes, b"read");
+                ().validate_read_source(&ctx, &validate).await.unwrap();
+                let own = WriteInlineRequest {
+                    request_id,
+                    ops: vec![CopyOp::new(0, 2, 2)],
+                    bytes: b"ok".to_vec(),
+                };
+                ().write_inline(&ctx, &own).await.unwrap();
+            })
+            .await;
+        assert_eq!(&target.seal(None).await.unwrap()[0][..], b"keok");
     }
 }

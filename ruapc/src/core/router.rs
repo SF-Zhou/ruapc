@@ -228,7 +228,7 @@ mod tests {
         let mut expected = vec![
             "MemoryService/read_inline",
             "MemoryService/read_into_target",
-            "MemoryService/request_is_pending",
+            "MemoryService/validate_read_source",
             "MemoryService/write_inline",
         ];
         #[cfg(feature = "rdma")]

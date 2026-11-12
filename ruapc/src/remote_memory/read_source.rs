@@ -13,9 +13,13 @@ use tokio::{
     time::timeout_at,
 };
 
-use crate::{CopyOp, Error, ErrorKind, Result};
+use crate::{CopyOp, Error, ErrorKind, MAX_COPY_OPS, Result, msg::frame::MAX_MSG_SIZE};
 
 const SOURCE_REQUEST_CAPACITY: usize = 32;
+
+/// A reply of this many bytes could never be framed. Source ranges may overlap,
+/// so without this bound a peer could request far more than the source holds.
+const MAX_INLINE_BYTES: u64 = MAX_MSG_SIZE as u64;
 
 #[derive(Debug)]
 enum SourceRequest {
@@ -60,16 +64,22 @@ pub(crate) struct ReadSourceSender {
     requests: mpsc::Sender<SourceRequest>,
 }
 
-/// Driven only by the original request future while it borrows the source.
-pub(crate) struct ReadSourceReceiver {
+/// The borrowed source of one request attempt together with its mailbox.
+/// Only the original request future drives it, so source requests are answered
+/// exactly while that future is polled with its borrow.
+pub(crate) struct ReadSourceService<'a> {
+    source: &'a ReadSource<'a>,
     requests: mpsc::Receiver<SourceRequest>,
 }
 
-pub(crate) fn read_source_channel() -> (ReadSourceSender, ReadSourceReceiver) {
-    let (sender, receiver) = mpsc::channel(SOURCE_REQUEST_CAPACITY);
+/// Opens the route to `source` for one request attempt.
+pub(crate) fn serve_read_source<'a>(
+    source: &'a ReadSource<'a>,
+) -> (ReadSourceSender, ReadSourceService<'a>) {
+    let (sender, requests) = mpsc::channel(SOURCE_REQUEST_CAPACITY);
     (
         ReadSourceSender { requests: sender },
-        ReadSourceReceiver { requests: receiver },
+        ReadSourceService { source, requests },
     )
 }
 
@@ -98,12 +108,31 @@ impl ReadSourceSender {
     }
 
     /// Copies inline bytes inside the source owner's polling context.
-    pub(crate) async fn gather(&self, ops: Vec<CopyOp>, deadline: Instant) -> Result<Vec<u8>> {
+    ///
+    /// Bounds the peer-supplied work before queueing or cloning it: the
+    /// operation count, and the bytes the owner would allocate and copy in its
+    /// poll. Full validation and byte access remain in the borrowing future.
+    pub(crate) async fn gather(&self, ops: &[CopyOp], deadline: Instant) -> Result<Vec<u8>> {
+        if ops.len() > MAX_COPY_OPS {
+            return Err(Error::new(
+                ErrorKind::InvalidCopyOp,
+                "too many inline read operations".into(),
+            ));
+        }
+        let bytes = ops
+            .iter()
+            .try_fold(0u64, |total, op| total.checked_add(op.len));
+        if bytes.is_none_or(|bytes| bytes >= MAX_INLINE_BYTES) {
+            return Err(Error::new(
+                ErrorKind::InvalidCopyOp,
+                format!("inline read exceeds the {MAX_INLINE_BYTES}-byte message limit"),
+            ));
+        }
         let (reply, response) = oneshot::channel();
         self.request(
             SourceRequest::Inline {
                 deadline,
-                ops,
+                ops: ops.to_vec(),
                 reply,
             },
             response,
@@ -133,15 +162,11 @@ impl ReadSourceSender {
     }
 }
 
-impl ReadSourceReceiver {
+impl ReadSourceService<'_> {
     /// Drives both the business operation and source requests without allowing
-    /// references to escape into independently running tasks. The same receiver
+    /// references to escape into independently running tasks. The same service
     /// may cover successive send and response phases of one immutable source.
-    pub(crate) async fn drive<F: Future>(
-        &mut self,
-        source: &ReadSource<'_>,
-        future: F,
-    ) -> F::Output {
+    pub(crate) async fn drive<F: Future>(&mut self, future: F) -> F::Output {
         tokio::pin!(future);
         loop {
             // Poll business completion first, and yield between bounded batches
@@ -151,12 +176,23 @@ impl ReadSourceReceiver {
                     biased;
                     output = &mut future => return output,
                     request = self.requests.recv() => match request {
-                        Some(request) => request.handle(source),
+                        Some(request) => request.handle(self.source),
                         None => return future.await,
                     },
                 }
             }
             tokio::task::yield_now().await;
+        }
+    }
+
+    /// Awaits `future`, answering source requests if the attempt has a source.
+    pub(crate) async fn drive_optional<F: Future>(
+        service: Option<&mut Self>,
+        future: F,
+    ) -> F::Output {
+        match service {
+            Some(service) => service.drive(future).await,
+            None => future.await,
         }
     }
 }
@@ -197,11 +233,14 @@ mod tests {
     #[tokio::test]
     async fn forgetting_the_driver_allows_source_reuse_but_no_new_confirmation() {
         let mut buffers = buffers();
-        let (sender, mut receiver) = read_source_channel();
         let completed_read = buffers[0].to_vec();
+        let sender;
         let completed_probe = {
             let source = ReadSource::new(&buffers);
-            let mut driver = Box::pin(receiver.drive(&source, pending::<()>()));
+            let mut service;
+            (sender, service) = serve_read_source(&source);
+            // The request future owns its service.
+            let mut driver = Box::pin(async move { service.drive(pending::<()>()).await });
 
             // Model a completed READ followed by its own fresh probe.
             let mut probe = Box::pin(sender.validate(deadline()));
@@ -229,70 +268,107 @@ mod tests {
     async fn inline_gather_returns_owned_bytes_and_checks_ranges() {
         let buffers = buffers();
         let source = ReadSource::new(&buffers);
-        let (sender, mut receiver) = read_source_channel();
+        let (sender, mut service) = serve_read_source(&source);
         let work = async {
             assert_eq!(
                 sender
-                    .gather(vec![CopyOp::new(2, 0, 4)], deadline())
+                    .gather(&[CopyOp::new(2, 0, 4)], deadline())
                     .await
                     .unwrap(),
                 b"cdef"
             );
+            // Source ranges may overlap; the reply holds each operation's bytes.
+            assert_eq!(
+                sender
+                    .gather(&[CopyOp::new(0, 0, 4), CopyOp::new(0, 4, 4)], deadline())
+                    .await
+                    .unwrap(),
+                b"abcdabcd"
+            );
             let error = sender
-                .gather(vec![CopyOp::new(7, 0, 2)], deadline())
+                .gather(&[CopyOp::new(7, 0, 2)], deadline())
                 .await
                 .unwrap_err();
             assert_eq!(error.kind, ErrorKind::InvalidCopyOp);
         };
-        receiver.drive(&source, work).await;
+        service.drive(work).await;
+    }
+
+    #[tokio::test]
+    async fn oversized_inline_work_is_rejected_before_reaching_the_owner() {
+        let buffers = buffers();
+        let source = ReadSource::new(&buffers);
+        let (sender, service) = serve_read_source(&source);
+        // Nobody drives the service: every rejection precedes the mailbox.
+        for ops in [
+            vec![CopyOp::new(0, 0, 0); MAX_COPY_OPS + 1],
+            vec![CopyOp::new(0, 0, MAX_INLINE_BYTES)],
+            // Overlapping source ranges amplify a small source.
+            (0..MAX_COPY_OPS as u64)
+                .map(|index| {
+                    let len = MAX_INLINE_BYTES.div_ceil(MAX_COPY_OPS as u64);
+                    CopyOp::new(0, index * len, len)
+                })
+                .collect(),
+            vec![CopyOp::new(0, 0, u64::MAX), CopyOp::new(0, 0, 1)],
+        ] {
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                sender.gather(&ops, Instant::now() + Duration::from_secs(30)),
+            )
+            .await
+            .expect("oversized work must fail without waiting for the owner");
+            assert_eq!(result.unwrap_err().kind, ErrorKind::InvalidCopyOp);
+        }
+        assert_eq!(service.requests.len(), 0);
     }
 
     #[tokio::test]
     async fn business_completion_stops_confirmation_until_the_next_phase() {
         let buffers = buffers();
         let source = ReadSource::new(&buffers);
-        let (sender, mut receiver) = read_source_channel();
+        let (sender, mut service) = serve_read_source(&source);
         let mut probe = Box::pin(sender.validate(deadline()));
         assert!(futures_util::poll!(probe.as_mut()).is_pending());
 
-        assert_eq!(receiver.drive(&source, ready(17)).await, 17);
+        assert_eq!(service.drive(ready(17)).await, 17);
         assert!(futures_util::poll!(probe.as_mut()).is_pending());
 
         // A send phase may end while a probe waits for the response phase.
-        receiver.drive(&source, probe).await.unwrap();
+        service.drive(probe).await.unwrap();
     }
 
     #[tokio::test]
-    async fn dropping_the_receiver_fails_queued_and_new_requests() {
-        let (sender, receiver) = read_source_channel();
+    async fn dropping_the_service_fails_queued_and_new_requests() {
+        let buffers = buffers();
+        let source = ReadSource::new(&buffers);
+        let (sender, service) = serve_read_source(&source);
         let mut queued = Box::pin(sender.validate(deadline()));
         assert!(futures_util::poll!(queued.as_mut()).is_pending());
-        drop(receiver);
+        drop(service);
         assert_eq!(queued.await.unwrap_err().kind, ErrorKind::Timeout);
         assert_eq!(
             sender.validate(deadline()).await.unwrap_err().kind,
             ErrorKind::Timeout
         );
         assert_eq!(
-            sender
-                .gather(Vec::new(), deadline())
-                .await
-                .unwrap_err()
-                .kind,
+            sender.gather(&[], deadline()).await.unwrap_err().kind,
             ErrorKind::Timeout
         );
     }
 
     #[tokio::test]
     async fn queue_admission_and_unpolled_replies_share_the_deadline() {
-        let (sender, receiver) = read_source_channel();
+        let buffers = buffers();
+        let source = ReadSource::new(&buffers);
+        let (sender, service) = serve_read_source(&source);
         let mut queued = Vec::new();
         for _ in 0..SOURCE_REQUEST_CAPACITY {
             let mut probe = Box::pin(sender.validate(deadline()));
             assert!(futures_util::poll!(probe.as_mut()).is_pending());
             queued.push(probe);
         }
-        assert_eq!(receiver.requests.len(), SOURCE_REQUEST_CAPACITY);
+        assert_eq!(service.requests.len(), SOURCE_REQUEST_CAPACITY);
         assert_eq!(
             sender
                 .validate(Instant::now() + Duration::from_millis(10))
@@ -301,14 +377,14 @@ mod tests {
                 .kind,
             ErrorKind::Timeout
         );
-        assert_eq!(receiver.requests.len(), SOURCE_REQUEST_CAPACITY);
+        assert_eq!(service.requests.len(), SOURCE_REQUEST_CAPACITY);
     }
 
     #[tokio::test]
     async fn expired_queued_work_cannot_be_answered_when_polling_resumes() {
         let buffers = buffers();
         let source = ReadSource::new(&buffers);
-        let (sender, mut receiver) = read_source_channel();
+        let (sender, mut service) = serve_read_source(&source);
         let expired = Instant::now();
         let (validate_reply, validate_response) = oneshot::channel();
         let (inline_reply, inline_response) = oneshot::channel();
@@ -327,8 +403,8 @@ mod tests {
                 reply: inline_reply,
             })
             .unwrap();
-        receiver
-            .drive(&source, async {
+        service
+            .drive(async {
                 assert!(validate_response.await.is_err());
                 assert!(inline_response.await.is_err());
             })
@@ -347,11 +423,11 @@ mod tests {
         let buffers = buffers();
         let source = ReadSource::new(&buffers);
         for closed in [false, true] {
-            let (sender, mut receiver) = read_source_channel();
+            let (sender, mut service) = serve_read_source(&source);
             let sender = (!closed).then_some(sender);
             let wake_count = Arc::new(WakeCount(AtomicUsize::new(0)));
             let waker = Waker::from(wake_count.clone());
-            let mut driver = Box::pin(receiver.drive(&source, pending::<()>()));
+            let mut driver = Box::pin(service.drive(pending::<()>()));
             assert!(matches!(
                 driver.as_mut().poll(&mut Context::from_waker(&waker)),
                 Poll::Pending
