@@ -6,7 +6,6 @@ readme = "README.md"
 authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 keywords = ["rdma", "ibverbs", "infiniband", "roce", "ffi"]
@@ -54,3 +53,6 @@ cc.workspace = true
 pkg-config.workspace = true
 syn.workspace = true
 prettyplease.workspace = true
+
+[lints]
+workspace = true

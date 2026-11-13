@@ -335,9 +335,9 @@ impl BuddyAllocator {
     pub(super) fn reserve_subtree(&mut self, level: usize) -> Option<ReservedSubtree> {
         let mut best: Option<(NonNull<BuddyBlock>, usize, usize)> = None;
 
-        for i in 0..self.blocks.len() {
+        for block in &self.blocks {
             let block_ptr =
-                NonNull::new(std::ptr::from_ref::<BuddyBlock>(&self.blocks[i]).cast_mut()).unwrap();
+                NonNull::new(std::ptr::from_ref::<BuddyBlock>(block).cast_mut()).unwrap();
             let state = unsafe { BuddyBlock::allocator_state(block_ptr) };
 
             for root_index in 0..NODES_PER_LEVEL[level] {

@@ -29,8 +29,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   request without a source route now fails with `Timeout` like an
   unresponsive one. Peers must run the same version to complete an RDMA
   `remote_read`.
-- Declare Rust 1.95 as the minimum supported version and check the library
+- Declare Rust 1.100 as the minimum supported version and check the library
   targets at that toolchain in CI.
+- Allocate aligned buffer-pool backing memory through the stable
+  `std::alloc::Allocator` API with the process global allocator, replacing raw
+  allocator calls and the private anonymous-mapping path. New backing memory is
+  no longer zeroed before use.
 - The `ruapc` documentation on docs.rs now enables the `rdma` feature, so RDMA
   items appear in the published API reference.
 

@@ -32,13 +32,13 @@ jobs:
         RUSTDOCFLAGS='-D warnings' cargo doc -p ruapc-memory --no-deps
 
   msrv:
-    name: MSRV (1.95)
+    name: MSRV (1.100)
     runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v6
 
-    - uses: dtolnay/rust-toolchain@1.95.0
+    - uses: dtolnay/rust-toolchain@1.100.0
 
     - name: Install RDMA build prerequisites
       run: sudo apt-get update && sudo apt-get install -y clang pkg-config libibverbs-dev libclang-dev
