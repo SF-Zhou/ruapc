@@ -4,7 +4,6 @@ version.workspace = true
 authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-homepage.workspace = true
 repository.workspace = true
 description = "Reusable buffer pool with buddy allocation, slab caches and optional device registration"
 keywords = ["buffer-pool", "memory", "allocation", "buddy-allocator"]
