@@ -29,9 +29,10 @@ route source-copy requests to the original borrowing future and resolve write
 targets through its waiter. RDMA exports
 registered addresses and keys for the connection's actual NIC.
 
-New backing memory is initialized before safe slices are exposed. Reused
-buffers are not cleared. Mutable slices require exclusive access, and logical
-buffer lengths determine which bytes a transfer exposes.
+New backing memory is allocated through the process global allocator without a
+zeroing pass; reused buffers are not cleared either. Mutable slices require
+exclusive access, and logical buffer lengths determine which bytes a transfer
+exposes.
 
 RDMA registration requires ordinary virtual addresses. QP creation requires
 an RC QP and matching PD/CQ contexts, and rejects an external SRQ or raw context

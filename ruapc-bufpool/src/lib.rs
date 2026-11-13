@@ -4,8 +4,9 @@
 //! 16 MiB, and 64 MiB buddy nodes. Small allocations use reclaimable thread
 //! caches by default. [`Buffer`] returns its allocation to the pool on drop.
 //!
-//! New blocks are zero-initialized and registered with the configured devices;
-//! reused buffers retain their contents. [`BufferPool::allocate`] fails when
+//! New blocks are allocated through the process global allocator and registered
+//! with the configured devices; their contents are unspecified until written,
+//! and reused buffers retain their contents. [`BufferPool::allocate`] fails when
 //! capacity is unavailable, while [`BufferPool::async_allocate`] can wait for
 //! a returned buffer. Growth and device registration run on the calling thread.
 //!

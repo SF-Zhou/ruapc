@@ -39,7 +39,7 @@ pub struct Buffer {
     index: u8,
 }
 
-// SAFETY: each buffer exclusively owns a disjoint initialized region. Moving
+// SAFETY: each buffer exclusively owns a disjoint region. Moving
 // the buffer transfers that ownership; its Arc keeps the backing pool alive.
 unsafe impl Send for Buffer {}
 
@@ -53,7 +53,7 @@ impl Buffer {
     /// # Safety
     ///
     /// The caller must ensure:
-    /// - `ptr` exclusively owns initialized bytes of the size for `level`
+    /// - `ptr` exclusively owns the region for `level`
     /// - `block` belongs to `pool` and remains installed for the pool's lifetime
     /// - `level` is in range 0-3
     /// - `index` is valid for the given level
@@ -88,7 +88,7 @@ impl Buffer {
     /// # Safety
     ///
     /// The caller must ensure:
-    /// - `ptr` exclusively owns an initialized chunk of `SLAB_CLASS_SIZES[class]`
+    /// - `ptr` exclusively owns a chunk of `SLAB_CLASS_SIZES[class]`
     ///   bytes inside a slab owned by the pool's slab layer
     /// - `block` points to the `BuddyBlock` containing the chunk
     /// - `class` is a valid slab class and `index` a valid chunk index

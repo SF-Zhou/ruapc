@@ -14,7 +14,6 @@ license.workspace = true
 [dependencies]
 aliasable.workspace = true
 foldhash.workspace = true
-libc.workspace = true
 schemars.workspace = true
 serde.workspace = true
 
@@ -22,6 +21,8 @@ serde.workspace = true
 # Installed as the process allocator by every benchmark harness.
 tikv-jemallocator.workspace = true
 tokio.workspace = true
+# Benchmarks pin worker affinity; the library no longer allocates through libc.
+libc.workspace = true
 
 [[bench]]
 name = "lazy_merge"

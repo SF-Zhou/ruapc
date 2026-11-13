@@ -29,9 +29,10 @@ smallest-request-first.
 
 Buffers initially have `len() == capacity()`. Use `set_len` to select the logical
 data length; `extend_from_slice` appends at that length. Dropping a buffer returns
-its allocation to the pool. Reused bytes are **not cleared**. Newly allocated
-backing blocks are initialized, with 2 MiB alignment on 64-bit targets and 4 KiB
-otherwise; Linux 64-bit builds use demand-paged anonymous mappings.
+its allocation to the pool. Reused bytes are **not cleared**. New backing blocks
+are allocated from the process global allocator through the standard allocator
+API, with 2 MiB alignment on 64-bit targets and 4 KiB otherwise; allocation does
+not zero them. Large blocks typically come from demand-paged memory.
 
 ## Usage
 
@@ -74,7 +75,7 @@ registrars until all blocks have been released.
 | [`registration.rs`](src/registration.rs) | Audited memory registrar and owned registration handles |
 | [`completion.rs`](src/completion.rs) | Safe runtime-independent single-value notification shared with RDMA |
 | [`pool/small.rs`](src/pool/small.rs), [`slab.rs`](src/slab.rs), [`thread_cache.rs`](src/thread_cache.rs) | Slab classes, chunk ownership, thread caches and reclamation |
-| [`buddy.rs`](src/buddy.rs), [`aligned.rs`](src/aligned.rs) | Backing regions, allocation metadata and initialized memory |
+| [`buddy.rs`](src/buddy.rs), [`aligned.rs`](src/aligned.rs) | Backing regions, allocation metadata and owned memory |
 
 Cache locks are released before acquiring slab or buddy locks. Slab locks may
 precede the buddy mutex; the reverse order is forbidden. `BuddyState` keeps

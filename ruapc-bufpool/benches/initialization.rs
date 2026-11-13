@@ -1,12 +1,12 @@
 //! Compare first allocation cost without charging initialization to the hot pool
-//! reuse path. The raw controls never expose uninitialized memory as byte slices.
-//! `std alloc` cases measure the process global allocator, which every harness
-//! sets to jemalloc; `AlignedMemory` uses its own mapping path on 64-bit Linux.
+//! reuse path. The control cases allocate through `std::alloc::Global`, which
+//! every harness backs with jemalloc, and never expose uninitialized memory as
+//! byte slices. `AlignedMemory` allocates through the same global allocator.
 //! See `docs/benchmark.md#allocator`.
 //!
 //! Run with: cargo bench -p ruapc-bufpool --bench initialization
 
-use std::alloc::{Layout, alloc, alloc_zeroed, dealloc};
+use std::alloc::{Allocator, Global, Layout};
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -33,29 +33,30 @@ fn measure(name: &str, mut allocate: impl FnMut()) {
         allocate();
     }
     let micros = start.elapsed().as_secs_f64() * 1e6 / f64::from(ITERATIONS);
-    println!("{name:<36} {micros:>9.2} us per 64 MiB block");
+    println!("{name:<44} {micros:>9.2} us per 64 MiB block");
 }
 
 fn main() {
     let layout = Layout::from_size_align(SIZE, ALIGN).unwrap();
     for zeroed in [false, true] {
         let name = if zeroed {
-            "std alloc_zeroed + free"
+            "Global allocate_zeroed + deallocate"
         } else {
-            "std alloc + free (uninitialized)"
+            "Global allocate + deallocate (uninitialized)"
         };
         measure(name, || {
-            // SAFETY: valid nonzero layout, checked allocation, matching free.
-            // This benchmark does not read the raw uninitialized control.
+            let block = if zeroed {
+                Global.allocate_zeroed(layout)
+            } else {
+                Global.allocate(layout)
+            }
+            .unwrap();
+            assert!(block.len() >= layout.size());
+            black_box(block);
+            // SAFETY: `block` was allocated by `Global` with `layout` above.
+            // This benchmark does not read the uninitialized control.
             unsafe {
-                let ptr = if zeroed {
-                    alloc_zeroed(layout)
-                } else {
-                    alloc(layout)
-                };
-                assert!(!ptr.is_null());
-                black_box(ptr);
-                dealloc(ptr, layout);
+                Global.deallocate(block.cast(), layout);
             }
         });
     }

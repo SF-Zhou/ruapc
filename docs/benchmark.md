@@ -23,10 +23,10 @@ disabled at run time. Record any allocator override with the raw output and
 keep it identical when comparing versions; the workload variables documented
 below only select cases, they never change the allocator.
 
-Harnesses that call `std::alloc` directly measure jemalloc as well. In
-[`initialization`](../ruapc-bufpool/benches/initialization.rs) the raw controls
-therefore measure jemalloc while `AlignedMemory` keeps its own mapping path on
-64-bit Linux.
+Harnesses that allocate through the global allocator measure jemalloc as well.
+In [`initialization`](../ruapc-bufpool/benches/initialization.rs) the control
+cases and `AlignedMemory` both allocate through jemalloc with the same 64 MiB,
+2 MiB-aligned layout.
 
 <a id="how-to-run"></a>
 <a id="remote-memory-and-allocation"></a>
@@ -340,11 +340,12 @@ These harnesses need no RDMA libraries or device:
   free separately; `ns per alloc+free` is wall time divided by pairs per thread,
   not an individual-operation latency distribution.
 - [`initialization`](../ruapc-bufpool/benches/initialization.rs) compares 64 MiB
-  backing allocation and first full write. The `std alloc` cases measure the
-  process global allocator's large-allocation path, `AlignedMemory` cases
-  measure the pool's own mapping path on 64-bit Linux, and the last case adds
-  the first full write. It separates demand-paged creation from touching all
-  bytes; it does not measure hot pool reuse or registration.
+  backing allocation and first full write. The `Global` allocator control cases
+  measure the process global allocator's large-allocation path directly,
+  `AlignedMemory` cases measure the pool's owning block type through the same
+  allocator, and the last case adds the first full write. It separates
+  demand-paged creation from touching all bytes; it does not measure hot pool
+  reuse or registration.
 - [`handoff`](../ruapc-bufpool/benches/handoff.rs) compares same-thread
   allocation/free, producer allocation with consumer-thread free, and a
   preallocated-buffer handoff control. Cases use 16 KiB/64 KiB/1 MiB buffers,
