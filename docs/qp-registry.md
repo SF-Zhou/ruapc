@@ -95,6 +95,12 @@ thresholds, not hard queue limits: concurrent pollers may observe the same
 backlog before enqueueing. A stopped worker causes its queued-send attempt
 to fail and the batch to be dropped.
 
+After a batch, a worker keeps checking its queue for `rdma.polling.poll_spin_us`,
+yielding to the runtime between checks, before parking on the queue. Waking a
+parked worker from the poll thread costs a futex wake and thread wake-up
+latency in each direction of a round trip; a spinning worker registers no
+receiver waker, so the poller's enqueue wakes nothing. Zero disables this.
+
 Small received frame batches (up to 1 KiB total) are copied out so registered
 receive buffers can be reused promptly; larger batches retain the zero-copy path.
 This reduces receive-pool pressure without moving parsing onto the poller.

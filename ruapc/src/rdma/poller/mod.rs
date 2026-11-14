@@ -270,8 +270,9 @@ pub struct PollerConfig {
     pub cq_len: u32,
     /// Per-NIC READ limit, shared by all connections.
     pub read_limit: u32,
-    /// Busy-poll window after the last completion, in microseconds.
-    /// `0` disables spinning (pure event-driven mode).
+    /// Busy-poll window after the last completion, in microseconds. Dispatch
+    /// workers use the same window before parking. `0` disables spinning
+    /// (pure event-driven mode).
     pub spin_us: u64,
     /// Number of dispatch worker tasks shared by all shards of the pool
     /// (consulted once, when the first shard starts).
@@ -890,7 +891,12 @@ impl DevicePollers {
         let mut inner = self.0.lock().unwrap();
         let dispatcher = inner
             .dispatcher
-            .get_or_insert_with(|| Dispatcher::start(config.dispatch_workers))
+            .get_or_insert_with(|| {
+                Dispatcher::start(
+                    config.dispatch_workers,
+                    Duration::from_micros(config.spin_us),
+                )
+            })
             .clone();
         let entry = inner.devices.entry(name.clone()).or_default();
         if entry.shards.len() < shard_count as usize {
@@ -1032,7 +1038,10 @@ mod tests {
             device.context(),
             "cq-clamp-test",
             config,
-            Dispatcher::start(config.dispatch_workers),
+            Dispatcher::start(
+                config.dispatch_workers,
+                Duration::from_micros(config.spin_us),
+            ),
         )
         .expect("CQ creation must succeed with a clamped length");
         let max_cqe = device.context().query_device().unwrap().max_cqe;
@@ -1098,7 +1107,7 @@ mod tests {
             spin_us: 0,
             dispatch_workers: 1,
         };
-        let dispatcher = Dispatcher::start(1);
+        let dispatcher = Dispatcher::start(1, Duration::ZERO);
         let mut shards = DeviceShards::default();
         for index in 0..2 {
             shards.shards.push(Arc::new(
@@ -1230,7 +1239,7 @@ mod tests {
             comp_channel: channel,
             wake_rx,
             shared,
-            dispatcher: Dispatcher::start(1),
+            dispatcher: Dispatcher::start(1, Duration::ZERO),
             spin: Duration::ZERO,
             conns: HashMap::default(),
             dirty_qps: Vec::new(),

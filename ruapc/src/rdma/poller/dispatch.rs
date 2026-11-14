@@ -2,10 +2,14 @@
 //! threads to a fixed pool of long-lived dispatch worker tasks that walk
 //! and parse the frames on tokio worker threads.
 
-use std::sync::{Arc, atomic::Ordering};
+use std::{
+    sync::{Arc, atomic::Ordering},
+    time::{Duration, Instant},
+};
 
 use bytes::Bytes;
 use ruapc_wire::frame::decode_frames;
+use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::{Message, Socket, State};
 
@@ -65,19 +69,21 @@ impl Dispatcher {
     /// from within a tokio runtime. The workers exit once every
     /// `Dispatcher` clone (one per poll thread, plus the owning pool's)
     /// has been dropped.
-    pub fn start(workers: u32) -> Self {
+    ///
+    /// After each batch a worker keeps checking its queue for `spin`,
+    /// yielding to the runtime between checks, before it parks. A parked
+    /// worker must be woken from the poll thread, which on many-core hosts
+    /// costs a futex wake plus several microseconds of thread wake-up per
+    /// direction. While the worker polls with `try_recv`, no receiver waker is
+    /// registered, so sends from the poll thread wake nothing. Yielding lets
+    /// handlers and callers woken by the batch run on this thread in between.
+    pub fn start(workers: u32, spin: Duration) -> Self {
         debug_assert!(workers > 0);
         let workers: Arc<[DispatchWorker]> = (0..workers)
             .map(|_| {
-                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DispatchBatch>();
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DispatchBatch>();
                 let backlog = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                let worker_backlog = backlog.clone();
-                tokio::spawn(async move {
-                    while let Some(batch) = rx.recv().await {
-                        run_dispatch_batch(batch);
-                        worker_backlog.fetch_sub(1, Ordering::Release);
-                    }
-                });
+                tokio::spawn(run_worker(rx, backlog.clone(), spin));
                 DispatchWorker { tx, backlog }
             })
             .collect();
@@ -135,6 +141,34 @@ impl Dispatcher {
         if let Err(e) = worker.tx.send(batch) {
             worker.backlog.fetch_sub(1, Ordering::AcqRel);
             tracing::debug!("dispatch worker gone; dropping {} buffer(s)", e.0.len());
+        }
+    }
+}
+
+/// One dispatch worker: drains its queue, spinning briefly before parking.
+async fn run_worker(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<DispatchBatch>,
+    backlog: Arc<std::sync::atomic::AtomicUsize>,
+    spin: Duration,
+) {
+    let mut spin_until = Instant::now();
+    loop {
+        let batch = match rx.try_recv() {
+            Ok(batch) => batch,
+            Err(TryRecvError::Disconnected) => return,
+            Err(TryRecvError::Empty) if Instant::now() < spin_until => {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            Err(TryRecvError::Empty) => match rx.recv().await {
+                Some(batch) => batch,
+                None => return,
+            },
+        };
+        run_dispatch_batch(batch);
+        backlog.fetch_sub(1, Ordering::Release);
+        if !spin.is_zero() {
+            spin_until = Instant::now() + spin;
         }
     }
 }

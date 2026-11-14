@@ -138,7 +138,9 @@ pub struct RdmaPollingConfig {
     /// Requested entries per CQ shard, clamped to the device limit.
     /// Admission uses the actual capacity returned by the provider.
     pub device_cq_len: u32,
-    /// Busy-poll duration after the latest completion. Zero disables spinning.
+    /// Busy-poll duration after the latest completion. Dispatch workers also
+    /// keep checking their queue this long (yielding to the runtime) before
+    /// parking. Zero disables spinning.
     pub poll_spin_us: u64,
     /// Maximum CQ shards (one poll thread each) per device. Shards start
     /// lazily and receive connections according to available CQ credits.
