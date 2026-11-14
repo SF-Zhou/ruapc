@@ -9,6 +9,12 @@ use crate::{Error, ErrorKind, Result};
 
 const NANOS_PER_SEC: u64 = 1_000_000_000;
 
+/// Tokio timers round sleeps up to whole milliseconds, so a shorter wait
+/// cannot be expressed: with a zero burst, two overlapping transfers would
+/// make the later one sleep a full millisecond for microseconds of debt.
+/// Tolerating this much burst keeps the long-run rate exact.
+pub(crate) const MIN_BURST: Duration = Duration::from_millis(1);
+
 /// A continuously refilling token bucket represented by one atomic
 /// theoretical-arrival timestamp (TAT).
 #[derive(Debug)]
@@ -107,7 +113,7 @@ impl RdmaBandwidthLimiter {
             device,
             port_num,
             bytes_per_sec,
-            burst,
+            burst: burst.max(MIN_BURST),
             max_wait,
             send: GcraRateLimiter::default(),
             recv: GcraRateLimiter::default(),
@@ -283,6 +289,23 @@ mod tests {
         );
         assert_eq!(limiters.send.reserve_within_at(100, 100, 0, 0, 1_000), None);
         assert_eq!(limiters.recv.reserve_within_at(100, 100, 0, 0, 1_000), None);
+    }
+
+    #[tokio::test]
+    async fn sub_timer_debt_is_absorbed_by_the_minimum_burst() {
+        // 1 GB/s: each 100 KB transfer costs 100 us, far below timer resolution.
+        let limiter = RdmaBandwidthLimiter::new(
+            "mlx5_0".into(),
+            1,
+            1_000_000_000,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        );
+        let start = Instant::now();
+        for _ in 0..5 {
+            limiter.reserve_send(100_000, None).await.unwrap();
+        }
+        assert!(start.elapsed() < Duration::from_millis(1));
     }
 
     #[tokio::test]

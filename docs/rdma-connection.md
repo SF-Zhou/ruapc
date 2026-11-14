@@ -92,8 +92,9 @@ may first appear in the activation SEND's completion. Publication and acquire do
 not wait for activation. Either the activation packet or ordinary traffic can
 provide the acceptor's first successful receive.
 
-A failed handshake can try another candidate. Local QP connection failures
-mark the peer's NIC pair failed for 30 seconds; selection prefers alternatives
+A failed handshake can try another candidate. Local QP connection failures,
+and published connections removed after failing before any successful SEND or
+receive completion, mark the peer's NIC pair failed for 30 seconds; selection prefers alternatives
 but can fall back to marked paths when none remain. Advertisements are cached
 for 30 seconds. Prepare RPC failure, invalid prepare responses, and path
 enumeration failure invalidate that cache for subsequent discovery.

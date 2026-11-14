@@ -129,9 +129,7 @@ impl ConnState {
                 return;
             }
         };
-        for _ in 0..completed.swept_sends {
-            self.flow.data_completed();
-        }
+        self.flow.data_completed_n(completed.swept_sends);
         let wc = completed.wc;
         let buffer = completed.buffer;
         let result = if wc.is_recv() {
@@ -140,6 +138,9 @@ impl ConnState {
         } else {
             self.handle_send_completion(wc, buffer)
         };
+        if result.is_ok() && wc.succ() {
+            self.socket.mark_path_verified();
+        }
         if let Err(err) = result {
             // QP setup only programs the NIC; an unreachable path often first
             // fails on the activation SEND. Preserve that completion error,

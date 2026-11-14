@@ -73,6 +73,10 @@ pub struct RdmaSocket {
     probe_ready: AtomicBool,
     /// Server-side accept lease notified by the first successful receive.
     accept_lease_id: AtomicU64,
+    /// Set by the poll thread on the first successful SEND or receive
+    /// completion. RTS programs only local state, so a connection that fails
+    /// before this point usually ran on an unreachable NIC pair.
+    path_verified: AtomicBool,
     /// Shared bandwidth shaper for the local RDMA port.
     bandwidth_limiter: Arc<RdmaBandwidthLimiter>,
     /// Software budget for READ admission and completion. `None` disables
@@ -105,6 +109,7 @@ impl RdmaSocket {
             activation_requested: AtomicBool::new(false),
             probe_ready: AtomicBool::new(false),
             accept_lease_id: AtomicU64::new(0),
+            path_verified: AtomicBool::new(false),
             bandwidth_limiter: config.bandwidth_limiter,
             read_timeout: config.read_timeout,
         }
@@ -129,13 +134,32 @@ impl RdmaSocket {
         self.probe_ready.load(Ordering::Acquire)
     }
 
+    /// Runs on every maintenance pass; the plain load keeps the common
+    /// no-request case free of a locked read-modify-write.
     pub(crate) fn take_activation_request(&self) -> bool {
-        self.activation_requested.swap(false, Ordering::AcqRel)
+        self.activation_requested.load(Ordering::Acquire)
+            && self.activation_requested.swap(false, Ordering::AcqRel)
     }
 
     pub(crate) fn set_accept_lease(&self, connection_id: u64) {
         debug_assert_ne!(connection_id, 0);
         self.accept_lease_id.store(connection_id, Ordering::Release);
+    }
+
+    pub(crate) fn mark_path_verified(&self) {
+        if !self.path_verified.load(Ordering::Relaxed) {
+            self.path_verified.store(true, Ordering::Release);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_path_verified(&self) {
+        self.path_verified.store(false, Ordering::Release);
+    }
+
+    /// Whether traffic has completed successfully on this NIC pair.
+    pub(crate) fn is_path_verified(&self) -> bool {
+        self.path_verified.load(Ordering::Acquire)
     }
 
     pub(crate) fn take_accept_lease(&self) -> Option<u64> {
@@ -246,7 +270,14 @@ impl RdmaSocket {
                     self.queue_pair
                         .send(encoded.buffer, ibv_send_flags::IBV_SEND_SIGNALED)
                 };
-                posted.map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
+                // The window credit cannot be refunded: a rejected WR never
+                // completes or gets acknowledged, so the window would shrink
+                // permanently. Fail the connection like the poller's posts do;
+                // the request was not accepted and remains retryable.
+                posted.map_err(|e| {
+                    self.set_error();
+                    Error::new(ErrorKind::RdmaSendFailed, e.to_string())
+                })?;
                 Ok(())
             }
             SendPermit::Full => {

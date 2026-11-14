@@ -336,6 +336,8 @@ pub struct RdmaRemoteMemoryConfig {
     /// Fraction of nominal port bandwidth available to remote I/O.
     /// Zero disables bandwidth limiting.
     pub bandwidth_limit_ratio: f64,
+    /// Bandwidth burst tolerance in milliseconds. Values below 1 ms are
+    /// raised to 1 ms, the timer resolution of bandwidth waits.
     pub bandwidth_limit_burst_ms: u64,
     /// Maximum bandwidth-budget wait. Zero rejects immediately.
     pub bandwidth_limit_max_wait_ms: u64,

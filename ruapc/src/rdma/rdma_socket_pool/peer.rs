@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicI64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -33,9 +33,53 @@ pub(super) struct PeerStripes {
     reconnect_requested: bool,
 }
 
+/// Millisecond-granularity last-use time, written on every request. The
+/// atomic avoids a mutex per request, and storing only when the millisecond
+/// changes keeps concurrent requesters from bouncing its cache line.
+pub(super) struct LastUsed {
+    epoch: Instant,
+    /// Signed milliseconds from `epoch`; `NEVER` before the first use.
+    millis: AtomicI64,
+}
+
+impl LastUsed {
+    const NEVER: i64 = i64::MIN;
+
+    fn new() -> Self {
+        Self {
+            epoch: Instant::now(),
+            millis: AtomicI64::new(Self::NEVER),
+        }
+    }
+
+    pub(super) fn set(&self, at: Instant) {
+        let millis = match at.checked_duration_since(self.epoch) {
+            Some(after) => i64::try_from(after.as_millis()).unwrap_or(i64::MAX),
+            // Round away from `epoch` so the recorded time never exceeds `at`.
+            None => -i64::try_from(self.epoch.duration_since(at).as_micros().div_ceil(1000))
+                .unwrap_or(i64::MAX),
+        };
+        if self.millis.load(Ordering::Relaxed) != millis {
+            self.millis.store(millis, Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn get(&self) -> Option<Instant> {
+        let millis = self.millis.load(Ordering::Relaxed);
+        if millis == Self::NEVER {
+            return None;
+        }
+        let offset = Duration::from_millis(millis.unsigned_abs());
+        if millis >= 0 {
+            self.epoch.checked_add(offset)
+        } else {
+            self.epoch.checked_sub(offset)
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct PeerMeta {
-    pub(super) last_used: Option<Instant>,
     pub(super) device_cache: Option<CachedPeerAdvertisement>,
     pub(super) backoff: HashMap<String, RetryBackoff, RandomState>,
     pub(super) blacklist: HashMap<PathKey, Instant, RandomState>,
@@ -48,6 +92,7 @@ pub(crate) struct PeerState {
     pub(super) connect: tokio::sync::Mutex<()>,
     pub(super) stripes: RwLock<PeerStripes>,
     pub(super) meta: Mutex<PeerMeta>,
+    pub(super) last_used: LastUsed,
     /// One queued or running background reconciliation task for this group.
     reconcile_pending: AtomicBool,
 }
@@ -77,6 +122,7 @@ impl PeerState {
             connect: tokio::sync::Mutex::new(()),
             stripes: RwLock::new(PeerStripes::default()),
             meta: Mutex::new(PeerMeta::default()),
+            last_used: LastUsed::new(),
             reconcile_pending: AtomicBool::new(false),
         }
     }
@@ -91,7 +137,7 @@ impl PeerState {
     }
 
     pub(super) fn touch(&self, now: Instant) {
-        self.meta.lock().unwrap().last_used = Some(now);
+        self.last_used.set(now);
     }
 
     pub(super) fn contains_active(&self, socket: &Arc<RdmaSocket>) -> bool {
@@ -118,7 +164,27 @@ impl PeerState {
         socket.set_error();
         stripes.active.remove(index);
         stripes.reconnect_requested = true;
+        drop(stripes);
+        self.blacklist_if_unverified(socket);
         true
+    }
+
+    /// Temporarily penalizes a NIC pair towards this peer.
+    pub(super) fn blacklist(&self, path: &super::RdmaPathInfo) {
+        self.meta.lock().unwrap().blacklist.insert(
+            super::RdmaSocketPool::path_key(path),
+            Instant::now() + super::RdmaSocketPool::PATH_BLACKLIST_TTL,
+        );
+    }
+
+    /// A connection that failed before any successful completion most likely
+    /// ran on an unreachable pair; avoid reconnecting it there right away.
+    fn blacklist_if_unverified(&self, socket: &RdmaSocket) {
+        if !socket.is_path_verified() {
+            tracing::warn!(conn_id = socket.conn_id, path = ?socket.path,
+                "RDMA connection failed before any successful completion; avoiding its NIC pair");
+            self.blacklist(&socket.path);
+        }
     }
 
     /// Remember failed active connections before pruning them, including
@@ -126,9 +192,13 @@ impl PeerState {
     pub(super) fn prune_dead(&self, request_reconnect: bool) {
         let mut stripes = self.stripes.write().unwrap();
         let mut removed_active = false;
+        let mut unverified = Vec::new();
         stripes.active.retain(|stripe| {
             let healthy = stripe.socket.state.is_ok();
             removed_active |= !healthy;
+            if !healthy && !stripe.socket.is_path_verified() {
+                unverified.push(stripe.socket.clone());
+            }
             healthy
         });
         // Use the retain decision itself: the poller can fail a socket at
@@ -137,6 +207,10 @@ impl PeerState {
         stripes
             .draining
             .retain(|stripe| stripe.socket.state.is_ok());
+        drop(stripes);
+        for socket in unverified {
+            self.blacklist_if_unverified(&socket);
+        }
     }
 
     pub(super) fn needs_reconnect(&self) -> bool {
@@ -148,10 +222,8 @@ impl PeerState {
         !stripes.active.is_empty()
             || stripes.reconnect_requested
             || self
-                .meta
-                .lock()
-                .unwrap()
                 .last_used
+                .get()
                 .is_some_and(|last_used| now.saturating_duration_since(last_used) < idle_ttl)
     }
 

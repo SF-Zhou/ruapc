@@ -78,7 +78,12 @@ impl FlowControl {
     }
 
     pub(super) fn data_completed(&mut self) {
-        self.send.data_completed += 1;
+        self.data_completed_n(1);
+    }
+
+    /// Settles `count` data SENDs, e.g. unsignaled ones swept by a later CQE.
+    pub(super) fn data_completed_n(&mut self, count: usize) {
+        self.send.data_completed += count as u64;
     }
 
     pub(super) fn ack_completed(&mut self) {
