@@ -335,6 +335,8 @@ impl RdmaSocketPool {
             max_rd_atomic: rd_atomic,
             max_dest_rd_atomic: rd_atomic,
             traffic_class,
+            ack_timeout: self.config.connection.ack_timeout,
+            retry_count: self.config.connection.retry_count,
         })
         .map_err(Error::from)
     }

@@ -55,6 +55,13 @@ pub struct RdmaConnectionTuningConfig {
     pub msg_aggregation: bool,
     /// GRH traffic class selected by the connection initiator.
     pub traffic_class: u8,
+    /// Local QP ACK timeout exponent (0..=31; 4.096 us * 2^value per retry).
+    /// With `retry_count` it bounds how long an unreachable path takes to fail
+    /// its first SEND: the default is about 7.5 s. Lower values detect dead
+    /// paths sooner but risk spurious failures on congested fabrics.
+    pub ack_timeout: u8,
+    /// Local QP transport retry count (0..=7).
+    pub retry_count: u8,
 }
 
 impl Default for RdmaConnectionTuningConfig {
@@ -69,6 +76,8 @@ impl Default for RdmaConnectionTuningConfig {
             max_inflight_large_bytes: 128 * 1024 * 1024,
             msg_aggregation: true,
             traffic_class: 0,
+            ack_timeout: ruapc_rdma::QpConnectionConfig::DEFAULT_ACK_TIMEOUT,
+            retry_count: ruapc_rdma::QpConnectionConfig::DEFAULT_RETRY_COUNT,
         }
     }
 }
@@ -100,6 +109,11 @@ impl RdmaConnectionTuningConfig {
         if self.qp.max_send_sge == 0 || self.qp.max_recv_sge == 0 {
             return Err(invalid_config(
                 "rdma.connection.qp scatter/gather limits must be nonzero",
+            ));
+        }
+        if self.ack_timeout > 31 || self.retry_count > 7 {
+            return Err(invalid_config(
+                "rdma.connection.ack_timeout must be at most 31 and retry_count at most 7",
             ));
         }
         if self.send_signal_interval == 0 {

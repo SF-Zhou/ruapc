@@ -944,6 +944,8 @@ mod completion_tests {
                 max_rd_atomic: 1,
                 max_dest_rd_atomic: 1,
                 traffic_class: 0,
+                ack_timeout: QpConnectionConfig::DEFAULT_ACK_TIMEOUT,
+                retry_count: QpConnectionConfig::DEFAULT_RETRY_COUNT,
             };
             reader.connect(&config(&peer)).unwrap();
             peer.connect(&config(&reader)).unwrap();
@@ -1079,6 +1081,8 @@ mod completion_tests {
                 max_rd_atomic: 1,
                 max_dest_rd_atomic: 1,
                 traffic_class: 0,
+                ack_timeout: QpConnectionConfig::DEFAULT_ACK_TIMEOUT,
+                retry_count: QpConnectionConfig::DEFAULT_RETRY_COUNT,
             };
             sender.connect(&config(&receiver)).unwrap();
             receiver.connect(&config(&sender)).unwrap();

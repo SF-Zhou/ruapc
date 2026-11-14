@@ -1322,6 +1322,8 @@ mod tests {
             max_rd_atomic: 1,
             max_dest_rd_atomic: 1,
             traffic_class: 0,
+            ack_timeout: ruapc_rdma::QpConnectionConfig::DEFAULT_ACK_TIMEOUT,
+            retry_count: ruapc_rdma::QpConnectionConfig::DEFAULT_RETRY_COUNT,
         };
         first.connect(&config(second)).unwrap();
         second.connect(&config(first)).unwrap();
