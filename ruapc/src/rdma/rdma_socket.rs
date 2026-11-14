@@ -129,8 +129,11 @@ impl RdmaSocket {
         self.probe_ready.load(Ordering::Acquire)
     }
 
+    /// Runs on every maintenance pass; the plain load keeps the common
+    /// no-request case free of a locked read-modify-write.
     pub(crate) fn take_activation_request(&self) -> bool {
-        self.activation_requested.swap(false, Ordering::AcqRel)
+        self.activation_requested.load(Ordering::Acquire)
+            && self.activation_requested.swap(false, Ordering::AcqRel)
     }
 
     pub(crate) fn set_accept_lease(&self, connection_id: u64) {
@@ -246,7 +249,14 @@ impl RdmaSocket {
                     self.queue_pair
                         .send(encoded.buffer, ibv_send_flags::IBV_SEND_SIGNALED)
                 };
-                posted.map_err(|e| Error::new(ErrorKind::RdmaSendFailed, e.to_string()))?;
+                // The window credit cannot be refunded: a rejected WR never
+                // completes or gets acknowledged, so the window would shrink
+                // permanently. Fail the connection like the poller's posts do;
+                // the request was not accepted and remains retryable.
+                posted.map_err(|e| {
+                    self.set_error();
+                    Error::new(ErrorKind::RdmaSendFailed, e.to_string())
+                })?;
                 Ok(())
             }
             SendPermit::Full => {

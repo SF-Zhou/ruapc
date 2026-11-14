@@ -129,9 +129,7 @@ impl ConnState {
                 return;
             }
         };
-        for _ in 0..completed.swept_sends {
-            self.flow.data_completed();
-        }
+        self.flow.data_completed_n(completed.swept_sends);
         let wc = completed.wc;
         let buffer = completed.buffer;
         let result = if wc.is_recv() {
