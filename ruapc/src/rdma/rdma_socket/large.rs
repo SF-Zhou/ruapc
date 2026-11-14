@@ -28,7 +28,8 @@ const FINISHED_CACHE: usize = 256;
 
 #[derive(Debug)]
 struct Source {
-    _buffer: Buffer,
+    /// Every chunk the offer's regions point into.
+    _buffers: Vec<Buffer>,
     _permit: OwnedSemaphorePermit,
     request_id: Option<u64>,
     deadline: Option<Instant>,
@@ -164,7 +165,7 @@ impl RdmaSocket {
         request: &SendRequest<'_>,
         state: &Arc<State>,
     ) -> Result<()> {
-        let payload_len = encoded.buffer.len() - encoded.payload_offset;
+        let payload_len = encoded.len() - encoded.payload_offset;
         let business_deadline = request.deadline();
         self.reserve_send_bandwidth(payload_len as u64, business_deadline)
             .await?;
@@ -189,14 +190,23 @@ impl RdmaSocket {
             return Err(ErrorKind::ConnectionClosed.into());
         }
         request.refresh(meta)?;
-        let mut region = encoded
+        // One region per chunk: the first starts after the metadata, which
+        // the offer carries separately.
+        let mut regions = Vec::with_capacity(1 + encoded.chunks.len());
+        let mut first = encoded
             .buffer
             .remote_buffer_info(self.queue_pair.device_index)?;
-        region.addr = region
+        first.addr = first
             .addr
             .checked_add(encoded.payload_offset as u64)
             .ok_or_else(|| protocol_error("payload address overflow"))?;
-        region.len = payload_len as u64;
+        first.len = (encoded.buffer.len() - encoded.payload_offset) as u64;
+        if first.len != 0 {
+            regions.push(first);
+        }
+        for chunk in &encoded.chunks {
+            regions.push(chunk.remote_buffer_info(self.queue_pair.device_index)?);
+        }
         let (msgid, response) = state.waiter.alloc_owned_until(cleanup_deadline);
         state.waiter.bind_connection(msgid, self.conn_id);
         {
@@ -211,7 +221,7 @@ impl RdmaSocket {
             let offer = LargePayloadOffer {
                 transfer_id: id,
                 payload_len: payload_len as u64,
-                regions: vec![region],
+                regions,
                 meta: meta.clone(),
             };
             let offer_meta = MsgMeta {
@@ -223,7 +233,7 @@ impl RdmaSocket {
             };
             // Offers must fit inline. Never recursively rendezvous a descriptor.
             let descriptor = self.serialize_msg(&offer_meta, &offer)?;
-            if descriptor.buffer.len() > self.max_msg_size {
+            if descriptor.len() > self.max_msg_size {
                 return Err(Error::new(
                     ErrorKind::SerializeFailed,
                     "RDMA large-payload descriptor exceeds receive buffer".into(),
@@ -237,7 +247,9 @@ impl RdmaSocket {
             sources.active.insert(
                 id,
                 Source {
-                    _buffer: encoded.buffer,
+                    _buffers: std::iter::once(encoded.buffer)
+                        .chain(encoded.chunks)
+                        .collect(),
                     _permit: encoded
                         .permit
                         .expect("large serialization reserves its source bytes"),
@@ -469,7 +481,7 @@ impl RdmaSocket {
         };
         let request = SendRequest::bind(&mut meta, &state.waiter, self.conn_id)?;
         let encoded = self.serialize_msg(&meta, &FinishPayloadRequest { transfer_id: id })?;
-        if encoded.buffer.len() > self.max_msg_size {
+        if encoded.len() > self.max_msg_size {
             return Err(protocol_error("payload finish RPC exceeds receive buffer"));
         }
         self.send_buffer(&mut meta, encoded, &request).await?;
@@ -612,7 +624,7 @@ mod tests {
                 .insert(
                     id,
                     Source {
-                        _buffer: buffer,
+                        _buffers: vec![buffer],
                         _permit: permit,
                         request_id,
                         deadline,
@@ -662,7 +674,7 @@ mod tests {
         assert!(!ctx.state.waiter.pending_on_connection(msgid, CONNECTION_ID));
         assert_eq!(large.send_bytes.available_permits(), 0);
         assert_eq!(
-            &large.sources.lock().unwrap().active[&SOURCE_ID]._buffer[..],
+            &large.sources.lock().unwrap().active[&SOURCE_ID]._buffers[0][..],
             b"source"
         );
         assert!(!large.finish(SOURCE_ID, &ctx.state, CONNECTION_ID, true));
@@ -743,7 +755,7 @@ mod tests {
         assert!(large.receivers.lock().unwrap().active.is_empty());
         assert_eq!(send_budget.available_permits(), 0);
         assert_eq!(
-            &large.sources.lock().unwrap().active[&SOURCE_ID]._buffer[..],
+            &large.sources.lock().unwrap().active[&SOURCE_ID]._buffers[0][..],
             b"source"
         );
 
@@ -1121,8 +1133,10 @@ mod lifecycle_tests {
                     .pending_on_connection(msgid, self.socket.conn_id)
             );
             let capacity = self.socket.large.sources.lock().unwrap().active[&offer.transfer_id]
-                ._buffer
-                .capacity();
+                ._buffers
+                .iter()
+                .map(Buffer::capacity)
+                .sum::<usize>();
             (offer, capacity)
         }
 

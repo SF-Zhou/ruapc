@@ -328,17 +328,6 @@ impl SocketPool {
     }
 
     #[cfg(feature = "rdma")]
-    pub(crate) fn rdma_commit_connection(&self, lease: &ConnectionLease) -> Result<()> {
-        match &self.rdma {
-            Some(pool) => pool.rdma_commit_connection(lease),
-            None => Err(Error::new(
-                ErrorKind::InvalidArgument,
-                "RDMA is not enabled".into(),
-            )),
-        }
-    }
-
-    #[cfg(feature = "rdma")]
     pub(crate) fn rdma_cancel_connection(&self, lease: &ConnectionLease) -> Result<()> {
         match &self.rdma {
             Some(pool) => {

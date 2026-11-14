@@ -13,7 +13,7 @@ use crate::{
 };
 
 /// Version of the RDMA bootstrap protocol.
-pub(crate) const RDMA_BOOTSTRAP_PROTOCOL_VERSION: u32 = 3;
+pub(crate) const RDMA_BOOTSTRAP_PROTOCOL_VERSION: u32 = 4;
 
 fn port_is_connectable(port: &Port) -> bool {
     port.is_usable() && (!port.port_attr.link_layer.is_ethernet() || !port.gids.is_empty())
@@ -200,16 +200,10 @@ pub(crate) trait RdmaService {
         request: &rdma::PrepareConnectionRequest,
     ) -> Result<rdma::PrepareConnectionResponse>;
 
-    /// Confirms that the initiator received the endpoint and retained its
-    /// local QP. The first confirmation starts the data-plane activation
-    /// budget; repeated confirmations do not extend it. The connection
-    /// remains leased until a successful receive also proves activation.
-    /// The bootstrap service assumes a trusted control plane; the token
-    /// correlates lifecycle state but does not authenticate the caller.
-    async fn commit_connection(&self, ctx: &Context, lease: &rdma::ConnectionLease) -> Result<()>;
-
-    /// Best-effort idempotent cleanup when the initiator cannot complete the
-    /// confirmation exchange.
+    /// Best-effort idempotent cleanup when the initiator abandons a prepared
+    /// connection before activating it. The bootstrap service assumes a
+    /// trusted control plane; the lease correlates lifecycle state but does
+    /// not authenticate the caller.
     async fn cancel_connection(&self, ctx: &Context, lease: &rdma::ConnectionLease) -> Result<()>;
 
     /// Checks RPC delivery and reads the attached nonce over the same RDMA connection.
@@ -241,10 +235,6 @@ impl RdmaService for () {
         ctx.state
             .socket_pool
             .rdma_prepare_connection(request, &ctx.state)
-    }
-
-    async fn commit_connection(&self, ctx: &Context, lease: &rdma::ConnectionLease) -> Result<()> {
-        ctx.state.socket_pool.rdma_commit_connection(lease)
     }
 
     async fn cancel_connection(&self, ctx: &Context, lease: &rdma::ConnectionLease) -> Result<()> {
@@ -314,7 +304,7 @@ pub(crate) fn is_payload_method(method: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ErrorKind, SocketPoolConfig, rdma::RdmaSocketPoolConfig};
+    use crate::{SocketPoolConfig, rdma::RdmaSocketPoolConfig};
 
     #[test]
     fn ethernet_advertisement_requires_a_gid() {
@@ -383,8 +373,6 @@ mod tests {
             attempt_id: u64::MAX,
             accepted_connection_id: u64::MAX,
         };
-        let err = ().commit_connection(&ctx, &lease).await.unwrap_err();
-        assert_eq!(err.kind, ErrorKind::InvalidArgument);
         ().cancel_connection(&ctx, &lease).await.unwrap();
     }
 

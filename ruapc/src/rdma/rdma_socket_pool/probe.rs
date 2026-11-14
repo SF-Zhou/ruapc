@@ -74,7 +74,7 @@ impl RdmaSocketPool {
             }
             // A failed reconnect remains desired and is retried here even
             // when maintenance is disabled and no user requests arrive.
-            if peer.needs_reconnect() {
+            if peer.needs_connections() {
                 self.schedule_reconcile(&peer, state);
             }
         }
@@ -402,7 +402,7 @@ mod tests {
         let rdma = config.rdma.as_mut().unwrap();
         rdma.peers.connections_per_peer = 2;
         // Replacement must work even when remote-NIC preconnect and periodic
-        // maintenance are disabled; there are still two desired initial stripes.
+        // maintenance are disabled; the peer target is still two stripes.
         rdma.peers.preconnect_max_per_peer = 2;
         rdma.probe.interval_ms = interval_ms;
         rdma.probe.timeout_ms = timeout_ms;
@@ -464,10 +464,20 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(client.ping(&context, &19).await.unwrap(), 19);
-            let outbound = healthy_qps(&context.state, RdmaConnDirection::Outbound).await;
-            let inbound = healthy_qps(server.state(), RdmaConnDirection::Inbound).await;
-            assert_eq!(outbound.len(), 2);
-            assert_eq!(inbound.len(), 2);
+            // The first call publishes one stripe; reconciliation adds the
+            // second in the background.
+            let (outbound, inbound) = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let outbound = healthy_qps(&context.state, RdmaConnDirection::Outbound).await;
+                    let inbound = healthy_qps(server.state(), RdmaConnDirection::Inbound).await;
+                    if outbound.len() == 2 && inbound.len() == 2 {
+                        break (outbound, inbound);
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("both configured stripes connect");
             Self {
                 server,
                 context,
@@ -764,8 +774,17 @@ mod tests {
         }
         pool.run_maintenance(&fixture.context.state).await;
         assert!(peer.active_snapshot().is_empty());
-        assert!(peer.needs_reconnect());
+        assert!(peer.needs_connections());
         let endpoint = peer.endpoint.clone();
+        // With every connection gone, the report still shows the recovery.
+        let report = pool.path_report().await;
+        assert!(report.recovering_peers.contains(&endpoint));
+        assert!(
+            report
+                .paths
+                .iter()
+                .all(|path| path.peer.as_ref() != Some(&endpoint))
+        );
         let original = Arc::downgrade(&peer);
         peer.last_used
             .set(Instant::now() - Duration::from_secs(120));
@@ -797,7 +816,7 @@ mod tests {
                 let qps = healthy_qps(&fixture.context.state, RdmaConnDirection::Outbound).await;
                 let recovered = pool
                     .existing_peer(&endpoint)
-                    .is_some_and(|peer| !peer.needs_reconnect());
+                    .is_some_and(|peer| !peer.needs_connections());
                 if qps.len() == 2 && qps.is_disjoint(&fixture.outbound) && recovered {
                     break;
                 }
@@ -818,7 +837,7 @@ mod tests {
         let failed = initial[0].socket.clone();
         let survivor = initial[1].socket.clone();
         assert!(peer.contains_active(&failed));
-        assert!(!peer.needs_reconnect());
+        assert!(!peer.needs_connections());
 
         assert!(peer.fail_active(&failed));
         assert!(!failed.state.is_ok());
@@ -826,21 +845,21 @@ mod tests {
         assert!(peer.contains_active(&survivor));
         assert!(survivor.state.is_ok());
         assert_eq!(peer.active_snapshot().len(), 1);
-        assert!(peer.needs_reconnect());
+        assert!(peer.needs_connections());
         // Per-NIC coverage is disabled in this fixture. One healthy socket
         // still does not satisfy its two-connection target.
         peer.finish_recovery(&[], &pool.config.peers);
-        assert!(peer.needs_reconnect());
+        assert!(peer.needs_connections());
 
         pool.replenish_peer(&peer, &fixture.context.state).await;
         let restored = peer.active_snapshot();
         assert_eq!(restored.len(), 2);
         assert!(restored.iter().all(|stripe| stripe.socket.state.is_ok()));
         assert!(peer.contains_active(&survivor));
-        assert!(!peer.needs_reconnect());
+        assert!(!peer.needs_connections());
         // A stale failure for the old identity cannot request another recovery.
         assert!(!peer.fail_active(&failed));
-        assert!(!peer.needs_reconnect());
+        assert!(!peer.needs_connections());
         drop((initial, restored, failed, survivor, peer));
         fixture.shutdown().await;
     }
@@ -851,7 +870,7 @@ mod tests {
         let pool = fixture.context.state.socket_pool.rdma_pool().unwrap();
         let peer = pool.peers.iter().next().unwrap().value().clone();
         let socket = {
-            let mut stripes = peer.stripes.write().unwrap();
+            let mut stripes = peer.lock_stripes();
             let stripe = stripes.active.pop().unwrap();
             let socket = stripe.socket.clone();
             stripes.draining.push(stripe);
@@ -865,9 +884,9 @@ mod tests {
             .bind_connection(msgid, socket.conn_id);
         pool.probe_connection_closed(&fixture.context.state, &socket, Some(&peer));
         assert!(socket.state.is_ok());
-        assert!(!peer.needs_reconnect());
+        assert!(!peer.needs_connections());
         assert!(fixture.context.state.waiter.contains_message_id(msgid));
-        assert_eq!(peer.stripes.read().unwrap().draining.len(), 1);
+        assert_eq!(peer.lock_stripes().draining.len(), 1);
         drop(receiver);
         drop((peer, socket));
         fixture.shutdown().await;

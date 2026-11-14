@@ -26,8 +26,18 @@ impl RdmaSocketPool {
             .collect();
 
         let mut paths = Vec::new();
+        let mut pending_fill_peers = Vec::new();
+        let mut recovering_peers = Vec::new();
         for peer in self.peers.iter() {
-            let stripes = peer.value().stripes.read().unwrap();
+            let peer = peer.value();
+            // One lock: intents and stripes come from the same moment.
+            let stripes = peer.lock_stripes();
+            if stripes.fill_pending() {
+                pending_fill_peers.push(peer.endpoint.clone());
+            }
+            if stripes.recovery_requested() {
+                recovering_peers.push(peer.endpoint.clone());
+            }
             for (phase, entries) in [
                 (StripePhase::Active, &stripes.active),
                 (StripePhase::Draining, &stripes.draining),
@@ -65,6 +75,8 @@ impl RdmaSocketPool {
         RdmaPathReport {
             devices,
             paths,
+            pending_fill_peers,
+            recovering_peers,
             completion_queues: self.pollers.report(),
         }
     }

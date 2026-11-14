@@ -218,7 +218,8 @@ pub struct RdmaPathPolicyConfig {
 #[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone)]
 #[serde(default, deny_unknown_fields)]
 pub struct RdmaPeerPoolConfig {
-    /// Initial foreground stripe count and total healthy-connection target.
+    /// Total healthy-stripe target; stripes beyond the first connect in the
+    /// background.
     pub connections_per_peer: u32,
     /// Background coverage target for each remote NIC with a compatible
     /// local path. Zero disables per-NIC coverage preconnection.
@@ -226,10 +227,9 @@ pub struct RdmaPeerPoolConfig {
     /// Maximum active connections per peer. Coverage takes priority over
     /// extra stripes on an already covered NIC; replacements drain separately.
     pub preconnect_max_per_peer: u32,
-    /// Budget for preparation and, after the first commit, data-plane
-    /// activation. Once active, retain the lease for this long solely for
-    /// idempotent commits. Duplicate commits do not extend any budget.
-    /// Milliseconds; must be at least 15s.
+    /// Acceptor budget from preparation to the first data-plane receive; an
+    /// unactivated accepted connection is closed after it. Initiators abandon
+    /// setup that has used half of it. Milliseconds; must be at least 15s.
     pub connect_lease_ms: u64,
 }
 

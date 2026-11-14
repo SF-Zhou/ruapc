@@ -1,4 +1,9 @@
-//! Serialize once, growing registered storage without re-running user Serialize.
+//! Serialize once into registered storage without re-running user Serialize.
+//!
+//! Inline messages grow one contiguous buffer up to the inline limit. Past it,
+//! the message is large: later bytes go to appended chunks instead of being
+//! copied into ever larger allocations, and each chunk becomes one region of
+//! the large-payload offer.
 
 use std::{io::Write, sync::Arc};
 
@@ -9,17 +14,36 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use super::RdmaSocket;
 use crate::{Buffer, BufferPool, Error, ErrorKind, MsgMeta, Result, msg::SendMsg};
 
+/// Smallest and largest chunk appended for small writes to a large message.
+/// Chunk sizes follow the encoded length, so a message at the 64 MiB limit
+/// needs at most about 20 offer regions (well under the 64-region space
+/// limit); one larger write gets a single chunk of its own size.
+const MIN_CHUNK: usize = 64 * 1024;
+const MAX_CHUNK: usize = 4 * 1024 * 1024;
+
 pub(super) struct Encoded {
+    /// Frame header, metadata and the payload's beginning.
     pub(super) buffer: Buffer,
+    /// Payload continuation of a large message, in order. Always empty for
+    /// messages within the inline limit.
+    pub(super) chunks: Vec<Buffer>,
     pub(super) payload_offset: usize,
     pub(super) permit: Option<OwnedSemaphorePermit>,
 }
 
 impl Encoded {
+    /// Complete framed length across every chunk.
+    pub(super) fn len(&self) -> usize {
+        self.buffer.len() + self.chunks.iter().map(Buffer::len).sum::<usize>()
+    }
+
     /// Refresh the remaining budget after queue admission without invoking
     /// user serialization again. Only timeout_ms changes, and its encoding
     /// can only shrink as the remaining request budget decreases.
     pub(super) fn refresh_timeout(&mut self, meta: &MsgMeta) -> Result<()> {
+        // Only inline sends refresh in place; a chunked message is transferred
+        // by the offer RPC, which carries its metadata separately.
+        debug_assert!(self.chunks.is_empty());
         // Typical metadata fits on the stack; this runs for every
         // window-blocked send whose remaining budget changed while queued.
         let mut stack = [0u8; 512];
@@ -63,6 +87,9 @@ struct GrowingMessage<'a> {
     budget: &'a Arc<Semaphore>,
     inline_limit: usize,
     limit: usize,
+    /// Bytes the fast path may append to the current chunk without growth,
+    /// budget or limit checks. Recomputed by the slow path.
+    room: usize,
 }
 
 impl RdmaSocket {
@@ -74,6 +101,7 @@ impl RdmaSocket {
         let mut message = GrowingMessage {
             encoded: Encoded {
                 buffer: self.rdmabuf_pool.allocate(4096.min(self.max_msg_size))?,
+                chunks: Vec::new(),
                 payload_offset: 0,
                 permit: None,
             },
@@ -81,6 +109,7 @@ impl RdmaSocket {
             budget: &self.large.send_bytes,
             inline_limit: self.max_msg_size,
             limit: self.max_msg_size.max(self.max_large_msg_size),
+            room: 0,
         };
         meta.serialize_to(payload, &mut message)?;
         Ok(message.encoded)
@@ -95,14 +124,9 @@ impl Write for GrowingMessage<'_> {
 
     #[inline]
     fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        let inline_capacity = self
-            .encoded
-            .buffer
-            .capacity()
-            .min(self.inline_limit)
-            .min(self.limit);
-        if bytes.len() <= inline_capacity.saturating_sub(self.encoded.buffer.len()) {
-            return self.encoded.buffer.extend_from_slice(bytes);
+        if bytes.len() <= self.room {
+            self.room -= bytes.len();
+            return self.current().extend_from_slice(bytes);
         }
         self.write_slow(bytes)
     }
@@ -113,71 +137,103 @@ impl Write for GrowingMessage<'_> {
 }
 
 impl GrowingMessage<'_> {
+    fn current(&mut self) -> &mut Buffer {
+        self.encoded
+            .chunks
+            .last_mut()
+            .unwrap_or(&mut self.encoded.buffer)
+    }
+
+    fn refresh_room(&mut self) {
+        let len = self.encoded.len();
+        let bound = if self.encoded.permit.is_some() {
+            self.limit
+        } else {
+            self.inline_limit.min(self.limit)
+        };
+        let current = self.current();
+        self.room = (current.capacity() - current.len()).min(bound.saturating_sub(len));
+    }
+
+    fn reserve_budget(&self, bytes: usize) -> std::io::Result<OwnedSemaphorePermit> {
+        self.budget
+            .clone()
+            .try_acquire_many_owned(u32::try_from(bytes).map_err(std::io::Error::other)?)
+            .map_err(|_| std::io::Error::other("RDMA large-message send byte budget exhausted"))
+    }
+
     // Keep growth and byte-budget admission out of the small-message writer.
+    // Every failure leaves the encoded bytes, chunks and budget unchanged.
     #[cold]
     fn write_slow(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        let end = self
-            .encoded
-            .buffer
-            .len()
+        let len = self.encoded.len();
+        let end = len
             .checked_add(bytes.len())
             .filter(|end| *end <= self.limit)
             .ok_or_else(|| {
                 std::io::Error::other("message exceeds negotiated RDMA message limit")
             })?;
-        if end > self.encoded.buffer.capacity() {
-            let size = end
-                .max(self.encoded.buffer.capacity().saturating_mul(4))
-                .min(self.limit);
-            let capacity = BufferPool::allocation_capacity(size)?;
-            // Both the old and new allocation coexist while copying. Reserve
-            // the entire replacement before allocating, then return the old
-            // permit only once its buffer has been released.
-            let replacement_permit = if end > self.inline_limit {
-                Some(
-                    self.budget
-                        .clone()
-                        .try_acquire_many_owned(
-                            u32::try_from(capacity).map_err(std::io::Error::other)?,
-                        )
-                        .map_err(|_| {
-                            std::io::Error::other("RDMA large-message send byte budget exhausted")
-                        })?,
-                )
-            } else {
-                None
-            };
-            let mut replacement = self.pool.allocate(size).map_err(std::io::Error::other)?;
-            replacement.set_len(0);
-            replacement.extend_from_slice(&self.encoded.buffer)?;
-            self.encoded.buffer = replacement;
-            self.encoded.permit = replacement_permit;
-        } else if end > self.inline_limit {
-            self.reserve(self.encoded.buffer.capacity())?;
-        }
-        self.encoded.buffer.extend_from_slice(bytes)
-    }
-
-    fn reserve(&mut self, capacity: usize) -> std::io::Result<()> {
-        let held = self
-            .encoded
-            .permit
-            .as_ref()
-            .map_or(0, OwnedSemaphorePermit::num_permits);
-        if capacity > held {
-            let additional = u32::try_from(capacity - held).map_err(std::io::Error::other)?;
-            let permit = self
-                .budget
-                .clone()
-                .try_acquire_many_owned(additional)
-                .map_err(|_| {
-                    std::io::Error::other("RDMA large-message send byte budget exhausted")
-                })?;
-            match &mut self.encoded.permit {
-                Some(held) => held.merge(permit),
-                slot @ None => *slot = Some(permit),
+        if self.encoded.permit.is_none() && end <= self.inline_limit {
+            // Inline messages stay one contiguous SEND buffer.
+            let capacity = self.encoded.buffer.capacity();
+            if end > capacity {
+                let size = end.max(capacity.saturating_mul(4)).min(self.inline_limit);
+                let mut replacement = self.pool.allocate(size).map_err(std::io::Error::other)?;
+                replacement.set_len(0);
+                replacement.extend_from_slice(&self.encoded.buffer)?;
+                self.encoded.buffer = replacement;
             }
+            self.encoded.buffer.extend_from_slice(bytes)?;
+            self.refresh_room();
+            return Ok(());
         }
+        // Large message. Its first crossing charges the existing buffer; all
+        // storage is then held until the source settles.
+        let mut permit = match self.encoded.permit.is_none() {
+            true => Some(self.reserve_budget(self.encoded.buffer.capacity())?),
+            false => None,
+        };
+        let current = self.current();
+        let mut space = current.capacity() - current.len();
+        let mut capacity = len + space;
+        let mut added = Vec::new();
+        while space < bytes.len() {
+            // A single large write gets one chunk covering it: fewer regions
+            // and READ WRs, and still no copy of earlier bytes.
+            let size = capacity
+                .clamp(MIN_CHUNK, MAX_CHUNK)
+                .max(bytes.len() - space)
+                .min(self.limit - capacity.min(self.limit))
+                .max(1);
+            let chunk_permit = self.reserve_budget(BufferPool::allocation_capacity(size)?)?;
+            let mut chunk = self.pool.allocate(size).map_err(std::io::Error::other)?;
+            chunk.set_len(0);
+            space += chunk.capacity();
+            capacity += chunk.capacity();
+            match &mut permit {
+                Some(held) => held.merge(chunk_permit),
+                slot @ None => *slot = Some(chunk_permit),
+            }
+            added.push(chunk);
+        }
+        match (&mut self.encoded.permit, permit) {
+            (Some(held), Some(permit)) => held.merge(permit),
+            (slot @ None, permit) => *slot = permit,
+            (Some(_), None) => {}
+        }
+        let mut rest = bytes;
+        let current = self.current();
+        let take = (current.capacity() - current.len()).min(rest.len());
+        current.extend_from_slice(&rest[..take])?;
+        rest = &rest[take..];
+        for mut chunk in added {
+            let take = chunk.capacity().min(rest.len());
+            chunk.extend_from_slice(&rest[..take])?;
+            rest = &rest[take..];
+            self.encoded.chunks.push(chunk);
+        }
+        debug_assert!(rest.is_empty());
+        self.refresh_room();
         Ok(())
     }
 }
@@ -186,21 +242,26 @@ impl SendMsg for GrowingMessage<'_> {
     type Error = Error;
 
     fn size(&self) -> usize {
-        self.encoded.buffer.len()
+        self.encoded.len()
     }
 
     fn prepare(&mut self) -> Result<()> {
         self.encoded.buffer.set_len(0);
+        self.encoded.chunks.clear();
+        self.encoded.permit = None;
+        self.room = 0;
         self.write_all(&[0; HEADER_LEN])?;
         Ok(())
     }
 
     fn finish(&mut self, meta_offset: usize, payload_offset: usize) -> Result<()> {
-        if meta_offset != HEADER_LEN {
+        // Metadata, and therefore its backfilled length, must lie in the
+        // first chunk; it is far smaller than the inline limit in practice.
+        if meta_offset != HEADER_LEN || payload_offset > self.encoded.buffer.len() {
             return Err(ErrorKind::InvalidArgument.into());
         }
         self.encoded.buffer.finish(meta_offset, payload_offset)?;
-        let header = encode_header(self.encoded.buffer.len() - HEADER_LEN)?;
+        let header = encode_header(self.encoded.len() - HEADER_LEN)?;
         self.encoded.buffer[..HEADER_LEN].copy_from_slice(&header);
         self.encoded.payload_offset = payload_offset;
         Ok(())
@@ -225,6 +286,18 @@ mod tests {
 
     const INLINE: usize = 16 * 1024;
 
+    fn concatenated(encoded: &Encoded) -> Vec<u8> {
+        let mut bytes = encoded.buffer.to_vec();
+        for chunk in &encoded.chunks {
+            bytes.extend_from_slice(chunk);
+        }
+        bytes
+    }
+
+    fn held_capacity(encoded: &Encoded) -> usize {
+        encoded.buffer.capacity() + encoded.chunks.iter().map(Buffer::capacity).sum::<usize>()
+    }
+
     fn pool() -> Arc<BufferPool> {
         ruapc_bufpool::BufferPoolBuilder::new(Vec::new()).build()
     }
@@ -240,6 +313,7 @@ mod tests {
         GrowingMessage {
             encoded: Encoded {
                 buffer,
+                chunks: Vec::new(),
                 payload_offset: 0,
                 permit: None,
             },
@@ -247,6 +321,7 @@ mod tests {
             budget,
             inline_limit,
             limit,
+            room: 0,
         }
     }
 
@@ -303,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn grows_across_multiple_buffers_without_serializing_user_value_again() {
+    fn large_messages_append_chunks_without_serializing_user_value_again() {
         let pool = pool();
         for use_msgpack in [true, false] {
             let budget = Arc::new(Semaphore::new(512 * 1024));
@@ -331,38 +406,37 @@ mod tests {
             meta.serialize_to(&value, &mut message).unwrap();
             assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-            let buffer = &message.encoded.buffer;
-            assert!(buffer.len() > 16 * 1024);
+            let encoded = &message.encoded;
+            // The first buffer stopped at the inline limit; nothing was copied
+            // into larger allocations.
+            assert_eq!(encoded.buffer.len(), 16 * 1024);
+            assert!(!encoded.chunks.is_empty());
+            let bytes = concatenated(encoded);
+            assert_eq!(bytes.len(), encoded.len());
             assert_eq!(
-                u32::from_be_bytes(buffer[4..HEADER_LEN].try_into().unwrap()) as usize,
-                buffer.len() - HEADER_LEN
+                u32::from_be_bytes(bytes[4..HEADER_LEN].try_into().unwrap()) as usize,
+                bytes.len() - HEADER_LEN
             );
-            assert_eq!(&buffer[..4], &frame::MAGIC_NUM.to_be_bytes());
-            assert_eq!(
-                buffer.as_ref(),
-                frame::encode(&meta, &chunks).unwrap().as_ref()
-            );
+            assert_eq!(bytes, frame::encode(&meta, &chunks).unwrap().as_ref());
             let meta_len =
-                u32::from_be_bytes(buffer[HEADER_LEN..HEADER_LEN + 4].try_into().unwrap()) as usize;
-            assert_eq!(message.encoded.payload_offset, HEADER_LEN + 4 + meta_len);
-            let decoded = Message::parse(Bytes::copy_from_slice(&buffer[HEADER_LEN..])).unwrap();
+                u32::from_be_bytes(bytes[HEADER_LEN..HEADER_LEN + 4].try_into().unwrap()) as usize;
+            assert_eq!(encoded.payload_offset, HEADER_LEN + 4 + meta_len);
+            let decoded = Message::parse(Bytes::copy_from_slice(&bytes[HEADER_LEN..])).unwrap();
             assert_eq!(decoded.meta, meta);
             assert_eq!(
                 decoded.payload.deserialize::<Vec<String>>(&meta).unwrap(),
                 chunks
             );
-            assert_eq!(
-                message.encoded.permit.as_ref().unwrap().num_permits(),
-                buffer.capacity()
-            );
-            assert_eq!(budget.available_permits() + buffer.capacity(), 512 * 1024);
+            let held = held_capacity(encoded);
+            assert_eq!(encoded.permit.as_ref().unwrap().num_permits(), held);
+            assert_eq!(budget.available_permits() + held, 512 * 1024);
             drop(message);
             assert_eq!(budget.available_permits(), 512 * 1024);
         }
     }
 
     #[test]
-    fn exact_inline_limit_keeps_fast_path_and_next_byte_reserves_capacity() {
+    fn exact_inline_limit_keeps_fast_path_and_next_byte_starts_a_chunk() {
         let pool = pool();
         let budget = Arc::new(Semaphore::new(128 * 1024));
         let mut message = message(&pool, &budget, INLINE, 256 * 1024);
@@ -372,13 +446,60 @@ mod tests {
         assert_eq!(budget.available_permits(), 128 * 1024);
 
         message.write_all(&[18]).unwrap();
-        assert_eq!(message.encoded.buffer.len(), INLINE + 1);
+        assert_eq!(message.encoded.buffer.len(), INLINE);
+        assert_eq!(message.encoded.chunks.len(), 1);
+        assert_eq!(&message.encoded.chunks[0][..], &[18]);
         assert_eq!(
             message.encoded.permit.as_ref().unwrap().num_permits(),
-            message.encoded.buffer.capacity()
+            held_capacity(&message.encoded)
         );
-        assert_eq!(&message.encoded.buffer[..INLINE], &[17; INLINE]);
-        assert_eq!(message.encoded.buffer[INLINE], 18);
+        // Later bytes take the fast path into the new chunk.
+        message.write_all(&[19; 100]).unwrap();
+        assert_eq!(message.encoded.chunks.len(), 1);
+        assert_eq!(message.encoded.len(), INLINE + 101);
+    }
+
+    #[test]
+    fn one_write_larger_than_max_chunk_gets_a_single_chunk() {
+        let pool = pool();
+        // One 5 MiB serializer write, above MAX_CHUNK (4 MiB), under a 6 MiB
+        // negotiated limit. It must land in exactly one chunk instead of being
+        // split, and the allocation is rounded up to the pool size class.
+        let budget = Arc::new(Semaphore::new(32 * 1024 * 1024));
+        let mut message = message(&pool, &budget, INLINE, 6 * 1024 * 1024);
+        let payload = vec![0x5a; 5 * 1024 * 1024];
+        message.write_all(&payload).unwrap();
+        let encoded = &message.encoded;
+        assert_eq!(encoded.chunks.len(), 1);
+        assert!(encoded.chunks[0].capacity() > MAX_CHUNK);
+        assert_eq!(concatenated(encoded), payload);
+        let held = held_capacity(encoded);
+        assert_eq!(encoded.permit.as_ref().unwrap().num_permits(), held);
+        assert_eq!(budget.available_permits() + held, 32 * 1024 * 1024);
+        drop(message);
+        assert_eq!(budget.available_permits(), 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn later_large_writes_merge_into_the_held_reservation() {
+        let pool = pool();
+        let budget = Arc::new(Semaphore::new(4 * 1024 * 1024));
+        let mut message = message(&pool, &budget, INLINE, 4 * 1024 * 1024);
+        message.write_all(&[1; INLINE]).unwrap();
+        // Each later write crosses the current chunk and must merge its byte
+        // permit into the reservation the message already holds.
+        for _ in 0..3 {
+            message.write_all(&[2; 64 * 1024]).unwrap();
+        }
+        let encoded = &message.encoded;
+        assert_eq!(encoded.len(), INLINE + 3 * 64 * 1024);
+        assert!(!encoded.chunks.is_empty());
+        let held = held_capacity(encoded);
+        assert_eq!(encoded.permit.as_ref().unwrap().num_permits(), held);
+        assert_eq!(budget.available_permits() + held, 4 * 1024 * 1024);
+        assert_eq!(concatenated(encoded).len(), INLINE + 3 * 64 * 1024);
+        drop(message);
+        assert_eq!(budget.available_permits(), 4 * 1024 * 1024);
     }
 
     #[test]
@@ -389,7 +510,7 @@ mod tests {
         message.write_all(&[73; 64 * 1024]).unwrap();
         let held = message.encoded.permit.as_ref().unwrap().num_permits();
         assert!(message.write_all(&[74]).is_err());
-        assert_eq!(&message.encoded.buffer[..], &[73; 64 * 1024]);
+        assert_eq!(concatenated(&message.encoded), vec![73; 64 * 1024]);
         assert_eq!(budget.available_permits(), 128 * 1024 - held);
         drop(message);
         assert_eq!(budget.available_permits(), 128 * 1024);
@@ -408,23 +529,22 @@ mod tests {
     }
 
     #[test]
-    fn failed_growth_preserves_existing_bytes_and_releases_budget_on_drop() {
+    fn failed_chunk_reservation_preserves_existing_bytes_and_budget() {
         let pool = pool();
-        let budget = Arc::new(Semaphore::new(256 * 1024));
+        // Exactly the first buffer plus one minimum chunk.
+        let budget = Arc::new(Semaphore::new(INLINE + MIN_CHUNK));
         let mut message = message(&pool, &budget, INLINE, 256 * 1024);
         message.write_all(&[43; INLINE]).unwrap();
         message.write_all(&[44]).unwrap();
-        assert_eq!(budget.available_permits(), 192 * 1024);
-        // The final 256 KiB allocation fits the total budget, but the old 64 KiB
-        // source remains live during copying. Reserving only the capacity delta
-        // would incorrectly allow 320 KiB of simultaneous registered storage.
-        assert!(message.write_all(&[45; 48 * 1024]).is_err());
-        assert_eq!(message.encoded.buffer.len(), INLINE + 1);
-        assert_eq!(&message.encoded.buffer[..INLINE], &[43; INLINE]);
-        assert_eq!(message.encoded.buffer[INLINE], 44);
-        assert_eq!(budget.available_permits(), 192 * 1024);
+        assert_eq!(budget.available_permits(), 0);
+        assert!(message.write_all(&[45; MIN_CHUNK]).is_err());
+        let mut expected = vec![43; INLINE];
+        expected.push(44);
+        assert_eq!(concatenated(&message.encoded), expected);
+        assert_eq!(message.encoded.chunks.len(), 1);
+        assert_eq!(budget.available_permits(), 0);
         drop(message);
-        assert_eq!(budget.available_permits(), 256 * 1024);
+        assert_eq!(budget.available_permits(), INLINE + MIN_CHUNK);
     }
 
     #[test]

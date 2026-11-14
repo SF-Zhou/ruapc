@@ -82,7 +82,7 @@ and source recovery, see
 ## RDMA: `RdmaService`
 
 With the `rdma` feature, `RdmaService` groups connection bootstrap, serialized
-payload transfer and health probes in one built-in service. Its seven methods
+payload transfer and health probes in one built-in service. Its six methods
 share the router and method directory; each group has its own transport
 prerequisites below. The crate-private trait, payload request types and probe
 reply type are defined in
@@ -92,7 +92,7 @@ reply type are defined in
 
 The connection pool uses these methods over the RDMA endpoint's declared
 bootstrap transport (`tcp`, `ws` or `http`).
-Peers must advertise bootstrap protocol version **3**.
+Peers must advertise bootstrap protocol version **4**.
 Bootstrap RPCs use the endpoint's full equivalent-address group; every address
 must share the acceptor's `State` and lease records. See
 [group identity](endpoints.md#identity-and-caller-obligations).
@@ -101,8 +101,7 @@ must share the acceptor's `State` and lease records. See
 |---|---|---|---|
 | `RdmaService/discover` | `()` | `RdmaPeerAdvertisement` | Protocol version and currently connectable devices. |
 | `RdmaService/prepare_connection` | `PrepareConnectionRequest` | `PrepareConnectionResponse` | Acceptor QP endpoint, lease, and actual limits. |
-| `RdmaService/commit_connection` | `ConnectionLease` | `()` | Idempotently confirms initiator ownership. |
-| `RdmaService/cancel_connection` | `ConnectionLease` | `()` | Best-effort rollback. |
+| `RdmaService/cancel_connection` | `ConnectionLease` | `()` | Best-effort rollback of a prepared connection before activation. |
 
 The advertisement carries device load, directional limits, ports, and GIDs.
 A lease contains `attempt_id` and `accepted_connection_id`. See

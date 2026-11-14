@@ -17,11 +17,10 @@ use super::{
     wr_slots::WrSlots,
 };
 use crate::{
-    Error, ErrorKind, QpConnectionConfig, Result, WRID, WRType, ibv_qp, ibv_qp_attr,
-    ibv_qp_attr_mask, ibv_qp_init_attr, ibv_qp_type, ibv_recv_wr, ibv_send_flags, ibv_send_wr,
-    ibv_send_wr__bindgen_ty_1, ibv_send_wr__bindgen_ty_2, ibv_send_wr__bindgen_ty_2__bindgen_ty_1,
-    ibv_sge, ibv_wc, ibv_wr_opcode, ruapc_ibv_create_qp, ruapc_ibv_destroy_qp, ruapc_ibv_modify_qp,
-    ruapc_ibv_post_recv, ruapc_ibv_post_send,
+    Error, ErrorKind, QpConnectionConfig, Result, WRType, ibv_qp, ibv_qp_attr, ibv_qp_attr_mask,
+    ibv_qp_init_attr, ibv_qp_type, ibv_recv_wr, ibv_send_flags, ibv_send_wr,
+    ibv_send_wr__bindgen_ty_1, ibv_sge, ibv_wc, ibv_wr_opcode, ruapc_ibv_create_qp,
+    ruapc_ibv_destroy_qp, ruapc_ibv_modify_qp, ruapc_ibv_post_recv, ruapc_ibv_post_send,
 };
 
 /// Maximum gather-list length accepted by [`QueuePair::send_gather`];
@@ -79,16 +78,16 @@ pub struct CompletedWork<'a> {
     pub swept_sends: usize,
 }
 
-/// One local scatter segment resolved from an owned READ plan.
-#[derive(Debug, Clone, Copy)]
-struct ReadSge {
-    /// Local destination address.
-    addr: u64,
-    /// Segment length in bytes.
-    len: u32,
-    /// Local memory key covering the segment on this QP's device.
-    lkey: u32,
-}
+/// One local scatter segment resolved from an owned READ plan, stored in the
+/// provider's layout so a posted chain points straight into the plan.
+type ReadSge = ibv_sge;
+
+/// Longest READ chain posted by one [`QueuePair::post_reads`] call: one
+/// provider lock and doorbell cover the whole chain.
+pub const MAX_READ_CHAIN: usize = 16;
+
+/// Longest receive chain posted by one provider call in [`QueuePair::recv_many`].
+pub const MAX_RECV_CHAIN: usize = 32;
 
 /// Signaling is explicit at each entry point: window-tail and backlog sends
 /// must complete independently; ordinary data sends may share a later CQE.
@@ -455,72 +454,6 @@ impl QueuePair {
         self.max_inline_data
     }
 
-    /// Posts one RDMA READ from a contiguous remote region into the local
-    /// scatter list `sges`, always signaled.
-    ///
-    /// Unlike sends, no buffer ownership is stored in the WR slot table:
-    /// the caller guarantees the memory behind `sges` stays alive (and is
-    /// not recycled) until the read's work completion — success, error or
-    /// flush — has been observed. `register` runs with the allocated
-    /// [`WRID`] *before* the work request is posted (under the SQ post
-    /// lock), so a completion can never race the caller's bookkeeping; on
-    /// post failure `unregister` undoes it.
-    ///
-    /// # Safety
-    ///
-    /// Every SGE must describe writable registered memory on this QP's device.
-    /// Keep that memory alive and exclusively available for DMA until the WR's
-    /// success, error, or flush completion is observed (or the QP is destroyed).
-    unsafe fn read_sges(
-        &self,
-        sges: &[ReadSge],
-        remote_addr: u64,
-        rkey: u32,
-        register: impl FnOnce(WRID),
-        unregister: impl FnOnce(WRID),
-    ) -> Result<WRID> {
-        if sges.is_empty() || sges.len() > self.gather_limit() {
-            return Err(Error::new(
-                ErrorKind::IBPostSendFail,
-                format!(
-                    "invalid read scatter list length {} (limit {})",
-                    sges.len(),
-                    self.gather_limit()
-                ),
-            ));
-        }
-        let mut raw = [ibv_sge::default(); MAX_GATHER_SGE];
-        for (dst, sge) in raw.iter_mut().zip(sges.iter()) {
-            *dst = ibv_sge {
-                addr: sge.addr,
-                length: sge.len,
-                lkey: sge.lkey,
-            };
-        }
-        let num_sge = sges.len() as c_int;
-
-        let posting = self.identity.lock_send()?;
-        let id = posting.sequence();
-        let wr_id = self.identity().encode(WRType::Read, id);
-        register(wr_id);
-        let mut wr = ibv_send_wr {
-            wr_id,
-            sg_list: raw.as_mut_ptr(),
-            num_sge,
-            opcode: ibv_wr_opcode::IBV_WR_RDMA_READ,
-            send_flags: ibv_send_flags::IBV_SEND_SIGNALED.0,
-            wr: ibv_send_wr__bindgen_ty_2 {
-                rdma: ibv_send_wr__bindgen_ty_2__bindgen_ty_1 { remote_addr, rkey },
-            },
-            ..Default::default()
-        };
-        unsafe { self.post_send(&mut wr) }.map_err(|(_, err)| {
-            unregister(wr_id);
-            err
-        })?;
-        Ok(wr_id)
-    }
-
     pub fn recv(&self, buffer: Buffer) -> Result<()> {
         let addr = buffer.as_ptr() as u64;
         let len = buffer.capacity() as u32;
@@ -545,6 +478,88 @@ impl QueuePair {
             self.recv_wrs.take(id);
             err
         })
+    }
+
+    /// Posts every buffer in `buffers` as receives, chaining up to
+    /// [`MAX_RECV_CHAIN`] per provider call. Returns the number posted; on
+    /// error the buffers not yet posted are dropped (their slots rolled back)
+    /// and the error is returned. Each WR's ownership is recorded first.
+    pub fn recv_many(&self, buffers: &mut Vec<Buffer>) -> (usize, Result<()>) {
+        let mut posted = 0;
+        while !buffers.is_empty() {
+            let count = buffers.len().min(MAX_RECV_CHAIN);
+            let mut sges = [ibv_sge::default(); MAX_RECV_CHAIN];
+            let mut wrs = [ibv_recv_wr::default(); MAX_RECV_CHAIN];
+            let mut ids = [0u64; MAX_RECV_CHAIN];
+            let mut prepared = 0;
+            let mut failure = None;
+            for buffer in buffers.drain(..count) {
+                let lkey = match self.lkey(&buffer) {
+                    Ok(lkey) => lkey,
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                };
+                let id = match self.identity.alloc_recv() {
+                    Ok(id) => id,
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                };
+                sges[prepared] = ibv_sge {
+                    addr: buffer.as_ptr() as u64,
+                    length: buffer.capacity() as u32,
+                    lkey,
+                };
+                if self.recv_wrs.insert(id, buffer.into()).is_err() {
+                    failure = Some(ErrorKind::WorkRequestSlotsExhausted.into());
+                    break;
+                }
+                ids[prepared] = id;
+                wrs[prepared] = ibv_recv_wr {
+                    wr_id: self.identity().encode(WRType::Recv, id),
+                    num_sge: 1,
+                    ..Default::default()
+                };
+                prepared += 1;
+            }
+            if failure.is_some() {
+                // Drop the rest of the batch with the failed buffer.
+                buffers.clear();
+            }
+            if prepared != 0 {
+                let base = wrs.as_mut_ptr();
+                for index in 0..prepared {
+                    // SAFETY: indices are within the stack arrays.
+                    unsafe {
+                        (*base.add(index)).sg_list = sges.as_mut_ptr().add(index);
+                        if index + 1 < prepared {
+                            (*base.add(index)).next = base.add(index + 1);
+                        }
+                    }
+                }
+                // SAFETY: the slot table owns every buffer before the NIC can
+                // observe its WR; the stack descriptors outlive the call.
+                if let Err((bad, error)) = unsafe { self.post_recv(base) } {
+                    // An unidentifiable bad_wr keeps every buffer posted:
+                    // memory-safe, but the connection must then be destroyed
+                    // because no completion can settle an unposted slot.
+                    let accepted = posted_prefix(base, bad, prepared);
+                    for id in &ids[accepted..prepared] {
+                        self.recv_wrs.take(*id);
+                    }
+                    buffers.clear();
+                    return (posted + accepted, Err(error));
+                }
+                posted += prepared;
+            }
+            if let Some(error) = failure {
+                return (posted, Err(error));
+            }
+        }
+        (posted, Ok(()))
     }
 
     /// Consumes a CQ-issued completion proof and releases the completed memory.
@@ -665,6 +680,22 @@ impl QueuePair {
     }
 }
 
+/// Number of leading WRs a provider accepted from a posted chain.
+///
+/// `ibv_post_send`/`ibv_post_recv` post every WR before `bad_wr` and none from
+/// it onward. A null or out-of-range `bad_wr` cannot be attributed to this
+/// chain, so treating the whole chain as posted keeps every ownership entry:
+/// memory-safe, but the caller must treat the post error as fatal because a
+/// ledger entry for a WR that was never posted can never be settled.
+pub(crate) fn posted_prefix<T>(base: *const T, bad: *const T, count: usize) -> usize {
+    debug_assert!(std::mem::size_of::<T>() != 0);
+    if bad.is_null() || count == 0 {
+        return count;
+    }
+    let offset = (bad as usize).wrapping_sub(base as usize) / std::mem::size_of::<T>().max(1);
+    if offset < count { offset } else { count }
+}
+
 // ibv_modify_qp returns an errno value directly; last_os_error() can be stale.
 fn modify_error(qp_num: u32, attr: &ibv_qp_attr, attr_mask: c_int, errno: c_int) -> Error {
     let target = if attr_mask & ibv_qp_attr_mask::IBV_QP_STATE.0 as c_int != 0 {
@@ -706,6 +737,23 @@ mod tests {
     use super::*;
 
     use crate::{ibv_qp_cap, ibv_qp_state, test_utils::open_device};
+
+    #[test]
+    fn posted_prefix_attributes_the_provider_failing_wr() {
+        let chain = [ibv_send_wr::default(); 4];
+        let base = chain.as_ptr();
+        // SAFETY: every `add` stays within the array or one past its end; the
+        // out-of-chain pointer uses `wrapping_add` and is never dereferenced.
+        unsafe {
+            assert_eq!(posted_prefix(base, std::ptr::null(), 4), 4);
+            assert_eq!(posted_prefix(base, base, 4), 0);
+            assert_eq!(posted_prefix(base, base.add(2), 4), 2);
+            assert_eq!(posted_prefix(base, base.add(4), 4), 4);
+            // An out-of-chain pointer keeps every ownership entry.
+            assert_eq!(posted_prefix(base, base.wrapping_add(9), 4), 4);
+            assert_eq!(posted_prefix(base, std::ptr::null(), 0), 0);
+        }
+    }
 
     #[test]
     fn selective_sweep_skips_previous_incarnations_and_already_completed_work() {
@@ -891,6 +939,31 @@ mod completion_tests {
         ibv_qp_state, ibv_qp_type, ibv_send_flags, test_utils::open_device,
     };
 
+    fn create_qp(
+        device: &Arc<crate::ActiveDevice>,
+        cq: &Arc<CompletionQueue>,
+        max_send_wr: u32,
+        max_recv_wr: u32,
+    ) -> QueuePair {
+        QueuePair::create(
+            device.pd(),
+            cq,
+            &mut ibv_qp_init_attr {
+                qp_type: ibv_qp_type::IBV_QPT_RC,
+                cap: ibv_qp_cap {
+                    max_send_wr,
+                    max_recv_wr,
+                    max_send_sge: 1,
+                    max_recv_sge: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            0,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn recoverable_read_requires_real_completion_or_provider_destruction_after_error() {
         for poll_completion in [true, false] {
@@ -1007,6 +1080,120 @@ mod completion_tests {
             assert_eq!(returned[0].as_ptr(), address);
             assert_eq!(returned[0].len(), 64);
         }
+    }
+
+    #[test]
+    fn chained_reads_post_once_and_complete_every_request() {
+        let device = Arc::new(open_device());
+        let pool = BufferPoolBuilder::new(vec![device.clone()]).build();
+        let mut source = pool.allocate(4096).unwrap();
+        source.set_len(4096);
+        for (index, byte) in source.as_mut_slice().iter_mut().enumerate() {
+            *byte = (index % 251) as u8;
+        }
+        let remote = source.remote_buffer_info(0).unwrap();
+        let cq = CompletionQueue::create(device.context(), 64, None).unwrap();
+        let create = || {
+            QueuePair::create(
+                device.pd(),
+                &cq,
+                &mut ibv_qp_init_attr {
+                    qp_type: ibv_qp_type::IBV_QPT_RC,
+                    cap: ibv_qp_cap {
+                        max_send_wr: 16,
+                        max_recv_wr: 4,
+                        max_send_sge: 2,
+                        max_recv_sge: 1,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                0,
+            )
+            .unwrap()
+        };
+        let reader = create();
+        let peer = create();
+        let port = device.info().ports.iter().find(|p| p.is_usable()).unwrap();
+        let gid = port
+            .gids
+            .iter()
+            .find(|g| g.gid_type == GidType::RoCEv2)
+            .or_else(|| port.gids.first())
+            .unwrap();
+        let config = |remote: &QueuePair| QpConnectionConfig {
+            local_port_num: port.port_num,
+            local_gid_index: gid.index,
+            pkey_index: 0,
+            link_layer: port.port_attr.link_layer,
+            path_mtu: port.port_attr.active_mtu,
+            remote_qp_num: remote.qp_num(),
+            remote_gid: gid.gid,
+            remote_lid: port.port_attr.lid,
+            local_psn: 7,
+            remote_psn: 7,
+            max_rd_atomic: 4,
+            max_dest_rd_atomic: 4,
+            traffic_class: 0,
+            ack_timeout: QpConnectionConfig::DEFAULT_ACK_TIMEOUT,
+            retry_count: QpConnectionConfig::DEFAULT_RETRY_COUNT,
+        };
+        reader.connect(&config(&peer)).unwrap();
+        peer.connect(&config(&reader)).unwrap();
+        let mut destination = pool.allocate(4096).unwrap();
+        destination.set_len(4096);
+        // Five 1 KiB-ish requests, the second scattered into two segments.
+        let requests = (0..4)
+            .map(|index| ReadRequest {
+                remote_addr: remote.addr + index * 1024,
+                rkey: remote.key.rkey,
+                segments: if index == 1 {
+                    vec![
+                        ReadSegment {
+                            buffer: 0,
+                            offset: 1024,
+                            len: 512,
+                        },
+                        ReadSegment {
+                            buffer: 0,
+                            offset: 1536,
+                            len: 512,
+                        },
+                    ]
+                } else {
+                    vec![ReadSegment {
+                        buffer: 0,
+                        offset: index as usize * 1024,
+                        len: 1024,
+                    }]
+                },
+            })
+            .collect();
+        let (mut posting, mut result) = reader.prepare_reads(vec![destination], requests).unwrap();
+        let (accepted, posted) = reader.post_reads(&mut posting, 3);
+        posted.unwrap();
+        assert_eq!(accepted, 3);
+        assert_eq!(posting.remaining(), 1);
+        let (accepted, posted) = reader.post_reads(&mut posting, MAX_READ_CHAIN);
+        posted.unwrap();
+        assert_eq!(accepted, 1);
+        assert!(reader.post_reads(&mut posting, 1).1.is_err());
+        let mut cursor = CompletionCursor::default();
+        let mut batch = CompletionBatch::<8>::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut completed = 0;
+        while completed < 4 {
+            assert!(Instant::now() < deadline, "chained READs did not complete");
+            for completion in cq.poll_batch(&mut batch).unwrap() {
+                let work = reader.complete(completion, &mut cursor).unwrap();
+                assert!(work.wc.succ());
+                completed += 1;
+            }
+        }
+        assert_eq!(reader.pending_read_count(), 0);
+        drop(posting);
+        let buffers = result.try_recv().unwrap().unwrap();
+        assert_eq!(buffers[0].as_slice(), source.as_slice());
     }
 
     #[test]
@@ -1161,5 +1348,236 @@ mod completion_tests {
             // never report fallback-map use.
             assert_eq!(sender.read_slot_spills(), 0);
         }
+    }
+
+    #[test]
+    fn recv_many_posts_a_chain_and_releases_every_completed_buffer() {
+        let device = Arc::new(open_device());
+        let pool = BufferPoolBuilder::new(vec![device.clone()]).build();
+        let cq = CompletionQueue::create(device.context(), 32, None).unwrap();
+        let create = || {
+            QueuePair::create(
+                device.pd(),
+                &cq,
+                &mut ibv_qp_init_attr {
+                    qp_type: ibv_qp_type::IBV_QPT_RC,
+                    cap: ibv_qp_cap {
+                        max_send_wr: 8,
+                        max_recv_wr: 4,
+                        max_send_sge: 1,
+                        max_recv_sge: 1,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                0,
+            )
+            .unwrap()
+        };
+        let receiver = create();
+        let sender = create();
+        let port = device.info().ports.iter().find(|p| p.is_usable()).unwrap();
+        let gid = port
+            .gids
+            .iter()
+            .find(|g| g.gid_type == GidType::RoCEv2)
+            .or_else(|| port.gids.first())
+            .unwrap();
+        let config = |remote: &QueuePair| QpConnectionConfig {
+            local_port_num: port.port_num,
+            local_gid_index: gid.index,
+            pkey_index: 0,
+            link_layer: port.port_attr.link_layer,
+            path_mtu: port.port_attr.active_mtu,
+            remote_qp_num: remote.qp_num(),
+            remote_gid: gid.gid,
+            remote_lid: port.port_attr.lid,
+            local_psn: 7,
+            remote_psn: 7,
+            max_rd_atomic: 1,
+            max_dest_rd_atomic: 1,
+            traffic_class: 0,
+            ack_timeout: QpConnectionConfig::DEFAULT_ACK_TIMEOUT,
+            retry_count: QpConnectionConfig::DEFAULT_RETRY_COUNT,
+        };
+        receiver.connect(&config(&sender)).unwrap();
+        sender.connect(&config(&receiver)).unwrap();
+
+        let mut posted: Vec<_> = (0..2)
+            .map(|_| {
+                let mut buffer = pool.allocate(64).unwrap();
+                buffer.set_len(64);
+                buffer
+            })
+            .collect();
+        let (count, result) = receiver.recv_many(&mut posted);
+        result.unwrap();
+        assert_eq!(count, 2);
+        assert!(
+            posted.is_empty(),
+            "posted buffers moved into the slot table"
+        );
+
+        for fill in [0x11u8, 0x22] {
+            let mut buffer = pool.allocate(64).unwrap();
+            buffer.set_len(64);
+            buffer.as_mut_slice().fill(fill);
+            sender.send(buffer, ibv_send_flags(0)).unwrap();
+        }
+
+        let mut recv_cursor = CompletionCursor::default();
+        let mut send_cursor = CompletionCursor::default();
+        let mut batch = CompletionBatch::<16>::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut received = 0;
+        let mut sent = 0;
+        // Providers differ in whether the local SEND completions arrive before
+        // or after the peer's receive completions, so wait for both.
+        while received < 2 || sent < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "chained send/receive completions did not arrive"
+            );
+            for completion in cq.poll_batch(&mut batch).unwrap() {
+                let is_recv = completion.info().is_recv();
+                let work = if is_recv {
+                    receiver.complete(completion, &mut recv_cursor).unwrap()
+                } else {
+                    sender.complete(completion, &mut send_cursor).unwrap()
+                };
+                assert!(work.wc.succ());
+                if is_recv {
+                    received += 1;
+                    let buffer = work
+                        .buffer
+                        .and_then(WrBuffers::into_single)
+                        .expect("a receive completion returns its posted buffer");
+                    assert_eq!(work.wc.byte_len as usize, 64);
+                    assert_eq!(buffer.len(), 64);
+                    assert!(
+                        buffer
+                            .as_slice()
+                            .iter()
+                            .all(|byte| *byte == 0x11 || *byte == 0x22),
+                        "receive completed into the wrong posted buffer"
+                    );
+                } else {
+                    sent += 1;
+                }
+            }
+            std::thread::yield_now();
+        }
+        assert_eq!(received, 2);
+        assert_eq!(sent, 2);
+        assert_eq!(receiver.recv_wrs.len(), 0);
+    }
+
+    #[test]
+    fn recv_many_rejects_a_buffer_without_an_lkey() {
+        let device = Arc::new(open_device());
+        let pool = BufferPoolBuilder::new(vec![device.clone()]).build();
+        let unregistered = BufferPoolBuilder::new(Vec::new()).build();
+        let cq = CompletionQueue::create(device.context(), 16, None).unwrap();
+        let receiver = create_qp(&device, &cq, 4, 4);
+
+        let mut buffers = vec![
+            unregistered.allocate(64).unwrap(),
+            pool.allocate(64).unwrap(),
+        ];
+        let (posted, result) = receiver.recv_many(&mut buffers);
+        assert_eq!(posted, 0);
+        assert!(
+            result.is_err(),
+            "a buffer without a key for this device cannot be posted"
+        );
+        assert!(
+            buffers.is_empty(),
+            "the rest of the batch is dropped with the failed buffer"
+        );
+        assert_eq!(receiver.recv_wrs.len(), 0);
+    }
+
+    #[test]
+    fn recv_many_rejected_chain_keeps_only_the_accepted_prefix() {
+        let device = Arc::new(open_device());
+        let pool = BufferPoolBuilder::new(vec![device.clone()]).build();
+        let cq = CompletionQueue::create(device.context(), 16, None).unwrap();
+        let receiver = create_qp(&device, &cq, 4, 2);
+
+        // More receives than the queue can hold: the provider rejects the
+        // chain and only the prefix it accepted keeps its slot ownership.
+        let mut buffers: Vec<_> = (0..8).map(|_| pool.allocate(64).unwrap()).collect();
+        let (accepted, result) = receiver.recv_many(&mut buffers);
+        assert!(
+            result.is_err(),
+            "posting past the receive queue depth must fail"
+        );
+        // An identifiable bad_wr keeps only the accepted prefix; an
+        // unidentifiable one keeps every entry. Both are memory-safe.
+        assert_eq!(receiver.recv_wrs.len(), accepted);
+        assert!(buffers.is_empty());
+    }
+
+    #[test]
+    fn post_reads_rejects_a_plan_owned_by_another_queue_pair() {
+        let device = Arc::new(open_device());
+        let pool = BufferPoolBuilder::new(vec![device.clone()]).build();
+        let cq = CompletionQueue::create(device.context(), 16, None).unwrap();
+        let owner = create_qp(&device, &cq, 4, 4);
+        let other = create_qp(&device, &cq, 4, 4);
+
+        let mut destination = pool.allocate(64).unwrap();
+        destination.set_len(64);
+        let source = pool.allocate(64).unwrap();
+        let remote = source.remote_buffer_info(0).unwrap();
+        let (mut posting, _completion) = owner
+            .prepare_reads(
+                vec![destination],
+                vec![ReadRequest {
+                    remote_addr: remote.addr,
+                    rkey: remote.key.rkey,
+                    segments: vec![ReadSegment {
+                        buffer: 0,
+                        offset: 0,
+                        len: 64,
+                    }],
+                }],
+            )
+            .unwrap();
+
+        let (accepted, result) = other.post_reads(&mut posting, 1);
+        assert_eq!(accepted, 0);
+        assert!(result.is_err(), "another QP cannot post this plan");
+        // The single-request wrapper reports the same rejection.
+        assert!(other.post_read(&mut posting).is_err());
+    }
+
+    #[test]
+    fn post_reads_rejected_chain_rolls_back_the_suffix() {
+        let device = Arc::new(open_device());
+        let pool = BufferPoolBuilder::new(vec![device.clone()]).build();
+        let cq = CompletionQueue::create(device.context(), 16, None).unwrap();
+        // A send queue shallower than the plan forces a provider rejection.
+        let qp = create_qp(&device, &cq, 2, 4);
+
+        let mut destination = pool.allocate(256).unwrap();
+        destination.set_len(256);
+        let source = pool.allocate(256).unwrap();
+        let remote = source.remote_buffer_info(0).unwrap();
+        let requests: Vec<_> = (0..4)
+            .map(|index| ReadRequest {
+                remote_addr: remote.addr + index * 64,
+                rkey: remote.key.rkey,
+                segments: vec![ReadSegment {
+                    buffer: 0,
+                    offset: index as usize * 64,
+                    len: 64,
+                }],
+            })
+            .collect();
+        let (mut posting, _completion) = qp.prepare_reads(vec![destination], requests).unwrap();
+        let (accepted, result) = qp.post_reads(&mut posting, MAX_READ_CHAIN);
+        assert!(result.is_err(), "a chain longer than the SQ must fail");
+        assert_eq!(posting.remaining(), 4 - accepted);
     }
 }

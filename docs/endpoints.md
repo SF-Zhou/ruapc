@@ -105,7 +105,7 @@ state. Different groups remain independent even when they overlap: `[a, b]`,
 RuaPC does not merge groups by observed addresses or successful connections.
 
 Callers guarantee that every address in a group reaches the same server state.
-For RDMA, discovery and prepare/commit/cancel requests through any group address
+For RDMA, discovery and prepare/cancel requests through any group address
 must share the same `State` and lease records. There is no negotiated server
 instance identifier that verifies this promise. Different groups pointing to
 the same server still remain distinct. See [RDMA bootstrap](rdma-connection.md)

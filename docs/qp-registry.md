@@ -105,8 +105,13 @@ mlx5 run this halves serial echo latency (about 25 to 14 microseconds) at a
 few percent of concurrent throughput. Zero disables this.
 
 Small received frame batches (up to 1 KiB total) are copied out so registered
-receive buffers can be reused promptly; larger batches retain the zero-copy path.
-This reduces receive-pool pressure without moving parsing onto the poller.
+receive buffers can be reused promptly; larger batches retain the zero-copy
+path. This reduces receive-pool pressure without moving parsing onto the poller.
+A drain's replacement receives are queued and posted as linked chains (up to 32
+per provider call) when maintenance starts, before it publishes ACKs; the peer
+can only use those slots after such an ACK, so batching adds no
+receiver-not-ready retries. A closed connection drops its pending replacements
+instead of posting them.
 
 ## Closing a connection
 

@@ -88,8 +88,9 @@ pub(super) struct EstablishedSocket {
 }
 
 impl RdmaSocketPool {
-    /// Prepare -> exchange -> connect/register -> confirm. Publication and the
-    /// first data-plane activation are the caller's responsibility.
+    /// Prepare -> exchange -> connect/register. Publication and the first
+    /// data-plane activation, which retires the acceptor's lease, are the
+    /// caller's responsibility.
     pub(super) async fn connect_stripe(
         &self,
         peer: &Arc<PeerState>,
@@ -118,7 +119,7 @@ impl RdmaSocketPool {
             let result = self.establish_connection(peer, state, bootstrap_ctx, candidate, attempt_id).await;
             match result {
                 Ok(established) => {
-                    tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "RDMA connection confirmed; awaiting publication");
+                    tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "RDMA connection established; awaiting publication");
                     Ok(established)
                 }
                 Err(err) => {
@@ -166,6 +167,7 @@ impl RdmaSocketPool {
         // Bootstrap RPCs recurse through SocketPool::acquire. Boxing keeps the
         // generated future finite; the bootstrap context uses the endpoint's
         // declared stream transport.
+        let prepared_at = Instant::now();
         let response = Box::pin(self.bootstrap_client.prepare_connection(ctx, &request))
             .await
             .map_err(|err| {
@@ -194,11 +196,21 @@ impl RdmaSocketPool {
         let socket = local.register(self, state, candidate.path.clone())?;
         rollback.socket = Some(socket.clone());
         tracing::Span::current().record("conn_id", socket.conn_id);
-        check_deadline(ctx, "before peer commit")?;
-        self.confirm_connection(ctx, &response.lease)
-            .await
-            .map_err(|err| at_stage("peer commit RPC", err))?;
-        check_deadline(ctx, "after peer commit")?;
+        check_deadline(ctx, "after local connect")?;
+        // The acceptor closes the connection unless activation arrives within
+        // its lease, which started no earlier than our prepare request. Keep
+        // half the lease for publication and the activation round trip.
+        let lease_budget = std::time::Duration::from_millis(self.config.peers.connect_lease_ms) / 2;
+        if prepared_at.elapsed() > lease_budget {
+            return Err(Error::new(
+                ErrorKind::Timeout,
+                format!(
+                    "RDMA setup took {:?}, beyond half the {} ms accept lease",
+                    prepared_at.elapsed(),
+                    self.config.peers.connect_lease_ms
+                ),
+            ));
+        }
         if !socket.state.is_ok() {
             return Err(Error::new(
                 ErrorKind::ConnectionClosed,
@@ -206,19 +218,6 @@ impl RdmaSocketPool {
             ));
         }
         Ok(EstablishedSocket { socket, rollback })
-    }
-
-    /// Commit is idempotent while its lease is retained. Retry one ambiguous
-    /// response timeout if the caller still has budget; generic RPC retries
-    /// cannot make this method-specific idempotency assumption.
-    async fn confirm_connection(&self, ctx: &Context, lease: &ConnectionLease) -> Result<()> {
-        match Box::pin(self.bootstrap_client.commit_connection(ctx, lease)).await {
-            Err(err) if err.kind == ErrorKind::Timeout && !ctx.is_expired() => {
-                tracing::debug!(%err, "RDMA connection commit timed out; retrying once");
-                Box::pin(self.bootstrap_client.commit_connection(ctx, lease)).await
-            }
-            result => result,
-        }
     }
 }
 

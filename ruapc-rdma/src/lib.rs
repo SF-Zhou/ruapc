@@ -63,9 +63,9 @@ mod verbs;
 pub use verbs::{
     ActiveDevice, CompChannel, CompletedWork, Completion, CompletionBatch, CompletionCursor,
     CompletionIdentity, CompletionQueue, Completions, Context, Device, DeviceList, MAX_GATHER_SGE,
-    MemoryRegion, ProtectionDomain, QpConnectionConfig, QpRegistryStats, QueuePair, ReadCompletion,
-    ReadFailure, ReadHandle, ReadObservation, ReadPosting, ReadRecovery, ReadRequest, ReadSegment,
-    ReadStatus, WrBuffers,
+    MAX_READ_CHAIN, MAX_RECV_CHAIN, MemoryRegion, ProtectionDomain, QpConnectionConfig,
+    QpRegistryStats, QueuePair, ReadCompletion, ReadFailure, ReadHandle, ReadObservation,
+    ReadPosting, ReadRecovery, ReadRequest, ReadSegment, ReadStatus, WrBuffers,
 };
 
 /// Internal ownership components used by the standalone benchmarks.

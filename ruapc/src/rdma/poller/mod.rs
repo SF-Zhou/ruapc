@@ -654,6 +654,8 @@ impl PollLoop {
         retry_receives: bool,
     ) -> bool {
         conn.dirty = false;
+        conn.post_pending_reposts();
+        conn.return_read_credits();
         if sweep_reads {
             conn.sweep_read_timeouts(now);
         }
@@ -786,6 +788,7 @@ impl PollLoop {
             );
         }
         for conn in self.conns.values_mut() {
+            conn.return_read_credits();
             conn.socket.set_error();
             conn.start_error_flush();
             // Nobody will poll the flush completions after this thread
@@ -1286,6 +1289,10 @@ mod tests {
                     assert!(completion.info().succ());
                     assert!(completion.info().is_read());
                     poll_loop.dispatch(completion, &mut Vec::new());
+                    // Maintenance normally returns the drain's READ permits.
+                    for conn in poll_loop.conns.values_mut() {
+                        conn.return_read_credits();
+                    }
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -2750,5 +2757,41 @@ mod tests {
         assert_eq!(poller.shared.budget.snapshot(), (0, 0));
         assert_eq!(counts[0].load(Ordering::Acquire), 0);
         assert_eq!(ring_total.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn closed_connection_drops_pending_reposts_without_posting() {
+        let devices = make_rdma_devices();
+        let device = &devices[0];
+        let pool = ruapc_bufpool::BufferPoolBuilder::new(
+            devices.iter().map(|device| device.registrar()).collect(),
+        )
+        .build();
+        let (poller, mut poll_loop) = manual_poller(device.context());
+        let (state, _stop) = State::create(
+            Router::default(),
+            &SocketPoolConfig {
+                rdma: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let socket = register_idle_socket(&poller, device, &pool, &state);
+        let qp_num = socket.queue_pair.qp_num();
+        assert!(poll_loop.drain_incoming(false));
+        poll_loop
+            .conns
+            .get_mut(&qp_num)
+            .unwrap()
+            .queue_pending_repost_for_test(pool.allocate(64).unwrap());
+        socket.set_error();
+
+        let conn = poll_loop.conns.get_mut(&qp_num).unwrap();
+        conn.post_pending_reposts();
+        assert!(
+            !conn.has_pending_reposts_for_test(),
+            "a closed connection must not post its queued replacements"
+        );
+        poll_loop.shutdown_cleanup();
     }
 }

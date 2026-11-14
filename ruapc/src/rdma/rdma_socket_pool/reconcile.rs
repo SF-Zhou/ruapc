@@ -27,7 +27,10 @@ impl RdmaSocketPool {
     /// First use and detected failures share one queued reconciliation pass,
     /// independent of the periodic timer and the foreground request's deadline.
     pub(super) fn schedule_reconcile(&self, peer: &Arc<PeerState>, state: &Arc<State>) {
-        if self.config.peers.min_connections_per_remote_nic == 0 && !peer.needs_reconnect() {
+        if self.config.peers.min_connections_per_remote_nic == 0
+            && !peer.needs_connections()
+            && peer.healthy_count() >= self.config.peers.connections_per_peer as usize
+        {
             return;
         }
         let Some(reconcile) = peer.try_reconcile() else {
@@ -173,6 +176,10 @@ impl RdmaSocketPool {
         .await;
         match result {
             Err(err) => {
+                // Keep the fill pending so probes, periodic maintenance or a
+                // later slow-path acquisition retry it under backoff; an idle
+                // peer can still be evicted.
+                peer.request_fill();
                 self.record_reconnect_failure(peer, PEER_BACKOFF_KEY);
                 tracing::debug!("replenishing RDMA stripes to {endpoint} failed: {err}");
             }
@@ -219,14 +226,23 @@ mod tests {
     //! Real bootstrap handshakes verify that replenishment yields the peer lock
     //! between connections while still completing without a maintenance timer.
 
-    use std::{collections::HashSet, sync::Arc, time::Duration};
+    use std::{
+        collections::HashSet,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
     use tokio::{sync::mpsc, time::timeout};
 
     use super::backoff_delay;
+    use crate::rdma::RdmaConnDirection;
     use crate::rdma::test_utils::small_rdma_config;
     use crate::{
-        Context, Endpoint, Error, ErrorKind, Payload, Result, Router, Server, Socket, Transport,
+        Context, Endpoint, Error, ErrorKind, Payload, Result, Router, Server, Socket, State,
+        Transport,
     };
 
     #[test]
@@ -237,6 +253,51 @@ mod tests {
     }
 
     type Handler = Arc<dyn Fn(Context, Payload) -> Result<()> + Send + Sync>;
+
+    /// Fails the `fail_call`-th `prepare_connection` request with a peer error
+    /// and forwards every other call, so a background fill can fail once and
+    /// then succeed when a later trigger retries it.
+    fn failing_prepare_router(fail_call: usize) -> Router {
+        let mut router = Router::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        router.wrap_method("RdmaService/prepare_connection", move |original| {
+            let handler: Handler = Arc::from(original);
+            let calls = calls.clone();
+            Box::new(move |context, payload| {
+                if calls.fetch_add(1, Ordering::SeqCst) == fail_call {
+                    return Err(Error::kind(ErrorKind::ConnectionClosed));
+                }
+                handler(context, payload)
+            })
+        });
+        router
+    }
+
+    async fn healthy_qps(state: &State, direction: RdmaConnDirection) -> usize {
+        state
+            .rdma_path_report()
+            .await
+            .unwrap()
+            .paths
+            .iter()
+            .filter(|path| path.direction == direction && path.healthy)
+            .count()
+    }
+
+    async fn wait_for_stripes(client: &Context, server: &Server, count: usize) {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let outbound = healthy_qps(&client.state, RdmaConnDirection::Outbound).await;
+                let inbound = healthy_qps(server.state(), RdmaConnDirection::Inbound).await;
+                if outbound == count && inbound == count {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("health probes did not retry a failed background fill");
+    }
 
     struct PendingPrepare {
         handler: Handler,
@@ -376,5 +437,60 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn periodic_reconcile_yields_to_foreground_between_connections() {
         assert_reconcile_yields_to_foreground(true).await;
+    }
+
+    /// A background fill that fails once must not leave the peer below its
+    /// target forever: the failure marks recovery intent, and the next health
+    /// probe round retries the fill even with periodic maintenance disabled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_background_fill_is_retried_by_health_probes() {
+        let mut config = small_rdma_config();
+        let rdma = config.rdma.as_mut().unwrap();
+        rdma.peers.connections_per_peer = 2;
+        rdma.peers.preconnect_max_per_peer = 2;
+        rdma.probe.interval_ms = 50;
+        rdma.probe.timeout_ms = 2_000;
+        rdma.probe.max_consecutive_timeouts = 3;
+        assert_eq!(rdma.maintenance.interval_ms, 0);
+        assert_eq!(rdma.peers.min_connections_per_remote_nic, 0);
+
+        // The second prepare request (the first background fill) fails; every
+        // later request is served normally.
+        let server = Server::create(failing_prepare_router(1), &config).unwrap();
+        let address = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let endpoint = Endpoint::rdma(Transport::TCP, [address]).unwrap();
+        let context = Context::create(&config)
+            .unwrap()
+            .with_endpoint(endpoint.clone());
+        let pool = context.state.socket_pool.rdma_pool().unwrap();
+
+        // The first acquisition publishes one stripe and schedules the
+        // background fill that the injected failure aborts.
+        let socket = timeout(
+            Duration::from_secs(10),
+            pool.acquire_with_options(&endpoint, &HashSet::new(), None, &context.state),
+        )
+        .await
+        .expect("first acquisition timed out")
+        .unwrap();
+        assert!(matches!(socket, Socket::RDMA(_)));
+        let peer = pool.peer(&endpoint);
+        assert_eq!(peer.active_snapshot().len(), 1);
+
+        // Probe rounds observe the recovery intent and retry the fill.
+        wait_for_stripes(&context, &server, 2).await;
+        assert_eq!(peer.active_snapshot().len(), 2);
+        assert!(!peer.needs_connections());
+
+        drop(socket);
+        context.state.socket_pool.stop();
+        server.stop();
+        timeout(Duration::from_secs(5), async {
+            tokio::join!(context.state.socket_pool.join(), server.join());
+        })
+        .await
+        .expect("recovery test left shutdown waiting");
+        assert_eq!(context.state.waiter.pending_count(), 0);
+        assert_eq!(server.state().waiter.pending_count(), 0);
     }
 }

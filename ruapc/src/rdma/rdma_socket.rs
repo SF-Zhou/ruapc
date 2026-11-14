@@ -69,10 +69,16 @@ pub struct RdmaSocket {
     /// Process-wide unique connection id (see [`crate::task::next_conn_id`]).
     pub(crate) conn_id: u64,
     /// Initiator asks the poll thread to send one accounted immediate-only
-    /// SEND after control-plane confirmation.
+    /// SEND after publication.
     activation_requested: AtomicBool,
-    /// Published by the initiator, or confirmed and activated by the acceptor.
+    /// Published by the initiator, or activated by the acceptor's first
+    /// data-plane receive.
     probe_ready: AtomicBool,
+    /// Set once autonomous poller SENDs may reach the peer: when the initiator
+    /// publishes the connection, or when the acceptor observes its first
+    /// data-plane receive. Until then the poll thread posts no idle ACK or
+    /// keepalive, so no pre-publication packet can imply activation.
+    send_released: AtomicBool,
     /// Server-side accept lease notified by the first successful receive.
     accept_lease_id: AtomicU64,
     /// Set by the poll thread on the first successful SEND or receive
@@ -111,6 +117,7 @@ impl RdmaSocket {
             conn_id: next_conn_id(),
             activation_requested: AtomicBool::new(false),
             probe_ready: AtomicBool::new(false),
+            send_released: AtomicBool::new(false),
             accept_lease_id: AtomicU64::new(0),
             path_verified: AtomicBool::new(false),
             bandwidth_limiter: config.bandwidth_limiter,
@@ -120,8 +127,21 @@ impl RdmaSocket {
 
     /// Start an outbound connection after publication has disarmed rollback.
     pub(crate) fn activate_published(&self) {
+        self.release_sends();
         self.request_activation();
         self.enable_probes();
+    }
+
+    /// Allows the poll thread to post autonomous SENDs (standalone ACKs and
+    /// keepalives) on this connection. Call only once the connection is
+    /// selectable, or for an accepted socket after its first data-plane
+    /// receive; before that, a peer could mistake the packet for activation.
+    pub(crate) fn release_sends(&self) {
+        self.send_released.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn sends_released(&self) -> bool {
+        self.send_released.load(Ordering::Acquire)
     }
 
     pub(crate) fn request_activation(&self) {
@@ -178,7 +198,12 @@ impl RdmaSocket {
         }
         match self.accept_lease_id.swap(0, Ordering::AcqRel) {
             0 => None,
-            connection_id => Some(connection_id),
+            connection_id => {
+                // The first data-plane receive proved the initiator published
+                // the connection; this side may now post its own ACKs.
+                self.release_sends();
+                Some(connection_id)
+            }
         }
     }
 
@@ -244,7 +269,7 @@ impl RdmaSocket {
         if !self.state.is_ok() {
             return Err(ErrorKind::ConnectionClosed.into());
         }
-        if encoded.buffer.len() > self.max_msg_size {
+        if encoded.len() > self.max_msg_size {
             request.check()?;
             // Keep the rendezvous state out of every inline send's future.
             return Box::pin(self.send_large(meta, encoded, &request, state)).await;

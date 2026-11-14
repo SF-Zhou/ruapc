@@ -232,7 +232,17 @@ impl RdmaSocket {
     ) -> Result<()> {
         let mut registered = false;
         while posting.remaining() != 0 {
-            if let Err(error) = self.post_read(posting, deadline).await {
+            let before = posting.remaining();
+            let result = self.post_read(posting, deadline).await;
+            if !registered && posting.remaining() < before {
+                // Publish after the first provider-accepted WR and before the
+                // next await, including admission for a later WR, and also
+                // when a chain was only partly accepted. Cancellation cannot
+                // skip registration while leaving posted DMA behind.
+                self.register_read_batch(posting, read_deadline, request_deadline);
+                registered = true;
+            }
+            if let Err(error) = result {
                 // Waiting for admission does not prove a QP failure. The
                 // poller still applies the independent READ watchdog to any
                 // outstanding work after this caller's deadline has expired.
@@ -242,13 +252,6 @@ impl RdmaSocket {
                     self.set_error();
                 }
                 return Err(error);
-            }
-            if !registered {
-                // Publish after the first provider-accepted WR and before the
-                // next await, including admission for a later WR. Cancellation
-                // cannot skip registration while leaving posted DMA behind.
-                self.register_read_batch(posting, read_deadline, request_deadline);
-                registered = true;
             }
         }
         Ok(())
@@ -278,19 +281,32 @@ impl RdmaSocket {
         posting: &mut ReadPosting,
         deadline: Option<ReadDeadline>,
     ) -> Result<()> {
-        let (sq_permit, device_permit) = self.read_credits.acquire(deadline).await?;
+        let first = self.read_credits.acquire(deadline).await?;
+        // Without waiting again, take whatever further credits are free so
+        // the run posts as one WR chain (one provider lock and doorbell).
+        let mut permits = vec![first];
+        let wanted = posting.remaining().min(ruapc_rdma::MAX_READ_CHAIN);
+        while permits.len() < wanted {
+            let Some(pair) = self.read_credits.try_acquire() else {
+                break;
+            };
+            permits.push(pair);
+        }
         if !self.state.is_ok() {
             return Err(read_closed_error());
         }
         // Covers uncontended admission and credits becoming ready together
         // with expiry, without creating a timer for the fast path.
         ReadDeadline::check(deadline)?;
-        // The held SQ permit keeps the completion route registered even if
+        // The held SQ permits keep the completion route registered even if
         // closing the connection races this final check and the actual post.
-        self.queue_pair.post_read(posting).map_err(plan_error)?;
-        sq_permit.forget();
-        device_permit.forget();
-        Ok(())
+        let (accepted, result) = self.queue_pair.post_reads(posting, permits.len());
+        // Accepted WRs keep their permits until completion; the rest return.
+        for (sq_permit, device_permit) in permits.drain(..accepted) {
+            sq_permit.forget();
+            device_permit.forget();
+        }
+        result.map_err(plan_error)
     }
 
     /// READs `source` into the attached destinations of an original call.

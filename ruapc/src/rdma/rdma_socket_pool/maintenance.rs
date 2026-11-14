@@ -277,9 +277,7 @@ impl RdmaSocketPool {
                 () = tokio::time::sleep(drain) => {}
             }
             socket.set_error();
-            peer.stripes
-                .write()
-                .unwrap()
+            peer.lock_stripes()
                 .draining
                 .retain(|stripe| !Arc::ptr_eq(&stripe.socket, &socket));
         });

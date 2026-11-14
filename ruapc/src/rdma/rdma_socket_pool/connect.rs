@@ -62,83 +62,38 @@ impl RdmaSocketPool {
             avoided_remote_nics,
         };
 
-        if !existing.is_empty() {
-            let max_connections = self.config.peers.preconnect_max_per_peer as usize;
-            if existing
-                .iter()
-                .filter(|stripe| stripe.socket.state.is_ok())
-                .count()
-                >= max_connections
-            {
-                return fallback.ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::Overloaded,
-                        format!(
-                            "RDMA peer {endpoint} reached preconnect_max_per_peer ({max_connections})"
-                        ),
-                    )
-                });
-            }
-            let established = match self
-                .connect_with_failover(peer, state, &plan, preference, &existing)
-                .await
-            {
-                Ok(established) => established,
-                Err(err) if fallback.is_some() => {
-                    tracing::debug!(peer = %endpoint, %err, "RDMA additional connection failed; using existing stripe");
-                    return Ok(fallback.expect("checked above"));
-                }
-                Err(err) => return Err(err),
-            };
-            let stripe = self.admit_established(peer, established);
-            return Ok(Socket::from(&stripe.socket));
-        }
-
-        // Establish `connections_per_peer` stripes towards this peer;
-        // requests are spread round-robin across them (and, with poll
-        // thread shards, across cores). Each stripe picks its own path:
-        // local side by least connections, remote side by
-        // power-of-two-choices over the peer's advertised per-NIC load.
-        let stripe_count = self.config.peers.connections_per_peer;
-        let mut stripes: Vec<Stripe> = Vec::with_capacity(stripe_count as usize);
-        let mut established_sockets = Vec::with_capacity(stripe_count as usize);
-        for _ in 0..stripe_count {
-            match self
-                .connect_with_failover(peer, state, &plan, preference, &stripes)
-                .await
-            {
-                Ok(established) => {
-                    stripes.push(Stripe {
-                        socket: established.socket.clone(),
-                    });
-                    established_sockets.push(established);
-                }
-                Err(err) => return Err(err),
-            }
-        }
-
-        // Earlier handshakes may have closed while later stripes were being
-        // prepared. Keep the initial set all-or-nothing at publication.
-        if let Some(stripe) = stripes.iter().find(|stripe| !stripe.socket.state.is_ok()) {
-            return Err(Error::new(
-                ErrorKind::ConnectionClosed,
-                format!(
-                    "RDMA initial stripe {} to {endpoint} closed before publication",
-                    stripe.socket.conn_id
-                ),
-            ));
-        }
-        let socket = self
-            .pick_stripe(&stripes, avoided_remote_nics)
-            .or_else(|| self.pick_stripe(&stripes, &HashSet::new()))
-            .ok_or_else(|| {
+        let healthy = existing
+            .iter()
+            .filter(|stripe| stripe.socket.state.is_ok())
+            .count();
+        let max_connections = self.config.peers.preconnect_max_per_peer as usize;
+        if healthy >= max_connections {
+            return fallback.ok_or_else(|| {
                 Error::new(
-                    ErrorKind::ConnectionClosed,
-                    format!("all freshly established RDMA stripes to {endpoint} failed"),
+                    ErrorKind::Overloaded,
+                    format!(
+                        "RDMA peer {endpoint} reached preconnect_max_per_peer ({max_connections})"
+                    ),
                 )
-            })?;
-        self.admit_initial(peer, established_sockets);
-        Ok(socket)
+            });
+        }
+        // The foreground establishes one stripe and returns as soon as it is
+        // published. The reconciliation pass scheduled by the caller fills the
+        // remaining `connections_per_peer` stripes and NIC coverage, so the
+        // first request pays for one handshake rather than all of them.
+        let established = match self
+            .connect_with_failover(peer, state, &plan, preference, &existing)
+            .await
+        {
+            Ok(established) => established,
+            Err(err) if fallback.is_some() => {
+                tracing::debug!(peer = %endpoint, %err, "RDMA additional connection failed; using existing stripe");
+                return Ok(fallback.expect("checked above"));
+            }
+            Err(err) => return Err(err),
+        };
+        let stripe = self.admit_established(peer, established);
+        Ok(Socket::from(&stripe.socket))
     }
 
     /// Fetches the peer's device list and enumerates the compatible path
@@ -250,7 +205,7 @@ impl RdmaSocketPool {
         }
     }
 
-    /// Admits one confirmed connection into request rotation.
+    /// Admits one established connection into request rotation.
     /// Under the publication lock: track -> disarm rollback -> publish;
     /// then request data-plane activation.
     pub(super) fn admit_established(
@@ -260,37 +215,13 @@ impl RdmaSocketPool {
     ) -> Stripe {
         let EstablishedSocket { socket, rollback } = established;
         let stripe = Stripe { socket };
-        let mut stripes = peer.stripes.write().unwrap();
+        let mut stripes = peer.lock_stripes();
         rollback.disarm();
         stripes.active.push(stripe.clone());
         drop(stripes);
         stripe.socket.activate_published();
         tracing::debug!(peer = %peer.endpoint, conn_id = stripe.socket.conn_id, "RDMA stripe published; activation requested");
         stripe
-    }
-
-    /// Atomically publishes an initial stripe set after every handshake
-    /// succeeded. Dropping before publication cancels every unadmitted connection.
-    fn admit_initial(&self, peer: &Arc<PeerState>, established: Vec<EstablishedSocket>) {
-        let mut rollbacks = Vec::with_capacity(established.len());
-        let stripes: Vec<Stripe> = established
-            .into_iter()
-            .map(|established| {
-                let EstablishedSocket { socket, rollback } = established;
-                rollbacks.push(rollback);
-                Stripe { socket }
-            })
-            .collect();
-        let mut published = peer.stripes.write().unwrap();
-        for rollback in rollbacks {
-            rollback.disarm();
-        }
-        published.active = stripes.clone();
-        drop(published);
-        for stripe in &stripes {
-            stripe.socket.activate_published();
-        }
-        tracing::debug!(peer = %peer.endpoint, stripes = stripes.len(), "RDMA initial stripes published; activation requested");
     }
 
     /// Replaces `victim` only if it is still in rotation. The replacement is
@@ -302,7 +233,7 @@ impl RdmaSocketPool {
         established: EstablishedSocket,
     ) -> bool {
         let EstablishedSocket { socket, rollback } = established;
-        let mut stripes = peer.stripes.write().unwrap();
+        let mut stripes = peer.lock_stripes();
         let Some(position) = stripes
             .active
             .iter()

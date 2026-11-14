@@ -1,5 +1,5 @@
-//! Acceptor bootstrap: prepare resources, confirm ownership and observe the
-//! first data-plane receive. Until both signals arrive, the connection is leased.
+//! Acceptor bootstrap: prepare resources and lease the accepted connection
+//! until the first data-plane receive proves the initiator published it.
 
 use std::{
     sync::atomic::Ordering,
@@ -15,42 +15,13 @@ use super::super::{
 use super::{RdmaSocket, RdmaSocketPool};
 use crate::{Error, ErrorKind, Result, State};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AcceptLeaseState {
-    Pending,
-    ReceiveObserved,
-    Confirmed,
-    Active,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum AcceptLeaseEvent {
-    Confirm,
-    Receive,
-}
-
-impl AcceptLeaseState {
-    fn advance(self, event: AcceptLeaseEvent) -> Self {
-        match (self, event) {
-            (Self::Pending, AcceptLeaseEvent::Confirm) => Self::Confirmed,
-            (Self::Pending, AcceptLeaseEvent::Receive) => Self::ReceiveObserved,
-            (Self::Confirmed, AcceptLeaseEvent::Receive)
-            | (Self::ReceiveObserved, AcceptLeaseEvent::Confirm) => Self::Active,
-            _ => self,
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum LeaseExpiry {
-    CloseInactiveConnection,
-    ForgetActiveTombstone,
-}
-
+/// An accepted connection awaiting its first data-plane receive. The
+/// initiator sends its activation only after publishing the connection, so
+/// that receive proves initiator ownership; until then the lease bounds how
+/// long an abandoned QP can live and lets the initiator cancel it.
 pub(super) struct AcceptLease {
     socket: Weak<RdmaSocket>,
     accepted_connection_id: u64,
-    state: AcceptLeaseState,
     expires_at: Instant,
 }
 
@@ -59,63 +30,21 @@ impl AcceptLease {
         self.accepted_connection_id == lease.accepted_connection_id
     }
 
-    /// The first confirmation starts the activation budget. Replayed events
-    /// cannot prolong an unfinished handshake. Activation starts only the
-    /// tombstone retention period; it no longer limits the socket's lifetime.
-    fn advance(&mut self, event: AcceptLeaseEvent, now: Instant, lease_duration: Duration) {
-        let previous = self.state;
-        self.state = previous.advance(event);
-        if self.state != previous
-            && matches!(
-                self.state,
-                AcceptLeaseState::Confirmed | AcceptLeaseState::Active
-            )
-        {
-            self.expires_at = now + lease_duration;
-        }
-        if self.state == AcceptLeaseState::Active
-            && let Some(socket) = self.socket.upgrade()
-        {
-            socket.enable_probes();
-        }
+    fn is_expired(&self, now: Instant) -> bool {
+        self.expires_at <= now
     }
 
-    fn expiry(&self, now: Instant) -> Option<LeaseExpiry> {
-        (self.expires_at <= now).then(|| {
-            if self.state == AcceptLeaseState::Active {
-                LeaseExpiry::ForgetActiveTombstone
-            } else {
-                LeaseExpiry::CloseInactiveConnection
-            }
-        })
-    }
-
-    /// All expiration paths use the same policy. An active entry is only an
-    /// idempotency tombstone; forgetting it must never close a healthy QP.
-    fn expire(&self, attempt_id: u64, now: Instant) {
-        let Some(socket) = self.socket.upgrade() else {
-            return;
-        };
-        match self.expiry(now) {
-            Some(LeaseExpiry::CloseInactiveConnection) => {
-                tracing::warn!(
-                    attempt_id,
-                    conn_id = self.accepted_connection_id,
-                    local_qp = socket.queue_pair.qp_num(),
-                    state = ?self.state,
-                    path = ?socket.path,
-                    "RDMA accept lease expired before activation"
-                );
-                socket.set_error();
-            }
-            Some(LeaseExpiry::ForgetActiveTombstone) => {
-                tracing::trace!(
-                    attempt_id,
-                    conn_id = self.accepted_connection_id,
-                    "RDMA active connection tombstone expired"
-                );
-            }
-            None => {}
+    /// Closes the never-activated connection.
+    fn expire(&self, attempt_id: u64) {
+        if let Some(socket) = self.socket.upgrade() {
+            tracing::warn!(
+                attempt_id,
+                conn_id = self.accepted_connection_id,
+                local_qp = socket.queue_pair.qp_num(),
+                path = ?socket.path,
+                "RDMA accept lease expired before activation"
+            );
+            socket.set_error();
         }
     }
 }
@@ -184,7 +113,7 @@ impl RdmaSocketPool {
         if let dashmap::mapref::entry::Entry::Occupied(entry) =
             self.accept_leases.entry(request.attempt_id)
         {
-            if entry.get().expiry(now).is_none() && entry.get().socket.strong_count() > 0 {
+            if !entry.get().is_expired(now) && entry.get().socket.strong_count() > 0 {
                 return Err(Error::new(
                     ErrorKind::InvalidArgument,
                     format!(
@@ -195,7 +124,7 @@ impl RdmaSocketPool {
                 ));
             }
             let (_, expired) = entry.remove_entry();
-            expired.expire(request.attempt_id, now);
+            expired.expire(request.attempt_id);
         }
 
         let (device_index, _) = self.find_device_by_name(&request.target)?;
@@ -233,7 +162,6 @@ impl RdmaSocketPool {
                 entry.insert(AcceptLease {
                     socket: Arc::downgrade(&socket),
                     accepted_connection_id: socket.conn_id,
-                    state: AcceptLeaseState::Pending,
                     expires_at: Instant::now() + self.accept_lease_duration(),
                 });
             }
@@ -259,77 +187,13 @@ impl RdmaSocketPool {
             local_qp = socket.queue_pair.qp_num(),
             lease_ms = self.config.peers.connect_lease_ms,
             limits = ?limits,
-            "RDMA connection prepared; awaiting commit and data-plane receive"
+            "RDMA connection prepared; awaiting data-plane activation"
         );
         Ok(PrepareConnectionResponse {
             endpoint: local_endpoint,
             lease,
             limits,
         })
-    }
-
-    pub(crate) fn rdma_commit_connection(&self, lease: &ConnectionLease) -> Result<()> {
-        let dashmap::mapref::entry::Entry::Occupied(mut entry) =
-            self.accept_leases.entry(lease.attempt_id)
-        else {
-            return Err(Error::new(
-                ErrorKind::InvalidArgument,
-                format!(
-                    "RDMA commit attempt {} connection {}: unknown or expired lease",
-                    lease.attempt_id, lease.accepted_connection_id,
-                ),
-            ));
-        };
-        if !entry.get().matches(lease) {
-            return Err(Error::new(
-                ErrorKind::InvalidArgument,
-                format!(
-                    "RDMA commit attempt {}: connection identity mismatch (expected {}, received {})",
-                    lease.attempt_id,
-                    entry.get().accepted_connection_id,
-                    lease.accepted_connection_id,
-                ),
-            ));
-        }
-        let now = Instant::now();
-        if entry.get().expiry(now).is_some() {
-            let (_, expired) = entry.remove_entry();
-            expired.expire(lease.attempt_id, now);
-            return Err(Error::new(
-                ErrorKind::Timeout,
-                format!(
-                    "RDMA commit attempt {} connection {}: lease expired in {:?} state",
-                    lease.attempt_id, lease.accepted_connection_id, expired.state,
-                ),
-            ));
-        }
-        if !entry
-            .get()
-            .socket
-            .upgrade()
-            .is_some_and(|socket| socket.state.is_ok())
-        {
-            entry.remove();
-            return Err(Error::new(
-                ErrorKind::ConnectionClosed,
-                format!(
-                    "RDMA commit attempt {} connection {}: accepted connection already closed",
-                    lease.attempt_id, lease.accepted_connection_id,
-                ),
-            ));
-        }
-        let previous = entry.get().state;
-        entry
-            .get_mut()
-            .advance(AcceptLeaseEvent::Confirm, now, self.accept_lease_duration());
-        tracing::debug!(
-            attempt_id = lease.attempt_id,
-            conn_id = lease.accepted_connection_id,
-            previous_state = ?previous,
-            state = ?entry.get().state,
-            "RDMA connection commit acknowledged"
-        );
-        Ok(())
     }
 
     pub(crate) fn rdma_cancel_connection(&self, requested: &ConnectionLease) {
@@ -340,7 +204,6 @@ impl RdmaSocketPool {
             tracing::debug!(
                 attempt_id = requested.attempt_id,
                 conn_id = requested.accepted_connection_id,
-                state = ?lease.state,
                 "RDMA accepted connection cancelled"
             );
             if let Some(socket) = lease.socket.upgrade() {
@@ -359,31 +222,26 @@ impl RdmaSocketPool {
         self.observe_accept_receive(attempt_id, &Arc::downgrade(socket));
     }
 
+    /// The first receive activates the connection: drop its lease and allow
+    /// probes. A receive after expiry cannot revive a closed connection.
     fn observe_accept_receive(&self, attempt_id: u64, socket: &Weak<RdmaSocket>) {
-        let dashmap::mapref::entry::Entry::Occupied(mut entry) =
-            self.accept_leases.entry(attempt_id)
+        let Some((_, lease)) = self
+            .accept_leases
+            .remove_if(&attempt_id, |_, lease| lease.socket.ptr_eq(socket))
         else {
             return;
         };
-        if !entry.get().socket.ptr_eq(socket) {
+        if lease.is_expired(Instant::now()) {
+            lease.expire(attempt_id);
             return;
         }
-        let now = Instant::now();
-        if entry.get().expiry(now).is_some() {
-            let (_, expired) = entry.remove_entry();
-            expired.expire(attempt_id, now);
-            return;
+        if let Some(socket) = lease.socket.upgrade() {
+            socket.enable_probes();
         }
-        let previous = entry.get().state;
-        entry
-            .get_mut()
-            .advance(AcceptLeaseEvent::Receive, now, self.accept_lease_duration());
         tracing::debug!(
             attempt_id,
-            conn_id = entry.get().accepted_connection_id,
-            previous_state = ?previous,
-            state = ?entry.get().state,
-            "RDMA accepted connection observed its first data-plane receive"
+            conn_id = lease.accepted_connection_id,
+            "RDMA accepted connection activated by its first data-plane receive"
         );
     }
 
@@ -392,10 +250,10 @@ impl RdmaSocketPool {
             if lease.socket.strong_count() == 0 {
                 return false;
             }
-            if lease.expiry(now).is_none() {
+            if !lease.is_expired(now) {
                 return true;
             }
-            lease.expire(*attempt_id, now);
+            lease.expire(*attempt_id);
             false
         });
     }
@@ -440,7 +298,6 @@ mod tests {
         AcceptLease {
             socket: Weak::new(),
             accepted_connection_id: 7,
-            state: AcceptLeaseState::Pending,
             expires_at: now + LEASE_DURATION,
         }
     }
@@ -457,114 +314,17 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn activation_requires_confirmation_and_receive_in_either_order() {
-        let started = Instant::now();
-        for (first, second, intermediate) in [
-            (
-                AcceptLeaseEvent::Confirm,
-                AcceptLeaseEvent::Receive,
-                AcceptLeaseState::Confirmed,
-            ),
-            (
-                AcceptLeaseEvent::Receive,
-                AcceptLeaseEvent::Confirm,
-                AcceptLeaseState::ReceiveObserved,
-            ),
-        ] {
-            let mut lease = pending_lease(started);
-            lease.advance(first, started + Duration::from_secs(1), LEASE_DURATION);
-            assert_eq!(lease.state, intermediate);
-            assert_eq!(
-                lease.expiry(lease.expires_at),
-                Some(LeaseExpiry::CloseInactiveConnection),
-            );
-
-            let activated_at = started + Duration::from_secs(2);
-            lease.advance(second, activated_at, LEASE_DURATION);
-            assert_eq!(lease.state, AcceptLeaseState::Active);
-            assert_eq!(lease.expires_at, activated_at + LEASE_DURATION);
-            assert_eq!(lease.expiry(activated_at), None);
-            assert_eq!(
-                lease.expiry(lease.expires_at),
-                Some(LeaseExpiry::ForgetActiveTombstone),
-            );
-        }
-    }
-
-    #[test]
-    fn duplicate_commits_do_not_extend_activation_or_tombstone_deadlines() {
-        let started = Instant::now();
-        let mut lease = pending_lease(started);
-        let confirmed_at = started + Duration::from_secs(5);
-        lease.advance(AcceptLeaseEvent::Confirm, confirmed_at, LEASE_DURATION);
-        let activation_deadline = confirmed_at + LEASE_DURATION;
-        assert_eq!(lease.expires_at, activation_deadline);
-
-        for elapsed in [1, 5, 29] {
-            lease.advance(
-                AcceptLeaseEvent::Confirm,
-                confirmed_at + Duration::from_secs(elapsed),
-                LEASE_DURATION,
-            );
-            assert_eq!(lease.expires_at, activation_deadline);
-        }
-        assert_eq!(
-            lease.expiry(activation_deadline),
-            Some(LeaseExpiry::CloseInactiveConnection),
-        );
-
-        let activated_at = activation_deadline - Duration::from_secs(1);
-        lease.advance(AcceptLeaseEvent::Receive, activated_at, LEASE_DURATION);
-        let tombstone_deadline = lease.expires_at;
-        lease.advance(
-            AcceptLeaseEvent::Confirm,
-            tombstone_deadline - Duration::from_secs(1),
-            LEASE_DURATION,
-        );
-        assert_eq!(lease.expires_at, tombstone_deadline);
-        assert_eq!(
-            lease.expiry(tombstone_deadline),
-            Some(LeaseExpiry::ForgetActiveTombstone),
-        );
-    }
-
-    #[test]
-    fn unconfirmed_receives_do_not_extend_the_prepare_deadline() {
-        let started = Instant::now();
-        let mut lease = pending_lease(started);
-        let deadline = lease.expires_at;
-        for elapsed in [1, 5, 29] {
-            lease.advance(
-                AcceptLeaseEvent::Receive,
-                started + Duration::from_secs(elapsed),
-                LEASE_DURATION,
-            );
-            assert_eq!(lease.expires_at, deadline);
-        }
-        assert_eq!(lease.state, AcceptLeaseState::ReceiveObserved);
-        assert_eq!(
-            lease.expiry(deadline),
-            Some(LeaseExpiry::CloseInactiveConnection),
-        );
-    }
-
     #[tokio::test]
-    async fn lease_control_rejects_mismatched_connection_identity() {
+    async fn cancellation_requires_the_matching_connection_identity() {
         let pool = make_pool();
         let attempt_id = 42;
         pool.accept_leases
             .insert(attempt_id, pending_lease(Instant::now()));
-        let mismatched = ConnectionLease {
+        pool.rdma_cancel_connection(&ConnectionLease {
             attempt_id,
             accepted_connection_id: 8,
-        };
-        let err = pool.rdma_commit_connection(&mismatched).unwrap_err();
-        assert_eq!(err.kind, ErrorKind::InvalidArgument);
-        assert!(err.msg.contains("expected 7, received 8"));
-        pool.rdma_cancel_connection(&mismatched);
+        });
         assert!(pool.accept_leases.contains_key(&attempt_id));
-
         pool.rdma_cancel_connection(&ConnectionLease {
             attempt_id,
             accepted_connection_id: 7,
@@ -573,48 +333,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn late_commit_removes_expired_leases_at_the_expiration_boundary() {
-        let pool = make_pool();
-        let attempt_id = 42;
-        for state in [
-            AcceptLeaseState::Pending,
-            AcceptLeaseState::ReceiveObserved,
-            AcceptLeaseState::Confirmed,
-            AcceptLeaseState::Active,
-        ] {
-            let mut lease = pending_lease(Instant::now());
-            lease.state = state;
-            lease.expires_at = Instant::now();
-            pool.accept_leases.insert(attempt_id, lease);
-            let err = pool
-                .rdma_commit_connection(&ConnectionLease {
-                    attempt_id,
-                    accepted_connection_id: 7,
-                })
-                .unwrap_err();
-            assert_eq!(err.kind, ErrorKind::Timeout);
-            assert!(err.msg.contains(&format!("{state:?}")));
-            assert!(!pool.accept_leases.contains_key(&attempt_id));
-        }
-    }
-
-    #[tokio::test]
-    async fn receive_notification_updates_the_tracked_lease() {
+    async fn first_receive_retires_only_its_own_lease() {
         let pool = make_pool();
         let attempt_id = 42;
         let lease = pending_lease(Instant::now());
         let socket = lease.socket.clone();
         pool.accept_leases.insert(attempt_id, lease);
+        pool.observe_accept_receive(attempt_id + 1, &socket);
+        assert!(pool.accept_leases.contains_key(&attempt_id));
         pool.observe_accept_receive(attempt_id, &socket);
-        assert_eq!(
-            pool.accept_leases.get(&attempt_id).unwrap().state,
-            AcceptLeaseState::ReceiveObserved,
-        );
-        pool.accept_leases.get_mut(&attempt_id).unwrap().state = AcceptLeaseState::Confirmed;
-        pool.observe_accept_receive(attempt_id, &socket);
-        assert_eq!(
-            pool.accept_leases.get(&attempt_id).unwrap().state,
-            AcceptLeaseState::Active,
-        );
+        assert!(!pool.accept_leases.contains_key(&attempt_id));
+    }
+
+    #[tokio::test]
+    async fn leases_expire_at_their_deadline() {
+        let now = Instant::now();
+        let lease = pending_lease(now);
+        assert!(!lease.is_expired(now));
+        assert!(lease.is_expired(lease.expires_at));
     }
 }

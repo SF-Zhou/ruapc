@@ -234,7 +234,6 @@ mod tests {
         #[cfg(feature = "rdma")]
         expected.extend([
             "RdmaService/cancel_connection",
-            "RdmaService/commit_connection",
             "RdmaService/discover",
             "RdmaService/prepare_connection",
             "RdmaService/finish",

@@ -3,12 +3,13 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        Arc, Mutex, RwLock,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, AtomicI64, Ordering},
     },
     time::{Duration, Instant},
 };
 
+use arc_swap::ArcSwap;
 use foldhash::fast::RandomState;
 
 use crate::{Context, Endpoint, State};
@@ -19,9 +20,11 @@ use super::reconcile::RetryBackoff;
 use super::{PathKey, RdmaSocket, Stripe};
 use crate::rdma::RdmaPeerPoolConfig;
 
-/// Connection stripes of one peer, guarded by a *synchronous* lock:
-/// critical sections must stay short and must never await. Structural
-/// mutations of `active` happen under the peer's `connect` lock
+/// Connection stripes of one peer, guarded by a *synchronous* mutex that
+/// only writers and bookkeeping take: critical sections must stay short and
+/// must never await. Requests read the lock-free [`PeerState::active_view`]
+/// snapshot, which [`StripesGuard`] republishes after every mutable access.
+/// Structural mutations of `active` happen under the peer's `connect` lock
 /// (admission) or in failure detection/pruning; `draining` is additionally
 /// touched by the drain timers.
 #[derive(Default)]
@@ -31,6 +34,54 @@ pub(super) struct PeerStripes {
     /// Health detection keeps this peer desired until its targets recover,
     /// even when no user requests arrive and the idle TTL has elapsed.
     reconnect_requested: bool,
+    /// A reconciliation pass ended below its targets. Probes, maintenance and
+    /// slow-path acquisitions retry it under backoff, but unlike
+    /// `reconnect_requested` it does not keep an idle peer alive: a target
+    /// that stays unreachable must not pin the peer and its retries forever.
+    fill_pending: bool,
+}
+
+impl PeerStripes {
+    /// A reconciliation pass ended below a connection target.
+    pub(super) fn fill_pending(&self) -> bool {
+        self.fill_pending
+    }
+
+    /// Health detection requested recovery that has not completed.
+    pub(super) fn recovery_requested(&self) -> bool {
+        self.reconnect_requested
+    }
+}
+
+/// Exclusive access to a peer's stripes. Mutable access republishes the
+/// request-path snapshot before the mutex is released, so a published
+/// snapshot never lags a completed mutation.
+pub(super) struct StripesGuard<'a> {
+    view: &'a ArcSwap<Vec<Stripe>>,
+    inner: MutexGuard<'a, PeerStripes>,
+    dirty: bool,
+}
+
+impl std::ops::Deref for StripesGuard<'_> {
+    type Target = PeerStripes;
+    fn deref(&self) -> &PeerStripes {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for StripesGuard<'_> {
+    fn deref_mut(&mut self) -> &mut PeerStripes {
+        self.dirty = true;
+        &mut self.inner
+    }
+}
+
+impl Drop for StripesGuard<'_> {
+    fn drop(&mut self) {
+        if self.dirty {
+            self.view.store(Arc::new(self.inner.active.clone()));
+        }
+    }
 }
 
 /// Millisecond-granularity last-use time, written on every request. The
@@ -90,7 +141,9 @@ pub(crate) struct PeerState {
     /// Bootstrap endpoint over the stream transport selected by `endpoint`.
     pub(super) bootstrap_endpoint: Endpoint,
     pub(super) connect: tokio::sync::Mutex<()>,
-    pub(super) stripes: RwLock<PeerStripes>,
+    stripes: Mutex<PeerStripes>,
+    /// Lock-free copy of `stripes.active` for the request path.
+    active_view: ArcSwap<Vec<Stripe>>,
     pub(super) meta: Mutex<PeerMeta>,
     pub(super) last_used: LastUsed,
     /// One queued or running background reconciliation task for this group.
@@ -120,7 +173,8 @@ impl PeerState {
             endpoint,
             bootstrap_endpoint,
             connect: tokio::sync::Mutex::new(()),
-            stripes: RwLock::new(PeerStripes::default()),
+            stripes: Mutex::new(PeerStripes::default()),
+            active_view: ArcSwap::from_pointee(Vec::new()),
             meta: Mutex::new(PeerMeta::default()),
             last_used: LastUsed::new(),
             reconcile_pending: AtomicBool::new(false),
@@ -136,14 +190,25 @@ impl PeerState {
         Some(ReconcileGuard { peer: self.clone() })
     }
 
+    pub(super) fn lock_stripes(&self) -> StripesGuard<'_> {
+        StripesGuard {
+            view: &self.active_view,
+            inner: self.stripes.lock().unwrap(),
+            dirty: false,
+        }
+    }
+
+    /// Lock-free snapshot of the selectable stripes.
+    pub(super) fn active_view(&self) -> arc_swap::Guard<Arc<Vec<Stripe>>> {
+        self.active_view.load()
+    }
+
     pub(super) fn touch(&self, now: Instant) {
         self.last_used.set(now);
     }
 
     pub(super) fn contains_active(&self, socket: &Arc<RdmaSocket>) -> bool {
-        self.stripes
-            .read()
-            .unwrap()
+        self.lock_stripes()
             .active
             .iter()
             .any(|stripe| Arc::ptr_eq(&stripe.socket, socket))
@@ -153,7 +218,7 @@ impl PeerState {
     /// and recovery intent share the replacement lock, so a late probe can
     /// neither close a draining socket nor lose its request for replenishment.
     pub(super) fn fail_active(&self, socket: &Arc<RdmaSocket>) -> bool {
-        let mut stripes = self.stripes.write().unwrap();
+        let mut stripes = self.lock_stripes();
         let Some(index) = stripes
             .active
             .iter()
@@ -190,7 +255,7 @@ impl PeerState {
     /// Remember failed active connections before pruning them, including
     /// when foreground acquisition wins the race with a health probe.
     pub(super) fn prune_dead(&self, request_reconnect: bool) {
-        let mut stripes = self.stripes.write().unwrap();
+        let mut stripes = self.lock_stripes();
         let mut removed_active = false;
         let mut unverified = Vec::new();
         stripes.active.retain(|stripe| {
@@ -213,12 +278,31 @@ impl PeerState {
         }
     }
 
-    pub(super) fn needs_reconnect(&self) -> bool {
-        self.stripes.read().unwrap().reconnect_requested
+    pub(super) fn healthy_count(&self) -> usize {
+        self.lock_stripes()
+            .active
+            .iter()
+            .filter(|stripe| stripe.socket.state.is_ok())
+            .count()
+    }
+
+    /// Whether connection work remains: health-detected recovery or an
+    /// unfinished fill. Triggers retries; only the former pins the peer.
+    pub(super) fn needs_connections(&self) -> bool {
+        let stripes = self.lock_stripes();
+        stripes.reconnect_requested || stripes.fill_pending
+    }
+
+    /// Whether a background connection fill is still pending. Unlike
+    /// [`Self::needs_connections`] this does not include health-detected
+    /// recovery, and it does not make the peer desired.
+    #[cfg(test)]
+    pub(super) fn needs_fill(&self) -> bool {
+        self.lock_stripes().fill_pending()
     }
 
     pub(super) fn is_desired(&self, now: Instant, idle_ttl: Duration) -> bool {
-        let stripes = self.stripes.read().unwrap();
+        let stripes = self.lock_stripes();
         !stripes.active.is_empty()
             || stripes.reconnect_requested
             || self
@@ -227,20 +311,20 @@ impl PeerState {
                 .is_some_and(|last_used| now.saturating_duration_since(last_used) < idle_ttl)
     }
 
-    /// Complete recovery only against a current snapshot under the same
-    /// lock used to request it. Backoff does not make a missing NIC healthy.
+    /// Recompute connection intent from a current snapshot under the lock
+    /// that publishes it. Any remaining action marks a pending fill, which
+    /// probes, maintenance or a later slow-path acquisition retry. Reaching
+    /// every target clears both the fill and health-detected recovery;
+    /// backoff does not make a missing NIC healthy.
     pub(super) fn finish_recovery(&self, remote_names: &[String], config: &RdmaPeerPoolConfig) {
-        let mut stripes = self.stripes.write().unwrap();
-        if !stripes.reconnect_requested {
-            return;
-        }
+        let mut stripes = self.lock_stripes();
         let healthy_remotes: Vec<String> = stripes
             .active
             .iter()
             .filter(|stripe| stripe.socket.state.is_ok())
             .map(|stripe| stripe.socket.path.remote.device.clone())
             .collect();
-        if next_connection_action(
+        let pending = next_connection_action(
             remote_names,
             &healthy_remotes,
             &HashSet::new(),
@@ -248,10 +332,17 @@ impl PeerState {
             config.connections_per_peer as usize,
             config.preconnect_max_per_peer as usize,
         )
-        .is_none()
-        {
+        .is_some();
+        stripes.fill_pending = pending;
+        if !pending {
             stripes.reconnect_requested = false;
         }
+    }
+
+    /// Marks an unfinished fill after a failed reconciliation pass. Retries
+    /// follow, but the mark does not keep an idle peer from being evicted.
+    pub(super) fn request_fill(&self) {
+        self.lock_stripes().fill_pending = true;
     }
 
     /// Control RPCs use the same complete address group over the bootstrap
@@ -262,11 +353,11 @@ impl PeerState {
     }
 
     pub(super) fn active_snapshot(&self) -> Vec<Stripe> {
-        self.stripes.read().unwrap().active.clone()
+        self.active_view().to_vec()
     }
 
     pub(super) fn all_sockets(&self) -> Vec<Arc<super::RdmaSocket>> {
-        let stripes = self.stripes.read().unwrap();
+        let stripes = self.lock_stripes();
         stripes
             .active
             .iter()
@@ -310,24 +401,63 @@ mod tests {
         peer.touch(now - idle_ttl);
         assert!(!peer.is_desired(now, idle_ttl));
 
-        peer.stripes.write().unwrap().reconnect_requested = true;
+        peer.lock_stripes().reconnect_requested = true;
         assert!(peer.is_desired(now, idle_ttl));
         // Pruning an already empty peer must preserve its recovery intent.
         peer.prune_dead(false);
-        assert!(peer.needs_reconnect());
+        assert!(peer.needs_connections());
         assert!(peer.is_desired(now, idle_ttl));
     }
 
     #[test]
     fn disabled_coverage_does_not_complete_an_unfilled_total_target() {
         let peer = peer();
-        peer.stripes.write().unwrap().reconnect_requested = true;
+        peer.lock_stripes().reconnect_requested = true;
         let config = RdmaPeerPoolConfig {
             min_connections_per_remote_nic: 0,
             ..Default::default()
         };
         peer.finish_recovery(&[], &config);
-        assert!(peer.needs_reconnect());
+        assert!(peer.needs_connections());
+    }
+
+    #[test]
+    fn below_target_pass_retries_without_pinning_an_idle_peer() {
+        let peer = peer();
+        let now = Instant::now();
+        let idle_ttl = Duration::from_secs(60);
+        peer.touch(now - idle_ttl);
+        assert!(!peer.needs_connections());
+        // A reconciliation pass that ends below the total target must leave
+        // the fill pending, so probes or maintenance retry it.
+        let config = RdmaPeerPoolConfig {
+            connections_per_peer: 2,
+            min_connections_per_remote_nic: 0,
+            ..Default::default()
+        };
+        peer.finish_recovery(&[], &config);
+        assert!(peer.needs_connections());
+        assert!(peer.needs_fill());
+        // An unreachable target must not keep an idle peer alive forever.
+        assert!(!peer.is_desired(now, idle_ttl));
+        peer.request_fill();
+        assert!(peer.needs_fill());
+        assert!(!peer.is_desired(now, idle_ttl));
+
+        // Health-detected recovery still pins it until the targets recover.
+        peer.lock_stripes().reconnect_requested = true;
+        peer.finish_recovery(&[], &config);
+        assert!(peer.is_desired(now, idle_ttl));
+
+        // A pass that reaches every target clears both intents.
+        let config = RdmaPeerPoolConfig {
+            connections_per_peer: 0,
+            min_connections_per_remote_nic: 0,
+            ..Default::default()
+        };
+        peer.finish_recovery(&[], &config);
+        assert!(!peer.needs_connections());
+        assert!(!peer.needs_fill());
     }
 
     #[test]
