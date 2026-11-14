@@ -75,18 +75,57 @@ fn set_qp_error(socket: &RdmaSocket) {
     }
 }
 
-/// Wakes the poll thread out of its idle `poll(2)` sleep.
+/// Wake protocol shared by the poll thread and every waker.
+///
+/// Wakers publish `pending` and only write the pipe when the poll thread has
+/// announced `sleeping`; the poll thread announces sleep and then rechecks
+/// `pending`. Both sides use `SeqCst` (a Dekker handshake), so at least one
+/// observes the other: either the poll thread skips `poll(2)`, or the waker
+/// writes the pipe. A busy poll thread therefore costs wakers no syscall.
+#[derive(Debug)]
+struct WakeShared {
+    pipe: UnixStream,
+    /// Set by every wake; consumed at the top of each poll-loop iteration.
+    pending: AtomicBool,
+    /// Set by the poll thread around its `poll(2)` sleep.
+    sleeping: AtomicBool,
+    /// Connections requesting maintenance. Each socket appears at most once
+    /// until the poll thread clears its `maintenance_queued` flag.
+    conns: Mutex<Vec<u32>>,
+}
+
+/// Wakes the poll thread, optionally scheduling one connection's maintenance.
 #[derive(Clone, Debug)]
-pub struct PollerWaker(Arc<UnixStream>, Arc<AtomicBool>);
+pub struct PollerWaker(Arc<WakeShared>);
 
 impl PollerWaker {
-    /// Wakes the poll thread. Best-effort: if the pipe is full the thread is
-    /// already scheduled to wake up.
+    fn new(pipe: UnixStream) -> Self {
+        Self(Arc::new(WakeShared {
+            pipe,
+            pending: AtomicBool::new(false),
+            sleeping: AtomicBool::new(false),
+            conns: Mutex::new(Vec::new()),
+        }))
+    }
+
+    /// Breaks an idle sleep so the poll thread observes inbox, budget or
+    /// shutdown changes. Best-effort pipe write: a full pipe already wakes it.
     pub fn wake(&self) {
-        // Publish before the pipe write. The poll thread consumes this hint
-        // before maintenance, so a concurrent wake schedules another pass.
-        self.1.store(true, Ordering::Release);
-        let _ = (&*self.0).write(&[1u8]);
+        self.0.pending.store(true, Ordering::SeqCst);
+        if self.0.sleeping.load(Ordering::SeqCst) {
+            let _ = (&self.0.pipe).write(&[1u8]);
+        }
+    }
+
+    /// Schedules maintenance of the connection on `qp_num` (pending sends,
+    /// activation, error teardown), then wakes the poll thread. `queued` is
+    /// the socket's flag; the poll thread clears it before maintenance, so a
+    /// change published before this call is observed by that maintenance.
+    pub(crate) fn wake_conn(&self, qp_num: u32, queued: &AtomicBool) {
+        if !queued.swap(true, Ordering::AcqRel) {
+            self.0.conns.lock().unwrap().push(qp_num);
+        }
+        self.wake();
     }
 }
 
@@ -292,14 +331,14 @@ impl DevicePoller {
             has_incoming: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
         });
-        let maintenance_requested = Arc::new(AtomicBool::new(false));
+        let waker = PollerWaker::new(wake_tx);
         let handle = tokio::runtime::Handle::current();
 
         let thread = {
             let cq = cq.clone();
             let comp_channel = comp_channel.clone();
             let shared = shared.clone();
-            let maintenance_requested = maintenance_requested.clone();
+            let wake = waker.0.clone();
             std::thread::Builder::new()
                 .name(format!("ruapc-rdma-poll-{device_name}"))
                 .spawn(move || {
@@ -314,7 +353,8 @@ impl DevicePoller {
                         conns: HashMap::default(),
                         dirty_qps: Vec::new(),
                         drain: CqDrain::default(),
-                        maintenance_requested,
+                        wake,
+                        woken_qps: Vec::new(),
                         unack_cq_events: 0,
                     }
                     .run();
@@ -325,7 +365,7 @@ impl DevicePoller {
         Ok(Self {
             cq,
             shared,
-            waker: PollerWaker(Arc::new(wake_tx), maintenance_requested),
+            waker,
             thread: Some(thread),
             cq_capacity,
         })
@@ -443,9 +483,11 @@ struct PollLoop {
     dirty_qps: Vec<u32>,
     /// Undrained retirement snapshots survive scheduling yields.
     drain: CqDrain,
-    /// Existing pending/error/activation wakeups request a full scan because
-    /// those changes need not produce a CQE identifying the connection.
-    maintenance_requested: Arc<AtomicBool>,
+    /// Pending/error/activation changes produce no CQE identifying their
+    /// connection; wakers queue the QP number for targeted maintenance.
+    wake: Arc<WakeShared>,
+    /// Reused buffer swapped with `wake.conns` to keep both allocations.
+    woken_qps: Vec<u32>,
     unack_cq_events: u32,
 }
 
@@ -494,20 +536,21 @@ impl PollLoop {
             }
             // Consume before touching connections: wakeups racing maintenance
             // remain set for the next loop, even when their pipe bytes coalesce.
-            let requested = self.maintenance_requested.load(Ordering::Acquire)
-                && self.maintenance_requested.swap(false, Ordering::AcqRel);
+            let woken = self.wake.pending.load(Ordering::Acquire)
+                && self.wake.pending.swap(false, Ordering::AcqRel);
             let registered = self.drain_incoming(false);
+            if woken {
+                self.drain_woken_connections();
+            }
             let housekeeping = now >= next_housekeeping;
             let retry_receives = now >= next_receive_retry;
             if retry_receives {
                 next_receive_retry = now + Self::RECEIVE_RETRY_INTERVAL;
             }
-            if housekeeping || requested {
-                if housekeeping {
-                    next_housekeeping = now + Self::HOUSEKEEPING_INTERVAL;
-                }
-                self.maintain_connections(now, housekeeping, retry_receives);
-            } else if progressed || registered || retry_receives {
+            if housekeeping {
+                next_housekeeping = now + Self::HOUSEKEEPING_INTERVAL;
+                self.maintain_connections(now, true, retry_receives);
+            } else if progressed || registered || woken || retry_receives {
                 self.maintain_dirty_connections(now, retry_receives);
             }
             if tracing::enabled!(tracing::Level::DEBUG)
@@ -603,6 +646,21 @@ impl PollLoop {
         }
     }
 
+    /// Marks connections queued by [`PollerWaker::wake_conn`] dirty. Clearing
+    /// each socket's flag precedes its maintenance, so later wakes requeue it.
+    /// Unknown QPs belong to unregistered or removed sockets; registration
+    /// clears the flag and marks the new connection dirty itself.
+    fn drain_woken_connections(&mut self) {
+        std::mem::swap(&mut self.woken_qps, &mut self.wake.conns.lock().unwrap());
+        for &qp_num in &self.woken_qps {
+            if let Some(conn) = self.conns.get_mut(&qp_num) {
+                conn.socket.maintenance_queued.swap(false, Ordering::AcqRel);
+                Self::mark_dirty(conn, &mut self.dirty_qps);
+            }
+        }
+        self.woken_qps.clear();
+    }
+
     fn maintain_connections(&mut self, now: Instant, sweep_reads: bool, retry_receives: bool) {
         // Every old entry is covered by this scan. Rebuild only the receive
         // deficits that need another timed attempt, without stale QP entries.
@@ -665,7 +723,13 @@ impl PollLoop {
     /// Sleep until a CQ notification, explicit wake, or housekeeping timeout.
     /// Draining both sources before returning avoids a permanently readable fd.
     fn wait_for_event(&mut self) -> ruapc_rdma::Result<bool> {
-        let (cq_ready, wake_ready) = poll_readable2(
+        // Announce sleep, then recheck: see `WakeShared` for the handshake.
+        self.wake.sleeping.store(true, Ordering::SeqCst);
+        if self.wake.pending.load(Ordering::SeqCst) {
+            self.wake.sleeping.store(false, Ordering::Relaxed);
+            return Ok(true);
+        }
+        let polled = poll_readable2(
             self.comp_channel.fd().as_raw_fd(),
             self.wake_rx.as_raw_fd(),
             if self.dirty_qps.is_empty() {
@@ -675,7 +739,9 @@ impl PollLoop {
                 // without busy-spinning when the buffer pool remains full.
                 1
             },
-        )?;
+        );
+        self.wake.sleeping.store(false, Ordering::Relaxed);
+        let (cq_ready, wake_ready) = polled?;
         if cq_ready {
             while self.comp_channel.get_event().is_ok() {
                 self.unack_cq_events += 1;
@@ -988,21 +1054,39 @@ mod tests {
     }
 
     #[test]
-    fn wake_during_maintenance_survives_draining_the_pipe() {
+    fn wakes_write_the_pipe_only_while_the_poll_thread_sleeps() {
         let (writer, mut reader) = UnixStream::pair().unwrap();
         writer.set_nonblocking(true).unwrap();
         reader.set_nonblocking(true).unwrap();
-        let requested = Arc::new(AtomicBool::new(false));
-        let waker = PollerWaker(Arc::new(writer), requested.clone());
+        let waker = PollerWaker::new(writer);
+        let shared = &waker.0;
+        // A busy poll thread only needs the hint: no pipe byte is written.
         waker.wake();
-        assert!(requested.swap(false, Ordering::AcqRel));
-        // The first maintenance pass is in progress when a different sender
-        // publishes work. Consuming both pipe bytes must preserve its new hint.
+        assert!(shared.pending.swap(false, Ordering::AcqRel));
+        assert!(reader.read(&mut [0; 1]).is_err());
+        // A sleeping poll thread is woken through the pipe.
+        shared.sleeping.store(true, Ordering::SeqCst);
         waker.clone().wake();
-        let mut bytes = [0; 2];
-        reader.read_exact(&mut bytes).unwrap();
-        assert!(requested.swap(false, Ordering::AcqRel));
-        assert!(!requested.load(Ordering::Acquire));
+        reader.read_exact(&mut [0; 1]).unwrap();
+        assert!(shared.pending.swap(false, Ordering::AcqRel));
+    }
+
+    #[test]
+    fn connection_wakes_queue_each_socket_once_until_cleared() {
+        let (writer, _reader) = UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        let waker = PollerWaker::new(writer);
+        let queued = AtomicBool::new(false);
+        waker.wake_conn(7, &queued);
+        waker.wake_conn(7, &queued);
+        assert_eq!(*waker.0.conns.lock().unwrap(), [7]);
+        assert!(waker.0.pending.load(Ordering::Acquire));
+        // The poll thread clears the flag before maintenance; a later change
+        // queues the connection again.
+        waker.0.conns.lock().unwrap().clear();
+        assert!(queued.swap(false, Ordering::AcqRel));
+        waker.wake_conn(7, &queued);
+        assert_eq!(*waker.0.conns.lock().unwrap(), [7]);
     }
 
     #[tokio::test]
@@ -1132,11 +1216,12 @@ mod tests {
         let (wake_tx, wake_rx) = UnixStream::pair().unwrap();
         wake_tx.set_nonblocking(true).unwrap();
         wake_rx.set_nonblocking(true).unwrap();
-        let maintenance_requested = Arc::new(AtomicBool::new(false));
+        let waker = PollerWaker::new(wake_tx);
+        let wake = waker.0.clone();
         let poller = DevicePoller {
             cq: cq.clone(),
             shared: shared.clone(),
-            waker: PollerWaker(Arc::new(wake_tx), maintenance_requested.clone()),
+            waker,
             thread: None,
             cq_capacity: cq.capacity(),
         };
@@ -1150,7 +1235,8 @@ mod tests {
             conns: HashMap::default(),
             dirty_qps: Vec::new(),
             drain: CqDrain::default(),
-            maintenance_requested,
+            wake,
+            woken_qps: Vec::new(),
             unack_cq_events: 0,
         };
         (poller, poll_loop)

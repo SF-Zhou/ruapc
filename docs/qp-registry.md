@@ -52,10 +52,18 @@ not wait for a periodic scan. List membership belongs to the poll thread and
 needs no shared atomic per CQE.
 
 Every 100 ms a full pass checks keepalives, READ deadlines and teardown that
-became ready without a CQE. Pending-send, activation and error wakeups also
-request a full scan because the wake pipe does not identify a connection.
-The shared wake hint is consumed before maintenance so a concurrent wake
-requests another pass.
+became ready without a CQE. Pending-send, activation and error wakeups queue
+their QPN once (a per-socket flag deduplicates them) and only those
+connections join the dirty list, so wake cost does not grow with the number
+of connections on the CQ. The poller clears a socket's flag before
+maintaining it, and consumes the shared wake hint before maintenance, so a
+concurrent wake requests another pass.
+
+Wakers write the wake pipe only while the poll thread announces that it is
+sleeping. The poll thread sets that flag and rechecks the wake hint before
+`poll(2)`; both sides use sequentially consistent operations, so either the
+sleep is skipped or the pipe is written. A busy poller costs senders no
+syscall.
 
 Only receive-buffer deficits remain dirty for timed recovery: retry every
 100 microseconds while busy and use a 1 ms idle wait. Window-blocked sends

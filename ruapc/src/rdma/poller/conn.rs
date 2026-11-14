@@ -95,6 +95,11 @@ pub(super) struct ConnState {
 impl ConnState {
     pub(super) fn new(reg: RegisterConn) -> Self {
         let registration = RegisteredConnection::new(reg.state, reg.socket.conn_id);
+        // Registration marks the connection dirty, covering any wake that was
+        // queued before the poll thread could route it.
+        reg.socket
+            .maintenance_queued
+            .swap(false, std::sync::atomic::Ordering::AcqRel);
         Self {
             dirty: false,
             qp_error_requested: false,

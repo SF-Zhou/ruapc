@@ -57,7 +57,9 @@ pub struct RdmaSocket {
     /// credits free up.
     pub(crate) pending_sender: Sender<Buffer>,
     /// Wakes the device poll thread (pending sends, error teardown).
-    pub(crate) poller_waker: PollerWaker,
+    poller_waker: PollerWaker,
+    /// Set while this connection is queued for poll-thread maintenance.
+    pub(crate) maintenance_queued: AtomicBool,
     /// Negotiated maximum serialized message size (= the peer's receive
     /// buffer size).
     pub(crate) max_msg_size: usize,
@@ -98,6 +100,7 @@ impl RdmaSocket {
             state: RdmaState::new(config.send_window.max(1)),
             pending_sender,
             poller_waker,
+            maintenance_queued: AtomicBool::new(false),
             max_msg_size: config.max_msg_size,
             max_large_msg_size: config.max_large_msg_size,
             path: config.path,
@@ -118,7 +121,14 @@ impl RdmaSocket {
 
     pub(crate) fn request_activation(&self) {
         self.activation_requested.store(true, Ordering::Release);
-        self.poller_waker.wake();
+        self.wake_poller();
+    }
+
+    /// Schedules poll-thread maintenance of this connection. Use after any
+    /// change that produces no completion: pending sends, activation, errors.
+    pub(crate) fn wake_poller(&self) {
+        self.poller_waker
+            .wake_conn(self.queue_pair.qp_num(), &self.maintenance_queued);
     }
 
     pub(crate) fn enable_probes(&self) {
@@ -160,7 +170,7 @@ impl RdmaSocket {
         // The poll thread moves the QP to ERR, serialized with receive
         // reposting. A receive posted after the provider's ERR flush can
         // otherwise remain outstanding indefinitely (notably on RXE).
-        self.poller_waker.wake();
+        self.wake_poller();
     }
 
     /// Reserves SEND bandwidth before advertising local read buffers to the
@@ -272,7 +282,7 @@ impl RdmaSocket {
                 slot.send(encoded.buffer);
                 // The poll thread may be sleeping; enqueueing a pending send
                 // produces no completion event, so wake it explicitly.
-                self.poller_waker.wake();
+                self.wake_poller();
                 Ok(())
             }
             SendPermit::Error => Err(ErrorKind::ConnectionClosed.into()),
