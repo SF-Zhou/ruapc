@@ -95,6 +95,11 @@ pub(super) struct ConnState {
 impl ConnState {
     pub(super) fn new(reg: RegisterConn) -> Self {
         let registration = RegisteredConnection::new(reg.state, reg.socket.conn_id);
+        // Registration marks the connection dirty, covering any wake that was
+        // queued before the poll thread could route it.
+        reg.socket
+            .maintenance_queued
+            .swap(false, std::sync::atomic::Ordering::AcqRel);
         Self {
             dirty: false,
             qp_error_requested: false,
@@ -475,8 +480,20 @@ impl ConnState {
                 continue;
             }
 
-            // Prefer one contiguous SGE. If the pool cannot allocate it,
-            // gather existing buffers to preserve aggregation's credit savings.
+            // Prefer one contiguous SGE. Frames usually sit in buffers with
+            // spare capacity, so append the run to the head frame in place.
+            if total <= self.pending_sends[0].capacity() {
+                let mut agg = self.pending_sends.pop_front().unwrap();
+                for _ in 1..count {
+                    let frame = self.pending_sends.pop_front().unwrap();
+                    agg.extend_from_slice(&frame)?;
+                }
+                tracing::trace!("aggregating {count} pending messages into one {total}B send");
+                self.post_data(agg, ack)?;
+                continue;
+            }
+            // Otherwise allocate one; if the pool cannot, gather existing
+            // buffers to preserve aggregation's credit savings.
             match self.socket.rdmabuf_pool.allocate(total) {
                 Ok(mut agg) => {
                     agg.set_len(0);

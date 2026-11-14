@@ -37,10 +37,12 @@ mod budget;
 mod conn;
 mod dispatch;
 mod flow;
+mod shards;
+mod wake;
 
 use std::{
     collections::{HashMap, hash_map::Entry},
-    io::{Read as _, Write as _},
+    io::Read as _,
     os::unix::io::AsRawFd as _,
     os::unix::net::UnixStream,
     sync::{
@@ -56,6 +58,9 @@ use ruapc_rdma::{CompChannel, Completion, CompletionBatch, CompletionQueue, poll
 use budget::{CqBudget, CqDrain, Demand};
 use conn::ConnState;
 use dispatch::{DispatchBatch, Dispatcher, MAX_DISPATCH_BATCH};
+pub use shards::DevicePollers;
+pub use wake::PollerWaker;
+use wake::WakeShared;
 
 use super::RdmaSocket;
 use crate::{Buffer, Error, ErrorKind, Result, State, task::TaskSupervisorGuard};
@@ -72,21 +77,6 @@ fn set_qp_error(socket: &RdmaSocket) {
     if let Err(err) = socket.queue_pair.modify(&mut attr, mask.0 as _) {
         tracing::warn!(conn_id = socket.conn_id, local_qp = socket.queue_pair.qp_num(), %err,
             "failed to move RDMA queue pair to ERR");
-    }
-}
-
-/// Wakes the poll thread out of its idle `poll(2)` sleep.
-#[derive(Clone, Debug)]
-pub struct PollerWaker(Arc<UnixStream>, Arc<AtomicBool>);
-
-impl PollerWaker {
-    /// Wakes the poll thread. Best-effort: if the pipe is full the thread is
-    /// already scheduled to wake up.
-    pub fn wake(&self) {
-        // Publish before the pipe write. The poll thread consumes this hint
-        // before maintenance, so a concurrent wake schedules another pass.
-        self.1.store(true, Ordering::Release);
-        let _ = (&*self.0).write(&[1u8]);
     }
 }
 
@@ -237,6 +227,8 @@ pub struct PollerConfig {
     /// Number of dispatch worker tasks shared by all shards of the pool
     /// (consulted once, when the first shard starts).
     pub dispatch_workers: u32,
+    /// Dispatch-worker queue spin before parking, in microseconds.
+    pub dispatch_spin_us: u64,
 }
 
 impl DevicePoller {
@@ -292,14 +284,14 @@ impl DevicePoller {
             has_incoming: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
         });
-        let maintenance_requested = Arc::new(AtomicBool::new(false));
+        let waker = PollerWaker::new(wake_tx);
         let handle = tokio::runtime::Handle::current();
 
         let thread = {
             let cq = cq.clone();
             let comp_channel = comp_channel.clone();
             let shared = shared.clone();
-            let maintenance_requested = maintenance_requested.clone();
+            let wake = waker.0.clone();
             std::thread::Builder::new()
                 .name(format!("ruapc-rdma-poll-{device_name}"))
                 .spawn(move || {
@@ -314,7 +306,8 @@ impl DevicePoller {
                         conns: HashMap::default(),
                         dirty_qps: Vec::new(),
                         drain: CqDrain::default(),
-                        maintenance_requested,
+                        wake,
+                        woken_qps: Vec::new(),
                         unack_cq_events: 0,
                     }
                     .run();
@@ -325,7 +318,7 @@ impl DevicePoller {
         Ok(Self {
             cq,
             shared,
-            waker: PollerWaker(Arc::new(wake_tx), maintenance_requested),
+            waker,
             thread: Some(thread),
             cq_capacity,
         })
@@ -443,9 +436,11 @@ struct PollLoop {
     dirty_qps: Vec<u32>,
     /// Undrained retirement snapshots survive scheduling yields.
     drain: CqDrain,
-    /// Existing pending/error/activation wakeups request a full scan because
-    /// those changes need not produce a CQE identifying the connection.
-    maintenance_requested: Arc<AtomicBool>,
+    /// Pending/error/activation changes produce no CQE identifying their
+    /// connection; wakers queue the QP number for targeted maintenance.
+    wake: Arc<WakeShared>,
+    /// Reused buffer swapped with `wake.conns` to keep both allocations.
+    woken_qps: Vec<u32>,
     unack_cq_events: u32,
 }
 
@@ -484,9 +479,15 @@ impl PollLoop {
         let mut next_housekeeping = Instant::now();
         let mut next_receive_retry = Instant::now();
         let mut last_dump = Instant::now();
+        // Notifications are armed once per idle transition. The drain after
+        // arming observes any completion that raced the arm; one arriving
+        // later signals the channel, so the following sleep cannot miss it.
+        let mut armed = false;
 
         loop {
             let progressed = self.drain_completions(&cq, &mut wcs, &mut batch)?;
+            // Dispatch before maintenance: parsing on the workers overlaps it.
+            self.dispatcher.flush(&mut batch);
 
             let now = Instant::now();
             if self.shared.shutdown.load(Ordering::Acquire) {
@@ -494,20 +495,21 @@ impl PollLoop {
             }
             // Consume before touching connections: wakeups racing maintenance
             // remain set for the next loop, even when their pipe bytes coalesce.
-            let requested = self.maintenance_requested.load(Ordering::Acquire)
-                && self.maintenance_requested.swap(false, Ordering::AcqRel);
+            let woken = self.wake.pending.load(Ordering::Acquire)
+                && self.wake.pending.swap(false, Ordering::AcqRel);
             let registered = self.drain_incoming(false);
+            if woken {
+                self.drain_woken_connections();
+            }
             let housekeeping = now >= next_housekeeping;
             let retry_receives = now >= next_receive_retry;
             if retry_receives {
                 next_receive_retry = now + Self::RECEIVE_RETRY_INTERVAL;
             }
-            if housekeeping || requested {
-                if housekeeping {
-                    next_housekeeping = now + Self::HOUSEKEEPING_INTERVAL;
-                }
-                self.maintain_connections(now, housekeeping, retry_receives);
-            } else if progressed || registered || retry_receives {
+            if housekeeping {
+                next_housekeeping = now + Self::HOUSEKEEPING_INTERVAL;
+                self.maintain_connections(now, true, retry_receives);
+            } else if progressed || registered || woken || retry_receives {
                 self.maintain_dirty_connections(now, retry_receives);
             }
             if tracing::enabled!(tracing::Level::DEBUG)
@@ -518,6 +520,7 @@ impl PollLoop {
             }
 
             if progressed {
+                armed = false;
                 spin_until = now + self.spin;
                 continue;
             }
@@ -525,18 +528,12 @@ impl PollLoop {
                 std::hint::spin_loop();
                 continue;
             }
-
-            // Arm notifications, then poll again before sleeping. A completion
-            // racing the arm must be observed here or signal the channel.
-            self.cq.req_notify(false)?;
-            if self.poll_completions(&cq, &mut wcs, &mut batch)? > 0 {
-                self.dispatcher.flush(&mut batch);
-                // These CQEs were polled outside the normal drain. Maintain
-                // their credits now, even if the next drain finds an empty CQ.
-                self.maintain_dirty_connections(Instant::now(), false);
-                spin_until = Instant::now() + self.spin;
+            if !armed {
+                self.cq.req_notify(false)?;
+                armed = true;
                 continue;
             }
+            armed = false;
             if self.wait_for_event()? {
                 spin_until = Instant::now() + self.spin;
             }
@@ -544,7 +541,7 @@ impl PollLoop {
     }
 
     /// Drain a bounded burst, then return to maintenance even under sustained
-    /// READ traffic. Both this drain and the arm/poll check route CQEs identically.
+    /// READ traffic. Received buffers stay batched for the caller to dispatch.
     fn drain_completions(
         &mut self,
         cq: &CompletionQueue,
@@ -563,7 +560,6 @@ impl PollLoop {
                 break;
             }
         }
-        self.dispatcher.flush(batch);
         Ok(progressed)
     }
 
@@ -601,6 +597,21 @@ impl PollLoop {
             conn.dirty = true;
             dirty_qps.push(conn.identity.qp_num());
         }
+    }
+
+    /// Marks connections queued by [`PollerWaker::wake_conn`] dirty. Clearing
+    /// each socket's flag precedes its maintenance, so later wakes requeue it.
+    /// Unknown QPs belong to unregistered or removed sockets; registration
+    /// clears the flag and marks the new connection dirty itself.
+    fn drain_woken_connections(&mut self) {
+        std::mem::swap(&mut self.woken_qps, &mut self.wake.conns.lock().unwrap());
+        for &qp_num in &self.woken_qps {
+            if let Some(conn) = self.conns.get_mut(&qp_num) {
+                conn.socket.maintenance_queued.swap(false, Ordering::AcqRel);
+                Self::mark_dirty(conn, &mut self.dirty_qps);
+            }
+        }
+        self.woken_qps.clear();
     }
 
     fn maintain_connections(&mut self, now: Instant, sweep_reads: bool, retry_receives: bool) {
@@ -665,7 +676,13 @@ impl PollLoop {
     /// Sleep until a CQ notification, explicit wake, or housekeeping timeout.
     /// Draining both sources before returning avoids a permanently readable fd.
     fn wait_for_event(&mut self) -> ruapc_rdma::Result<bool> {
-        let (cq_ready, wake_ready) = poll_readable2(
+        // Announce sleep, then recheck: see `WakeShared` for the handshake.
+        self.wake.sleeping.store(true, Ordering::SeqCst);
+        if self.wake.pending.load(Ordering::SeqCst) {
+            self.wake.sleeping.store(false, Ordering::Relaxed);
+            return Ok(true);
+        }
+        let polled = poll_readable2(
             self.comp_channel.fd().as_raw_fd(),
             self.wake_rx.as_raw_fd(),
             if self.dirty_qps.is_empty() {
@@ -675,7 +692,9 @@ impl PollLoop {
                 // without busy-spinning when the buffer pool remains full.
                 1
             },
-        )?;
+        );
+        self.wake.sleeping.store(false, Ordering::Relaxed);
+        let (cq_ready, wake_ready) = polled?;
         if cq_ready {
             while self.comp_channel.get_event().is_ok() {
                 self.unack_cq_events += 1;
@@ -790,149 +809,9 @@ impl PollLoop {
     }
 }
 
-/// Lazily-created CQ/poll-thread shards, keyed by device name. Connections
-/// reserve completion credits on the least utilized shard that can admit
-/// them, before QP creation or peer negotiation. All shards share one fixed
-/// dispatcher worker pool; the configured thread count bounds CPU usage.
-#[derive(Default)]
-pub struct DevicePollers(Mutex<PollersInner>);
-
-#[derive(Default)]
-struct PollersInner {
-    devices: std::collections::HashMap<String, DeviceShards, RandomState>,
-    dispatcher: Option<Dispatcher>,
-}
-
-#[derive(Default)]
-struct DeviceShards {
-    shards: Vec<Arc<DevicePoller>>,
-    next: usize,
-}
-
-impl DevicePollers {
-    /// Select and reserve as one setup operation. Creating each configured
-    /// shard lazily spreads even a small number of connections across cores.
-    pub(crate) fn reserve(
-        &self,
-        device: &super::RdmaDevice,
-        config: PollerConfig,
-        shard_count: u32,
-        connection: &super::RdmaConnectionConfig,
-    ) -> Result<(Arc<DevicePoller>, ConnReservation)> {
-        let name = device.info().name.clone();
-        let demand = Demand::connection(connection);
-        let mut inner = self.0.lock().unwrap();
-        let dispatcher = inner
-            .dispatcher
-            .get_or_insert_with(|| Dispatcher::start(config.dispatch_workers))
-            .clone();
-        let entry = inner.devices.entry(name.clone()).or_default();
-        if entry.shards.len() < shard_count as usize {
-            let index = entry.shards.len();
-            match DevicePoller::start(
-                device.context(),
-                &format!("{name}.{index}"),
-                config,
-                dispatcher,
-            ) {
-                Ok(poller) => {
-                    tracing::info!(
-                        device = name,
-                        shard = index,
-                        capacity = poller.cq_capacity,
-                        "started RDMA CQ shard"
-                    );
-                    entry.shards.push(Arc::new(poller));
-                }
-                Err(error) if !entry.shards.is_empty() => {
-                    // An optional new thread/CQ is not required if an existing
-                    // shard has room (e.g. provider CQ resources exhausted).
-                    return entry.reserve(demand).map_err(|admission| {
-                        Error::new(
-                            admission.kind,
-                            format!(
-                                "RDMA device {name}: {}; new shard failed: {error}",
-                                admission.msg
-                            ),
-                        )
-                    });
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        entry
-            .reserve(demand)
-            .map_err(|err| Error::new(err.kind, format!("RDMA device {name}: {}", err.msg)))
-    }
-
-    pub(crate) fn report(&self) -> Vec<super::path::RdmaCqLoad> {
-        let inner = self.0.lock().unwrap();
-        let mut result = Vec::new();
-        for (device, entry) in &inner.devices {
-            for (shard, poller) in entry.shards.iter().enumerate() {
-                let (reserved, connections) = poller.shared.budget.snapshot();
-                let registry = poller.cq.qp_registry_stats();
-                result.push(super::path::RdmaCqLoad {
-                    device: device.clone(),
-                    shard,
-                    capacity: poller.cq_capacity,
-                    reserved,
-                    connections,
-                    registered_qps: registry.active,
-                    next_sequence_floor: registry.next_sequence_floor,
-                    sequence_bits: ruapc_rdma::WRID::SEQUENCE_BITS,
-                });
-            }
-        }
-        result.sort_by(|a, b| (&a.device, a.shard).cmp(&(&b.device, b.shard)));
-        result
-    }
-}
-
-impl DeviceShards {
-    fn reserve(&mut self, demand: Demand) -> Result<(Arc<DevicePoller>, ConnReservation)> {
-        let count = self.shards.len();
-        let start = self.next % count;
-        self.next = self.next.wrapping_add(1);
-        let mut candidates: Vec<_> = (0..count).map(|offset| (start + offset) % count).collect();
-        // Stable sort rotates equally utilized shards. Recheck admission
-        // under each budget's mutex; a reclamation can race these snapshots.
-        let loads: Vec<_> = self
-            .shards
-            .iter()
-            .map(|p| p.shared.budget.snapshot().0)
-            .collect();
-        candidates.sort_by(|&a, &b| {
-            (u64::from(loads[a]) * u64::from(self.shards[b].cq_capacity))
-                .cmp(&(u64::from(loads[b]) * u64::from(self.shards[a].cq_capacity)))
-        });
-        let mut error = None;
-        for index in candidates {
-            let poller = &self.shards[index];
-            match poller.reserve(demand) {
-                Ok(reservation) => return Ok((poller.clone(), reservation)),
-                Err(err) => error = Some(err),
-            }
-        }
-        let error = error.expect("at least one configured CQ shard");
-        Err(Error::new(
-            error.kind,
-            format!(
-                "all {count} RDMA CQ shards unavailable: {}; raise rdma.polling.device_cq_len or poll_threads_per_device",
-                error.msg
-            ),
-        ))
-    }
-}
-
-impl std::fmt::Debug for DevicePollers {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DevicePollers").finish()
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::shards::DeviceShards;
     use super::*;
     use ruapc_memory::BufferSet;
 
@@ -961,12 +840,16 @@ mod tests {
             read_limit: 1,
             spin_us: 0,
             dispatch_workers: 1,
+            dispatch_spin_us: 0,
         };
         let poller = DevicePoller::start(
             device.context(),
             "cq-clamp-test",
             config,
-            Dispatcher::start(config.dispatch_workers),
+            Dispatcher::start(
+                config.dispatch_workers,
+                Duration::from_micros(config.dispatch_spin_us),
+            ),
         )
         .expect("CQ creation must succeed with a clamped length");
         let max_cqe = device.context().query_device().unwrap().max_cqe;
@@ -987,24 +870,6 @@ mod tests {
         assert_eq!(total.load(Ordering::Acquire), 0);
     }
 
-    #[test]
-    fn wake_during_maintenance_survives_draining_the_pipe() {
-        let (writer, mut reader) = UnixStream::pair().unwrap();
-        writer.set_nonblocking(true).unwrap();
-        reader.set_nonblocking(true).unwrap();
-        let requested = Arc::new(AtomicBool::new(false));
-        let waker = PollerWaker(Arc::new(writer), requested.clone());
-        waker.wake();
-        assert!(requested.swap(false, Ordering::AcqRel));
-        // The first maintenance pass is in progress when a different sender
-        // publishes work. Consuming both pipe bytes must preserve its new hint.
-        waker.clone().wake();
-        let mut bytes = [0; 2];
-        reader.read_exact(&mut bytes).unwrap();
-        assert!(requested.swap(false, Ordering::AcqRel));
-        assert!(!requested.load(Ordering::Acquire));
-    }
-
     #[tokio::test]
     async fn shard_admission_tries_other_queues_and_reclaims_failed_setup() {
         let device = open_rdma_device();
@@ -1013,8 +878,9 @@ mod tests {
             read_limit: 32,
             spin_us: 0,
             dispatch_workers: 1,
+            dispatch_spin_us: 0,
         };
-        let dispatcher = Dispatcher::start(1);
+        let dispatcher = Dispatcher::start(1, Duration::ZERO);
         let mut shards = DeviceShards::default();
         for index in 0..2 {
             shards.shards.push(Arc::new(
@@ -1090,6 +956,7 @@ mod tests {
             read_limit: 1,
             spin_us: 0,
             dispatch_workers: 1,
+            dispatch_spin_us: 0,
         };
         let connection = RdmaConnectionConfig {
             recv_queue_len: 2,
@@ -1132,11 +999,12 @@ mod tests {
         let (wake_tx, wake_rx) = UnixStream::pair().unwrap();
         wake_tx.set_nonblocking(true).unwrap();
         wake_rx.set_nonblocking(true).unwrap();
-        let maintenance_requested = Arc::new(AtomicBool::new(false));
+        let waker = PollerWaker::new(wake_tx);
+        let wake = waker.0.clone();
         let poller = DevicePoller {
             cq: cq.clone(),
             shared: shared.clone(),
-            waker: PollerWaker(Arc::new(wake_tx), maintenance_requested.clone()),
+            waker,
             thread: None,
             cq_capacity: cq.capacity(),
         };
@@ -1145,12 +1013,13 @@ mod tests {
             comp_channel: channel,
             wake_rx,
             shared,
-            dispatcher: Dispatcher::start(1),
+            dispatcher: Dispatcher::start(1, Duration::ZERO),
             spin: Duration::ZERO,
             conns: HashMap::default(),
             dirty_qps: Vec::new(),
             drain: CqDrain::default(),
-            maintenance_requested,
+            wake,
+            woken_qps: Vec::new(),
             unack_cq_events: 0,
         };
         (poller, poll_loop)

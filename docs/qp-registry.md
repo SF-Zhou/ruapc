@@ -52,10 +52,18 @@ not wait for a periodic scan. List membership belongs to the poll thread and
 needs no shared atomic per CQE.
 
 Every 100 ms a full pass checks keepalives, READ deadlines and teardown that
-became ready without a CQE. Pending-send, activation and error wakeups also
-request a full scan because the wake pipe does not identify a connection.
-The shared wake hint is consumed before maintenance so a concurrent wake
-requests another pass.
+became ready without a CQE. Pending-send, activation and error wakeups queue
+their QPN once (a per-socket flag deduplicates them) and only those
+connections join the dirty list, so wake cost does not grow with the number
+of connections on the CQ. The poller clears a socket's flag before
+maintaining it, and consumes the shared wake hint before maintenance, so a
+concurrent wake requests another pass.
+
+Wakers write the wake pipe only while the poll thread announces that it is
+sleeping. The poll thread sets that flag and rechecks the wake hint before
+`poll(2)`; both sides use sequentially consistent operations, so either the
+sleep is skipped or the pipe is written. A busy poller costs senders no
+syscall.
 
 Only receive-buffer deficits remain dirty for timed recovery: retry every
 100 microseconds while busy and use a 1 ms idle wait. Window-blocked sends
@@ -86,6 +94,15 @@ at that threshold, a one-shot Tokio task handles the batch. These are routing
 thresholds, not hard queue limits: concurrent pollers may observe the same
 backlog before enqueueing. A stopped worker causes its queued-send attempt
 to fail and the batch to be dropped.
+
+After a batch, a worker keeps checking its queue for `rdma.polling.dispatch_spin_us`
+(default 50 microseconds),
+yielding to the runtime between checks, before parking on the queue. Waking a
+parked worker from the poll thread costs a futex wake and thread wake-up
+latency in each direction of a round trip; a spinning worker registers no
+receiver waker, so the poller's enqueue wakes nothing. On a pinned 32-core
+mlx5 run this halves serial echo latency (about 25 to 14 microseconds) at a
+few percent of concurrent throughput. Zero disables this.
 
 Small received frame batches (up to 1 KiB total) are copied out so registered
 receive buffers can be reused promptly; larger batches retain the zero-copy path.
@@ -119,6 +136,7 @@ DMA memory; see
 ## Implementation and regression coverage
 
 [Poller routing](../ruapc/src/rdma/poller/mod.rs),
+[wakeups](../ruapc/src/rdma/poller/wake.rs),
 [per-connection maintenance](../ruapc/src/rdma/poller/conn.rs),
 [flow control](../ruapc/src/rdma/poller/flow.rs) and
 [dispatch](../ruapc/src/rdma/poller/dispatch.rs) own these paths.

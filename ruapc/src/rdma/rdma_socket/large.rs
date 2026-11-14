@@ -248,7 +248,7 @@ impl RdmaSocket {
             );
             slot.send(descriptor.buffer);
         }
-        self.poller_waker.wake();
+        self.wake_poller();
         // Acceptance is irrevocable. Supervise the ACK independently so an
         // already delivered response cannot keep its business handler alive.
         // Failure (including shutdown before the task starts) closes the
@@ -1016,6 +1016,7 @@ mod lifecycle_tests {
                         read_limit: 2,
                         spin_us: 0,
                         dispatch_workers: 1,
+                        dispatch_spin_us: 0,
                     },
                     1,
                     &connection,
