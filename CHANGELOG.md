@@ -37,6 +37,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   no longer zeroed before use.
 - The `ruapc` documentation on docs.rs now enables the `rdma` feature, so RDMA
   items appear in the published API reference.
+- RDMA dispatch workers keep checking their queue for the new
+  `rdma.polling.dispatch_spin_us` (default 50 µs, yielding to the runtime)
+  before parking, so the poll thread no longer wakes a sleeping runtime thread
+  per received batch. Serial RDMA echo latency on mlx5 drops from about 25 µs
+  to about 14 µs, at a few percent of concurrent throughput; zero restores
+  immediate parking.
+- RDMA wakers write the poll thread's wake pipe only while it sleeps, and
+  pending-send, activation and error wakeups maintain only their own
+  connection instead of scanning every connection on the CQ.
+- **BREAKING** (config): small RDMA SENDs are posted inline
+  (`rdma.connection.qp.max_inline_data`, default 256 bytes; zero disables).
+- RDMA connections expose `rdma.connection.ack_timeout` and `retry_count`
+  (defaults 18 and 6, the previous fixed values).
+- RDMA stripe acquisition waits for the short stripe lock instead of queueing
+  behind the peer's connect lock, records last use without a mutex, and
+  maintenance replenishes peers concurrently.
+- Window-blocked RDMA sends aggregate into the head frame's spare capacity and
+  refresh their timeout metadata without allocating or shifting the payload.
+
+### Fixed
+- A provider-rejected direct RDMA SEND consumed a non-refundable window credit
+  without closing the connection, so repeated failures could stall it forever;
+  the connection now fails like the poller's own posts.
+- RDMA bandwidth shaping tolerates at least 1 ms of burst. With the default
+  zero burst, overlapping transfers turned microseconds of debt into
+  full-millisecond Tokio sleeps.
+- RDMA connections that fail before any successful completion now blacklist
+  their NIC pair for 30 seconds, so reconnection avoids an unreachable pair.
 
 ## [0.2.0-alpha.8] - 2026-11-11
 
