@@ -149,6 +149,7 @@ impl RdmaSocketPool {
                 max_recv_wr: negotiated.max_recv_wr,
                 max_send_sge: local.qp.max_send_sge,
                 max_recv_sge: local.qp.max_recv_sge,
+                max_inline_data: local.qp.max_inline_data,
             },
             recv_queue_len: negotiated.recv_queue_len,
             max_msg_size: negotiated.max_msg_size,
@@ -185,6 +186,9 @@ impl RdmaSocketPool {
                     .qp
                     .max_recv_sge
                     .min(info.device_attr.max_sge as u32),
+                // Device attributes do not report an inline limit; the
+                // provider rejects QP creation if this request is too large.
+                max_inline_data: self.config.connection.qp.max_inline_data,
             },
             recv_queue_len: self
                 .config
@@ -213,7 +217,7 @@ impl RdmaSocketPool {
                 max_recv_wr: config.qp.max_recv_wr,
                 max_send_sge: config.qp.max_send_sge,
                 max_recv_sge: config.qp.max_recv_sge,
-                max_inline_data: 0,
+                max_inline_data: config.qp.max_inline_data,
             },
             ..Default::default()
         };

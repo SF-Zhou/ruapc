@@ -1226,6 +1226,7 @@ mod tests {
                 max_recv_wr: 4,
                 max_send_sge: 1,
                 max_recv_sge: 1,
+                max_inline_data: 0,
             },
         };
         let reservation = poller.reserve(Demand::connection(&connection)).unwrap();

@@ -1001,6 +1001,7 @@ mod lifecycle_tests {
                     max_recv_wr: 4,
                     max_send_sge: 1,
                     max_recv_sge: 1,
+                    max_inline_data: 0,
                 },
                 recv_queue_len: 2,
                 max_msg_size: INLINE_BYTES as u32,

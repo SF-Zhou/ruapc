@@ -139,6 +139,11 @@ pub struct QueuePair {
     /// Negotiated gather-list capability (`init_attr.cap.max_send_sge`
     /// after creation).
     max_send_sge: usize,
+    /// Provider-granted inline capacity (`init_attr.cap.max_inline_data`
+    /// after creation). SENDs whose total length fits are posted with
+    /// `IBV_SEND_INLINE`: the CPU copies the payload into the WQE, sparing
+    /// the NIC a PCIe read. Their buffers stay owned until completion anyway.
+    max_inline_data: u32,
     /// Position of this QP's registrar in the buffers' pool. This is not a pool
     /// identity or a protection-domain compatibility check.
     pub device_index: usize,
@@ -227,6 +232,7 @@ impl QueuePair {
             recv_wrs,
             read_state,
             max_send_sge: init_attr.cap.max_send_sge as usize,
+            max_inline_data: init_attr.cap.max_inline_data,
             send_signal_interval: 1,
             device_index,
         };
@@ -401,6 +407,7 @@ impl QueuePair {
                 .insert(id, buffers)
                 .map_err(|_| ErrorKind::WorkRequestSlotsExhausted)?;
         }
+        let flags = self.inline_flags(sges, flags);
         let mut wr = ibv_send_wr {
             wr_id,
             sg_list: if sges.is_empty() {
@@ -429,6 +436,23 @@ impl QueuePair {
             err
         })?;
         Ok(id)
+    }
+
+    /// Adds `IBV_SEND_INLINE` when the gathered payload fits the granted
+    /// inline capacity. Inline posting never changes buffer ownership.
+    #[inline]
+    fn inline_flags(&self, sges: &[ibv_sge], flags: ibv_send_flags) -> ibv_send_flags {
+        let len = sges.iter().map(|sge| u64::from(sge.length)).sum::<u64>();
+        if len != 0 && len <= u64::from(self.max_inline_data) {
+            flags | ibv_send_flags::IBV_SEND_INLINE
+        } else {
+            flags
+        }
+    }
+
+    /// Provider-granted inline capacity in bytes; zero disables inline SENDs.
+    pub fn max_inline_data(&self) -> u32 {
+        self.max_inline_data
     }
 
     /// Posts one RDMA READ from a contiguous remote region into the local

@@ -473,6 +473,11 @@ pub struct RdmaQueuePairConfig {
     pub max_recv_wr: u32,
     pub max_send_sge: u32,
     pub max_recv_sge: u32,
+    /// Requested inline SEND capacity in bytes. SENDs (including small
+    /// aggregates and gather lists) that fit the provider-granted capacity
+    /// are copied into the WQE, saving the NIC a DMA read of the payload.
+    /// Zero disables inline SENDs.
+    pub max_inline_data: u32,
 }
 
 impl Default for RdmaQueuePairConfig {
@@ -482,6 +487,7 @@ impl Default for RdmaQueuePairConfig {
             max_recv_wr: 64,
             max_send_sge: 16,
             max_recv_sge: 1,
+            max_inline_data: 256,
         }
     }
 }
