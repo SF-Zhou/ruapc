@@ -27,6 +27,18 @@ pub struct QpConnectionConfig {
     pub max_dest_rd_atomic: u8,
     /// RoCE GRH traffic class. Unused for native InfiniBand paths.
     pub traffic_class: u8,
+    /// Local ACK timeout exponent (0..=31): each transport retry waits
+    /// 4.096 us * 2^`ack_timeout`. Together with `retry_count` this bounds how
+    /// long an unreachable path takes to fail. Zero waits forever.
+    pub ack_timeout: u8,
+    /// Transport retries (0..=7) before a send fails with RETRY_EXC.
+    pub retry_count: u8,
+}
+
+impl QpConnectionConfig {
+    /// About 1.07 s per retry, tolerant of congested lossless fabrics.
+    pub const DEFAULT_ACK_TIMEOUT: u8 = 18;
+    pub const DEFAULT_RETRY_COUNT: u8 = 6;
 }
 
 impl QpConnectionConfig {
@@ -63,6 +75,18 @@ impl QpConnectionConfig {
                     "{name} must be nonzero for RDMA READ support"
                 )));
             }
+        }
+        if self.ack_timeout > 31 {
+            return Err(invalid(format!(
+                "ack_timeout must fit in 5 bits, got {}",
+                self.ack_timeout
+            )));
+        }
+        if self.retry_count > 7 {
+            return Err(invalid(format!(
+                "retry_count must fit in 3 bits, got {}",
+                self.retry_count
+            )));
         }
         match self.link_layer {
             LinkLayer::InfiniBand if self.remote_lid == 0 || self.remote_lid >= 0xC000 => {
@@ -152,8 +176,8 @@ impl QpConnectionConfig {
     pub(super) fn send_attributes(&self) -> (ibv_qp_attr, ibv_qp_attr_mask) {
         let attr = ibv_qp_attr {
             qp_state: ibv_qp_state::IBV_QPS_RTS,
-            timeout: 0x12,
-            retry_cnt: 6,
+            timeout: self.ack_timeout,
+            retry_cnt: self.retry_count,
             rnr_retry: 6,
             sq_psn: self.local_psn,
             max_rd_atomic: self.max_rd_atomic,
@@ -190,6 +214,8 @@ mod tests {
             max_rd_atomic: 8,
             max_dest_rd_atomic: 4,
             traffic_class: 104,
+            ack_timeout: QpConnectionConfig::DEFAULT_ACK_TIMEOUT,
+            retry_count: QpConnectionConfig::DEFAULT_RETRY_COUNT,
         }
     }
 
@@ -214,6 +240,20 @@ mod tests {
                 "remote_qp_num",
                 QpConnectionConfig {
                     remote_qp_num: 0x100_0000,
+                    ..config()
+                },
+            ),
+            (
+                "ack_timeout",
+                QpConnectionConfig {
+                    ack_timeout: 32,
+                    ..config()
+                },
+            ),
+            (
+                "retry_count",
+                QpConnectionConfig {
+                    retry_count: 8,
                     ..config()
                 },
             ),

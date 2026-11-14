@@ -280,8 +280,10 @@ to zero, and zero is omitted. Zero selects inline-only operation. Protocol
 version 3 uses shared message frames and the payload-transfer RPCs; earlier
 protocol versions are rejected. The local
 [`max_inflight_large_bytes` budget](rdma-capacity.md#large-payload-admission-and-cleanup)
-is not negotiated. SGE limits, P_Key index, selective signaling, and CQ settings
-also remain local; CQs are shared by device shards.
+is not negotiated. SGE limits, inline SEND capacity, P_Key index, selective
+signaling, transport ACK timeout and retry count, and CQ settings also remain
+local; CQs are shared by device shards. The default `ack_timeout` of 18 with
+`retry_count` 6 makes a SEND on an unreachable path fail after about 7.5 s.
 
 Lease IDs identify lifecycle operations, not authentication credentials.
 Bootstrap assumes a trusted control plane.
