@@ -100,7 +100,9 @@ impl Dispatcher {
         if batch.is_empty() {
             return;
         }
-        let batch = std::mem::take(batch);
+        // Keep the next drain from regrowing its batch from zero capacity.
+        let capacity = batch.len().next_power_of_two().min(MAX_DISPATCH_BATCH);
+        let batch = std::mem::replace(batch, Vec::with_capacity(capacity));
 
         // Stay with the home worker while it is not too far behind;
         // otherwise spill — for this batch only — to the next worker
