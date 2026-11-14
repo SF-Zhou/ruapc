@@ -527,9 +527,15 @@ impl PollLoop {
         let mut next_housekeeping = Instant::now();
         let mut next_receive_retry = Instant::now();
         let mut last_dump = Instant::now();
+        // Notifications are armed once per idle transition. The drain after
+        // arming observes any completion that raced the arm; one arriving
+        // later signals the channel, so the following sleep cannot miss it.
+        let mut armed = false;
 
         loop {
             let progressed = self.drain_completions(&cq, &mut wcs, &mut batch)?;
+            // Dispatch before maintenance: parsing on the workers overlaps it.
+            self.dispatcher.flush(&mut batch);
 
             let now = Instant::now();
             if self.shared.shutdown.load(Ordering::Acquire) {
@@ -562,6 +568,7 @@ impl PollLoop {
             }
 
             if progressed {
+                armed = false;
                 spin_until = now + self.spin;
                 continue;
             }
@@ -569,18 +576,12 @@ impl PollLoop {
                 std::hint::spin_loop();
                 continue;
             }
-
-            // Arm notifications, then poll again before sleeping. A completion
-            // racing the arm must be observed here or signal the channel.
-            self.cq.req_notify(false)?;
-            if self.poll_completions(&cq, &mut wcs, &mut batch)? > 0 {
-                self.dispatcher.flush(&mut batch);
-                // These CQEs were polled outside the normal drain. Maintain
-                // their credits now, even if the next drain finds an empty CQ.
-                self.maintain_dirty_connections(Instant::now(), false);
-                spin_until = Instant::now() + self.spin;
+            if !armed {
+                self.cq.req_notify(false)?;
+                armed = true;
                 continue;
             }
+            armed = false;
             if self.wait_for_event()? {
                 spin_until = Instant::now() + self.spin;
             }
@@ -588,7 +589,7 @@ impl PollLoop {
     }
 
     /// Drain a bounded burst, then return to maintenance even under sustained
-    /// READ traffic. Both this drain and the arm/poll check route CQEs identically.
+    /// READ traffic. Received buffers stay batched for the caller to dispatch.
     fn drain_completions(
         &mut self,
         cq: &CompletionQueue,
@@ -607,7 +608,6 @@ impl PollLoop {
                 break;
             }
         }
-        self.dispatcher.flush(batch);
         Ok(progressed)
     }
 
