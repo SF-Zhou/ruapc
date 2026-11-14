@@ -133,6 +133,7 @@ DMA memory; see
 ## Implementation and regression coverage
 
 [Poller routing](../ruapc/src/rdma/poller/mod.rs),
+[wakeups](../ruapc/src/rdma/poller/wake.rs),
 [per-connection maintenance](../ruapc/src/rdma/poller/conn.rs),
 [flow control](../ruapc/src/rdma/poller/flow.rs) and
 [dispatch](../ruapc/src/rdma/poller/dispatch.rs) own these paths.

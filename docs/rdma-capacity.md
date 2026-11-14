@@ -233,7 +233,8 @@ not match established paths.
 
 The implementation and adjacent tests are in
 [poller/budget.rs](../ruapc/src/rdma/poller/budget.rs),
-[poller routing and shard selection](../ruapc/src/rdma/poller/mod.rs),
+[poller routing](../ruapc/src/rdma/poller/mod.rs),
+[shard selection](../ruapc/src/rdma/poller/shards.rs),
 [READ execution](../ruapc/src/rdma/rdma_socket/read.rs) and
 [READ admission and credits](../ruapc/src/rdma/rdma_socket/read/credits.rs), with
 [deadline tracking](../ruapc/src/rdma/rdma_socket/read/pending.rs) in the core.

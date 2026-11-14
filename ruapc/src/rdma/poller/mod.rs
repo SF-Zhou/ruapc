@@ -37,10 +37,12 @@ mod budget;
 mod conn;
 mod dispatch;
 mod flow;
+mod shards;
+mod wake;
 
 use std::{
     collections::{HashMap, hash_map::Entry},
-    io::{Read as _, Write as _},
+    io::Read as _,
     os::unix::io::AsRawFd as _,
     os::unix::net::UnixStream,
     sync::{
@@ -56,6 +58,9 @@ use ruapc_rdma::{CompChannel, Completion, CompletionBatch, CompletionQueue, poll
 use budget::{CqBudget, CqDrain, Demand};
 use conn::ConnState;
 use dispatch::{DispatchBatch, Dispatcher, MAX_DISPATCH_BATCH};
+pub use shards::DevicePollers;
+pub use wake::PollerWaker;
+use wake::WakeShared;
 
 use super::RdmaSocket;
 use crate::{Buffer, Error, ErrorKind, Result, State, task::TaskSupervisorGuard};
@@ -72,60 +77,6 @@ fn set_qp_error(socket: &RdmaSocket) {
     if let Err(err) = socket.queue_pair.modify(&mut attr, mask.0 as _) {
         tracing::warn!(conn_id = socket.conn_id, local_qp = socket.queue_pair.qp_num(), %err,
             "failed to move RDMA queue pair to ERR");
-    }
-}
-
-/// Wake protocol shared by the poll thread and every waker.
-///
-/// Wakers publish `pending` and only write the pipe when the poll thread has
-/// announced `sleeping`; the poll thread announces sleep and then rechecks
-/// `pending`. Both sides use `SeqCst` (a Dekker handshake), so at least one
-/// observes the other: either the poll thread skips `poll(2)`, or the waker
-/// writes the pipe. A busy poll thread therefore costs wakers no syscall.
-#[derive(Debug)]
-struct WakeShared {
-    pipe: UnixStream,
-    /// Set by every wake; consumed at the top of each poll-loop iteration.
-    pending: AtomicBool,
-    /// Set by the poll thread around its `poll(2)` sleep.
-    sleeping: AtomicBool,
-    /// Connections requesting maintenance. Each socket appears at most once
-    /// until the poll thread clears its `maintenance_queued` flag.
-    conns: Mutex<Vec<u32>>,
-}
-
-/// Wakes the poll thread, optionally scheduling one connection's maintenance.
-#[derive(Clone, Debug)]
-pub struct PollerWaker(Arc<WakeShared>);
-
-impl PollerWaker {
-    fn new(pipe: UnixStream) -> Self {
-        Self(Arc::new(WakeShared {
-            pipe,
-            pending: AtomicBool::new(false),
-            sleeping: AtomicBool::new(false),
-            conns: Mutex::new(Vec::new()),
-        }))
-    }
-
-    /// Breaks an idle sleep so the poll thread observes inbox, budget or
-    /// shutdown changes. Best-effort pipe write: a full pipe already wakes it.
-    pub fn wake(&self) {
-        self.0.pending.store(true, Ordering::SeqCst);
-        if self.0.sleeping.load(Ordering::SeqCst) {
-            let _ = (&self.0.pipe).write(&[1u8]);
-        }
-    }
-
-    /// Schedules maintenance of the connection on `qp_num` (pending sends,
-    /// activation, error teardown), then wakes the poll thread. `queued` is
-    /// the socket's flag; the poll thread clears it before maintenance, so a
-    /// change published before this call is observed by that maintenance.
-    pub(crate) fn wake_conn(&self, qp_num: u32, queued: &AtomicBool) {
-        if !queued.swap(true, Ordering::AcqRel) {
-            self.0.conns.lock().unwrap().push(qp_num);
-        }
-        self.wake();
     }
 }
 
@@ -857,154 +808,9 @@ impl PollLoop {
     }
 }
 
-/// Lazily-created CQ/poll-thread shards, keyed by device name. Connections
-/// reserve completion credits on the least utilized shard that can admit
-/// them, before QP creation or peer negotiation. All shards share one fixed
-/// dispatcher worker pool; the configured thread count bounds CPU usage.
-#[derive(Default)]
-pub struct DevicePollers(Mutex<PollersInner>);
-
-#[derive(Default)]
-struct PollersInner {
-    devices: std::collections::HashMap<String, DeviceShards, RandomState>,
-    dispatcher: Option<Dispatcher>,
-}
-
-#[derive(Default)]
-struct DeviceShards {
-    shards: Vec<Arc<DevicePoller>>,
-    next: usize,
-}
-
-impl DevicePollers {
-    /// Select and reserve as one setup operation. Creating each configured
-    /// shard lazily spreads even a small number of connections across cores.
-    pub(crate) fn reserve(
-        &self,
-        device: &super::RdmaDevice,
-        config: PollerConfig,
-        shard_count: u32,
-        connection: &super::RdmaConnectionConfig,
-    ) -> Result<(Arc<DevicePoller>, ConnReservation)> {
-        let name = device.info().name.clone();
-        let demand = Demand::connection(connection);
-        let mut inner = self.0.lock().unwrap();
-        let dispatcher = inner
-            .dispatcher
-            .get_or_insert_with(|| {
-                Dispatcher::start(
-                    config.dispatch_workers,
-                    Duration::from_micros(config.spin_us),
-                )
-            })
-            .clone();
-        let entry = inner.devices.entry(name.clone()).or_default();
-        if entry.shards.len() < shard_count as usize {
-            let index = entry.shards.len();
-            match DevicePoller::start(
-                device.context(),
-                &format!("{name}.{index}"),
-                config,
-                dispatcher,
-            ) {
-                Ok(poller) => {
-                    tracing::info!(
-                        device = name,
-                        shard = index,
-                        capacity = poller.cq_capacity,
-                        "started RDMA CQ shard"
-                    );
-                    entry.shards.push(Arc::new(poller));
-                }
-                Err(error) if !entry.shards.is_empty() => {
-                    // An optional new thread/CQ is not required if an existing
-                    // shard has room (e.g. provider CQ resources exhausted).
-                    return entry.reserve(demand).map_err(|admission| {
-                        Error::new(
-                            admission.kind,
-                            format!(
-                                "RDMA device {name}: {}; new shard failed: {error}",
-                                admission.msg
-                            ),
-                        )
-                    });
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        entry
-            .reserve(demand)
-            .map_err(|err| Error::new(err.kind, format!("RDMA device {name}: {}", err.msg)))
-    }
-
-    pub(crate) fn report(&self) -> Vec<super::path::RdmaCqLoad> {
-        let inner = self.0.lock().unwrap();
-        let mut result = Vec::new();
-        for (device, entry) in &inner.devices {
-            for (shard, poller) in entry.shards.iter().enumerate() {
-                let (reserved, connections) = poller.shared.budget.snapshot();
-                let registry = poller.cq.qp_registry_stats();
-                result.push(super::path::RdmaCqLoad {
-                    device: device.clone(),
-                    shard,
-                    capacity: poller.cq_capacity,
-                    reserved,
-                    connections,
-                    registered_qps: registry.active,
-                    next_sequence_floor: registry.next_sequence_floor,
-                    sequence_bits: ruapc_rdma::WRID::SEQUENCE_BITS,
-                });
-            }
-        }
-        result.sort_by(|a, b| (&a.device, a.shard).cmp(&(&b.device, b.shard)));
-        result
-    }
-}
-
-impl DeviceShards {
-    fn reserve(&mut self, demand: Demand) -> Result<(Arc<DevicePoller>, ConnReservation)> {
-        let count = self.shards.len();
-        let start = self.next % count;
-        self.next = self.next.wrapping_add(1);
-        let mut candidates: Vec<_> = (0..count).map(|offset| (start + offset) % count).collect();
-        // Stable sort rotates equally utilized shards. Recheck admission
-        // under each budget's mutex; a reclamation can race these snapshots.
-        let loads: Vec<_> = self
-            .shards
-            .iter()
-            .map(|p| p.shared.budget.snapshot().0)
-            .collect();
-        candidates.sort_by(|&a, &b| {
-            (u64::from(loads[a]) * u64::from(self.shards[b].cq_capacity))
-                .cmp(&(u64::from(loads[b]) * u64::from(self.shards[a].cq_capacity)))
-        });
-        let mut error = None;
-        for index in candidates {
-            let poller = &self.shards[index];
-            match poller.reserve(demand) {
-                Ok(reservation) => return Ok((poller.clone(), reservation)),
-                Err(err) => error = Some(err),
-            }
-        }
-        let error = error.expect("at least one configured CQ shard");
-        Err(Error::new(
-            error.kind,
-            format!(
-                "all {count} RDMA CQ shards unavailable: {}; raise rdma.polling.device_cq_len or poll_threads_per_device",
-                error.msg
-            ),
-        ))
-    }
-}
-
-impl std::fmt::Debug for DevicePollers {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DevicePollers").finish()
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::shards::DeviceShards;
     use super::*;
     use ruapc_memory::BufferSet;
 
@@ -1060,42 +866,6 @@ mod tests {
         assert_eq!(total.load(Ordering::Acquire), 32);
         drop(b);
         assert_eq!(total.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    fn wakes_write_the_pipe_only_while_the_poll_thread_sleeps() {
-        let (writer, mut reader) = UnixStream::pair().unwrap();
-        writer.set_nonblocking(true).unwrap();
-        reader.set_nonblocking(true).unwrap();
-        let waker = PollerWaker::new(writer);
-        let shared = &waker.0;
-        // A busy poll thread only needs the hint: no pipe byte is written.
-        waker.wake();
-        assert!(shared.pending.swap(false, Ordering::AcqRel));
-        assert!(reader.read(&mut [0; 1]).is_err());
-        // A sleeping poll thread is woken through the pipe.
-        shared.sleeping.store(true, Ordering::SeqCst);
-        waker.clone().wake();
-        reader.read_exact(&mut [0; 1]).unwrap();
-        assert!(shared.pending.swap(false, Ordering::AcqRel));
-    }
-
-    #[test]
-    fn connection_wakes_queue_each_socket_once_until_cleared() {
-        let (writer, _reader) = UnixStream::pair().unwrap();
-        writer.set_nonblocking(true).unwrap();
-        let waker = PollerWaker::new(writer);
-        let queued = AtomicBool::new(false);
-        waker.wake_conn(7, &queued);
-        waker.wake_conn(7, &queued);
-        assert_eq!(*waker.0.conns.lock().unwrap(), [7]);
-        assert!(waker.0.pending.load(Ordering::Acquire));
-        // The poll thread clears the flag before maintenance; a later change
-        // queues the connection again.
-        waker.0.conns.lock().unwrap().clear();
-        assert!(queued.swap(false, Ordering::AcqRel));
-        waker.wake_conn(7, &queued);
-        assert_eq!(*waker.0.conns.lock().unwrap(), [7]);
     }
 
     #[tokio::test]
