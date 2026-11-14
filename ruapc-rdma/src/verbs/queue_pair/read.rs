@@ -377,14 +377,11 @@ impl Drop for ReadPosting {
     }
 }
 
-/// READ batch state.
-///
-/// Field order is part of the design: `repr(C)` puts `accepted` exactly one
-/// cache line after `remaining`. Posting never invalidates the counter updated
-/// by every completion. The result mutex and rarely written fields fill that
-/// first line; see `posting_accounting_stays_off_the_completion_line`.
+/// READ batch state, shared through an `Arc` by the posting cursor and one
+/// ledger entry per accepted WR. Posting and completion both touch the `Arc`
+/// header's reference count, so no field layout keeps them on separate
+/// cache lines; the counters are simply plain atomics.
 #[derive(Debug)]
-#[repr(C)]
 pub(super) struct ReadBatch {
     /// WRs not yet settled by completion or unposted cancellation.
     remaining: AtomicUsize,
@@ -476,9 +473,6 @@ impl ReadBatch {
     }
 
     /// Records that the provider accepted `accepted` WRs of this plan.
-    ///
-    /// The field sits one cache line after `remaining`, so this store does not
-    /// invalidate the line a completion updates.
     #[inline]
     fn mark_accepted(&self, accepted: usize) {
         self.accepted.store(accepted, Ordering::Release);
@@ -1173,21 +1167,6 @@ mod tests {
             Pin::new(&mut rx).poll(&mut cx),
             Poll::Ready(Err(ReadFailure::Cancelled))
         ));
-    }
-
-    /// The posting cursor's per-WR store must never land on the line a
-    /// completion updates. Any nonzero multiple of the line size guarantees
-    /// that for every allocation address; the field order is chosen so the
-    /// gap costs no extra allocation space.
-    #[test]
-    #[cfg(target_pointer_width = "64")]
-    fn posting_accounting_stays_off_the_completion_line() {
-        let gap =
-            std::mem::offset_of!(ReadBatch, accepted) - std::mem::offset_of!(ReadBatch, remaining);
-        assert_eq!(
-            gap, 64,
-            "`accepted` must be one cache line after `remaining`; keep the repr(C) field order"
-        );
     }
 
     #[test]

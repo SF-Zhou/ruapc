@@ -149,6 +149,7 @@ impl Buffer {
     ///
     /// Initially set to the full capacity. Use `set_len` to adjust.
     #[must_use]
+    #[inline]
     pub const fn len(&self) -> usize {
         self.len
     }
@@ -157,6 +158,7 @@ impl Buffer {
     /// allocation size class): 16 KiB, 64 KiB, 256 KiB, 1 MiB, 4 MiB, 16 MiB or
     /// 64 MiB. Returns 0 for empty buffers created by [`empty`](Self::empty).
     #[must_use]
+    #[inline]
     pub const fn capacity(&self) -> usize {
         if self.level == Self::EMPTY_LEVEL {
             return 0;
@@ -182,6 +184,7 @@ impl Buffer {
     /// Panics if `len` exceeds the buffer's capacity (empty buffers
     /// created by [`empty`](Self::empty) have capacity 0, so only
     /// `set_len(0)` is valid).
+    #[inline]
     pub fn set_len(&mut self, len: usize) {
         assert!(
             len <= self.capacity(),
@@ -196,18 +199,11 @@ impl Buffer {
     /// # Errors
     ///
     /// Returns an error if the new length would exceed the capacity.
+    #[inline]
     pub fn extend_from_slice(&mut self, data: &[u8]) -> Result<()> {
         let new_len = self.len + data.len();
         if new_len > self.capacity() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "extend_from_slice: offset {} + length {} > capacity {}",
-                    self.len,
-                    data.len(),
-                    self.capacity()
-                ),
-            ));
+            return Err(self.overflow_error(data.len()));
         }
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -220,8 +216,23 @@ impl Buffer {
         Ok(())
     }
 
+    // Out of line so serializers can inline the append fast path.
+    #[cold]
+    #[inline(never)]
+    fn overflow_error(&self, appended: usize) -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "extend_from_slice: offset {} + length {appended} > capacity {}",
+                self.len,
+                self.capacity()
+            ),
+        )
+    }
+
     /// Returns a raw pointer to the buffer's memory.
     #[must_use]
+    #[inline]
     pub const fn as_ptr(&self) -> *const u8 {
         self.ptr.as_ptr()
     }
@@ -234,6 +245,7 @@ impl Buffer {
 
     /// Returns the buffer as a byte slice (up to the logical length).
     #[must_use]
+    #[inline]
     pub const fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
