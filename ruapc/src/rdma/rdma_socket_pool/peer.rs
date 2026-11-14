@@ -164,7 +164,27 @@ impl PeerState {
         socket.set_error();
         stripes.active.remove(index);
         stripes.reconnect_requested = true;
+        drop(stripes);
+        self.blacklist_if_unverified(socket);
         true
+    }
+
+    /// Temporarily penalizes a NIC pair towards this peer.
+    pub(super) fn blacklist(&self, path: &super::RdmaPathInfo) {
+        self.meta.lock().unwrap().blacklist.insert(
+            super::RdmaSocketPool::path_key(path),
+            Instant::now() + super::RdmaSocketPool::PATH_BLACKLIST_TTL,
+        );
+    }
+
+    /// A connection that failed before any successful completion most likely
+    /// ran on an unreachable pair; avoid reconnecting it there right away.
+    fn blacklist_if_unverified(&self, socket: &RdmaSocket) {
+        if !socket.is_path_verified() {
+            tracing::warn!(conn_id = socket.conn_id, path = ?socket.path,
+                "RDMA connection failed before any successful completion; avoiding its NIC pair");
+            self.blacklist(&socket.path);
+        }
     }
 
     /// Remember failed active connections before pruning them, including
@@ -172,9 +192,13 @@ impl PeerState {
     pub(super) fn prune_dead(&self, request_reconnect: bool) {
         let mut stripes = self.stripes.write().unwrap();
         let mut removed_active = false;
+        let mut unverified = Vec::new();
         stripes.active.retain(|stripe| {
             let healthy = stripe.socket.state.is_ok();
             removed_active |= !healthy;
+            if !healthy && !stripe.socket.is_path_verified() {
+                unverified.push(stripe.socket.clone());
+            }
             healthy
         });
         // Use the retain decision itself: the poller can fail a socket at
@@ -183,6 +207,10 @@ impl PeerState {
         stripes
             .draining
             .retain(|stripe| stripe.socket.state.is_ok());
+        drop(stripes);
+        for socket in unverified {
+            self.blacklist_if_unverified(&socket);
+        }
     }
 
     pub(super) fn needs_reconnect(&self) -> bool {

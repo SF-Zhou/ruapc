@@ -716,6 +716,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_connections_failing_before_any_completion_blacklist_their_path() {
+        let fixture = Fixture::new(60_000, 0, 500).await;
+        let pool = fixture.context.state.socket_pool.rdma_pool().unwrap();
+        let peer = pool.peers.iter().next().unwrap().value().clone();
+        let _connecting = peer.connect.lock().await;
+        let stripes = peer.active_snapshot();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !stripes
+                .iter()
+                .all(|stripe| stripe.socket.is_path_verified())
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("activation completes on every published stripe");
+        // A verified path failing later is not evidence against the NIC pair.
+        stripes[0].socket.set_error();
+        peer.prune_dead(true);
+        assert!(peer.meta.lock().unwrap().blacklist.is_empty());
+        stripes[1].socket.reset_path_verified();
+        stripes[1].socket.set_error();
+        peer.prune_dead(true);
+        {
+            let blacklist = &peer.meta.lock().unwrap().blacklist;
+            assert_eq!(blacklist.len(), 1);
+            let key = super::super::RdmaSocketPool::path_key(&stripes[1].socket.path);
+            assert!(blacklist.contains_key(&key));
+        }
+        drop(_connecting);
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn maintenance_retains_an_idle_empty_peer_until_probe_reconnects_it() {
         let fixture = Fixture::new(60_000, 0, 500).await;
         let pool = fixture.context.state.socket_pool.rdma_pool().unwrap();

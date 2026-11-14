@@ -156,7 +156,7 @@ impl RdmaSocketPool {
     }
 
     /// How long a NIC pair stays penalized after its QP setup failed.
-    const PATH_BLACKLIST_TTL: Duration = Duration::from_secs(30);
+    pub(super) const PATH_BLACKLIST_TTL: Duration = Duration::from_secs(30);
 
     /// Creates a new pool using the shared devices and buffer pool.
     pub fn new(
@@ -310,13 +310,10 @@ impl RdmaSocketPool {
 
     /// Penalizes a NIC pair towards this peer after its QP setup failed.
     fn blacklist_path(&self, peer: &PeerState, path: &RdmaPathInfo) {
-        peer.meta.lock().unwrap().blacklist.insert(
-            Self::path_key(path),
-            Instant::now() + Self::PATH_BLACKLIST_TTL,
-        );
+        peer.blacklist(path);
     }
 
-    fn path_key(path: &RdmaPathInfo) -> PathKey {
+    pub(super) fn path_key(path: &RdmaPathInfo) -> PathKey {
         (
             path.local.device.clone(),
             path.local.port_num,
