@@ -158,6 +158,13 @@ impl IdentityLease {
         lock_send_sequence(&self.send_next)
     }
 
+    /// Reserves `count` consecutive SQ sequences for one posted WR chain and
+    /// serializes posting until the guard is dropped. `sequence()` is the first.
+    #[inline]
+    pub(crate) fn lock_send_many(&self, count: u64) -> Result<SendSequenceGuard<'_>> {
+        lock_send_sequences(&self.send_next, count)
+    }
+
     #[inline]
     pub(crate) fn alloc_recv(&self) -> Result<u64> {
         allocate_sequence(&self.recv_next)
@@ -172,6 +179,21 @@ fn lock_send_sequence(next: &Mutex<u64>) -> Result<SendSequenceGuard<'_>> {
     }
     let sequence = *next;
     *next += 1;
+    Ok(SendSequenceGuard {
+        _next: next,
+        sequence,
+    })
+}
+
+#[inline]
+fn lock_send_sequences(next: &Mutex<u64>, count: u64) -> Result<SendSequenceGuard<'_>> {
+    let mut next = next.lock().unwrap();
+    let last = next
+        .checked_add(count.max(1) - 1)
+        .filter(|last| *last <= WRID::MAX_SEQUENCE)
+        .ok_or(ErrorKind::WorkRequestIdsExhausted)?;
+    let sequence = *next;
+    *next = last + 1;
     Ok(SendSequenceGuard {
         _next: next,
         sequence,
@@ -440,6 +462,34 @@ mod tests {
         let invalid = Mutex::new(u64::MAX);
         assert!(lock_send_sequence(&invalid).is_err());
         assert_eq!(*invalid.lock().unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn send_many_reserves_a_contiguous_block_and_never_wraps() {
+        let next = Mutex::new(WRID::MAX_SEQUENCE - 5);
+        let guard = lock_send_sequences(&next, 3).unwrap();
+        assert_eq!(guard.sequence(), WRID::MAX_SEQUENCE - 5);
+        drop(guard);
+        assert_eq!(*next.lock().unwrap(), WRID::MAX_SEQUENCE - 2);
+
+        // A block crossing the final sequence is rejected whole and consumes
+        // nothing, so a shorter chain still fits.
+        let error = lock_send_sequences(&next, 5).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::WorkRequestIdsExhausted);
+        assert_eq!(*next.lock().unwrap(), WRID::MAX_SEQUENCE - 2);
+        let guard = lock_send_sequences(&next, 3).unwrap();
+        assert_eq!(guard.sequence(), WRID::MAX_SEQUENCE - 2);
+        drop(guard);
+        assert_eq!(*next.lock().unwrap(), WRID::MAX_SEQUENCE + 1);
+
+        // Once exhausted, even a single sequence is rejected without wrapping.
+        for _ in 0..3 {
+            assert_eq!(
+                lock_send_sequences(&next, 1).unwrap_err().kind,
+                ErrorKind::WorkRequestIdsExhausted
+            );
+            assert_eq!(*next.lock().unwrap(), WRID::MAX_SEQUENCE + 1);
+        }
     }
 
     #[test]

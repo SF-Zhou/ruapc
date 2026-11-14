@@ -4,9 +4,7 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use ruapc::rdma::{RdmaConnDirection, RdmaPathReport};
-use ruapc::{
-    Client, Context, Endpoint, ErrorKind, ListenMode, Listener, Server, SocketPoolConfig, Transport,
-};
+use ruapc::{Client, Context, Endpoint, ListenMode, Listener, Server, SocketPoolConfig, Transport};
 
 #[ruapc::service]
 trait BootstrapProbe {
@@ -51,8 +49,8 @@ fn config() -> SocketPoolConfig {
     rdma.polling.poll_threads_per_device = 1;
     rdma.polling.dispatch_workers = 1;
     // Disable periodic replenishment so it cannot hide a lost stripe. The
-    // single NIC is already covered by the two initial stripes, so first-use
-    // preconnect has no additional coverage to create.
+    // first acquisition still establishes one stripe synchronously; the
+    // second one comes from the first-use background preconnection.
     rdma.maintenance.interval_ms = 0;
     config
 }
@@ -79,6 +77,29 @@ fn healthy_qps(report: &RdmaPathReport, direction: RdmaConnDirection) -> BTreeSe
         .filter(|path| path.direction == direction && path.healthy)
         .map(|path| path.qp_num)
         .collect()
+}
+
+/// The first call publishes one stripe; background reconciliation adds the
+/// rest. Waits until both ends report `count` healthy connections.
+async fn wait_for_stripes(client: &Context, server: &Server, count: usize) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let outbound = healthy_qps(
+                &client.state.rdma_path_report().await.unwrap(),
+                RdmaConnDirection::Outbound,
+            );
+            let inbound = healthy_qps(
+                &server.state().rdma_path_report().await.unwrap(),
+                RdmaConnDirection::Inbound,
+            );
+            if outbound.len() == count && inbound.len() == count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("configured stripes connect in the background");
 }
 
 /// Equivalent group spellings reuse one stripe set. Losing every bootstrap
@@ -119,6 +140,7 @@ async fn bootstrap_group_reuses_stripes_after_listeners_stop() {
         tokio::join!(client.ping(&context, &1), client.ping(&reordered, &2),);
     assert_eq!(first_reply.unwrap(), 1);
     assert_eq!(second_reply.unwrap(), 2);
+    wait_for_stripes(&context, &server, 2).await;
     let report = context.state.rdma_path_report().await.unwrap();
     let qps = healthy_qps(&report, RdmaConnDirection::Outbound);
     assert_eq!(qps.len(), 2);
@@ -148,11 +170,12 @@ async fn bootstrap_group_reuses_stripes_after_listeners_stop() {
     stop_server(&server).await;
 }
 
-/// The first stripe is already confirmed when the second stripe fails local
-/// registration. Both the first committed lease and the second prepared lease
-/// must be rolled back, without waiting for either accept lease to expire.
+/// The first call returns on one published stripe. The background attempt for
+/// the second stripe fails while reserving completion capacity, before the peer
+/// prepare RPC creates a lease. The published stripe must stay healthy and no
+/// half-prepared connection may leak.
 #[tokio::test]
-async fn initial_stripe_failure_rolls_back_all_unpublished_connections() {
+async fn background_stripe_failure_keeps_the_published_stripe_healthy() {
     let server_config = config();
     let (server, address) = start_server(&server_config).await;
     let mut client_config = server_config.clone();
@@ -160,54 +183,56 @@ async fn initial_stripe_failure_rolls_back_all_unpublished_connections() {
     // One stripe needs R4 + W2 + A2 + min(H32, K8) = 16 CQEs.
     // Request 16: providers may round to 31, still below two stripes' 32.
     rdma.polling.device_cq_len = 16;
+    let endpoint = Endpoint::rdma(Transport::TCP, [address]).unwrap();
     let context = Context::create(&client_config)
         .unwrap()
-        .with_endpoint(Endpoint::rdma(Transport::TCP, [address]).unwrap());
+        .with_endpoint(endpoint.clone());
     let client = Client {
         max_retries: 0,
         ..Default::default()
     };
-    let error = client.ping(&context, &7).await.unwrap_err();
-    assert_eq!(error.kind, ErrorKind::Overloaded, "{error}");
-    for expected in [
-        "reserve completion capacity",
-        "shared CQ capacity exhausted",
-        "all 1 RDMA CQ shards unavailable",
-        "attempt",
-        &address.to_string(),
-    ] {
-        assert!(
-            error.msg.contains(expected),
-            "missing {expected:?}: {error}"
-        );
-    }
-    let cleanup = tokio::time::timeout(Duration::from_secs(5), async {
+    // The first call succeeds on the one stripe that fits the CQ budget; the
+    // scheduled background attempt fails without disturbing it.
+    assert_eq!(client.ping(&context, &7).await.unwrap(), 7);
+
+    // Wait until the background attempt has failed and left its fill pending.
+    // With periodic maintenance disabled nothing retries it here; this test
+    // checks that the failed fill neither leaks a connection nor loses the
+    // published stripe, and that the pending fill is reported.
+    let client_report = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let client_report = context.state.rdma_path_report().await.unwrap();
-            let server_report = server.state().rdma_path_report().await.unwrap();
-            if [&client_report, &server_report].iter().all(|report| {
-                report.paths.is_empty()
-                    && report.devices.iter().all(|device| device.connections == 0)
-            }) {
-                break;
+            let report = context.state.rdma_path_report().await.unwrap();
+            if report.pending_fill_peers.contains(&endpoint) {
+                break report;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await;
-    if cleanup.is_err() {
-        let client_report = context.state.rdma_path_report().await.unwrap();
-        let server_report = server.state().rdma_path_report().await.unwrap();
-        panic!(
-            "bootstrap rollback retained connections: client={client_report:?}, server={server_report:?}"
-        );
+    .await
+    .expect("the failed background fill must stay pending");
+    assert_eq!(client_report.pending_fill_peers, vec![endpoint.clone()]);
+    // A failed fill is not health-detected recovery.
+    assert!(client_report.recovering_peers.is_empty());
+    let server_report = server.state().rdma_path_report().await.unwrap();
+    assert_eq!(
+        healthy_qps(&client_report, RdmaConnDirection::Outbound).len(),
+        1,
+        "a failed background fill changed the outbound stripe set: {client_report:?}"
+    );
+    assert_eq!(
+        healthy_qps(&server_report, RdmaConnDirection::Inbound).len(),
+        1,
+        "a failed background fill leaked an accepted connection: {server_report:?}"
+    );
+    for value in 8..10 {
+        assert_eq!(client.ping(&context, &value).await.unwrap(), value);
     }
     drop(context);
     stop_server(&server).await;
 }
 
-/// Every stripe needs its own activation receive, including stripes that the
-/// first user RPC does not use. Tombstone expiration must keep both QPs alive.
+/// Every stripe needs its own activation receive, including stripes that no
+/// user RPC uses. Leases must not close activated QPs once they expire.
 #[tokio::test]
 async fn all_initial_stripes_survive_accept_lease_expiration() {
     let mut config = config();
@@ -221,6 +246,7 @@ async fn all_initial_stripes_survive_accept_lease_expiration() {
         ..Default::default()
     };
     assert_eq!(client.ping(&context, &7).await.unwrap(), 7);
+    wait_for_stripes(&context, &server, 2).await;
 
     let outbound = healthy_qps(
         &context.state.rdma_path_report().await.unwrap(),
@@ -234,7 +260,7 @@ async fn all_initial_stripes_survive_accept_lease_expiration() {
     assert_eq!(inbound.len(), 2);
 
     // The lease sweeper runs at most one second apart; leave time for it to
-    // process the expired tombstones before checking that the QPs survived.
+    // pass the lease deadline before checking that the QPs survived.
     tokio::time::sleep(Duration::from_secs(17)).await;
     for value in 8..12 {
         assert_eq!(client.ping(&context, &value).await.unwrap(), value);

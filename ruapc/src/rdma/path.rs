@@ -117,7 +117,11 @@ pub struct RdmaCqLoad {
 }
 
 /// Snapshot of all live RDMA connections and per-device load.
+///
+/// Non-exhaustive so diagnostics can grow without breaking callers; obtain it
+/// from `State::rdma_path_report()`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[non_exhaustive]
 pub struct RdmaPathReport {
     /// CQ shard capacities and current reserved completion credits.
     pub completion_queues: Vec<RdmaCqLoad>,
@@ -125,6 +129,17 @@ pub struct RdmaPathReport {
     pub devices: Vec<RdmaDeviceLoad>,
     /// Every live connection with its path.
     pub paths: Vec<RdmaPathEntry>,
+    /// Peers whose last reconciliation pass ended below a connection target:
+    /// the `connections_per_peer` healthy-stripe count or the per-remote-NIC
+    /// coverage (`min_connections_per_remote_nic`). Retried under backoff
+    /// while the peer remains desired; never keeps an idle peer alive.
+    #[serde(default)]
+    pub pending_fill_peers: Vec<Endpoint>,
+    /// Peers recovering from health-detected connection failures. Such a peer
+    /// stays desired until its targets are met again, even when none of its
+    /// connections remain and `paths` therefore lists none of them.
+    #[serde(default)]
+    pub recovering_peers: Vec<Endpoint>,
 }
 
 #[cfg(test)]

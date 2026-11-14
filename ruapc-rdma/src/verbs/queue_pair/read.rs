@@ -20,8 +20,13 @@ use ruapc_bufpool::Buffer;
 use ruapc_bufpool::completion as oneshot;
 
 use super::super::wr_slots::SlotTable;
-use super::{QueuePair, ReadSge};
+use super::{MAX_READ_CHAIN, QueuePair, ReadSge, posted_prefix};
 use crate::{Error, ErrorKind, Result, WRID};
+use crate::{
+    WRType, ibv_send_flags, ibv_send_wr, ibv_send_wr__bindgen_ty_2,
+    ibv_send_wr__bindgen_ty_2__bindgen_ty_1, ibv_wr_opcode,
+};
+use std::os::raw::c_int;
 
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 
@@ -617,7 +622,7 @@ fn prepare(
             }
             sges.push(ReadSge {
                 addr: buffer.as_ptr() as u64 + segment.offset as u64,
-                len,
+                length: len,
                 lkey: keys[segment.buffer],
             });
         }
@@ -705,40 +710,88 @@ impl QueuePair {
         ))
     }
 
-    /// Posts the next request once. The QP installs ownership before exposing
-    /// its addresses to hardware; a failed post rolls that ownership back.
+    /// Posts the next request once. See [`Self::post_reads`].
     pub fn post_read(&self, posting: &mut ReadPosting) -> Result<()> {
-        if posting.owner != self.read_state.owner {
-            return Err(invalid("READ plan belongs to another QP"));
+        match self.post_reads(posting, 1) {
+            (_, Err(error)) => Err(error),
+            (_, Ok(())) => Ok(()),
         }
-        let read = posting
-            .reads
-            .get(posting.next)
-            .ok_or_else(|| invalid("READ plan already fully posted"))?;
+    }
+
+    /// Posts up to `max` (at most [`MAX_READ_CHAIN`]) next requests as one
+    /// linked WR chain: one SQ sequence reservation, provider lock and
+    /// doorbell. Returns how many the provider accepted, plus the post error
+    /// for the rest, if any. Ownership of every chained WR is recorded before
+    /// the NIC can observe it; WRs the provider rejected are rolled back and
+    /// stay part of the unposted suffix.
+    pub fn post_reads(&self, posting: &mut ReadPosting, max: usize) -> (usize, Result<()>) {
+        if posting.owner != self.read_state.owner {
+            return (0, Err(invalid("READ plan belongs to another QP")));
+        }
+        let count = max.min(MAX_READ_CHAIN).min(posting.remaining());
+        if count == 0 {
+            return (0, Err(invalid("READ plan already fully posted")));
+        }
+        let guard = match self.identity.lock_send_many(count as u64) {
+            Ok(guard) => guard,
+            Err(error) => return (0, Err(error)),
+        };
+        let first = guard.sequence();
+        let route = self.identity();
+        let sges = posting.sges.as_mut_ptr();
+        let mut wrs = [ibv_send_wr::default(); MAX_READ_CHAIN];
+        for (index, wr) in wrs[..count].iter_mut().enumerate() {
+            let read = &posting.reads[posting.next + index];
+            let sequence = first + index as u64;
+            // The ledger owns the batch before the provider sees the WR.
+            self.read_state.insert(sequence, posting.batch.clone());
+            *wr = ibv_send_wr {
+                wr_id: route.encode(WRType::Read, sequence),
+                // SAFETY: prepare bounded each range within `posting.sges`.
+                sg_list: unsafe { sges.add(read.sge_start) },
+                num_sge: (read.sge_end - read.sge_start) as c_int,
+                opcode: ibv_wr_opcode::IBV_WR_RDMA_READ,
+                send_flags: ibv_send_flags::IBV_SEND_SIGNALED.0,
+                wr: ibv_send_wr__bindgen_ty_2 {
+                    rdma: ibv_send_wr__bindgen_ty_2__bindgen_ty_1 {
+                        remote_addr: read.remote_addr,
+                        rkey: read.rkey,
+                    },
+                },
+                ..Default::default()
+            };
+        }
+        let base = wrs.as_mut_ptr();
+        for index in 1..count {
+            // SAFETY: both indices are within the stack array.
+            unsafe { (*base.add(index - 1)).next = base.add(index) };
+        }
         // SAFETY: prepare validated every range against the owned buffers and
-        // resolved keys on this QP. The exclusive cursor posts each range once.
-        // This QP keeps the batch through an authentic completion or destruction.
-        let sges = &posting.sges[read.sge_start..read.sge_end];
-        unsafe {
-            self.read_sges(
-                sges,
-                read.remote_addr,
-                read.rkey,
-                |wr_id| {
-                    self.read_state
-                        .insert(wr_id.sequence(), posting.batch.clone());
-                },
-                |wr_id| {
-                    self.read_state.remove(wr_id.sequence());
-                },
-            )
-        }?;
-        // The provider has accepted this WR. Account it before any operation
-        // that can unwind, or Drop would treat posted DMA as unposted.
-        let accepted = posting.next + 1;
-        posting.batch.mark_accepted(accepted);
-        posting.next = accepted;
-        Ok(())
+        // resolved keys on this QP, the exclusive cursor posts each range once,
+        // and the ledger keeps the batch through an authentic completion or
+        // destruction. The descriptors outlive the post call.
+        let (accepted, result) = match unsafe { self.post_send(base) } {
+            Ok(()) => (count, Ok(())),
+            Err((bad, error)) => {
+                // WRs before `bad_wr` reached the provider. An unidentifiable
+                // `bad_wr` keeps every entry: memory-safe, but a ledger entry
+                // that no completion can settle keeps the connection from
+                // becoming removable, so the post error must be treated as
+                // fatal to the QP.
+                let accepted = posted_prefix(base, bad, count);
+                for index in accepted..count {
+                    self.read_state.remove(first + index as u64);
+                }
+                (accepted, Err(error))
+            }
+        };
+        drop(guard);
+        // Account accepted WRs before any operation that can unwind, or Drop
+        // would treat posted DMA as unposted.
+        let next = posting.next + accepted;
+        posting.batch.mark_accepted(next);
+        posting.next = next;
+        (accepted, result)
     }
 
     /// Whether a recorded READ still awaits completion or rollback.

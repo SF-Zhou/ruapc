@@ -70,10 +70,20 @@ impl ReadCredits {
         }
     }
 
-    /// Called once for each authentic READ completion, including errors.
-    pub(crate) fn complete(&self) {
-        self.device.add_permits(1);
-        self.sq.add_permits(1);
+    /// Takes one more SQ and NIC permit pair if both are free right now.
+    pub(super) fn try_acquire(&self) -> Option<(SemaphorePermit<'_>, SemaphorePermit<'_>)> {
+        let sq = self.sq.try_acquire().ok()?;
+        let device = self.device.try_acquire().ok()?;
+        Some((sq, device))
+    }
+
+    /// Returns the permits of `count` authentic READ completions, including
+    /// errors. The poll thread batches a drain's completions per connection.
+    pub(crate) fn complete(&self, count: usize) {
+        if count != 0 {
+            self.device.add_permits(count);
+            self.sq.add_permits(count);
+        }
     }
 
     pub(crate) fn close(&self) {
@@ -154,6 +164,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batched_completion_returns_every_counted_pair() {
+        let device = Arc::new(Semaphore::new(2));
+        let credits = ReadCredits::new(device.clone(), 2);
+        retain_posted_credits(&credits).await;
+        retain_posted_credits(&credits).await;
+        assert_eq!(device.available_permits(), 0);
+        assert!(!credits.is_idle());
+
+        // One maintenance pass settles both CQEs without a per-CQE lock.
+        credits.complete(2);
+        assert_eq!(device.available_permits(), 2);
+        assert!(credits.is_idle());
+        drop(credits);
+        assert_eq!(device.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn try_acquire_needs_both_permits_free_right_now() {
+        let device = Arc::new(Semaphore::new(1));
+        let credits = ReadCredits::new(device.clone(), 1);
+        let (sq, nic) = credits.try_acquire().expect("both permits are free");
+        assert!(credits.try_acquire().is_none());
+        drop(nic);
+        // SQ capacity alone does not admit another READ.
+        assert!(credits.try_acquire().is_none());
+        drop(sq);
+        let admitted = credits.try_acquire().expect("both permits are free again");
+        assert_eq!(device.available_permits(), 0);
+        drop(admitted);
+        assert_eq!(device.available_permits(), 1);
+    }
+
+    #[tokio::test]
     async fn completion_before_post_returns_does_not_double_return_credits() {
         let device = Arc::new(Semaphore::new(2));
         let credits = ReadCredits::new(device.clone(), 2);
@@ -163,7 +206,7 @@ mod tests {
 
         // A poll thread can process the CQE while the posting thread still
         // holds both permits, before the provider call returns to post_read.
-        credits.complete();
+        credits.complete(1);
         assert_eq!(device.available_permits(), 2);
         assert_eq!(credits.sq.available_permits(), 2);
         sq_permit.forget();
@@ -184,7 +227,7 @@ mod tests {
 
         credits.close();
         assert!(credits.is_closed());
-        credits.complete();
+        credits.complete(1);
         assert!(credits.is_idle());
         assert_eq!(device.available_permits(), 2);
         drop(credits);
@@ -200,7 +243,7 @@ mod tests {
         retain_posted_credits(&credits).await;
         assert_eq!(device.available_permits(), 1);
 
-        credits.complete();
+        credits.complete(1);
         assert_eq!(device.available_permits(), 2);
         // Model the exclusive QP snapshot: one of the two posted WRs still
         // lacks a processed CQE. Merely recording it must not refund anything.

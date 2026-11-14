@@ -115,9 +115,9 @@ pub struct RdmaSocketPool {
     /// Inbound (accepted) connections, for path reporting and the
     /// port-down watchdog; dead entries are pruned opportunistically.
     inbound: std::sync::Mutex<Vec<Weak<RdmaSocket>>>,
-    /// Accepted connections remain leased until confirmation and a data-plane
-    /// receive have both occurred. Active entries remain briefly as tombstones
-    /// so a lost confirmation response can be retried idempotently.
+    /// Accepted connections stay leased from prepare completion until their
+    /// first data-plane receive retires the lease; a lease that reaches its
+    /// deadline first closes the still-unactivated connection.
     accept_leases: dashmap::DashMap<u64, AcceptLease, RandomState>,
     lease_sweeper_started: AtomicBool,
     /// Shared buffer pool (owned by State, kept alive via Arc).
@@ -250,13 +250,10 @@ impl RdmaSocketPool {
         avoided_remote_nics: &HashSet<String>,
     ) -> Option<Socket> {
         let peer = self.existing_peer(endpoint)?;
-        // Stripe writers never await and hold the lock briefly, so waiting
-        // for one is cheap. Falling through instead would queue this request
-        // behind the peer's connect lock, which background handshakes hold
-        // for whole round trips even while a healthy stripe exists.
-        let stripes = peer.stripes.read().unwrap();
-        let socket = self.pick_stripe(&stripes.active, avoided_remote_nics)?;
-        drop(stripes);
+        // A lock-free snapshot: requests neither contend with each other nor
+        // wait for stripe writers or the peer's connect lock, which background
+        // handshakes hold for whole round trips.
+        let socket = self.pick_stripe(&peer.active_view(), avoided_remote_nics)?;
         peer.touch(Instant::now());
         Some(socket)
     }

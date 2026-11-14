@@ -13,7 +13,7 @@ answered a bootstrap RPC. Different or overlapping groups are not
 automatically merged.
 
 Callers declare all group addresses equivalent: they must reach one server
-`State`, including shared prepare/commit/cancel lease records. Bootstrap does
+`State`, including shared prepare/cancel lease records. Bootstrap does
 not negotiate an instance ID to verify this. A later RPC or rollback can use
 another group address. See [endpoint identity and strings](endpoints.md).
 
@@ -34,10 +34,10 @@ Paths are relative to the repository root.
 | `ruapc/src/rdma/rdma_service.rs` | Connection bootstrap, payload-transfer and health-probe RPCs and types, protocol version, connectable-device advertisements. |
 | `ruapc/src/rdma/endpoint.rs` | Wire types, endpoint validation, directional negotiation, prepare-response validation. |
 | `ruapc/src/rdma/rdma_socket_pool/placement.rs` | Candidate paths, static policy, load ranking, failure preferences. |
-| `ruapc/src/rdma/rdma_socket_pool/connect.rs` | Discovery cache, path failover, stripe-set publication. |
+| `ruapc/src/rdma/rdma_socket_pool/connect.rs` | Discovery cache, path failover, stripe publication. |
 | `ruapc/src/rdma/rdma_socket_pool/handshake.rs` | One outbound handshake and rollback until publication. |
 | `ruapc/src/rdma/rdma_socket_pool/setup.rs` | Shared negotiation, poller/QP creation, endpoint generation, connection and registration. |
-| `ruapc/src/rdma/rdma_socket_pool/accept.rs` | Acceptor prepare/commit/cancel, leases, expiry. |
+| `ruapc/src/rdma/rdma_socket_pool/accept.rs` | Acceptor prepare/cancel, activation leases, expiry. |
 | `ruapc/src/rdma/probe.rs` | Client health-check round trip, RPC and READ nonce verification, per-probe deadline. |
 | `ruapc/src/rdma/rdma_socket_pool/probe.rs` | Periodic checks of individual connections, timeout counts, reconnect scheduling. |
 | `ruapc/src/rdma/rdma_socket_pool/reconcile.rs` | Shared first-use, periodic and recovery replenishment, single-flight scheduling and backoff. |
@@ -52,7 +52,7 @@ Paths are relative to the repository root.
 
 The first connection to a peer follows this sequence. Healthy stripes are
 reused; replenishment and migration reuse the same single-stripe handshake.
-Discovery must return bootstrap protocol version **3**.
+Discovery must return bootstrap protocol version **4**.
 
 ```mermaid
 sequenceDiagram
@@ -63,34 +63,36 @@ sequenceDiagram
     I->>A: bootstrap discover()
     A-->>I: version, devices/ports/GIDs, load, limits
     I->>I: Validate version and select paths
-    loop Each initial stripe
+    loop Each stripe (first in the foreground, the rest in background reconciliation)
         I->>I: Negotiate limits; create local QP and endpoint
         I->>A: bootstrap prepare_connection(attempt_id, endpoint, target, limits)
         A->>A: Validate; create QP and connect to RTS
         A->>AP: Post receives and register socket
-        A->>A: Create Pending lease
+        A->>A: Create accept lease
         A-->>I: Endpoint, lease, actual limits
         I->>I: Hold rollback guard; validate response
         I->>I: Connect local QP to RTS
         I->>IP: Post receives and register socket
-        I->>A: bootstrap commit_connection(lease)
-        A->>A: Confirmed; start activation deadline
-        A-->>I: Success
-        I->>I: Retain EstablishedSocket and rollback guard
+        I->>I: Check half the lease remains; retain rollback guard
+        I->>I: Publish the stripe
+        I->>IP: Request activation and wake poller
+        Note over I,IP: Acquire may return before activation completes
+        IP->>AP: Empty RDMA SEND_WITH_IMM
+        AP->>A: First successful receive completion
+        A->>A: Remove lease; enable probes
     end
-    I->>I: Publish all initial stripes together
-    I->>IP: Request activation and wake poller
-    Note over I,IP: Acquire may return before activation completes
-    IP->>AP: Empty RDMA SEND_WITH_IMM
-    AP->>A: First successful receive completion
-    A->>A: Confirmed → Active; retain idempotency record
 ```
 
 RTS means the NIC accepted local configuration, not that the remote path is
-reachable. Bootstrap commit confirms initiator QP ownership; routing failures
-may first appear in the activation SEND's completion. Publication and acquire do
-not wait for activation. Either the activation packet or ordinary traffic can
-provide the acceptor's first successful receive.
+reachable. The initiator activates only published connections, so the
+acceptor's first successful receive proves initiator QP ownership without a
+separate bootstrap confirmation; routing failures may first appear in the
+activation SEND's completion. Publication and acquire do not wait for
+activation. Either the activation packet or ordinary traffic can provide the
+acceptor's first successful receive. The poller emits no idle ACK or
+keepalive on a connection before its initiator publishes it or its acceptor
+observes the first receive, so activation cannot be inferred from a
+pre-publication packet.
 
 A failed handshake can try another candidate. Local QP connection failures,
 and published connections removed after failing before any successful SEND or
@@ -125,14 +127,20 @@ they do not establish reachability.
 Ethernet paths require a matching GID type on both ends. RoCE v1 and RoCE v2
 do not match each other; a NIC with no compatible local GID pair is skipped.
 
-After the initial foreground stripes are published, the pool immediately
+After the first foreground stripe is published, the pool immediately
 schedules background preconnection for that address group. The first request
-does not wait for this work. Each remote NIC is a coverage target only if at
-least one local device/port/GID pair passes the connection constraints,
-including limit negotiation and a required connectivity domain. A remote NIC
-without such a pair is skipped. Subnet `prefer`, link-class preferences and
-load ranking choose paths within each target NIC; they do not exclude other
-compatible NICs from coverage.
+does not wait for this work. A background fill that ends below its target
+stays pending, so while the peer remains desired the health probes, the
+periodic maintenance pass, or a later slow-path acquisition retry it under
+backoff. A pending fill does not by itself keep an idle peer alive: eviction
+may remove it, and a later slow-path acquisition starts a fresh peer and
+retries. Unlike health-detected recovery, a pending fill never pins a peer, so
+an unreachable target cannot retain it and its retries indefinitely. Each
+remote NIC is a coverage target only if at least one local device/port/GID
+pair passes the connection constraints, including limit negotiation and a
+required connectivity domain. A remote NIC without such a pair is skipped.
+Subnet `prefer`, link-class preferences and load ranking choose paths within
+each target NIC; they do not exclude other compatible NICs from coverage.
 
 First-use preconnection, periodic replenishment and health-triggered recovery
 share one queued or running reconciliation pass per group. It shares the peer's
@@ -161,7 +169,7 @@ it replenishes remote-NIC coverage first, then total connections:
 | Setting | Default | Purpose |
 |---|---:|---|
 | `peers.min_connections_per_remote_nic` | 1 | Coverage target per compatible remote NIC; zero disables per-NIC preconnection. |
-| `peers.connections_per_peer` | 1 | Initial foreground stripe count and total healthy-stripe target. |
+| `peers.connections_per_peer` | 1 | Total healthy-stripe target; stripes beyond the first connect in the background. |
 | `peers.preconnect_max_per_peer` | 16 | Upper bound on active connections for replenishment/additional connections. |
 | `maintenance.rebalance_threshold` | 2 | Required load improvement before migration. |
 | `maintenance.drain_timeout_ms` | 10000 | Grace period before closing a replaced stripe. |
@@ -174,9 +182,13 @@ NICs within that cap. Set the cap high enough to cover every desired NIC.
 
 Failed replenishment backs off. Each maintenance pass considers one peer for
 rebalancing. A migration establishes and publishes a replacement before moving
-the old connection to draining. `State::rdma_path_report()` reports each NIC pair,
-direction, QP, health, active/draining phase, and device connection counts;
-servers access it through `Server::state()`. CQ fields are described in
+the old connection to draining. `State::rdma_path_report()` reports each NIC
+pair, direction, QP, health, active/draining phase and device connection
+counts. `pending_fill_peers` lists peers whose last reconciliation pass ended
+below the stripe-count or per-remote-NIC coverage target, and
+`recovering_peers` lists peers recovering from health-detected failures, even
+after all their connections are gone; servers access it through
+`Server::state()`. CQ fields are described in
 [capacity introspection](rdma-capacity.md#introspection-and-implementation).
 Implementations are `rdma_socket_pool/placement.rs`, `reconcile.rs`,
 `maintenance.rs`, and `report.rs`.
@@ -276,9 +288,9 @@ therefore fail and roll back setup rather than produce incompatible peers.
 | `attempt_id`, `accepted_connection_id` | Nonzero; the response attempt must match. Together they identify an accepted connection. |
 
 `max_large_msg_size` is an optional named MessagePack field: missing defaults
-to zero, and zero is omitted. Zero selects inline-only operation. Protocol
-version 3 uses shared message frames and the payload-transfer RPCs; earlier
-protocol versions are rejected. The local
+to zero, and zero is omitted. Zero selects inline-only operation. Version 3
+introduced shared message frames and the payload-transfer RPCs; version 4
+keeps them, and earlier protocol versions are rejected. The local
 [`max_inflight_large_bytes` budget](rdma-capacity.md#large-payload-admission-and-cleanup)
 is not negotiated. SGE limits, inline SEND capacity, P_Key index, selective
 signaling, transport ACK timeout and retry count, and CQ settings also remain
@@ -293,33 +305,28 @@ Bootstrap assumes a trusted control plane.
 ## Lease states and deadlines
 
 `peers.connect_lease_ms` defaults to 30000 ms and must be at least 15000 ms.
-Preparation, activation, and Active idempotency retention each use this duration.
+Each accepted connection holds one lease from prepare completion until its
+first successful receive. That receive removes the lease and enables probes;
+a lease reaching its deadline first closes the connection. A receive after
+expiry cannot revive it. A matching cancel closes a still-leased connection;
+duplicate, unmatched or post-activation cancels do nothing. A live duplicate
+prepare attempt ID is rejected.
 
-| State | Observed events | Expiry |
-|---|---|---|
-| `Pending` | Prepare complete | From prepare completion; close inactive connection. |
-| `ReceiveObserved` | Successful receive before commit | Keep preparation deadline; close on expiry. |
-| `Confirmed` | Commit before successful receive | From first commit; close if not activated. |
-| `Active` | Commit and successful receive, in either order | From activation; forget only the idempotency record, leaving the connection open. |
-
-Repeated commit/receive events do not extend deadlines. Commit is idempotent
-while a valid lease or Active record remains; missing records, mismatched
-identity, expiry, or closed sockets return errors. A matching cancel closes
-the socket even during Active record retention; duplicate or unmatched cancels
-do nothing. A live duplicate prepare attempt ID is rejected.
+The initiator abandons, and rolls back, a handshake whose local connect and
+registration finish after half the lease has elapsed since it sent prepare,
+leaving the other half for publication and the activation round trip.
 
 A separate sweeper runs every `clamp(connect_lease_ms / 4, 100ms, 1s)`.
-Commit, first receive, and repeated prepare also check expiry. Every Active
-expiry path only removes the record.
+The first receive and repeated prepare also check expiry.
 
 <a id="期限回滚与发布"></a>
 
 ## Deadlines, rollback, and publication
 
-The overall connection deadline covers discovery, path attempts, and all
-stripe handshakes. Bootstrap connect and response timeouts are each 5 seconds,
-capped by the remaining deadline. Commit retries one response timeout if
-the overall budget remains; this relies on commit's method-specific idempotency.
+The foreground acquisition's connection deadline covers discovery, path
+attempts, and its own handshake. Bootstrap connect and response timeouts are
+each 5 seconds, capped by the remaining deadline. Background reconciliation
+passes use fresh budgets independent of any request deadline.
 
 Once prepare returns a valid lease for the attempt, `BootstrapRollback` owns
 remote cleanup and, after local registration, failure closure of that socket.
@@ -330,11 +337,13 @@ the QP transition to ERR. If cancel fails, the supervisor has stopped, or a
 lost prepare response prevents learning the lease, acceptor expiry reclaims
 the incomplete connection.
 
-Initial `connections_per_peer` stripes retain their guards until all handshakes
-and publication health checks pass. Any failure rolls back the unpublished
-set. Under the publication lock, each stripe disarms rollback and enters the
-selectable active set. After unlocking, the pool requests activation and enables
-health probes. Thus automatic activation cannot precede publication.
+The foreground acquisition establishes and publishes one stripe, then returns
+it; the reconciliation pass it schedules adds the remaining
+`connections_per_peer` stripes and NIC coverage one at a time, so the first
+request pays for a single handshake. Under the publication lock, a stripe
+disarms rollback and enters the selectable active set. After unlocking, the
+pool requests activation and enables health probes. Thus automatic activation
+cannot precede publication. A failed background stripe rolls back alone.
 Migration likewise publishes a replacement before draining the old connection.
 
 <a id="日志定位"></a>
@@ -353,10 +362,10 @@ and `local_qp`. Connection IDs differ between peers; prepare's
 | `RDMA local endpoint prepared` | Complete endpoint and negotiated config: MTU, PSN, READ cap, queue sizes. |
 | `RDMA connection attempt failed` | `error_kind`, stage context, `elapsed_ms`; discovery errors include peer and stage. |
 | `ibv_modify_qp failed` | RESET→INIT / INIT→RTR / RTR→RTS stage, target state, attribute mask, provider errno, connection parameters. |
-| `RDMA connection confirmed; awaiting publication` | Control-plane confirmation only. |
+| `RDMA connection established; awaiting publication` | Both QPs reached RTS and registered; reachability is still unproven. |
 | `RDMA ... published; activation requested` | Selectable connection; activation remains asynchronous. |
 | `RDMA replacement discarded; previous stripe is no longer active` | Peer and old/new connection IDs; a concurrent failure removed the victim, so the unpublished replacement rolls back. |
-| `RDMA accept lease expired before activation` | Attempt, connection, state, QP, path; distinguishes missing commit from missing receive. |
+| `RDMA accept lease expired before activation` | Attempt, connection, QP, path; the initiator never published or its activation never arrived. |
 | `RDMA work completion failed; closing connection` | Connection, QP, path, WR ID, status, `vendor_err`; activation may expose reachability failure. |
 | `RDMA connection probe failed` | Connection, NIC pair, error and consecutive-timeout count. Non-timeout errors interrupt the count. |
 | `RDMA connection probe timeout threshold reached; closing connection` | Connection, NIC pair and timeout count that triggered closure. |

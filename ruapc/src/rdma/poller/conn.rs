@@ -81,6 +81,15 @@ pub(super) struct ConnState {
     /// messages return their buffer here so the repost skips the shared
     /// pool.
     recv_buf_cache: Vec<Buffer>,
+    /// Replacement receive buffers for this drain's receive completions,
+    /// posted as one chain by maintenance before it publishes ACKs. The peer
+    /// can only use these slots after such an ACK, so batching cannot cause
+    /// receiver-not-ready retries.
+    pending_reposts: Vec<Buffer>,
+    /// READ completions processed since the last credit return. Returning
+    /// them once per drain takes each semaphore's lock once, not per CQE;
+    /// maintenance returns them before any idle or teardown check.
+    read_credits_due: usize,
     /// Receive work requests that could not be reposted (transient buffer
     /// pool exhaustion); retried on subsequent iterations instead of
     /// failing the connection.
@@ -111,6 +120,8 @@ impl ConnState {
             recv_buf_size: reg.recv_buf_size,
             msg_aggregation: reg.msg_aggregation,
             recv_buf_cache: Vec::new(),
+            pending_reposts: Vec::new(),
+            read_credits_due: 0,
             recv_deficit: 0,
             socket: reg.socket,
             registration,
@@ -254,12 +265,39 @@ impl ConnState {
                 }
             },
         };
-        self.socket
-            .queue_pair
-            .recv(new_buf)
-            .map_err(|e| Error::new(ErrorKind::RdmaRecvFailed, e.to_string()))?;
-        self.flow.receive_posted();
+        self.pending_reposts.push(new_buf);
         Ok(())
+    }
+
+    /// Posts the drain's replacement receives as one chain. Runs first in
+    /// maintenance, so a closed connection never posts after its ERR request.
+    pub(super) fn post_pending_reposts(&mut self) {
+        if self.pending_reposts.is_empty() {
+            return;
+        }
+        if !self.socket.state.is_ok() {
+            self.pending_reposts.clear();
+            return;
+        }
+        let (posted, result) = self.socket.queue_pair.recv_many(&mut self.pending_reposts);
+        self.flow.receive_posted_n(posted);
+        if let Err(error) = result {
+            tracing::error!("recv repost failed: {error}");
+            self.socket.set_error();
+        }
+    }
+
+    /// Queues a replacement receive without posting it, for tests that model
+    /// a drain followed by connection closure.
+    #[cfg(test)]
+    pub(super) fn queue_pending_repost_for_test(&mut self, buffer: Buffer) {
+        self.pending_reposts.push(buffer);
+    }
+
+    /// Whether queued replacement receives remain unposted.
+    #[cfg(test)]
+    pub(super) fn has_pending_reposts_for_test(&self) -> bool {
+        !self.pending_reposts.is_empty()
     }
 
     /// Retries receive reposts that previously failed on allocation.
@@ -302,9 +340,9 @@ impl ConnState {
             // no flow control accounting.
             WRType::Read => {
                 debug_assert!(buffer.is_none(), "read WRs store no slot buffer");
-                // Return the in-flight-read permits (per-NIC + per-SQ)
-                // taken at post time.
-                self.socket.read_credits.complete();
+                // The in-flight-read permits (per-NIC + per-SQ) taken at
+                // post time return at the next maintenance of this drain.
+                self.read_credits_due += 1;
                 if wc.succ() {
                     return Ok(());
                 }
@@ -326,6 +364,13 @@ impl ConnState {
                 format!("send completion error: {wc:?}"),
             ))
         }
+    }
+
+    /// Returns READ permits settled by completions since the last call.
+    pub(super) fn return_read_credits(&mut self) {
+        self.socket
+            .read_credits
+            .complete(std::mem::take(&mut self.read_credits_due));
     }
 
     /// Moves at most the FIFO's remaining capacity out of the ingress channel.
@@ -392,7 +437,7 @@ impl ConnState {
         // Decide whether an ACK is due *before* flushing pending sends so it
         // can piggyback on one of them (saving a standalone WR + CQE + a
         // recv buffer cycle on the peer).
-        let mut ack = self.flow.due_ack(now);
+        let mut ack = self.flow.due_ack(now, self.socket.sends_released());
 
         // Flush pending sends against the *unpublished* finished value:
         // the backlog spends freshly freed credits before

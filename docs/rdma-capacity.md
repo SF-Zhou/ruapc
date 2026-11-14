@@ -38,7 +38,8 @@ credits, including error/flush CQEs from unsignaled SENDs:
 - Data and standalone ACK credits return only after local completion and
   peer confirmation. Activation SENDs consume the same capped ACK credits.
 - Receive replacement follows consumption of the previous receive CQE.
-- Posted READ permits return after completion processing while the CQ runs.
+- Posted READ permits return after completion processing while the CQ runs,
+  batched per connection once per maintenance pass.
 - Each CQ reserves up to `H` READ credits because all per-NIC READs may
   concentrate on any one shard. `sum(K)` caps the demand of its connections.
 
@@ -72,9 +73,14 @@ release that storage budget. DMA ownership follows
 
 ## Large-payload admission and cleanup
 
-The encoder serializes each message once into registered storage, growing it
-as needed. Messages within `max_msg_size` keep the inline format; larger ones
-use a [payload offer RPC](builtin-services.md#payload-transfer).
+The encoder serializes each message once into registered storage. Messages
+within `max_msg_size` grow one contiguous buffer and keep the inline format.
+Past that limit, further bytes go to appended chunks (64 KiB to 4 MiB,
+following the encoded length) instead of being copied into larger buffers; one
+serializer write larger than that gets a single chunk of its own size (rounded
+up to the pool allocation class). Such messages use a
+[payload offer RPC](builtin-services.md#payload-transfer) whose regions are the
+payload part of the first buffer followed by each chunk.
 `max_msg_size` still sizes each posted receive buffer, so large messages do
 not enlarge the receive ring. The complete serialized size includes metadata
 and the twelve-byte frame and metadata-length prefix; negotiation and version
@@ -87,10 +93,13 @@ the configured large-message limit. Accounting uses allocation capacity,
 including buffers retained after READ completion until their payload owner
 is dropped. If a READ fails or its receive task is cancelled before recovering
 the destination, its byte reservation remains quarantined until QP destruction;
-failing a waiter does not return that budget. Growth reserves the replacement
-allocation while the old one remains charged. A budget equal to the message
-limit can therefore reject growth before that limit; the default allows one
-maximum-size message with both allocations present. Payload READs use the
+failing a waiter does not return that budget. A large message charges its
+first buffer and every chunk, and each allocation is rounded up to the pool
+size class (16 KiB, 64 KiB, 256 KiB, 1 MiB, 4 MiB, 16 MiB or 64 MiB).
+Incremental serialization therefore retains at most about one chunk beyond the
+encoded size, while one serializer write larger than 4 MiB can round up to
+16 MiB or 64 MiB; size `max_inflight_large_bytes` with that rounding in mind.
+The default 128 MiB admits one maximum-size message. Payload READs use the
 existing READ permits and bandwidth admission.
 
 Each connection admits at most 128 active outgoing and 128 active incoming
@@ -205,6 +214,14 @@ disabled or missing flush completions. Expiry and closure never release
 posted DMA holds or return their permits. If no WR was posted, admission
 failure can restore the complete destination vector; after partial posting,
 the unposted suffix is cancelled and the QP retains the posted destinations.
+
+A poster that holds one permit pair also takes any further pairs free at that
+moment, up to `MAX_READ_CHAIN` (16), and posts that many requests as one
+linked WR chain with one SQ sequence reservation, provider lock and doorbell.
+Ownership of every chained WR is recorded first; WRs after a provider-rejected
+`bad_wr` are rolled back with their permits and stay in the unposted suffix,
+while accepted WRs keep theirs. A partly accepted chain registers the batch
+for deadline tracking like any accepted post.
 
 The [poller](qp-registry.md#closing-a-connection) owns normal removal and fatal
 shutdown. Shutdown closes all connection admission before releasing socket

@@ -23,7 +23,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   A stream `remote_read` of that size now fails with `InvalidCopyOp` instead
   of waiting for its deadline.
 
+### Added
+- `ruapc_rdma::QueuePair::post_reads` posts up to 16 READ requests as one
+  linked WR chain and reports how many the provider accepted;
+  `QueuePair::recv_many` posts up to 32 receives per call. `MAX_READ_CHAIN` and
+  `MAX_RECV_CHAIN` expose those limits.
+- `RdmaPathReport::pending_fill_peers` lists peers whose last reconciliation
+  pass ended below the stripe-count or per-remote-NIC coverage target, and
+  `recovering_peers` lists peers recovering from health-detected failures,
+  including peers with no remaining connections.
+
 ### Changed
+- **BREAKING** (API): `RdmaPathReport` is `#[non_exhaustive]`; obtain it from
+  `State::rdma_path_report()` instead of constructing it.
+- **BREAKING** (wire): RDMA bootstrap protocol version 4 removes
+  `RdmaService/commit_connection`. The acceptor's first data-plane receive,
+  which only a published connection sends, now retires its accept lease, and
+  the initiator abandons setup that used more than half of
+  `peers.connect_lease_ms`. Establishing a connection takes one bootstrap round
+  trip fewer. The poller sends no idle ACK or keepalive until the
+  initiator publishes the connection or the acceptor observes its first
+  data-plane receive, so a pre-publication packet cannot retire the lease.
+- **BREAKING** (behavior): the first RDMA acquisition for a peer publishes one
+  stripe and returns it; the remaining `connections_per_peer` stripes connect
+  in the background instead of all being established before the first call. A
+  failed background fill stays pending, so health probes, the periodic
+  maintenance pass, or a later slow-path acquisition retry it; a pending fill
+  does not prevent an idle peer from being evicted.
+- RDMA requests select stripes from a lock-free snapshot of the peer's
+  active set.
+- RDMA READ plans post every run of admitted requests (up to 16) as one
+  linked WR chain, the poll thread returns READ permits once per maintenance
+  pass, and a drain's replacement receives are posted as linked chains of up
+  to 32.
+- Large RDMA messages are encoded into appended chunks past the inline limit
+  instead of being copied into ever larger buffers; offers carry the payload
+  remainder of the first buffer plus one region per chunk, with each
+  allocation rounded up to the pool size class. 1 MiB serial echo improves by
+  about 20% on mlx5.
 - **BREAKING** (wire): `MemoryService/request_is_pending` is renamed to
   `MemoryService/validate_read_source` and returns `()` instead of `bool`. A
   request without a source route now fails with `Timeout` like an

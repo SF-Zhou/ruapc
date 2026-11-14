@@ -73,8 +73,6 @@ async fn test_http_openapi_includes_builtin_methods() {
         #[cfg(feature = "rdma")]
         "/RdmaService/prepare_connection",
         #[cfg(feature = "rdma")]
-        "/RdmaService/commit_connection",
-        #[cfg(feature = "rdma")]
         "/RdmaService/cancel_connection",
         #[cfg(feature = "rdma")]
         "/RdmaService/probe",

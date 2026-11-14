@@ -66,7 +66,11 @@ impl FlowControl {
     }
 
     pub(super) fn receive_posted(&mut self) {
-        self.recv.submitted += 1;
+        self.receive_posted_n(1);
+    }
+
+    pub(super) fn receive_posted_n(&mut self, count: usize) {
+        self.recv.submitted += count as u64;
     }
 
     pub(super) fn received_data(&mut self) {
@@ -115,7 +119,10 @@ impl FlowControl {
 
     /// ACK deltas are encoded in two 16-bit immediate-data fields. A large
     /// window may need multiple ACKs; unencoded credits stay in the ledger.
-    pub(super) fn due_ack(&self, now: Instant) -> Option<u32> {
+    /// `keepalive` clears the idle timer only once autonomous sends are
+    /// released; data and ACK thresholds still publish pending deltas, which
+    /// cannot exist before the peer sends.
+    pub(super) fn due_ack(&self, now: Instant, keepalive: bool) -> Option<u32> {
         let data = self.pending_data();
         let acks = self.recv.ack_received - self.recv.ack_acked;
         if data >= self.ack_threshold
@@ -124,7 +131,7 @@ impl FlowControl {
             // Batch at least two; data credit and keepalive triggers still
             // publish smaller pending ACK deltas when they need to send.
             || acks >= (self.ack_limit / 2).clamp(2, ACK_COUNTER_MAX)
-            || now.duration_since(self.last_ack) >= ACK_KEEPALIVE
+            || (keepalive && now.duration_since(self.last_ack) >= ACK_KEEPALIVE)
         {
             Some(((acks.min(ACK_COUNTER_MAX) as u32) << 16) | data.min(ACK_COUNTER_MAX) as u32)
         } else {
@@ -184,16 +191,38 @@ mod tests {
             let mut flow = FlowControl::new(window, 0, now);
             for _ in 0..(window / 2).max(1) - 1 {
                 flow.received_data();
-                assert_eq!(flow.due_ack(now), None);
+                assert_eq!(flow.due_ack(now, true), None);
             }
             flow.received_data();
             let ack = flow
-                .due_ack(now)
+                .due_ack(now, true)
                 .expect("ACK must precede window exhaustion");
             flow.mark_acked(ack, now);
-            assert_eq!(flow.due_ack(now), None);
-            assert_eq!(flow.due_ack(now + ACK_KEEPALIVE), Some(0));
+            assert_eq!(flow.due_ack(now, true), None);
+            assert_eq!(flow.due_ack(now + ACK_KEEPALIVE, true), Some(0));
         }
+    }
+
+    #[test]
+    fn keepalive_waits_until_autonomous_sends_are_released() {
+        let now = Instant::now();
+        let flow = FlowControl::new(4, 4, now);
+        // A registered but unpublished connection must not emit a packet that
+        // the peer could mistake for activation.
+        assert_eq!(flow.due_ack(now + ACK_KEEPALIVE, false), None);
+        assert_eq!(flow.due_ack(now + ACK_KEEPALIVE, true), Some(0));
+    }
+
+    #[test]
+    fn received_data_publishes_credit_before_keepalives_are_released() {
+        let now = Instant::now();
+        let mut flow = FlowControl::new(4, 4, now);
+        for _ in 0..2 {
+            flow.received_data();
+        }
+        // Data cannot arrive on an unpublished connection, so its credit must
+        // be published even while the idle keepalive remains gated.
+        assert_eq!(flow.due_ack(now, false), Some(2));
     }
 
     #[test]
@@ -211,7 +240,7 @@ mod tests {
             let flow = &mut peers[receiver];
             flow.received_ack();
             flow.peer_ack(imm);
-            if let Some(reply) = flow.due_ack(now)
+            if let Some(reply) = flow.due_ack(now, true)
                 && flow.can_submit_ack()
             {
                 flow.ack_posted(true);
@@ -232,12 +261,14 @@ mod tests {
         client.ack_posted(true);
         client.ack_completed();
         server.received_ack();
-        assert_eq!(server.due_ack(now), None);
+        assert_eq!(server.due_ack(now, true), None);
 
         // The first data message must return its window credit immediately,
         // carrying the pending activation confirmation in the same ACK.
         server.received_data();
-        let ack = server.due_ack(now).expect("the one-entry window is full");
+        let ack = server
+            .due_ack(now, true)
+            .expect("the one-entry window is full");
         assert_eq!(ack, (1 << 16) | 1);
         assert!(server.can_submit_ack());
         server.ack_posted(true);
@@ -245,7 +276,7 @@ mod tests {
         client.data_completed();
         client.peer_ack(ack);
         assert_eq!(client.finished_data(), 1);
-        assert_eq!(server.due_ack(now), None);
+        assert_eq!(server.due_ack(now, true), None);
         for _ in 0..2 {
             assert!(
                 client.can_submit_ack(),
@@ -290,10 +321,10 @@ mod tests {
         let mut flow = FlowControl::new(u32::MAX, 0, now);
         flow.recv.data_received = ACK_COUNTER_MAX + 7;
         flow.recv.ack_received = ACK_COUNTER_MAX + 11;
-        let first = flow.due_ack(now).unwrap();
+        let first = flow.due_ack(now, true).unwrap();
         assert_eq!(first, u32::MAX);
         flow.mark_acked(first, now);
-        let second = flow.due_ack(now + ACK_KEEPALIVE).unwrap();
+        let second = flow.due_ack(now + ACK_KEEPALIVE, true).unwrap();
         assert_eq!(second, (11 << 16) | 7);
         flow.mark_acked(second, now + ACK_KEEPALIVE);
         assert_eq!(flow.pending_data(), 0);
