@@ -206,7 +206,6 @@ impl SocketPool {
             Transport::RDMA => match &self.rdma {
                 Some(pool) => pool
                     .acquire_existing(endpoint, options.avoided_nics())
-                    .await
                     .map(Ok),
                 None => Some(Err(Error::new(
                     ErrorKind::InvalidArgument,

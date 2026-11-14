@@ -723,7 +723,8 @@ mod tests {
         // Prevent the first maintenance pass from reconnecting synchronously so
         // pruning can be checked independently of bootstrap speed.
         let connecting = peer.connect.lock().await;
-        peer.meta.lock().unwrap().last_used = Some(Instant::now() - Duration::from_secs(120));
+        peer.last_used
+            .set(Instant::now() - Duration::from_secs(120));
         for stripe in peer.active_snapshot() {
             stripe.socket.set_error();
         }
@@ -732,9 +733,10 @@ mod tests {
         assert!(peer.needs_reconnect());
         let endpoint = peer.endpoint.clone();
         let original = Arc::downgrade(&peer);
+        peer.last_used
+            .set(Instant::now() - Duration::from_secs(120));
         {
             let mut meta = peer.meta.lock().unwrap();
-            meta.last_used = Some(Instant::now() - Duration::from_secs(120));
             meta.backoff.insert(
                 String::new(),
                 super::super::reconcile::RetryBackoff {

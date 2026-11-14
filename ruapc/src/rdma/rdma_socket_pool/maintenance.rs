@@ -74,9 +74,10 @@ impl RdmaSocketPool {
         if peers.is_empty() {
             return;
         }
-        for peer in &peers {
-            self.replenish_peer(peer, state).await;
-        }
+        // Replenish concurrently: one unreachable peer's bootstrap timeouts
+        // must not delay every other peer's recovery in this tick.
+        futures_util::future::join_all(peers.iter().map(|peer| self.replenish_peer(peer, state)))
+            .await;
         let target =
             peers[self.rebalance_cursor.fetch_add(1, Ordering::Relaxed) % peers.len()].clone();
         self.rebalance_peer(&target, state).await;

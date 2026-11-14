@@ -250,27 +250,23 @@ impl RdmaSocketPool {
         avoided_remote_nics: &HashSet<String>,
     ) -> Option<Socket> {
         let peer = self.existing_peer(endpoint)?;
-        // The fast path must never block: a writer in the way means
-        // connection churn, which the slow path handles anyway. A
-        // poisoned lock likewise falls through to the slow path.
-        let stripes = peer.stripes.try_read().ok()?;
+        // Stripe writers never await and hold the lock briefly, so waiting
+        // for one is cheap. Falling through instead would queue this request
+        // behind the peer's connect lock, which background handshakes hold
+        // for whole round trips even while a healthy stripe exists.
+        let stripes = peer.stripes.read().unwrap();
         let socket = self.pick_stripe(&stripes.active, avoided_remote_nics)?;
         drop(stripes);
         peer.touch(Instant::now());
         Some(socket)
     }
 
-    pub(crate) async fn acquire_existing(
+    pub(crate) fn acquire_existing(
         &self,
         endpoint: &Endpoint,
         avoided_remote_nics: &HashSet<String>,
     ) -> Option<Socket> {
-        let peer = self.existing_peer(endpoint)?;
-        let stripes = peer.stripes.read().unwrap();
-        let socket = self.pick_stripe(&stripes.active, avoided_remote_nics)?;
-        drop(stripes);
-        peer.touch(Instant::now());
-        Some(socket)
+        self.try_acquire(endpoint, avoided_remote_nics)
     }
 
     fn peer(&self, endpoint: &Endpoint) -> Arc<PeerState> {
@@ -290,10 +286,12 @@ impl RdmaSocketPool {
         stripes: &[Stripe],
         avoided_remote_nics: &HashSet<String>,
     ) -> Option<Socket> {
-        if stripes.is_empty() {
-            return None;
-        }
-        let start = self.next_stripe.fetch_add(1, Ordering::Relaxed);
+        let start = match stripes.len() {
+            0 => return None,
+            // The default single stripe needs no shared rotation counter.
+            1 => 0,
+            _ => self.next_stripe.fetch_add(1, Ordering::Relaxed),
+        };
         (0..stripes.len())
             .map(|i| &stripes[(start + i) % stripes.len()])
             .find(|s| {
@@ -440,14 +438,13 @@ mod group_tests {
         assert_eq!(pool.peers.len(), 1);
         let now = Instant::now();
         peer.touch(now);
-        assert_eq!(
+        // Equivalent spellings share one peer; last use has 1 ms granularity.
+        assert!(
             pool.existing_peer(&equivalent)
                 .unwrap()
-                .meta
-                .lock()
-                .unwrap()
-                .last_used,
-            Some(now),
+                .last_used
+                .get()
+                .is_some_and(|used| used.max(now) - used.min(now) < Duration::from_millis(1)),
         );
 
         // Exercise the actual acquire path while the equivalent spelling owns
@@ -489,8 +486,8 @@ mod group_tests {
         assert!(overlapping.connect.try_lock().is_ok());
         assert!(subset.connect.try_lock().is_ok());
         first.touch(Instant::now());
-        assert!(overlapping.meta.lock().unwrap().last_used.is_none());
-        assert!(subset.meta.lock().unwrap().last_used.is_none());
+        assert!(overlapping.last_used.get().is_none());
+        assert!(subset.last_used.get().is_none());
     }
 
     fn mark_closed(socket: &Socket) -> bool {
