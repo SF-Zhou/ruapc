@@ -20,7 +20,18 @@ impl Encoded {
     /// user serialization again. Only timeout_ms changes, and its encoding
     /// can only shrink as the remaining request budget decreases.
     pub(super) fn refresh_timeout(&mut self, meta: &MsgMeta) -> Result<()> {
-        let metadata = rmp_serde::to_vec_named(meta)?;
+        // Typical metadata fits on the stack; this runs for every
+        // window-blocked send whose remaining budget changed while queued.
+        let mut stack = [0u8; 512];
+        let mut cursor = std::io::Cursor::new(&mut stack[..]);
+        let heap;
+        let metadata: &[u8] = if rmp_serde::encode::write_named(&mut cursor, meta).is_ok() {
+            let len = cursor.position() as usize;
+            &stack[..len]
+        } else {
+            heap = rmp_serde::to_vec_named(meta)?;
+            &heap
+        };
         let payload_offset = HEADER_LEN + 4 + metadata.len();
         if payload_offset > self.payload_offset {
             return Err(Error::new(
@@ -28,17 +39,20 @@ impl Encoded {
                 "RDMA timeout refresh grew message metadata".into(),
             ));
         }
-        let len = self.buffer.len();
-        self.buffer
-            .copy_within(self.payload_offset..len, payload_offset);
-        self.buffer
-            .set_len(len - (self.payload_offset - payload_offset));
-        self.buffer[HEADER_LEN + 4..payload_offset].copy_from_slice(&metadata);
-        let meta_len = u32::try_from(metadata.len())?;
-        self.buffer[HEADER_LEN..HEADER_LEN + 4].copy_from_slice(&meta_len.to_be_bytes());
-        let header = encode_header(self.buffer.len() - HEADER_LEN)?;
-        self.buffer[..HEADER_LEN].copy_from_slice(&header);
-        self.payload_offset = payload_offset;
+        if payload_offset < self.payload_offset {
+            // Only a narrower integer encoding shifts the payload.
+            let len = self.buffer.len();
+            self.buffer
+                .copy_within(self.payload_offset..len, payload_offset);
+            self.buffer
+                .set_len(len - (self.payload_offset - payload_offset));
+            let meta_len = u32::try_from(metadata.len())?;
+            self.buffer[HEADER_LEN..HEADER_LEN + 4].copy_from_slice(&meta_len.to_be_bytes());
+            let header = encode_header(self.buffer.len() - HEADER_LEN)?;
+            self.buffer[..HEADER_LEN].copy_from_slice(&header);
+            self.payload_offset = payload_offset;
+        }
+        self.buffer[HEADER_LEN + 4..payload_offset].copy_from_slice(metadata);
         Ok(())
     }
 }
