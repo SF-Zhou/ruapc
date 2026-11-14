@@ -221,13 +221,14 @@ pub struct PollerConfig {
     pub cq_len: u32,
     /// Per-NIC READ limit, shared by all connections.
     pub read_limit: u32,
-    /// Busy-poll window after the last completion, in microseconds. Dispatch
-    /// workers use the same window before parking. `0` disables spinning
-    /// (pure event-driven mode).
+    /// Busy-poll window after the last completion, in microseconds.
+    /// `0` disables spinning (pure event-driven mode).
     pub spin_us: u64,
     /// Number of dispatch worker tasks shared by all shards of the pool
     /// (consulted once, when the first shard starts).
     pub dispatch_workers: u32,
+    /// Dispatch-worker queue spin before parking, in microseconds.
+    pub dispatch_spin_us: u64,
 }
 
 impl DevicePoller {
@@ -839,6 +840,7 @@ mod tests {
             read_limit: 1,
             spin_us: 0,
             dispatch_workers: 1,
+            dispatch_spin_us: 0,
         };
         let poller = DevicePoller::start(
             device.context(),
@@ -846,7 +848,7 @@ mod tests {
             config,
             Dispatcher::start(
                 config.dispatch_workers,
-                Duration::from_micros(config.spin_us),
+                Duration::from_micros(config.dispatch_spin_us),
             ),
         )
         .expect("CQ creation must succeed with a clamped length");
@@ -876,6 +878,7 @@ mod tests {
             read_limit: 32,
             spin_us: 0,
             dispatch_workers: 1,
+            dispatch_spin_us: 0,
         };
         let dispatcher = Dispatcher::start(1, Duration::ZERO);
         let mut shards = DeviceShards::default();
@@ -953,6 +956,7 @@ mod tests {
             read_limit: 1,
             spin_us: 0,
             dispatch_workers: 1,
+            dispatch_spin_us: 0,
         };
         let connection = RdmaConnectionConfig {
             recv_queue_len: 2,

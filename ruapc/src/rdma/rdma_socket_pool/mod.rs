@@ -346,6 +346,7 @@ impl RdmaSocketPool {
             read_limit: self.config.remote_memory.max_inflight_read_wrs,
             spin_us: self.config.polling.poll_spin_us,
             dispatch_workers: self.config.polling.dispatch_workers,
+            dispatch_spin_us: self.config.polling.dispatch_spin_us,
         }
     }
 }

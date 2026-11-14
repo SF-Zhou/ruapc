@@ -50,7 +50,7 @@ impl DevicePollers {
             .get_or_insert_with(|| {
                 Dispatcher::start(
                     config.dispatch_workers,
-                    Duration::from_micros(config.spin_us),
+                    Duration::from_micros(config.dispatch_spin_us),
                 )
             })
             .clone();

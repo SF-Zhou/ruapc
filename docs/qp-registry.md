@@ -95,11 +95,14 @@ thresholds, not hard queue limits: concurrent pollers may observe the same
 backlog before enqueueing. A stopped worker causes its queued-send attempt
 to fail and the batch to be dropped.
 
-After a batch, a worker keeps checking its queue for `rdma.polling.poll_spin_us`,
+After a batch, a worker keeps checking its queue for `rdma.polling.dispatch_spin_us`
+(default 50 microseconds),
 yielding to the runtime between checks, before parking on the queue. Waking a
 parked worker from the poll thread costs a futex wake and thread wake-up
 latency in each direction of a round trip; a spinning worker registers no
-receiver waker, so the poller's enqueue wakes nothing. Zero disables this.
+receiver waker, so the poller's enqueue wakes nothing. On a pinned 32-core
+mlx5 run this halves serial echo latency (about 25 to 14 microseconds) at a
+few percent of concurrent throughput. Zero disables this.
 
 Small received frame batches (up to 1 KiB total) are copied out so registered
 receive buffers can be reused promptly; larger batches retain the zero-copy path.

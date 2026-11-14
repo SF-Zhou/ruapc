@@ -1016,6 +1016,7 @@ mod lifecycle_tests {
                         read_limit: 2,
                         spin_us: 0,
                         dispatch_workers: 1,
+                        dispatch_spin_us: 0,
                     },
                     1,
                     &connection,

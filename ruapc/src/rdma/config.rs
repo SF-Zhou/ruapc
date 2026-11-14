@@ -138,14 +138,18 @@ pub struct RdmaPollingConfig {
     /// Requested entries per CQ shard, clamped to the device limit.
     /// Admission uses the actual capacity returned by the provider.
     pub device_cq_len: u32,
-    /// Busy-poll duration after the latest completion. Dispatch workers also
-    /// keep checking their queue this long (yielding to the runtime) before
-    /// parking. Zero disables spinning.
+    /// Busy-poll duration after the latest completion. Zero disables spinning.
     pub poll_spin_us: u64,
     /// Maximum CQ shards (one poll thread each) per device. Shards start
     /// lazily and receive connections according to available CQ credits.
     pub poll_threads_per_device: u32,
     pub dispatch_workers: u32,
+    /// How long a dispatch worker keeps checking its queue after a batch,
+    /// yielding to the runtime, before it parks. Parking makes the poll thread
+    /// wake a sleeping runtime thread for the next batch, which dominates
+    /// serial round-trip latency; spinning costs some throughput under
+    /// moderate concurrency. Zero parks immediately.
+    pub dispatch_spin_us: u64,
 }
 
 impl Default for RdmaPollingConfig {
@@ -155,6 +159,7 @@ impl Default for RdmaPollingConfig {
             poll_spin_us: 50,
             poll_threads_per_device: 1,
             dispatch_workers: 32,
+            dispatch_spin_us: 50,
         }
     }
 }
