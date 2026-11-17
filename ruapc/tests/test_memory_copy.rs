@@ -140,3 +140,81 @@ async fn packed_copies_keep_operation_order_holes_and_empty_segments_on_stream_t
         .await
         .unwrap();
 }
+
+#[service]
+trait LargeCopy {
+    /// Reads the whole read space, then writes it back with its halves swapped.
+    async fn swap_halves(&self, ctx: &Context, req: &()) -> ResultBufferReply<u64>;
+}
+
+struct LargeCopyService;
+
+impl LargeCopy for LargeCopyService {
+    async fn swap_halves(&self, ctx: &Context, _: &()) -> ResultBufferReply<u64> {
+        let read = ctx.remote_read_all().await?;
+        let total: u64 = read.iter().map(|buffer| buffer.len() as u64).sum();
+        let half = total / 2;
+        let ops = [
+            CopyOp::new(half, 0, total - half),
+            CopyOp::new(0, total - half, half),
+        ];
+        let sent = ctx.remote_write(&ops, read).await?;
+        Ok(sent.into_reply(total))
+    }
+}
+
+/// Transfers of several data frames each, from two requests in flight on the
+/// same connection at once, keep every byte in place in both directions.
+#[tokio::test]
+async fn multi_frame_transfers_interleave_on_stream_transports() {
+    let config = SocketPoolConfig {
+        listen_mode: ListenMode::UNIFIED,
+        buffer_pool_memory: 256 << 20,
+        #[cfg(feature = "rdma")]
+        rdma: None,
+        ..Default::default()
+    };
+    let mut router = Router::default();
+    Arc::new(LargeCopyService).ruapc_export(&mut router);
+    let server = Server::create(router, &config).unwrap();
+    let address = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let pool = BufferPool::new(Vec::new());
+    // Uneven buffers put frame and buffer boundaries in different places.
+    const LENGTHS: [usize; 3] = [(1 << 20) + 3, 3 << 20, (1 << 20) + 14];
+    let total: usize = LENGTHS.iter().sum();
+
+    for transport in [Transport::TCP, Transport::WS, Transport::HTTP] {
+        let ctx = Context::create(&config)
+            .unwrap()
+            .with_endpoint(Endpoint::new(transport, [address]).unwrap());
+        let client = Client {
+            timeout: Duration::from_secs(30),
+            ..Default::default()
+        };
+        let transfer = |seed: u8| {
+            let pattern: Vec<u8> = (0..total).map(|index| (index % 251) as u8 ^ seed).collect();
+            let source = buffers(&pool, &pattern, &LENGTHS);
+            let destination = buffers(&pool, &vec![0; total], &[total / 2, total - total / 2]);
+            let ctx = &ctx;
+            let client = &client;
+            async move {
+                let attached = client
+                    .with_read_buffers(&source)
+                    .with_write_buffers(destination);
+                let (len, written) = attached.swap_halves(ctx, &()).await.unwrap().into_parts();
+                assert_eq!(len, total as u64);
+                let written = flatten(&written.into_available().expect("destinations"));
+                let half = total / 2;
+                let mut expected = pattern[half..].to_vec();
+                expected.extend_from_slice(&pattern[..half]);
+                assert!(written == expected, "{transport:?} seed {seed}");
+            }
+        };
+        tokio::join!(transfer(0), transfer(0xa5));
+    }
+
+    server.stop();
+    tokio::time::timeout(Duration::from_secs(5), server.join())
+        .await
+        .unwrap();
+}

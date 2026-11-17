@@ -39,7 +39,7 @@ the dependencies retain buffer ownership and completion authority.
 | `core` | Contexts, listeners, method registration and handler admission |
 | `msg` | Owned messages and payloads, delegating codecs to `ruapc-wire` |
 | `sockets` | Concrete transports, connection queues, maps and closure |
-| `remote_memory` | Context transfer APIs, inline reverse RPCs, write targets and completion witnesses |
+| `remote_memory` | Context transfer APIs, reverse RPCs, stream data frames, write targets and completion witnesses |
 | `rdma` | Path selection, bootstrap, READ execution and CQ polling |
 | `task` | Background-task supervision and response waiters |
 | `metrics` | Cached recorder handles and scoped request accounting |
@@ -118,7 +118,8 @@ shutdown additionally follows the [poller and DMA cleanup rules](docs/qp-registr
 Metrics use the `metrics` facade; applications install a recorder before
 traffic. Per-method handles are cached per `State`, and guards settle accounting
 on completion, cancellation and panic. Only `server_inflight` has a local value,
-used for admission control.
+used for admission control. Stream data frames run no method, so they have
+counters of their own for frames and bytes sent, received and discarded.
 
 ## Message ownership and framing
 
@@ -145,11 +146,26 @@ the payload view without copying.
 | Carrier | Frame |
 |---|---|
 | TCP, HTTP/2 stream, RDMA | `[RUA!: 4B][body_len: 4B][meta_len: 4B][meta][payload]` |
-| WebSocket binary message | one shared frame per binary message |
+| TCP, HTTP/2 stream data | `[RUAD: 4B][body_len: 4B][head_len: 4B][head][raw bytes]` |
+| WebSocket binary message | one shared frame of either kind per binary message |
 | Unary HTTP | JSON bodies; routing comes from the URL |
 
-Lengths are big-endian `u32`s. `body_len` counts the `meta_len` prefix,
-metadata and payload.
+Lengths are big-endian `u32`s. `body_len` counts everything after it.
+A data frame carries at most 1 MiB of raw bytes for the write space of a
+request pending at the receiver; its MessagePack head names that request's
+message ID, the destination ranges as `[offset, len]` pairs and an optional
+acknowledgement ID. RDMA and unary HTTP never carry data frames. See
+[stream data frames](docs/remote-memory.md#stream-transports-data-frames).
+
+Stream send queues hold one frame per entry, as one or more `Bytes` segments.
+A data frame's segments can share the sender's buffers: TCP writes them with
+vectored writes and HTTP/2 yields each as a body chunk, while WebSocket joins
+them into its one binary message. A data frame also owns its share of the
+connection's queued-byte budget, a fair semaphore; the frame's last segment
+carries that share until the carrier has written it. TCP receives a data
+frame's raw bytes straight into the destination buffers with nonblocking
+vectored reads under the write target's mutex; HTTP/2 and WebSocket copy them
+from the received chunks. Neither assembles the frame.
 
 TCP, HTTP/2, WebSocket and RDMA share header validation and size limits in
 [`ruapc-wire/src/frame.rs`](ruapc-wire/src/frame.rs); a WebSocket binary message
@@ -198,7 +214,8 @@ posting.
 | `ruapc-memory` | Space validation and planning, CPU gather/scatter and immutable borrowed sources with cached layouts |
 | `context.rs` | Public transfer APIs |
 | `transfer.rs` | Owned preparation, convenience allocation and centralized enum dispatch |
-| `rpc_transfer.rs` | Reverse-RPC protocol, handlers and TCP/WS/HTTP fallback |
+| `rpc_transfer.rs` | Reverse-RPC protocol and handlers (inline reads, RDMA `read_into_target` and source validation) |
+| `data.rs` | Stream data frames: pending-request routing, destination checks, frame pushes and acknowledgements |
 | `write_target.rs` | Exclusive destination checkout for CPU copies or owned RDMA READ plans, their recovery, and final sealing |
 | `reply.rs` | Write receipts and shared reply types with local destination availability |
 | `rdma/rdma_socket/read.rs` | Concrete READ planning and execution |

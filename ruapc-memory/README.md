@@ -118,7 +118,10 @@ mutation while the source is used.
 
 RuaPC keeps write-target checkout, RPC attachments and waiter registration,
 reverse RPCs, deadlines, READ execution and completion witnesses in `ruapc`.
-An inline write holds the target's mutex for the complete scatter batch. The
+Stream data frames write a target one contiguous range at a time with
+`BufferSet::write_at`, or let a socket read into `BufferSet::slices_mut`, under
+the target's mutex; `CopyBatch::split` cuts a batch into frame-sized pieces and
+`ReadSource::for_each_slice` gathers one piece into frame storage. The
 runtime converts `MemoryError` into its RPC error categories. Posted RDMA
 buffers and completion authority remain in `ruapc-rdma`. See
 [safety boundaries](https://github.com/SF-Zhou/ruapc/blob/main/docs/safe-boundaries.md)

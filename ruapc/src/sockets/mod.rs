@@ -3,10 +3,16 @@ mod socket;
 pub use socket::Socket;
 
 mod channel;
+mod outbound;
+pub(crate) use outbound::{Outbound, Segment};
 mod send_queue;
+#[cfg(test)]
+pub(crate) mod test_util;
 pub(crate) use send_queue::{SendRequest, reserve_send};
 mod connect;
 pub(crate) use channel::ChannelConnection;
+#[cfg(test)]
+pub(crate) use channel::MAX_DEFERRED_RESPONSES;
 mod lifecycle;
 pub(crate) use lifecycle::{ConnectionLifecycle, ConnectionMap, PoolConnection};
 

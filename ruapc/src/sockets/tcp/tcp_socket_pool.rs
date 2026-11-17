@@ -1,6 +1,6 @@
-use std::{io::IoSlice, net::SocketAddr, sync::Arc};
+use std::{collections::VecDeque, io::IoSlice, net::SocketAddr, sync::Arc};
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{
@@ -15,8 +15,9 @@ use super::TcpSocket;
 use crate::{
     ConnectionMap, Endpoint, Message, Socket, State, TaskSupervisor,
     error::{Error, ErrorKind, Result},
-    msg::frame,
-    sockets::connect::ConnectGroups,
+    msg::frame::{self, Frame, Parsed},
+    remote_memory::IncomingData,
+    sockets::{Outbound, connect::ConnectGroups},
 };
 
 pub struct TcpSocketPool {
@@ -208,10 +209,6 @@ impl TcpSocketPool {
         state.connection_closed(socket.conn_id(), &err);
     }
 
-    fn parse_message(buffer: &mut BytesMut) -> Result<Option<Bytes>> {
-        frame::parse_message(buffer).map_err(Into::into)
-    }
-
     async fn start_recv_loop(
         mut recv_stream: OwnedReadHalf,
         tcp_socket: TcpSocket,
@@ -220,56 +217,141 @@ impl TcpSocketPool {
         let mut buffer = BytesMut::with_capacity(1 << 20);
         let socket = Socket::TCP(tcp_socket);
         loop {
-            if let Some(bytes) = Self::parse_message(&mut buffer)? {
-                let msg = Message::parse(bytes)?;
-                state.handle_recv(&socket, msg)?;
-            } else {
-                let n = recv_stream
-                    .read_buf(&mut buffer)
-                    .await
-                    .map_err(|e| Error::new(ErrorKind::TcpRecvMsgFailed, e.to_string()))?;
-                if n == 0 {
-                    return Err(Error::new(
-                        ErrorKind::TcpRecvMsgFailed,
-                        "socket eof".to_string(),
-                    ));
+            match frame::parse_frame(&mut buffer)? {
+                Parsed::Frame(Frame::Message(bytes)) => {
+                    let msg = Message::parse(bytes)?;
+                    state.handle_recv(&socket, msg)?;
+                }
+                Parsed::Frame(Frame::Data { head, len }) => {
+                    let mut incoming = IncomingData::begin(state, &socket, head, len);
+                    Self::receive_data(&mut recv_stream, &mut buffer, &mut incoming).await?;
+                    incoming.finish(state, &socket)?;
+                }
+                // The parser sized the buffer for a frame known to be
+                // incomplete, instead of doubling and copying it through
+                // repeated reads. Read little beyond that frame: bytes of a
+                // data frame that land here are copied once more, those read
+                // later go straight to their destination.
+                Parsed::Incomplete { missing } => {
+                    let limit = missing.saturating_add(READ_AHEAD);
+                    if buffer.capacity() - buffer.len() < READ_AHEAD {
+                        buffer.reserve(READ_AHEAD);
+                    }
+                    let n = recv_stream
+                        .read_buf(&mut (&mut buffer).limit(limit))
+                        .await
+                        .map_err(recv_failed)?;
+                    if n == 0 {
+                        return Err(end_of_stream());
+                    }
                 }
             }
         }
+    }
+
+    /// Consumes a data frame's raw bytes, which follow its head on the stream.
+    ///
+    /// Bytes that arrived in the receive buffer with the head are copied from
+    /// there. The others are read from the socket straight into their
+    /// destination while its write space is locked: only the nonblocking
+    /// read runs under the lock, never the wait for readiness. Ranges too
+    /// short for a read of their own, and bytes without a destination, pass
+    /// through the receive buffer, which is empty by then.
+    async fn receive_data(
+        recv_stream: &mut OwnedReadHalf,
+        buffer: &mut BytesMut,
+        incoming: &mut IncomingData,
+    ) -> Result<()> {
+        let buffered = incoming.remaining().min(buffer.len());
+        incoming.write(&buffer[..buffered]);
+        buffer.advance(buffered);
+        while incoming.remaining() > 0 {
+            recv_stream.readable().await.map_err(recv_failed)?;
+            let direct = incoming.read_with(DIRECT_READ_MIN, |slices| {
+                recv_stream.try_read_vectored(slices)
+            });
+            let read = direct.unwrap_or_else(|| {
+                let limit = incoming.remaining().min(READ_AHEAD);
+                buffer.reserve(limit);
+                let read = recv_stream.try_read_buf(&mut (&mut *buffer).limit(limit));
+                incoming.write(buffer);
+                buffer.clear();
+                read
+            });
+            match read {
+                Ok(0) => return Err(end_of_stream()),
+                Ok(_) => {}
+                // Readiness was stale; wait for the socket again.
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(recv_failed(error)),
+            }
+        }
+        Ok(())
     }
 
     async fn start_send_loop(
         mut send_stream: OwnedWriteHalf,
-        mut receiver: mpsc::Receiver<Bytes>,
+        mut receiver: mpsc::Receiver<Outbound>,
     ) -> Result<()> {
         const LIMIT: usize = 64;
-        let mut msgs = Vec::with_capacity(LIMIT);
+        let mut frames = Vec::with_capacity(LIMIT);
+        // Unwritten segments of the received frames, in wire order.
+        let mut segments = VecDeque::with_capacity(LIMIT);
         loop {
-            let mut bufs = [IoSlice::new(&[]); LIMIT];
-
-            let n = receiver.recv_many(&mut msgs, LIMIT).await;
-            if n == 0 {
+            if receiver.recv_many(&mut frames, LIMIT).await == 0 {
                 return Ok(());
             }
+            segments.extend(frames.drain(..).flat_map(Outbound::segments));
 
-            for (msg, io_slice) in msgs.iter().zip(&mut bufs) {
-                *io_slice = IoSlice::new(msg);
-            }
-
-            let mut slices = &mut bufs[..msgs.len()];
-            while !slices.is_empty() {
-                match send_stream.write_vectored(slices).await {
-                    Ok(n) => {
-                        IoSlice::advance_slices(&mut slices, n);
+            while !segments.is_empty() {
+                let mut slices = [IoSlice::new(&[]); LIMIT];
+                let mut count = 0;
+                for (slice, segment) in slices.iter_mut().zip(&segments) {
+                    *slice = IoSlice::new(&segment.bytes);
+                    count += 1;
+                }
+                let mut written = match send_stream.write_vectored(&slices[..count]).await {
+                    Ok(0) => {
+                        return Err(Error::new(
+                            ErrorKind::TcpSendMsgFailed,
+                            "socket accepted no bytes".into(),
+                        ));
                     }
-                    Err(e) => {
-                        return Err(Error::new(ErrorKind::TcpSendMsgFailed, e.to_string()));
+                    Ok(written) => written,
+                    Err(e) => return Err(Error::new(ErrorKind::TcpSendMsgFailed, e.to_string())),
+                };
+                // Release every segment as soon as it is written: a data
+                // frame's segments share buffers that their owner waits for,
+                // and its last one returns the frame's queued bytes.
+                while written > 0 {
+                    let first = segments.front_mut().expect("written bytes were queued");
+                    if written < first.bytes.len() {
+                        first.bytes.advance(written);
+                        break;
                     }
+                    written -= first.bytes.len();
+                    segments.pop_front();
                 }
             }
-            msgs.clear();
         }
     }
+}
+
+/// Bytes read beyond what the frame under assembly needs. Batches small
+/// messages into few reads, and bounds how much of a data frame is received
+/// into the buffer instead of its destination.
+const READ_AHEAD: usize = 64 << 10;
+
+/// Shortest remainder of a destination range that gets a socket read of its
+/// own. Shorter ones are cheaper to read together and copy.
+const DIRECT_READ_MIN: usize = 4 << 10;
+
+fn recv_failed(error: std::io::Error) -> Error {
+    Error::new(ErrorKind::TcpRecvMsgFailed, error.to_string())
+}
+
+fn end_of_stream() -> Error {
+    Error::new(ErrorKind::TcpRecvMsgFailed, "socket eof".to_string())
 }
 
 impl std::fmt::Debug for TcpSocketPool {

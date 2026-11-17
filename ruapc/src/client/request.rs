@@ -41,6 +41,12 @@ impl<'a> ReadAttachment<'a> {
 }
 
 impl Client {
+    /// When a response awaited from now on is due: this client's timeout,
+    /// capped by the remaining budget of the request that `ctx` handles.
+    pub(crate) fn response_deadline(&self, ctx: &Context) -> std::time::Instant {
+        capped_deadline(std::time::Instant::now(), self.timeout, ctx.deadline)
+    }
+
     /// Executes one logical call, including pre-wire retries and metrics.
     /// The caller keeps `write_target` and recovers its buffers afterwards.
     pub(crate) async fn ruapc_request<Req, Rsp, E>(
@@ -339,7 +345,7 @@ mod tests {
         }
     }
 
-    fn connected_context(sender: tokio::sync::mpsc::Sender<bytes::Bytes>) -> Context {
+    fn connected_context(sender: tokio::sync::mpsc::Sender<crate::sockets::Outbound>) -> Context {
         let config = SocketPoolConfig {
             #[cfg(feature = "rdma")]
             rdma: None,
@@ -398,7 +404,8 @@ mod tests {
         assert_eq!(
             route
                 .gather(
-                    &[crate::CopyOp::new(0, 0, 4)],
+                    vec![crate::CopyOp::new(0, 0, 4)],
+                    bytes::BytesMut::new(),
                     std::time::Instant::now() + Duration::from_millis(10)
                 )
                 .await
@@ -417,7 +424,7 @@ mod tests {
     async fn source_requests_progress_during_send_and_response_then_stop_on_cancel() {
         let (sender, mut queue) = tokio::sync::mpsc::channel(1);
         sender
-            .send(bytes::Bytes::from_static(b"occupied"))
+            .send(bytes::Bytes::from_static(b"occupied").into())
             .await
             .unwrap();
         let ctx = connected_context(sender);
@@ -440,13 +447,13 @@ mod tests {
                 .waiter
                 .read_source(0, ctx.conn_id().unwrap())
                 .unwrap();
-            let ops = [crate::CopyOp::new(1, 0, 2)];
-            let mut copying = Box::pin(route.gather(&ops, deadline));
+            let ops = vec![crate::CopyOp::new(1, 0, 2)];
+            let mut copying = Box::pin(route.gather(ops, bytes::BytesMut::new(), deadline));
             assert!(futures_util::poll!(copying.as_mut()).is_pending());
             assert!(futures_util::poll!(request.as_mut()).is_pending());
-            assert_eq!(copying.await.unwrap(), b"ea");
+            assert_eq!(&copying.await.unwrap()[..], b"ea");
 
-            assert_eq!(queue.recv().await.unwrap(), b"occupied"[..]);
+            assert_eq!(queue.recv().await.unwrap().into_bytes(), b"occupied"[..]);
             assert!(futures_util::poll!(request.as_mut()).is_pending());
             assert!(queue.try_recv().is_ok());
             let mut validating = Box::pin(route.validate(deadline));
@@ -502,7 +509,7 @@ mod tests {
     async fn full_send_queue_observes_parent_deadline_without_retrying() {
         let (sender, mut queue) = tokio::sync::mpsc::channel(1);
         sender
-            .send(bytes::Bytes::from_static(b"occupied"))
+            .send(bytes::Bytes::from_static(b"occupied").into())
             .await
             .unwrap();
         let mut ctx = connected_context(sender);
@@ -526,7 +533,7 @@ mod tests {
         .expect("full queue must not hide the request deadline");
         assert_eq!(result.unwrap_err().kind, ErrorKind::Timeout);
         assert_eq!(ctx.state.waiter.pending_count(), 0);
-        assert_eq!(queue.recv().await.unwrap(), b"occupied"[..]);
+        assert_eq!(queue.recv().await.unwrap().into_bytes(), b"occupied"[..]);
         assert!(
             queue.try_recv().is_err(),
             "expired request was never accepted"
@@ -652,7 +659,7 @@ mod tests {
     async fn cancelling_queue_admission_removes_waiter_without_sending() {
         let (sender, mut queue) = tokio::sync::mpsc::channel(1);
         sender
-            .send(bytes::Bytes::from_static(b"occupied"))
+            .send(bytes::Bytes::from_static(b"occupied").into())
             .await
             .unwrap();
         let ctx = connected_context(sender);
@@ -673,7 +680,7 @@ mod tests {
         assert_eq!(ctx.state.waiter.pending_count(), 1);
         drop(request);
         assert_eq!(ctx.state.waiter.pending_count(), 0);
-        assert_eq!(queue.recv().await.unwrap(), b"occupied"[..]);
+        assert_eq!(queue.recv().await.unwrap().into_bytes(), b"occupied"[..]);
         assert!(queue.try_recv().is_err());
     }
 

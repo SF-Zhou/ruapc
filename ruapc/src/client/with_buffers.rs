@@ -430,7 +430,7 @@ mod tests {
             }
             let peer = async {
                 let encoded = queue.recv().await.unwrap();
-                let mut encoded = BytesMut::from(encoded.as_ref());
+                let mut encoded = BytesMut::from(encoded.into_bytes().as_ref());
                 let request =
                     Message::parse(frame::parse_message(&mut encoded).unwrap().unwrap()).unwrap();
                 let retained = ctx
@@ -532,7 +532,7 @@ mod tests {
             let mut call = Box::pin(wrapper.buffered(&ctx, &()));
             assert!(futures_util::poll!(call.as_mut()).is_pending());
             let encoded = queue.recv().await.unwrap();
-            let mut encoded = BytesMut::from(encoded.as_ref());
+            let mut encoded = BytesMut::from(encoded.into_bytes().as_ref());
             let request =
                 Message::parse(frame::parse_message(&mut encoded).unwrap().unwrap()).unwrap();
             let (route, deadline) = ctx
@@ -598,7 +598,7 @@ mod tests {
         // Writes into the destinations attached to one request, then answers it.
         let mut serve = async |data: &[u8], response: Vec<u8>| {
             let encoded = queue.recv().await.unwrap();
-            let mut encoded = BytesMut::from(encoded.as_ref());
+            let mut encoded = BytesMut::from(encoded.into_bytes().as_ref());
             let request =
                 Message::parse(frame::parse_message(&mut encoded).unwrap().unwrap()).unwrap();
             ctx.state
@@ -733,7 +733,10 @@ mod tests {
     }
 
     /// A context whose outgoing requests the test receives and answers itself.
-    fn queued_context() -> (Context, tokio::sync::mpsc::Receiver<Bytes>) {
+    fn queued_context() -> (
+        Context,
+        tokio::sync::mpsc::Receiver<crate::sockets::Outbound>,
+    ) {
         let config = SocketPoolConfig {
             #[cfg(feature = "rdma")]
             rdma: None,
@@ -760,9 +763,11 @@ mod tests {
     }
 
     /// Receives one request and returns its message id.
-    async fn next_request(queue: &mut tokio::sync::mpsc::Receiver<Bytes>) -> u64 {
+    async fn next_request(
+        queue: &mut tokio::sync::mpsc::Receiver<crate::sockets::Outbound>,
+    ) -> u64 {
         let encoded = queue.recv().await.unwrap();
-        let mut encoded = BytesMut::from(encoded.as_ref());
+        let mut encoded = BytesMut::from(encoded.into_bytes().as_ref());
         Message::parse(frame::parse_message(&mut encoded).unwrap().unwrap())
             .unwrap()
             .meta

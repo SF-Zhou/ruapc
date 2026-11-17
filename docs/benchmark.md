@@ -200,8 +200,8 @@ Compare these scopes separately: excluding reusable layout preparation does not
 measure the cost of a complete attachment or one-shot transfer. Gather always
 includes packed-output allocation and destruction.
 
-The receiver case models the CPU-copy portion of an inline-write handler with
-an available target and an uncontended mutex. It excludes request lookup,
+The receiver case models the CPU-copy portion of writing received bytes into
+an available target with an uncontended mutex. It excludes request lookup,
 admission, RPC dispatch, unavailable-target handling and DMA ownership. Use the
 RPC harness for those runtime costs.
 

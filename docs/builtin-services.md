@@ -49,8 +49,7 @@ Their Rust trait and request types are crate-private.
 
 | Method | Request | Success value | Data path |
 |---|---|---|---|
-| `MemoryService/read_inline` | Original request ID and `CopyOp` batch | `ReadInlineResponse { bytes }` in operation order | TCP/WS/HTTP read; data in response. |
-| `MemoryService/write_inline` | Original request ID, `CopyOp` batch, bytes | `()` | TCP/WS/HTTP write; data in request. |
+| `MemoryService/read_inline` | Original request ID and `CopyOp` batch; destinations as this call's write space | `()` after the data frames | TCP/WS/HTTP read; data frames to this call. |
 | `MemoryService/read_into_target` | Original request ID and `CopyOp` batch; source in `MsgMeta.read_regions` | `()` | Client RDMA-READs server buffers into its pinned target. |
 | `MemoryService/validate_read_source` | Original request ID | `()` | Post-READ validation serviced by the original borrowing future. |
 
@@ -65,9 +64,12 @@ future; an expired or unresponsive source returns an RPC error. It is not a
 waiter-membership query.
 
 Inline reads route to the original request future, which gathers its borrowed
-source during a poll. A batch whose reply would reach the 64 MiB message limit
-is rejected before it is queued. Inline writes require the original request's
-retained write target. Both validate copy ranges. `read_into_target` additionally requires an
+source one data frame of at most 1 MiB per piece; the handler checks the batch
+against the source and this call's write space before the first byte moves,
+and the reader requires the frames to fill exactly its batch's destinations.
+Stream writes use no method: they are
+[data frames](remote-memory.md#stream-transports-data-frames) to the original
+request, which bind to its connection the same way. `read_into_target` additionally requires an
 established RDMA connection and advertised read regions. An ordinary HTTP POST
 cannot supply those RDMA prerequisites; the route reaches the handler, which
 returns an RPC error. Unary HTTP also lacks the reverse-RPC stream used by the
