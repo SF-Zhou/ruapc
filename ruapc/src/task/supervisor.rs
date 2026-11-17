@@ -125,6 +125,18 @@ impl TaskSupervisor {
         self.0.stopped.cancelled()
     }
 
+    /// Number of currently held task guards, including the internal stop
+    /// observer.
+    ///
+    /// Unit tests use this to observe that a task released its registration
+    /// without stopping the supervisor. Transport loops register one guard per
+    /// task, so a loop that forgets to race its I/O against teardown leaves the
+    /// count above its baseline.
+    #[cfg(test)]
+    pub(crate) fn running_tasks(&self) -> u64 {
+        self.0.running.load(Ordering::Acquire)
+    }
+
     /// Registers infrastructure during construction or under an existing task
     /// guard. These callers guarantee the task count cannot have reached zero;
     /// external callers must use the shutdown-aware `try_start_async_task`.

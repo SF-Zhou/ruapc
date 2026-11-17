@@ -94,6 +94,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   refresh their timeout metadata without allocating or shifting the payload.
 
 ### Fixed
+- TCP and WebSocket connections whose peer sent EOF stayed half open: the
+  receive loop evicted the socket, but the independent send loop kept the write
+  half and the connection's only send-queue sender alive, so its queue never
+  closed and the task never ended. The peer never received a FIN and each
+  leaked connection held one descriptor in `CLOSE_WAIT` on servers (and in
+  `FIN-WAIT-2` on clients) until the pool stopped. Both loops now race their
+  I/O against the connection's teardown signal, so either direction ending
+  drops the halves, releases the descriptor and evicts the socket. A
+  half-closed peer is therefore treated as gone; requests on such a connection
+  already failed with `ConnectionClosed` once its receive side ended, so the
+  remaining write direction had no users.
 - A provider-rejected direct RDMA SEND consumed a non-refundable window credit
   without closing the connection, so repeated failures could stall it forever;
   the connection now fails like the poller's own posts.

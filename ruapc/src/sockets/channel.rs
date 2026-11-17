@@ -32,6 +32,17 @@ impl ChannelConnection {
         self.lifecycle.is_closed() || self.sender.is_closed()
     }
 
+    /// Completes once teardown marked this connection closed.
+    ///
+    /// Transport loops race their I/O against this future so that one
+    /// direction failing ends the other one. Each loop keeps the queue's only
+    /// sender alive through its `Arc<ChannelConnection>`, so a loop cannot wait
+    /// for the queue to close while it is the one that would have to drop the
+    /// sender.
+    pub(crate) async fn closed(&self) {
+        self.lifecycle.closed().await
+    }
+
     /// Reserves capacity within the request's budget, then encodes and commits
     /// without yielding. Responses have no local response waiter or deadline.
     pub(crate) async fn send(
