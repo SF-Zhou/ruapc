@@ -118,6 +118,15 @@ impl TcpSocketPool {
                     () = task_supervisor.stopped() => {
                         Error::new(ErrorKind::ConnectionClosed, "TCP pool stopped".into())
                     }
+                    // Teardown from the receive loop must also end this task:
+                    // it owns the write half and keeps the send queue's only
+                    // sender alive through `tcp_socket`, so dropping them is
+                    // what reports EOF to the peer and releases the descriptor.
+                    // Waiting for `recv_many` to observe channel closure cannot
+                    // work while this task itself keeps the sender alive.
+                    () = tcp_socket.closed() => {
+                        Error::new(ErrorKind::ConnectionClosed, "TCP connection closed".into())
+                    }
                     result = Self::start_send_loop(send_stream, receiver) => result.err()
                         .unwrap_or_else(|| Error::new(
                             ErrorKind::ConnectionClosed,
@@ -146,6 +155,12 @@ impl TcpSocketPool {
                 let error = tokio::select! {
                     () = recv_task.stopped() => {
                         Error::new(ErrorKind::ConnectionClosed, "TCP pool stopped".into())
+                    }
+                    // Symmetric teardown: a failed send loop must release the
+                    // read half too instead of leaving the descriptor alive in
+                    // the pool.
+                    () = tcp_socket.closed() => {
+                        Error::new(ErrorKind::ConnectionClosed, "TCP connection closed".into())
                     }
                     result = Self::start_recv_loop(recv_stream, tcp_socket.clone(), &state) =>
                         result.err().unwrap_or_else(|| Error::new(
@@ -265,12 +280,103 @@ impl std::fmt::Debug for TcpSocketPool {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
+
     use super::*;
+    use crate::{Context, RawStream, SocketPoolConfig, sockets::AcquireOptions};
 
     #[tokio::test]
     async fn test_tcp_socket_pool_debug_format() {
         let pool = TcpSocketPool::new();
         let debug = format!("{pool:?}");
         assert!(debug.contains("TcpSocketPool"));
+    }
+
+    /// A peer that sends EOF is gone: the server must close its own write half
+    /// (and thus the descriptor) instead of keeping the connection half open in
+    /// `CLOSE_WAIT` until the pool stops.
+    #[tokio::test]
+    async fn peer_eof_closes_server_write_half() {
+        let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = ctx.state.clone();
+        let accept = tokio::spawn(async move {
+            while let Ok((stream, peer)) = listener.accept().await {
+                state
+                    .clone()
+                    .handle_new_stream(RawStream::TCP(stream), peer)
+                    .await;
+            }
+        });
+
+        // Send FIN without waiting for the connection to be fully established
+        // on the server side; EOF is observable as soon as the accept loop ran.
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut buf = [0u8; 1];
+        let closed = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf)).await;
+        accept.abort();
+        let n = closed
+            .expect("server must close the connection after peer EOF")
+            .expect("client read must succeed");
+        assert_eq!(n, 0, "client must observe the server FIN");
+    }
+
+    /// The client-side mirror: when the remote closes, the recv loop must evict
+    /// the socket and close the local half instead of holding the pooled
+    /// connection (and its descriptor) open.
+    #[tokio::test]
+    async fn remote_eof_evicts_and_closes_client_socket() {
+        let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut buf = [0u8; 1];
+            let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+                .await
+                .expect("client must close its half after the server EOF")
+                .expect("server read must succeed");
+            assert_eq!(n, 0);
+        });
+
+        let endpoint: Endpoint = format!("tcp://{addr}").parse().unwrap();
+        let socket = ctx
+            .state
+            .socket_pool
+            .acquire(&endpoint, &ctx.state)
+            .await
+            .unwrap();
+        let Socket::TCP(tcp_socket) = &socket else {
+            panic!("TCP endpoint must acquire a TCP socket");
+        };
+        server.await.unwrap();
+
+        // The receive loop runs teardown asynchronously with respect to the
+        // FIN the raw peer observed; wait for the eviction to become visible.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if ctx
+                .state
+                .socket_pool
+                .try_acquire(&endpoint, AcquireOptions::default())
+                .is_none()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "closed connection must be evicted from the pool"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(tcp_socket.is_closed());
     }
 }

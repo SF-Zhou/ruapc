@@ -42,6 +42,11 @@ impl WebSocket {
     pub(crate) fn is_closed(&self) -> bool {
         self.inner.is_closed()
     }
+
+    /// Completes once teardown marked this connection closed.
+    pub(crate) async fn closed(&self) {
+        self.inner.closed().await;
+    }
 }
 
 impl PoolConnection for WebSocket {

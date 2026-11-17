@@ -160,6 +160,15 @@ impl WebSocketPool {
                     () = task_supervisor.stopped() => {
                         Error::new(ErrorKind::ConnectionClosed, "WebSocket pool stopped".into())
                     }
+                    // Teardown from the receive loop must also end this task:
+                    // it owns the sink half and keeps the send queue's only
+                    // sender alive through `web_socket`, so dropping them is
+                    // what closes the underlying stream. Waiting for `recv` to
+                    // observe channel closure cannot work while this task
+                    // itself keeps the sender alive.
+                    () = web_socket.closed() => {
+                        Error::new(ErrorKind::ConnectionClosed, "WebSocket connection closed".into())
+                    }
                     result = Self::start_send_loop(send_stream, receiver) => result.err()
                         .unwrap_or_else(|| Error::new(
                             ErrorKind::ConnectionClosed,
@@ -188,6 +197,11 @@ impl WebSocketPool {
                 let error = tokio::select! {
                     () = recv_task.stopped() => {
                         Error::new(ErrorKind::ConnectionClosed, "WebSocket pool stopped".into())
+                    }
+                    // Symmetric teardown: a failed send loop must release the
+                    // receive half too instead of leaving the descriptor alive.
+                    () = web_socket.closed() => {
+                        Error::new(ErrorKind::ConnectionClosed, "WebSocket connection closed".into())
                     }
                     result = Self::start_recv_loop(recv_stream, web_socket.clone(), &state) =>
                         result.err().unwrap_or_else(|| Error::new(
@@ -301,7 +315,15 @@ impl std::fmt::Debug for WebSocketPool {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
+
     use super::*;
+    use crate::{Context, ListenMode, RawStream, SocketPoolConfig};
 
     #[tokio::test]
     async fn test_web_socket_pool_debug_format() {
@@ -311,5 +333,58 @@ mod tests {
         // Exercise shutdown through the guard used by the composite pool.
         drop(pool.drop_guard());
         pool.join().await;
+    }
+
+    /// A peer that sends EOF is gone: the server must close the underlying
+    /// stream instead of keeping it half open until the pool stops.
+    #[tokio::test]
+    async fn peer_eof_closes_server_connection() {
+        let config = SocketPoolConfig {
+            listen_mode: ListenMode::WS,
+            ..Default::default()
+        };
+        let ctx = Context::create(&config).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = ctx.state.clone();
+        let accept = tokio::spawn(async move {
+            while let Ok((stream, peer)) = listener.accept().await {
+                state
+                    .clone()
+                    .handle_new_stream(RawStream::TCP(stream), peer)
+                    .await;
+            }
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "GET / HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\n\
+             Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Version: 13\r\n\r\n"
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        // Consume the upgrade response: the server has installed its receive
+        // loop by the time the handshake completes, so the EOF below is the
+        // only end-of-stream it can observe. The timeout keeps a regression
+        // that stalls the accept path from hanging the test.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut response = Vec::new();
+            let mut chunk = [0u8; 512];
+            while !response.windows(4).any(|window| window == b"\r\n\r\n") {
+                let n = client.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "connection ended during the WebSocket handshake");
+                response.extend_from_slice(&chunk[..n]);
+            }
+        })
+        .await
+        .expect("server must answer the WebSocket handshake");
+        client.shutdown().await.unwrap();
+        let mut buf = [0u8; 1];
+        let closed = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf)).await;
+        accept.abort();
+        let n = closed
+            .expect("server must close the WebSocket after peer EOF")
+            .expect("client read must succeed");
+        assert_eq!(n, 0, "client must observe the server FIN");
     }
 }
