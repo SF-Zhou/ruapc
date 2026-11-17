@@ -288,7 +288,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{Context, RawStream, SocketPoolConfig, sockets::AcquireOptions};
+    use crate::{Context, MsgFlags, MsgMeta, RawStream, SocketPoolConfig, sockets::AcquireOptions};
 
     #[tokio::test]
     async fn test_tcp_socket_pool_debug_format() {
@@ -378,5 +378,72 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(tcp_socket.is_closed());
+    }
+
+    /// A failed send loop must end the pending receive loop of the same
+    /// connection without stopping the pool.
+    ///
+    /// The receive loop cannot observe the failure by itself: the peer keeps its
+    /// write direction open, so reads stay pending forever. Only the connection's
+    /// teardown signal raced into the select ends it. Without that arm the
+    /// receive task keeps the read half and its descriptor registered, so the
+    /// registration count stays above the idle baseline and only stopping the
+    /// whole pool would reclaim them.
+    #[tokio::test]
+    async fn send_failure_releases_pending_receive_half() {
+        let ctx = Context::create(&SocketPoolConfig::default()).unwrap();
+        let pool = TcpSocketPool::new();
+        let idle_tasks = pool.task_supervisor.running_tasks();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // The test peer owns the connection for the whole test: dropping it would
+        // send a FIN and end the receive loop through the EOF path instead.
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let (mut server_stream, peer) = listener.accept().await.unwrap();
+
+        // Half-close only the write direction before the pool takes the stream:
+        // the send loop's next write fails, while the receive loop stays blocked
+        // because the peer never sends data or EOF.
+        server_stream.shutdown().await.unwrap();
+        let socket = pool
+            .add_socket(None, peer, server_stream, &ctx.state)
+            .unwrap();
+
+        // One queued request makes the send loop attempt the failing write. The
+        // response receiver stays bound: teardown eagerly fails it.
+        let (msgid, _response) = ctx.state.waiter.alloc(Duration::from_secs(10));
+        let mut meta = MsgMeta {
+            msgid,
+            flags: MsgFlags::IsReq,
+            ..Default::default()
+        };
+        socket.send(&mut meta, &(), &ctx.state).await.unwrap();
+
+        // The receive loop future owned the read half and one task registration;
+        // returning to the idle count proves both were released. The supervisor
+        // keeps one guard for its internal stop observer, so the idle count
+        // also shows the pool itself is still running.
+        let stopped = tokio::time::timeout(Duration::from_secs(2), async {
+            while pool.task_supervisor.running_tasks() != idle_tasks {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            stopped.is_ok(),
+            "receive task stayed registered: {} != {idle_tasks}",
+            pool.task_supervisor.running_tasks(),
+        );
+        assert!(socket.is_closed());
+
+        // Only the failed connection may end: the pool keeps accepting new
+        // connections and their loops stay registered.
+        let _client2 = TcpStream::connect(addr).await.unwrap();
+        let (server_stream2, peer2) = listener.accept().await.unwrap();
+        let second = pool
+            .add_socket(None, peer2, server_stream2, &ctx.state)
+            .expect("a connection failure must not stop the pool");
+        assert!(!second.is_closed());
+        assert_eq!(pool.task_supervisor.running_tasks(), idle_tasks + 2);
     }
 }

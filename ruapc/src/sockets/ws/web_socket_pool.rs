@@ -323,7 +323,8 @@ mod tests {
     };
 
     use super::*;
-    use crate::{Context, ListenMode, RawStream, SocketPoolConfig};
+    use crate::{Context, ListenMode, MsgFlags, MsgMeta, RawStream, SocketPoolConfig};
+    use tokio_tungstenite::tungstenite::protocol::Role;
 
     #[tokio::test]
     async fn test_web_socket_pool_debug_format() {
@@ -386,5 +387,83 @@ mod tests {
             .expect("server must close the WebSocket after peer EOF")
             .expect("client read must succeed");
         assert_eq!(n, 0, "client must observe the server FIN");
+    }
+
+    /// The WebSocket mirror of the TCP send-failure regression: when the sink
+    /// fails while the peer keeps the stream open, only the connection's
+    /// teardown signal can end the pending receive half. Without that arm the
+    /// receive task keeps the stream (and its descriptor) alive until the whole
+    /// pool stops.
+    #[tokio::test]
+    async fn send_failure_releases_pending_receive_half() {
+        let config = SocketPoolConfig {
+            listen_mode: ListenMode::WS,
+            ..Default::default()
+        };
+        let ctx = Context::create(&config).unwrap();
+        let pool = WebSocketPool::new();
+        let idle_tasks = pool.task_supervisor.running_tasks();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // The test peer owns the connection for the whole test: dropping it would
+        // end the receive loop through the EOF path instead.
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let (mut server_stream, peer) = listener.accept().await.unwrap();
+
+        // Half-close only the write direction before the pool takes the stream:
+        // the sink's next send fails, while the receive loop stays blocked
+        // because the peer never sends data or a close frame. The stream is
+        // wrapped without a handshake, which the pool's framing does not need.
+        server_stream.shutdown().await.unwrap();
+        let stream = WebSocketStream::from_raw_socket(
+            server_stream,
+            Role::Server,
+            Some(web_socket_config()),
+        )
+        .await;
+        let socket = pool.add_socket(None, peer, stream, &ctx.state).unwrap();
+
+        // One queued request makes the send loop attempt the failing send. The
+        // response receiver stays bound: teardown eagerly fails it.
+        let (msgid, _response) = ctx.state.waiter.alloc(Duration::from_secs(10));
+        let mut meta = MsgMeta {
+            msgid,
+            flags: MsgFlags::IsReq,
+            ..Default::default()
+        };
+        socket.send(&mut meta, &(), &ctx.state).await.unwrap();
+
+        // The receive loop future owned the stream halves and one task
+        // registration; returning to the idle count proves both were released.
+        // The supervisor keeps one guard for its internal stop observer, so the
+        // idle count also shows the pool itself is still running.
+        let stopped = tokio::time::timeout(Duration::from_secs(2), async {
+            while pool.task_supervisor.running_tasks() != idle_tasks {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            stopped.is_ok(),
+            "receive task stayed registered: {} != {idle_tasks}",
+            pool.task_supervisor.running_tasks(),
+        );
+        assert!(socket.is_closed());
+
+        // Only the failed connection may end: the pool keeps accepting new
+        // connections and their loops stay registered.
+        let _client2 = TcpStream::connect(addr).await.unwrap();
+        let (server_stream2, peer2) = listener.accept().await.unwrap();
+        let stream2 = WebSocketStream::from_raw_socket(
+            server_stream2,
+            Role::Server,
+            Some(web_socket_config()),
+        )
+        .await;
+        let second = pool
+            .add_socket(None, peer2, stream2, &ctx.state)
+            .expect("a connection failure must not stop the pool");
+        assert!(!second.is_closed());
+        assert_eq!(pool.task_supervisor.running_tasks(), idle_tasks + 2);
     }
 }
