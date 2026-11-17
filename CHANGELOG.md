@@ -7,8 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 ## [Unreleased]
 
 ### Security
-- Remote-memory reverse RPCs (`MemoryService/read_inline`, `write_inline`,
-  `read_into_target` and `validate_read_source`) now reach a request's read
+- Remote-memory reverse RPCs (`MemoryService/read_inline`,
+  `read_into_target` and `validate_read_source`) and stream data frames now
+  reach a request's read
   source or write destinations only when they arrive on the connection that
   carries the request. Request IDs are sequential, so a peer on any other
   connection of the same process could previously guess one and read the
@@ -16,14 +17,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   call. Such calls, and unary HTTP calls that have no such connection, now
   return the same `Timeout` error as a request that is gone. See
   [route binding](docs/safe-boundaries.md#routes-belong-to-the-requests-connection).
-- `MemoryService/read_inline` rejects a batch whose reply would reach the
-  64 MiB message limit before queueing it. Source ranges may overlap, so a
-  peer could previously make the borrowing request future allocate and copy up
-  to 1024 times its attached source for a reply that no frame can carry.
-  A stream `remote_read` of that size now fails with `InvalidCopyOp` instead
-  of waiting for its deadline.
+- `MemoryService/read_inline` checks a batch against the source and its own
+  write space before queueing any work, and asks the borrowing request future
+  for one data frame of at most 1 MiB per piece. The source loop serves a
+  bounded number of queued pieces per poll (at most 32 MiB), so a peer can no
+  longer make that future allocate and copy up to 1024 times its attached
+  source in one poll.
 
 ### Added
+- `ruapc_wire::frame` data frames: `DataHead`, `DataRange`, `Frame`,
+  `Parsed`, `parse_frame`, `FrameDecoder::decode_frame`,
+  `FrameDecoder::has_partial`, `encode_data_head`, `DATA_MAGIC_NUM`,
+  `MAX_DATA_LEN`, `MAX_DATA_HEAD_LEN` and `EAGER_RESERVE`. `parse_frame`
+  reports how many bytes an incomplete frame still needs and reserves room for
+  them within the `EAGER_RESERVE` bound.
+- Metrics for stream data frames: `ruapc_data_frames_total` and
+  `ruapc_data_bytes_total`, labelled `direction` (`sent` or `received`), and
+  `ruapc_data_frames_discarded_total` for received frames whose bytes did not
+  all reach a write space.
+- `ruapc_memory`: `BufferSet::slices_mut` and `write_at` for contiguous
+  destination ranges, `CopyBatch::split` for bounded pieces,
+  `ReadSource::for_each_slice` and `SpaceLayout::check_range`.
 - `ruapc_rdma::QueuePair::post_reads` posts up to 16 READ requests as one
   linked WR chain and reports how many the provider accepted;
   `QueuePair::recv_many` posts up to 32 receives per call. `MAX_READ_CHAIN` and
@@ -34,6 +48,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   including peers with no remaining connections.
 
 ### Changed
+- **BREAKING** (wire): TCP, WebSocket and HTTP/2 move remote-memory bytes in
+  `RUAD` [data frames](docs/remote-memory.md#stream-transports-data-frames)
+  to a pending request's write space instead of inside RPC messages.
+  `remote_write` pushes the source buffers to the original request, and the
+  client's receive loop applies them and acknowledges the last frame without
+  running a handler; `MemoryService/write_inline` is removed.
+  `MemoryService/read_inline` lends the handler's destinations as its write
+  space and returns `()`; the client pushes the source bytes to it. Frames
+  carry at most 1 MiB, so stream transfers are no longer limited to 64 MiB per
+  batch. Sources are sent without copying, from `Bytes` that share the
+  handler's buffers through multi-segment send-queue entries; TCP reads
+  received bytes straight into the destination buffers. A stream
+  `remote_write`'s sources return once the connection has dropped every frame
+  that shares them; after a failed write, each buffer returns to its pool as
+  soon as its own last frame is dropped. The reader of a stream `remote_read`
+  requires the frames to fill exactly the destinations of its own copy
+  operations, in operation order: a repeated, skipped or misplaced byte fails
+  the transfer with `InvalidCopyOp` and the reason the frame was refused.
+- **BREAKING** (API): `tcp::TcpSocket::new`, `ws::WebSocket::new` and
+  `http::ChannelBody::new` are crate-private: their send queues now carry
+  crate-private multi-segment frame entries instead of `Bytes`.
+- Stream receivers reserve buffer space for an incomplete frame once, after
+  its header, but at most the larger of `EAGER_RESERVE` (1 MiB) and the bytes
+  received so far.
+- Stream send queues admit data frames by bytes before entries: one frame
+  can own about 1 MiB of gathered storage, so a slow reader can keep at most
+  8 MiB of data frames queued per connection instead of the entry count
+  suggesting nearly a gigabyte. A frame's bytes are released once its last
+  segment is written, and a frame waiting for bytes holds no queue entry.
+  A frame that waits for bytes is admitted before any frame that arrives
+  later, so a large frame cannot starve behind smaller ones.
+- A receive loop that cannot queue the acknowledgement of a data frame hands
+  it to a task instead of waiting for its own send queue. A connection keeps
+  at most 1024 such tasks and closes when a peer asks for more without
+  reading the answers.
+- `CopyBatch::split` rejects `max_ops` above `MAX_COPY_OPS`, which would
+  otherwise produce pieces that are not valid batches.
 - **BREAKING** (API): `RdmaPathReport` is `#[non_exhaustive]`; obtain it from
   `State::rdma_path_report()` instead of constructing it.
 - **BREAKING** (wire): RDMA bootstrap protocol version 4 removes
@@ -105,6 +156,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   half-closed peer is therefore treated as gone; requests on such a connection
   already failed with `ConnectionClosed` once its receive side ended, so the
   remaining write direction had no users.
+- HTTP/2 RPC streams report a body that ends inside a partially received
+  header or data frame instead of treating it as a clean stream end.
 - A provider-rejected direct RDMA SEND consumed a non-refundable window credit
   without closing the connection, so repeated failures could stall it forever;
   the connection now fails like the poller's own posts.

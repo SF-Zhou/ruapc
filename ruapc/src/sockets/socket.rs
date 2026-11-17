@@ -4,6 +4,7 @@ use ruapc_bufpool::RemoteBufferInfo;
 use serde::Serialize;
 use thin_vec::ThinVec;
 
+use super::ChannelConnection;
 use crate::{Buffer, MsgMeta, Result, State, http::HttpSocket, tcp::TcpSocket, ws::WebSocket};
 #[cfg(feature = "rdma")]
 use crate::{Error, ErrorKind, rdma::RdmaSocket};
@@ -107,6 +108,25 @@ impl Socket {
             Socket::HTTP(http_socket) => http_socket.send(meta, payload, state).await,
             #[cfg(feature = "rdma")]
             Socket::RDMA(rdma_socket) => rdma_socket.send(meta, payload, state).await,
+        }
+    }
+
+    /// The send queue of a connection that carries data frames: raw bytes for
+    /// a pending request's write space, outside any message. `None` for a
+    /// unary HTTP exchange, which carries JSON bodies only, and for RDMA,
+    /// which moves bulk bytes with READs instead.
+    ///
+    /// Frames reach a pending request only on the connection that carries it:
+    /// this channel's [`conn_id`](ChannelConnection::conn_id) is the only
+    /// identity a data frame may be routed by.
+    pub(crate) fn data_channel(&self) -> Option<&ChannelConnection> {
+        match self {
+            Self::TCP(socket) => Some(socket.channel()),
+            Self::WS(socket) => Some(socket.channel()),
+            Self::HTTP(HttpSocket::Stream(socket)) => Some(socket.channel()),
+            Self::HTTP(HttpSocket::ForResponse(_)) => None,
+            #[cfg(feature = "rdma")]
+            Self::RDMA(_) => None,
         }
     }
 }

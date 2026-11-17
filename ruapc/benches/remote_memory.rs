@@ -12,7 +12,7 @@
 //! Every operation verifies the complete deterministic byte pattern; reported
 //! time includes that verification. Bulk bytes use remote memory, with only a
 //! case index and byte count in the application RPC request/response. RDMA uses
-//! one-sided reads; TCP/WS/HTTP use their inline reverse-RPC fallback.
+//! one-sided reads; TCP/WS/HTTP push data frames.
 
 use std::{
     sync::{Arc, Mutex},

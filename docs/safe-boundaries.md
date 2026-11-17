@@ -157,25 +157,39 @@ control-message route, never a source reference
 or address that a background CPU reader can dereference.
 
 `read_inline` accepts a request ID and logical operations, not peer-provided
-addresses. It sends that operation to the original request future, which
-synchronously gathers the bytes during its poll and replies with an owned byte
-vector. No borrowed source escapes that poll into an independent task.
-Source ranges may overlap, so the handler rejects a batch before queueing it
-when it has too many operations or its reply would reach the 64 MiB message
-limit: a peer cannot make the borrowing future allocate and copy more than one
-message can carry.
+addresses. It sends one data frame's piece at a time to the original request
+future, which synchronously gathers those bytes during its poll into owned
+frame storage. No borrowed source escapes that poll into an independent task.
+Source ranges may overlap, so the handler rejects a batch with too many
+operations or ranges outside the source or its own write space before
+queueing any work, and each queued piece is at most one data frame, 1 MiB. The
+source loop serves a bounded number of queued pieces per poll
+(`SOURCE_REQUEST_CAPACITY`), so one poll copies at most that many frames, and a
+full send queue holds back the next piece. On the reading side, the frames
+must fill exactly the destinations of the reader's own batch, in operation
+order; a repeated, skipped or misplaced byte refuses the whole transfer. A
+byte count alone would let a peer leave requested destinations stale.
 
 ### Routes belong to the request's connection
 
 The waiter entry holds a request's source route and write target from the
-moment its ID exists. `read_inline`, `write_inline`, `read_into_target` and
-`validate_read_source` name the original request by that ID, and reach its
-memory only when they arrive on the connection the request was sent on. Request
+moment its ID exists. `read_inline`, `read_into_target`,
+`validate_read_source` and stream data frames name the original request by
+that ID, and reach its memory only when they arrive on the connection the
+request was sent on. Request
 IDs are sequential and easy to guess, and a process usually has several peers;
 an ID alone therefore selects nothing. A reverse RPC from another connection,
 or from a unary HTTP exchange that has none, gets the same `Timeout` error as
-one for a request that is gone. This binds a route to its connection; it does
-not authenticate the peer on that connection.
+one for a request that is gone; a data frame from elsewhere is consumed
+without writing anything, and its acknowledgement, if requested, carries that
+error. This binds a route to its connection; it does not authenticate the
+peer on that connection.
+
+An acknowledgement is requested by the peer, for any frame it likes, and is
+sent by the receive loop, which must not wait for its own send queue. With
+that queue full, the answer waits in a task. A connection keeps at most 1024
+such tasks and closes when a peer asks for more without reading: a frame is
+a few bytes, so the tasks would otherwise grow without bound.
 
 ### Read first, then validate
 
