@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc};
 
 use ruapc::{
-    BufferAvailability, BufferReply, Client, Context, CopyOp, ListenMode, Result, Router, Server,
+    BufferAvailability, BufferReply, Client, Context, ListenMode, Result, Router, Server,
     SocketPoolConfig,
 };
 
@@ -22,22 +22,12 @@ const GUESSES: u64 = 256;
 
 // Wire-only proxies: the built-in remote-memory operations are not part of
 // RuaPC's public Rust API, but any peer can put their names on the wire.
+// Stream writes are data frames, which the public API sends only to the
+// request a handler serves; the unit tests forge them on other connections.
 #[derive(Serialize, Deserialize, JsonSchema)]
 struct ReadInline {
-    ops: Vec<CopyOp>,
+    ranges: Vec<(u64, u64)>,
     request_id: u64,
-}
-
-#[derive(Serialize, Deserialize, JsonSchema)]
-struct InlineBytes {
-    bytes: Vec<u8>,
-}
-
-#[derive(Serialize, Deserialize, JsonSchema)]
-struct WriteInline {
-    request_id: u64,
-    ops: Vec<CopyOp>,
-    bytes: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -47,8 +37,8 @@ struct ValidateSource {
 
 #[ruapc::service(name = "MemoryService")]
 trait RawMemory {
-    async fn read_inline(&self, ctx: &Context, req: &ReadInline) -> Result<InlineBytes>;
-    async fn write_inline(&self, ctx: &Context, req: &WriteInline) -> Result<()>;
+    /// The source bytes arrive in packed response frames.
+    async fn read_inline(&self, ctx: &Context, req: &ReadInline) -> Result<()>;
     async fn validate_read_source(&self, ctx: &Context, req: &ValidateSource) -> Result<()>;
 }
 
@@ -78,7 +68,6 @@ impl Holder for HolderImpl {
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 struct Loot {
     read: Vec<u8>,
-    writes: u32,
     validations: u32,
 }
 
@@ -96,22 +85,31 @@ impl Thief for ThiefImpl {
             use_msgpack: false,
             ..Default::default()
         };
-        let ops = vec![CopyOp::new(0, 0, *len)];
+        let ranges = vec![(0, *len)];
         let mut loot = Loot::default();
         for request_id in 0..GUESSES {
             let read = ReadInline {
-                ops: ops.clone(),
+                ranges: ranges.clone(),
                 request_id,
             };
-            if let Ok(reply) = client.read_inline(ctx, &read).await {
-                loot.read.extend(reply.bytes);
+            let mut space = ctx
+                .state
+                .buffer_pool
+                .allocate(usize::try_from(*len).unwrap())?;
+            space.set_len(usize::try_from(*len).unwrap());
+            space.fill(0);
+            let attached = client.with_write_buffers(vec![space]);
+            let read_ok = attached.read_inline(ctx, &read).await.is_ok();
+            let space = attached.take_write_buffers().into_available();
+            let received = space
+                .iter()
+                .flatten()
+                .flat_map(|buffer| buffer.iter().copied())
+                .filter(|&byte| byte != 0);
+            if read_ok {
+                loot.read.push(b'+');
             }
-            let write = WriteInline {
-                request_id,
-                ops: ops.clone(),
-                bytes: vec![b'!'; usize::try_from(*len).unwrap()],
-            };
-            loot.writes += u32::from(client.write_inline(ctx, &write).await.is_ok());
+            loot.read.extend(received);
             let validate = ValidateSource { request_id };
             loot.validations +=
                 u32::from(client.validate_read_source(ctx, &validate).await.is_ok());

@@ -57,7 +57,9 @@ impl Context {
     /// All transfers validate the connection, attached space, bounds, overflow,
     /// operation count and destination overlap. An empty or zero-byte batch
     /// returns `local` after validation without I/O.
-    /// RDMA uses one-sided READs; TCP/WS/HTTP use a reverse inline-copy RPC.
+    /// RDMA uses one-sided READs. On TCP, WebSocket and HTTP/2, the reader
+    /// requests source ranges in a reverse RPC and scatters the returned
+    /// packed bytes into `local` in copy-operation order.
     ///
     /// Returns the same buffers with the requested ranges filled. Failures
     /// return recoverable buffers in [`RemoteIoError`]; in-flight RDMA can
@@ -114,7 +116,8 @@ impl Context {
     /// while awaiting that response; this path does not use the pending probe
     /// described in [`remote_read`](Self::remote_read). Failure or cancellation
     /// can still recover the source before remote DMA finishes. TCP/WS/HTTP
-    /// instead send the bytes in an inline-copy RPC.
+    /// instead push the bytes into the original request's write space as data
+    /// frames and wait for the acknowledgement of the last one.
     ///
     /// The transfer happens *here*, inside the handler, so its latency and
     /// errors are directly observable. Pair the witness with a response
@@ -162,29 +165,25 @@ impl Context {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "rdma")]
-    use ruapc_memory::{BufferSet, CopyBatch};
+    use ruapc_memory::BufferSet;
     use std::time::Duration;
 
-    use bytes::{Bytes, BytesMut};
+    use bytes::Bytes;
     use ruapc_bufpool::RemoteBufferInfo;
-    use serde::Serialize;
 
     use crate::{
         BufferReply, Error, ErrorKind, MAX_COPY_OPS, Message, MsgFlags, MsgMeta, Payload, Socket,
-        SocketPoolConfig, msg::frame, tcp::TcpSocket,
+        SocketPoolConfig, core::ContextEndpoint, tcp::TcpSocket,
     };
-    #[cfg(feature = "rdma")]
     use crate::{
-        remote_memory::{MemoryService, WriteTarget, rpc_transfer::WriteInlineRequest},
+        msg::frame::{DataHead, DataPlacement},
+        remote_memory::{IncomingData, WriteTarget},
+        sockets::{
+            Outbound,
+            test_util::{self, Sent, deliver, encoded_data_frame},
+        },
         task::MemoryRoutes,
     };
-
-    #[derive(Serialize)]
-    struct PackedReadReply {
-        #[serde(with = "serde_bytes")]
-        bytes: Vec<u8>,
-    }
 
     #[tokio::test]
     async fn test_send_rsp_invalid_endpoint_logs_and_does_not_panic() {
@@ -202,7 +201,7 @@ mod tests {
         ctx
     }
 
-    fn connected_context(meta: MsgMeta) -> (Context, tokio::sync::mpsc::Receiver<Bytes>) {
+    fn connected_context(meta: MsgMeta) -> (Context, tokio::sync::mpsc::Receiver<Outbound>) {
         let config = SocketPoolConfig {
             #[cfg(feature = "rdma")]
             rdma: None,
@@ -446,49 +445,101 @@ mod tests {
         assert_eq!(err.kind, ErrorKind::MissingBufferInfo);
     }
 
+    /// A data frame carrying `bytes` to `offset` of request `id`'s write space.
+    fn data_frame(id: u64, ack: Option<u64>, offset: u64, bytes: &[u8]) -> Outbound {
+        test_util::data_frame(id, ack, &[(offset, bytes.len() as u64)], bytes).into()
+    }
+
+    fn connection(ctx: &Context) -> &Socket {
+        match &ctx.endpoint {
+            ContextEndpoint::Connected(socket) => socket,
+            _ => unreachable!("the test context is connected"),
+        }
+    }
+
+    /// The peer's word is not enough for an inline read: the frames must
+    /// deliver exactly the batch's bytes, and a failed call returns the
+    /// destinations whatever they received.
     #[tokio::test]
-    async fn inline_read_bad_packed_replies_and_rpc_errors_preserve_destinations() {
-        for (reply, expected) in [
-            (Ok(vec![0x5a; 3]), ErrorKind::InvalidCopyOp),
-            (Ok(vec![0x5a; 5]), ErrorKind::InvalidCopyOp),
+    async fn inline_read_short_deliveries_and_rpc_errors_preserve_destinations() {
+        for (pushed, reply, expected, reason, contents) in [
             (
+                None,
+                Ok(()),
+                ErrorKind::InvalidCopyOp,
+                "delivered 0 of 4 bytes",
+                b"........",
+            ),
+            (
+                Some((DataPlacement::Packed, &b"cd"[..])),
+                Ok(()),
+                ErrorKind::InvalidCopyOp,
+                "delivered 2 of 4 bytes",
+                b"....cd..",
+            ),
+            // Packed read destinations accept no peer-specified offsets.
+            (
+                Some((
+                    DataPlacement::Ranges {
+                        ranges: vec![(0, 4)],
+                        ack: None,
+                    },
+                    &b"wxyz"[..],
+                )),
+                Ok(()),
+                ErrorKind::InvalidCopyOp,
+                "addressed write frame for a packed read",
+                b"........",
+            ),
+            (
+                Some((DataPlacement::Packed, &b"extra"[..])),
+                Ok(()),
+                ErrorKind::InvalidCopyOp,
+                "5 bytes with only 4 bytes remaining",
+                b"........",
+            ),
+            (
+                None,
                 Err(Error::kind(ErrorKind::Overloaded)),
                 ErrorKind::Overloaded,
+                "",
+                b"........",
             ),
         ] {
-            let base = Context::create(&SocketPoolConfig::default()).unwrap();
-            let (sender, mut queue) = tokio::sync::mpsc::channel(1);
-            let ctx = Context::server_ctx(
-                &base.state,
-                Socket::TCP(TcpSocket::new(sender)),
-                MsgMeta {
-                    msgid: 123,
-                    read_regions: [region(4)].into(),
-                    timeout_ms: 5_000,
-                    ..Default::default()
-                },
-            );
+            let (ctx, mut queue) = connected_context(MsgMeta {
+                msgid: 123,
+                read_regions: [region(4)].into(),
+                timeout_ms: 5_000,
+                ..Default::default()
+            });
             let mut local = ctx.state.buffer_pool.allocate(8).unwrap();
             local.set_len(8);
             local.copy_from_slice(b"........");
             let original_pointer = local.as_ptr();
             let ops = [CopyOp::new(2, 4, 2), CopyOp::new(0, 0, 2)];
             let peer = async {
-                let encoded = queue.recv().await.unwrap();
-                let mut encoded = BytesMut::from(encoded.as_ref());
-                let request =
-                    Message::parse(frame::parse_message(&mut encoded).unwrap().unwrap()).unwrap();
+                let request = Sent::decode(queue.recv().await.unwrap()).message();
                 assert_eq!(request.meta.method, "MemoryService/read_inline");
-                let response = reply.map(|bytes| PackedReadReply { bytes });
+                let id = request.meta.msgid;
+                if let Some((placement, bytes)) = pushed {
+                    deliver(
+                        &ctx.state,
+                        connection(&ctx),
+                        encoded_data_frame(id, placement, bytes).into(),
+                        1,
+                    );
+                }
+                let response: &std::result::Result<(), Error> = &reply;
                 ctx.state.waiter.post(
-                    request.meta.msgid,
+                    id,
+                    ctx.conn_id(),
                     Message::new(
                         MsgMeta {
-                            msgid: request.meta.msgid,
+                            msgid: id,
                             flags: MsgFlags::UseMessagePack | MsgFlags::IsRsp,
                             ..Default::default()
                         },
-                        Payload::from(Bytes::from(rmp_serde::to_vec_named(&response).unwrap())),
+                        Payload::from(Bytes::from(rmp_serde::to_vec_named(response).unwrap())),
                     ),
                 );
             };
@@ -499,22 +550,134 @@ mod tests {
             .unwrap();
             let mut error = result.unwrap_err();
             assert_eq!(error.error.kind, expected);
+            assert!(error.error.msg.contains(reason), "{}", error.error);
             let recovered = error.take_recovered_buffers().unwrap();
             assert_eq!(recovered.len(), 1);
             assert_eq!(recovered[0].as_ptr(), original_pointer);
-            assert_eq!(recovered[0].as_slice(), b"........");
+            assert_eq!(recovered[0].as_slice(), contents);
         }
     }
 
-    #[cfg(feature = "rdma")]
+    /// The reader scatters a packed stream locally, even when the destination
+    /// offsets go backwards and a frame crosses an operation boundary.
     #[tokio::test]
-    async fn inline_write_checks_request_before_busy_and_keeps_empty_batch_semantics() {
-        let (ctx, _queue) = connected_context(MsgMeta::default());
-        let mut buffer = ctx.state.buffer_pool.allocate(4).unwrap();
-        buffer.set_len(4);
-        buffer.copy_from_slice(b"keep");
-        let target = WriteTarget::new(BufferSet::new(vec![buffer]));
-        let (request_id, _receiver) = ctx.state.waiter.alloc_until(
+    async fn inline_read_fills_the_requested_destinations() {
+        let (ctx, mut queue) = connected_context(MsgMeta {
+            msgid: 123,
+            read_regions: [region(4)].into(),
+            timeout_ms: 5_000,
+            ..Default::default()
+        });
+        let mut local = ctx.state.buffer_pool.allocate(8).unwrap();
+        local.set_len(8);
+        local.copy_from_slice(b"........");
+        let ops = [CopyOp::new(2, 4, 2), CopyOp::new(0, 0, 2)];
+        let peer = async {
+            let request = Sent::decode(queue.recv().await.unwrap()).message();
+            assert_eq!(request.meta.method, "MemoryService/read_inline");
+            assert!(request.meta.write_regions.is_empty());
+            assert_eq!(
+                request
+                    .payload
+                    .deserialize::<serde_json::Value>(&request.meta)
+                    .unwrap(),
+                serde_json::json!({"request_id": 123, "ranges": [[2, 2], [0, 2]]}),
+            );
+            let id = request.meta.msgid;
+            deliver(
+                &ctx.state,
+                connection(&ctx),
+                encoded_data_frame(id, DataPlacement::Packed, b"cda").into(),
+                1,
+            );
+            deliver(
+                &ctx.state,
+                connection(&ctx),
+                encoded_data_frame(id, DataPlacement::Packed, b"b").into(),
+                1,
+            );
+            let response: &std::result::Result<(), Error> = &Ok(());
+            ctx.state.waiter.post(
+                id,
+                ctx.conn_id(),
+                Message::new(
+                    MsgMeta {
+                        msgid: id,
+                        flags: MsgFlags::UseMessagePack | MsgFlags::IsRsp,
+                        ..Default::default()
+                    },
+                    Payload::from(Bytes::from(rmp_serde::to_vec_named(response).unwrap())),
+                ),
+            );
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(ctx.remote_read(&ops, vec![local]), peer)
+        })
+        .await
+        .unwrap();
+        let buffers = result.unwrap();
+        assert_eq!(buffers.len(), 1);
+        assert_eq!(buffers[0].as_slice(), b"ab..cd..");
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_stream_read_revokes_a_partially_received_frame() {
+        let (ctx, mut queue) = connected_context(MsgMeta {
+            read_regions: [region(4)].into(),
+            timeout_ms: 5_000,
+            ..Default::default()
+        });
+        let ops = [CopyOp::new(0, 0, 4)];
+        let mut call = Box::pin(ctx.remote_read(&ops, vec![filled(&ctx, b"....")]));
+        assert!(futures_util::poll!(call.as_mut()).is_pending());
+        let request = Sent::decode(queue.recv().await.unwrap()).message();
+        let id = request.meta.msgid;
+        let target = ctx
+            .state
+            .waiter
+            .write_target(id, ctx.conn_id().unwrap())
+            .unwrap();
+        let socket = connection(&ctx);
+        let head = DataHead {
+            id,
+            placement: DataPlacement::Packed,
+        };
+        let mut frame = IncomingData::begin(&ctx.state, socket, head, 4);
+        frame.write(b"ab");
+        assert_eq!(target.received(), 2);
+
+        drop(call);
+        frame.write(b"cd");
+        frame.finish(&ctx.state, socket).unwrap();
+        assert_eq!(target.received(), 2);
+        assert!(target.seal_now().is_none());
+    }
+
+    /// The acknowledgement that a data frame asked for, from `queue`.
+    fn ack(queue: &mut tokio::sync::mpsc::Receiver<Outbound>, id: u64) -> Result<()> {
+        let message = Sent::decode(queue.try_recv().unwrap()).message();
+        assert_eq!(message.meta.msgid, id);
+        assert!(message.meta.is_rsp());
+        message
+            .payload
+            .deserialize::<Result<()>>(&message.meta)
+            .unwrap()
+    }
+
+    /// A data frame reaches only a write space that is available and attached
+    /// by a request pending on its own connection, and only within bounds.
+    /// The acknowledgement of a frame reports every earlier refusal too.
+    #[tokio::test]
+    async fn data_frames_write_only_pending_targets_on_their_connection() {
+        let (ctx, mut queue) = connected_context(MsgMeta::default());
+        let socket = connection(&ctx);
+        let (sender, mut other_queue) = tokio::sync::mpsc::channel(4);
+        let other = Socket::TCP(TcpSocket::new(sender));
+        let target = WriteTarget::new(BufferSet::new(vec![
+            filled(&ctx, b"abcd"),
+            filled(&ctx, b"efgh"),
+        ]));
+        let (request_id, _response) = ctx.state.waiter.alloc_until(
             std::time::Instant::now() + Duration::from_secs(5),
             MemoryRoutes {
                 write_target: Some(target.clone()),
@@ -524,39 +687,102 @@ mod tests {
         ctx.state
             .waiter
             .bind_connection(request_id, ctx.conn_id().unwrap());
-        // Sealing makes the buffers as unavailable as a READ that owns them.
-        let taken = target.seal(None).await.unwrap();
 
-        let empty = CopyBatch::new(&[]).unwrap();
-        target.copy_inline(&empty, &[]).unwrap();
-        let zero_ops = [CopyOp::new(u64::MAX, u64::MAX, 0)];
-        let zeros = CopyBatch::new(&zero_ops).unwrap();
-        target.copy_inline(&zeros, &[]).unwrap();
+        // Another connection, or a request without a write space, reaches nothing.
+        deliver(
+            &ctx.state,
+            &other,
+            data_frame(request_id, Some(1), 0, b"XX"),
+            4,
+        );
+        assert_eq!(
+            ack(&mut other_queue, 1).unwrap_err().kind,
+            ErrorKind::Timeout
+        );
+        let (unattached, _unattached) = ctx.state.waiter.alloc(Duration::from_secs(5));
+        ctx.state
+            .waiter
+            .bind_connection(unattached, ctx.conn_id().unwrap());
+        deliver(
+            &ctx.state,
+            socket,
+            data_frame(unattached, Some(2), 0, b"XX"),
+            4,
+        );
+        assert_eq!(ack(&mut queue, 2).unwrap_err().kind, ErrorKind::Timeout);
+        // A frame without an acknowledgement is consumed silently.
+        deliver(
+            &ctx.state,
+            &other,
+            data_frame(request_id, None, 0, b"XX"),
+            4,
+        );
+        assert!(other_queue.try_recv().is_err());
+        assert_eq!(target.received(), 0);
 
-        for (ops, bytes, expected) in [
-            (
-                vec![CopyOp::new(0, 0, 1)],
-                vec![b'x'],
-                ErrorKind::BuffersInUse,
-            ),
-            (vec![CopyOp::new(0, 0, 1)], vec![], ErrorKind::InvalidCopyOp),
-            (
-                vec![CopyOp::new(0, 4, 1)],
-                vec![b'x'],
-                ErrorKind::InvalidCopyOp,
-            ),
-        ] {
-            let request = WriteInlineRequest {
-                request_id,
-                ops,
-                bytes,
-            };
+        // Pieces of any size cross the buffer boundary.
+        deliver(
+            &ctx.state,
+            socket,
+            data_frame(request_id, Some(3), 2, b"WXYZ"),
+            3,
+        );
+        ack(&mut queue, 3).unwrap();
+        assert_eq!(target.received(), 4);
+
+        // A frame that does not fit is refused, and so is every later one.
+        for (offset, ack_id) in [(6, 4), (0, 5)] {
+            deliver(
+                &ctx.state,
+                socket,
+                data_frame(request_id, Some(ack_id), offset, b"!!!!"),
+                2,
+            );
             assert_eq!(
-                ().write_inline(&ctx, &request).await.unwrap_err().kind,
-                expected
+                ack(&mut queue, ack_id).unwrap_err().kind,
+                ErrorKind::InvalidCopyOp
             );
         }
+        let buffers = target.seal(None).await.unwrap();
+        assert_eq!(&buffers[0][..], b"abWX");
+        assert_eq!(&buffers[1][..], b"YZgh");
+    }
+
+    /// Sealing revokes the target: a later frame is consumed but writes nothing.
+    #[tokio::test]
+    async fn data_frames_cannot_write_sealed_targets() {
+        let (ctx, mut queue) = connected_context(MsgMeta::default());
+        let target = WriteTarget::new(BufferSet::new(vec![filled(&ctx, b"keep")]));
+        let (request_id, _response) = ctx.state.waiter.alloc_until(
+            std::time::Instant::now() + Duration::from_secs(5),
+            MemoryRoutes {
+                write_target: Some(target.clone()),
+                ..Default::default()
+            },
+        );
+        ctx.state
+            .waiter
+            .bind_connection(request_id, ctx.conn_id().unwrap());
+        let taken = target.seal(None).await.unwrap();
+        deliver(
+            &ctx.state,
+            connection(&ctx),
+            data_frame(request_id, Some(9), 0, b"lost"),
+            1,
+        );
+        assert_eq!(
+            ack(&mut queue, 9).unwrap_err().kind,
+            ErrorKind::BuffersInUse
+        );
         assert_eq!(taken[0].as_slice(), b"keep");
+        assert_eq!(target.received(), 0);
+    }
+
+    fn filled(ctx: &Context, bytes: &[u8]) -> Buffer {
+        let mut buffer = ctx.state.buffer_pool.allocate(bytes.len()).unwrap();
+        buffer.set_len(bytes.len());
+        buffer.copy_from_slice(bytes);
+        buffer
     }
 }
 
@@ -564,7 +790,8 @@ mod tests {
 mod timeout_tests {
     //! Exercise public remote-memory calls with a live connection whose peer
     //! consumes reverse RPCs without replying. Observe the server's API return
-    //! independently of the original caller's timeout.
+    //! independently of the original caller's timeout. Stream writes make no
+    //! reverse RPC; `data` covers their lost acknowledgements.
 
     use std::{sync::Arc, time::Duration};
 
@@ -580,9 +807,8 @@ mod timeout_tests {
 
     const BYTES: usize = 64;
     const GUARD: Duration = Duration::from_secs(5);
-    const METHODS: [&str; 4] = [
+    const METHODS: [&str; 3] = [
         "MemoryService/read_inline",
-        "MemoryService/write_inline",
         "MemoryService/validate_read_source",
         "MemoryService/read_into_target",
     ];
@@ -757,10 +983,10 @@ mod timeout_tests {
             assert_eq!(report.parent_expired, parent_timeout < default_timeout);
             let (method, wire_budget) = self.dropped.try_recv().unwrap();
             let expected_method = match (self.transport, operation) {
-                (Transport::RDMA, Operation::Read) => METHODS[2],
-                (Transport::RDMA, Operation::Write) => METHODS[3],
+                (Transport::RDMA, Operation::Read) => METHODS[1],
+                (Transport::RDMA, Operation::Write) => METHODS[2],
                 (_, Operation::Read) => METHODS[0],
-                (_, Operation::Write) => METHODS[1],
+                (_, Operation::Write) => unreachable!("stream writes make no reverse RPC"),
             };
             assert_eq!(method, expected_method);
             assert!(wire_budget > 0);
@@ -808,7 +1034,12 @@ mod timeout_tests {
             Transport::RDMA,
         ] {
             let mut fixture = Fixture::new(transport).await;
-            for operation in [Operation::Read, Operation::Write] {
+            let operations: &[_] = if transport == Transport::RDMA {
+                &[Operation::Read, Operation::Write]
+            } else {
+                &[Operation::Read]
+            };
+            for &operation in operations {
                 fixture.check(operation, parent_timeout).await;
             }
             fixture.shutdown().await;

@@ -229,7 +229,6 @@ mod tests {
             "MemoryService/read_inline",
             "MemoryService/read_into_target",
             "MemoryService/validate_read_source",
-            "MemoryService/write_inline",
         ];
         #[cfg(feature = "rdma")]
         expected.extend([

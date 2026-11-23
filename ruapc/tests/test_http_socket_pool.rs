@@ -65,7 +65,6 @@ async fn test_http_openapi_includes_builtin_methods() {
     let expected_paths = [
         "/TestService/test_method",
         "/MemoryService/read_inline",
-        "/MemoryService/write_inline",
         "/MemoryService/read_into_target",
         "/MemoryService/validate_read_source",
         #[cfg(feature = "rdma")]
@@ -112,12 +111,7 @@ async fn test_http_builtin_methods_dispatch_and_validate_context() {
         ),
         (
             "/MemoryService/read_inline",
-            serde_json::json!({ "request_id": u64::MAX, "ops": [] }),
-            ErrorKind::Timeout,
-        ),
-        (
-            "/MemoryService/write_inline",
-            serde_json::json!({ "request_id": u64::MAX, "ops": [], "bytes": [] }),
+            serde_json::json!({ "request_id": u64::MAX, "ranges": [] }),
             ErrorKind::Timeout,
         ),
         (

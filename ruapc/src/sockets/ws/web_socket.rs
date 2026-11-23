@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use bytes::Bytes;
 use serde::Serialize;
 use tokio::sync::mpsc;
 
@@ -8,7 +7,7 @@ use crate::{
     State,
     error::Result,
     msg::{MsgMeta, frame::encode},
-    sockets::{ChannelConnection, PoolConnection},
+    sockets::{ChannelConnection, Outbound, PoolConnection},
 };
 
 #[derive(Debug, Clone)]
@@ -17,9 +16,9 @@ pub struct WebSocket {
 }
 
 impl WebSocket {
-    pub fn new(stream: mpsc::Sender<Bytes>) -> Self {
+    pub(crate) fn new(stream: mpsc::Sender<Outbound>) -> Self {
         Self {
-            inner: Arc::new(ChannelConnection::new(stream)),
+            inner: Arc::new(ChannelConnection::new(stream, "WebSocket")),
         }
     }
 
@@ -47,6 +46,11 @@ impl WebSocket {
     pub(crate) async fn closed(&self) {
         self.inner.closed().await;
     }
+
+    /// The connection's send queue, which also carries data frames.
+    pub(crate) fn channel(&self) -> &ChannelConnection {
+        &self.inner
+    }
 }
 
 impl PoolConnection for WebSocket {
@@ -67,7 +71,7 @@ impl WebSocket {
         state: &Arc<State>,
     ) -> Result<()> {
         self.inner
-            .send(meta, &state.waiter, "WebSocket", |meta| {
+            .send(meta, &state.waiter, |meta| {
                 encode(meta, payload).map_err(Into::into)
             })
             .await

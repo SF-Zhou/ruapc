@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     pin::Pin,
     sync::Arc,
     task::{Context as TaskContext, Poll},
@@ -12,7 +13,7 @@ use tokio::sync::mpsc;
 use crate::{
     Error, ErrorKind, Message, MsgMeta, Result, State,
     msg::{SendMsg, frame::encode},
-    sockets::{ChannelConnection, PoolConnection},
+    sockets::{ChannelConnection, Outbound, PoolConnection, Segment},
 };
 
 #[derive(Clone, Debug)]
@@ -28,9 +29,9 @@ pub struct StreamSocket {
 }
 
 impl StreamSocket {
-    pub(crate) fn new(sender: mpsc::Sender<Bytes>) -> Self {
+    pub(crate) fn new(sender: mpsc::Sender<Outbound>) -> Self {
         Self {
-            inner: Arc::new(ChannelConnection::new(sender)),
+            inner: Arc::new(ChannelConnection::new(sender, "HTTP")),
         }
     }
 
@@ -51,6 +52,11 @@ impl StreamSocket {
 
     pub(crate) fn is_closed(&self) -> bool {
         self.inner.is_closed()
+    }
+
+    /// The stream's send queue, which also carries data frames.
+    pub(crate) fn channel(&self) -> &ChannelConnection {
+        &self.inner
     }
 }
 
@@ -80,13 +86,20 @@ impl HttpSocket {
 ///
 /// Implements `http_body::Body` so it can be used as both
 /// request and response body for HTTP/2 bidirectional streaming.
+/// Each segment of a queued frame becomes one body chunk, so the buffers a
+/// data frame shares with its sender reach the connection without a copy.
 pub struct ChannelBody {
-    rx: mpsc::Receiver<Bytes>,
+    rx: mpsc::Receiver<Outbound>,
+    /// Segments of the frame being sent that have not been yielded yet.
+    pending: VecDeque<Segment>,
 }
 
 impl ChannelBody {
-    pub fn new(rx: mpsc::Receiver<Bytes>) -> Self {
-        Self { rx }
+    pub(crate) fn new(rx: mpsc::Receiver<Outbound>) -> Self {
+        Self {
+            rx,
+            pending: VecDeque::new(),
+        }
     }
 }
 
@@ -98,10 +111,15 @@ impl hyper::body::Body for ChannelBody {
         mut self: Pin<&mut Self>,
         cx: &mut TaskContext<'_>,
     ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
-        match self.rx.poll_recv(cx) {
-            Poll::Ready(Some(data)) => Poll::Ready(Some(Ok(Frame::data(data)))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
+        loop {
+            if let Some(segment) = self.pending.pop_front() {
+                return Poll::Ready(Some(Ok(Frame::data(segment.into_bytes()))));
+            }
+            match self.rx.poll_recv(cx) {
+                Poll::Ready(Some(frame)) => self.pending.extend(frame.segments()),
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
         }
     }
 }
@@ -124,7 +142,7 @@ impl HttpSocket {
                         meta: meta.clone(),
                         payload: bytes.into(),
                     };
-                    state.waiter.post(*msgid, msg);
+                    state.waiter.post(*msgid, None, msg);
                     Ok(())
                 } else {
                     Err(Error::new(
@@ -136,7 +154,7 @@ impl HttpSocket {
             HttpSocket::Stream(stream_socket) => {
                 stream_socket
                     .inner
-                    .send(meta, &state.waiter, "HTTP", |meta| {
+                    .send(meta, &state.waiter, |meta| {
                         encode(meta, payload).map_err(Into::into)
                     })
                     .await

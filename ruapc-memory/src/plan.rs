@@ -2,7 +2,9 @@
 
 use std::convert::Infallible;
 
-use crate::{CopyBatch, MemoryError, MemoryErrorKind, MemoryResult, SpaceLayout};
+use crate::{
+    CopyBatch, CopyOp, MAX_COPY_OPS, MemoryError, MemoryErrorKind, MemoryResult, SpaceLayout,
+};
 
 /// One destination slice of a [`SrcChunk`]: contiguous within a single
 /// destination segment.
@@ -101,6 +103,49 @@ impl CopyBatch<'_> {
             .unwrap();
         }
         Ok(chunks)
+    }
+}
+
+impl<'a> CopyBatch<'a> {
+    /// Splits the batch into consecutive pieces of at most `max_bytes` bytes
+    /// and `max_ops` operations each, cutting operations where needed.
+    ///
+    /// The pieces together copy exactly the batch's bytes, in operation
+    /// order; zero-length operations are dropped. Pieces are produced lazily
+    /// and need no layout: each one is a valid batch for the spaces that the
+    /// whole batch was checked against. Both limits must be nonzero, and
+    /// `max_ops` must not exceed [`MAX_COPY_OPS`].
+    pub fn split(
+        &self,
+        max_bytes: u64,
+        max_ops: usize,
+    ) -> MemoryResult<impl Iterator<Item = Vec<CopyOp>> + use<'a>> {
+        if max_bytes == 0 || max_ops == 0 || max_ops > MAX_COPY_OPS {
+            return Err(MemoryError::new(
+                MemoryErrorKind::InvalidArgument,
+                format!("piece limits must be nonzero and at most {MAX_COPY_OPS} operations"),
+            ));
+        }
+        let ops = self.ops();
+        // The next operation and the bytes of it already handed out.
+        let (mut index, mut done) = (0, 0u64);
+        Ok(std::iter::from_fn(move || {
+            let mut piece = Vec::new();
+            let mut bytes = 0u64;
+            while piece.len() < max_ops && bytes < max_bytes {
+                let Some(op) = ops.get(index) else { break };
+                if op.len == done {
+                    (index, done) = (index + 1, 0);
+                    continue;
+                }
+                let len = (op.len - done).min(max_bytes - bytes);
+                // Structural validation bounded both ends of every operation.
+                piece.push(CopyOp::new(op.src_offset + done, op.dst_offset + done, len));
+                bytes += len;
+                done += len;
+            }
+            (!piece.is_empty()).then_some(piece)
+        }))
     }
 }
 
@@ -240,6 +285,47 @@ mod tests {
         for chunk in &chunks {
             assert_eq!(chunk.dst.iter().map(|s| s.len).sum::<u64>(), chunk.len);
             assert!(chunk.dst.len() <= 2);
+        }
+    }
+    #[test]
+    fn split_cuts_operations_at_both_limits_and_preserves_order() {
+        let ops = [
+            CopyOp::new(100, 0, 5),
+            CopyOp::new(u64::MAX, 77, 0),
+            CopyOp::new(200, 10, 1),
+            CopyOp::new(300, 20, 7),
+            CopyOp::new(0, 0, 0),
+        ];
+        let batch = CopyBatch::new(&ops).unwrap();
+        let pieces: Vec<_> = batch.split(4, 2).unwrap().collect();
+        assert_eq!(
+            pieces,
+            [
+                vec![CopyOp::new(100, 0, 4)],
+                vec![CopyOp::new(104, 4, 1), CopyOp::new(200, 10, 1)],
+                vec![CopyOp::new(300, 20, 4)],
+                vec![CopyOp::new(304, 24, 3)],
+            ]
+        );
+        // Every piece is itself a valid batch within the limits.
+        for piece in &pieces {
+            let piece = CopyBatch::new(piece).unwrap();
+            assert!(piece.byte_count() <= 4 && piece.ops().len() <= 2);
+        }
+
+        // Generous limits keep the nonempty operations in one piece.
+        let whole: Vec<_> = batch.split(u64::MAX, MAX_COPY_OPS).unwrap().collect();
+        assert_eq!(whole, [vec![ops[0], ops[2], ops[3]]]);
+
+        // Nothing to copy yields no piece.
+        let empty = [CopyOp::new(1, 2, 0)];
+        let batch = CopyBatch::new(&empty).unwrap();
+        assert_eq!(batch.split(4, 2).unwrap().count(), 0);
+        for (max_bytes, max_ops) in [(0, 1), (1, 0), (4, MAX_COPY_OPS + 1)] {
+            assert_eq!(
+                batch.split(max_bytes, max_ops).err().unwrap().kind,
+                MemoryErrorKind::InvalidArgument
+            );
         }
     }
 }

@@ -141,7 +141,7 @@ impl State {
             let ctx = Context::server_ctx(self, socket.clone(), msg.meta);
             self.router.dispatch(ctx, msg.payload);
         } else if msg.meta.is_rsp() {
-            self.waiter.post(msg.meta.msgid, msg);
+            self.waiter.post(msg.meta.msgid, socket.conn_id(), msg);
         } else {
             tracing::warn!("invalid msg type {:?}", msg.meta);
         }
@@ -223,6 +223,7 @@ impl std::fmt::Debug for State {
 mod tests {
     use super::*;
     use crate::{Message, MsgFlags, MsgMeta, Payload, SocketPoolConfig, sockets::tcp::TcpSocket};
+    use std::time::Duration;
 
     #[cfg(feature = "rdma")]
     #[test]
@@ -306,6 +307,40 @@ mod tests {
             &path,
         ));
         assert!(!rdma_device_allowed(&mlx5_0, true, &path));
+    }
+
+    #[tokio::test]
+    async fn responses_complete_only_waiters_bound_to_the_receiving_connection() {
+        let config = SocketPoolConfig {
+            #[cfg(feature = "rdma")]
+            rdma: None,
+            ..Default::default()
+        };
+        let (state, _guard) = State::create(Router::default(), &config).unwrap();
+        let tcp_socket = || Socket::TCP(TcpSocket::new(tokio::sync::mpsc::channel(1).0));
+        let connection = tcp_socket();
+        let other = tcp_socket();
+        let response = |msgid| {
+            Message::new(
+                MsgMeta {
+                    msgid,
+                    flags: MsgFlags::IsRsp,
+                    ..Default::default()
+                },
+                Payload::Empty,
+            )
+        };
+
+        let (id, pending) = state.waiter.alloc(Duration::from_secs(5));
+        state.handle_recv(&other, response(id)).unwrap();
+        assert!(state.waiter.contains_message_id(id));
+        state
+            .waiter
+            .bind_connection(id, connection.conn_id().unwrap());
+        state.handle_recv(&other, response(id)).unwrap();
+        assert!(state.waiter.contains_message_id(id));
+        state.handle_recv(&connection, response(id)).unwrap();
+        assert_eq!(pending.recv().await.unwrap().meta.msgid, id);
     }
 
     #[tokio::test]

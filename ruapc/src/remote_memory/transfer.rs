@@ -17,7 +17,7 @@ enum Direction {
 /// so they cannot select a different request, connection, or memory space.
 pub(crate) struct Transfer<'ctx, 'ops> {
     pub(crate) ctx: &'ctx Context,
-    socket: &'ctx Socket,
+    pub(crate) socket: &'ctx Socket,
     #[cfg(feature = "rdma")]
     pub(crate) remote: RemoteSpace<'ctx>,
     pub(crate) ops: CopyBatch<'ops>,

@@ -8,11 +8,13 @@
 //!
 //! Setup, registration, buffer initialization and warmup are outside timing.
 //! Read-source wrappers, server write sources and client write destinations are
-//! reused. `remote_read_all` retains its normal pool-allocation behavior.
+//! reused. Stream writes also measure 32 equal physical source buffers and
+//! 32 adjacent copy operations into a single destination. `remote_read_all`
+//! retains its normal pool-allocation behavior.
 //! Every operation verifies the complete deterministic byte pattern; reported
 //! time includes that verification. Bulk bytes use remote memory, with only a
 //! case index and byte count in the application RPC request/response. RDMA uses
-//! one-sided reads; TCP/WS/HTTP use their inline reverse-RPC fallback.
+//! one-sided reads; TCP/WS/HTTP push data frames.
 
 use std::{
     sync::{Arc, Mutex},
@@ -20,8 +22,8 @@ use std::{
 };
 
 use ruapc::{
-    Buffer, BufferPool, Client, Context, ListenMode, Result, ResultBufferReply, Router, Server,
-    SocketPoolConfig, Transport,
+    Buffer, BufferPool, Client, Context, CopyOp, ListenMode, Result, ResultBufferReply, Router,
+    Server, SocketPoolConfig, Transport,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -32,6 +34,7 @@ use serde::{Deserialize, Serialize};
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 const WARMUP_ITERS: usize = 8;
+const FRAGMENTS: usize = 32;
 /// Size in bytes and measured iterations; the larger case moves more bytes.
 const CASES: [(usize, usize); 2] = [(64 * 1024, 512), (1024 * 1024, 128)];
 
@@ -77,6 +80,7 @@ fn optional_env(name: &str) -> Option<String> {
 #[derive(Serialize, Deserialize, JsonSchema)]
 struct BenchRequest {
     case: usize,
+    fragmented: bool,
 }
 
 #[ruapc::service]
@@ -89,6 +93,8 @@ trait RemoteMemoryBench {
 struct Case {
     expected: Vec<u8>,
     write_source: Mutex<Option<Vec<Buffer>>>,
+    fragmented_source: Mutex<Option<Vec<Buffer>>>,
+    ops: Vec<CopyOp>,
 }
 
 struct BenchService {
@@ -103,13 +109,26 @@ impl BenchService {
                     .map(|offset| ((offset.wrapping_mul(31) ^ (offset >> 8)) & 0xff) as u8)
                     .collect(),
                 write_source: Mutex::new(None),
+                fragmented_source: Mutex::new(None),
+                ops: (0..FRAGMENTS)
+                    .map(|i| {
+                        let len = (size / FRAGMENTS) as u64;
+                        CopyOp::new(i as u64 * len, i as u64 * len, len)
+                    })
+                    .collect(),
             }),
         }
     }
 
     fn initialize_sources(&self, pool: &Arc<BufferPool>) {
         for case in &self.cases {
-            *case.write_source.lock().unwrap() = Some(make_buffers(pool, &case.expected));
+            *case.write_source.lock().unwrap() = Some(vec![make_buffer(pool, &case.expected)]);
+            *case.fragmented_source.lock().unwrap() = Some(
+                case.expected
+                    .chunks_exact(case.expected.len() / FRAGMENTS)
+                    .map(|chunk| make_buffer(pool, chunk))
+                    .collect(),
+            );
         }
     }
 }
@@ -128,23 +147,31 @@ impl RemoteMemoryBench for BenchService {
 
     async fn write_all(&self, ctx: &Context, req: &BenchRequest) -> ResultBufferReply<usize> {
         let case = &self.cases[req.case];
-        let source = case
-            .write_source
+        let slot = if req.fragmented {
+            &case.fragmented_source
+        } else {
+            &case.write_source
+        };
+        let source = slot
             .lock()
             .unwrap()
             .take()
             .expect("serial benchmark must have one reusable write source");
-        let mut sent = ctx.remote_write_all(source).await?;
-        *case.write_source.lock().unwrap() = sent.take_sources().into_available();
+        let mut sent = if req.fragmented {
+            ctx.remote_write(&case.ops, source).await?
+        } else {
+            ctx.remote_write_all(source).await?
+        };
+        *slot.lock().unwrap() = sent.take_sources().into_available();
         Ok(sent.into_reply(case.expected.len()))
     }
 }
 
-fn make_buffers(pool: &Arc<BufferPool>, data: &[u8]) -> Vec<Buffer> {
+fn make_buffer(pool: &Arc<BufferPool>, data: &[u8]) -> Buffer {
     let mut buffer = pool.allocate(data.len()).unwrap();
     buffer.set_len(data.len());
     buffer.copy_from_slice(data);
-    vec![buffer]
+    buffer
 }
 
 fn verify(buffers: &[Buffer], expected: &[u8]) {
@@ -180,7 +207,7 @@ async fn bench_read(
     iters: usize,
     warmup: usize,
 ) {
-    let buffers = make_buffers(&ctx.state.buffer_pool, expected);
+    let buffers = [make_buffer(&ctx.state.buffer_pool, expected)];
     let client = Client::default();
     let source = client.with_read_buffers(&buffers);
     for _ in 0..warmup {
@@ -200,7 +227,10 @@ async fn bench_write(
     iters: usize,
     warmup: usize,
 ) {
-    let mut destinations = make_buffers(&ctx.state.buffer_pool, &vec![0; expected.len()]);
+    let mut destinations = vec![make_buffer(
+        &ctx.state.buffer_pool,
+        &vec![0; expected.len()],
+    )];
     let client = Client::default();
     for _ in 0..warmup {
         let (written, returned) = client
@@ -227,7 +257,12 @@ async fn bench_write(
         verify(&returned, expected);
         destinations = returned;
     }
-    report("remote_write_all", expected.len(), iters, start.elapsed());
+    let operation = if req.fragmented {
+        "remote_write/32"
+    } else {
+        "remote_write_all"
+    };
+    report(operation, expected.len(), iters, start.elapsed());
 }
 
 async fn run(options: BenchOptions) {
@@ -283,12 +318,22 @@ async fn run(options: BenchOptions) {
             panic!("{transport:?} setup failed: {error}");
         }
         for (case, &(size, iters)) in CASES.iter().enumerate() {
-            let request = BenchRequest { case };
+            let request = BenchRequest {
+                case,
+                fragmented: false,
+            };
             let expected = &service.cases[case].expected;
             assert_eq!(expected.len(), size);
             let iters = options.serial_iters.unwrap_or(iters);
             bench_read(&ctx, &request, expected, iters, options.warmup_iters).await;
             bench_write(&ctx, &request, expected, iters, options.warmup_iters).await;
+            if matches!(transport, Transport::TCP | Transport::WS | Transport::HTTP) {
+                let fragmented = BenchRequest {
+                    case,
+                    fragmented: true,
+                };
+                bench_write(&ctx, &fragmented, expected, iters, options.warmup_iters).await;
+            }
         }
     }
     server.stop();

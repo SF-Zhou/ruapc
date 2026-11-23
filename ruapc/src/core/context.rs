@@ -257,7 +257,7 @@ mod tests {
                 } else {
                     ctx.send_rsp(expected.clone()).await;
                 }
-                let mut encoded = queue.try_recv().unwrap();
+                let mut encoded = queue.try_recv().unwrap().into_bytes();
                 let body = FrameDecoder::default()
                     .decode(&mut encoded)
                     .unwrap()

@@ -18,8 +18,9 @@ use super::WebSocket;
 use crate::{
     ConnectionMap, Endpoint, Message, RawStream, Socket, State, TaskSupervisor,
     error::{Error, ErrorKind, Result},
-    msg::frame::{FrameDecoder, MAX_MSG_SIZE},
-    sockets::{connect::ConnectGroups, tcp},
+    msg::frame::{Frame, FrameDecoder, MAX_MSG_SIZE},
+    remote_memory::IncomingData,
+    sockets::{Outbound, connect::ConnectGroups, tcp},
 };
 
 /// WebSocket protocol limits aligned with the shared stream frame limit: one
@@ -258,29 +259,10 @@ impl WebSocketPool {
         S: AsyncRead + AsyncWrite + Unpin,
     {
         let socket = Socket::WS(web_socket);
-        let mut decoder = FrameDecoder::default();
         while let Some(msg) = recv_stream.next().await {
             let msg = msg.map_err(|e| Error::new(ErrorKind::WebSocketRecvFailed, e.to_string()))?;
             match msg {
-                tungstenite::Message::Binary(bytes) => {
-                    // One WebSocket binary message carries exactly one stream
-                    // frame; complete frames are decoded without copying.
-                    let mut input = bytes;
-                    let body = decoder.decode(&mut input)?.ok_or_else(|| {
-                        Error::new(
-                            ErrorKind::ParseMsgFailed,
-                            "incomplete WebSocket frame".into(),
-                        )
-                    })?;
-                    if !input.is_empty() {
-                        return Err(Error::new(
-                            ErrorKind::ParseMsgFailed,
-                            "trailing bytes after WebSocket frame".into(),
-                        ));
-                    }
-                    let msg = Message::parse(body)?;
-                    state.handle_recv(&socket, msg)?;
-                }
+                tungstenite::Message::Binary(bytes) => Self::handle_binary(bytes, &socket, state)?,
                 tungstenite::Message::Close(_) => {
                     return Err(Error::kind(ErrorKind::WebSocketClosed));
                 }
@@ -290,16 +272,60 @@ impl WebSocketPool {
         Ok(())
     }
 
+    /// Handles one binary message, which carries exactly one stream frame:
+    /// a message frame, or a data frame together with all of its raw bytes.
+    /// Complete frames are decoded without copying.
+    fn handle_binary(mut input: Bytes, socket: &Socket, state: &Arc<State>) -> Result<()> {
+        let frame = FrameDecoder::default()
+            .decode_frame(&mut input)?
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::ParseMsgFailed,
+                    "incomplete WebSocket frame".into(),
+                )
+            })?;
+        match frame {
+            Frame::Message(body) => {
+                if !input.is_empty() {
+                    return Err(Error::new(
+                        ErrorKind::ParseMsgFailed,
+                        "trailing bytes after WebSocket frame".into(),
+                    ));
+                }
+                let msg = Message::parse(body)?;
+                state.handle_recv(socket, msg)
+            }
+            // The rest of the message is the frame's raw bytes, copied from
+            // it into their destination.
+            Frame::Data { head, len } => {
+                if input.len() != len {
+                    return Err(Error::new(
+                        ErrorKind::ParseMsgFailed,
+                        format!(
+                            "WebSocket message carries {} bytes for a data frame of {len}",
+                            input.len()
+                        ),
+                    ));
+                }
+                let mut incoming = IncomingData::begin(state, socket, head, len);
+                incoming.write(&input);
+                incoming.finish(state, socket)
+            }
+        }
+    }
+
     async fn start_send_loop<S>(
         mut send_stream: SplitSink<WebSocketStream<S>, tungstenite::Message>,
-        mut receiver: mpsc::Receiver<Bytes>,
+        mut receiver: mpsc::Receiver<Outbound>,
     ) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        while let Some(bytes) = receiver.recv().await {
+        while let Some(frame) = receiver.recv().await {
+            // A binary message is one contiguous allocation, so a data frame
+            // that shares its sender's buffers is copied together here.
             send_stream
-                .send(tungstenite::Message::Binary(bytes))
+                .send(tungstenite::Message::Binary(frame.into_bytes()))
                 .await
                 .map_err(|e| Error::new(ErrorKind::WebSocketSendFailed, e.to_string()))?;
         }
@@ -325,6 +351,53 @@ mod tests {
     use super::*;
     use crate::{Context, ListenMode, MsgFlags, MsgMeta, RawStream, SocketPoolConfig};
     use tokio_tungstenite::tungstenite::protocol::Role;
+
+    /// One binary message is exactly one frame: a data frame's message
+    /// carries its head and precisely the bytes that the head describes.
+    #[tokio::test]
+    async fn binary_messages_carry_exactly_one_frame() {
+        use crate::sockets::test_util::{data_frame, pending_write_space};
+
+        let config = SocketPoolConfig {
+            #[cfg(feature = "rdma")]
+            rdma: None,
+            ..Default::default()
+        };
+        let state = Context::create(&config).unwrap().state;
+        let (sender, _queue) = mpsc::channel(8);
+        let socket = Socket::WS(WebSocket::new(sender));
+        let (target, id, _pending) = pending_write_space(&state, &socket, b"........");
+        let frame = data_frame(id, None, &[(2, 4)], b"wxyz");
+
+        WebSocketPool::handle_binary(frame.clone(), &socket, &state).unwrap();
+        assert_eq!(target.received(), 4);
+
+        // Fewer or more bytes than the head describes, a cut head and a
+        // second frame in the same message all fail the connection, and
+        // none of them writes anything.
+        let mut longer = bytes::BytesMut::from(&frame[..]);
+        longer.extend_from_slice(b"!");
+        let mut doubled = bytes::BytesMut::from(&frame[..]);
+        doubled.extend_from_slice(&frame);
+        let message = crate::msg::frame::encode(&MsgMeta::default(), &"x").unwrap();
+        let mut trailed = bytes::BytesMut::from(&message[..]);
+        trailed.extend_from_slice(b"!");
+        for invalid in [
+            frame.slice(..frame.len() - 1),
+            longer.freeze(),
+            doubled.freeze(),
+            frame.slice(..frame.len() - 5),
+            frame.slice(..3),
+            Bytes::new(),
+            trailed.freeze(),
+            message.slice(..message.len() - 1),
+        ] {
+            let error = WebSocketPool::handle_binary(invalid, &socket, &state).unwrap_err();
+            assert_eq!(error.kind, ErrorKind::ParseMsgFailed);
+        }
+        assert_eq!(target.received(), 4);
+        assert_eq!(target.seal_now().unwrap()[0].as_slice(), b"..wxyz..");
+    }
 
     #[tokio::test]
     async fn test_web_socket_pool_debug_format() {

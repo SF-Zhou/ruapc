@@ -1,10 +1,13 @@
 # Remote memory
 
 Clients borrow read sources and attach write destinations, either owned or
-[lent from caller-owned slots](#lend-write-destinations); handlers access them through
-`Context::remote_read` and `remote_write`. TCP, WebSocket and HTTP/2 use reverse
-RPCs to copy bytes. RDMA uses READ, including a client-side READ for
-`remote_write`. Ordinary unary HTTP calls do not support these reverse RPCs.
+[lent from caller-owned slots](#lend-write-destinations). Handlers access them
+through `Context::remote_read` and `remote_write`. TCP, WebSocket and HTTP/2
+move bulk bytes in [data frames](#stream-transports-data-frames). A stream
+read requests source ranges and places the returned bytes using the handler's
+local destination plan. RDMA uses READ,
+including a client-side READ for `remote_write`. Ordinary unary HTTP calls do
+not support these reverse RPCs or data frames.
 
 For standalone logical-space validation, copy planning and immutable buffer
 sources, see the [memory crate](../ruapc-memory/README.md). RPC applications keep
@@ -43,10 +46,72 @@ these same checks, then return without destination checkout or I/O. Use
 memory. Only the requested destination ranges are filled; separate calls require
 caller coordination.
 
-On TCP, WebSocket and HTTP/2 the bytes of one batch travel inline in a single
-message, which is limited to 64 MiB including framing. A `remote_read` batch
-whose bytes reach that limit fails with `InvalidCopyOp`; split larger transfers
-across calls. RDMA READs have no such limit.
+On TCP, WebSocket and HTTP/2 the bytes travel as
+[data frames](#stream-transports-data-frames) of at most 1 MiB each, so no
+message size limit bounds a batch; RDMA uses READs.
+
+## Stream transports: data frames
+
+A data frame carries up to 1 MiB of raw bytes and names a request pending on
+the receiving connection. The receiver uses the frame's placement to interpret
+the bytes.
+
+- `remote_write` sends explicit destination ranges for the original call's
+  attached write space. Adjacent destinations in operation order can share a
+  range. Each frame holds at most 1024 ranges whose lengths add up to its raw
+  byte count. The client's receive loop applies the bytes and answers the
+  final frame on the same connection. A successful acknowledgement completes
+  the write.
+- `remote_read` keeps its destination buffers and validated copy plan with a
+  local waiter. Its reverse call to `MemoryService/read_inline` sends the
+  source ranges in operation order. The original borrowing future gathers
+  the requested source bytes, and the client sends packed frames followed by
+  the RPC response. As bytes arrive, the reader scatters them through the next
+  destinations of its own plan, including across frame boundaries. Success
+  requires both a successful RPC response and complete delivery.
+
+An explicit frame sent to a packed target, or a packed frame sent to an
+explicit target, fails the transfer. An out-of-bounds frame also causes the
+target to refuse subsequent frames, so a write's final acknowledgement reports
+an earlier refusal. Returning or dropping the owning call seals the target,
+including for a frame already routed to it. The receive loop consumes bytes
+for a gone or sealed request to preserve framing.
+
+For writes, TCP and HTTP/2 can share the source buffers with the send queue.
+TCP uses vectored writes, and HTTP/2 yields each segment as a body chunk. A
+write frame spanning more than 64 source slices is gathered into contiguous
+storage. For HTTP/2 frames of at most 64 KiB of raw bytes the threshold is 16
+slices. WebSocket always packs the write into one binary message. On receive,
+TCP can read directly into destination slices. WebSocket and HTTP/2 copy from
+incoming chunks.
+
+Every connection has an 8 MiB budget for data frames in preparation, in the
+queue and being written. A producer reserves the encoded header and raw byte
+count before allocating or gathering the payload, then takes a queue entry
+when the frame is ready. Producers waiting for bytes keep their place and
+leave the queue available for other messages. A frame releases its reservation
+after its last segment is written or the frame is dropped.
+
+A receive loop that cannot queue an acknowledgement immediately hands it to a
+task and continues reading. A connection permits up to 1024 pending tasks
+for these replies and closes if another reply needs deferral. See
+[connection-bound routes](safe-boundaries.md#routes-belong-to-the-requests-connection).
+
+The source buffers of a stream `remote_write` return once the connection has
+dropped every frame that shares them, usually as soon as they are written to
+the socket. A successful write waits for that within its deadline; a set that
+is still shared then is reported `Unavailable`. A failed write does not wait:
+its queued frames can outlive it, so its error recovers the buffers only when
+no frame holds them, and otherwise each buffer returns to its pool as soon as
+its own last frame is dropped.
+
+The `ruapc_data_frames_total` and `ruapc_data_bytes_total` counters, labelled
+`direction` (`sent` or `received`), count the frames a connection accepted and
+the frames a receiver consumed. `ruapc_data_frames_discarded_total` counts
+received frames whose bytes did not all reach a write space: the request was
+gone or on another connection, or its write space was sealed or refused the
+frame. Stream writes run no reverse RPC, so these counters, not per-method
+metrics, show them.
 
 ## Copy a client's read space into its write space
 
@@ -148,9 +213,10 @@ See [READ admission and failure](rdma-capacity.md#read-admission-and-failure)
 for configuration, error kinds and the periodic completion checks.
 
 Reverse RPCs use the default client's response budget, capped by the handler's
-remaining deadline. This covers TCP/WebSocket/HTTP/2 inline copies, RDMA
-`remote_write`, and the source validation after an RDMA `remote_read` completes.
-Send-queue admission and response waiting both honor this effective budget.
+remaining deadline. This covers TCP/WebSocket/HTTP/2 inline reads, the wait
+for a stream `remote_write`'s acknowledgement, RDMA `remote_write`, and the
+source validation after an RDMA `remote_read` completes. Send-queue admission
+of every data frame and response waiting both honor this effective budget.
 The response and READ expiry sweeps can delay notification beyond the nominal
 deadline; they do not require a response or completion to arrive first.
 
@@ -177,9 +243,9 @@ unavailable response, write-attachment state or receipt is not a handle that
 can later recover buffers. Read sources are borrowed separately and never enter
 this recovery state machine.
 
-When a call ends, with any result, the client seals its write target: a
-reverse handler that still holds the target can no longer write, and a set
-that no READ owns is returned as `Available`. Posted READ destinations remain
+Returning or dropping a call seals its write target, revoking every existing
+writer. A returning call reports a set that no READ owns as `Available`.
+Posted READ destinations remain
 owned until completion or successful QP destruction. If a READ still owns the
 set at that point, the call reports `Unavailable` and the QP later recycles
 the memory into the pool. A call with [lent destinations](#lend-write-destinations)

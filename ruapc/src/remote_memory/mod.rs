@@ -1,17 +1,20 @@
 //! Request-bound remote-memory execution and buffer recovery.
 //!
 //! Pure layouts and copy batches live in `ruapc-memory`. `transfer` binds them
-//! to one request before dispatch; `rpc_transfer` owns the reverse protocol.
+//! to one request before dispatch; `rpc_transfer` owns the reverse protocol
+//! and `data` the data frames that carry bytes on stream connections.
 //! `write_target` controls destination ownership; `reply` exposes completion
 //! and local buffer availability as separate facts.
 
 mod context;
+mod data;
 mod read_source;
 mod reply;
 mod rpc_transfer;
 pub(crate) mod transfer;
 mod write_target;
 
+pub(crate) use data::IncomingData;
 pub(crate) use read_source::{ReadSourceSender, ReadSourceService, serve_read_source};
 pub use reply::{BufferAvailability, BufferReply, ResultBufferReply, WriteReceipt};
 pub(crate) use rpc_transfer::MemoryService;
@@ -21,4 +24,4 @@ pub(crate) use rpc_transfer::ReadIntoTargetRequest;
 pub(crate) use rpc_transfer::ValidateSourceRequest;
 pub(crate) use ruapc_memory::ReadSource;
 pub use ruapc_memory::{CopyOp, MAX_COPY_OPS, MAX_REGIONS, RemoteSpace};
-pub(crate) use write_target::WriteTarget;
+pub(crate) use write_target::{WriteTarget, WriteTargetOwner};

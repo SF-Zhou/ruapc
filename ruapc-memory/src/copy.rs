@@ -266,6 +266,52 @@ impl BufferSet {
     pub fn scatter(&mut self, batch: &CopyBatch<'_>, packed: &[u8]) -> MemoryResult<()> {
         batch.scatter_into_layout(&self.layout, packed, &mut self.buffers)
     }
+
+    /// Mutable views of the logical range `[offset, offset + len)`: one slice
+    /// per buffer the range crosses, in order, `len` bytes in total.
+    ///
+    /// Checks the region limit and the range before returning any slice. An
+    /// empty range yields nothing and permits any offset. The slices cannot
+    /// change buffer lengths, so the cached layout stays valid.
+    pub fn slices_mut(
+        &mut self,
+        offset: u64,
+        len: u64,
+    ) -> MemoryResult<impl Iterator<Item = &mut [u8]>> {
+        self.layout.check_range(offset, len)?;
+        let (first, mut skip) = if len == 0 {
+            (self.buffers.len(), 0)
+        } else {
+            self.layout.locate(offset)
+        };
+        let mut remaining = len;
+        Ok(self.buffers[first..]
+            .iter_mut()
+            // Empty buffers occupy no offsets.
+            .filter(|buffer| !buffer.is_empty())
+            .map_while(move |buffer| {
+                if remaining == 0 {
+                    return None;
+                }
+                let start = std::mem::take(&mut skip) as usize;
+                let count = remaining.min((buffer.len() - start) as u64);
+                remaining -= count;
+                Some(&mut buffer[start..start + count as usize])
+            }))
+    }
+
+    /// Copies `bytes` to the logical range starting at `offset`, after the
+    /// same checks as [`slices_mut`](Self::slices_mut). A rejected range
+    /// writes nothing.
+    pub fn write_at(&mut self, offset: u64, bytes: &[u8]) -> MemoryResult<()> {
+        let mut bytes = bytes;
+        for slice in self.slices_mut(offset, bytes.len() as u64)? {
+            let (head, tail) = bytes.split_at(slice.len());
+            slice.copy_from_slice(head);
+            bytes = tail;
+        }
+        Ok(())
+    }
 }
 
 fn validate_structure(ops: &[CopyOp]) -> MemoryResult<(u64, u64, u64)> {

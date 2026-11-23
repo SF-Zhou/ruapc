@@ -35,6 +35,28 @@ carrier uses `[RUA!: 4B][body_len: 4B][meta_len: 4B][meta][payload]` and the
 same frame size limit. `frame::encode_header` lets registered-buffer serializers
 backfill that header without an intermediate allocation.
 
+Stream carriers also accept data frames,
+`[RUAD: 4B][body_len: 4B][head_len: 4B][head][raw bytes]`. The named-field
+MessagePack `DataHead` identifies the pending request and selects placement.
+A packed read response follows the receiver's own ordered destinations.
+An explicit write lists up to `MAX_DATA_RANGES` (1024) destination ranges
+and can request an acknowledgement. Each `frame::DataRange` is a Rust
+`(u64, u64)` pair encoded as `[offset, len]`.
+The raw length is `body_len - 4 - head_len`, at most `MAX_DATA_LEN` (1 MiB).
+For a write, its range lengths must add up to exactly that count.
+`frame::parse_frame` and `FrameDecoder::decode_frame` return a data frame once
+its head is complete and leave its raw bytes in the stream for the caller to
+consume; nothing buffers them on the frame's behalf. `encode_data_head` writes
+the header and head so the raw bytes can follow as separate segments.
+`parse_message`, `decode` and `decode_frames` accept message frames only. For
+an incomplete frame, `parse_frame` returns `Parsed::Incomplete` with the bytes
+still missing and sizes the receive buffer for them, reserving at most the
+larger of `EAGER_RESERVE` and the bytes already received.
+`FrameDecoder::has_partial`
+reports bytes still held for an incomplete frame. A data head describes bytes;
+it is no evidence that the receiver has the named request or that the ranges
+fit its write space.
+
 These codecs describe bytes and owned storage. Connection admission, sending,
 RDMA transfer ownership and completion validation remain in the transport
 runtime. A successfully encoded or decoded RPC message is not completion

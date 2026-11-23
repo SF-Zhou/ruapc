@@ -80,7 +80,7 @@ impl SpaceLayout {
     ///
     /// `offset` must be strictly below [`total`](Self::total). Zero-length
     /// segments are skipped (they occupy no offsets).
-    fn locate(&self, offset: u64) -> (usize, u64) {
+    pub(crate) fn locate(&self, offset: u64) -> (usize, u64) {
         debug_assert!(offset < self.total());
         // partition_point: first segment whose start is > offset, minus 1.
         let idx = self.starts.partition_point(|&s| s <= offset) - 1;
@@ -100,6 +100,13 @@ impl SpaceLayout {
         len: u64,
         f: impl FnMut(usize, u64, u64) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), E> {
+        self.check_range(offset, len)?;
+        self.for_each_slice_in_bounds(offset, len, f)
+    }
+
+    /// Checks the region limit and that `[offset, offset + len)` lies within
+    /// the space. An empty range permits any offset.
+    pub fn check_range(&self, offset: u64, len: u64) -> MemoryResult<()> {
         self.check_region_limit()?;
         if len != 0 && offset.checked_add(len).is_none_or(|end| end > self.total()) {
             return Err(MemoryError::new(
@@ -108,10 +115,9 @@ impl SpaceLayout {
                     "range at offset {offset} with length {len} exceeds logical space ({} bytes)",
                     self.total()
                 ),
-            )
-            .into());
+            ));
         }
-        self.for_each_slice_in_bounds(offset, len, f)
+        Ok(())
     }
 
     /// Iterates a range checked by this module or a batch's whole-space check.

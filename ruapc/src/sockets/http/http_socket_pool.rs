@@ -15,8 +15,9 @@ use super::{
 use crate::{
     ConnectionMap, Endpoint, Error, ErrorKind, Message, Result, Socket, SocketPoolConfig, State,
     TaskSupervisor, TaskSupervisorHandle,
-    msg::frame::FrameDecoder,
-    sockets::{connect::ConnectGroups, tcp},
+    msg::frame::{Frame, FrameDecoder},
+    remote_memory::IncomingData,
+    sockets::{Outbound, connect::ConnectGroups, tcp},
 };
 
 type HttpSocketMap = ConnectionMap<HttpSocket>;
@@ -141,7 +142,7 @@ impl HttpSocketPool {
         supervisor: &TaskSupervisorHandle,
     ) -> Result<Response<Either<Full<Bytes>, ChannelBody>>> {
         // Create the send channel for server → client messages.
-        let (tx, rx) = mpsc::channel::<Bytes>(1024);
+        let (tx, rx) = mpsc::channel::<Outbound>(1024);
         let stream_socket = StreamSocket::new(tx);
         let socket_for_recv = Socket::HTTP(HttpSocket::Stream(stream_socket.clone()));
 
@@ -189,30 +190,76 @@ impl HttpSocketPool {
         match error.kind {
             // Local shutdown and a peer closing/resetting its HTTP body are
             // connection lifecycle events. Pending callers receive their own
-            // ConnectionClosed errors through the waiter.
-            ErrorKind::ConnectionClosed | ErrorKind::HttpWaitRspFailed => {
+            // ConnectionClosed errors through the waiter. So is closing the
+            // stream of a peer that does not read its acknowledgements: its
+            // frames were valid, and TCP and WebSocket log it the same way.
+            ErrorKind::ConnectionClosed | ErrorKind::HttpWaitRspFailed | ErrorKind::Overloaded => {
                 tracing::debug!(%addr, side, %error, "HTTP RPC stream ended");
             }
             _ => tracing::warn!(%addr, side, %error, "invalid HTTP RPC stream"),
         }
     }
 
-    /// Read framed messages from an HTTP body stream.
+    /// Read frames from an HTTP body stream.
     ///
     /// Uses the same wire format as TCP: `[magic][len][body]`.
-    async fn recv_loop(mut body: Incoming, socket: &Socket, state: &Arc<State>) -> Result<()> {
+    async fn recv_loop<B>(mut body: B, socket: &Socket, state: &Arc<State>) -> Result<()>
+    where
+        B: hyper::body::Body<Data = Bytes> + Unpin,
+        B::Error: std::fmt::Display,
+    {
         let mut decoder = FrameDecoder::default();
+        // The data frame whose raw bytes the stream currently carries.
+        let mut receiving: Option<IncomingData> = None;
         while let Some(frame) = body.frame().await {
             let frame =
                 frame.map_err(|e| Error::new(ErrorKind::HttpWaitRspFailed, e.to_string()))?;
             // Trailers carry no RPC data. Complete frames retain their original
             // Bytes allocation; only frames spanning DATA chunks are buffered.
-            if let Ok(mut data) = frame.into_data() {
-                while let Some(bytes) = decoder.decode(&mut data)? {
-                    let msg = Message::parse(bytes)?;
-                    state.handle_recv(socket, msg)?;
+            let Ok(mut data) = frame.into_data() else {
+                continue;
+            };
+            loop {
+                if let Some(incoming) = &mut receiving {
+                    // Raw bytes go from each chunk to their destination; the
+                    // frame is never assembled.
+                    let chunk = data.split_to(incoming.remaining().min(data.len()));
+                    incoming.write(&chunk);
+                    if incoming.remaining() > 0 {
+                        break;
+                    }
+                    if let Some(incoming) = receiving.take() {
+                        incoming.finish(state, socket)?;
+                    }
+                }
+                match decoder.decode_frame(&mut data)? {
+                    Some(Frame::Message(bytes)) => {
+                        let msg = Message::parse(bytes)?;
+                        state.handle_recv(socket, msg)?;
+                    }
+                    Some(Frame::Data { head, len }) => {
+                        receiving = Some(IncomingData::begin(state, socket, head, len));
+                    }
+                    None => break,
                 }
             }
+        }
+        // The body ended. A clean end cannot interrupt a frame that was
+        // already announced; report it instead of treating the stream as done.
+        if let Some(incoming) = receiving.take() {
+            return Err(Error::new(
+                ErrorKind::HttpWaitRspFailed,
+                format!(
+                    "HTTP RPC stream ended inside a data frame, {} bytes missing",
+                    incoming.remaining()
+                ),
+            ));
+        }
+        if decoder.has_partial() {
+            return Err(Error::new(
+                ErrorKind::HttpWaitRspFailed,
+                "HTTP RPC stream ended inside a frame".into(),
+            ));
         }
         Ok(())
     }
@@ -254,7 +301,7 @@ impl HttpSocketPool {
         });
 
         // Create send channel for client → server messages (request body).
-        let (req_tx, req_rx) = mpsc::channel::<Bytes>(1024);
+        let (req_tx, req_rx) = mpsc::channel::<Outbound>(1024);
 
         let req = Request::builder()
             .uri(format!("http://{addr}{base_path}/_rpc"))
@@ -326,5 +373,90 @@ impl HttpSocketPool {
 impl std::fmt::Debug for HttpSocketPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpSocketPool").finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::convert::Infallible;
+
+    use http_body_util::StreamBody;
+    use hyper::body::Frame as BodyFrame;
+
+    use super::*;
+    use crate::sockets::test_util::{data_frame, pending_write_space};
+
+    /// A request or response body that delivers `chunks` and then ends.
+    fn body(chunks: &[Bytes]) -> impl hyper::body::Body<Data = Bytes, Error = Infallible> + Unpin {
+        let frames: Vec<_> = chunks
+            .iter()
+            .map(|chunk| Ok(BodyFrame::data(chunk.clone())))
+            .collect();
+        StreamBody::new(futures_util::stream::iter(frames))
+    }
+
+    fn stream() -> (Arc<State>, Socket, mpsc::Receiver<Outbound>) {
+        let config = SocketPoolConfig {
+            #[cfg(feature = "rdma")]
+            rdma: None,
+            ..Default::default()
+        };
+        let state = crate::Context::create(&config).unwrap().state;
+        let (sender, queue) = mpsc::channel(8);
+        let socket = Socket::HTTP(HttpSocket::Stream(StreamSocket::new(sender)));
+        (state, socket, queue)
+    }
+
+    /// A data frame's bytes reach their destination from whatever body
+    /// chunks carry them, without the frame being assembled.
+    #[tokio::test]
+    async fn data_frames_cross_body_chunks() {
+        let (state, socket, _queue) = stream();
+        let (target, id, _pending) = pending_write_space(&state, &socket, b"........");
+        let frame = data_frame(id, None, &[(6, 1), (1, 3)], b"wxyz");
+        for split in 0..=frame.len() {
+            let chunks = [frame.slice(..split), frame.slice(split..), frame.clone()];
+            HttpSocketPool::recv_loop(body(&chunks), &socket, &state)
+                .await
+                .unwrap();
+        }
+        assert_eq!(target.received(), 8 * (frame.len() as u64 + 1));
+        assert_eq!(target.seal_now().unwrap()[0].as_slice(), b".xyz..w.");
+    }
+
+    /// A body that ends inside a frame did not end cleanly, wherever the
+    /// frame was cut: in its header, its head or its raw bytes.
+    #[tokio::test]
+    async fn a_body_cannot_end_inside_a_frame() {
+        let (state, socket, _queue) = stream();
+        let (target, id, _pending) = pending_write_space(&state, &socket, b"........");
+        let frame = data_frame(id, None, &[(2, 4)], b"wxyz");
+        let head = frame.len() - 4;
+        // A clean end follows complete frames, or nothing at all.
+        for chunks in [&[][..], std::slice::from_ref(&frame)] {
+            HttpSocketPool::recv_loop(body(chunks), &socket, &state)
+                .await
+                .unwrap();
+        }
+        for cut in 1..frame.len() {
+            let chunks = [frame.clone(), frame.slice(..cut)];
+            let error = HttpSocketPool::recv_loop(body(&chunks), &socket, &state)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind, ErrorKind::HttpWaitRspFailed, "cut {cut}");
+            if cut < head {
+                assert!(error.msg.contains("inside a frame"), "cut {cut}: {error}");
+            } else {
+                let missing = format!("{} bytes missing", frame.len() - cut);
+                assert!(error.msg.contains(&missing), "cut {cut}: {error}");
+            }
+        }
+        // The same holds for a message frame.
+        let message = crate::msg::frame::encode(&crate::MsgMeta::default(), &"x").unwrap();
+        let error = HttpSocketPool::recv_loop(body(&[message.slice(..9)]), &socket, &state)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::HttpWaitRspFailed);
+        drop(target);
     }
 }

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Buffer, BufferAvailability, Context, Error,
-    remote_memory::{ReadSource, WriteTarget},
+    remote_memory::{ReadSource, WriteTarget, WriteTargetOwner},
 };
 
 use super::{Client, ReadAttachment};
@@ -307,7 +307,7 @@ impl<'a> ClientWithBuffers<'a> {
         match checked_out {
             None => self.call(ctx, req, None, method_name).await,
             Some(CheckedOut::Owned(buffers)) => {
-                let target = WriteTarget::new(BufferSet::new(buffers));
+                let target = WriteTargetOwner::new(WriteTarget::new(BufferSet::new(buffers)));
                 let result = self.call(ctx, req, Some(&target), method_name).await;
                 // The set is either back, or owned by a READ that only
                 // `wait_for_write_buffers` waits for.
@@ -430,7 +430,7 @@ mod tests {
             }
             let peer = async {
                 let encoded = queue.recv().await.unwrap();
-                let mut encoded = BytesMut::from(encoded.as_ref());
+                let mut encoded = BytesMut::from(encoded.into_bytes().as_ref());
                 let request =
                     Message::parse(frame::parse_message(&mut encoded).unwrap().unwrap()).unwrap();
                 let retained = ctx
@@ -459,6 +459,7 @@ mod tests {
                     }
                     ctx.state.waiter.post(
                         request.meta.msgid,
+                        ctx.conn_id(),
                         Message::new(
                             MsgMeta {
                                 msgid: request.meta.msgid,
@@ -532,7 +533,7 @@ mod tests {
             let mut call = Box::pin(wrapper.buffered(&ctx, &()));
             assert!(futures_util::poll!(call.as_mut()).is_pending());
             let encoded = queue.recv().await.unwrap();
-            let mut encoded = BytesMut::from(encoded.as_ref());
+            let mut encoded = BytesMut::from(encoded.into_bytes().as_ref());
             let request =
                 Message::parse(frame::parse_message(&mut encoded).unwrap().unwrap()).unwrap();
             let (route, deadline) = ctx
@@ -598,7 +599,7 @@ mod tests {
         // Writes into the destinations attached to one request, then answers it.
         let mut serve = async |data: &[u8], response: Vec<u8>| {
             let encoded = queue.recv().await.unwrap();
-            let mut encoded = BytesMut::from(encoded.as_ref());
+            let mut encoded = BytesMut::from(encoded.into_bytes().as_ref());
             let request =
                 Message::parse(frame::parse_message(&mut encoded).unwrap().unwrap()).unwrap();
             ctx.state
@@ -609,6 +610,7 @@ mod tests {
                 .unwrap();
             ctx.state.waiter.post(
                 request.meta.msgid,
+                ctx.conn_id(),
                 Message::new(
                     MsgMeta {
                         msgid: request.meta.msgid,
@@ -733,7 +735,10 @@ mod tests {
     }
 
     /// A context whose outgoing requests the test receives and answers itself.
-    fn queued_context() -> (Context, tokio::sync::mpsc::Receiver<Bytes>) {
+    fn queued_context() -> (
+        Context,
+        tokio::sync::mpsc::Receiver<crate::sockets::Outbound>,
+    ) {
         let config = SocketPoolConfig {
             #[cfg(feature = "rdma")]
             rdma: None,
@@ -760,9 +765,11 @@ mod tests {
     }
 
     /// Receives one request and returns its message id.
-    async fn next_request(queue: &mut tokio::sync::mpsc::Receiver<Bytes>) -> u64 {
+    async fn next_request(
+        queue: &mut tokio::sync::mpsc::Receiver<crate::sockets::Outbound>,
+    ) -> u64 {
         let encoded = queue.recv().await.unwrap();
-        let mut encoded = BytesMut::from(encoded.as_ref());
+        let mut encoded = BytesMut::from(encoded.into_bytes().as_ref());
         Message::parse(frame::parse_message(&mut encoded).unwrap().unwrap())
             .unwrap()
             .meta
@@ -772,6 +779,7 @@ mod tests {
     fn respond<T: Serialize>(ctx: &Context, msgid: u64, response: &Result<T, Error>) {
         ctx.state.waiter.post(
             msgid,
+            ctx.conn_id(),
             Message::new(
                 MsgMeta {
                     msgid,
@@ -824,6 +832,29 @@ mod tests {
         }
         assert_eq!(slots.each_ref().map(|buffer| buffer.as_ptr()), pointers);
         assert_eq!([&*slots[0], &*slots[1]], [b"tw", b"o."]);
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_owned_call_revokes_already_routed_writers() {
+        let (ctx, mut queue) = queued_context();
+        let client = Client::default();
+        let wrapper = client.with_write_buffers(vec![lent_buffer(&ctx, b"keep")]);
+        let mut call = Box::pin(wrapper.test_call(&ctx, &()));
+        assert!(futures_util::poll!(call.as_mut()).is_pending());
+        let msgid = next_request(&mut queue).await;
+        let target = ctx
+            .state
+            .waiter
+            .write_target(msgid, ctx.conn_id().unwrap())
+            .unwrap();
+
+        drop(call);
+        assert!(target.copy_in(0, b"late").is_err());
+        assert!(target.seal_now().is_none());
+        assert!(matches!(
+            wrapper.take_write_buffers(),
+            BufferAvailability::Unavailable
+        ));
     }
 
     #[tokio::test]

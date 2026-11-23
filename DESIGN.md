@@ -39,7 +39,7 @@ the dependencies retain buffer ownership and completion authority.
 | `core` | Contexts, listeners, method registration and handler admission |
 | `msg` | Owned messages and payloads, delegating codecs to `ruapc-wire` |
 | `sockets` | Concrete transports, connection queues, maps and closure |
-| `remote_memory` | Context transfer APIs, inline reverse RPCs, write targets and completion witnesses |
+| `remote_memory` | Context transfer APIs, reverse RPCs, stream data frames, write targets and completion witnesses |
 | `rdma` | Path selection, bootstrap, READ execution and CQ polling |
 | `task` | Background-task supervision and response waiters |
 | `metrics` | Cached recorder handles and scoped request accounting |
@@ -106,10 +106,11 @@ See [endpoint identity](docs/endpoints.md) for normalization and caller obligati
    expired requests before execution. Generated handlers contain panics.
    Running handlers are not cancelled by deadline expiry; they can poll
    `Context::is_expired()`.
-7. A response, connection failure, cancellation guard or expiry sweep removes
-   the waiter. Response expiry uses a shared 50 ms sweep, subject to scheduler
-   delay. Unary HTTP allocates its response waiter after receiving the complete
-   request body.
+7. A network response removes the waiter matching both its message ID and
+   the receiving connection. Connection failure, cancellation or expiry also
+   remove waiters. Response expiry uses a shared 50 ms sweep, subject to
+   scheduler delay. Unary HTTP allocates an unbound waiter after receiving its
+   complete request body and completes it locally.
 
 Connection closure is idempotent and eagerly fails its waiters. Eviction checks
 connection identity so an old connection cannot remove its replacement. RDMA
@@ -118,7 +119,8 @@ shutdown additionally follows the [poller and DMA cleanup rules](docs/qp-registr
 Metrics use the `metrics` facade; applications install a recorder before
 traffic. Per-method handles are cached per `State`, and guards settle accounting
 on completion, cancellation and panic. Only `server_inflight` has a local value,
-used for admission control.
+used for admission control. Stream data frames run no method, so they have
+counters of their own for frames and bytes sent, received and discarded.
 
 ## Message ownership and framing
 
@@ -145,11 +147,23 @@ the payload view without copying.
 | Carrier | Frame |
 |---|---|
 | TCP, HTTP/2 stream, RDMA | `[RUA!: 4B][body_len: 4B][meta_len: 4B][meta][payload]` |
-| WebSocket binary message | one shared frame per binary message |
+| TCP, HTTP/2 stream data | `[RUAD: 4B][body_len: 4B][head_len: 4B][head][raw bytes]` |
+| WebSocket binary message | one shared frame of either kind per binary message |
 | Unary HTTP | JSON bodies; routing comes from the URL |
 
-Lengths are big-endian `u32`s. `body_len` counts the `meta_len` prefix,
-metadata and payload.
+Lengths are big-endian `u32`s. `body_len` counts everything after it.
+A data frame's named-field MessagePack head identifies the pending request and
+selects the placement of up to 1 MiB of raw bytes. A packed frame advances the
+reader's local copy plan. An explicit write frame supplies destination ranges
+as `[offset, len]` pairs and may request an acknowledgement. The raw byte count
+is `body_len - 4 - head_len`. See the [wire crate](ruapc-wire/README.md).
+
+Stream send queues hold one frame per entry. Producers reserve wire bytes
+before preparing a payload. TCP and HTTP/2 can share source buffers through
+a bounded list of `Bytes` segments. WebSocket writes a contiguous frame.
+TCP can receive data with nonblocking vectored reads under the write target's
+mutex. HTTP/2 and WebSocket copy from incoming chunks. See
+[stream data frames](docs/remote-memory.md#stream-transports-data-frames).
 
 TCP, HTTP/2, WebSocket and RDMA share header validation and size limits in
 [`ruapc-wire/src/frame.rs`](ruapc-wire/src/frame.rs); a WebSocket binary message
@@ -198,7 +212,8 @@ posting.
 | `ruapc-memory` | Space validation and planning, CPU gather/scatter and immutable borrowed sources with cached layouts |
 | `context.rs` | Public transfer APIs |
 | `transfer.rs` | Owned preparation, convenience allocation and centralized enum dispatch |
-| `rpc_transfer.rs` | Reverse-RPC protocol, handlers and TCP/WS/HTTP fallback |
+| `rpc_transfer.rs` | Reverse-RPC protocol and handlers (inline reads, RDMA `read_into_target` and source validation) |
+| `data.rs` | Stream data frames: pending-request routing, destination checks, frame pushes and acknowledgements |
 | `write_target.rs` | Exclusive destination checkout for CPU copies or owned RDMA READ plans, their recovery, and final sealing |
 | `reply.rs` | Write receipts and shared reply types with local destination availability |
 | `rdma/rdma_socket/read.rs` | Concrete READ planning and execution |
@@ -217,8 +232,9 @@ core runtime. A receipt creates a `BufferReply<T>`, the return type shared by
 handlers and clients. It carries the application response and local destination
 availability; only the application response is serialized. Waiters retain write
 targets and route read operations to the original borrowing request futures.
-Inline writes hold a target's mutex for the complete batch and copy through its
-cached `BufferSet`. Read sources likewise cache their logical layouts, whose
+Stream receivers borrow a target's `BufferSet` under its mutex during each
+synchronous copy or socket read. The caller seals the target when it returns
+or is dropped. Read sources likewise cache their logical layouts, whose
 region limits are checked before publication or copying. The memory crate
 supplies these synchronous operations without its own request registry or
 completion authority.

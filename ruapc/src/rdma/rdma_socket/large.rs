@@ -1125,7 +1125,9 @@ mod lifecycle_tests {
                 },
                 Bytes::from(rmp_serde::to_vec_named(&Result::<()>::Ok(())).unwrap()).into(),
             );
-            self.state.waiter.post(offer_meta.msgid, reply);
+            self.state
+                .waiter
+                .post(offer_meta.msgid, Some(self.socket.conn_id), reply);
             self.wait_for_offer_acks().await;
             assert!(
                 self.state
@@ -1357,6 +1359,7 @@ mod lifecycle_tests {
         assert!(retained < BYTE_BUDGET);
         state.waiter.post(
             offer_meta.msgid,
+            Some(fixture.socket.conn_id),
             Message::new(
                 MsgMeta {
                     msgid: offer_meta.msgid,

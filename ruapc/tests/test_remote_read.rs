@@ -194,6 +194,8 @@ enum Expected {
     Ok,
     /// Expect success with the two halves of `data` swapped.
     OkSwapped,
+    /// Expect success with `data` repeated this many times.
+    OkRepeated(usize),
     /// Expect failure with this error kind.
     Err(ErrorKind),
 }
@@ -253,6 +255,9 @@ async fn run_test(tc: TestCase) {
             let mut swapped = tc.data[half..].to_vec();
             swapped.extend_from_slice(&tc.data[..half]);
             assert_eq!(rsp, digest(&swapped));
+        }
+        Expected::OkRepeated(count) => {
+            assert_eq!(result.unwrap(), digest(&tc.data.repeat(count)));
         }
         Expected::Err(expected_kind) => {
             let err = result.unwrap_err();
@@ -317,11 +322,12 @@ async fn test_tcp_read_vectored_ops() {
     .await;
 }
 
-/// A stream batch travels in one message. The source peer refuses one whose
-/// reply could not be framed before allocating or copying it, so the reader
-/// gets the error instead of waiting for a reply that cannot arrive.
+/// A stream batch travels as data frames of bounded size, so the message
+/// limit does not bound it: overlapping source ranges may describe more bytes
+/// than one message could ever hold, and each frame's piece is copied by the
+/// source owner on its own.
 #[tokio::test]
-async fn test_stream_read_rejects_batches_beyond_the_message_limit() {
+async fn test_stream_read_splits_batches_beyond_the_message_limit() {
     for scheme in ["tcp", "ws", "http"] {
         run_test(TestCase {
             // 1024 overlapping reads of 64 KiB total exactly 64 MiB.
@@ -331,7 +337,7 @@ async fn test_stream_read_rejects_batches_beyond_the_message_limit() {
             client_timeout: Duration::from_secs(5),
             scheme,
             method: Method::Amplified,
-            expect: Expected::Err(ErrorKind::InvalidCopyOp),
+            expect: Expected::OkRepeated(MAX_COPY_OPS),
         })
         .await;
     }
