@@ -106,10 +106,11 @@ See [endpoint identity](docs/endpoints.md) for normalization and caller obligati
    expired requests before execution. Generated handlers contain panics.
    Running handlers are not cancelled by deadline expiry; they can poll
    `Context::is_expired()`.
-7. A response, connection failure, cancellation guard or expiry sweep removes
-   the waiter. Response expiry uses a shared 50 ms sweep, subject to scheduler
-   delay. Unary HTTP allocates its response waiter after receiving the complete
-   request body.
+7. A network response removes the waiter matching both its message ID and
+   the receiving connection. Connection failure, cancellation or expiry also
+   remove waiters. Response expiry uses a shared 50 ms sweep, subject to
+   scheduler delay. Unary HTTP allocates an unbound waiter after receiving its
+   complete request body and completes it locally.
 
 Connection closure is idempotent and eagerly fails its waiters. Eviction checks
 connection identity so an old connection cannot remove its replacement. RDMA
@@ -151,21 +152,18 @@ the payload view without copying.
 | Unary HTTP | JSON bodies; routing comes from the URL |
 
 Lengths are big-endian `u32`s. `body_len` counts everything after it.
-A data frame carries at most 1 MiB of raw bytes for the write space of a
-request pending at the receiver; its MessagePack head names that request's
-message ID, the destination ranges as `[offset, len]` pairs and an optional
-acknowledgement ID. RDMA and unary HTTP never carry data frames. See
-[stream data frames](docs/remote-memory.md#stream-transports-data-frames).
+A data frame's named-field MessagePack head identifies the pending request and
+selects the placement of up to 1 MiB of raw bytes. A packed frame advances the
+reader's local copy plan. An explicit write frame supplies destination ranges
+as `[offset, len]` pairs and may request an acknowledgement. The raw byte count
+is `body_len - 4 - head_len`. See the [wire crate](ruapc-wire/README.md).
 
-Stream send queues hold one frame per entry, as one or more `Bytes` segments.
-A data frame's segments can share the sender's buffers: TCP writes them with
-vectored writes and HTTP/2 yields each as a body chunk, while WebSocket joins
-them into its one binary message. A data frame also owns its share of the
-connection's queued-byte budget, a fair semaphore; the frame's last segment
-carries that share until the carrier has written it. TCP receives a data
-frame's raw bytes straight into the destination buffers with nonblocking
-vectored reads under the write target's mutex; HTTP/2 and WebSocket copy them
-from the received chunks. Neither assembles the frame.
+Stream send queues hold one frame per entry. Producers reserve wire bytes
+before preparing a payload. TCP and HTTP/2 can share source buffers through
+a bounded list of `Bytes` segments. WebSocket writes a contiguous frame.
+TCP can receive data with nonblocking vectored reads under the write target's
+mutex. HTTP/2 and WebSocket copy from incoming chunks. See
+[stream data frames](docs/remote-memory.md#stream-transports-data-frames).
 
 TCP, HTTP/2, WebSocket and RDMA share header validation and size limits in
 [`ruapc-wire/src/frame.rs`](ruapc-wire/src/frame.rs); a WebSocket binary message
@@ -234,8 +232,9 @@ core runtime. A receipt creates a `BufferReply<T>`, the return type shared by
 handlers and clients. It carries the application response and local destination
 availability; only the application response is serialized. Waiters retain write
 targets and route read operations to the original borrowing request futures.
-Inline writes hold a target's mutex for the complete batch and copy through its
-cached `BufferSet`. Read sources likewise cache their logical layouts, whose
+Stream receivers borrow a target's `BufferSet` under its mutex during each
+synchronous copy or socket read. The caller seals the target when it returns
+or is dropped. Read sources likewise cache their logical layouts, whose
 region limits are checked before publication or copying. The memory crate
 supplies these synchronous operations without its own request registry or
 completion authority.

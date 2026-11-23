@@ -9,7 +9,8 @@ use serde::Serialize;
 mod data;
 use data::HeadParse;
 pub use data::{
-    DATA_MAGIC_NUM, DataHead, DataRange, MAX_DATA_HEAD_LEN, MAX_DATA_LEN, encode_data_head,
+    DATA_MAGIC_NUM, DataHead, DataPlacement, DataRange, MAX_DATA_HEAD_LEN, MAX_DATA_LEN,
+    MAX_DATA_RANGES, deserialize_ranges, encode_data_head,
 };
 
 /// Magic prefix of a message frame on all framed transports.
@@ -148,7 +149,7 @@ pub enum Frame {
     Data {
         /// What the bytes are for.
         head: DataHead,
-        /// Number of raw bytes that follow, the sum of the head's ranges.
+        /// Number of raw bytes that follow the head.
         len: usize,
     },
 }
@@ -575,22 +576,21 @@ mod tests {
     fn data_head(lens: &[u64]) -> DataHead {
         DataHead {
             id: 7,
-            ack: Some(u64::MAX),
-            ranges: lens
-                .iter()
-                .enumerate()
-                .map(|(index, &len)| DataRange {
-                    offset: 100 * index as u64,
-                    len,
-                })
-                .collect(),
+            placement: DataPlacement::Ranges {
+                ack: Some(u64::MAX),
+                ranges: lens
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &len)| (100 * index as u64, len))
+                    .collect(),
+            },
         }
     }
 
     /// A data frame carrying `data`, and the length of everything before it.
     fn data_frame(head: &DataHead, data: &[u8]) -> (Bytes, usize) {
         let mut frame = BytesMut::new();
-        assert_eq!(encode_data_head(head, &mut frame).unwrap(), data.len());
+        encode_data_head(head, data.len(), &mut frame).unwrap();
         let prefix = frame.len();
         frame.extend_from_slice(data);
         (frame.freeze(), prefix)
@@ -710,28 +710,39 @@ mod tests {
             &[u64::MAX, 2],
         ] {
             assert_eq!(
-                encode_data_head(&data_head(lens), &mut BytesMut::new())
+                encode_data_head(&data_head(lens), MAX_DATA_LEN, &mut BytesMut::new())
                     .unwrap_err()
                     .kind,
                 CodecErrorKind::InvalidArgument
             );
         }
-        let ranges = vec![DataRange::default(); MAX_DATA_HEAD_LEN / 2];
+        let ranges = vec![DataRange::default(); MAX_DATA_RANGES + 1];
         let oversized = DataHead {
-            ranges,
+            placement: DataPlacement::Ranges { ranges, ack: None },
             ..Default::default()
         };
         assert_eq!(
-            encode_data_head(&oversized, &mut BytesMut::new())
+            encode_data_head(&oversized, 0, &mut BytesMut::new())
                 .unwrap_err()
                 .kind,
             CodecErrorKind::InvalidArgument
         );
+        // An independently encoded head is subject to the same range limit.
+        let encoded = rmp_serde::to_vec_named(&oversized).unwrap();
+        assert!(
+            DataHead::decode(&encoded, 0)
+                .unwrap_err()
+                .msg
+                .contains("1024")
+        );
+        let at_limit = data_head(&vec![0; MAX_DATA_RANGES]);
+        let encoded = rmp_serde::to_vec_named(&at_limit).unwrap();
+        assert_eq!(DataHead::decode(&encoded, 0).unwrap(), at_limit);
 
         // A full frame is accepted; an empty one needs no ranges.
         let full = data_head(&[MAX_DATA_LEN as u64]);
         let mut frame = BytesMut::new();
-        assert_eq!(encode_data_head(&full, &mut frame).unwrap(), MAX_DATA_LEN);
+        encode_data_head(&full, MAX_DATA_LEN, &mut frame).unwrap();
         assert_eq!(
             parse_frame(&mut frame).unwrap().frame(),
             Some(Frame::Data {
@@ -744,13 +755,49 @@ mod tests {
             ..Default::default()
         };
         let mut frame = BytesMut::new();
-        assert_eq!(encode_data_head(&empty, &mut frame).unwrap(), 0);
+        encode_data_head(&empty, 0, &mut frame).unwrap();
         assert_eq!(
             parse_frame(&mut frame).unwrap().frame(),
             Some(Frame::Data {
                 head: empty,
                 len: 0
             })
+        );
+    }
+
+    #[test]
+    fn packed_frames_take_their_length_from_the_prefixes() {
+        let head = DataHead {
+            id: 9,
+            placement: DataPlacement::Packed,
+        };
+        let mut prefix = BytesMut::new();
+        encode_data_head(&head, MAX_DATA_LEN, &mut prefix).unwrap();
+        let mut decoder = FrameDecoder::default();
+        for byte in &prefix[..prefix.len() - 1] {
+            assert!(
+                decoder
+                    .decode_frame(&mut Bytes::copy_from_slice(&[*byte]))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let mut tail = prefix.split_off(prefix.len() - 1);
+        tail.extend_from_slice(b"abc");
+        let mut tail = tail.freeze();
+        assert_eq!(
+            decoder.decode_frame(&mut tail).unwrap(),
+            Some(Frame::Data {
+                head: head.clone(),
+                len: MAX_DATA_LEN
+            })
+        );
+        assert_eq!(&tail[..], b"abc");
+        assert_eq!(
+            encode_data_head(&head, MAX_DATA_LEN + 1, &mut prefix)
+                .unwrap_err()
+                .kind,
+            CodecErrorKind::InvalidArgument
         );
     }
 
@@ -773,6 +820,7 @@ mod tests {
             (largest, MAX_DATA_HEAD_LEN + 1),
             (largest, MAX_DATA_HEAD_LEN - 1),
             (100, 97),
+            (100, u32::MAX as usize),
         ] {
             let mut frame = BytesMut::from(make_header(DATA_MAGIC_NUM, body_len as u32).as_slice());
             frame.extend_from_slice(&(head_len as u32).to_be_bytes());
@@ -820,37 +868,44 @@ mod tests {
             ..Default::default()
         };
         let encoded = rmp_serde::to_vec_named(&minimal).unwrap();
-        assert!(!encoded.windows(3).any(|field| field == b"ack"));
-        assert!(!encoded.windows(6).any(|field| field == b"ranges"));
+        assert_eq!(
+            rmp_serde::from_slice::<serde_json::Value>(&encoded).unwrap(),
+            serde_json::json!({"id": 9, "placement": "packed"})
+        );
 
         #[derive(Serialize)]
         struct Extended {
             id: u64,
             future: Vec<u8>,
-            ranges: Vec<DataRange>,
+            placement: DataPlacement,
         }
+        let placement = DataPlacement::Ranges {
+            ranges: vec![(4, 2)],
+            ack: None,
+        };
         let encoded = rmp_serde::to_vec_named(&Extended {
             id: 9,
             future: vec![1, 2, 3],
-            ranges: vec![DataRange { offset: 4, len: 2 }],
+            placement: placement.clone(),
         })
         .unwrap();
         let decoded = DataHead::decode(&encoded, 2).unwrap();
         assert_eq!(decoded.id, 9);
-        assert_eq!(decoded.ack, None);
-        assert_eq!(decoded.ranges, [DataRange { offset: 4, len: 2 }]);
+        assert_eq!(decoded.placement, placement);
+        let encoded = rmp_serde::to_vec_named(&decoded).unwrap();
+        assert_eq!(
+            rmp_serde::from_slice::<serde_json::Value>(&encoded).unwrap(),
+            serde_json::json!({"id": 9, "placement": {"write": {"ranges": [[4, 2]]}}})
+        );
     }
 
     /// A range is the array `[offset, len]`: a head can list one per copy
     /// operation, and field names would be most of it.
     #[test]
     fn data_ranges_encode_as_two_element_arrays() {
-        let range = DataRange { offset: 4, len: 2 };
+        let range: DataRange = (4, 2);
         assert_eq!(rmp_serde::to_vec_named(&range).unwrap(), [0x92, 4, 2]);
-        let widest = DataRange {
-            offset: u64::MAX,
-            len: u64::MAX,
-        };
+        let widest: DataRange = (u64::MAX, u64::MAX);
         let encoded = rmp_serde::to_vec_named(&widest).unwrap();
         assert_eq!(encoded.len(), 19);
         assert_eq!(

@@ -5,6 +5,7 @@ mod copy;
 mod error;
 mod layout;
 mod plan;
+mod ranges;
 mod read_source;
 mod remote_space;
 
@@ -12,5 +13,6 @@ pub use copy::{BufferSet, CopyBatch, CopyOp, MAX_COPY_OPS};
 pub use error::{MemoryError, MemoryErrorKind, MemoryResult};
 pub use layout::{MAX_REGIONS, SpaceLayout};
 pub use plan::{DstSlice, SrcChunk};
+pub use ranges::RangeCursor;
 pub use read_source::ReadSource;
 pub use remote_space::RemoteSpace;

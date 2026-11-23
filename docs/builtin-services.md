@@ -49,7 +49,7 @@ Their Rust trait and request types are crate-private.
 
 | Method | Request | Success value | Data path |
 |---|---|---|---|
-| `MemoryService/read_inline` | Original request ID and `CopyOp` batch; destinations as this call's write space | `()` after the data frames | TCP/WS/HTTP read; data frames to this call. |
+| `MemoryService/read_inline` | `{ request_id, ranges }` with ordered `[src_offset, len]` pairs | `()` after the packed frames | TCP/WS/HTTP stream read into the reader's local destination plan. |
 | `MemoryService/read_into_target` | Original request ID and `CopyOp` batch; source in `MsgMeta.read_regions` | `()` | Client RDMA-READs server buffers into its pinned target. |
 | `MemoryService/validate_read_source` | Original request ID | `()` | Post-READ validation serviced by the original borrowing future. |
 
@@ -63,20 +63,19 @@ a unary HTTP call therefore always fails that way. See
 future; an expired or unresponsive source returns an RPC error. It is not a
 waiter-membership query.
 
-Inline reads route to the original request future, which gathers its borrowed
-source one data frame of at most 1 MiB per piece; the handler checks the batch
-against the source and this call's write space before the first byte moves,
-and the reader requires the frames to fill exactly its batch's destinations.
-Stream writes use no method: they are
-[data frames](remote-memory.md#stream-transports-data-frames) to the original
-request, which bind to its connection the same way. `read_into_target` additionally requires an
-established RDMA connection and advertised read regions. An ordinary HTTP POST
-cannot supply those RDMA prerequisites; the route reaches the handler, which
-returns an RPC error. Unary HTTP also lacks the reverse-RPC stream used by the
-remote-memory API.
+For `read_inline`, the JSON and MessagePack decoders accept at most
+`MAX_COPY_OPS` source ranges (1024). The handler checks those ranges against
+the original request's borrowed source before queueing work. Its owner gathers at
+most 1 MiB per piece while polled. The reader keeps its destination plan local
+and places packed bytes in that order. Stream writes use explicit ranges in
+[data frames](remote-memory.md#stream-transports-data-frames). The request
+layouts and validation handlers are in
+[rpc_transfer.rs](../ruapc/src/remote_memory/rpc_transfer.rs).
 
-Inline byte fields use MessagePack `bin` encoding. The request layouts and
-validation handlers are in [rpc_transfer.rs](../ruapc/src/remote_memory/rpc_transfer.rs).
+`read_into_target` requires an established RDMA connection and advertised read
+regions. Unary HTTP reaches the registered method but lacks the connection and
+regions required to perform the transfer.
+
 For the meaning of a successful READ, future-driven validation, error-buffer contents,
 and source recovery, see
 [read validation and recovery](safe-boundaries.md#application-read-source-validation-and-recovery).

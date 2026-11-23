@@ -1,20 +1,17 @@
 //! Shared send-queue ownership for TCP, WebSocket and HTTP/2 connections.
 
-use std::{sync::Arc, time::Instant};
+use std::{future::Future, sync::Arc, time::Instant};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc};
 
 use super::{ConnectionLifecycle, Outbound, SendRequest, reserve_send};
 use crate::{Error, ErrorKind, MsgMeta, Result, Waiter};
 
-/// Most data-frame bytes one connection may hold queued ahead of its send
-/// loop.
-///
-/// The queue is entry-counted, and one data frame can own about 1 MiB of
-/// freshly gathered storage, so entries alone would let a slow reader pin
-/// almost a gigabyte. A full transfer keeps at most this much frame storage in
-/// flight; the send loop releases it as it writes each frame.
+/// Wire-byte budget shared by producers preparing payloads, queued frames,
+/// and the carrier writing them. A frame can own 1 MiB of gathered bytes:
+/// reserving before gathering prevents concurrent producers from each
+/// allocating a full frame while waiting for queue capacity.
 const MAX_QUEUED_DATA_BYTES: usize = 8 << 20;
 
 /// Most responses of one connection that may wait in tasks of their own for
@@ -114,60 +111,38 @@ impl ChannelConnection {
         Ok(())
     }
 
-    /// Queues a data frame, waiting for capacity until `deadline` or closure.
-    ///
-    /// A data frame belongs to no local waiter: its sender bounds the wait
-    /// with the deadline of the transfer the frame is part of. Frames queued
-    /// by one task keep their order.
-    ///
-    /// Admission counts both frame bytes and queue entries, so a slow reader
-    /// bounds how many data-frame bytes the connection keeps queued. Bytes
-    /// are reserved first: a frame that waits for them holds no queue entry
-    /// that messages could use meanwhile. The frame keeps its bytes until the
-    /// send loop has written all of it.
-    pub(crate) async fn send_data(&self, frame: Outbound, deadline: Instant) -> Result<()> {
+    /// Reserves the wire bytes of one frame before gathering its payload.
+    /// The producer takes a queue entry only once it has a complete frame.
+    pub(crate) async fn reserve_data(
+        &self,
+        bytes: usize,
+        deadline: Instant,
+    ) -> Result<DataReservation<'_>> {
         self.check_open()?;
         if deadline <= Instant::now() {
             return Err(ErrorKind::Timeout.into());
         }
-        // Dropped on any failure below, which returns the bytes.
-        let queued = self.reserve_bytes(frame.byte_len(), deadline).await?;
-        let permit = reserve_send(&self.sender, Some(deadline), || self.lifecycle.closed()).await?;
-        self.check_open()?;
-        permit.send(match queued {
-            Some(queued) => frame.admitted(queued),
-            None => frame,
-        });
-        Ok(())
-    }
-
-    /// Reserves queued-frame bytes until `deadline` or connection closure.
-    ///
-    /// Returns `None` for a frame without bytes, and for one larger than the
-    /// whole budget, which the data frame encoders never produce and which
-    /// could never be admitted.
-    async fn reserve_bytes(
-        &self,
-        bytes: usize,
-        deadline: Instant,
-    ) -> Result<Option<OwnedSemaphorePermit>> {
-        debug_assert!(
-            bytes <= MAX_QUEUED_DATA_BYTES,
-            "data frame exceeds the queued-byte budget"
-        );
-        let permits = match u32::try_from(bytes) {
-            Ok(permits) if (1..=MAX_QUEUED_DATA_BYTES).contains(&bytes) => permits,
-            _ => return Ok(None),
-        };
-        match self.data_bytes.clone().try_acquire_many_owned(permits) {
-            Ok(queued) => Ok(Some(queued)),
+        if bytes > MAX_QUEUED_DATA_BYTES {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "data frame exceeds the connection's byte budget".into(),
+            ));
+        }
+        let permits = bytes as u32;
+        let queued = match self.data_bytes.clone().try_acquire_many_owned(permits) {
+            Ok(queued) => Ok(queued),
             Err(TryAcquireError::Closed) => Err(ErrorKind::ConnectionClosed.into()),
             // Keep the timer out of every frame's future, as `reserve_send`
             // does: only a full budget waits.
             Err(TryAcquireError::NoPermits) => {
                 Box::pin(self.wait_for_bytes(permits, deadline)).await
             }
-        }
+        }?;
+        Ok(DataReservation {
+            channel: self,
+            queued,
+            deadline,
+        })
     }
 
     #[cold]
@@ -175,13 +150,12 @@ impl ChannelConnection {
         &self,
         permits: u32,
         deadline: Instant,
-    ) -> Result<Option<OwnedSemaphorePermit>> {
+    ) -> Result<OwnedSemaphorePermit> {
         tokio::select! {
             biased;
             () = tokio::time::sleep_until(deadline.into()) => Err(ErrorKind::Timeout.into()),
             () = self.lifecycle.closed() => Err(ErrorKind::ConnectionClosed.into()),
             queued = self.data_bytes.clone().acquire_many_owned(permits) => queued
-                .map(Some)
                 .map_err(|_| ErrorKind::ConnectionClosed.into()),
         }
     }
@@ -204,17 +178,90 @@ impl ChannelConnection {
     }
 }
 
+/// Holds byte capacity through frame preparation, queueing, and carrier I/O.
+pub(crate) struct DataReservation<'a> {
+    channel: &'a ChannelConnection,
+    queued: OwnedSemaphorePermit,
+    deadline: Instant,
+}
+
+impl DataReservation<'_> {
+    /// The gather operation owns its byte reservation through the copy and
+    /// returns it with the filled frame for transport admission.
+    pub(crate) async fn send_gathered<F>(
+        self,
+        gather: impl FnOnce(OwnedSemaphorePermit) -> F,
+    ) -> Result<()>
+    where
+        F: Future<Output = Result<(BytesMut, OwnedSemaphorePermit)>>,
+    {
+        let (bytes, queued) = gather(self.queued).await?;
+        Self { queued, ..self }.send(bytes.freeze().into()).await
+    }
+
+    pub(crate) async fn send(self, frame: Outbound) -> Result<()> {
+        if frame.byte_len() != self.queued.num_permits() {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "data frame length differs from its reservation".into(),
+            ));
+        }
+        let permit = reserve_send(&self.channel.sender, Some(self.deadline), || {
+            self.channel.closed()
+        })
+        .await?;
+        self.channel.check_open()?;
+        if self.deadline <= Instant::now() {
+            return Err(ErrorKind::Timeout.into());
+        }
+        permit.send(frame.admitted(self.queued));
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{cell::Cell, time::Duration};
-
-    use bytes::BytesMut;
 
     use super::*;
     use crate::{
         Message, MsgFlags,
         msg::frame::{encode, parse_message},
     };
+
+    impl ChannelConnection {
+        async fn send_data(&self, frame: Outbound, deadline: Instant) -> Result<()> {
+            self.reserve_data(frame.byte_len(), deadline)
+                .await?
+                .send(frame)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn preparing_a_frame_uses_byte_capacity_but_no_queue_entry() {
+        let (sender, receiver) = mpsc::channel(1);
+        let connection = ChannelConnection::new(sender, "test");
+        let deadline = in_five_seconds();
+        let reservation = connection
+            .reserve_data(MAX_QUEUED_DATA_BYTES, deadline)
+            .await
+            .unwrap();
+        let waiting = connection.reserve_data(1, deadline);
+        tokio::pin!(waiting);
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+        assert_eq!(receiver.capacity(), 1);
+        drop(reservation);
+        let next = waiting.await.unwrap();
+        assert_eq!(
+            next.send(data_frame(2)).await.unwrap_err().kind,
+            ErrorKind::InvalidArgument
+        );
+        assert_eq!(
+            connection.data_bytes.available_permits(),
+            MAX_QUEUED_DATA_BYTES
+        );
+    }
 
     fn full_queue() -> (ChannelConnection, mpsc::Receiver<Outbound>) {
         let (sender, receiver) = mpsc::channel(1);

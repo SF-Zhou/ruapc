@@ -24,4 +24,4 @@ pub(crate) use rpc_transfer::ReadIntoTargetRequest;
 pub(crate) use rpc_transfer::ValidateSourceRequest;
 pub(crate) use ruapc_memory::ReadSource;
 pub use ruapc_memory::{CopyOp, MAX_COPY_OPS, MAX_REGIONS, RemoteSpace};
-pub(crate) use write_target::WriteTarget;
+pub(crate) use write_target::{WriteTarget, WriteTargetOwner};

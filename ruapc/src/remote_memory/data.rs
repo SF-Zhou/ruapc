@@ -3,28 +3,30 @@
 //!
 //! This is the one primitive behind both stream transfers. `remote_write`
 //! pushes the handler's buffers into the original request's write space.
-//! `remote_read` makes a reverse call that lends the handler's buffers as its
-//! own write space, and the client pushes the source bytes into that.
+//! `remote_read` receives packed bytes for a reverse call and scatters them
+//! according to that call's local destination plan.
 //!
 //! A frame names a request by its message ID. As for the reverse RPCs, the ID
 //! selects a write space only on the connection that carries the request.
 
 use std::{
     io::IoSliceMut,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::Instant,
 };
 
 use bytes::{Bytes, BytesMut};
 use futures_util::FutureExt;
-use ruapc_memory::{CopyBatch, SpaceLayout};
+use ruapc_memory::{CopyBatch, RangeCursor, SpaceLayout};
 use tokio::sync::Notify;
 
 use super::WriteTarget;
 use crate::{
     Buffer, Context, CopyOp, Error, ErrorKind, MAX_COPY_OPS, MsgFlags, MsgMeta, Result, Socket,
     State,
-    msg::frame::{DataHead, DataRange, MAX_DATA_LEN, encode_data_head},
+    msg::frame::{
+        DataHead, DataPlacement, DataRange, MAX_DATA_LEN, MAX_DATA_RANGES, encode_data_head,
+    },
     sockets::{ChannelConnection, Outbound},
     task::MemoryRoutes,
 };
@@ -42,41 +44,45 @@ pub(super) fn request_gone(operation: &str, attachment: &str) -> Error {
     )
 }
 
-/// The destination ranges that a piece of a batch fills, in order.
-fn destination_ranges(piece: &[CopyOp]) -> Vec<DataRange> {
+/// A checked frame piece may combine adjacent logical ranges on either side;
+/// the two spaces have independent segment boundaries.
+fn contiguous_ranges(
+    piece: &[CopyOp],
+    offset: impl Fn(&CopyOp) -> u64 + Copy,
+) -> impl Iterator<Item = (u64, u64)> {
     piece
-        .iter()
-        .map(|op| DataRange {
-            offset: op.dst_offset,
-            len: op.len,
+        .chunk_by(move |a, b| offset(a) + a.len == offset(b))
+        .map(move |run| {
+            let start = offset(&run[0]);
+            let last = &run[run.len() - 1];
+            (start, offset(last) + last.len - start)
         })
-        .collect()
 }
 
-/// Encodes the header and head of the data frame that carries `piece` to the
-/// write space of request `id`, into storage with room for the piece's bytes
-/// when `inline` is set. Also returns the number of raw bytes that complete
-/// the frame.
-pub(super) fn encode_head(
-    id: u64,
-    ack: Option<u64>,
-    piece: &[CopyOp],
-    inline: bool,
-) -> Result<(BytesMut, usize)> {
+/// Adjacent logical destinations form one wire range regardless of the layout
+/// of their sources. Preserve operation order across gaps.
+fn write_head(id: u64, ack: Option<u64>, piece: &[CopyOp]) -> Result<(BytesMut, usize)> {
+    let ranges: Vec<DataRange> = contiguous_ranges(piece, |op| op.dst_offset).collect();
+    // The splitter bounds the raw byte count of the entire piece.
+    let len = ranges.iter().map(|&(_, len)| len as usize).sum();
+    let mut encoded = BytesMut::with_capacity(64 + 20 * ranges.len());
     let head = DataHead {
         id,
-        ack,
-        ranges: destination_ranges(piece),
+        placement: DataPlacement::Ranges { ranges, ack },
     };
-    // A capacity hint only: the storage grows if the head needs more.
-    let mut capacity = 64 + 20 * piece.len();
-    if inline {
-        let bytes: u64 = piece.iter().map(|op| op.len).sum();
-        capacity += usize::try_from(bytes).unwrap_or(0).min(MAX_DATA_LEN);
-    }
-    let mut encoded = BytesMut::with_capacity(capacity);
-    let len = encode_data_head(&head, &mut encoded)?;
+    encode_data_head(&head, len, &mut encoded)?;
     Ok((encoded, len))
+}
+
+/// Encode the small read header before budgeting and preparing the frame.
+pub(super) fn packed_head(id: u64, len: usize) -> Result<BytesMut> {
+    let head = DataHead {
+        id,
+        placement: DataPlacement::Packed,
+    };
+    let mut encoded = BytesMut::with_capacity(48);
+    encode_data_head(&head, len, &mut encoded)?;
+    Ok(encoded)
 }
 
 /// The stream connection that carries the data frames of `socket`.
@@ -91,39 +97,54 @@ pub(super) fn data_channel(socket: &Socket) -> Result<&ChannelConnection> {
     })
 }
 
-/// Queues one data frame that carries `len` raw bytes, waiting for the
-/// connection's capacity until `deadline`, and counts it as sent. Frames
-/// queued by one task reach the peer in that order, and before any message
-/// the task sends afterwards.
-pub(super) async fn send_frame(
-    state: &State,
-    channel: &ChannelConnection,
-    frame: Outbound,
+/// Gather into one allocation once the carrier's segment limit is reached.
+/// At most `segment_limit` shared slices are materialized, even when each
+/// copy operation spans many small source buffers.
+fn write_frame(
+    mut head: BytesMut,
     len: usize,
-    deadline: Instant,
-) -> Result<()> {
-    channel.send_data(frame, deadline).await?;
-    state.metrics.data_frame_sent(len);
-    Ok(())
+    piece: &[CopyOp],
+    layout: &SpaceLayout,
+    sources: &[Bytes],
+    segment_limit: usize,
+) -> Result<Outbound> {
+    let mut segments: Vec<Bytes> = Vec::with_capacity(segment_limit.min(piece.len()));
+    let mut packed = false;
+    for (offset, length) in contiguous_ranges(piece, |op| op.src_offset) {
+        layout.for_each_slice::<Error>(offset, length, |index, offset, length| {
+            let range = offset as usize..(offset + length) as usize;
+            if !packed && segments.len() == segment_limit {
+                head.reserve(len);
+                for segment in std::mem::take(&mut segments) {
+                    head.extend_from_slice(&segment);
+                }
+                packed = true;
+            }
+            if packed {
+                head.extend_from_slice(&sources[index][range]);
+            } else {
+                segments.push(sources[index].slice(range));
+            }
+            Ok(())
+        })?;
+    }
+    Ok(Outbound::with_data(head.freeze(), segments))
 }
 
 /// Splits a checked batch into the pieces that one data frame each carries.
 ///
-/// Pieces stay within [`MAX_DATA_LEN`] bytes and [`MAX_COPY_OPS`] operations,
-/// whose worst-case encoded head fits
-/// [`MAX_DATA_HEAD_LEN`](crate::msg::frame::MAX_DATA_HEAD_LEN).
-pub(super) fn frame_pieces<'a>(
-    batch: &CopyBatch<'a>,
-) -> Result<impl Iterator<Item = Vec<CopyOp>> + use<'a>> {
-    Ok(batch.split(MAX_DATA_LEN as u64, MAX_COPY_OPS)?)
+/// Each operation can require its own destination range on the wire.
+fn frame_pieces<'a>(batch: &CopyBatch<'a>) -> Result<impl Iterator<Item = Vec<CopyOp>> + use<'a>> {
+    Ok(batch.split(MAX_DATA_LEN as u64, MAX_COPY_OPS.min(MAX_DATA_RANGES))?)
 }
 
 /// Pushes the source bytes of `batch` into the write space of the request
 /// that `ctx` handles, and waits for the peer to confirm the last frame.
 ///
 /// `sources` are the buffers of the source space described by `layout`.
-/// Frames share them instead of copying, and can keep sharing them after
-/// this returns: a frame stays queued even when the transfer fails.
+/// Vectored frames share them and may outlive this call if the transfer
+/// fails after queueing. Contiguous carriers and heavily fragmented frames
+/// copy them within the connection's byte reservation.
 ///
 /// The peer applies frames in order and acknowledges only the last one. Its
 /// write space refuses every frame after one it could not accept, so that
@@ -148,17 +169,19 @@ pub(super) async fn push(
     waiter.bind_connection(ack, channel.conn_id());
     while let Some(piece) = pieces.next() {
         let ack = pieces.peek().is_none().then_some(ack);
-        let (head, len) = encode_head(ctx.msg_meta.msgid, ack, &piece, false)?;
-        let mut data = Vec::with_capacity(piece.len());
-        for op in &piece {
-            layout.for_each_slice::<Error>(op.src_offset, op.len, |segment, offset, len| {
-                let (offset, len) = (offset as usize, len as usize);
-                data.push(sources[segment].slice(offset..offset + len));
-                Ok(())
-            })?;
-        }
-        let frame = Outbound::with_data(head.freeze(), data);
-        send_frame(&ctx.state, channel, frame, len, deadline).await?;
+        let (head, len) = write_head(ctx.msg_meta.msgid, ack, &piece)?;
+        let reservation = channel.reserve_data(head.len() + len, deadline).await?;
+        // WebSocket sends one contiguous binary message. On HTTP/2 a tiny
+        // segment costs an entire body chunk, so pack fragmented small frames.
+        // Large spans stay vectored; a TCP write accepts up to 64 segments.
+        let segment_limit = match socket {
+            Socket::WS(_) => 0,
+            Socket::HTTP(_) if len <= 64 << 10 => 16,
+            _ => 64,
+        };
+        let frame = write_frame(head, len, &piece, layout, sources, segment_limit)?;
+        reservation.send(frame).await?;
+        ctx.state.metrics.data_frame_sent(len);
     }
     let reply = acknowledged.recv().await?;
     reply.payload.deserialize::<Result<()>>(&reply.meta)?
@@ -189,15 +212,13 @@ struct Slots {
     /// The lent buffers at their original positions, once returned.
     buffers: Vec<Option<Buffer>>,
     missing: usize,
-    /// Nobody waits for the set any more: returning buffers are released.
-    abandoned: bool,
 }
 
 /// One lent buffer, as the owner of the `Bytes` that shares it.
 struct LentBuffer {
     buffer: Option<Buffer>,
     index: usize,
-    home: Arc<Home>,
+    home: Weak<Home>,
 }
 
 impl AsRef<[u8]> for LentBuffer {
@@ -208,29 +229,16 @@ impl AsRef<[u8]> for LentBuffer {
 
 impl Drop for LentBuffer {
     fn drop(&mut self) {
-        let mut slots = self.home.slots.lock().unwrap();
-        if slots.abandoned {
-            // Release the buffer itself outside the lock, with `self`.
+        let Some(home) = self.home.upgrade() else {
             return;
-        }
+        };
+        let mut slots = home.slots.lock().unwrap();
         slots.buffers[self.index] = self.buffer.take();
         slots.missing -= 1;
         if slots.missing == 0 {
             drop(slots);
-            self.home.returned.notify_one();
+            home.returned.notify_one();
         }
-    }
-}
-
-impl Drop for LentSources {
-    fn drop(&mut self) {
-        let parked = {
-            let mut slots = self.home.slots.lock().unwrap();
-            slots.abandoned = true;
-            std::mem::take(&mut slots.buffers)
-        };
-        // Buffers that came home before nobody wanted the set.
-        drop(parked);
     }
 }
 
@@ -241,7 +249,6 @@ impl LentSources {
             slots: Mutex::new(Slots {
                 buffers: buffers.iter().map(|_| None).collect(),
                 missing: buffers.len(),
-                abandoned: false,
             }),
             returned: Notify::new(),
         });
@@ -252,7 +259,7 @@ impl LentSources {
                 Bytes::from_owner(LentBuffer {
                     buffer: Some(buffer),
                     index,
-                    home: home.clone(),
+                    home: Arc::downgrade(&home),
                 })
             })
             .collect();
@@ -302,10 +309,7 @@ impl LentSources {
 pub(crate) struct IncomingData {
     /// `None` once the remaining bytes are only discarded.
     target: Option<Arc<WriteTarget>>,
-    ranges: Vec<DataRange>,
-    /// The range being filled and the bytes of it already written.
-    range: usize,
-    filled: u64,
+    ranges: RangeCursor,
     /// Raw bytes of the whole frame, and those not yet consumed.
     len: usize,
     remaining: usize,
@@ -319,23 +323,29 @@ impl IncomingData {
     /// The frame reaches a write space only if the request it names is
     /// pending on this very connection.
     pub(crate) fn begin(state: &State, socket: &Socket, head: DataHead, len: usize) -> Self {
-        let target = socket
+        let ack = match &head.placement {
+            DataPlacement::Packed => None,
+            DataPlacement::Ranges { ack, .. } => *ack,
+        };
+        let admitted = socket
             .data_channel()
             .and_then(|channel| state.waiter.write_target(head.id, channel.conn_id()))
             .ok_or_else(|| request_gone("data frame", "write"))
-            .and_then(|target| target.admit(&head.ranges).map(|()| target));
-        let (target, result) = match target {
-            Ok(target) => (Some(target), Ok(())),
-            Err(error) => (None, Err(error)),
+            .and_then(|target| {
+                target
+                    .admit(head.placement, len)
+                    .map(|ranges| (target, ranges))
+            });
+        let (target, ranges, result) = match admitted {
+            Ok((target, ranges)) => (Some(target), ranges, Ok(())),
+            Err(error) => (None, RangeCursor::default(), Err(error)),
         };
         Self {
             target,
-            ranges: head.ranges,
-            range: 0,
-            filled: 0,
+            ranges,
             len,
             remaining: len,
-            ack: head.ack,
+            ack,
             result,
         }
     }
@@ -343,20 +353,6 @@ impl IncomingData {
     /// Bytes of the frame that the transport has not handed over yet.
     pub(crate) fn remaining(&self) -> usize {
         self.remaining
-    }
-
-    /// The range that the frame's next byte belongs to, as its absolute
-    /// offset and the bytes of the range still missing.
-    fn next_range(&mut self) -> Option<(u64, u64)> {
-        loop {
-            let range = self.ranges.get(self.range)?;
-            if self.filled < range.len {
-                // `filled` is nonzero only after `admit` checked `offset + len`
-                // against the write space, so this cannot overflow.
-                return Some((range.offset + self.filled, range.len - self.filled));
-            }
-            (self.range, self.filled) = (self.range + 1, 0);
-        }
     }
 
     /// Stops writing: the frame's remaining bytes are discarded.
@@ -373,7 +369,7 @@ impl IncomingData {
         self.remaining = self.remaining.saturating_sub(bytes.len());
         while !bytes.is_empty() {
             // The ranges describe exactly the frame's bytes.
-            let Some((offset, missing)) = self.next_range() else {
+            let Some((offset, missing)) = self.ranges.front() else {
                 return;
             };
             let Some(target) = &self.target else { return };
@@ -382,7 +378,7 @@ impl IncomingData {
             if let Err(error) = target.push(offset, piece) {
                 return self.fail(error);
             }
-            self.filled += count as u64;
+            self.ranges.next_span(count as u64);
             bytes = rest;
         }
     }
@@ -399,14 +395,14 @@ impl IncomingData {
         min: usize,
         read: impl FnOnce(&mut [IoSliceMut<'_>]) -> std::io::Result<usize>,
     ) -> Option<std::io::Result<usize>> {
-        let (offset, missing) = self.next_range()?;
+        let (offset, missing) = self.ranges.front()?;
         if missing < min as u64 {
             return None;
         }
         let target = self.target.as_ref()?;
         match target.push_with(offset, missing, read) {
             Ok(Ok(count)) => {
-                self.filled += count as u64;
+                self.ranges.next_span(count as u64);
                 self.remaining = self.remaining.saturating_sub(count);
                 Some(Ok(count))
             }
@@ -487,7 +483,6 @@ mod tests {
     use crate::{
         Message, Payload, SocketPoolConfig,
         core::ContextEndpoint,
-        msg::frame::MAX_DATA_HEAD_LEN,
         sockets::{MAX_DEFERRED_RESPONSES, test_util::Sent},
         tcp::TcpSocket,
     };
@@ -531,9 +526,10 @@ mod tests {
         }
     }
 
-    fn answer(state: &State, id: u64, result: &Result<()>) {
-        state.waiter.post(
+    fn answer(ctx: &Context, id: u64, result: &Result<()>) {
+        ctx.state.waiter.post(
             id,
+            ctx.conn_id(),
             Message::new(
                 MsgMeta {
                     msgid: id,
@@ -641,8 +637,13 @@ mod tests {
                 while frames.len() < 2 {
                     frames.push(Sent::decode(queue.recv().await.unwrap()).data());
                 }
-                let ack = frames[1].0.ack.expect("the last frame asks for an answer");
-                assert_eq!(frames[0].0.ack, None);
+                let DataPlacement::Ranges { ack: Some(ack), .. } = frames[1].0.placement else {
+                    panic!("the last write frame requests an ACK");
+                };
+                assert!(matches!(
+                    frames[0].0.placement,
+                    DataPlacement::Ranges { ack: None, .. }
+                ));
                 assert!(frames.iter().all(|(head, _)| head.id == 41));
                 let bytes: Vec<u8> = frames
                     .iter()
@@ -651,7 +652,7 @@ mod tests {
                 assert!(bytes[..len - 3] == pattern[3..]);
                 assert_eq!(&bytes[len - 3..], &pattern[..3]);
                 if let Some(result) = &outcome {
-                    answer(&state, ack, result);
+                    answer(&ctx, ack, result);
                 }
             };
             let (result, ()) = tokio::join!(pushing, peer);
@@ -691,11 +692,10 @@ mod tests {
     fn head(id: u64, ranges: &[(u64, u64)]) -> DataHead {
         DataHead {
             id,
-            ack: None,
-            ranges: ranges
-                .iter()
-                .map(|&(offset, len)| DataRange { offset, len })
-                .collect(),
+            placement: DataPlacement::Ranges {
+                ack: None,
+                ranges: ranges.to_vec(),
+            },
         }
     }
 
@@ -758,8 +758,10 @@ mod tests {
         let frame = |ack| {
             let head = DataHead {
                 id: u64::MAX,
-                ack,
-                ranges: Vec::new(),
+                placement: DataPlacement::Ranges {
+                    ack,
+                    ranges: Vec::new(),
+                },
             };
             IncomingData::begin(&state, &socket, head, 0)
         };
@@ -786,8 +788,10 @@ mod tests {
         let finish = |ack: u64| {
             let head = DataHead {
                 id: u64::MAX,
-                ack: Some(ack),
-                ranges: Vec::new(),
+                placement: DataPlacement::Ranges {
+                    ack: Some(ack),
+                    ranges: Vec::new(),
+                },
             };
             IncomingData::begin(&state, &socket, head, 0).finish(&state, &socket)
         };
@@ -897,27 +901,55 @@ mod tests {
         assert_eq!(counter("ruapc_data_frames_discarded_total", None), 1);
     }
 
-    /// The largest piece the splitter can produce still encodes its head
-    /// within the wire limit: the batch and frame limits are coupled, because
-    /// one piece becomes one frame head.
+    #[test]
+    fn fragmented_writes_bound_segments_and_preserve_copy_order() {
+        let sources = [Bytes::from_static(b"ab"), Bytes::from_static(b"cd")];
+        let layout = SpaceLayout::from_lens([2, 2]).unwrap();
+        let ops = [
+            CopyOp::new(1, 3, 3),
+            CopyOp::new(0, 6, 1),
+            CopyOp::new(0, 0, 2),
+        ];
+        for (limit, count) in [(0, 1), (3, 1), (4, 5)] {
+            let (head, len) = write_head(99, Some(7), &ops).unwrap();
+            let frame = write_frame(head, len, &ops, &layout, &sources, limit).unwrap();
+            let segments: Vec<_> = frame.segments().collect();
+            assert_eq!(segments.len(), count);
+            if limit == 4 {
+                assert_eq!(segments[2].bytes.as_ptr(), sources[1].as_ptr());
+            }
+            let bytes: Vec<_> = segments
+                .iter()
+                .flat_map(|segment| segment.bytes.iter().copied())
+                .collect();
+            let (head, payload) = Sent::decode(Outbound::from(Bytes::from(bytes))).data();
+            assert_eq!(payload.as_ref(), b"bcdaab");
+            assert_eq!(
+                head.placement,
+                DataPlacement::Ranges {
+                    ranges: vec![(3, 4), (0, 2)],
+                    ack: Some(7),
+                }
+            );
+        }
+    }
+
+    /// A full batch of disjoint, 64-bit destinations encodes successfully
+    /// even when the wire's per-frame range limit is lower than the batch limit.
     #[test]
     fn worst_case_piece_head_fits_the_data_frame_limit() {
-        let len = (MAX_DATA_LEN as u64) / MAX_COPY_OPS as u64;
-        // 64-bit offsets make every range encode at its longest, and the
-        // lengths fill exactly one frame.
+        let len = MAX_DATA_LEN.div_ceil(MAX_COPY_OPS) as u64;
         let ops: Vec<CopyOp> = (0..MAX_COPY_OPS)
-            .map(|index| CopyOp::new(0, (1u64 << 40) + index as u64 * len, len))
+            .map(|index| CopyOp::new(0, (1u64 << 40) + index as u64 * (len + 1), len))
             .collect();
-        assert_eq!(
-            ops.iter().map(|op| op.len).sum::<u64>(),
-            MAX_DATA_LEN as u64
-        );
-        let (head, len) = encode_head(7, None, &ops, false).unwrap();
-        assert_eq!(len, MAX_DATA_LEN);
-        assert!(
-            head.len() <= MAX_DATA_HEAD_LEN,
-            "worst-case piece head is {} bytes, over the {MAX_DATA_HEAD_LEN}-byte limit",
-            head.len()
-        );
+        let batch = CopyBatch::new(&ops).unwrap();
+        let mut encoded_bytes = 0;
+        for piece in frame_pieces(&batch).unwrap() {
+            assert!(piece.len() <= MAX_DATA_RANGES);
+            // The wire encoder checks both the range count and encoded head size.
+            let (_, bytes) = write_head(u64::MAX, Some(u64::MAX), &piece).unwrap();
+            encoded_bytes += bytes as u64;
+        }
+        assert_eq!(encoded_bytes, batch.byte_count());
     }
 }

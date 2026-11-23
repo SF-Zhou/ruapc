@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc};
 
 use ruapc::{
-    BufferAvailability, BufferReply, Client, Context, CopyOp, ListenMode, Result, Router, Server,
+    BufferAvailability, BufferReply, Client, Context, ListenMode, Result, Router, Server,
     SocketPoolConfig,
 };
 
@@ -26,7 +26,7 @@ const GUESSES: u64 = 256;
 // request a handler serves; the unit tests forge them on other connections.
 #[derive(Serialize, Deserialize, JsonSchema)]
 struct ReadInline {
-    ops: Vec<CopyOp>,
+    ranges: Vec<(u64, u64)>,
     request_id: u64,
 }
 
@@ -37,7 +37,7 @@ struct ValidateSource {
 
 #[ruapc::service(name = "MemoryService")]
 trait RawMemory {
-    /// The source bytes arrive as data frames in this call's write space.
+    /// The source bytes arrive in packed response frames.
     async fn read_inline(&self, ctx: &Context, req: &ReadInline) -> Result<()>;
     async fn validate_read_source(&self, ctx: &Context, req: &ValidateSource) -> Result<()>;
 }
@@ -85,11 +85,11 @@ impl Thief for ThiefImpl {
             use_msgpack: false,
             ..Default::default()
         };
-        let ops = vec![CopyOp::new(0, 0, *len)];
+        let ranges = vec![(0, *len)];
         let mut loot = Loot::default();
         for request_id in 0..GUESSES {
             let read = ReadInline {
-                ops: ops.clone(),
+                ranges: ranges.clone(),
                 request_id,
             };
             let mut space = ctx

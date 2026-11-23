@@ -11,7 +11,7 @@ use ruapc_memory::BufferSet;
 use super::Outbound;
 use crate::{
     Message, Socket, State,
-    msg::frame::{self, DataHead, Frame},
+    msg::frame::{self, DataHead, DataPlacement, Frame},
     remote_memory::{IncomingData, WriteTarget},
     task::MemoryRoutes,
 };
@@ -71,19 +71,16 @@ pub(crate) fn deliver(state: &Arc<State>, socket: &Socket, frame: Outbound, piec
 /// An encoded data frame that carries `bytes` to `ranges` of the write space
 /// of request `id`.
 pub(crate) fn data_frame(id: u64, ack: Option<u64>, ranges: &[(u64, u64)], bytes: &[u8]) -> Bytes {
-    let head = DataHead {
-        id,
+    let placement = DataPlacement::Ranges {
         ack,
-        ranges: ranges
-            .iter()
-            .map(|&(offset, len)| frame::DataRange { offset, len })
-            .collect(),
+        ranges: ranges.to_vec(),
     };
+    encoded_data_frame(id, placement, bytes)
+}
+
+pub(crate) fn encoded_data_frame(id: u64, placement: DataPlacement, bytes: &[u8]) -> Bytes {
     let mut encoded = BytesMut::new();
-    assert_eq!(
-        frame::encode_data_head(&head, &mut encoded).unwrap(),
-        bytes.len()
-    );
+    frame::encode_data_head(&DataHead { id, placement }, bytes.len(), &mut encoded).unwrap();
     encoded.extend_from_slice(bytes);
     encoded.freeze()
 }

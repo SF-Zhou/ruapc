@@ -142,7 +142,7 @@ impl HttpSocket {
                         meta: meta.clone(),
                         payload: bytes.into(),
                     };
-                    state.waiter.post(*msgid, msg);
+                    state.waiter.post(*msgid, None, msg);
                     Ok(())
                 } else {
                     Err(Error::new(

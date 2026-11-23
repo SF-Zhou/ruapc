@@ -53,7 +53,8 @@ release buffers. See [WRID ownership](wrid.md) for token validation, posting
 cursors and reclamation, and [capacity](rdma-capacity.md) for permits and CQ
 retirement.
 
-Inline CPU writes hold the `WriteTarget` mutex for the entire validated batch.
+Stream receivers hold the `WriteTarget` mutex during each synchronous copy
+or nonblocking read into destination slices.
 Under that same mutex, `WriteTarget` moves its entire destination vector into
 an owned READ plan and keeps the plan's recovery receiver in its place; no
 await separates the two. CPU copies and competing transfers that access bytes
@@ -67,9 +68,9 @@ failed or its handler was cancelled, and for a plan that never posted. Early
 READ failure notification does not resolve it. The next access to the target
 restores a settled vector.
 
-The original RPC seals the target when it ends, with any result, and takes
-whatever the target holds. A reverse handler holding an older target reference
-cannot start another READ or CPU write afterwards, so the final destination
+The original RPC seals the target on return or drop. A reverse handler
+holding an older target reference cannot start another READ or CPU write
+afterwards, so the final destination
 set can be returned even if such references still exist. A vector that a READ
 still owns is not returned: by default the call drops the recovery receiver
 and reports the set unavailable, and the QP releases the memory once the READ
@@ -156,19 +157,29 @@ future handles source operations while it is polled. The waiter stores only a
 control-message route, never a source reference
 or address that a background CPU reader can dereference.
 
-`read_inline` accepts a request ID and logical operations, not peer-provided
-addresses. It sends one data frame's piece at a time to the original request
-future, which synchronously gathers those bytes during its poll into owned
-frame storage. No borrowed source escapes that poll into an independent task.
-Source ranges may overlap, so the handler rejects a batch with too many
-operations or ranges outside the source or its own write space before
-queueing any work, and each queued piece is at most one data frame, 1 MiB. The
-source loop serves a bounded number of queued pieces per poll
-(`SOURCE_REQUEST_CAPACITY`), so one poll copies at most that many frames, and a
-full send queue holds back the next piece. On the reading side, the frames
-must fill exactly the destinations of the reader's own batch, in operation
-order; a repeated, skipped or misplaced byte refuses the whole transfer. A
-byte count alone would let a peer leave requested destinations stale.
+`read_inline` accepts the original request ID and ordered source ranges.
+The decoder limits the list to `MAX_COPY_OPS` entries. Before queueing work,
+the handler checks each nonempty range against the source and the sum of the
+lengths for overflow.
+For each piece it reserves the frame's wire bytes, allocates storage for
+the header and payload, and keeps the buffer and its byte permit together.
+The source mailbox receives the ranges and a weak handle to that pair.
+Cancelling the handler before the pair is claimed releases both resources,
+even if the borrowing request future has been forgotten.
+
+While polled, the borrowing future claims the buffer and permit together,
+copies at most 1 MiB from its source, and returns the pair to the handler for
+sending. If the handler is cancelled during the copy, the permit stays with
+the buffer until the copy ends and the buffer is dropped. The source loop
+serves at most `SOURCE_REQUEST_CAPACITY` pieces per poll.
+
+The reader holds the destinations and a cursor into its own validated copy
+plan. It assigns each packed frame the next spans in operation order, then
+counts the actual bytes written there. An explicit-range frame, a packed
+frame beyond the remaining plan, or a successful response before every
+destination is filled fails the read. Dropping the
+owning call seals its target, revoking access even from an already routed
+frame. Bytes placed before failure follow the usual error-buffer rules.
 
 ### Routes belong to the request's connection
 
@@ -185,11 +196,15 @@ without writing anything, and its acknowledgement, if requested, carries that
 error. This binds a route to its connection; it does not authenticate the
 peer on that connection.
 
-An acknowledgement is requested by the peer, for any frame it likes, and is
-sent by the receive loop, which must not wait for its own send queue. With
-that queue full, the answer waits in a task. A connection keeps at most 1024
-such tasks and closes when a peer asks for more without reading: a frame is
-a few bytes, so the tasks would otherwise grow without bound.
+Each network response, including an explicit write frame's acknowledgement,
+completes its waiter only when the message ID and connection ID both match.
+A response on another connection leaves the waiter pending. Locally generated
+unary HTTP responses complete their own unbound waiters.
+
+A receive loop answers a write frame immediately if its send queue has room.
+It can hand up to 1024 replies per connection to tasks while it continues
+reading. If another acknowledgement would exceed that limit, the connection
+closes.
 
 ### Read first, then validate
 

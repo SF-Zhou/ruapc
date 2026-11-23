@@ -111,7 +111,7 @@ async fn test_http_builtin_methods_dispatch_and_validate_context() {
         ),
         (
             "/MemoryService/read_inline",
-            serde_json::json!({ "request_id": u64::MAX, "ops": [] }),
+            serde_json::json!({ "request_id": u64::MAX, "ranges": [] }),
             ErrorKind::Timeout,
         ),
         (

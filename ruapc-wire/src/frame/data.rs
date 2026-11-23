@@ -1,7 +1,7 @@
 //! Data frames: raw bytes pushed into a pending request's write space.
 
 use bytes::{BufMut, BytesMut};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 
 use super::HEADER_LEN;
 use crate::{CodecError, CodecErrorKind, CodecResult, MAX_DECODE_DEPTH};
@@ -13,81 +13,111 @@ pub const DATA_MAGIC_NUM: u32 = u32::from_be_bytes(*b"RUAD");
 pub const MAX_DATA_LEN: usize = 1 << 20;
 /// Longest encoded head of a data frame.
 pub const MAX_DATA_HEAD_LEN: usize = 64 << 10;
+/// Most explicit destination ranges in one write frame.
+pub const MAX_DATA_RANGES: usize = 1024;
 
 /// Size of a data frame's head length prefix.
 const HEAD_LEN_PREFIX: usize = std::mem::size_of::<u32>();
 /// Where the encoded head starts in a data frame.
 const HEAD_OFFSET: usize = HEADER_LEN + HEAD_LEN_PREFIX;
 
-/// A contiguous destination range in a write space.
-///
-/// Encoded as the two-element array `[offset, len]`: a head lists up to one
-/// range per copy operation, so field names would dominate it.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(from = "(u64, u64)", into = "(u64, u64)")]
-pub struct DataRange {
-    /// Byte offset into the receiver's write space.
-    pub offset: u64,
-    /// Number of bytes for this range.
-    pub len: u64,
-}
-
-impl From<(u64, u64)> for DataRange {
-    fn from((offset, len): (u64, u64)) -> Self {
-        Self { offset, len }
-    }
-}
-
-impl From<DataRange> for (u64, u64) {
-    fn from(range: DataRange) -> Self {
-        (range.offset, range.len)
-    }
-}
+/// A destination's `(byte offset, length)` in the write space, encoded as
+/// the two-element MessagePack array `[offset, len]`.
+pub type DataRange = (u64, u64);
 
 /// The head of a data frame: where the frame's raw bytes go.
 ///
 /// A data frame is `[RUAD: 4B][body_len: 4B][head_len: 4B][head][raw bytes]`,
 /// with big-endian lengths and `body_len` counting everything after it. The
-/// head is named-field MessagePack. The raw bytes fill [`ranges`](Self::ranges)
-/// in order, so their count is the sum of the range lengths, at most
-/// [`MAX_DATA_LEN`].
-///
-/// A frame describes bytes; it is no evidence that the receiver has a request
-/// `id`, that the request lent a write space, or that the ranges fit it.
+/// named-field MessagePack head selects how the receiver places the raw bytes.
+/// The two length prefixes determine the raw byte count for both placements.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DataHead {
-    /// Message ID of a request pending at the receiver. The bytes go to the
-    /// write space which that request attached, on this connection.
+    /// Message ID of a request pending on the connection that carries the frame.
     pub id: u64,
-    /// Message ID that the receiver answers with an ordinary response message
-    /// once it has consumed this frame, reporting whether the write space
-    /// accepted it. `None` requests no answer.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ack: Option<u64>,
-    /// Destination ranges, filled in order by the frame's raw bytes.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ranges: Vec<DataRange>,
+    /// How the receiver places the bytes in that request's write space.
+    pub placement: DataPlacement,
+}
+
+/// Destination selection for the raw bytes of a data frame.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DataPlacement {
+    /// Continue a read through the receiver's own ordered destination plan.
+    #[default]
+    Packed,
+    /// Write into the sender-specified ranges of a published write space.
+    #[serde(rename = "write")]
+    Ranges {
+        /// Destination ranges, filled in order. Their lengths sum to the raw byte count.
+        #[serde(deserialize_with = "deserialize_ranges::<MAX_DATA_RANGES, _>")]
+        ranges: Vec<DataRange>,
+        /// Message ID to answer once the receiver has consumed this frame.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ack: Option<u64>,
+    },
+}
+
+/// Decodes a sequence of `[offset, len]` pairs with at most `LIMIT` entries.
+/// A counted sequence is checked before allocating. A streaming sequence is
+/// checked before storing each pair.
+pub fn deserialize_ranges<'de, const LIMIT: usize, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<DataRange>, D::Error> {
+    struct Ranges<const LIMIT: usize>;
+
+    impl<'de, const LIMIT: usize> de::Visitor<'de> for Ranges<LIMIT> {
+        type Value = Vec<DataRange>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "at most {LIMIT} data ranges")
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let count = seq.size_hint().unwrap_or(0);
+            if count > LIMIT {
+                return Err(de::Error::invalid_length(count, &self));
+            }
+            let mut ranges = Vec::with_capacity(count);
+            while let Some(range) = seq.next_element()? {
+                if ranges.len() == LIMIT {
+                    return Err(de::Error::invalid_length(ranges.len() + 1, &self));
+                }
+                ranges.push(range);
+            }
+            Ok(ranges)
+        }
+    }
+
+    deserializer.deserialize_seq(Ranges::<LIMIT>)
 }
 
 impl DataHead {
-    /// Number of raw bytes a frame with this head carries.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CodecErrorKind::InvalidArgument`] when the ranges describe
-    /// more than [`MAX_DATA_LEN`] bytes.
-    pub fn data_len(&self) -> CodecResult<usize> {
-        self.ranges
-            .iter()
-            .try_fold(0u64, |total, range| total.checked_add(range.len))
-            .and_then(|total| usize::try_from(total).ok())
-            .filter(|&total| total <= MAX_DATA_LEN)
-            .ok_or_else(|| {
-                CodecError::new(
-                    CodecErrorKind::InvalidArgument,
-                    format!("data frame ranges exceed {MAX_DATA_LEN} bytes"),
-                )
-            })
+    fn check_data_len(&self, len: usize, kind: CodecErrorKind) -> CodecResult<()> {
+        if len > MAX_DATA_LEN {
+            return Err(CodecError::new(
+                kind,
+                format!("data frame exceeds {MAX_DATA_LEN} raw bytes"),
+            ));
+        }
+        if let DataPlacement::Ranges { ranges, .. } = &self.placement {
+            if ranges.len() > MAX_DATA_RANGES {
+                return Err(CodecError::new(
+                    kind,
+                    format!("data frame exceeds {MAX_DATA_RANGES} ranges"),
+                ));
+            }
+            let total = ranges
+                .iter()
+                .try_fold(0u64, |sum, &(_, len)| sum.checked_add(len));
+            if total != Some(len as u64) {
+                return Err(CodecError::new(
+                    kind,
+                    format!("data frame carries {len} bytes that its ranges do not describe"),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Decodes a head whose frame carries `len` raw bytes.
@@ -95,31 +125,20 @@ impl DataHead {
         let mut deserializer = rmp_serde::Deserializer::from_read_ref(encoded);
         deserializer.set_max_depth(MAX_DECODE_DEPTH);
         let head = Self::deserialize(&mut deserializer)?;
-        // The ranges alone say where each byte goes, so they must account
-        // for exactly the bytes that follow.
-        if head.data_len().ok() != Some(len) {
-            return Err(CodecError::new(
-                CodecErrorKind::InvalidFrame,
-                format!("data frame carries {len} bytes that its ranges do not describe"),
-            ));
-        }
+        head.check_data_len(len, CodecErrorKind::InvalidFrame)?;
         Ok(head)
     }
 }
 
-/// Appends a data frame's header and head to `out` and returns the number of
-/// raw bytes that complete the frame.
-///
-/// The caller sends exactly that many bytes after the appended ones, either
-/// in the same storage or as separate segments of the same frame.
+/// Appends the header and head of a frame carrying `data_len` raw bytes to `out`.
+/// The caller sends those bytes next, possibly as separate segments.
 ///
 /// # Errors
 ///
-/// Returns [`CodecErrorKind::InvalidArgument`] when the ranges describe more
-/// than [`MAX_DATA_LEN`] bytes or the encoded head exceeds
-/// [`MAX_DATA_HEAD_LEN`]. `out` then keeps a partial encoding.
-pub fn encode_data_head(head: &DataHead, out: &mut BytesMut) -> CodecResult<usize> {
-    let data_len = head.data_len()?;
+/// Returns [`CodecErrorKind::InvalidArgument`] for a frame over any size or
+/// range limit or whose explicit ranges describe a different raw length.
+pub fn encode_data_head(head: &DataHead, data_len: usize, out: &mut BytesMut) -> CodecResult<()> {
+    head.check_data_len(data_len, CodecErrorKind::InvalidArgument)?;
     let start = out.len();
     out.put_bytes(0, HEAD_OFFSET);
     rmp_serde::encode::write_named(&mut out.writer(), head)?;
@@ -135,7 +154,7 @@ pub fn encode_data_head(head: &DataHead, out: &mut BytesMut) -> CodecResult<usiz
     prefix[..4].copy_from_slice(&DATA_MAGIC_NUM.to_be_bytes());
     prefix[4..HEADER_LEN].copy_from_slice(&body_len.to_be_bytes());
     prefix[HEADER_LEN..].copy_from_slice(&u32::try_from(head_len)?.to_be_bytes());
-    Ok(data_len)
+    Ok(())
 }
 
 /// Checks a data frame's body length before any of the body is buffered.
@@ -174,7 +193,8 @@ pub(super) fn parse_head(frame: &[u8], body_len: usize) -> CodecResult<HeadParse
     };
     let head_len = usize::try_from(u32::from_be_bytes(head_len.try_into().unwrap()))?;
     let len = body_len
-        .checked_sub(HEAD_LEN_PREFIX + head_len)
+        .checked_sub(HEAD_LEN_PREFIX)
+        .and_then(|rest| rest.checked_sub(head_len))
         .filter(|&len| (1..=MAX_DATA_HEAD_LEN).contains(&head_len) && len <= MAX_DATA_LEN)
         .ok_or_else(|| {
             CodecError::new(

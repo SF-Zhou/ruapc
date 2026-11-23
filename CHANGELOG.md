@@ -7,36 +7,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 ## [Unreleased]
 
 ### Security
-- Remote-memory reverse RPCs (`MemoryService/read_inline`,
-  `read_into_target` and `validate_read_source`) and stream data frames now
-  reach a request's read
-  source or write destinations only when they arrive on the connection that
-  carries the request. Request IDs are sequential, so a peer on any other
-  connection of the same process could previously guess one and read the
-  attached source bytes or write into the attached destinations of a pending
-  call. Such calls, and unary HTTP calls that have no such connection, now
-  return the same `Timeout` error as a request that is gone. See
-  [route binding](docs/safe-boundaries.md#routes-belong-to-the-requests-connection).
-- `MemoryService/read_inline` checks a batch against the source and its own
-  write space before queueing any work, and asks the borrowing request future
-  for one data frame of at most 1 MiB per piece. The source loop serves a
-  bounded number of queued pieces per poll (at most 32 MiB), so a peer can no
-  longer make that future allocate and copy up to 1024 times its attached
-  source in one poll.
+- Remote-memory reverse RPCs and stream data frames reach a request's
+  attachments only on its connection. Network responses, including the
+  acknowledgement behind a stream `WriteReceipt`, must match both connection
+  and message ID. A response arriving elsewhere leaves the waiter pending.
+  See [route binding](docs/safe-boundaries.md#routes-belong-to-the-requests-connection).
+- `MemoryService/read_inline` checks source bounds and operation limits
+  before queueing work to the borrowing request future. Each piece holds
+  at most 1 MiB of raw bytes and each poll serves at most 32 pieces.
+- Cancelling the owning call seals its write target even if a partial frame
+  already holds a reference. Outstanding RDMA READs retain their buffers
+  through settlement.
 
 ### Added
-- `ruapc_wire::frame` data frames: `DataHead`, `DataRange`, `Frame`,
+- `ruapc_wire::frame` data frames: `DataHead`, `DataPlacement`, `DataRange`, `Frame`,
   `Parsed`, `parse_frame`, `FrameDecoder::decode_frame`,
   `FrameDecoder::has_partial`, `encode_data_head`, `DATA_MAGIC_NUM`,
-  `MAX_DATA_LEN`, `MAX_DATA_HEAD_LEN` and `EAGER_RESERVE`. `parse_frame`
+  `MAX_DATA_LEN`, `MAX_DATA_RANGES`, `MAX_DATA_HEAD_LEN` and `EAGER_RESERVE`. `parse_frame`
   reports how many bytes an incomplete frame still needs and reserves room for
   them within the `EAGER_RESERVE` bound.
 - Metrics for stream data frames: `ruapc_data_frames_total` and
   `ruapc_data_bytes_total`, labelled `direction` (`sent` or `received`), and
   `ruapc_data_frames_discarded_total` for received frames whose bytes did not
   all reach a write space.
-- `ruapc_memory`: `BufferSet::slices_mut` and `write_at` for contiguous
-  destination ranges, `CopyBatch::split` for bounded pieces,
+- `ruapc_memory`: `RangeCursor` and `CopyBatch::destination_cursor` for
+  traversing ordered spans, `BufferSet::slices_mut` and `write_at` for
+  contiguous destination ranges, `CopyBatch::split` for bounded pieces,
   `ReadSource::for_each_slice` and `SpaceLayout::check_range`.
 - `ruapc_rdma::QueuePair::post_reads` posts up to 16 READ requests as one
   linked WR chain and reports how many the provider accepted;
@@ -48,37 +44,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   including peers with no remaining connections.
 
 ### Changed
-- **BREAKING** (wire): TCP, WebSocket and HTTP/2 move remote-memory bytes in
+- **BREAKING** `ruapc_wire::frame::DataRange` is the pair `(u64, u64)`.
+  An addressed frame can pass its ranges directly to `RangeCursor::new`, which
+  takes ownership of their vector. Use `RangeCursor::from_slice` to build an
+  owned cursor from borrowed ranges.
+- **BREAKING** TCP, WebSocket and HTTP/2 carry remote-memory bytes in
   `RUAD` [data frames](docs/remote-memory.md#stream-transports-data-frames)
-  to a pending request's write space instead of inside RPC messages.
-  `remote_write` pushes the source buffers to the original request, and the
-  client's receive loop applies them and acknowledges the last frame without
-  running a handler; `MemoryService/write_inline` is removed.
-  `MemoryService/read_inline` lends the handler's destinations as its write
-  space and returns `()`; the client pushes the source bytes to it. Frames
-  carry at most 1 MiB, so stream transfers are no longer limited to 64 MiB per
-  batch. Sources are sent without copying, from `Bytes` that share the
-  handler's buffers through multi-segment send-queue entries; TCP reads
-  received bytes straight into the destination buffers. A stream
-  `remote_write`'s sources return once the connection has dropped every frame
-  that shares them; after a failed write, each buffer returns to its pool as
-  soon as its own last frame is dropped. The reader of a stream `remote_read`
-  requires the frames to fill exactly the destinations of its own copy
-  operations, in operation order: a repeated, skipped or misplaced byte fails
-  the transfer with `InvalidCopyOp` and the reason the frame was refused.
+  of at most 1 MiB, removing the previous 64 MiB per-batch limit.
+  `remote_write` sends explicit ranges and requests an acknowledgement on
+  the last frame. The client's receive loop applies them directly, removing
+  `MemoryService/write_inline`. `MemoryService/read_inline` takes ordered
+  source ranges and returns `()` after the packed frames. The reader keeps
+  its destination plan locally and requires complete delivery.
+- Stream writes share source buffers on TCP and HTTP/2 when the source fits
+  the carrier's segment limit. Highly fragmented writes and WebSocket writes
+  gather into contiguous storage. Each shared source returns to its pool
+  after its final reference is dropped if the transfer fails.
+- **BREAKING** `Waiter::post` takes the response's connection ID. Pass
+  `None` for locally generated unary HTTP responses.
 - **BREAKING** (API): `tcp::TcpSocket::new`, `ws::WebSocket::new` and
   `http::ChannelBody::new` are crate-private: their send queues now carry
   crate-private multi-segment frame entries instead of `Bytes`.
 - Stream receivers reserve buffer space for an incomplete frame once, after
   its header, but at most the larger of `EAGER_RESERVE` (1 MiB) and the bytes
   received so far.
-- Stream send queues admit data frames by bytes before entries: one frame
-  can own about 1 MiB of gathered storage, so a slow reader can keep at most
-  8 MiB of data frames queued per connection instead of the entry count
-  suggesting nearly a gigabyte. A frame's bytes are released once its last
-  segment is written, and a frame waiting for bytes holds no queue entry.
-  A frame that waits for bytes is admitted before any frame that arrives
-  later, so a large frame cannot starve behind smaller ones.
+- Each stream connection reserves the wire size of a data frame before
+  gathering its bytes. Its fair 8 MiB budget covers frames being prepared,
+  queued and written. A producer takes a queue entry only after the payload
+  is ready. The reservation returns when the frame's last segment is written
+  or the frame is dropped.
 - A receive loop that cannot queue the acknowledgement of a data frame hands
   it to a task instead of waiting for its own send queue. A connection keeps
   at most 1024 such tasks and closes when a peer asks for more without

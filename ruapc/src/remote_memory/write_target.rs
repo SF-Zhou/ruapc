@@ -4,21 +4,22 @@
 use std::sync::Weak;
 use std::{
     io::IoSliceMut,
+    ops::Deref,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use ruapc_bufpool::RemoteBufferInfo;
-use ruapc_memory::BufferSet;
 #[cfg(feature = "rdma")]
 use ruapc_memory::SpaceLayout;
+use ruapc_memory::{BufferSet, CopyBatch, RangeCursor};
 #[cfg(feature = "rdma")]
 use ruapc_rdma::ReadRecovery;
 use thin_vec::ThinVec;
 
 #[cfg(feature = "rdma")]
 use crate::rdma::RdmaSocket;
-use crate::{Buffer, CopyOp, Error, ErrorKind, Result, Socket, msg::frame::DataRange};
+use crate::{Buffer, Error, ErrorKind, Result, Socket, msg::frame::DataPlacement};
 
 /// Most destination buffers that one direct read fills. A range that crosses
 /// more is filled by several reads.
@@ -40,6 +41,32 @@ pub(crate) struct WriteTarget {
     total_len: u64,
 }
 
+/// Held by the call that owns these destinations. Cancelling the call revokes
+/// writers even when a connection is still receiving an admitted frame.
+pub(crate) struct WriteTargetOwner(Arc<WriteTarget>);
+
+impl WriteTargetOwner {
+    pub(crate) fn new(target: Arc<WriteTarget>) -> Self {
+        Self(target)
+    }
+}
+
+impl Deref for WriteTargetOwner {
+    type Target = Arc<WriteTarget>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for WriteTargetOwner {
+    fn drop(&mut self) {
+        // Available buffers return to the pool. Dropping a recovery receiver
+        // leaves the RDMA plan responsible for the buffers it still owns.
+        drop(self.0.take());
+    }
+}
+
 /// Everything writers change, under the target's one mutex.
 #[derive(Debug)]
 struct TargetState {
@@ -50,155 +77,51 @@ struct TargetState {
 /// What data frames have done to a target so far.
 #[derive(Debug, Default)]
 struct FrameProgress {
-    /// The destinations that frames must fill, when the call owns the batch
-    /// that describes them. An inline read has one; a write target attached
-    /// by `with_write_buffers` has no such batch locally.
-    expected: Option<ExpectedRanges>,
-    /// Bytes that data frames have written.
+    /// For a reverse read, destinations in local copy order and the complete
+    /// number of bytes owed. A normal write attachment accepts addressed frames.
+    packed: Option<(RangeCursor, u64)>,
     received: u64,
-    /// Why the target refused a data frame, for good: the first such error.
     refusal: Option<Error>,
 }
 
 impl FrameProgress {
-    /// Decides whether a frame may write `ranges` of a space of `total_len`
-    /// bytes. The first refusal is kept and refuses every later frame.
-    fn admit(&mut self, ranges: &[DataRange], total_len: u64) -> Result<()> {
+    fn admit(
+        &mut self,
+        placement: DataPlacement,
+        len: usize,
+        space_len: u64,
+    ) -> Result<RangeCursor> {
         if let Some(first) = &self.refusal {
-            return Err(Error::new(
-                first.kind.clone(),
-                format!("write target refused an earlier data frame: {}", first.msg),
-            ));
+            return Err(first.clone());
         }
-        let checked = check_bounds(ranges, total_len).and_then(|()| {
-            self.expected
-                .as_ref()
-                .map(|expected| expected.check(ranges))
-                .transpose()
-        });
-        match checked {
-            Ok(position) => {
-                if let (Some(expected), Some(position)) = (&mut self.expected, position) {
-                    expected.commit(position);
-                }
-                Ok(())
+        let result = match (&mut self.packed, placement) {
+            (Some((cursor, _)), DataPlacement::Packed) if len as u64 <= cursor.remaining() => {
+                Ok(cursor.split_to(len as u64))
             }
-            Err(error) => {
-                self.refusal = Some(error.clone());
-                Err(error)
+            (Some((cursor, _)), DataPlacement::Packed) => Err(Error::new(
+                ErrorKind::InvalidCopyOp,
+                format!(
+                    "packed frame carries {len} bytes with only {} bytes remaining",
+                    cursor.remaining()
+                ),
+            )),
+            (None, DataPlacement::Ranges { ranges, .. }) => {
+                RangeCursor::new(ranges, space_len).map_err(Error::from)
             }
+            (Some(_), DataPlacement::Ranges { .. }) => Err(Error::new(
+                ErrorKind::InvalidCopyOp,
+                "addressed write frame for a packed read".into(),
+            )),
+            (None, DataPlacement::Packed) => Err(Error::new(
+                ErrorKind::InvalidCopyOp,
+                "packed read frame for an addressed write target".into(),
+            )),
+        };
+        if let Err(error) = &result {
+            self.refusal = Some(error.clone());
         }
+        result
     }
-}
-
-/// Checks that every nonempty range lies within a space of `total_len` bytes.
-fn check_bounds(ranges: &[DataRange], total_len: u64) -> Result<()> {
-    let fits = |range: &DataRange| {
-        range.len == 0
-            || range
-                .offset
-                .checked_add(range.len)
-                .is_some_and(|end| end <= total_len)
-    };
-    match ranges.iter().find(|range| !fits(range)) {
-        None => Ok(()),
-        Some(range) => Err(Error::new(
-            ErrorKind::InvalidCopyOp,
-            format!(
-                "data frame range at offset {} with length {} exceeds the write space \
-                 ({total_len} bytes)",
-                range.offset, range.len
-            ),
-        )),
-    }
-}
-
-/// The destinations that an inline read's data frames must fill, in
-/// operation order.
-#[derive(Debug)]
-struct ExpectedRanges {
-    /// Destination ranges of the batch's nonempty operations, in the order
-    /// the peer delivers their bytes.
-    ranges: Vec<DataRange>,
-    /// Bytes of all `ranges` together.
-    total: u64,
-    /// Index of the range that the next admitted bytes belong to.
-    next: usize,
-    /// Bytes of `ranges[next]` already admitted.
-    filled: u64,
-}
-
-impl ExpectedRanges {
-    /// The destinations of the nonempty operations of `ops`, none admitted.
-    fn new(ops: &[CopyOp]) -> Self {
-        let ranges: Vec<_> = ops
-            .iter()
-            .filter(|op| op.len != 0)
-            .map(|op| DataRange {
-                offset: op.dst_offset,
-                len: op.len,
-            })
-            .collect();
-        Self {
-            // A checked batch bounds the sum of its lengths.
-            total: ranges.iter().map(|range| range.len).sum(),
-            ranges,
-            next: 0,
-            filled: 0,
-        }
-    }
-
-    /// Checks that `ranges` continue exactly where the admitted bytes ended,
-    /// without repeating or skipping any requested byte, and returns the
-    /// position after them.
-    fn check(&self, ranges: &[DataRange]) -> Result<(usize, u64)> {
-        let (mut next, mut filled) = (self.next, self.filled);
-        for range in ranges {
-            // A zero-byte range writes nothing, so it may name any offset.
-            if range.len == 0 {
-                continue;
-            }
-            let Some(expected) = self.ranges.get(next) else {
-                return Err(placement_error(format!(
-                    "data frame writes {} bytes at offset {} after the requested destinations \
-                     ended",
-                    range.len, range.offset
-                )));
-            };
-            let start = expected.offset.checked_add(filled).ok_or_else(|| {
-                placement_error(format!(
-                    "requested destination at offset {} overflows",
-                    expected.offset
-                ))
-            })?;
-            let missing = expected.len - filled;
-            if range.offset != start || range.len > missing {
-                return Err(placement_error(format!(
-                    "data frame writes {} bytes at offset {} but the requested destinations \
-                     continue with {missing} bytes at offset {start}",
-                    range.len, range.offset
-                )));
-            }
-            filled += range.len;
-            if filled == expected.len {
-                (next, filled) = (next + 1, 0);
-            }
-        }
-        Ok((next, filled))
-    }
-
-    fn commit(&mut self, (next, filled): (usize, u64)) {
-        (self.next, self.filled) = (next, filled);
-    }
-
-    /// Whether frames were admitted for every requested destination.
-    fn complete(&self) -> bool {
-        self.next == self.ranges.len()
-    }
-}
-
-fn placement_error(message: String) -> Error {
-    Error::new(ErrorKind::InvalidCopyOp, message)
 }
 
 #[derive(Debug)]
@@ -240,27 +163,14 @@ impl WriteTarget {
         Self::with_frames(buffers, FrameProgress::default())
     }
 
-    /// Installs a destination set that data frames must fill exactly as `ops`
-    /// describes: the destinations of its operations, in operation order,
-    /// and no others.
-    ///
-    /// The peer of an inline read chooses each frame's destination ranges, so
-    /// a byte count alone cannot tell this side whether its requested
-    /// destinations were filled. The operations belong to this side's batch
-    /// and their destination bounds were checked against `buffers` during
-    /// transfer preparation.
-    pub fn expecting(buffers: BufferSet, ops: &[CopyOp]) -> Arc<Self> {
-        debug_assert!(
-            ops.iter().filter(|op| op.len != 0).all(|op| op
-                .dst_offset
-                .checked_add(op.len)
-                .is_some_and(|end| end <= buffers.layout().total())),
-            "expected destinations must fit the write space"
-        );
+    /// Installs a reverse read's local scatter plan. Only packed frames may
+    /// advance it, and its destinations are never advertised to the peer.
+    pub fn expecting(buffers: BufferSet, batch: &CopyBatch<'_>) -> Arc<Self> {
+        let cursor = batch.destination_cursor();
         Self::with_frames(
             buffers,
             FrameProgress {
-                expected: Some(ExpectedRanges::new(ops)),
+                packed: Some((cursor, batch.byte_count())),
                 ..Default::default()
             },
         )
@@ -293,28 +203,17 @@ impl WriteTarget {
     /// Exports available destinations for the selected transport while locked.
     pub fn export_regions(&self, socket: &Socket) -> Result<ThinVec<RemoteBufferInfo>> {
         let mut state = self.state.lock().unwrap();
+        if state.frames.packed.is_some() {
+            return Ok(ThinVec::new());
+        }
         socket.export_regions(state.destinations.available()?.buffers())
     }
 
-    /// Decides whether a data frame may write `ranges`, before any of its
-    /// bytes is consumed.
-    ///
-    /// The target must still be available, and every range must lie within
-    /// it. A target that [expects](Self::expecting) destinations also
-    /// requires the frame to continue exactly where the admitted bytes ended:
-    /// it may neither skip, repeat nor misplace a requested byte.
-    ///
-    /// Otherwise ranges may repeat or overlap: pieces are written in arrival
-    /// order under the mutex, so later bytes replace earlier ones.
-    ///
-    /// A refused frame refuses the target for good. Only the last frame of a
-    /// transfer is acknowledged, and that acknowledgement must also report
-    /// every earlier frame: once one frame has been refused, each later one
-    /// is too, with the first refusal's reason.
-    pub fn admit(&self, ranges: &[DataRange]) -> Result<()> {
+    /// Resolves a complete frame's destinations before any bytes are written.
+    pub(super) fn admit(&self, placement: DataPlacement, len: usize) -> Result<RangeCursor> {
         let mut state = self.state.lock().unwrap();
         state.destinations.available()?;
-        state.frames.admit(ranges, self.total_len)
+        state.frames.admit(placement, len, self.total_len)
     }
 
     /// Copies one contiguous piece of a data frame to `offset`. Fails once
@@ -375,16 +274,14 @@ impl WriteTarget {
         if let Some(refusal) = &frames.refusal {
             return Err(refusal.clone());
         }
-        match &frames.expected {
-            Some(expected) if !expected.complete() || frames.received != expected.total => {
-                Err(Error::new(
-                    ErrorKind::InvalidCopyOp,
-                    format!(
-                        "data frames delivered {} of {} bytes to the requested destinations",
-                        frames.received, expected.total
-                    ),
-                ))
-            }
+        match &frames.packed {
+            Some((_, total)) if frames.received != *total => Err(Error::new(
+                ErrorKind::InvalidCopyOp,
+                format!(
+                    "data frames delivered {} of {} bytes to the requested destinations",
+                    frames.received, total
+                ),
+            )),
             _ => Ok(()),
         }
     }
@@ -529,105 +426,40 @@ mod tests {
         assert_eq!(buffers[1].as_slice(), b"yz..");
     }
 
-    fn expecting(pool: &Arc<BufferPool>, contents: &[&[u8]], ops: &[CopyOp]) -> Arc<WriteTarget> {
-        let buffers = contents.iter().map(|bytes| filled(pool, bytes)).collect();
-        WriteTarget::expecting(BufferSet::new(buffers), ops)
-    }
-
-    #[tokio::test]
-    async fn expected_destinations_are_filled_in_operation_order() {
-        // The batch delivers its second destination first, on purpose.
-        let ops = [
-            CopyOp::new(0, 4, 2),
-            CopyOp::new(9, 7, 0),
-            CopyOp::new(0, 0, 2),
-        ];
-        let target = expecting(&pool(), &[b"....", b"...."], &ops);
-        assert_eq!(
-            target.delivery().unwrap_err().kind,
-            ErrorKind::InvalidCopyOp
-        );
-        // One requested range may arrive in several frames.
-        target.admit(&[DataRange { offset: 4, len: 1 }]).unwrap();
-        target.copy_in(4, b"c").unwrap();
-        target.admit(&[DataRange { offset: 5, len: 1 }]).unwrap();
-        target.copy_in(5, b"d").unwrap();
-        assert!(target.delivery().is_err());
-        target.admit(&[DataRange { offset: 0, len: 2 }]).unwrap();
-        // Admitted bytes that have not arrived are not delivered.
-        let error = target.delivery().unwrap_err();
-        assert_eq!(error.kind, ErrorKind::InvalidCopyOp);
-        assert!(error.msg.contains("2 of 4 bytes"), "{error}");
-        target.copy_in(0, b"ab").unwrap();
-        target.delivery().unwrap();
-        // Zero-byte ranges write nothing and may name any offset.
-        target
-            .admit(&[DataRange {
-                offset: u64::MAX,
-                len: 0,
-            }])
-            .unwrap();
-        target.delivery().unwrap();
-        let buffers = target.seal(None).await.unwrap();
-        assert_eq!(buffers[0].as_slice(), b"ab..");
-        assert_eq!(buffers[1].as_slice(), b"cd..");
-        // Sealing keeps the verdict.
-        target.delivery().unwrap();
-
-        // Without expectations, the target accepts any in-bounds range and
-        // owes no delivery.
-        let target = new_target(&pool(), &[b"...."]);
-        target.delivery().unwrap();
-        target.admit(&[DataRange { offset: 2, len: 1 }]).unwrap();
-        target.admit(&[DataRange { offset: 2, len: 1 }]).unwrap();
-        target.delivery().unwrap();
+    fn write_range(offset: u64, len: u64) -> DataPlacement {
+        DataPlacement::Ranges {
+            ranges: vec![(offset, len)],
+            ack: None,
+        }
     }
 
     #[test]
-    fn misplaced_repeated_or_skipped_frames_refuse_the_target() {
-        for ranges in [
-            // Before the first requested destination.
-            vec![DataRange { offset: 0, len: 2 }],
-            // Continues past the requested range.
-            vec![DataRange { offset: 4, len: 3 }],
-            // Fills a later destination first.
-            vec![DataRange { offset: 6, len: 2 }],
-            // Repeats bytes already admitted.
-            vec![
-                DataRange { offset: 4, len: 2 },
-                DataRange { offset: 4, len: 2 },
-            ],
-            // Overlaps the previous frame instead of continuing.
-            vec![
-                DataRange { offset: 4, len: 1 },
-                DataRange { offset: 4, len: 1 },
-            ],
-            // Skips the byte that follows.
-            vec![
-                DataRange { offset: 4, len: 1 },
-                DataRange { offset: 6, len: 1 },
-            ],
-            // Writes after every requested destination was filled.
-            vec![
-                DataRange { offset: 4, len: 2 },
-                DataRange { offset: 0, len: 2 },
-                DataRange { offset: 2, len: 1 },
-            ],
-        ] {
-            let ops = [CopyOp::new(0, 4, 2), CopyOp::new(0, 0, 2)];
-            let target = expecting(&pool(), &[b"........"], &ops);
-            let refusal = target.admit(&ranges).unwrap_err();
-            assert_eq!(refusal.kind, ErrorKind::InvalidCopyOp);
-            // The first refusal sticks: later frames fail even when correct,
-            // and report why the first one was refused.
-            let later = target
-                .admit(&[DataRange { offset: 4, len: 2 }])
-                .unwrap_err();
-            assert_eq!(later.kind, ErrorKind::InvalidCopyOp);
-            assert!(later.msg.contains(&refusal.msg), "{later}");
-            // The call reports the refusal itself, not a byte count.
-            assert_eq!(target.delivery().unwrap_err(), refusal);
-        }
+    fn packed_frame_admission_uses_local_destinations_and_counts_actual_bytes() {
+        use crate::CopyOp;
+        let ops = [CopyOp::new(0, 4, 2), CopyOp::new(0, 0, 2)];
+        let pool = pool();
+        let target = WriteTarget::expecting(
+            BufferSet::new(vec![filled(&pool, b"........")]),
+            &CopyBatch::new(&ops).unwrap(),
+        );
+        let mut first = target.admit(DataPlacement::Packed, 3).unwrap();
+        assert_eq!(first.next_span(u64::MAX), Some((4, 2)));
+        assert_eq!(first.next_span(u64::MAX), Some((0, 1)));
+        let last = target.admit(DataPlacement::Packed, 1).unwrap();
+        assert_eq!(last.front(), Some((1, 1)));
+        assert!(target.delivery().is_err());
+        target.push(4, b"cd").unwrap();
+        target.push(0, b"ab").unwrap();
+        target.delivery().unwrap();
+        assert_eq!(target.seal_now().unwrap()[0].as_slice(), b"ab..cd..");
+    }
+
+    #[test]
+    fn packed_frame_for_normal_write_attachment_refuses_later_writes() {
+        let target = new_target(&pool(), &[b"...."]);
+        let first = target.admit(DataPlacement::Packed, 1).unwrap_err();
+        assert_eq!(first.kind, ErrorKind::InvalidCopyOp);
+        assert_eq!(target.admit(write_range(0, 1), 1).unwrap_err(), first);
     }
 
     /// A range outside the write space refuses any target for good, and a
@@ -636,26 +468,22 @@ mod tests {
     async fn out_of_bounds_frames_refuse_the_target_and_sealing_does_not() {
         let target = new_target(&pool(), &[b"...."]);
         for (offset, len) in [(3, 2), (4, 1), (u64::MAX, 2)] {
-            let refusal = target.admit(&[DataRange { offset, len }]).unwrap_err();
+            let refusal = target
+                .admit(write_range(offset, len), len as usize)
+                .unwrap_err();
             assert_eq!(refusal.kind, ErrorKind::InvalidCopyOp);
         }
         let first = target.delivery().unwrap_err();
         assert!(first.msg.contains("offset 3 with length 2"), "{first}");
         assert_eq!(
-            target
-                .admit(&[DataRange { offset: 0, len: 1 }])
-                .unwrap_err()
-                .kind,
+            target.admit(write_range(0, 1), 1).unwrap_err().kind,
             ErrorKind::InvalidCopyOp
         );
 
         let target = new_target(&pool(), &[b"...."]);
         target.seal(None).await.unwrap();
         assert_eq!(
-            target
-                .admit(&[DataRange { offset: 0, len: 1 }])
-                .unwrap_err()
-                .kind,
+            target.admit(write_range(0, 1), 1).unwrap_err().kind,
             ErrorKind::BuffersInUse
         );
         target.delivery().unwrap();

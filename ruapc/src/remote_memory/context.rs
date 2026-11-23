@@ -57,8 +57,9 @@ impl Context {
     /// All transfers validate the connection, attached space, bounds, overflow,
     /// operation count and destination overlap. An empty or zero-byte batch
     /// returns `local` after validation without I/O.
-    /// RDMA uses one-sided READs; TCP/WS/HTTP route a reverse RPC that fills
-    /// the destinations with data frames.
+    /// RDMA uses one-sided READs. On TCP, WebSocket and HTTP/2, the reader
+    /// requests source ranges in a reverse RPC and scatters the returned
+    /// packed bytes into `local` in copy-operation order.
     ///
     /// Returns the same buffers with the requested ranges filled. Failures
     /// return recoverable buffers in [`RemoteIoError`]; in-flight RDMA can
@@ -167,7 +168,7 @@ mod tests {
     use ruapc_memory::BufferSet;
     use std::time::Duration;
 
-    use bytes::{Bytes, BytesMut};
+    use bytes::Bytes;
     use ruapc_bufpool::RemoteBufferInfo;
 
     use crate::{
@@ -175,11 +176,11 @@ mod tests {
         SocketPoolConfig, core::ContextEndpoint, tcp::TcpSocket,
     };
     use crate::{
-        msg::frame::{DataHead, DataRange, encode_data_head},
-        remote_memory::WriteTarget,
+        msg::frame::{DataHead, DataPlacement},
+        remote_memory::{IncomingData, WriteTarget},
         sockets::{
             Outbound,
-            test_util::{Sent, deliver},
+            test_util::{self, Sent, deliver, encoded_data_frame},
         },
         task::MemoryRoutes,
     };
@@ -446,18 +447,7 @@ mod tests {
 
     /// A data frame carrying `bytes` to `offset` of request `id`'s write space.
     fn data_frame(id: u64, ack: Option<u64>, offset: u64, bytes: &[u8]) -> Outbound {
-        let head = DataHead {
-            id,
-            ack,
-            ranges: vec![DataRange {
-                offset,
-                len: bytes.len() as u64,
-            }],
-        };
-        let mut frame = BytesMut::new();
-        encode_data_head(&head, &mut frame).unwrap();
-        frame.extend_from_slice(bytes);
-        frame.freeze().into()
+        test_util::data_frame(id, ack, &[(offset, bytes.len() as u64)], bytes).into()
     }
 
     fn connection(ctx: &Context) -> &Socket {
@@ -481,19 +471,31 @@ mod tests {
                 b"........",
             ),
             (
-                Some((4, &b"cd"[..])),
+                Some((DataPlacement::Packed, &b"cd"[..])),
                 Ok(()),
                 ErrorKind::InvalidCopyOp,
                 "delivered 2 of 4 bytes",
                 b"....cd..",
             ),
-            // The right byte count at the wrong destination is not a read,
-            // and the error tells where the frame should have written.
+            // Packed read destinations accept no peer-specified offsets.
             (
-                Some((0, &b"wxyz"[..])),
+                Some((
+                    DataPlacement::Ranges {
+                        ranges: vec![(0, 4)],
+                        ack: None,
+                    },
+                    &b"wxyz"[..],
+                )),
                 Ok(()),
                 ErrorKind::InvalidCopyOp,
-                "continue with 2 bytes at offset 4",
+                "addressed write frame for a packed read",
+                b"........",
+            ),
+            (
+                Some((DataPlacement::Packed, &b"extra"[..])),
+                Ok(()),
+                ErrorKind::InvalidCopyOp,
+                "5 bytes with only 4 bytes remaining",
                 b"........",
             ),
             (
@@ -519,17 +521,18 @@ mod tests {
                 let request = Sent::decode(queue.recv().await.unwrap()).message();
                 assert_eq!(request.meta.method, "MemoryService/read_inline");
                 let id = request.meta.msgid;
-                if let Some((offset, bytes)) = pushed {
+                if let Some((placement, bytes)) = pushed {
                     deliver(
                         &ctx.state,
                         connection(&ctx),
-                        data_frame(id, None, offset, bytes),
+                        encoded_data_frame(id, placement, bytes).into(),
                         1,
                     );
                 }
                 let response: &std::result::Result<(), Error> = &reply;
                 ctx.state.waiter.post(
                     id,
+                    ctx.conn_id(),
                     Message::new(
                         MsgMeta {
                             msgid: id,
@@ -555,8 +558,8 @@ mod tests {
         }
     }
 
-    /// An inline read fills exactly the destinations its own batch named,
-    /// even when the peer delivers them out of offset order.
+    /// The reader scatters a packed stream locally, even when the destination
+    /// offsets go backwards and a frame crosses an operation boundary.
     #[tokio::test]
     async fn inline_read_fills_the_requested_destinations() {
         let (ctx, mut queue) = connected_context(MsgMeta {
@@ -572,22 +575,31 @@ mod tests {
         let peer = async {
             let request = Sent::decode(queue.recv().await.unwrap()).message();
             assert_eq!(request.meta.method, "MemoryService/read_inline");
+            assert!(request.meta.write_regions.is_empty());
+            assert_eq!(
+                request
+                    .payload
+                    .deserialize::<serde_json::Value>(&request.meta)
+                    .unwrap(),
+                serde_json::json!({"request_id": 123, "ranges": [[2, 2], [0, 2]]}),
+            );
             let id = request.meta.msgid;
             deliver(
                 &ctx.state,
                 connection(&ctx),
-                data_frame(id, None, 4, b"cd"),
+                encoded_data_frame(id, DataPlacement::Packed, b"cda").into(),
                 1,
             );
             deliver(
                 &ctx.state,
                 connection(&ctx),
-                data_frame(id, None, 0, b"ab"),
+                encoded_data_frame(id, DataPlacement::Packed, b"b").into(),
                 1,
             );
             let response: &std::result::Result<(), Error> = &Ok(());
             ctx.state.waiter.post(
                 id,
+                ctx.conn_id(),
                 Message::new(
                     MsgMeta {
                         msgid: id,
@@ -606,6 +618,39 @@ mod tests {
         let buffers = result.unwrap();
         assert_eq!(buffers.len(), 1);
         assert_eq!(buffers[0].as_slice(), b"ab..cd..");
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_stream_read_revokes_a_partially_received_frame() {
+        let (ctx, mut queue) = connected_context(MsgMeta {
+            read_regions: [region(4)].into(),
+            timeout_ms: 5_000,
+            ..Default::default()
+        });
+        let ops = [CopyOp::new(0, 0, 4)];
+        let mut call = Box::pin(ctx.remote_read(&ops, vec![filled(&ctx, b"....")]));
+        assert!(futures_util::poll!(call.as_mut()).is_pending());
+        let request = Sent::decode(queue.recv().await.unwrap()).message();
+        let id = request.meta.msgid;
+        let target = ctx
+            .state
+            .waiter
+            .write_target(id, ctx.conn_id().unwrap())
+            .unwrap();
+        let socket = connection(&ctx);
+        let head = DataHead {
+            id,
+            placement: DataPlacement::Packed,
+        };
+        let mut frame = IncomingData::begin(&ctx.state, socket, head, 4);
+        frame.write(b"ab");
+        assert_eq!(target.received(), 2);
+
+        drop(call);
+        frame.write(b"cd");
+        frame.finish(&ctx.state, socket).unwrap();
+        assert_eq!(target.received(), 2);
+        assert!(target.seal_now().is_none());
     }
 
     /// The acknowledgement that a data frame asked for, from `queue`.

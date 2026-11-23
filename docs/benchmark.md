@@ -50,7 +50,7 @@ and sufficient locked-memory allowance.
 |---|---|---|
 | [`echo`](../ruapc/benches/echo.rs), serial | One request at a time, 16 B and 4 KiB payloads | 1,000 warmups and 5,000 measured requests per size |
 | `echo`, concurrent | 16 B payload, 64 or 1,024 tasks | 256,000 requests per case, split evenly across tasks |
-| [`remote_memory`](../ruapc/benches/remote_memory.rs) | Serial 64 KiB and 1 MiB reads/writes with full-pattern verification | 8 warmups; 512 measured requests for 64 KiB, 128 for 1 MiB |
+| [`remote_memory`](../ruapc/benches/remote_memory.rs) | Serial 64 KiB and 1 MiB reads/writes with full-pattern verification, including fragmented stream writes | 8 warmups; 512 measured requests for 64 KiB, 128 for 1 MiB |
 
 Echo also runs concurrent RDMA cases with one endpoint containing two bootstrap
 addresses on the same server. Both addresses share one peer's stripe set.
@@ -90,10 +90,14 @@ Concurrent timing includes task creation; its `us/op` divides total wall time
 by requests per task, not individual latency samples. Remote-memory timing
 excludes setup, initial registration and warmup, and reuses sources and write
 destinations. It includes full-pattern verification and per-call
-`remote_read_all` destination allocation. Each transfer uses one full-span copy
-operation with one source and destination buffer. Fragmented, multi-operation
-RPCs are not measured by this harness; the standalone memory benchmarks isolate
-those CPU and planning workloads.
+`remote_read_all` destination allocation. The `remote_read_all` and
+`remote_write_all` cases use one full-span operation with one source and one
+destination buffer. The additional `remote_write/32` stream case copies 32 equal-sized
+source buffers into one destination using 32 consecutive, disjoint operations.
+Compare it with the single-buffer write at the same size and transport to
+measure the cost of fragmentation, including the carrier's choice to share
+slices or gather them into one frame. The standalone memory benchmarks isolate
+copy and planning costs.
 
 ## Wire codecs
 

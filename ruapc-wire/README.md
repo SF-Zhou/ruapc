@@ -36,10 +36,14 @@ same frame size limit. `frame::encode_header` lets registered-buffer serializers
 backfill that header without an intermediate allocation.
 
 Stream carriers also accept data frames,
-`[RUAD: 4B][body_len: 4B][head_len: 4B][head][raw bytes]`, whose named-field
-MessagePack `DataHead` lists destination ranges that account for exactly the
-raw bytes, at most `MAX_DATA_LEN` (1 MiB). Each range is the two-element array
-`[offset, len]`, since a head can list one per copy operation.
+`[RUAD: 4B][body_len: 4B][head_len: 4B][head][raw bytes]`. The named-field
+MessagePack `DataHead` identifies the pending request and selects placement.
+A packed read response follows the receiver's own ordered destinations.
+An explicit write lists up to `MAX_DATA_RANGES` (1024) destination ranges
+and can request an acknowledgement. Each `frame::DataRange` is a Rust
+`(u64, u64)` pair encoded as `[offset, len]`.
+The raw length is `body_len - 4 - head_len`, at most `MAX_DATA_LEN` (1 MiB).
+For a write, its range lengths must add up to exactly that count.
 `frame::parse_frame` and `FrameDecoder::decode_frame` return a data frame once
 its head is complete and leave its raw bytes in the stream for the caller to
 consume; nothing buffers them on the frame's behalf. `encode_data_head` writes

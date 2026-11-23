@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use ruapc::{
     Buffer, BufferPool, Client, Context, CopyOp, Endpoint, ListenMode, ResultBufferReply, Router,
@@ -143,30 +143,22 @@ async fn packed_copies_keep_operation_order_holes_and_empty_segments_on_stream_t
 
 #[service]
 trait LargeCopy {
-    /// Reads the whole read space, then writes it back with its halves swapped.
-    async fn swap_halves(&self, ctx: &Context, req: &()) -> ResultBufferReply<u64>;
+    /// Reads the whole read space, then writes the two specified ranges back.
+    async fn copy_back(&self, ctx: &Context, ops: &[CopyOp; 2]) -> ResultBufferReply<u64>;
 }
 
 struct LargeCopyService;
 
 impl LargeCopy for LargeCopyService {
-    async fn swap_halves(&self, ctx: &Context, _: &()) -> ResultBufferReply<u64> {
+    async fn copy_back(&self, ctx: &Context, ops: &[CopyOp; 2]) -> ResultBufferReply<u64> {
         let read = ctx.remote_read_all().await?;
         let total: u64 = read.iter().map(|buffer| buffer.len() as u64).sum();
-        let half = total / 2;
-        let ops = [
-            CopyOp::new(half, 0, total - half),
-            CopyOp::new(0, total - half, half),
-        ];
-        let sent = ctx.remote_write(&ops, read).await?;
+        let sent = ctx.remote_write(ops, read).await?;
         Ok(sent.into_reply(total))
     }
 }
 
-/// Transfers of several data frames each, from two requests in flight on the
-/// same connection at once, keep every byte in place in both directions.
-#[tokio::test]
-async fn multi_frame_transfers_interleave_on_stream_transports() {
+async fn large_copy_server() -> (Server, SocketAddr, SocketPoolConfig) {
     let config = SocketPoolConfig {
         listen_mode: ListenMode::UNIFIED,
         buffer_pool_memory: 256 << 20,
@@ -178,6 +170,14 @@ async fn multi_frame_transfers_interleave_on_stream_transports() {
     Arc::new(LargeCopyService).ruapc_export(&mut router);
     let server = Server::create(router, &config).unwrap();
     let address = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    (server, address, config)
+}
+
+/// Transfers of several data frames each, from two requests in flight on the
+/// same connection at once, keep every byte in place in both directions.
+#[tokio::test]
+async fn multi_frame_transfers_interleave_on_stream_transports() {
+    let (server, address, config) = large_copy_server().await;
     let pool = BufferPool::new(Vec::new());
     // Uneven buffers put frame and buffer boundaries in different places.
     const LENGTHS: [usize; 3] = [(1 << 20) + 3, 3 << 20, (1 << 20) + 14];
@@ -201,16 +201,74 @@ async fn multi_frame_transfers_interleave_on_stream_transports() {
                 let attached = client
                     .with_read_buffers(&source)
                     .with_write_buffers(destination);
-                let (len, written) = attached.swap_halves(ctx, &()).await.unwrap().into_parts();
+                let half = total / 2;
+                let rest = (total - half) as u64;
+                let ops = [
+                    CopyOp::new(half as u64, 0, rest),
+                    CopyOp::new(0, rest, half as u64),
+                ];
+                let (len, written) = attached.copy_back(ctx, &ops).await.unwrap().into_parts();
                 assert_eq!(len, total as u64);
                 let written = flatten(&written.into_available().expect("destinations"));
-                let half = total / 2;
                 let mut expected = pattern[half..].to_vec();
                 expected.extend_from_slice(&pattern[..half]);
                 assert!(written == expected, "{transport:?} seed {seed}");
             }
         };
         tokio::join!(transfer(0), transfer(0xa5));
+    }
+
+    server.stop();
+    tokio::time::timeout(Duration::from_secs(5), server.join())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn fragmented_writes_preserve_large_spans_and_untouched_gaps() {
+    let (server, address, config) = large_copy_server().await;
+    let pool = BufferPool::new(Vec::new());
+
+    // remote_read_all mirrors all 34 buffers on the server. This single 40 KiB
+    // frame exceeds the small HTTP/2 frame's packing threshold and fits TCP's
+    // scatter limit, with a run of small slices between two large spans.
+    let mut lengths = [512; 34];
+    lengths[0] = 16 << 10;
+    lengths[33] = 8 << 10;
+    let total = lengths.iter().sum::<usize>();
+    let pattern: Vec<_> = (0..total).map(|offset| (offset % 251) as u8).collect();
+    let source = buffers(&pool, &pattern, &lengths);
+    const GAP: usize = 7;
+    let initial = vec![0xff; total + 3 * GAP];
+    let mut expected = initial.clone();
+    let half = total / 2;
+    expected[GAP..GAP + half].copy_from_slice(&pattern[half..]);
+    expected[2 * GAP + half..2 * GAP + total].copy_from_slice(&pattern[..half]);
+    // Write the upper destination first; leave a sentinel before, between and
+    // after the two nonoverlapping ranges.
+    let ops = [
+        CopyOp::new(0, (2 * GAP + half) as u64, half as u64),
+        CopyOp::new(half as u64, GAP as u64, half as u64),
+    ];
+
+    for transport in [Transport::TCP, Transport::HTTP] {
+        let ctx = Context::create(&config)
+            .unwrap()
+            .with_endpoint(Endpoint::new(transport, [address]).unwrap());
+        // Neither destination boundary coincides with the source segments or
+        // the halves of the copy batch.
+        let destination = buffers(&pool, &initial, &[11, half, initial.len() - half - 11]);
+        let client = Client::default();
+        let attached = client
+            .with_read_buffers(&source)
+            .with_write_buffers(destination);
+        let (count, written) = attached.copy_back(&ctx, &ops).await.unwrap().into_parts();
+        assert_eq!(count, total as u64);
+        let actual = flatten(&written.into_available().expect("destinations available"));
+        assert!(
+            actual == expected,
+            "{transport:?} mixed spans or untouched gaps"
+        );
     }
 
     server.stop();

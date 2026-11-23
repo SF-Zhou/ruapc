@@ -44,9 +44,8 @@ struct WaiterEntry {
     write_target: Option<Arc<WriteTarget>>,
     /// Drop memory holds before waking the receiver on every completion path.
     sender: oneshot::Sender<WaiterResult>,
-    /// Id of the connection the request was sent on (see
-    /// [`Waiter::bind_connection`]); used by [`Waiter::fail_connection`] to
-    /// fail pending requests eagerly when the connection dies.
+    /// The connection that can complete the request or access its memory
+    /// routes. Teardown eagerly fails the waiters bound to that connection.
     conn_id: Option<NonZeroU64>,
     /// Coarse expiry: the entry is dropped by the periodic sweep once the
     /// deadline passed, waking the waiting task with a timeout error.
@@ -177,19 +176,17 @@ impl Waiter {
         (msgid, rx)
     }
 
-    /// Posts a response message to the waiting receiver.
-    ///
-    /// Removes the entry from the map, releasing its memory holds, and sends
-    /// the response message.
-    ///
-    /// If no waiter is found (e.g., because of timeout), a warning is logged.
-    pub fn post(&self, msgid: u64, result: Message) {
-        if let Some((_, entry)) = self.id_map.remove(&msgid) {
+    /// Completes a request only on the connection that carries it. Local
+    /// unary HTTP responses use `None` for their unbound waiter.
+    pub fn post(&self, msgid: u64, conn_id: Option<u64>, result: Message) {
+        if let Some((_, entry)) = self.id_map.remove_if(&msgid, |_, entry| {
+            entry.conn_id.map(NonZeroU64::get) == conn_id
+        }) {
             drop(entry.read_source);
             drop(entry.write_target);
             let _ = entry.sender.send(Ok(result));
         } else {
-            tracing::warn!("Waiter post failed for msgid: {}", msgid);
+            tracing::warn!(msgid, ?conn_id, "no matching waiter for response");
         }
     }
 
@@ -249,8 +246,8 @@ impl Waiter {
     }
 
     /// The pending entry, if its request was sent on exactly this connection.
-    /// Message IDs are sequential, so an ID alone must not select an entry
-    /// for a peer: every lookup made on a peer's behalf goes through here.
+    /// Memory and deadline lookups borrow this entry. Responses check the
+    /// same identity under the lock that removes the entry.
     fn on_connection(
         &self,
         msgid: u64,
@@ -402,7 +399,7 @@ mod tests {
             assert!(receiving.as_mut().poll(&mut context).is_pending());
 
             match completion {
-                Completion::Response => waiter.post(msgid, Message::default()),
+                Completion::Response => waiter.post(msgid, Some(conn_id), Message::default()),
                 Completion::ConnectionFailure => {
                     waiter.fail_connection(conn_id, &Error::kind(ErrorKind::ConnectionClosed))
                 }
@@ -446,7 +443,7 @@ mod tests {
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 let mut msg = Message::default();
                 msg.meta.method = "dummy".into();
-                msg_waiter.post(msgid, msg);
+                msg_waiter.post(msgid, None, msg);
             })
         };
 
@@ -463,7 +460,7 @@ mod tests {
     async fn test_waiter_post_nonexistent_msgid() {
         let waiter = Waiter::default();
         // Posting to a non-existent msgid should log a warning and not panic.
-        waiter.post(42, Message::default());
+        waiter.post(42, None, Message::default());
     }
 
     #[tokio::test]
@@ -488,7 +485,7 @@ mod tests {
         drop(handler_clone);
 
         // Posting the response removes the entry and its hold on the target.
-        waiter.post(msgid, Message::default());
+        waiter.post(msgid, Some(conn_id), Message::default());
         rx.recv().await.unwrap();
         assert!(waiter.write_target(msgid, conn_id).is_none());
         assert_eq!(Arc::strong_count(&target), 1);

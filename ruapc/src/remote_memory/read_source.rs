@@ -5,16 +5,20 @@
 //! a post-READ probe or gather inline bytes. Queued requests contain no borrowed
 //! source memory, and every reply belongs to one operation.
 
-use std::{future::Future, time::Instant};
+use std::{
+    future::Future,
+    sync::{Arc, Mutex, Weak},
+    time::Instant,
+};
 
 use bytes::BytesMut;
-use ruapc_memory::{CopyBatch, ReadSource};
+use ruapc_memory::{RangeCursor, ReadSource};
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{OwnedSemaphorePermit, mpsc, oneshot},
     time::timeout_at,
 };
 
-use crate::{CopyOp, Error, ErrorKind, MAX_COPY_OPS, Result, msg::frame::MAX_DATA_LEN};
+use crate::{Error, ErrorKind, Result, msg::frame::MAX_DATA_LEN};
 
 const SOURCE_REQUEST_CAPACITY: usize = 32;
 
@@ -22,6 +26,15 @@ const SOURCE_REQUEST_CAPACITY: usize = 32;
 /// frame. Source ranges may overlap, so without this bound a peer could make
 /// one poll of the borrowing future copy far more than the source holds.
 const MAX_GATHER_BYTES: u64 = MAX_DATA_LEN as u64;
+
+type ReservedFrame = (BytesMut, OwnedSemaphorePermit);
+
+/// The handler owns the slot until its source claims the frame. A stale mailbox
+/// carries only a weak handle; an active copy owns both storage and permits.
+#[derive(Debug)]
+struct GatherWork {
+    frame: Mutex<Option<ReservedFrame>>,
+}
 
 #[derive(Debug)]
 enum SourceRequest {
@@ -31,10 +44,9 @@ enum SourceRequest {
     },
     Gather {
         deadline: Instant,
-        ops: Vec<CopyOp>,
-        /// Owned storage that receives the bytes after its current content.
-        into: BytesMut,
-        reply: oneshot::Sender<Result<BytesMut>>,
+        ranges: RangeCursor,
+        work: Weak<GatherWork>,
+        reply: oneshot::Sender<Result<ReservedFrame>>,
     },
 }
 
@@ -48,27 +60,32 @@ impl SourceRequest {
             }
             Self::Gather {
                 deadline,
-                ops,
-                into,
+                ranges,
+                work,
                 reply,
             } => {
-                if Instant::now() < deadline && !reply.is_closed() {
-                    let _ = reply.send(append(source, &ops, into));
+                if Instant::now() < deadline
+                    && !reply.is_closed()
+                    && let Some((frame, permit)) = work
+                        .upgrade()
+                        .and_then(|work| work.frame.lock().unwrap().take())
+                {
+                    let result = append(source, ranges, frame).map(|bytes| (bytes, permit));
+                    let _ = reply.send(result);
                 }
             }
         }
     }
 }
 
-/// Appends the source bytes of `ops` to `into` in operation order. Every
-/// range is checked before the first byte is copied.
-fn append(source: &ReadSource<'_>, ops: &[CopyOp], mut into: BytesMut) -> Result<BytesMut> {
-    let batch = CopyBatch::new(ops)?;
-    source.layout().check_region_limit()?;
-    batch.check_source(source.layout().total())?;
-    into.reserve(usize::try_from(batch.byte_count()).unwrap_or(usize::MAX));
-    for op in ops {
-        source.for_each_slice(op.src_offset, op.len, |slice| into.extend_from_slice(slice))?;
+/// Fill the already-reserved frame while the source owner is active.
+fn append(
+    source: &ReadSource<'_>,
+    mut ranges: RangeCursor,
+    mut into: BytesMut,
+) -> Result<BytesMut> {
+    while let Some((offset, len)) = ranges.next_span(u64::MAX) {
+        source.for_each_slice(offset, len, |slice| into.extend_from_slice(slice))?;
     }
     Ok(into)
 }
@@ -133,46 +150,52 @@ impl ReadSourceSender {
         self.source_len
     }
 
-    /// Copies source bytes inside the source owner's polling context: the
-    /// bytes of `ops`, in operation order, are appended to `into`, which the
-    /// owner hands back. Destination offsets are not used.
-    ///
-    /// Bounds the peer-supplied work before queueing it: the operation count,
-    /// and the bytes the owner copies in one poll, at most one data frame.
-    /// Full validation and byte access remain in the borrowing future.
-    pub(crate) async fn gather(
+    /// Copies a checked piece while the owner is actively polling its source.
+    /// Queued requests hold a weak handle to the budgeted frame.
+    pub(crate) async fn gather_reserved(
         &self,
-        ops: Vec<CopyOp>,
+        ranges: RangeCursor,
         into: BytesMut,
         deadline: Instant,
-    ) -> Result<BytesMut> {
-        if ops.len() > MAX_COPY_OPS {
-            return Err(Error::new(
-                ErrorKind::InvalidCopyOp,
-                "too many inline read operations".into(),
-            ));
-        }
-        let bytes = ops
-            .iter()
-            .try_fold(0u64, |total, op| total.checked_add(op.len));
-        if bytes.is_none_or(|bytes| bytes > MAX_GATHER_BYTES) {
+        permit: OwnedSemaphorePermit,
+    ) -> Result<ReservedFrame> {
+        if ranges.remaining() > MAX_GATHER_BYTES {
             return Err(Error::new(
                 ErrorKind::InvalidCopyOp,
                 format!("inline read piece exceeds the {MAX_GATHER_BYTES} bytes of a data frame"),
             ));
         }
+        let size = usize::try_from(ranges.remaining()).expect("one bounded data frame");
+        let mut frame = BytesMut::with_capacity(into.len() + size);
+        frame.extend_from_slice(&into);
+        let work = Arc::new(GatherWork {
+            frame: Mutex::new(Some((frame, permit))),
+        });
         let (reply, response) = oneshot::channel();
         self.request(
             SourceRequest::Gather {
                 deadline,
-                ops,
-                into,
+                ranges,
+                work: Arc::downgrade(&work),
                 reply,
             },
             response,
             deadline,
         )
         .await?
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn gather(
+        &self,
+        ranges: RangeCursor,
+        into: BytesMut,
+        deadline: Instant,
+    ) -> Result<BytesMut> {
+        let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = capacity.try_acquire_owned().unwrap();
+        let (bytes, _) = self.gather_reserved(ranges, into, deadline, permit).await?;
+        Ok(bytes)
     }
 
     async fn request<T>(
@@ -308,7 +331,7 @@ mod tests {
             // The bytes follow whatever the storage already holds.
             let frame = sender
                 .gather(
-                    vec![CopyOp::new(2, 0, 4)],
+                    RangeCursor::new(vec![(2, 4)], 8).unwrap(),
                     BytesMut::from("head:"),
                     deadline(),
                 )
@@ -318,28 +341,75 @@ mod tests {
             // Source ranges may overlap; the storage gets each operation's bytes.
             let frame = sender
                 .gather(
-                    vec![CopyOp::new(0, 0, 4), CopyOp::new(0, 4, 4)],
+                    RangeCursor::new(vec![(0, 4), (0, 4)], 8).unwrap(),
                     BytesMut::new(),
                     deadline(),
                 )
                 .await
                 .unwrap();
             assert_eq!(&frame[..], b"abcdabcd");
-            // A range outside the source fails before any earlier one is copied.
-            for ops in [
-                vec![CopyOp::new(7, 0, 2)],
-                vec![CopyOp::new(0, 0, 4), CopyOp::new(8, 4, 1)],
-                // Pieces are batches: their destinations must not overlap.
-                vec![CopyOp::new(0, 0, 4), CopyOp::new(4, 2, 4)],
-            ] {
-                let error = sender
-                    .gather(ops, BytesMut::new(), deadline())
-                    .await
-                    .unwrap_err();
-                assert_eq!(error.kind, ErrorKind::InvalidCopyOp);
-            }
+            // Even a piece prepared for a larger space is checked against
+            // the actual borrowed buffers before it can return bytes.
+            let piece = RangeCursor::new(vec![(0, 4), (8, 1)], 9).unwrap();
+            let error = sender
+                .gather(piece, BytesMut::new(), deadline())
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind, ErrorKind::InvalidCopyOp);
         };
         service.drive(work).await;
+    }
+
+    #[tokio::test]
+    async fn only_an_active_copy_or_its_result_keeps_reserved_bytes_after_cancellation() {
+        let buffers = buffers();
+        let source = ReadSource::new(&buffers);
+        let (sender, mut service) = serve_read_source(&source);
+        let capacity = Arc::new(tokio::sync::Semaphore::new(4));
+
+        for poll_source in [false, true] {
+            let held = capacity.clone().try_acquire_many_owned(4).unwrap();
+            let mut copying = Box::pin(sender.gather_reserved(
+                RangeCursor::new(vec![(0, 4)], 8).unwrap(),
+                BytesMut::new(),
+                deadline(),
+                held,
+            ));
+            assert!(futures_util::poll!(copying.as_mut()).is_pending());
+            if poll_source {
+                service.requests.try_recv().unwrap().handle(&source);
+            }
+            assert_eq!(capacity.available_permits(), 0);
+            drop(copying);
+            assert_eq!(capacity.available_permits(), 4);
+            if !poll_source {
+                service.requests.try_recv().unwrap().handle(&source);
+            }
+        }
+
+        let held = capacity.clone().try_acquire_many_owned(4).unwrap();
+        let mut copying = Box::pin(sender.gather_reserved(
+            RangeCursor::new(vec![(0, 4)], 8).unwrap(),
+            BytesMut::new(),
+            deadline(),
+            held,
+        ));
+        assert!(futures_util::poll!(copying.as_mut()).is_pending());
+        let SourceRequest::Gather { work, .. } = service.requests.try_recv().unwrap() else {
+            panic!("expected gather request")
+        };
+        let frame = work
+            .upgrade()
+            .unwrap()
+            .frame
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap();
+        drop(copying);
+        assert_eq!(capacity.available_permits(), 0);
+        drop(frame);
+        assert_eq!(capacity.available_permits(), 4);
     }
 
     #[tokio::test]
@@ -348,30 +418,10 @@ mod tests {
         let source = ReadSource::new(&buffers);
         let (sender, service) = serve_read_source(&source);
         // Nobody drives the service: every rejection precedes the mailbox.
-        for ops in [
-            vec![CopyOp::new(0, 0, 0); MAX_COPY_OPS + 1],
-            vec![CopyOp::new(0, 0, MAX_GATHER_BYTES + 1)],
-            // Overlapping source ranges amplify a small source.
-            (0..MAX_COPY_OPS as u64)
-                .map(|index| {
-                    let len = (MAX_GATHER_BYTES + 1).div_ceil(MAX_COPY_OPS as u64);
-                    CopyOp::new(0, index * len, len)
-                })
-                .collect(),
-            vec![CopyOp::new(0, 0, u64::MAX), CopyOp::new(0, 0, 1)],
-        ] {
-            let result = tokio::time::timeout(
-                Duration::from_secs(1),
-                sender.gather(
-                    ops,
-                    BytesMut::new(),
-                    Instant::now() + Duration::from_secs(30),
-                ),
-            )
-            .await
-            .expect("oversized work must fail without waiting for the owner");
-            assert_eq!(result.unwrap_err().kind, ErrorKind::InvalidCopyOp);
-        }
+        let ranges =
+            RangeCursor::new(vec![(0, MAX_GATHER_BYTES), (0, 1)], MAX_GATHER_BYTES).unwrap();
+        let result = sender.gather(ranges, BytesMut::new(), deadline()).await;
+        assert_eq!(result.unwrap_err().kind, ErrorKind::InvalidCopyOp);
         assert_eq!(service.requests.len(), 0);
     }
 
@@ -405,7 +455,7 @@ mod tests {
         );
         assert_eq!(
             sender
-                .gather(Vec::new(), BytesMut::new(), deadline())
+                .gather(RangeCursor::default(), BytesMut::new(), deadline())
                 .await
                 .unwrap_err()
                 .kind,
@@ -454,9 +504,9 @@ mod tests {
         sender
             .requests
             .try_send(SourceRequest::Gather {
+                work: Weak::new(),
                 deadline: expired,
-                ops: vec![CopyOp::new(0, 0, 4)],
-                into: BytesMut::new(),
+                ranges: RangeCursor::new(vec![(0, 4)], 8).unwrap(),
                 reply: inline_reply,
             })
             .unwrap();

@@ -58,7 +58,7 @@ mod tests {
         tokio::spawn(async move {
             let mut msg = Message::default();
             msg.meta.method = "ping".into();
-            w.post(msgid, msg);
+            w.post(msgid, None, msg);
         });
 
         let msg = rx.recv().await.unwrap();
@@ -73,7 +73,7 @@ mod tests {
         assert_eq!(Arc::strong_count(&waiter), 2);
         let task = tokio::spawn(receiver.recv());
         let message = Message::default();
-        waiter.post(msgid, message);
+        waiter.post(msgid, None, message);
         task.await.unwrap().unwrap();
         assert_eq!(waiter.pending_count(), 0);
         assert_eq!(Arc::strong_count(&waiter), 1);

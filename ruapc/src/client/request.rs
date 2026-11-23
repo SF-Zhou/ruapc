@@ -310,6 +310,7 @@ mod tests {
     use crate::{Socket, SocketPoolConfig, tcp::TcpSocket};
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use ruapc_bufpool::BufferPool;
+    use ruapc_memory::RangeCursor;
     use std::{
         future::Future,
         task::{Context as TaskContext, Poll, Waker},
@@ -404,7 +405,7 @@ mod tests {
         assert_eq!(
             route
                 .gather(
-                    vec![crate::CopyOp::new(0, 0, 4)],
+                    RangeCursor::new(vec![(0, 4)], route.source_len()).unwrap(),
                     bytes::BytesMut::new(),
                     std::time::Instant::now() + Duration::from_millis(10)
                 )
@@ -447,8 +448,8 @@ mod tests {
                 .waiter
                 .read_source(0, ctx.conn_id().unwrap())
                 .unwrap();
-            let ops = vec![crate::CopyOp::new(1, 0, 2)];
-            let mut copying = Box::pin(route.gather(ops, bytes::BytesMut::new(), deadline));
+            let ranges = RangeCursor::new(vec![(1, 2)], route.source_len()).unwrap();
+            let mut copying = Box::pin(route.gather(ranges, bytes::BytesMut::new(), deadline));
             assert!(futures_util::poll!(copying.as_mut()).is_pending());
             assert!(futures_util::poll!(request.as_mut()).is_pending());
             assert_eq!(&copying.await.unwrap()[..], b"ea");
